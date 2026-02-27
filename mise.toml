@@ -1,0 +1,4 @@
+[tasks]
+test = { run = "mise/tasks/test", description = "Run all tests: unit, clippy, e2e (single, p2p, nostr)" }
+use-local = { run = "mise/tasks/use-local", description = "Build from local source, install, restart daemon" }
+use-published = { run = "mise/tasks/use-published", description = "Install from crates.io, clean local artifacts, restart daemon" }

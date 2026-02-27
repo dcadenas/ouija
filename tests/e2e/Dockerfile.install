@@ -1,0 +1,56 @@
+FROM rust:latest
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tmux curl jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# Simulate: cargo install ouija (from local source)
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+COPY hooks/ hooks/
+COPY scripts/ scripts/
+COPY skills/ skills/
+COPY .mcp.json ./
+RUN cargo install --path . 2>&1
+
+# Verify binary is in PATH
+RUN ouija --help
+
+# Test: ouija start launches and responds on the default port
+RUN bash -c '\
+    set -e; \
+    tmux new-session -d -s bg; \
+    ouija start --port 7880 & \
+    DAEMON_PID=$!; \
+    for i in $(seq 1 20); do \
+        if curl -sf http://127.0.0.1:7880/api/status >/dev/null 2>&1; then \
+            echo "PASS: daemon responding on port 7880"; \
+            break; \
+        fi; \
+        if [ $i -eq 20 ]; then echo "FAIL: daemon did not start"; exit 1; fi; \
+        sleep 0.5; \
+    done; \
+    \
+    STATUS=$(curl -sf http://127.0.0.1:7880/api/status); \
+    echo "Status: $STATUS"; \
+    echo "$STATUS" | jq -e .daemon_id > /dev/null || { echo "FAIL: no daemon_id in status"; exit 1; }; \
+    echo "PASS: status has daemon_id"; \
+    \
+    echo "$STATUS" | jq -e .sessions > /dev/null || { echo "FAIL: no sessions in status"; exit 1; }; \
+    echo "PASS: status has sessions"; \
+    \
+    curl -sf http://127.0.0.1:7880/admin > /dev/null || { echo "FAIL: admin dashboard not responding"; exit 1; }; \
+    echo "PASS: admin dashboard accessible"; \
+    \
+    MCP_INIT=$(curl -s --max-time 5 -X POST http://127.0.0.1:7880/mcp \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json, text/event-stream" \
+        -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"0.1\"}}}" || true); \
+    echo "$MCP_INIT" | grep -qF "serverInfo" || { echo "FAIL: MCP init failed: $MCP_INIT"; exit 1; }; \
+    echo "PASS: MCP endpoint responds to initialize"; \
+    \
+    kill $DAEMON_PID 2>/dev/null; \
+    echo ""; \
+    echo "ALL INSTALL TESTS PASSED"; \
+'
