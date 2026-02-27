@@ -1,0 +1,2 @@
+[tasks]
+test = { run = "mise/tasks/test", description = "Run all tests: unit, clippy, e2e (single, p2p, nostr)" }
