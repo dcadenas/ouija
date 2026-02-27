@@ -1,0 +1,10 @@
+/target
+/docs/*
+!/docs/plans/
+/demo
+IDEAS.md
+firebase-debug.log
+.claude/
+*.png
+!screenshot.png
+.playwright-mcp/
