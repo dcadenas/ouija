@@ -245,7 +245,10 @@ pub async fn regenerate_ticket(
         );
     }
 
-    match t.regenerate(&state.config.config_dir, &state.config.data_dir).await {
+    match t
+        .regenerate(&state.config.config_dir, &state.config.data_dir)
+        .await
+    {
         Ok(ticket) => (
             StatusCode::OK,
             Json(json!({ "ticket": ticket, "transport": "nostr" })),
@@ -479,7 +482,9 @@ pub async fn send_msg(
         let sessions = state.sessions.read().await;
         let suggestions: Vec<&str> = sessions
             .keys()
-            .filter(|k| k.ends_with(&format!("/{}", body.to)) || k.starts_with(&format!("{}/", body.to)))
+            .filter(|k| {
+                k.ends_with(&format!("/{}", body.to)) || k.starts_with(&format!("{}/", body.to))
+            })
             .map(|k| k.as_str())
             .collect();
         let hint = if suggestions.is_empty() {

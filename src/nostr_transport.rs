@@ -373,11 +373,7 @@ impl Transport for NostrTransport {
             .map(|bech32| format!("{bech32}#{secret}"))
     }
 
-    async fn regenerate(
-        &self,
-        config_dir: &Path,
-        data_dir: &Path,
-    ) -> anyhow::Result<String> {
+    async fn regenerate(&self, config_dir: &Path, data_dir: &Path) -> anyhow::Result<String> {
         // For nostr, regenerating means generating new keys + new secret
         let new_keys = Keys::generate();
 
@@ -1717,14 +1713,8 @@ pub async fn ensure_active(
         tracing::warn!("failed to save relay URLs: {e}");
     }
 
-    let transport = Arc::new(
-        NostrTransport::new(
-            keys,
-            relay_urls,
-            state.config.data_dir.clone(),
-        )
-        .await?,
-    );
+    let transport =
+        Arc::new(NostrTransport::new(keys, relay_urls, state.config.data_dir.clone()).await?);
 
     transport.start_receive_loop(state.clone()).await?;
     state.add_transport(transport.clone()).await;

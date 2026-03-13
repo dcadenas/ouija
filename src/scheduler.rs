@@ -311,9 +311,7 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask, formatted:
     // Session not found — create from scratch if task has enough info
     let Some(session) = session else {
         if task.project_dir.is_some() {
-            tracing::info!(
-                "session '{session_name}' not found, creating from task project_dir",
-            );
+            tracing::info!("session '{session_name}' not found, creating from task project_dir",);
             return revive_from_task(state, task, formatted, timestamp).await;
         }
         return TaskRun {
