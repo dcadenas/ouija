@@ -500,7 +500,7 @@ mod tests {
             id: "a1b2c3d4".into(),
             name: "test".into(),
             cron: "*/5 * * * *".into(),
-            target_session: "web".into(),
+            target_session: Some("web".into()),
             message: "hello".into(),
             enabled: true,
             created_at: Utc::now(),
@@ -535,7 +535,7 @@ mod tests {
             timestamp: Utc::now(),
             status: crate::scheduler::TaskRunStatus::Ok,
             error: None,
-            target_session: "web".into(),
+            session_name: "web".into(),
             revived_pane: None,
         };
         append_task_run(dir.path(), &run).unwrap();

@@ -72,7 +72,10 @@ pub struct ScheduledTask {
     pub id: String,
     pub name: String,
     pub cron: String,
-    pub target_session: String,
+    /// Optional: inject into this existing session (ContinueSession only).
+    /// When absent or when creating a new session, `name` is used instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_session: Option<String>,
     pub message: String,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
@@ -90,6 +93,19 @@ pub struct ScheduledTask {
     pub on_fire: OnFire,
 }
 
+impl ScheduledTask {
+    /// The ouija session name to look up or create.
+    /// For ContinueSession, prefer target_session if set; otherwise use the task name.
+    /// For all other OnFire variants, always use the task name.
+    pub fn session_name(&self) -> &str {
+        if matches!(self.on_fire, OnFire::ContinueSession) {
+            self.target_session.as_deref().unwrap_or(&self.name)
+        } else {
+            &self.name
+        }
+    }
+}
+
 impl<'de> serde::Deserialize<'de> for ScheduledTask {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
@@ -97,7 +113,8 @@ impl<'de> serde::Deserialize<'de> for ScheduledTask {
             id: String,
             name: String,
             cron: String,
-            target_session: String,
+            #[serde(default)]
+            target_session: Option<String>,
             message: String,
             enabled: bool,
             created_at: DateTime<Utc>,
@@ -177,7 +194,7 @@ pub struct TaskRun {
     pub timestamp: DateTime<Utc>,
     pub status: TaskRunStatus,
     pub error: Option<String>,
-    pub target_session: String,
+    pub session_name: String,
     pub revived_pane: Option<String>,
 }
 
@@ -283,19 +300,19 @@ pub async fn execute_task(state: &SharedState, task_id: &str) {
 /// Try to inject into the target session, reviving if needed.
 async fn execute_injection(state: &SharedState, task: &ScheduledTask, formatted: &str) -> TaskRun {
     let timestamp = Utc::now();
+    let session_name = task.session_name();
 
-    // Look up target session
+    // Look up session
     let session = {
         let sessions = state.sessions.read().await;
-        sessions.get(&task.target_session).cloned()
+        sessions.get(session_name).cloned()
     };
 
     // Session not found — create from scratch if task has enough info
     let Some(session) = session else {
         if task.project_dir.is_some() {
             tracing::info!(
-                "session '{}' not found, creating from task project_dir",
-                task.target_session
+                "session '{session_name}' not found, creating from task project_dir",
             );
             return revive_from_task(state, task, formatted, timestamp).await;
         }
@@ -305,10 +322,9 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask, formatted:
             timestamp,
             status: TaskRunStatus::Failed,
             error: Some(format!(
-                "session '{}' not found and task has no project_dir",
-                task.target_session
+                "session '{session_name}' not found and task has no project_dir",
             )),
-            target_session: task.target_session.clone(),
+            session_name: session_name.to_string(),
             revived_pane: None,
         };
     };
@@ -321,7 +337,7 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask, formatted:
             timestamp,
             status: TaskRunStatus::Failed,
             error: Some("cannot target remote sessions".into()),
-            target_session: task.target_session.clone(),
+            session_name: session_name.to_string(),
             revived_pane: None,
         };
     }
@@ -362,7 +378,7 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask, formatted:
         Ok(new_pane) => {
             if task.on_fire.clears_context() {
                 let mut sessions = state.sessions.write().await;
-                if let Some(s) = sessions.get_mut(&task.target_session) {
+                if let Some(s) = sessions.get_mut(task.session_name()) {
                     s.metadata.claude_session_id = None;
                 }
             }
@@ -372,7 +388,7 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask, formatted:
                 timestamp,
                 status: TaskRunStatus::Ok,
                 error: None,
-                target_session: task.target_session.clone(),
+                session_name: task.session_name().to_string(),
                 revived_pane: Some(new_pane),
             }
         }
@@ -382,7 +398,7 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask, formatted:
             timestamp,
             status: TaskRunStatus::Failed,
             error: Some(e.to_string()),
-            target_session: task.target_session.clone(),
+            session_name: task.session_name().to_string(),
             revived_pane: None,
         },
     }
@@ -412,7 +428,7 @@ async fn inject_into_pane(
             timestamp,
             status: TaskRunStatus::Ok,
             error: None,
-            target_session: task.target_session.clone(),
+            session_name: task.session_name().to_string(),
             revived_pane: None,
         },
         Ok(Err(e)) => TaskRun {
@@ -421,7 +437,7 @@ async fn inject_into_pane(
             timestamp,
             status: TaskRunStatus::Failed,
             error: Some(e.to_string()),
-            target_session: task.target_session.clone(),
+            session_name: task.session_name().to_string(),
             revived_pane: None,
         },
         Err(e) => TaskRun {
@@ -430,7 +446,7 @@ async fn inject_into_pane(
             timestamp,
             status: TaskRunStatus::Failed,
             error: Some(e.to_string()),
-            target_session: task.target_session.clone(),
+            session_name: task.session_name().to_string(),
             revived_pane: None,
         },
     }
@@ -497,7 +513,7 @@ async fn respawn_and_inject(
             timestamp,
             status: TaskRunStatus::Failed,
             error: Some(err),
-            target_session: task.target_session.clone(),
+            session_name: task.session_name().to_string(),
             revived_pane: None,
         };
     }
@@ -505,7 +521,7 @@ async fn respawn_and_inject(
     // Clear claude_session_id since we started fresh
     {
         let mut sessions = state.sessions.write().await;
-        if let Some(s) = sessions.get_mut(&task.target_session) {
+        if let Some(s) = sessions.get_mut(task.session_name()) {
             s.metadata.claude_session_id = None;
         }
     }
@@ -551,7 +567,7 @@ async fn respawn_and_inject(
         timestamp,
         status: TaskRunStatus::Ok,
         error: None,
-        target_session: task.target_session.clone(),
+        session_name: task.session_name().to_string(),
         revived_pane: None,
     }
 }
@@ -568,7 +584,7 @@ async fn revive_from_task(
         Ok(new_pane) => {
             if task.on_fire.clears_context() {
                 let mut sessions = state.sessions.write().await;
-                if let Some(s) = sessions.get_mut(&task.target_session) {
+                if let Some(s) = sessions.get_mut(task.session_name()) {
                     s.metadata.claude_session_id = None;
                 }
             }
@@ -578,7 +594,7 @@ async fn revive_from_task(
                 timestamp,
                 status: TaskRunStatus::Ok,
                 error: None,
-                target_session: task.target_session.clone(),
+                session_name: task.session_name().to_string(),
                 revived_pane: Some(new_pane),
             }
         }
@@ -588,7 +604,7 @@ async fn revive_from_task(
             timestamp,
             status: TaskRunStatus::Failed,
             error: Some(e.to_string()),
-            target_session: task.target_session.clone(),
+            session_name: task.session_name().to_string(),
             revived_pane: None,
         },
     }
@@ -615,7 +631,7 @@ async fn revive_and_inject(
     let new_pane = tokio::task::spawn_blocking({
         let dir = dir.clone();
         let task_name = task.name.clone();
-        let target_session = task.target_session.clone();
+        let session_name = task.session_name().to_string();
         let claude_session_id = if clears_context {
             None
         } else {
@@ -625,7 +641,7 @@ async fn revive_and_inject(
         };
         move || -> anyhow::Result<String> {
             let tmux_session_exists = std::process::Command::new("tmux")
-                .args(["has-session", "-t", &target_session])
+                .args(["has-session", "-t", &session_name])
                 .output()
                 .is_ok_and(|o| o.status.success());
 
@@ -635,9 +651,9 @@ async fn revive_and_inject(
                         "new-window",
                         "-d",
                         "-t",
-                        &target_session,
+                        &session_name,
                         "-n",
-                        &target_session,
+                        &session_name,
                         "-P",
                         "-F",
                         "#{pane_id}",
@@ -649,9 +665,9 @@ async fn revive_and_inject(
                         "new-session",
                         "-d",
                         "-s",
-                        &target_session,
+                        &session_name,
                         "-n",
-                        &target_session,
+                        &session_name,
                         "-P",
                         "-F",
                         "#{pane_id}",
@@ -779,7 +795,7 @@ async fn revive_and_inject(
     };
     state
         .register_session(
-            task.target_session.clone(),
+            task.session_name().to_string(),
             Some(new_pane.clone()),
             metadata,
         )
@@ -816,7 +832,7 @@ pub(crate) fn shell_escape(s: &str) -> String {
 pub fn new_task(
     name: String,
     cron: String,
-    target_session: String,
+    target_session: Option<String>,
     message: String,
     project_dir: Option<String>,
     once: bool,
@@ -889,7 +905,7 @@ mod tests {
             id: "a1b2c3d4".into(),
             name: "test task".into(),
             cron: "*/5 * * * *".into(),
-            target_session: "web".into(),
+            target_session: Some("web".into()),
             message: "hello".into(),
             enabled: true,
             created_at: Utc::now(),
@@ -932,7 +948,7 @@ mod tests {
         let task = new_task(
             "t".into(),
             "*/1 * * * *".into(),
-            "web".into(),
+            Some("web".into()),
             "hi".into(),
             None,
             false,
@@ -950,7 +966,7 @@ mod tests {
             id: "wt123456".into(),
             name: "wt-task".into(),
             cron: "0 9 * * *".into(),
-            target_session: "web".into(),
+            target_session: Some("web".into()),
             message: "run checks".into(),
             enabled: true,
             created_at: Utc::now(),

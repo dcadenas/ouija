@@ -100,8 +100,9 @@ pub struct TaskCreateParams {
     pub name: String,
     /// Cron expression (e.g. "*/5 * * * *"). Evaluated in UTC.
     pub cron: String,
-    /// Target session ID to inject the message into
-    pub target_session: String,
+    /// Optional: inject into this existing session (only for continue_session mode).
+    /// When absent, the task name is used as the session name.
+    pub target_session: Option<String>,
     /// Message to inject on each run
     pub message: String,
     /// Override project directory for session revival

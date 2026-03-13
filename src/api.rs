@@ -1006,7 +1006,7 @@ pub async fn list_tasks(State(state): State<SharedState>) -> Json<serde_json::Va
 pub struct CreateTaskBody {
     name: String,
     cron: String,
-    target_session: String,
+    target_session: Option<String>,
     message: String,
     project_dir: Option<String>,
     #[serde(default)]
@@ -1143,7 +1143,7 @@ pub async fn list_task_runs(
                 "timestamp": r.timestamp,
                 "status": r.status,
                 "error": r.error,
-                "target_session": r.target_session,
+                "session_name": r.session_name,
                 "revived_pane": r.revived_pane,
             })
         })

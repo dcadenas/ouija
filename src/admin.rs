@@ -245,13 +245,13 @@ pub async fn dashboard(State(state): State<SharedState>) -> Html<String> {
             id = html_escape(&t.id),
             name = html_escape(&t.name),
             cron = html_escape(&t.cron),
-            target = html_escape(&t.target_session),
+            target = html_escape(t.target_session.as_deref().unwrap_or("—")),
             run_count = t.run_count,
         ));
     }
     if sorted_tasks.is_empty() {
         tasks_html.push_str(
-            r#"<tr><td colspan="10" class="empty">No scheduled tasks.<br>CLI: <b>ouija task add "check-logs" "0 9 * * *" web "check the error logs"</b><br>MCP: use the <b>task_create</b> tool from any Claude session</td></tr>"#,
+            r#"<tr><td colspan="10" class="empty">No scheduled tasks.<br>CLI: <b>ouija task add "check-logs" "0 9 * * *" "check the error logs"</b><br>MCP: use the <b>task_create</b> tool from any Claude session</td></tr>"#,
         );
     }
 
@@ -270,7 +270,7 @@ pub async fn dashboard(State(state): State<SharedState>) -> Html<String> {
             "<tr><td class=\"dim\">{}</td><td>{}</td><td>{}</td><td class=\"{status_class}\">{status_text}</td><td class=\"msg-cell\">{}</td></tr>",
             time_with_date(&r.timestamp),
             html_escape(&r.task_name),
-            html_escape(&r.target_session),
+            html_escape(&r.session_name),
             html_escape(error),
         ));
     }

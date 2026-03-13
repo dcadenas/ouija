@@ -163,10 +163,11 @@ enum TaskAction {
         name: String,
         /// Cron expression (e.g. "*/5 * * * *"), evaluated in UTC
         cron: String,
-        /// Target session ID
-        target: String,
         /// Message to inject
         message: String,
+        /// Inject into this existing session (continue_session mode only)
+        #[arg(long)]
+        target: Option<String>,
         /// Override project dir for session revival
         #[arg(long)]
         project_dir: Option<String>,
@@ -563,7 +564,7 @@ async fn main() -> anyhow::Result<()> {
                             let id = t["id"].as_str().unwrap_or("-");
                             let name = t["name"].as_str().unwrap_or("-");
                             let cron = t["cron"].as_str().unwrap_or("-");
-                            let target = t["target_session"].as_str().unwrap_or("-");
+                            let target = t["target_session"].as_str().unwrap_or("—");
                             let enabled = t["enabled"].as_bool().unwrap_or(false);
                             let next = t["next_run"].as_str().unwrap_or("-");
                             let runs = t["run_count"].as_u64().unwrap_or(0);
@@ -627,7 +628,7 @@ async fn main() -> anyhow::Result<()> {
                         for r in list {
                             let ts = r["timestamp"].as_str().unwrap_or("-");
                             let name = r["task_name"].as_str().unwrap_or("-");
-                            let target = r["target_session"].as_str().unwrap_or("-");
+                            let target = r["session_name"].as_str().unwrap_or("-");
                             let status = r["status"].as_str().unwrap_or("-");
                             let err = r["error"].as_str().unwrap_or("");
                             println!(
