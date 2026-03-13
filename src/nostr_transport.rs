@@ -19,7 +19,7 @@ pub struct NostrTransport {
     keys: Keys,
     relay_urls: RwLock<Vec<String>>,
     peer_pubkeys: RwLock<HashSet<PublicKey>>,
-    connect_secret: String,
+    connect_secret: RwLock<String>,
     data_dir: PathBuf,
     ready: AtomicBool,
 }
@@ -29,7 +29,6 @@ impl NostrTransport {
     pub async fn new(
         keys: Keys,
         relay_urls: Vec<String>,
-        connect_secret: String,
         data_dir: PathBuf,
     ) -> anyhow::Result<Self> {
         let client = Client::builder().signer(keys.clone()).build();
@@ -56,12 +55,22 @@ impl NostrTransport {
 
         let peer_pubkeys = load_peer_pubkeys(&data_dir);
 
+        // Clean up legacy connect_secret file from disk
+        let legacy_secret_path = data_dir.join("connect_secret");
+        if legacy_secret_path.exists() {
+            if let Err(e) = std::fs::remove_file(&legacy_secret_path) {
+                tracing::warn!("failed to remove legacy connect_secret file: {e}");
+            } else {
+                tracing::info!("removed legacy connect_secret file from disk");
+            }
+        }
+
         Ok(Self {
             client,
             keys,
             relay_urls: RwLock::new(relay_urls),
             peer_pubkeys: RwLock::new(peer_pubkeys),
-            connect_secret,
+            connect_secret: RwLock::new(generate_secret()),
             data_dir,
             ready: AtomicBool::new(ready),
         })
@@ -188,8 +197,11 @@ impl NostrTransport {
                                                     secret,
                                                     relays,
                                                 }) if !is_authorized => {
-                                                    if secret == transport.connect_secret {
+                                                    let current_secret = transport.connect_secret.read().await.clone();
+                                                    if secret == current_secret {
                                                         transport.authorize_peer(sender).await;
+                                                        // Void the secret — each ticket is single-use
+                                                        *transport.connect_secret.write().await = generate_secret();
                                                         tracing::info!(
                                                         "peer authorized via connect secret: {npub}"
                                                     );
@@ -353,11 +365,12 @@ impl Transport for NostrTransport {
             .filter_map(|u| RelayUrl::parse(u).ok())
             .collect();
 
+        let secret = self.connect_secret.read().await;
         let profile = Nip19Profile::new(self.keys.public_key(), relay_urls);
         profile
             .to_bech32()
             .ok()
-            .map(|bech32| format!("{bech32}#{}", self.connect_secret))
+            .map(|bech32| format!("{bech32}#{secret}"))
     }
 
     async fn regenerate(
@@ -371,9 +384,9 @@ impl Transport for NostrTransport {
         // Persist the new nsec to config dir
         save_nsec(config_dir, &new_keys)?;
 
-        // Generate and persist new connect secret
+        // Generate new in-memory connect secret
         let new_secret = generate_secret();
-        save_secret(data_dir, &new_secret)?;
+        *self.connect_secret.write().await = new_secret.clone();
 
         // Clear persisted connections
         if let Err(e) = crate::persistence::clear_connections(data_dir) {
@@ -1704,12 +1717,10 @@ pub async fn ensure_active(
         tracing::warn!("failed to save relay URLs: {e}");
     }
 
-    let connect_secret = load_or_create_secret(&state.config.data_dir)?;
     let transport = Arc::new(
         NostrTransport::new(
             keys,
             relay_urls,
-            connect_secret,
             state.config.data_dir.clone(),
         )
         .await?,
@@ -1758,26 +1769,6 @@ fn generate_secret() -> String {
         write!(s, "{b:02x}").unwrap();
     }
     s
-}
-
-/// Load connect secret from disk, or generate and persist a new one.
-fn load_or_create_secret(data_dir: &Path) -> anyhow::Result<String> {
-    let path = data_dir.join("connect_secret");
-    if path.exists() {
-        let secret = std::fs::read_to_string(&path)?.trim().to_string();
-        if !secret.is_empty() {
-            return Ok(secret);
-        }
-    }
-    let secret = generate_secret();
-    save_secret(data_dir, &secret)?;
-    Ok(secret)
-}
-
-fn save_secret(data_dir: &Path, secret: &str) -> anyhow::Result<()> {
-    let path = data_dir.join("connect_secret");
-    std::fs::write(&path, secret)?;
-    Ok(())
 }
 
 // --- Relay persistence ---
@@ -1911,21 +1902,13 @@ mod tests {
     }
 
     #[test]
-    fn secret_persistence_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let secret = load_or_create_secret(dir.path()).unwrap();
-        assert_eq!(secret.len(), 32);
-
-        // Loading again returns the same secret
-        let secret2 = load_or_create_secret(dir.path()).unwrap();
-        assert_eq!(secret, secret2);
-    }
-
-    #[test]
-    fn secret_is_32_char_hex() {
-        let secret = generate_secret();
-        assert_eq!(secret.len(), 32);
-        assert!(secret.chars().all(|c| c.is_ascii_hexdigit()));
+    fn secret_is_ephemeral_and_unique() {
+        let s1 = generate_secret();
+        let s2 = generate_secret();
+        assert_eq!(s1.len(), 32);
+        assert_eq!(s2.len(), 32);
+        assert!(s1.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(s1, s2, "each generated secret must be unique");
     }
 
     // --- Human command parsing tests ---
