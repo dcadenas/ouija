@@ -29,9 +29,9 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 
 **Message any session** — local or remote. Sessions discover each other automatically.
 
-**Spawn sessions on the fly** — `session_start("crash-ios")` creates a tmux window, launches Claude Code, and registers it. Coordinate parallel investigations, then collect results.
+**Spawn sessions on the fly** — `session_start("crash-ios")` creates a tmux window, launches Claude Code, and registers it. Pass a `prompt` to seed the session with context: `session_start(name="crash-ios", prompt="Investigate the iOS crash in auth module. Key context: ...")`. Works on `session_restart` too.
 
-**Schedule tasks** — cron jobs that inject messages into sessions. If the target session is dead, the daemon revives it automatically. One-shot tasks (`--once`) fire once then auto-delete.
+**Schedule tasks** — cron jobs that inject messages into sessions. If the target session is dead, the daemon revives it automatically. One-shot tasks (`once: true`) fire once then auto-delete. Test a task immediately with `task_trigger` without waiting for its schedule.
 
 **Worktree sessions** — spawn sessions in isolated git worktrees for parallel work on the same repo without branch conflicts.
 
@@ -85,16 +85,17 @@ Run `ouija --help` for the full command list.
 
 ## Data
 
-Stored in `~/.local/share/ouija/`. Message metadata is logged for diagnostics (content is not logged).
+Config in `~/.config/ouija/` (settings, identity). Data in `~/.local/share/ouija/` (sessions, tasks, connections). Message metadata is logged for diagnostics (content is not logged).
 
 ## Testing
 
 ```bash
-cargo test
+# All tests (unit + local e2e + nostr e2e, all in Docker)
+tests/e2e/run-e2e.sh
 
-# E2E (Docker)
-docker build -f tests/e2e/Dockerfile -t ouija-test . && docker run --rm ouija-test
+# Only local e2e
+tests/e2e/run-e2e.sh local
 
-# Nostr P2P E2E (Docker Compose — relay + 4 daemons + auth tests)
-docker compose -f tests/e2e/docker-compose.nostr.yml up --build --abort-on-container-exit
+# Only nostr P2P e2e (relay + 4 daemons + auth tests)
+tests/e2e/run-e2e.sh nostr
 ```
