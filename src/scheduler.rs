@@ -17,10 +17,11 @@ const TUI_READY_TIMEOUT_SECS: u64 = 30;
 const REVIVAL_POLL_SECS: u64 = 2;
 
 /// What happens each time the task fires.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum OnFire {
     /// Inject into live session; revive with --continue if dead.
+    #[default]
     ContinueSession,
     /// Kill pane, start fresh conversation (no --continue/--resume).
     NewSession,
@@ -34,12 +35,6 @@ pub enum OnFire {
     /// Anonymous worktree, created fresh and cleaned up after each fire.
     /// Always starts a new conversation (context clearing is implicit).
     DisposableWorktree,
-}
-
-impl Default for OnFire {
-    fn default() -> Self {
-        Self::ContinueSession
-    }
 }
 
 impl OnFire {
