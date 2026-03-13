@@ -145,6 +145,10 @@ pub struct SessionNameParams {
     /// If omitted, derives from projects_dir + name.
     #[serde(default)]
     pub project_dir: Option<String>,
+    /// Initial prompt to inject into the session after launch.
+    /// The text is sent to the pane once claude is ready.
+    #[serde(default)]
+    pub prompt: Option<String>,
 }
 
 #[tool_router]
@@ -751,6 +755,7 @@ impl OuijaMcp {
                 &params.name,
                 params.worktree,
                 params.project_dir.as_deref(),
+                params.prompt.as_deref(),
             )
             .await
         };
@@ -773,7 +778,13 @@ impl OuijaMcp {
             };
             execute_command(&self.state, &params.name, verb).await
         } else {
-            crate::nostr_transport::admin_restart_session(&self.state, &params.name, fresh).await
+            crate::nostr_transport::admin_restart_session(
+                &self.state,
+                &params.name,
+                fresh,
+                params.prompt.as_deref(),
+            )
+            .await
         };
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }

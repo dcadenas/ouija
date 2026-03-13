@@ -1325,6 +1325,8 @@ pub struct SessionNameBody {
     worktree: Option<bool>,
     #[serde(default)]
     project_dir: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
 }
 
 pub async fn kill_session(
@@ -1344,6 +1346,7 @@ pub async fn start_session(
         &body.name,
         body.worktree,
         body.project_dir.as_deref(),
+        body.prompt.as_deref(),
     )
     .await;
     (StatusCode::OK, Json(json!({ "result": result })))
@@ -1354,7 +1357,13 @@ pub async fn restart_session(
     Json(body): Json<SessionNameBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let fresh = body.fresh.unwrap_or(false);
-    let result = crate::nostr_transport::admin_restart_session(&state, &body.name, fresh).await;
+    let result = crate::nostr_transport::admin_restart_session(
+        &state,
+        &body.name,
+        fresh,
+        body.prompt.as_deref(),
+    )
+    .await;
     (StatusCode::OK, Json(json!({ "result": result })))
 }
 

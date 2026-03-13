@@ -1080,7 +1080,7 @@ pub async fn handle_admin_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         admin_kill_session(state, name).await
     } else if let Some(rest) = cmd.strip_prefix("/start ") {
         let name = rest.trim();
-        admin_start_session(state, name, None, None).await
+        admin_start_session(state, name, None, None, None).await
     } else if let Some(rest) = cmd.strip_prefix("/restart ") {
         let rest = rest.trim();
         let (name, fresh) = if let Some(name) = rest.strip_suffix(" --fresh") {
@@ -1090,7 +1090,7 @@ pub async fn handle_admin_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         } else {
             (rest, false)
         };
-        admin_restart_session(state, name, fresh).await
+        admin_restart_session(state, name, fresh, None).await
     } else {
         "unknown admin command".to_string()
     }
@@ -1226,6 +1226,7 @@ pub async fn admin_start_session(
     name: &str,
     worktree: Option<bool>,
     project_dir: Option<&str>,
+    prompt: Option<&str>,
 ) -> String {
     // Check if already exists
     if state.sessions.read().await.contains_key(name) {
@@ -1375,6 +1376,9 @@ pub async fn admin_start_session(
             state
                 .register_session(name.to_string(), Some(pane_id.clone()), metadata)
                 .await;
+            if let Some(text) = prompt {
+                schedule_prompt_injection(state, pane_id.clone(), text.to_string());
+            }
             if auto_worktree {
                 let conflict_name = {
                     let sessions = state.sessions.read().await;
@@ -1402,6 +1406,7 @@ pub async fn admin_restart_session(
     state: &std::sync::Arc<AppState>,
     name: &str,
     fresh: bool,
+    prompt: Option<&str>,
 ) -> String {
     // Snapshot full metadata before killing so we can carry it forward
     let session = state.sessions.read().await.get(name).cloned();
@@ -1586,11 +1591,33 @@ pub async fn admin_restart_session(
             state
                 .register_session(name.to_string(), Some(pane_id.clone()), metadata)
                 .await;
+            if let Some(text) = prompt {
+                schedule_prompt_injection(state, pane_id.clone(), text.to_string());
+            }
             format!("restarted '{name}' in {dir} (pane {pane_id})")
         }
         Ok(Err(e)) => format!("restart failed: {e}"),
         Err(e) => format!("restart failed: {e}"),
     }
+}
+
+/// Inject a prompt into a pane after a short delay, giving claude time to start.
+fn schedule_prompt_injection(state: &std::sync::Arc<AppState>, pane_id: String, prompt: String) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        // Wait for claude to initialize in the pane
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let lock = state.pane_lock(&pane_id);
+        let _guard = lock.lock().await;
+        let pane = pane_id.clone();
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || crate::tmux::inject(&pane, &prompt, false))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")))
+        {
+            tracing::warn!("prompt injection into {pane_id} failed: {e}");
+        }
+    });
 }
 
 /// Auto-detect the Claude session ID from the most recently modified JSONL
