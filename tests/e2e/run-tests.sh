@@ -1,6 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 
+# These tests must run inside Docker (via run-e2e.sh) for isolation.
+# Running directly on the host picks up live tmux panes and will fail.
+if [ -z "${OUIJA_E2E:-}" ] && [ ! -f /.dockerenv ]; then
+    echo "ERROR: e2e tests require Docker for tmux isolation." >&2
+    echo "Run:  bash tests/e2e/run-e2e.sh local" >&2
+    echo "Or:   bash tests/e2e/run-e2e.sh        (all suites)" >&2
+    exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 

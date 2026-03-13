@@ -322,16 +322,11 @@ impl OuijaMcp {
                                 &params.message,
                                 params.expects_reply,
                             );
-                            let pane = pane.clone();
                             let vim_mode = session.metadata.vim_mode;
-                            let lock = self.state.pane_lock(&pane);
-                            let _guard = lock.lock().await;
-                            match tokio::task::spawn_blocking(move || {
-                                tmux::inject(&pane, &formatted, vim_mode)
-                            })
-                            .await
+                            match tmux::locked_inject(&self.state, pane, &formatted, vim_mode)
+                                .await
                             {
-                                Ok(Ok(())) => {
+                                Ok(()) => {
                                     // Mark target as handling an injected message
                                     {
                                         let mut sessions = self.state.sessions.write().await;
@@ -369,12 +364,9 @@ impl OuijaMcp {
                                         .await;
                                     Ok(CallToolResult::success(contents))
                                 }
-                                Ok(Err(e)) => Ok(CallToolResult::error(vec![Content::text(
+                                Err(e) => Ok(CallToolResult::error(vec![Content::text(
                                     format!("tmux inject failed: {e}"),
                                 )])),
-                                Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                                    "task failed: {e}"
-                                ))])),
                             }
                         } else {
                             Ok(CallToolResult::error(vec![Content::text(format!(

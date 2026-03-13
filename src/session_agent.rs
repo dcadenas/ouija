@@ -118,7 +118,7 @@ impl Actor for SessionAgent {
 
                 // Nudge about pending replies older than idle_timeout
                 let cutoff = Utc::now() - chrono::Duration::seconds(timeout as i64);
-                let overdue: Vec<_> = state
+                let overdue: Vec<String> = state
                     .pending_replies
                     .iter()
                     .filter(|p| !p.reminded && p.received_at < cutoff)
@@ -126,30 +126,7 @@ impl Actor for SessionAgent {
                     .collect();
 
                 if !overdue.is_empty() {
-                    let pane = state.pane.clone();
-                    let vim_mode = self
-                        .app_state
-                        .sessions
-                        .read()
-                        .await
-                        .get(&state.session_id)
-                        .map(|s| s.metadata.vim_mode)
-                        .unwrap_or(false);
-
-                    for from in &overdue {
-                        let reminder = format!(
-                            "You have an unanswered question from {from} — reply using session_send"
-                        );
-                        let pane = pane.clone();
-                        let lock = self.app_state.pane_lock(&pane);
-                        let guard = lock.lock().await;
-                        let _ = tokio::task::spawn_blocking(move || {
-                            crate::tmux::inject(&pane, &reminder, vim_mode)
-                        })
-                        .await;
-                        drop(guard);
-                    }
-
+                    self.send_reminders(&overdue, state).await;
                     for p in &mut state.pending_replies {
                         if !p.reminded && p.received_at < cutoff {
                             p.reminded = true;
@@ -193,12 +170,11 @@ impl Actor for SessionAgent {
                     "idle timeout fired"
                 );
 
-                // Remind about un-replied pending questions
-                let unreminded: Vec<_> = state
+                let unreminded: Vec<String> = state
                     .pending_replies
                     .iter()
                     .filter(|p| !p.reminded)
-                    .map(|p| (p.from.clone(), p.message.clone()))
+                    .map(|p| p.from.clone())
                     .collect();
 
                 if !unreminded.is_empty() {
@@ -207,30 +183,7 @@ impl Actor for SessionAgent {
                         count = unreminded.len(),
                         "reminding about unanswered pending replies"
                     );
-                    let pane = state.pane.clone();
-                    let vim_mode = self
-                        .app_state
-                        .sessions
-                        .read()
-                        .await
-                        .get(&state.session_id)
-                        .map(|s| s.metadata.vim_mode)
-                        .unwrap_or(false);
-
-                    for (from, _message) in &unreminded {
-                        let reminder = format!(
-                            "You have an unanswered question from {from} — reply using session_send"
-                        );
-                        let pane = pane.clone();
-                        let lock = self.app_state.pane_lock(&pane);
-                        let guard = lock.lock().await;
-                        let _ = tokio::task::spawn_blocking(move || {
-                            crate::tmux::inject(&pane, &reminder, vim_mode)
-                        })
-                        .await;
-                        drop(guard);
-                    }
-
+                    self.send_reminders(&unreminded, state).await;
                     for p in &mut state.pending_replies {
                         if !p.reminded {
                             p.reminded = true;
@@ -249,6 +202,29 @@ impl Actor for SessionAgent {
     ) -> Result<(), ActorProcessingErr> {
         tracing::info!("session agent stopped: {}", state.session_id);
         Ok(())
+    }
+}
+
+impl SessionAgent {
+    /// Inject pending-reply reminders into the session's pane.
+    async fn send_reminders(&self, senders: &[String], state: &SessionAgentState) {
+        let vim_mode = self
+            .app_state
+            .sessions
+            .read()
+            .await
+            .get(&state.session_id)
+            .map(|s| s.metadata.vim_mode)
+            .unwrap_or(false);
+
+        for from in senders {
+            let reminder = format!(
+                "You have an unanswered question from {from} — reply using session_send"
+            );
+            let _ =
+                crate::tmux::locked_inject(&self.app_state, &state.pane, &reminder, vim_mode)
+                    .await;
+        }
     }
 }
 

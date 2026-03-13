@@ -89,14 +89,8 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
             match target {
                 Some(DeliveryTarget::Local { pane, vim_mode }) => {
                     let formatted = tmux::format_session_message(&from, &message, expects_reply);
-                    let lock = state.pane_lock(&pane);
-                    let guard = lock.lock().await;
-                    let result = tokio::task::spawn_blocking(move || {
-                        tmux::inject(&pane, &formatted, vim_mode)
-                    })
-                    .await;
-                    drop(guard);
-                    let delivered = matches!(result, Ok(Ok(())));
+                    let delivered =
+                        tmux::locked_inject(state, &pane, &formatted, vim_mode).await.is_ok();
                     if delivered {
                         let mut sessions = state.sessions.write().await;
                         if let Some(s) = sessions.get_mut(&to) {
@@ -167,11 +161,7 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
             daemon_name,
             metadata,
         } => {
-            let display_name = if daemon_name.is_empty() {
-                &daemon_id
-            } else {
-                &daemon_name
-            };
+            let display_name = display_name(&daemon_name, &daemon_id);
             let key = crate::state::remote_session_key(display_name, &id);
             tracing::info!("remote session announced: {key} from daemon {daemon_id}");
             let mut sessions = state.sessions.write().await;
@@ -258,11 +248,7 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
             daemon_id,
             daemon_name,
         } => {
-            let display_name = if daemon_name.is_empty() {
-                &daemon_id
-            } else {
-                &daemon_name
-            };
+            let display_name = display_name(&daemon_name, &daemon_id);
             let key = crate::state::remote_session_key(display_name, &id);
             tracing::info!("remote session removed: {key} from daemon {daemon_id}");
             let mut sessions = state.sessions.write().await;
@@ -319,6 +305,15 @@ pub async fn broadcast_local_sessions(state: &AppState) {
         daemon_name: state.config.name.clone(),
     };
     broadcast(state, &msg).await;
+}
+
+/// Pick `daemon_name` if non-empty, otherwise fall back to `daemon_id`.
+fn display_name<'a>(daemon_name: &'a str, daemon_id: &'a str) -> &'a str {
+    if daemon_name.is_empty() {
+        daemon_id
+    } else {
+        daemon_name
+    }
 }
 
 /// Broadcast a wire message via all active transports.

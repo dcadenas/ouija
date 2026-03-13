@@ -12,11 +12,11 @@ use crate::state::{Session, SessionMetadata, SessionOrigin};
 
 /// Load a JSON file, returning `default` if the file doesn't exist.
 fn load_json<T: DeserializeOwned>(path: &Path, default: T) -> Result<T> {
-    if !path.exists() {
-        return Ok(default);
+    match std::fs::read_to_string(path) {
+        Ok(data) => Ok(serde_json::from_str(&data)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(default),
+        Err(e) => Err(e.into()),
     }
-    let data = std::fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&data)?)
 }
 
 /// Atomically write JSON to a file (write to .tmp, then rename).
@@ -96,16 +96,15 @@ pub fn add_connection(
         node_name: node_name.map(String::from),
         daemon_npub: daemon_npub.map(String::from),
     });
-    let data = serde_json::to_string(&conns)?;
-    atomic_write(&data_dir.join("connections.json"), data.as_bytes())
+    save_json(&data_dir.join("connections.json"), &conns, false)
 }
 
 pub fn clear_connections(data_dir: &Path) -> Result<()> {
-    let path = data_dir.join("connections.json");
-    if path.exists() {
-        std::fs::remove_file(&path)?;
+    match std::fs::remove_file(data_dir.join("connections.json")) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
     }
-    Ok(())
 }
 
 // --- Settings ---

@@ -193,6 +193,34 @@ pub struct TaskRun {
     pub revived_pane: Option<String>,
 }
 
+impl TaskRun {
+    /// Create an Ok run for this task.
+    fn ok(task: &ScheduledTask, revived_pane: Option<String>) -> Self {
+        Self {
+            task_id: task.id.clone(),
+            task_name: task.name.clone(),
+            timestamp: Utc::now(),
+            status: TaskRunStatus::Ok,
+            error: None,
+            session_name: task.session_name().to_string(),
+            revived_pane,
+        }
+    }
+
+    /// Create a Failed run for this task.
+    fn failed(task: &ScheduledTask, error: String) -> Self {
+        Self {
+            task_id: task.id.clone(),
+            task_name: task.name.clone(),
+            timestamp: Utc::now(),
+            status: TaskRunStatus::Failed,
+            error: Some(error),
+            session_name: task.session_name().to_string(),
+            revived_pane: None,
+        }
+    }
+}
+
 /// Validate a cron expression and return a human-readable description.
 pub fn validate_cron(expr: &str) -> Result<String, String> {
     let cron = expr.parse::<Cron>().map_err(|e| format!("{e}"))?;
@@ -294,7 +322,6 @@ pub async fn execute_task(state: &SharedState, task_id: &str) {
 
 /// Try to inject into the target session, reviving if needed.
 async fn execute_injection(state: &SharedState, task: &ScheduledTask, formatted: &str) -> TaskRun {
-    let timestamp = Utc::now();
     let session_name = task.session_name();
 
     // Look up session
@@ -307,37 +334,22 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask, formatted:
     let Some(session) = session else {
         if task.project_dir.is_some() {
             tracing::info!("session '{session_name}' not found, creating from task project_dir",);
-            return revive_from_task(state, task, formatted, timestamp).await;
+            return revive_from_task(state, task, formatted, None).await;
         }
-        return TaskRun {
-            task_id: task.id.clone(),
-            task_name: task.name.clone(),
-            timestamp,
-            status: TaskRunStatus::Failed,
-            error: Some(format!(
-                "session '{session_name}' not found and task has no project_dir",
-            )),
-            session_name: session_name.to_string(),
-            revived_pane: None,
-        };
+        return TaskRun::failed(
+            task,
+            format!("session '{session_name}' not found and task has no project_dir"),
+        );
     };
 
     // Only handle local sessions
     if !matches!(session.origin, crate::state::SessionOrigin::Local) {
-        return TaskRun {
-            task_id: task.id.clone(),
-            task_name: task.name.clone(),
-            timestamp,
-            status: TaskRunStatus::Failed,
-            error: Some("cannot target remote sessions".into()),
-            session_name: session_name.to_string(),
-            revived_pane: None,
-        };
+        return TaskRun::failed(task, "cannot target remote sessions".into());
     }
 
     let Some(pane) = &session.pane else {
         // Session exists but has no pane — revive it
-        return revive_from_task(state, task, formatted, timestamp).await;
+        return revive_from_task(state, task, formatted, None).await;
     };
 
     // Check if pane is alive
@@ -361,40 +373,12 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask, formatted:
         }
     }
 
-    // Pane is dead — attempt revival
+    // Pane is dead — attempt revival, falling back to session's project_dir
     let project_dir = task
         .project_dir
         .as_deref()
         .or(session.metadata.project_dir.as_deref());
-
-    match revive_and_inject(state, task, project_dir, formatted).await {
-        Ok(new_pane) => {
-            if task.on_fire.clears_context() {
-                let mut sessions = state.sessions.write().await;
-                if let Some(s) = sessions.get_mut(task.session_name()) {
-                    s.metadata.claude_session_id = None;
-                }
-            }
-            TaskRun {
-                task_id: task.id.clone(),
-                task_name: task.name.clone(),
-                timestamp,
-                status: TaskRunStatus::Ok,
-                error: None,
-                session_name: task.session_name().to_string(),
-                revived_pane: Some(new_pane),
-            }
-        }
-        Err(e) => TaskRun {
-            task_id: task.id.clone(),
-            task_name: task.name.clone(),
-            timestamp,
-            status: TaskRunStatus::Failed,
-            error: Some(e.to_string()),
-            session_name: task.session_name().to_string(),
-            revived_pane: None,
-        },
-    }
+    revive_from_task(state, task, formatted, project_dir).await
 }
 
 /// Inject a message into a live pane.
@@ -405,43 +389,9 @@ async fn inject_into_pane(
     vim_mode: bool,
     formatted: &str,
 ) -> TaskRun {
-    let pane = pane.to_string();
-    let vim = vim_mode;
-    let msg = formatted.to_string();
-    let lock = state.pane_lock(&pane);
-    let _guard = lock.lock().await;
-
-    let result = tokio::task::spawn_blocking(move || tmux::inject(&pane, &msg, vim)).await;
-
-    let timestamp = Utc::now();
-    match result {
-        Ok(Ok(())) => TaskRun {
-            task_id: task.id.clone(),
-            task_name: task.name.clone(),
-            timestamp,
-            status: TaskRunStatus::Ok,
-            error: None,
-            session_name: task.session_name().to_string(),
-            revived_pane: None,
-        },
-        Ok(Err(e)) => TaskRun {
-            task_id: task.id.clone(),
-            task_name: task.name.clone(),
-            timestamp,
-            status: TaskRunStatus::Failed,
-            error: Some(e.to_string()),
-            session_name: task.session_name().to_string(),
-            revived_pane: None,
-        },
-        Err(e) => TaskRun {
-            task_id: task.id.clone(),
-            task_name: task.name.clone(),
-            timestamp,
-            status: TaskRunStatus::Failed,
-            error: Some(e.to_string()),
-            session_name: task.session_name().to_string(),
-            revived_pane: None,
-        },
+    match tmux::locked_inject(state, pane, formatted, vim_mode).await {
+        Ok(()) => TaskRun::ok(task, None),
+        Err(e) => TaskRun::failed(task, e.to_string()),
     }
 }
 
@@ -453,7 +403,6 @@ async fn respawn_and_inject(
     dir: &str,
     formatted: &str,
 ) -> TaskRun {
-    let timestamp = Utc::now();
     let pane_id = pane.to_string();
     let dir = dir.to_string();
     let uses_worktree = task.on_fire.uses_worktree();
@@ -493,22 +442,10 @@ async fn respawn_and_inject(
     })
     .await;
 
-    let ok = matches!(respawn_result, Ok(Ok(())));
-    if !ok {
-        let err = match respawn_result {
-            Ok(Err(e)) => e.to_string(),
-            Err(e) => e.to_string(),
-            _ => unreachable!(),
-        };
-        return TaskRun {
-            task_id: task.id.clone(),
-            task_name: task.name.clone(),
-            timestamp,
-            status: TaskRunStatus::Failed,
-            error: Some(err),
-            session_name: task.session_name().to_string(),
-            revived_pane: None,
-        };
+    match respawn_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return TaskRun::failed(task, e.to_string()),
+        Err(e) => return TaskRun::failed(task, e.to_string()),
     }
 
     // Clear claude_session_id since we started fresh
@@ -522,57 +459,28 @@ async fn respawn_and_inject(
     // Wait for claude to start, then inject
     let poll_pane = pane_id.clone();
     let ready = tokio::task::spawn_blocking(move || {
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(REVIVAL_TIMEOUT_SECS);
-        while std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_secs(REVIVAL_POLL_SECS));
-            if let Ok(output) = std::process::Command::new("tmux")
-                .args([
-                    "display-message",
-                    "-t",
-                    &poll_pane,
-                    "-p",
-                    "#{pane_current_command}",
-                ])
-                .output()
-            {
-                if String::from_utf8_lossy(&output.stdout).trim() == "claude" {
-                    return true;
-                }
-            }
-        }
-        false
+        wait_for_claude_process(&poll_pane, REVIVAL_TIMEOUT_SECS)
     })
     .await
     .unwrap_or(false);
 
     if ready {
-        let msg = formatted.to_string();
-        let inject_pane = pane_id.clone();
-        let lock = state.pane_lock(&inject_pane);
-        let _guard = lock.lock().await;
-        let _ = tokio::task::spawn_blocking(move || tmux::inject(&inject_pane, &msg, false)).await;
+        let _ = tmux::locked_inject(state, &pane_id, formatted, false).await;
     }
 
-    TaskRun {
-        task_id: task.id.clone(),
-        task_name: task.name.clone(),
-        timestamp,
-        status: TaskRunStatus::Ok,
-        error: None,
-        session_name: task.session_name().to_string(),
-        revived_pane: None,
-    }
+    TaskRun::ok(task, None)
 }
 
-/// Create a session from scratch using task config (no pre-existing session needed).
+/// Create or revive a session and inject a message.
+///
+/// `project_dir_override` falls back to `task.project_dir` if `None`.
 async fn revive_from_task(
     state: &SharedState,
     task: &ScheduledTask,
     formatted: &str,
-    timestamp: chrono::DateTime<chrono::Utc>,
+    project_dir_override: Option<&str>,
 ) -> TaskRun {
-    let project_dir = task.project_dir.as_deref();
+    let project_dir = project_dir_override.or(task.project_dir.as_deref());
     match revive_and_inject(state, task, project_dir, formatted).await {
         Ok(new_pane) => {
             if task.on_fire.clears_context() {
@@ -581,25 +489,9 @@ async fn revive_from_task(
                     s.metadata.claude_session_id = None;
                 }
             }
-            TaskRun {
-                task_id: task.id.clone(),
-                task_name: task.name.clone(),
-                timestamp,
-                status: TaskRunStatus::Ok,
-                error: None,
-                session_name: task.session_name().to_string(),
-                revived_pane: Some(new_pane),
-            }
+            TaskRun::ok(task, Some(new_pane))
         }
-        Err(e) => TaskRun {
-            task_id: task.id.clone(),
-            task_name: task.name.clone(),
-            timestamp,
-            status: TaskRunStatus::Failed,
-            error: Some(e.to_string()),
-            session_name: task.session_name().to_string(),
-            revived_pane: None,
-        },
+        Err(e) => TaskRun::failed(task, e.to_string()),
     }
 }
 
@@ -723,27 +615,7 @@ async fn revive_and_inject(
     // Phase 1: Wait for claude process to appear in the pane
     let poll_pane = new_pane.clone();
     let process_ready = tokio::task::spawn_blocking(move || {
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(REVIVAL_TIMEOUT_SECS);
-        while std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_secs(REVIVAL_POLL_SECS));
-            if let Ok(output) = std::process::Command::new("tmux")
-                .args([
-                    "display-message",
-                    "-t",
-                    &poll_pane,
-                    "-p",
-                    "#{pane_current_command}",
-                ])
-                .output()
-            {
-                let cmd = String::from_utf8_lossy(&output.stdout);
-                if cmd.trim() == "claude" {
-                    return true;
-                }
-            }
-        }
-        false
+        wait_for_claude_process(&poll_pane, REVIVAL_TIMEOUT_SECS)
     })
     .await
     .unwrap_or(false);
@@ -755,22 +627,7 @@ async fn revive_and_inject(
     // Phase 2: Wait for Claude's TUI to be ready (prompt indicator appears)
     let poll_pane = new_pane.clone();
     let tui_ready = tokio::task::spawn_blocking(move || {
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(TUI_READY_TIMEOUT_SECS);
-        while std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_secs(REVIVAL_POLL_SECS));
-            if let Ok(output) = std::process::Command::new("tmux")
-                .args(["capture-pane", "-t", &poll_pane, "-p", "-S", "-20"])
-                .output()
-            {
-                let content = String::from_utf8_lossy(&output.stdout);
-                // ❯ (U+276F) is Claude Code's prompt indicator
-                if content.contains('\u{276F}') {
-                    return true;
-                }
-            }
-        }
-        false
+        wait_for_tui_ready(&poll_pane, TUI_READY_TIMEOUT_SECS)
     })
     .await
     .unwrap_or(false);
@@ -806,13 +663,43 @@ async fn revive_and_inject(
     }
 
     // Inject the scheduled message
-    let pane_for_inject = new_pane.clone();
-    let msg = formatted.to_string();
-    let lock = state.pane_lock(&pane_for_inject);
-    let _guard = lock.lock().await;
-    tokio::task::spawn_blocking(move || tmux::inject(&pane_for_inject, &msg, false)).await??;
+    tmux::locked_inject(state, &new_pane, formatted, false).await?;
 
     Ok(new_pane)
+}
+
+/// Poll a pane until `claude` appears as the current command (blocking).
+fn wait_for_claude_process(pane: &str, timeout_secs: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_secs(REVIVAL_POLL_SECS));
+        if let Ok(output) = std::process::Command::new("tmux")
+            .args(["display-message", "-t", pane, "-p", "#{pane_current_command}"])
+            .output()
+        {
+            if String::from_utf8_lossy(&output.stdout).trim() == "claude" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Poll a pane until Claude's TUI prompt indicator (❯) appears (blocking).
+fn wait_for_tui_ready(pane: &str, timeout_secs: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_secs(REVIVAL_POLL_SECS));
+        if let Ok(output) = std::process::Command::new("tmux")
+            .args(["capture-pane", "-t", pane, "-p", "-S", "-20"])
+            .output()
+        {
+            if String::from_utf8_lossy(&output.stdout).contains('\u{276F}') {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Escape a string for safe use in shell commands.

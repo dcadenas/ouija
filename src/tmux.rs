@@ -27,14 +27,66 @@ pub struct TmuxPane {
     pub pane_current_path: Option<String>,
 }
 
+/// Parsed process tree snapshot for efficient descendant lookups.
+struct ProcessTree {
+    children: std::collections::HashMap<u32, Vec<u32>>,
+    names: std::collections::HashMap<u32, String>,
+}
+
+impl ProcessTree {
+    /// Take a snapshot of all processes via `ps`.
+    fn snapshot() -> Option<Self> {
+        let output = Command::new("ps")
+            .args(["-eo", "pid,ppid,comm"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut children: std::collections::HashMap<u32, Vec<u32>> =
+            std::collections::HashMap::new();
+        let mut names: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+
+        for line in stdout.lines().skip(1) {
+            let mut parts = line.split_whitespace();
+            let (Some(pid_s), Some(ppid_s), Some(comm)) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let (Ok(pid), Ok(ppid)) = (pid_s.parse::<u32>(), ppid_s.parse::<u32>()) else {
+                continue;
+            };
+            children.entry(ppid).or_default().push(pid);
+            names.insert(pid, comm.to_string());
+        }
+
+        Some(Self { children, names })
+    }
+
+    /// Check if any descendant of `root` is named `claude`.
+    fn has_claude_descendant(&self, root: u32) -> bool {
+        let mut stack = vec![root];
+        while let Some(pid) = stack.pop() {
+            if self.names.get(&pid).is_some_and(|n| n == "claude") {
+                return true;
+            }
+            if let Some(kids) = self.children.get(&pid) {
+                stack.extend(kids);
+            }
+        }
+        false
+    }
+}
+
 /// Find all tmux panes that have a `claude` process.
 ///
 /// Checks `pane_current_command` first (fast path), then falls back to
-/// walking the process tree with [`has_claude_descendant`] for panes
-/// where Claude runs under a shell (e.g. fish, bash).
+/// walking the process tree for panes where Claude runs under a shell.
+/// The process snapshot is taken once and reused for all panes.
 pub fn find_claude_panes() -> anyhow::Result<Vec<TmuxPane>> {
-    // Use `|||` as field separator — tmux's handling of `\t` varies across
-    // versions (some interpret it as tab, others pass it through literally).
     const SEP: &str = "|||";
     let format = format!(
         "#{{pane_id}}{SEP}#{{session_name}}{SEP}#{{pane_pid}}{SEP}#{{pane_current_command}}{SEP}#{{pane_current_path}}"
@@ -49,16 +101,28 @@ pub fn find_claude_panes() -> anyhow::Result<Vec<TmuxPane>> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Lazily snapshot the process tree only if needed (some pane isn't directly claude)
+    let mut proc_tree: Option<ProcessTree> = None;
+    let needs_tree = stdout.lines().any(|line| {
+        let parts: Vec<&str> = line.split(SEP).collect();
+        parts.len() >= 5 && parts[3] != "claude"
+    });
+    if needs_tree {
+        proc_tree = ProcessTree::snapshot();
+    }
+
     let panes = stdout
         .lines()
         .filter_map(|line| {
             let parts: Vec<&str> = line.split(SEP).collect();
             if parts.len() >= 5 {
                 let is_claude = parts[3] == "claude"
-                    || parts[2]
-                        .parse::<u32>()
-                        .ok()
-                        .is_some_and(has_claude_descendant);
+                    || parts[2].parse::<u32>().ok().is_some_and(|pid| {
+                        proc_tree
+                            .as_ref()
+                            .is_some_and(|t| t.has_claude_descendant(pid))
+                    });
                 if is_claude {
                     let path = parts[4].trim();
                     return Some(TmuxPane {
@@ -94,44 +158,8 @@ pub fn pane_alive(pane_id: &str) -> bool {
         Err(_) => return false,
     };
 
-    has_claude_descendant(pane_pid)
-}
-
-/// Walk the process tree rooted at `root` looking for a process named `claude`.
-fn has_claude_descendant(root: u32) -> bool {
-    let output = match Command::new("ps").args(["-eo", "pid,ppid,comm"]).output() {
-        Ok(o) if o.status.success() => o,
-        _ => return false,
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut children: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
-    let mut names: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
-
-    for line in stdout.lines().skip(1) {
-        let mut parts = line.split_whitespace();
-        let (Some(pid_s), Some(ppid_s), Some(comm)) = (parts.next(), parts.next(), parts.next())
-        else {
-            continue;
-        };
-        let (Ok(pid), Ok(ppid)) = (pid_s.parse::<u32>(), ppid_s.parse::<u32>()) else {
-            continue;
-        };
-        children.entry(ppid).or_default().push(pid);
-        names.insert(pid, comm.to_string());
-    }
-
-    let mut stack = vec![root];
-    while let Some(pid) = stack.pop() {
-        if names.get(&pid).is_some_and(|n| n == "claude") {
-            return true;
-        }
-        if let Some(kids) = children.get(&pid) {
-            stack.extend(kids);
-        }
-    }
-
-    false
+    ProcessTree::snapshot()
+        .is_some_and(|t| t.has_claude_descendant(pane_pid))
 }
 
 /// Log a warning if the pane is not running a known app (e.g. `claude`).
@@ -348,6 +376,23 @@ fn inject_text(pane: &str, message: &str) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Inject a message while holding the pane lock (async wrapper).
+///
+/// Acquires the per-pane mutex from `state`, then runs the blocking
+/// injection on a dedicated thread. Returns `Ok(())` on success.
+pub async fn locked_inject(
+    state: &crate::state::AppState,
+    pane: &str,
+    message: &str,
+    vim_mode: bool,
+) -> anyhow::Result<()> {
+    let lock = state.pane_lock(pane);
+    let _guard = lock.lock().await;
+    let pane = pane.to_string();
+    let message = message.to_string();
+    tokio::task::spawn_blocking(move || inject(&pane, &message, vim_mode)).await?
 }
 
 pub fn format_session_message(from: &str, message: &str, expects_reply: bool) -> String {

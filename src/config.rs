@@ -46,22 +46,20 @@ impl OuijaConfig {
     }
 }
 
-fn dirs_data_dir() -> anyhow::Result<PathBuf> {
-    let base = std::env::var("XDG_DATA_HOME")
+fn xdg_dir(env_var: &str, fallback_suffix: &str) -> anyhow::Result<PathBuf> {
+    let base = std::env::var(env_var)
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            PathBuf::from(home).join(".local/share")
+            PathBuf::from(home).join(fallback_suffix)
         });
     Ok(base.join("ouija"))
 }
 
+fn dirs_data_dir() -> anyhow::Result<PathBuf> {
+    xdg_dir("XDG_DATA_HOME", ".local/share")
+}
+
 fn dirs_config_dir() -> anyhow::Result<PathBuf> {
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            PathBuf::from(home).join(".config")
-        });
-    Ok(base.join("ouija"))
+    xdg_dir("XDG_CONFIG_HOME", ".config")
 }

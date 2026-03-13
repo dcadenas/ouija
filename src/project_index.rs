@@ -116,12 +116,7 @@ fn first_meaningful_line(content: &str) -> Option<String> {
 /// Resolve `projects_dir` from settings, expanding `~/`.
 pub fn resolve_projects_dir(projects_dir: &Option<String>) -> Option<PathBuf> {
     let dir = projects_dir.as_ref()?;
-    let expanded = if let Some(rest) = dir.strip_prefix("~/") {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        PathBuf::from(format!("{home}/{rest}"))
-    } else {
-        PathBuf::from(dir)
-    };
+    let expanded = PathBuf::from(crate::state::expand_tilde(dir));
     if expanded.is_dir() {
         Some(expanded)
     } else {

@@ -510,16 +510,9 @@ pub async fn send_msg(
                 if let Some(pane) = &session.pane {
                     let formatted =
                         tmux::format_session_message(&body.from, &body.message, body.expects_reply);
-                    let pane = pane.clone();
                     let vim_mode = session.metadata.vim_mode;
-                    let lock = state.pane_lock(&pane);
-                    let _guard = lock.lock().await;
-                    match tokio::task::spawn_blocking(move || {
-                        tmux::inject(&pane, &formatted, vim_mode)
-                    })
-                    .await
-                    {
-                        Ok(Ok(())) => {
+                    match tmux::locked_inject(&state, pane, &formatted, vim_mode).await {
+                        Ok(()) => {
                             if body.expects_reply {
                                 state
                                     .notify_agent(
@@ -548,10 +541,6 @@ pub async fn send_msg(
                                 Json(json!({ "status": "delivered", "method": "tmux" })),
                             )
                         }
-                        Ok(Err(e)) => (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(json!({ "error": e.to_string() })),
-                        ),
                         Err(e) => (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(json!({ "error": e.to_string() })),
@@ -791,17 +780,8 @@ pub async fn inject(
     State(state): State<SharedState>,
     Json(body): Json<InjectBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let pane = body.pane;
-    let message = body.message;
-    let vim_mode = body.vim_mode;
-    let lock = state.pane_lock(&pane);
-    let _guard = lock.lock().await;
-    match tokio::task::spawn_blocking(move || tmux::inject(&pane, &message, vim_mode)).await {
-        Ok(Ok(())) => (StatusCode::OK, Json(json!({ "status": "injected" }))),
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        ),
+    match tmux::locked_inject(&state, &body.pane, &body.message, body.vim_mode).await {
+        Ok(()) => (StatusCode::OK, Json(json!({ "status": "injected" }))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),

@@ -56,13 +56,10 @@ impl NostrTransport {
         let peer_pubkeys = load_peer_pubkeys(&data_dir);
 
         // Clean up legacy connect_secret file from disk
-        let legacy_secret_path = data_dir.join("connect_secret");
-        if legacy_secret_path.exists() {
-            if let Err(e) = std::fs::remove_file(&legacy_secret_path) {
-                tracing::warn!("failed to remove legacy connect_secret file: {e}");
-            } else {
-                tracing::info!("removed legacy connect_secret file from disk");
-            }
+        match std::fs::remove_file(data_dir.join("connect_secret")) {
+            Ok(()) => tracing::info!("removed legacy connect_secret file from disk"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!("failed to remove legacy connect_secret file: {e}"),
         }
 
         Ok(Self {
@@ -925,15 +922,11 @@ async fn route_human_message(state: &AppState, from: &str, to: &str, message: &s
                 if let Some(pane) = &session.pane {
                     // Human messages always expect a reply
                     let formatted = crate::tmux::format_session_message(from, message, true);
-                    let pane = pane.clone();
                     let vim_mode = session.metadata.vim_mode;
-                    let lock = state.pane_lock(&pane);
-                    let _guard = lock.lock().await;
-                    let result = tokio::task::spawn_blocking(move || {
-                        crate::tmux::inject(&pane, &formatted, vim_mode)
-                    })
-                    .await;
-                    let delivered = matches!(result, Ok(Ok(())));
+                    let delivered =
+                        crate::tmux::locked_inject(state, pane, &formatted, vim_mode)
+                            .await
+                            .is_ok();
                     if delivered {
                         let mut sessions = state.sessions.write().await;
                         if let Some(s) = sessions.get_mut(to) {
@@ -1238,19 +1231,8 @@ pub async fn admin_start_session(
     } else {
         let projects_dir = state.settings.read().await.projects_dir.clone();
         let base = match projects_dir {
-            Some(dir) => {
-                // Expand ~ to HOME
-                if let Some(rest) = dir.strip_prefix("~/") {
-                    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-                    format!("{home}/{rest}")
-                } else {
-                    dir
-                }
-            }
-            None => {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-                format!("{home}/code")
-            }
+            Some(dir) => crate::state::expand_tilde(&dir),
+            None => crate::state::expand_tilde("~/code"),
         };
         format!("{base}/{name}")
     };
@@ -1422,18 +1404,8 @@ pub async fn admin_restart_session(
 
     let projects_dir = state.settings.read().await.projects_dir.clone();
     let base = match projects_dir {
-        Some(dir) => {
-            if let Some(rest) = dir.strip_prefix("~/") {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-                format!("{home}/{rest}")
-            } else {
-                dir
-            }
-        }
-        None => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            format!("{home}/code")
-        }
+        Some(dir) => crate::state::expand_tilde(&dir),
+        None => crate::state::expand_tilde("~/code"),
     };
 
     // Use previous project_dir if available, otherwise derive from name
@@ -1607,14 +1579,7 @@ fn schedule_prompt_injection(state: &std::sync::Arc<AppState>, pane_id: String, 
     tokio::spawn(async move {
         // Wait for claude to initialize in the pane
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        let lock = state.pane_lock(&pane_id);
-        let _guard = lock.lock().await;
-        let pane = pane_id.clone();
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || crate::tmux::inject(&pane, &prompt, false))
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}")))
-        {
+        if let Err(e) = crate::tmux::locked_inject(&state, &pane_id, &prompt, false).await {
             tracing::warn!("prompt injection into {pane_id} failed: {e}");
         }
     });

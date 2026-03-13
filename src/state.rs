@@ -31,6 +31,16 @@ pub fn sanitize_session_id(name: &str) -> String {
         .to_string()
 }
 
+/// Expand `~/` to `$HOME/` in a path string.
+pub fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        format!("{home}/{rest}")
+    } else {
+        path.to_string()
+    }
+}
+
 /// Resolve a pane's cwd to the actual project root.
 /// If the path is inside a `.claude/worktrees/<branch>` directory, walk up to
 /// the repo root so autoregistration derives the project name, not the branch.
