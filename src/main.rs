@@ -225,21 +225,13 @@ async fn main() -> anyhow::Result<()> {
             });
 
             // Load nostr keys early — the npub serves as the daemon's universal identity.
-            // Data dir must be created before loading keys.
-            let data_dir = data
-                .as_deref()
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| {
-                    let base = std::env::var("XDG_DATA_HOME")
-                        .map(std::path::PathBuf::from)
-                        .unwrap_or_else(|_| {
-                            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                            std::path::PathBuf::from(home).join(".local/share")
-                        });
-                    base.join("ouija")
-                });
-            std::fs::create_dir_all(&data_dir)?;
-            let nostr_keys = nostr_transport::load_or_create_keys(&data_dir)?;
+            // Config dir holds the nsec; data dir holds runtime state.
+            let config_dir = match data.as_deref() {
+                Some(d) => std::path::PathBuf::from(d),
+                None => config::OuijaConfig::default_config_dir(),
+            };
+            std::fs::create_dir_all(&config_dir)?;
+            let nostr_keys = nostr_transport::load_or_create_keys(&config_dir)?;
             let npub = nostr_keys
                 .public_key()
                 .to_bech32()

@@ -28,7 +28,7 @@ pub trait Transport: Send + Sync {
     async fn ticket_string(&self) -> Option<String>;
 
     /// Regenerate identity/topic, invalidating old tickets.
-    async fn regenerate(&self, data_dir: &Path) -> anyhow::Result<String>;
+    async fn regenerate(&self, config_dir: &Path, data_dir: &Path) -> anyhow::Result<String>;
 
     /// Remove a peer so future messages from it are rejected.
     ///

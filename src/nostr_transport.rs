@@ -360,12 +360,16 @@ impl Transport for NostrTransport {
             .map(|bech32| format!("{bech32}#{}", self.connect_secret))
     }
 
-    async fn regenerate(&self, data_dir: &Path) -> anyhow::Result<String> {
+    async fn regenerate(
+        &self,
+        config_dir: &Path,
+        data_dir: &Path,
+    ) -> anyhow::Result<String> {
         // For nostr, regenerating means generating new keys + new secret
         let new_keys = Keys::generate();
 
-        // Persist the new nsec
-        save_nsec(data_dir, &new_keys)?;
+        // Persist the new nsec to config dir
+        save_nsec(config_dir, &new_keys)?;
 
         // Generate and persist new connect secret
         let new_secret = generate_secret();
@@ -1674,7 +1678,7 @@ pub async fn ensure_active(
         return Ok(t);
     }
 
-    let keys = load_or_create_keys(&state.config.data_dir)?;
+    let keys = load_or_create_keys(&state.config.config_dir)?;
 
     let npub = keys
         .public_key()

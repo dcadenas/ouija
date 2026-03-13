@@ -245,7 +245,7 @@ pub async fn regenerate_ticket(
         );
     }
 
-    match t.regenerate(&state.config.data_dir).await {
+    match t.regenerate(&state.config.config_dir, &state.config.data_dir).await {
         Ok(ticket) => (
             StatusCode::OK,
             Json(json!({ "ticket": ticket, "transport": "nostr" })),
