@@ -6,6 +6,7 @@ COPY hooks/ hooks/
 COPY scripts/ scripts/
 COPY skills/ skills/
 COPY .mcp.json ./
+RUN cargo test 2>&1
 RUN cargo build --release 2>&1
 
 FROM rust:latest
