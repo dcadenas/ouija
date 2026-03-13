@@ -221,6 +221,11 @@ log "Test 12: Send to non-existent session"
 result=$(api "$BASE" POST /api/send -d '{"from":"sess-b","to":"nobody","message":"hi"}')
 assert_contains "send error for missing" "$result" '"error"'
 
+log "Test 12a: Self-send rejected with hint"
+result=$(curl -s -X POST "${BASE}/api/send" -H 'Content-Type: application/json' -d '{"from":"sess-b","to":"sess-b","message":"hi"}')
+assert_contains "self-send error" "$result" '"error"'
+assert_contains "self-send mentions yourself" "$result" 'cannot send a message to yourself'
+
 # ═══════════════════════════════════════════════════════════════════
 # PERSISTENCE TESTS
 # ═══════════════════════════════════════════════════════════════════

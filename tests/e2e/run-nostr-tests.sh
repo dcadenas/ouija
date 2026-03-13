@@ -237,8 +237,9 @@ api "$BASE_A" POST /api/remove -d '{"id":"sess-alpha2"}' >/dev/null 2>&1 || true
 api "$BASE_C" POST /api/remove -d '{"id":"sess-gamma"}' >/dev/null 2>&1 || true
 
 # ═══════════════════════════════════════════════════════════════════
-# UNAUTHORIZED SENDER TEST — daemon D connects without secret
-# Verifies that peers who don't present the connect secret are rejected.
+# SINGLE-USE TICKET TEST — ticket voided after C connected
+# The ticket C used in test 11 should be invalidated. D tries to
+# reuse it and should be rejected (unauthorized).
 # ═══════════════════════════════════════════════════════════════════
 
 PORT_D=7883
@@ -247,23 +248,53 @@ BASE_D="http://127.0.0.1:$PORT_D"
 PANE_D1=$(create_claude_pane "$FAKE_BIN")
 sleep 1
 
-log "Starting daemon D (delta) on port $PORT_D — unauthorized sender test"
+log "Starting daemon D (delta) on port $PORT_D — single-use ticket test"
 PID_D=$(start_daemon $PORT_D "delta" /tmp/ouija-D --relay "$RELAY_URL")
 log "Daemon D started (PID $PID_D)"
 
 # Wait for nostr transport
 wait_for 30 bash -c "transport_names '$BASE_D' | grep -qF 'nostr'"
 
+log "Test 14b: Reused ticket rejected (single-use)"
+# ticket_a was captured in test 11 — C already used it, so it should be voided
+result=$(api "$BASE_D" POST /api/connect -d "{\"ticket\":\"$ticket_a\"}")
+if echo "$result" | grep -qF '"status":"connected"' || echo "$result" | grep -qF '"error":"already connected'; then
+    pass "D connect call succeeds locally (ticket sent)"
+else
+    fail "D connect call" "connected or already-connected" "$result"
+fi
+
+# Register session on D and wait — A should NOT authorize D
+api "$BASE_D" POST /api/register -d "{\"id\":\"sess-delta\",\"pane\":\"$PANE_D1\"}" >/dev/null
+sleep 5
+
+remote_a=$(remote_session_ids "$BASE_A")
+assert_not_contains "A rejects reused ticket (D not visible)" "$remote_a" "delta/sess-delta"
+
+# Check A's log for the rejection
+daemon_a_log=$(cat /tmp/ouija-A/daemon.log 2>/dev/null || echo "")
+assert_contains "A log rejects invalid secret" "$daemon_a_log" "rejected connect with invalid secret"
+
+# ═══════════════════════════════════════════════════════════════════
+# UNAUTHORIZED SENDER TEST — daemon D connects without secret
+# Verifies that peers who don't present the connect secret are rejected.
+# (D is already running from the single-use ticket test above)
+# ═══════════════════════════════════════════════════════════════════
+
 # Re-register a session on A for this test
 api "$BASE_A" POST /api/register -d "{\"id\":\"sess-alpha3\",\"pane\":\"$PANE_A1\"}" >/dev/null
 
-# Get A's ticket and strip the secret — D only gets the nprofile
+# Get A's FRESH ticket and strip the secret — D only gets the nprofile
 ticket_a=$(api "$BASE_A" GET "/api/ticket" | jq -r '.ticket // ""')
 nprofile_only=$(echo "$ticket_a" | cut -d'#' -f1)
 
 log "Test 15: D connects to A without secret (nprofile only)"
-result=$(api "$BASE_D" POST /api/connect -d "{\"ticket\":\"$nprofile_only\"}")
+# Remove D's old session from single-use test, re-register fresh
+api "$BASE_D" POST /api/remove -d '{"id":"sess-delta"}' >/dev/null 2>&1 || true
+
+result=$(curl -s -X POST "${BASE_D}/api/connect" -H 'Content-Type: application/json' -d "{\"ticket\":\"$nprofile_only\"}")
 # Connect itself will succeed (adds relay + pubkey locally) but A won't authorize D
+# Use curl -s (not -sf) because "already connected" returns HTTP 409
 if echo "$result" | grep -qF '"status":"connected"' || echo "$result" | grep -qF '"error":"already connected'; then
     pass "D connect call succeeds (local setup)"
 else
