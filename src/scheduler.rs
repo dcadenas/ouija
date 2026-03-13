@@ -339,14 +339,13 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask, formatted:
 
     if alive {
         if task.on_fire.clears_context() {
-            // Kill the live pane so we can start fresh
-            let kill_pane = pane.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                std::process::Command::new("tmux")
-                    .args(["kill-pane", "-t", &kill_pane])
-                    .status()
-            })
-            .await;
+            // Respawn in-place: kill process and restart claude in the same pane
+            let dir = task
+                .project_dir
+                .as_deref()
+                .or(session.metadata.project_dir.as_deref())
+                .unwrap_or("/tmp");
+            return respawn_and_inject(state, task, pane, dir, formatted).await;
         } else {
             // Direct injection into live pane
             return inject_into_pane(state, task, pane, session.metadata.vim_mode, formatted).await;
@@ -437,6 +436,126 @@ async fn inject_into_pane(
     }
 }
 
+/// Respawn claude in an existing pane (for clears_context on a live session).
+async fn respawn_and_inject(
+    state: &SharedState,
+    task: &ScheduledTask,
+    pane: &str,
+    dir: &str,
+    formatted: &str,
+) -> TaskRun {
+    let timestamp = Utc::now();
+    let pane_id = pane.to_string();
+    let dir = dir.to_string();
+    let uses_worktree = task.on_fire.uses_worktree();
+    let is_disposable = task.on_fire.is_disposable_worktree();
+    let task_name = task.name.clone();
+
+    let claude_cmd = {
+        let base = format!(
+            "cd {} && claude --dangerously-skip-permissions",
+            shell_escape(&dir),
+        );
+        if uses_worktree {
+            if is_disposable {
+                format!("{base} --worktree")
+            } else {
+                format!("{base} --worktree {}", shell_escape(&task_name))
+            }
+        } else {
+            base
+        }
+    };
+
+    let respawn_result = tokio::task::spawn_blocking({
+        let pane_id = pane_id.clone();
+        move || -> anyhow::Result<()> {
+            let output = std::process::Command::new("tmux")
+                .args(["respawn-pane", "-k", "-t", &pane_id, &claude_cmd])
+                .output()?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "respawn-pane failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Ok(())
+        }
+    })
+    .await;
+
+    let ok = matches!(respawn_result, Ok(Ok(())));
+    if !ok {
+        let err = match respawn_result {
+            Ok(Err(e)) => e.to_string(),
+            Err(e) => e.to_string(),
+            _ => unreachable!(),
+        };
+        return TaskRun {
+            task_id: task.id.clone(),
+            task_name: task.name.clone(),
+            timestamp,
+            status: TaskRunStatus::Failed,
+            error: Some(err),
+            target_session: task.target_session.clone(),
+            revived_pane: None,
+        };
+    }
+
+    // Clear claude_session_id since we started fresh
+    {
+        let mut sessions = state.sessions.write().await;
+        if let Some(s) = sessions.get_mut(&task.target_session) {
+            s.metadata.claude_session_id = None;
+        }
+    }
+
+    // Wait for claude to start, then inject
+    let poll_pane = pane_id.clone();
+    let ready = tokio::task::spawn_blocking(move || {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(REVIVAL_TIMEOUT_SECS);
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_secs(REVIVAL_POLL_SECS));
+            if let Ok(output) = std::process::Command::new("tmux")
+                .args([
+                    "display-message",
+                    "-t",
+                    &poll_pane,
+                    "-p",
+                    "#{pane_current_command}",
+                ])
+                .output()
+            {
+                if String::from_utf8_lossy(&output.stdout).trim() == "claude" {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+
+    if ready {
+        let msg = formatted.to_string();
+        let inject_pane = pane_id.clone();
+        let lock = state.pane_lock(&inject_pane);
+        let _guard = lock.lock().await;
+        let _ = tokio::task::spawn_blocking(move || tmux::inject(&inject_pane, &msg, false)).await;
+    }
+
+    TaskRun {
+        task_id: task.id.clone(),
+        task_name: task.name.clone(),
+        timestamp,
+        status: TaskRunStatus::Ok,
+        error: None,
+        target_session: task.target_session.clone(),
+        revived_pane: None,
+    }
+}
+
 /// Create a session from scratch using task config (no pre-existing session needed).
 async fn revive_from_task(
     state: &SharedState,
@@ -490,10 +609,13 @@ async fn revive_and_inject(
     let uses_worktree = task.on_fire.uses_worktree();
     let is_disposable = task.on_fire.is_disposable_worktree();
 
-    // Create new tmux window
+    // Create named tmux session/window for the revived session.
+    // If a tmux session with the target name exists, add a window to it;
+    // otherwise create a new tmux session. Both get the ouija session name.
     let new_pane = tokio::task::spawn_blocking({
         let dir = dir.clone();
         let task_name = task.name.clone();
+        let target_session = task.target_session.clone();
         let claude_session_id = if clears_context {
             None
         } else {
@@ -502,16 +624,58 @@ async fn revive_and_inject(
                 .or_else(|| crate::nostr_transport::detect_claude_session_id(&dir))
         };
         move || -> anyhow::Result<String> {
-            let output = std::process::Command::new("tmux")
-                .args(["new-window", "-d", "-P", "-F", "#{pane_id}"])
-                .output()?;
+            let tmux_session_exists = std::process::Command::new("tmux")
+                .args(["has-session", "-t", &target_session])
+                .output()
+                .is_ok_and(|o| o.status.success());
+
+            let output = if tmux_session_exists {
+                std::process::Command::new("tmux")
+                    .args([
+                        "new-window",
+                        "-d",
+                        "-t",
+                        &target_session,
+                        "-n",
+                        &target_session,
+                        "-P",
+                        "-F",
+                        "#{pane_id}",
+                    ])
+                    .output()?
+            } else {
+                std::process::Command::new("tmux")
+                    .args([
+                        "new-session",
+                        "-d",
+                        "-s",
+                        &target_session,
+                        "-n",
+                        &target_session,
+                        "-P",
+                        "-F",
+                        "#{pane_id}",
+                    ])
+                    .output()?
+            };
             if !output.status.success() {
                 anyhow::bail!(
-                    "tmux new-window failed: {}",
+                    "tmux session/window creation failed: {}",
                     String::from_utf8_lossy(&output.stderr)
                 );
             }
             let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+            // Prevent tmux from overriding the window name
+            let _ = std::process::Command::new("tmux")
+                .args([
+                    "set-window-option",
+                    "-t",
+                    &pane_id,
+                    "automatic-rename",
+                    "off",
+                ])
+                .status();
 
             // Launch claude in the project dir with --dangerously-skip-permissions
             let cmd = match (&claude_session_id, clears_context) {

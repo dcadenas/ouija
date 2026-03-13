@@ -24,7 +24,7 @@ PANE_SHELL=$(tmux display-message -t test -p '#{pane_id}')
 # Don't run anything special — default shell (bash)
 
 # Wait for processes to start
-sleep 1
+sleep 0.5
 
 log "Panes: claude-A=$PANE_A  claude-B=$PANE_B  shell=$PANE_SHELL"
 tmux list-panes -a -F '#{pane_id} #{pane_current_command}'
@@ -33,7 +33,7 @@ tmux list-panes -a -F '#{pane_id} #{pane_current_command}'
 log "Starting ouija daemon"
 rm -rf /tmp/ouija-test
 mkdir -p /tmp/ouija-test
-echo '{"auto_register":false}' > /tmp/ouija-test/settings.json
+echo '{"auto_register":false,"reaper_interval_secs":1}' > /tmp/ouija-test/settings.json
 DAEMON_PID=$(start_daemon $PORT "local" /tmp/ouija-test)
 log "Daemon started (PID $DAEMON_PID, logs in /tmp/ouija-test/daemon.log)"
 
@@ -82,13 +82,8 @@ assert_contains "error for missing session" "$result" '"error"'
 
 log "Test 7: Reaper removes session with dead pane"
 api "$BASE" POST /api/register -d '{"id":"ghost","pane":"%99999"}' >/dev/null
-# Note: reaper may remove dead-pane session before we can check count=3
-log "  Waiting for reaper (max 10s)..."
-for i in $(seq 1 10); do
-    sleep 1
-    count=$(session_count "$BASE")
-    if [ "$count" = "2" ]; then break; fi
-done
+log "  Waiting for reaper..."
+wait_for 5 bash -c '[ "$(session_count "'"$BASE"'")" = "2" ]'
 assert_eq "ghost reaped" "$(session_count "$BASE")" "2"
 ids=$(session_ids "$BASE")
 assert_not_contains "ghost gone" "$ids" "ghost"
@@ -96,20 +91,14 @@ assert_contains "sess-a2 survived" "$ids" "sess-a2"
 assert_contains "sess-b survived" "$ids" "sess-b"
 
 log "Test 8: Reaper keeps live claude pane"
-# sess-a2 and sess-b have live panes running /tmp/claude
-log "  Waiting 6s to confirm reaper doesn't kill live sessions..."
-sleep 6
+# sess-a2 and sess-b have live panes running /tmp/claude — wait 2 reaper cycles
+sleep 3
 assert_eq "live sessions survive reaper" "$(session_count "$BASE")" "2"
 
 log "Test 9: Reaper removes session whose pane runs non-claude process"
 api "$BASE" POST /api/register -d "{\"id\":\"shell-session\",\"pane\":\"$PANE_SHELL\"}" >/dev/null
-# Note: reaper may remove non-claude pane before we can check count=3
 log "  Waiting for reaper..."
-for i in $(seq 1 10); do
-    sleep 1
-    count=$(session_count "$BASE")
-    if [ "$count" = "2" ]; then break; fi
-done
+wait_for 5 bash -c '[ "$(session_count "'"$BASE"'")" = "2" ]'
 assert_eq "shell pane reaped" "$(session_count "$BASE")" "2"
 assert_not_contains "shell-session gone" "$(session_ids "$BASE")" "shell-session"
 
@@ -222,7 +211,7 @@ assert_contains "pending replies count is 0" "$result_after" '"count":0'
 log "Test 11f: MCP clear_pending_reply tool"
 # Create a new pending reply
 api "$BASE" POST /api/send -d "{\"from\":\"sess-b\",\"to\":\"sess-a2\",\"message\":\"another reply needed\",\"expects_reply\":true}" >/dev/null
-sleep 1
+sleep 0.5
 # Clear it via MCP
 mcp_call_tool "$BASE" "clear_pending_reply" '{"session":"sess-a2","from":"sess-b"}' >/dev/null
 result_after=$(api "$BASE" GET "/api/pane/${PANE_A_NUM}/pending-replies")
@@ -250,7 +239,7 @@ log "  Sessions before restart: $ids_before ($count_before)"
 # Kill and restart daemon
 kill $DAEMON_PID 2>/dev/null || true
 wait $DAEMON_PID 2>/dev/null || true
-sleep 1
+sleep 0.5
 RUST_LOG=ouija=debug ouija start --port $PORT --data /tmp/ouija-test >/tmp/daemon-restart.log 2>&1 &
 DAEMON_PID=$!
 # Wait for HTTP to be ready
@@ -438,9 +427,29 @@ L1_IDS=$(session_ids "$BASE")
 assert_contains "L1: session registered" "$L1_IDS" "lifecycle-test"
 # Verify directory was created
 assert_eq "L1: project dir created" "$(test -d /tmp/projects/lifecycle-test && echo yes)" "yes"
-# Verify tmux session exists
+# Verify tmux session exists with matching window name
 tmux_sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null)
 assert_contains "L1: tmux session created" "$tmux_sessions" "lifecycle-test"
+L1_PANE=$(session_field "$BASE" "lifecycle-test" "pane")
+L1_WIN_NAME=$(tmux display-message -t "$L1_PANE" -p '#{window_name}' 2>/dev/null)
+assert_eq "L1: window name matches session name" "$L1_WIN_NAME" "lifecycle-test"
+
+log "Test L1b: Start session when tmux session name already taken"
+# Create a bare tmux session with a name that will collide
+tmux new-session -d -s "tmux-collide"
+L1B=$(api "$BASE" POST /api/sessions/start -d '{"name":"tmux-collide","project_dir":"/tmp/projects/tmux-collide"}')
+assert_contains "L1b: start succeeds despite tmux name collision" "$L1B" "started"
+wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'tmux-collide'"
+# Verify the new pane lives as a window inside the existing tmux session
+L1B_PANE=$(session_field "$BASE" "tmux-collide" "pane")
+L1B_TMUX_SESS=$(tmux display-message -t "$L1B_PANE" -p '#{session_name}' 2>/dev/null)
+assert_eq "L1b: pane is a window in the existing tmux session" "$L1B_TMUX_SESS" "tmux-collide"
+# Verify window name matches ouija session name
+L1B_WIN_NAME=$(tmux display-message -t "$L1B_PANE" -p '#{window_name}' 2>/dev/null)
+assert_eq "L1b: window named after ouija session" "$L1B_WIN_NAME" "tmux-collide"
+# Clean up
+api "$BASE" POST /api/sessions/kill -d '{"name":"tmux-collide"}' >/dev/null 2>&1 || true
+tmux kill-session -t tmux-collide 2>/dev/null || true
 
 log "Test L2: Start duplicate session fails"
 L2=$(api "$BASE" POST /api/sessions/start -d '{"name":"lifecycle-test"}')
@@ -476,14 +485,13 @@ log "Test L6b: Metadata preserved after restart"
 # Register a session with rich metadata, restart, verify metadata survives
 # Use a pane with fake claude process so pane_alive (has_claude_descendant) passes
 L6B_PANE=$(create_claude_pane "$FAKE_BIN")
-sleep 1
+sleep 0.5
 api "$BASE" POST /api/register -d "{\"id\":\"meta-restart\",\"pane\":\"$L6B_PANE\",\"vim_mode\":true,\"role\":\"backend\",\"project_dir\":\"/tmp/meta-test\"}" >/dev/null
-sleep 1
 L6B_ROLE_BEFORE=$(session_field "$BASE" "meta-restart" "role")
 assert_eq "L6b: role set before restart" "$L6B_ROLE_BEFORE" "backend"
 # Restart and check metadata survived
 api "$BASE" POST /api/sessions/restart -d '{"name":"meta-restart"}' >/dev/null
-sleep 2
+wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'meta-restart'"
 L6B_VIM=$(session_field "$BASE" "meta-restart" "vim_mode")
 L6B_ROLE=$(session_field "$BASE" "meta-restart" "role")
 L6B_DIR=$(session_field "$BASE" "meta-restart" "project_dir")
@@ -494,7 +502,7 @@ assert_eq "L6b: project_dir preserved" "$L6B_DIR" "/tmp/meta-test"
 log "Test L6c: Pane ID changes after restart"
 L6C_PANE_BEFORE=$(session_field "$BASE" "meta-restart" "pane")
 api "$BASE" POST /api/sessions/restart -d '{"name":"meta-restart"}' >/dev/null
-sleep 2
+wait_for 5 bash -c '[ "$(session_field "'"$BASE"'" "meta-restart" "pane")" != "'"$L6C_PANE_BEFORE"'" ]'
 L6C_PANE_AFTER=$(session_field "$BASE" "meta-restart" "pane")
 if [ -n "$L6C_PANE_BEFORE" ] && [ -n "$L6C_PANE_AFTER" ] && [ "$L6C_PANE_BEFORE" != "$L6C_PANE_AFTER" ]; then
     pass "L6c: pane changed after restart ($L6C_PANE_BEFORE -> $L6C_PANE_AFTER)"
@@ -503,8 +511,8 @@ else
 fi
 
 log "Test L6d: Restart pane runs correct command"
-sleep 2
 L6D_PANE=$(session_field "$BASE" "meta-restart" "pane")
+wait_for 5 bash -c "tmux capture-pane -t '$L6D_PANE' -p 2>/dev/null | grep -qE '(--resume|--continue)'"
 L6D_CONTENT=$(tmux capture-pane -t "$L6D_PANE" -p 2>/dev/null || echo "")
 if echo "$L6D_CONTENT" | grep -qE '(--resume|--continue)'; then
     pass "L6d: restart pane has --resume or --continue flag"
@@ -514,7 +522,7 @@ fi
 
 log "Test L6e: Reaper grace period — session survives reaper cycle after restart"
 api "$BASE" POST /api/sessions/restart -d '{"name":"meta-restart"}' >/dev/null
-sleep 6
+sleep 3
 L6E_IDS=$(session_ids "$BASE")
 assert_contains "L6e: session survives reaper after restart" "$L6E_IDS" "meta-restart"
 
@@ -666,7 +674,7 @@ assert_not_contains "no ouija prefix in reminder" "$pane_content" "[ouija]"
 # Count injections by capturing pane content before and after second idle cycle
 pre_count=$(tmux capture-pane -t "$PANE_A" -p -S -50 | grep -c "unanswered question from asker" || true)
 curl -sf -X POST "${BASE}/api/pane/${PANE_A_NUM}/stopped" >/dev/null 2>&1
-sleep 4
+sleep 3
 post_count=$(tmux capture-pane -t "$PANE_A" -p -S -50 | grep -c "unanswered question from asker" || true)
 assert_eq "no duplicate reminder" "$post_count" "$pre_count"
 # Clean up

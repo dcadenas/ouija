@@ -155,6 +155,8 @@ pub struct OuijaSettings {
     pub router: Option<RouterConfig>,
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
+    #[serde(default = "default_reaper_interval")]
+    pub reaper_interval_secs: u64,
 }
 
 fn default_true() -> bool {
@@ -165,6 +167,10 @@ fn default_idle_timeout() -> u64 {
     180
 }
 
+fn default_reaper_interval() -> u64 {
+    5
+}
+
 impl Default for OuijaSettings {
     fn default() -> Self {
         Self {
@@ -173,6 +179,7 @@ impl Default for OuijaSettings {
             projects_dir: None,
             router: None,
             idle_timeout_secs: 180,
+            reaper_interval_secs: 5,
         }
     }
 }

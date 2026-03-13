@@ -267,9 +267,8 @@ async fn main() -> anyhow::Result<()> {
                 let mut first_run = true;
 
                 loop {
-                    // First iteration waits 5s, giving restore_persisted_sessions
-                    // time to finish before auto-register runs.
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let interval = reaper_state.settings.read().await.reaper_interval_secs;
+                    tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
 
                     // Reap dead local sessions and announce removals
                     let reaped = reaper_state.reap_dead_sessions().await;
@@ -474,9 +473,9 @@ async fn main() -> anyhow::Result<()> {
                 if !npub.starts_with("npub1") {
                     anyhow::bail!("npub must start with 'npub1'");
                 }
-                let data_dir = config::OuijaConfig::default_data_dir();
-                std::fs::create_dir_all(&data_dir)?;
-                let mut settings = persistence::load_settings(&data_dir)?;
+                let config_dir = config::OuijaConfig::default_config_dir();
+                std::fs::create_dir_all(&config_dir)?;
+                let mut settings = persistence::load_settings(&config_dir)?;
                 if settings.human_sessions.iter().any(|h| h.name == name) {
                     anyhow::bail!("human session '{name}' already exists");
                 }
@@ -487,23 +486,23 @@ async fn main() -> anyhow::Result<()> {
                     default_session,
                     welcomed: false,
                 });
-                persistence::save_settings(&data_dir, &settings)?;
+                persistence::save_settings(&config_dir, &settings)?;
                 println!("added human session '{name}'");
             }
             Some(ConfigAction::RemoveHuman { name }) => {
-                let data_dir = config::OuijaConfig::default_data_dir();
-                let mut settings = persistence::load_settings(&data_dir)?;
+                let config_dir = config::OuijaConfig::default_config_dir();
+                let mut settings = persistence::load_settings(&config_dir)?;
                 let before = settings.human_sessions.len();
                 settings.human_sessions.retain(|h| h.name != name);
                 if settings.human_sessions.len() == before {
                     anyhow::bail!("human session '{name}' not found");
                 }
-                persistence::save_settings(&data_dir, &settings)?;
+                persistence::save_settings(&config_dir, &settings)?;
                 println!("removed human session '{name}'");
             }
             Some(ConfigAction::ListHumans) => {
-                let data_dir = config::OuijaConfig::default_data_dir();
-                let settings = persistence::load_settings(&data_dir)?;
+                let config_dir = config::OuijaConfig::default_config_dir();
+                let settings = persistence::load_settings(&config_dir)?;
                 if settings.human_sessions.is_empty() {
                     println!("no human sessions configured");
                 } else {
@@ -527,9 +526,9 @@ async fn main() -> anyhow::Result<()> {
                 model,
                 base_url,
             }) => {
-                let data_dir = config::OuijaConfig::default_data_dir();
-                std::fs::create_dir_all(&data_dir)?;
-                let mut settings = persistence::load_settings(&data_dir)?;
+                let config_dir = config::OuijaConfig::default_config_dir();
+                std::fs::create_dir_all(&config_dir)?;
+                let mut settings = persistence::load_settings(&config_dir)?;
                 settings.router = Some(persistence::RouterConfig {
                     api_key,
                     model: model.unwrap_or_else(|| "gemini-2.5-flash".to_string()),
@@ -537,14 +536,14 @@ async fn main() -> anyhow::Result<()> {
                         "https://generativelanguage.googleapis.com/v1beta/openai".to_string()
                     }),
                 });
-                persistence::save_settings(&data_dir, &settings)?;
+                persistence::save_settings(&config_dir, &settings)?;
                 println!("router configured");
             }
             Some(ConfigAction::RemoveRouter) => {
-                let data_dir = config::OuijaConfig::default_data_dir();
-                let mut settings = persistence::load_settings(&data_dir)?;
+                let config_dir = config::OuijaConfig::default_config_dir();
+                let mut settings = persistence::load_settings(&config_dir)?;
                 settings.router = None;
-                persistence::save_settings(&data_dir, &settings)?;
+                persistence::save_settings(&config_dir, &settings)?;
                 println!("router removed");
             }
         },

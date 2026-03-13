@@ -7,13 +7,14 @@ pub struct OuijaConfig {
     pub name: String,
     pub port: u16,
     pub data_dir: PathBuf,
+    pub config_dir: PathBuf,
     /// Nostr public key used as the daemon's universal identity.
     pub npub: String,
 }
 
 impl OuijaConfig {
-    pub fn default_data_dir() -> PathBuf {
-        dirs_data_dir().unwrap_or_else(|_| PathBuf::from("."))
+    pub fn default_config_dir() -> PathBuf {
+        dirs_config_dir().unwrap_or_else(|_| PathBuf::from("."))
     }
 
     pub fn new(
@@ -22,16 +23,24 @@ impl OuijaConfig {
         data_dir: Option<String>,
         npub: String,
     ) -> anyhow::Result<Self> {
-        let data_dir = match data_dir {
-            Some(d) => PathBuf::from(d),
-            None => dirs_data_dir()?,
+        // When --data is given, co-locate config there (e.g. tests).
+        // Otherwise use XDG dirs.
+        let (data_dir, config_dir) = match data_dir {
+            Some(ref d) => {
+                let p = PathBuf::from(d);
+                (p.clone(), p)
+            }
+            None => (dirs_data_dir()?, dirs_config_dir()?),
         };
         std::fs::create_dir_all(&data_dir)
             .with_context(|| format!("creating data dir: {}", data_dir.display()))?;
+        std::fs::create_dir_all(&config_dir)
+            .with_context(|| format!("creating config dir: {}", config_dir.display()))?;
         Ok(Self {
             name,
             port,
             data_dir,
+            config_dir,
             npub,
         })
     }
@@ -43,6 +52,16 @@ fn dirs_data_dir() -> anyhow::Result<PathBuf> {
         .unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
             PathBuf::from(home).join(".local/share")
+        });
+    Ok(base.join("ouija"))
+}
+
+fn dirs_config_dir() -> anyhow::Result<PathBuf> {
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            PathBuf::from(home).join(".config")
         });
     Ok(base.join("ouija"))
 }

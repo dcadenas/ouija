@@ -143,8 +143,10 @@ mcp_call_tool() {
 start_daemon() {
     local port="$1" name="$2" data_dir="$3"; shift 3
     mkdir -p "$data_dir"
-    # Disable auto-register so real Claude panes don't pollute test state
-    echo '{"auto_register":false}' > "${data_dir}/settings.json"
+    # Write default settings only if caller hasn't pre-created one
+    if [ ! -f "${data_dir}/settings.json" ]; then
+        echo '{"auto_register":false}' > "${data_dir}/settings.json"
+    fi
     RUST_LOG=ouija=debug ouija start --port "$port" --name "$name" --data "$data_dir" "$@" \
         >"${data_dir}/daemon.log" 2>&1 &
     local pid=$!

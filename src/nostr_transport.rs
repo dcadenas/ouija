@@ -458,7 +458,7 @@ async fn handle_human_message(
                 let settings_snapshot = settings.clone();
                 drop(settings);
                 if let Err(e) =
-                    crate::persistence::save_settings(&state.config.data_dir, &settings_snapshot)
+                    crate::persistence::save_settings(&state.config.config_dir, &settings_snapshot)
                 {
                     tracing::warn!("failed to save welcomed flag: {e}");
                 }
@@ -859,7 +859,7 @@ async fn set_default_session(state: &AppState, human_name: &str, session_id: &st
         h.default_session = Some(session_id.to_string());
         let snapshot = settings.clone();
         drop(settings);
-        if let Err(e) = crate::persistence::save_settings(&state.config.data_dir, &snapshot) {
+        if let Err(e) = crate::persistence::save_settings(&state.config.config_dir, &snapshot) {
             tracing::warn!("failed to save default session: {e}");
             return "failed to save setting".to_string();
         }
@@ -1266,25 +1266,68 @@ pub async fn admin_start_session(
         move || -> anyhow::Result<String> {
             use std::process::Command;
 
-            // Create new tmux session (detached)
-            let output = Command::new("tmux")
+            // If a tmux session with this name exists, add a window to it;
+            // otherwise create a new tmux session. Window name matches ouija
+            // session name so the user gets visual identification.
+            let tmux_session_exists = Command::new("tmux")
+                .args(["has-session", "-t", &session_name])
+                .output()
+                .is_ok_and(|o| o.status.success());
+
+            let pane_id = if tmux_session_exists {
+                let output = Command::new("tmux")
+                    .args([
+                        "new-window",
+                        "-d",
+                        "-t",
+                        &session_name,
+                        "-n",
+                        &session_name,
+                        "-P",
+                        "-F",
+                        "#{pane_id}",
+                    ])
+                    .output()?;
+                if !output.status.success() {
+                    anyhow::bail!(
+                        "tmux new-window failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            } else {
+                let output = Command::new("tmux")
+                    .args([
+                        "new-session",
+                        "-d",
+                        "-s",
+                        &session_name,
+                        "-n",
+                        &session_name,
+                        "-P",
+                        "-F",
+                        "#{pane_id}",
+                    ])
+                    .output()?;
+                if !output.status.success() {
+                    anyhow::bail!(
+                        "tmux new-session failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            };
+
+            // Prevent tmux from overriding the window name
+            let _ = Command::new("tmux")
                 .args([
-                    "new-session",
-                    "-d",
-                    "-s",
-                    &session_name,
-                    "-P",
-                    "-F",
-                    "#{pane_id}",
+                    "set-window-option",
+                    "-t",
+                    &pane_id,
+                    "automatic-rename",
+                    "off",
                 ])
-                .output()?;
-            if !output.status.success() {
-                anyhow::bail!(
-                    "tmux new-session failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                .status();
 
             // Launch claude
             let cmd = if worktree {
@@ -1448,26 +1491,59 @@ pub async fn admin_restart_session(
                 }
             }
 
-            // Fallback: create a new tmux session (don't kill existing — user may
-            // be attached to a session with the same name)
-            let output = Command::new("tmux")
-                .args([
-                    "new-session",
-                    "-d",
-                    "-s",
-                    &session_name,
-                    "-P",
-                    "-F",
-                    "#{pane_id}",
-                ])
-                .output()?;
+            // Fallback: add window to existing tmux session, or create new one
+            let tmux_session_exists = Command::new("tmux")
+                .args(["has-session", "-t", &session_name])
+                .output()
+                .is_ok_and(|o| o.status.success());
+
+            let output = if tmux_session_exists {
+                Command::new("tmux")
+                    .args([
+                        "new-window",
+                        "-d",
+                        "-t",
+                        &session_name,
+                        "-n",
+                        &session_name,
+                        "-P",
+                        "-F",
+                        "#{pane_id}",
+                    ])
+                    .output()?
+            } else {
+                Command::new("tmux")
+                    .args([
+                        "new-session",
+                        "-d",
+                        "-s",
+                        &session_name,
+                        "-n",
+                        &session_name,
+                        "-P",
+                        "-F",
+                        "#{pane_id}",
+                    ])
+                    .output()?
+            };
             if !output.status.success() {
                 anyhow::bail!(
-                    "tmux new-session failed: {}",
+                    "tmux session/window creation failed: {}",
                     String::from_utf8_lossy(&output.stderr)
                 );
             }
             let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+            // Prevent tmux from overriding the window name
+            let _ = Command::new("tmux")
+                .args([
+                    "set-window-option",
+                    "-t",
+                    &pane_id,
+                    "automatic-rename",
+                    "off",
+                ])
+                .status();
 
             Command::new("tmux")
                 .args(["send-keys", "-t", &pane_id, &claude_cmd, "Enter"])

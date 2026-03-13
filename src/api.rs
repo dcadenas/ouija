@@ -867,6 +867,7 @@ pub struct SettingsUpdateBody {
     auto_register: Option<bool>,
     projects_dir: Option<String>,
     idle_timeout_secs: Option<u64>,
+    reaper_interval_secs: Option<u64>,
 }
 
 pub async fn update_settings(
@@ -883,7 +884,10 @@ pub async fn update_settings(
     if let Some(v) = body.idle_timeout_secs {
         settings.idle_timeout_secs = v;
     }
-    if let Err(e) = crate::persistence::save_settings(&state.config.data_dir, &settings) {
+    if let Some(v) = body.reaper_interval_secs {
+        settings.reaper_interval_secs = v;
+    }
+    if let Err(e) = crate::persistence::save_settings(&state.config.config_dir, &settings) {
         tracing::warn!("failed to save settings: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1201,7 +1205,7 @@ pub async fn add_human(
     };
     settings.human_sessions.push(human);
 
-    if let Err(e) = crate::persistence::save_settings(&state.config.data_dir, &settings) {
+    if let Err(e) = crate::persistence::save_settings(&state.config.config_dir, &settings) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("failed to save: {e}") })),
@@ -1248,7 +1252,7 @@ pub async fn remove_human(
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" })));
     }
 
-    if let Err(e) = crate::persistence::save_settings(&state.config.data_dir, &settings) {
+    if let Err(e) = crate::persistence::save_settings(&state.config.config_dir, &settings) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("failed to save: {e}") })),

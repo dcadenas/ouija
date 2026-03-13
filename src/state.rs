@@ -253,6 +253,7 @@ impl AppState {
                 npub: "npub1test".into(),
                 port: 0,
                 data_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+                config_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
             },
             sessions: RwLock::new(HashMap::new()),
             nodes: RwLock::new(HashMap::new()),
@@ -278,7 +279,7 @@ impl AppState {
 
     pub fn new(config: OuijaConfig) -> SharedState {
         let log_file = config.data_dir.join("messages.jsonl");
-        let settings = crate::persistence::load_settings(&config.data_dir).unwrap_or_default();
+        let settings = crate::persistence::load_settings(&config.config_dir).unwrap_or_default();
         let scheduled_tasks = crate::persistence::load_tasks(&config.data_dir).unwrap_or_default();
         Arc::new(Self {
             config,
@@ -1071,9 +1072,11 @@ pub(crate) mod tests {
 
     pub(crate) fn test_config() -> OuijaConfig {
         let dir = tempfile::tempdir().unwrap();
+        let path = dir.keep();
         OuijaConfig {
             name: "test".into(),
-            data_dir: dir.keep(),
+            data_dir: path.clone(),
+            config_dir: path,
             port: 0,
             npub: "npub1test".into(),
         }
