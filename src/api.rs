@@ -475,6 +475,26 @@ pub async fn send_msg(
     State(state): State<SharedState>,
     Json(body): Json<SendBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if body.from == body.to {
+        let sessions = state.sessions.read().await;
+        let suggestions: Vec<&str> = sessions
+            .keys()
+            .filter(|k| k.ends_with(&format!("/{}", body.to)) || k.starts_with(&format!("{}/", body.to)))
+            .map(|k| k.as_str())
+            .collect();
+        let hint = if suggestions.is_empty() {
+            "If you meant a remote session, use the full node-prefixed name (e.g. 'node/session'). Run session_list to see all available targets.".to_string()
+        } else {
+            format!(
+                "Did you mean one of these remote sessions? {} — use session_list to check.",
+                suggestions.join(", ")
+            )
+        };
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("cannot send a message to yourself. {hint}") })),
+        );
+    }
     let sessions = state.sessions.read().await;
     let target = sessions.get(&body.to).cloned();
     drop(sessions);
