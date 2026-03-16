@@ -12,8 +12,9 @@ NUM=$(echo "$CURRENT" | grep -o '[0-9]*$')
 NEXT="$PREFIX.$((NUM + 1))"
 echo "Next version: $NEXT"
 
-# Update Cargo.toml
+# Update Cargo.toml and regenerate Cargo.lock
 sed -i "s/^version = \"$CURRENT\"/version = \"$NEXT\"/" Cargo.toml
+cargo check --quiet 2>/dev/null || true
 
 # Commit and push
 git add Cargo.toml Cargo.lock
