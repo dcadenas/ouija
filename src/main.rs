@@ -198,14 +198,17 @@ async fn main() -> anyhow::Result<()> {
         .install_default()
         .expect("failed to install rustls CryptoProvider");
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ouija=info".parse().expect("valid default filter")),
-        )
-        .init();
-
     let cli = Cli::parse();
+
+    // Daemon logs to a file in the data dir; CLI subcommands log to stderr.
+    if !matches!(cli.command, Command::Start { .. }) {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "ouija=warn".parse().expect("valid default filter")),
+            )
+            .init();
+    }
 
     match cli.command {
         Command::Start {
@@ -215,6 +218,23 @@ async fn main() -> anyhow::Result<()> {
             ticket,
             relays,
         } => {
+            // Compute data dir early so we can point tracing at it.
+            let data_dir = match data.as_deref() {
+                Some(d) => std::path::PathBuf::from(d),
+                None => config::OuijaConfig::default_data_dir(),
+            };
+            std::fs::create_dir_all(&data_dir)?;
+
+            let log_file = std::fs::File::create(data_dir.join("daemon.log"))?;
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "ouija=info".parse().expect("valid default filter")),
+                )
+                .with_writer(log_file)
+                .with_ansi(false)
+                .init();
+
             preflight_checks();
             ensure_plugin_installed();
 
@@ -452,6 +472,7 @@ async fn main() -> anyhow::Result<()> {
         Command::LogPath { data } => {
             let config = config::OuijaConfig::new("_".into(), 0, data, String::new())?;
             println!("{}", config.data_dir.join("messages.jsonl").display());
+            println!("{}", config.data_dir.join("daemon.log").display());
         }
         Command::Update => {
             update_and_restart()?;
