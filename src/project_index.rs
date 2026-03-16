@@ -6,6 +6,11 @@ use serde::Serialize;
 
 use crate::state::AppState;
 
+/// Maximum number of bytes to read from a file for description extraction.
+const MAX_FILE_PREVIEW_BYTES: usize = 500;
+/// Maximum length of a project description line before truncation.
+const MAX_DESC_LENGTH: usize = 120;
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ProjectInfo {
     pub name: String,
@@ -70,7 +75,7 @@ fn extract_description(dir: &Path) -> Option<String> {
         let path = dir.join(filename);
         if let Ok(content) = std::fs::read_to_string(&path) {
             // Take first ~500 bytes to avoid reading huge files
-            let content = &content[..content.len().min(500)];
+            let content = &content[..content.len().min(MAX_FILE_PREVIEW_BYTES)];
             if let Some(line) = first_meaningful_line(content) {
                 return Some(line);
             }
@@ -103,8 +108,8 @@ fn first_meaningful_line(content: &str) -> Option<String> {
             continue;
         }
         // Truncate long lines
-        let desc = if trimmed.len() > 120 {
-            format!("{}...", &trimmed[..117])
+        let desc = if trimmed.len() > MAX_DESC_LENGTH {
+            format!("{}...", &trimmed[..MAX_DESC_LENGTH - 3])
         } else {
             trimmed.to_string()
         };

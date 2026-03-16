@@ -15,6 +15,9 @@ use crate::scheduler::{ScheduledTask, TaskRun};
 use crate::tmux_var;
 use crate::transport::Transport;
 
+/// Grace period before a local session's tmux pane is checked for liveness.
+const REAPER_GRACE_SECS: i64 = 15;
+
 /// Sanitize a name into a valid session ID (lowercase alphanumeric + dashes).
 pub fn sanitize_session_id(name: &str) -> String {
     name.to_lowercase()
@@ -648,7 +651,7 @@ impl AppState {
     /// Remove local sessions whose tmux panes have died.
     pub async fn reap_dead_sessions(&self) -> Vec<String> {
         let now = Utc::now();
-        let grace_secs = 15;
+        let grace_secs = REAPER_GRACE_SECS;
         let panes_to_check: Vec<(String, String)> = {
             let sessions = self.sessions.read().await;
             sessions

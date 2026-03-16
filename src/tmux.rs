@@ -19,6 +19,8 @@ const VIM_BACKSPACE_MS: u64 = 50;
 const PASTE_SETTLE_MS: u64 = 300;
 /// Delay before verification capture.
 const VERIFY_DELAY_MS: u64 = 100;
+/// Delay after dismissing autocomplete for Escape to settle.
+const ESCAPE_SETTLE_MS: u64 = 100;
 
 #[derive(Debug, Clone)]
 pub struct TmuxPane {
@@ -364,7 +366,7 @@ fn inject_text(pane: &str, message: &str) -> anyhow::Result<()> {
     let _ = Command::new("tmux")
         .args(["send-keys", "-t", pane, "Escape"])
         .status();
-    thread::sleep(Duration::from_millis(100));
+    thread::sleep(Duration::from_millis(ESCAPE_SETTLE_MS));
 
     let status = Command::new("tmux")
         .args(["send-keys", "-t", pane, "Enter"])

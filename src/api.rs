@@ -135,7 +135,7 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
     }))
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Debug, Deserialize, Default)]
 pub struct TicketQuery {
     /// Relay URLs for nostr transport (?relay=url1&relay=url2 or comma-separated).
     #[serde(default, deserialize_with = "deserialize_string_or_seq")]
@@ -219,7 +219,7 @@ pub async fn ticket(
     }
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Debug, Deserialize, Default)]
 pub struct RegenerateQuery {
     confirm: Option<bool>,
 }
@@ -479,12 +479,12 @@ pub async fn send_msg(
     Json(body): Json<SendBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     if body.from == body.to {
+        let suffix = format!("/{}", body.to);
+        let prefix = format!("{}/", body.to);
         let sessions = state.sessions.read().await;
         let suggestions: Vec<&str> = sessions
             .keys()
-            .filter(|k| {
-                k.ends_with(&format!("/{}", body.to)) || k.starts_with(&format!("{}/", body.to))
-            })
+            .filter(|k| k.ends_with(&suffix) || k.starts_with(&prefix))
             .map(|k| k.as_str())
             .collect();
         let hint = if suggestions.is_empty() {
@@ -1126,7 +1126,7 @@ pub async fn trigger_task(
     (StatusCode::OK, Json(json!({ "triggered": body.id })))
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Debug, Deserialize, Default)]
 pub struct TaskRunsQuery {
     task: Option<String>,
 }
@@ -1158,7 +1158,7 @@ pub async fn list_task_runs(
 
 // --- Human sessions ---
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct AddHumanBody {
     pub npub: String,
     pub name: String,
@@ -1241,7 +1241,7 @@ pub async fn add_human(
     )
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct RemoveHumanBody {
     pub name: String,
 }

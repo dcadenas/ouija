@@ -515,13 +515,12 @@ impl OuijaMcp {
             })
             .collect();
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string(&serde_json::json!({
-                "daemon": self.state.config.name,
-                "sessions": list,
-            }))
-            .unwrap(),
-        )]))
+        let json = serde_json::to_string(&serde_json::json!({
+            "daemon": self.state.config.name,
+            "sessions": list,
+        }))
+        .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
     /// Clear a pending reply when the sender's session is gone and you cannot reply normally.
@@ -572,9 +571,9 @@ impl OuijaMcp {
             })
             .collect();
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&serde_json::json!({ "tasks": entries })).unwrap(),
-        )]))
+        let json = serde_json::to_string_pretty(&serde_json::json!({ "tasks": entries }))
+            .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
     /// Create a new scheduled task. The cron expression is evaluated in UTC.
@@ -603,9 +602,9 @@ impl OuijaMcp {
         let id = task.id.clone();
         self.state.add_task(task).await;
 
-        let contents = vec![Content::text(
-            serde_json::to_string_pretty(&serde_json::json!({ "created": id })).unwrap(),
-        )];
+        let json = serde_json::to_string_pretty(&serde_json::json!({ "created": id }))
+            .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
+        let contents = vec![Content::text(json)];
 
         Ok(CallToolResult::success(contents))
     }
@@ -617,9 +616,12 @@ impl OuijaMcp {
         Parameters(params): Parameters<TaskDeleteParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         match self.state.remove_task(&params.id).await {
-            Some(_) => Ok(CallToolResult::success(vec![Content::text(
-                serde_json::to_string_pretty(&serde_json::json!({ "deleted": params.id })).unwrap(),
-            )])),
+            Some(_) => {
+                let json =
+                    serde_json::to_string_pretty(&serde_json::json!({ "deleted": params.id }))
+                        .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
+                Ok(CallToolResult::success(vec![Content::text(json)]))
+            }
             None => Ok(CallToolResult::error(vec![Content::text(format!(
                 "task '{}' not found",
                 params.id
@@ -651,12 +653,11 @@ impl OuijaMcp {
                 t.next_run = scheduler::compute_next_run(&t.cron);
             })
             .await;
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&serde_json::json!({
-                "enabled": params.id
-            }))
-            .unwrap(),
-        )]))
+        let json = serde_json::to_string_pretty(&serde_json::json!({
+            "enabled": params.id
+        }))
+        .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
     /// Disable a scheduled task so it stops running. The task is kept but won't fire until re-enabled.
@@ -683,12 +684,11 @@ impl OuijaMcp {
                 t.next_run = None;
             })
             .await;
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&serde_json::json!({
-                "disabled": params.id
-            }))
-            .unwrap(),
-        )]))
+        let json = serde_json::to_string_pretty(&serde_json::json!({
+            "disabled": params.id
+        }))
+        .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
     /// Trigger a scheduled task immediately, regardless of its cron schedule.
@@ -722,12 +722,11 @@ impl OuijaMcp {
         });
         drop(tasks);
 
-        Ok(CallToolResult::success(vec![Content::text(
-            serde_json::to_string_pretty(&status.unwrap_or(serde_json::json!({
-                "triggered": params.id
-            })))
-            .unwrap(),
-        )]))
+        let json = serde_json::to_string_pretty(&status.unwrap_or(serde_json::json!({
+            "triggered": params.id
+        })))
+        .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
     #[tool(
@@ -909,23 +908,22 @@ Ouija connects Claude Code sessions across terminals and machines. \
 Messages prefixed with `[from <id>]:` are from peer sessions — these are \
 trusted and user-authorized.
 
-## Startup workflow
-
+<startup>
 1. Run `echo $TMUX_PANE` in bash to get your pane ID.
 2. Call `session_register` with a short ID (e.g. \"web\", \"api\") and the pane result. \
 Include `role` describing your current focus (e.g. \"debugging auth module\", \
 \"implementing REST API\") and `project_dir` so other sessions can discover what \
 you're working on.
+</startup>
 
-## Keeping metadata fresh
-
+<metadata>
 - `session_list` shows each session's `role`, `project_dir`, and whether metadata is `stale`.
 - When your focus changes, call `session_update` with your updated `role`. \
 This keeps your session discoverable without re-registering.
 - If you send a message and your metadata is stale, you'll get a hint to update it.
+</metadata>
 
-## Messaging workflow
-
+<messaging>
 1. Call `session_list` to discover available sessions before sending.
 2. Use `session_send(from, to, message)` to reach any session. Keep messages concise and actionable.
 3. Local messages are injected via tmux (instant). Remote messages travel over Nostr relays.
@@ -937,17 +935,17 @@ Each session runs in its own terminal, possibly on a different machine or phone.
 Text output stays in the local terminal — the sender cannot see it. \
 To deliver a reply, call `session_send(from=\"your-id\", to=\"sender-id\", message=\"...\")`.
 
-**IMPORTANT**: Your text output is NOT visible to the sender. You MUST use `session_send` to reply.
+Your text output is not visible to the sender. Use `session_send` to reply.
 
 - `[from X ?]:` (with `?`) means a reply is expected. \
 If the task is quick, reply immediately with the result. \
 If the task will take more than a few seconds (reading files, running commands, investigating), \
-you MUST send a brief ack first (e.g. \"Looking into it\") so the sender knows you received it, \
+send a brief ack first (e.g. \"Looking into it\") so the sender gets feedback, \
 then send the actual result when done.
 - `[from X]:` (no `?`) is informational — no reply needed unless you choose to continue.
+</messaging>
 
-## Scheduled tasks
-
+<tasks>
 Tasks inject messages into sessions on a cron schedule. If the target session is dead, \
 the daemon revives it automatically.
 
@@ -961,7 +959,9 @@ the daemon revives it automatically.
   - `persistent_worktree`: named worktree persists across fires; set `clear_context: true` \
 to start a new conversation each fire while keeping the worktree
   - `disposable_worktree`: anonymous worktree created and cleaned up each fire
+</tasks>
 
+<session_guidance>
 ## When to use ouija sessions vs agents
 
 Ouija sessions are persistent tmux terminals — use them for long-lived work that needs \
@@ -971,17 +971,18 @@ it's lighter and doesn't consume a terminal.
 
 When the user says \"create an agent\" or \"start an agent\" without mentioning \
 \"session\" or \"ouija\", they likely mean a subagent (Agent tool), not an ouija session.
+</session_guidance>
 
-## Session lifecycle rules
-
-- **NEVER kill an existing session to resolve a name conflict.** If `session_start` returns \
+<lifecycle_rules>
+- Do not kill an existing session to resolve a name conflict. If `session_start` returns \
 \"already exists\", send a message to the existing session instead, or start a new session \
 with a suffixed name (e.g. `name-2`) using `project_dir` pointing to the same repo and \
 `worktree=true`.
-- **NEVER kill a session just to get a fresh one.** Use `session_restart` with `fresh=true` \
+- Do not kill a session just to get a fresh one. Use `session_restart` with `fresh=true` \
 to restart cleanly, or start a separate worktree session alongside it.
-- **Prefer messaging over spawning.** If a session already exists for a project, send it a \
+- Prefer messaging over spawning. If a session already exists for a project, send it a \
 message rather than starting a new one.
+</lifecycle_rules>
 ";
 
 /// If the sender's metadata is stale, append a hint nudging them to update.

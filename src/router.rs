@@ -1,6 +1,9 @@
 use crate::persistence::RouterConfig;
 use crate::state::{AppState, LogEntry, SessionOrigin};
 
+/// Timeout for LLM router API requests.
+const ROUTER_API_TIMEOUT_SECS: u64 = 30;
+
 #[derive(Debug, PartialEq)]
 pub enum RouterDecision {
     Route { targets: Vec<String> },
@@ -8,6 +11,7 @@ pub enum RouterDecision {
     DirectAnswer(String),
 }
 
+#[derive(Debug)]
 pub struct SessionSnapshot {
     pub id: String,
     pub origin: String,
@@ -17,6 +21,7 @@ pub struct SessionSnapshot {
     pub bulletin: Option<String>,
 }
 
+#[derive(Debug)]
 pub struct MessageSnapshot {
     pub timestamp: String,
     pub from: String,
@@ -51,22 +56,24 @@ fn build_system_prompt(
     is_admin: bool,
 ) -> String {
     let mut prompt = String::from(
-        "You are the message router for ouija, a cross-machine AI session daemon.\n\n\
-         ## About ouija\n\
+        "<role>\n\
+         You are the message router for ouija, a cross-machine AI session daemon.\n\
          ouija manages multiple Claude Code sessions running across different machines and projects.\n\
          Each session is an AI agent working in a tmux pane on a specific codebase.\n\
          Sessions communicate via the ouija daemon using Nostr (a decentralized messaging protocol).\n\
          The human sends messages via Nostr DMs to the daemon. Your job is to read those messages,\n\
-         understand intent and context, and route them to the right session(s).\n\n\
+         understand intent and context, and route them to the right session(s).\n\
+         </role>\n\n\
+         <context>\n\
          When you route a message, the daemon delivers the human's original message verbatim to\n\
          the target session(s) via tmux injection. The session then sees it as `[from <human>]: <message>`\n\
-         and can respond. You do NOT need to rewrite or summarize the message — just pick the target(s).\n\n\
+         and can respond. You do not need to rewrite or summarize the message — just pick the target(s).\n\n\
          Use the session list to understand what each session is working on (role, project directory,\n\
          project description). Use the message log to understand conversation context — who has been\n\
          talking to whom, what topics are active, what the human was last discussing and with which session.\n\
          This context is crucial for routing ambiguous messages like \"continue with that\" or\n\
          \"tell them about the fix\".\n\n\
-         ## Available Sessions\n",
+         <sessions>\n",
     );
 
     if sessions.is_empty() {
@@ -95,6 +102,7 @@ fn build_system_prompt(
             ));
         }
     }
+    prompt.push_str("</sessions>\n");
 
     // Split messages: human conversation vs inter-session chatter
     let human_msgs: Vec<&MessageSnapshot> = messages
@@ -106,7 +114,7 @@ fn build_system_prompt(
         .filter(|m| m.from != human_name && m.to != human_name)
         .collect();
 
-    prompt.push_str("\n## Recent Conversation with Human\n");
+    prompt.push_str("\n<conversation_history>\n");
     if human_msgs.is_empty() {
         prompt.push_str("(no recent messages)\n");
     } else {
@@ -117,20 +125,23 @@ fn build_system_prompt(
             ));
         }
     }
+    prompt.push_str("</conversation_history>\n");
 
     if !session_msgs.is_empty() {
         // Only include a small tail of inter-session traffic
-        prompt.push_str("\n## Recent Inter-Session Messages\n");
+        prompt.push_str("\n<inter_session_messages>\n");
         for m in session_msgs.iter().rev().take(10).rev() {
             prompt.push_str(&format!(
                 "[{}] {} -> {}: {}\n",
                 m.timestamp, m.from, m.to, m.message
             ));
         }
+        prompt.push_str("</inter_session_messages>\n");
     }
+    prompt.push_str("</context>\n");
 
     prompt.push_str(
-        "\n## Available Commands\n\
+        "\n<commands>\n\
          The human can also issue commands via natural language. If their message matches \
          a command intent, respond with COMMAND <slash_command>.\n\n\
          /help              — show help message\n\
@@ -150,19 +161,21 @@ fn build_system_prompt(
          /task trigger <id> — trigger a task\n",
         );
     }
+    prompt.push_str("</commands>\n");
 
     prompt.push_str(&format!(
-        "\n## Instructions\n\
+        "\n<instructions>\n\
          The human's name is \"{human_name}\".\n\
-         You are a message router. Read the human's message, understand their intent using \
-         the session list and conversation history above, and decide where to send it.\n\n\
-         Respond with EXACTLY ONE of these formats (no extra text):\n\n\
+         Read the human's message, understand their intent using the session list and \
+         conversation history, and decide where to send it.\n\n\
+         Respond with exactly one of these formats (no extra text):\n\n\
          ROUTE <session_id> [session_id2 ...]\n\
          COMMAND <slash_command>\n\
          ANSWER: <response>\n\n\
          ROUTE sends the human's message (verbatim, handled by the system) to one or more sessions.\n\
          COMMAND executes a daemon command on behalf of the human.\n\
-         ANSWER lets you reply directly — use this sparingly, only when no session is relevant.\n"
+         ANSWER lets you reply directly — use sparingly, only when no session is relevant.\n\
+         </instructions>\n"
     ));
 
     prompt
@@ -211,7 +224,7 @@ async fn call_api(
         .post(&url)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("content-type", "application/json")
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(ROUTER_API_TIMEOUT_SECS))
         .json(&body)
         .send()
         .await?;

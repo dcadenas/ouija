@@ -10,6 +10,15 @@ use crate::protocol::WireMessage;
 use crate::state::AppState;
 use crate::transport::Transport;
 
+/// Timeout when waiting for relay connections to establish.
+const RELAY_CONNECT_TIMEOUT_SECS: u64 = 5;
+/// Maximum size of the seen-events dedup cache before clearing.
+const SEEN_EVENTS_CACHE_LIMIT: usize = 2048;
+/// Timeout for the claude process to exit after sending /exit.
+const PROCESS_EXIT_TIMEOUT_SECS: u64 = 10;
+/// Delay before injecting a prompt into a freshly started pane.
+const PROMPT_INJECT_DELAY_SECS: u64 = 5;
+
 /// Nostr-based transport using NIP-17 private direct messages.
 ///
 /// Each daemon is a Nostr identity. Messages are sent as gift-wrapped
@@ -47,7 +56,7 @@ impl NostrTransport {
 
         if !relay_urls.is_empty() {
             client
-                .wait_for_connection(std::time::Duration::from_secs(5))
+                .wait_for_connection(std::time::Duration::from_secs(RELAY_CONNECT_TIMEOUT_SECS))
                 .await;
         }
 
@@ -157,7 +166,7 @@ impl NostrTransport {
                                 }
                                 // Prevent unbounded growth — duplicates only
                                 // arrive within seconds, so purging is safe.
-                                if seen.len() > 2048 {
+                                if seen.len() > SEEN_EVENTS_CACHE_LIMIT {
                                     seen.clear();
                                 }
                             }
@@ -317,7 +326,7 @@ impl Transport for NostrTransport {
 
         if wait {
             self.client
-                .wait_for_connection(std::time::Duration::from_secs(5))
+                .wait_for_connection(std::time::Duration::from_secs(RELAY_CONNECT_TIMEOUT_SECS))
                 .await;
         }
 
@@ -1157,7 +1166,7 @@ pub async fn admin_kill_session(state: &std::sync::Arc<AppState>, name: &str) ->
                     .status();
 
                 // Poll up to 10s for claude process to exit
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(PROCESS_EXIT_TIMEOUT_SECS);
                 let mut exited = false;
                 while std::time::Instant::now() < deadline {
                     std::thread::sleep(std::time::Duration::from_secs(1));
@@ -1594,7 +1603,7 @@ fn schedule_prompt_injection(state: &std::sync::Arc<AppState>, pane_id: String, 
     let state = state.clone();
     tokio::spawn(async move {
         // Wait for claude to initialize in the pane
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(PROMPT_INJECT_DELAY_SECS)).await;
         if let Err(e) = crate::tmux::locked_inject(&state, &pane_id, &prompt, false).await {
             tracing::warn!("prompt injection into {pane_id} failed: {e}");
         }
