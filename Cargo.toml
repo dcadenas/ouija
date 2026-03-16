@@ -46,7 +46,12 @@ nostr-sdk = { version = "0.44", features = ["nip59"] }
 [dev-dependencies]
 tempfile = "3"
 
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/ouija-{ version }-{ target }.tar.gz"
-bin-dir = "ouija-{ version }-{ target }/ouija"
-pkg-fmt = "tgz"
+pkg-url = "{ repo }/releases/download/v{ version }/ouija-{ target }.tar.xz"
+bin-dir = "ouija-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "txz"

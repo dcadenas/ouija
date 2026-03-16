@@ -15,9 +15,11 @@ Unlike Claude Code [agent teams](https://code.claude.com/docs/en/agent-teams), w
 ## Quick start
 
 ```bash
-cargo binstall ouija   # or: cargo install ouija
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dcadenas/ouija/releases/latest/download/ouija-installer.sh | sh
 ouija start
 ```
+
+Or with Rust: `cargo binstall ouija` / `cargo install ouija`.
 
 This launches the daemon and auto-configures Claude Code (MCP endpoint, hooks, skills, status line). Open Claude Code inside tmux:
 
