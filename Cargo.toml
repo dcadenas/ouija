@@ -1,6 +1,6 @@
 [package]
 name = "ouija"
-version = "0.1.0-alpha.65"
+version = "0.1.0-alpha.72"
 edition = "2024"
 rust-version = "1.85"
 description = "Cross-machine AI session daemon — bridges Claude Code sessions via tmux injection and Nostr P2P"
@@ -44,9 +44,15 @@ ractor = { version = "0.15", default-features = false, features = ["async-trait"
 nostr-sdk = { version = "0.44", features = ["nip59"] }
 
 [dev-dependencies]
+stateright = "0.31.0"
 tempfile = "3"
 
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/ouija-{ version }-{ target }.tar.gz"
-bin-dir = "ouija-{ version }-{ target }/ouija"
-pkg-fmt = "tgz"
+pkg-url = "{ repo }/releases/download/v{ version }/ouija-{ target }.tar.xz"
+bin-dir = "ouija-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "txz"

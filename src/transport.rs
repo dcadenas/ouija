@@ -49,7 +49,10 @@ pub trait Transport: Send + Sync {
 /// Route an incoming wire message to the appropriate handler.
 ///
 /// Called by transport implementations when bytes arrive from a peer.
-pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
+/// When `sender_npub` is provided, the daemon_id field in the message is
+/// verified against the actual Nostr sender pubkey. Mismatches are logged
+/// and the message is dropped.
+pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8], sender_npub: Option<&str>) {
     let msg: WireMessage = match serde_json::from_slice(content) {
         Ok(m) => m,
         Err(e) => {
@@ -57,6 +60,27 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
             return;
         }
     };
+
+    // Verify daemon_id matches the actual Nostr sender when available.
+    if let Some(expected) = sender_npub {
+        let claimed = msg.daemon_id();
+        if let Some(claimed) = claimed {
+            if claimed != expected {
+                tracing::warn!(
+                    "daemon_id mismatch: message claims {claimed} but sender is {expected}, dropping"
+                );
+                return;
+            }
+        }
+    }
+
+    // Drop stale wire messages using the monotonic sequence counter.
+    if let (Some(daemon_id), Some(seq)) = (msg.daemon_id(), msg.seq()) {
+        if !state.accept_seq(daemon_id, seq) {
+            tracing::debug!("dropping stale message from {daemon_id} (seq={seq} < last_seen)");
+            return;
+        }
+    }
 
     match msg {
         WireMessage::SessionSend {
@@ -70,9 +94,11 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
                 Human { npub: String },
             }
 
-            let target = {
+            // Resolve bare `from` to daemon-prefixed key so replies route
+            // back across machines (e.g. "ouija" -> "locota/ouija").
+            let (target, display_from, sender_known) = {
                 let sessions = state.sessions.read().await;
-                sessions.get(&to).and_then(|session| match &session.origin {
+                let target = sessions.get(&to).and_then(|session| match &session.origin {
                     SessionOrigin::Local if session.metadata.networked => {
                         session.pane.as_ref().map(|p| DeliveryTarget::Local {
                             pane: p.clone(),
@@ -83,21 +109,33 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
                         Some(DeliveryTarget::Human { npub: npub.clone() })
                     }
                     _ => None,
-                })
+                });
+                let remote_match = sessions
+                    .iter()
+                    .find(|(_, s)| {
+                        matches!(&s.origin, SessionOrigin::Remote(_))
+                            && crate::state::strip_remote_prefix(&s.id) == from.as_str()
+                    })
+                    .map(|(key, _)| key.clone());
+                let sender_known = remote_match.is_some();
+                let display_from = remote_match.unwrap_or_else(|| from.clone());
+                (target, display_from, sender_known)
             };
 
             match target {
                 Some(DeliveryTarget::Local { pane, vim_mode }) => {
-                    let formatted = tmux::format_session_message(&from, &message, expects_reply);
-                    let delivered =
-                        tmux::locked_inject(state, &pane, &formatted, vim_mode).await.is_ok();
+                    let formatted =
+                        tmux::format_session_message(&display_from, &message, expects_reply);
+                    let delivered = tmux::locked_inject(state, &pane, &formatted, vim_mode)
+                        .await
+                        .is_ok();
                     if delivered {
                         let mut sessions = state.sessions.write().await;
                         if let Some(s) = sessions.get_mut(&to) {
                             s.block_interactive = true;
                         }
                     }
-                    if delivered && expects_reply {
+                    if delivered && expects_reply && sender_known {
                         state
                             .notify_agent(
                                 &to,
@@ -130,7 +168,7 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
                     broadcast(state, &ack).await;
                 }
                 Some(DeliveryTarget::Human { npub }) => {
-                    let formatted = format!("[from {from}]: {message}");
+                    let formatted = format!("[from {display_from}]: {message}");
                     let delivered = crate::nostr_transport::send_plain_dm(state, &npub, &formatted)
                         .await
                         .is_ok();
@@ -160,6 +198,7 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
             daemon_id,
             daemon_name,
             metadata,
+            ..
         } => {
             let display_name = display_name(&daemon_name, &daemon_id);
             let key = crate::state::remote_session_key(display_name, &id);
@@ -172,6 +211,7 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
                     pane: None,
                     origin: SessionOrigin::Remote(daemon_id),
                     registered_at: chrono::Utc::now(),
+                    last_activity_at: chrono::Utc::now(),
                     metadata: metadata.clone().unwrap_or_default(),
                     block_interactive: false,
                 });
@@ -183,6 +223,7 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
             sessions: session_infos,
             daemon_id,
             daemon_name,
+            ..
         } => {
             let ids: Vec<&str> = session_infos.iter().map(|i| i.id.as_str()).collect();
             tracing::info!("received session list from {daemon_name} ({daemon_id}): {ids:?}",);
@@ -193,6 +234,25 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
 
             let mut sessions = state.sessions.write().await;
 
+            // Remove stale entries from a prior SessionAnnounce that used a
+            // different prefix (e.g. daemon_id when daemon_name was empty).
+            let raw_ids: std::collections::HashSet<&str> =
+                session_infos.iter().map(|i| i.id.as_str()).collect();
+            let announce_dupes: Vec<String> = sessions
+                .iter()
+                .filter(|(_, s)| matches!(&s.origin, SessionOrigin::Remote(d) if d == &daemon_id))
+                .filter(|(key, _)| {
+                    let suffix = crate::state::strip_remote_prefix(key);
+                    let canonical = crate::state::remote_session_key(&daemon_name, suffix);
+                    raw_ids.contains(suffix) && **key != canonical
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in &announce_dupes {
+                sessions.remove(key);
+                tracing::info!("removed announce-race duplicate: {key}");
+            }
+
             for info in &session_infos {
                 let key = crate::state::remote_session_key(&daemon_name, &info.id);
                 let entry = sessions
@@ -202,6 +262,7 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
                         pane: None,
                         origin: SessionOrigin::Remote(daemon_id.clone()),
                         registered_at: chrono::Utc::now(),
+                        last_activity_at: chrono::Utc::now(),
                         metadata: info.metadata.clone().unwrap_or_default(),
                         block_interactive: false,
                     });
@@ -222,6 +283,19 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
             }
 
             drop(sessions);
+
+            // Clear orphaned pending replies for all removed remote sessions.
+            // Pending replies track bare session names (from wire messages),
+            // so strip the daemon prefix from removed keys.
+            let mut removed_bare: Vec<String> = stale
+                .iter()
+                .chain(announce_dupes.iter())
+                .map(|key| crate::state::strip_remote_prefix(key).to_string())
+                .collect();
+            removed_bare.dedup();
+            if !removed_bare.is_empty() {
+                state.clear_orphaned_pending_replies(&removed_bare).await;
+            }
 
             state.nodes.write().await.insert(
                 daemon_id.clone(),
@@ -247,17 +321,58 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
             id,
             daemon_id,
             daemon_name,
+            ..
         } => {
             let display_name = display_name(&daemon_name, &daemon_id);
             let key = crate::state::remote_session_key(display_name, &id);
             tracing::info!("remote session removed: {key} from daemon {daemon_id}");
-            let mut sessions = state.sessions.write().await;
-            if sessions
-                .get(&key)
-                .is_some_and(|s| matches!(&s.origin, SessionOrigin::Remote(d) if d == &daemon_id))
-            {
-                sessions.remove(&key);
+            let removed = {
+                let mut sessions = state.sessions.write().await;
+                if sessions.get(&key).is_some_and(
+                    |s| matches!(&s.origin, SessionOrigin::Remote(d) if d == &daemon_id),
+                ) {
+                    sessions.remove(&key).is_some()
+                } else {
+                    false
+                }
+            };
+            if removed {
+                state.clear_orphaned_pending_replies(&[id]).await;
             }
+        }
+        WireMessage::SessionRenamed {
+            old_id,
+            new_id,
+            daemon_id,
+            daemon_name,
+            metadata,
+            ..
+        } => {
+            let display = display_name(&daemon_name, &daemon_id);
+            let old_key = crate::state::remote_session_key(display, &old_id);
+            let new_key = crate::state::remote_session_key(display, &new_id);
+            tracing::info!("remote session renamed: {old_key} -> {new_key}");
+
+            let mut sessions = state.sessions.write().await;
+            let old_session = sessions.remove(&old_key);
+            let new_session = crate::state::Session {
+                id: new_key.clone(),
+                pane: None,
+                origin: SessionOrigin::Remote(daemon_id),
+                registered_at: old_session
+                    .as_ref()
+                    .map(|s| s.registered_at)
+                    .unwrap_or_else(chrono::Utc::now),
+                last_activity_at: chrono::Utc::now(),
+                metadata: metadata
+                    .unwrap_or_else(|| old_session.map(|s| s.metadata).unwrap_or_default()),
+                block_interactive: false,
+            };
+            sessions.insert(new_key.clone(), new_session);
+            drop(sessions);
+
+            state.add_alias(&old_key, &new_key).await;
+            state.add_alias(&old_id, &new_id).await;
         }
         WireMessage::Command { command, daemon_id } => {
             tracing::info!("received command from {daemon_id}: {command}");
@@ -303,6 +418,7 @@ pub async fn broadcast_local_sessions(state: &AppState) {
         sessions: local_infos,
         daemon_id: state.config.npub.clone(),
         daemon_name: state.config.name.clone(),
+        seq: state.current_seq(),
     };
     broadcast(state, &msg).await;
 }

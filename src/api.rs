@@ -641,22 +641,17 @@ pub async fn rename(
     }
     match state.rename_session(&body.old_id, &body.new_id).await {
         Some(session) => {
-            // Notify peers: remove old name, announce new if networked
-            let remove_msg = crate::protocol::WireMessage::SessionRemove {
-                id: body.old_id.clone(),
+            let seq = state.next_seq();
+            let msg = crate::protocol::WireMessage::SessionRenamed {
+                old_id: body.old_id.clone(),
+                new_id: body.new_id.clone(),
                 daemon_id: state.config.npub.clone(),
                 daemon_name: state.config.name.clone(),
+                metadata: Some(session.metadata.clone()),
+                seq,
             };
-            transport::broadcast(&state, &remove_msg).await;
-            if state.is_session_networked(&session) {
-                let announce_msg = crate::protocol::WireMessage::SessionAnnounce {
-                    id: session.id.clone(),
-                    daemon_id: state.config.npub.clone(),
-                    daemon_name: state.config.name.clone(),
-                    metadata: Some(session.metadata.clone()),
-                };
-                transport::broadcast(&state, &announce_msg).await;
-            }
+            transport::broadcast(&state, &msg).await;
+            transport::broadcast_local_sessions(&state).await;
             (
                 StatusCode::OK,
                 Json(json!({ "renamed": body.old_id, "to": body.new_id })),
@@ -680,12 +675,15 @@ pub async fn remove(
 ) -> (StatusCode, Json<serde_json::Value>) {
     match state.remove_session(&body.id).await {
         Some(_) => {
+            let seq = state.next_seq();
             let msg = crate::protocol::WireMessage::SessionRemove {
                 id: body.id.clone(),
                 daemon_id: state.config.npub.clone(),
                 daemon_name: state.config.name.clone(),
+                seq,
             };
             transport::broadcast(&state, &msg).await;
+            transport::broadcast_local_sessions(&state).await;
             (StatusCode::OK, Json(json!({ "removed": body.id })))
         }
         None => (
@@ -873,6 +871,7 @@ pub struct SettingsUpdateBody {
     projects_dir: Option<String>,
     idle_timeout_secs: Option<u64>,
     reaper_interval_secs: Option<u64>,
+    max_local_sessions: Option<u64>,
 }
 
 pub async fn update_settings(
@@ -891,6 +890,9 @@ pub async fn update_settings(
     }
     if let Some(v) = body.reaper_interval_secs {
         settings.reaper_interval_secs = v;
+    }
+    if let Some(v) = body.max_local_sessions {
+        settings.max_local_sessions = v;
     }
     if let Err(e) = crate::persistence::save_settings(&state.config.config_dir, &settings) {
         tracing::warn!("failed to save settings: {e}");
@@ -1227,6 +1229,7 @@ pub async fn add_human(
             pane: None,
             origin: crate::state::SessionOrigin::Human(body.npub.clone()),
             registered_at: chrono::Utc::now(),
+            last_activity_at: chrono::Utc::now(),
             metadata: crate::state::SessionMetadata {
                 role: Some("human".to_string()),
                 networked: false,
@@ -1437,11 +1440,14 @@ pub async fn session_stopped(
 ) -> StatusCode {
     let pane_id = format!("%{pane}");
     let session_id = {
-        let sessions = state.sessions.read().await;
+        let mut sessions = state.sessions.write().await;
         sessions
-            .values()
+            .values_mut()
             .find(|s| s.pane.as_deref() == Some(&pane_id))
-            .map(|s| s.id.clone())
+            .map(|s| {
+                s.last_activity_at = chrono::Utc::now();
+                s.id.clone()
+            })
     };
     if let Some(id) = session_id {
         state
@@ -1462,6 +1468,7 @@ pub async fn session_active(
         .find(|s| s.pane.as_deref() == Some(&pane_id))
         .map(|s| {
             s.block_interactive = false;
+            s.last_activity_at = chrono::Utc::now();
             s.id.clone()
         });
     drop(sessions);

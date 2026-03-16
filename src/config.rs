@@ -17,6 +17,10 @@ impl OuijaConfig {
         dirs_config_dir().unwrap_or_else(|_| PathBuf::from("."))
     }
 
+    pub fn default_data_dir() -> PathBuf {
+        dirs_data_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
+
     pub fn new(
         name: String,
         port: u16,

@@ -251,12 +251,15 @@ impl OuijaMcp {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         match self.state.remove_session(&params.id).await {
             Some(_) => {
+                let seq = self.state.next_seq();
                 let msg = crate::protocol::WireMessage::SessionRemove {
                     id: params.id.clone(),
                     daemon_id: self.state.config.npub.clone(),
                     daemon_name: self.state.config.name.clone(),
+                    seq,
                 };
                 crate::transport::broadcast(&self.state, &msg).await;
+                crate::transport::broadcast_local_sessions(&self.state).await;
                 tracing::info!("unregistered session: {}", params.id);
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "unregistered {}",
@@ -292,11 +295,13 @@ impl OuijaMcp {
             Some(session) => {
                 // Broadcast updated metadata to peers if networked
                 if self.state.is_session_networked(&session) {
+                    let seq = self.state.next_seq();
                     let msg = crate::protocol::WireMessage::SessionAnnounce {
                         id: session.id.clone(),
                         daemon_id: self.state.config.npub.clone(),
                         daemon_name: self.state.config.name.clone(),
                         metadata: Some(session.metadata.clone()),
+                        seq,
                     };
                     crate::transport::broadcast(&self.state, &msg).await;
                 }
@@ -332,8 +337,7 @@ impl OuijaMcp {
                                 params.expects_reply,
                             );
                             let vim_mode = session.metadata.vim_mode;
-                            match tmux::locked_inject(&self.state, pane, &formatted, vim_mode)
-                                .await
+                            match tmux::locked_inject(&self.state, pane, &formatted, vim_mode).await
                             {
                                 Ok(()) => {
                                     // Mark target as handling an injected message
@@ -373,9 +377,9 @@ impl OuijaMcp {
                                         .await;
                                     Ok(CallToolResult::success(contents))
                                 }
-                                Err(e) => Ok(CallToolResult::error(vec![Content::text(
-                                    format!("tmux inject failed: {e}"),
-                                )])),
+                                Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                                    "tmux inject failed: {e}"
+                                ))])),
                             }
                         } else {
                             Ok(CallToolResult::error(vec![Content::text(format!(

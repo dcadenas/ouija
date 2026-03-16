@@ -21,6 +21,10 @@ const PASTE_SETTLE_MS: u64 = 300;
 const VERIFY_DELAY_MS: u64 = 100;
 /// Delay after dismissing autocomplete for Escape to settle.
 const ESCAPE_SETTLE_MS: u64 = 100;
+/// Max retry attempts for pane injection (pane busy / mid-output).
+const MAX_INJECT_RETRIES: u32 = 3;
+/// Base delay for exponential backoff between retries (500ms, 1s, 2s).
+const RETRY_BASE_MS: u64 = 500;
 
 #[derive(Debug, Clone)]
 pub struct TmuxPane {
@@ -160,8 +164,7 @@ pub fn pane_alive(pane_id: &str) -> bool {
         Err(_) => return false,
     };
 
-    ProcessTree::snapshot()
-        .is_some_and(|t| t.has_claude_descendant(pane_pid))
+    ProcessTree::snapshot().is_some_and(|t| t.has_claude_descendant(pane_pid))
 }
 
 /// Log a warning if the pane is not running a known app (e.g. `claude`).
@@ -189,7 +192,11 @@ fn check_known_app(pane: &str) -> anyhow::Result<()> {
     };
 
     if !KNOWN_APPS.iter().any(|&app| cmd == app) {
-        bail!("pane {pane} is running '{cmd}', not claude — refusing to inject");
+        tracing::warn!(
+            pane,
+            cmd,
+            "pane is not running a known app — injecting anyway"
+        );
     }
     Ok(())
 }
@@ -380,21 +387,70 @@ fn inject_text(pane: &str, message: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Inject a message while holding the pane lock (async wrapper).
+/// A queued injection request sent to the per-pane background worker.
+pub struct InjectRequest {
+    pub pane: String,
+    pub message: String,
+    pub vim_mode: bool,
+    pub result_tx: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+}
+
+/// Background worker that drains the FIFO queue for a single pane.
 ///
-/// Acquires the per-pane mutex from `state`, then runs the blocking
-/// injection on a dedicated thread. Returns `Ok(())` on success.
+/// Messages are processed in order. On failure, retries with exponential
+/// backoff before reporting the error back to the caller.
+pub async fn pane_inject_loop(mut rx: tokio::sync::mpsc::UnboundedReceiver<InjectRequest>) {
+    while let Some(req) = rx.recv().await {
+        let mut attempts = 0u32;
+        let result = loop {
+            let pane = req.pane.clone();
+            let message = req.message.clone();
+            let vim_mode = req.vim_mode;
+            match tokio::task::spawn_blocking(move || inject(&pane, &message, vim_mode)).await {
+                Ok(Ok(())) => break Ok(()),
+                Ok(Err(e)) => {
+                    attempts += 1;
+                    if attempts >= MAX_INJECT_RETRIES {
+                        break Err(e);
+                    }
+                    let delay = RETRY_BASE_MS * 2u64.pow(attempts - 1);
+                    tracing::warn!(
+                        pane = %req.pane,
+                        attempt = attempts,
+                        retry_ms = delay,
+                        "inject failed, retrying: {e}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+                Err(e) => break Err(anyhow::anyhow!("spawn_blocking join error: {e}")),
+            }
+        };
+        let _ = req.result_tx.send(result);
+    }
+}
+
+/// Enqueue a message for injection into a tmux pane.
+///
+/// Messages are queued in a per-pane FIFO and processed by a background
+/// worker. Ordering is preserved and messages are never lost. On injection
+/// failure the worker retries with backoff before returning the error.
 pub async fn locked_inject(
     state: &crate::state::AppState,
     pane: &str,
     message: &str,
     vim_mode: bool,
 ) -> anyhow::Result<()> {
-    let lock = state.pane_lock(pane);
-    let _guard = lock.lock().await;
-    let pane = pane.to_string();
-    let message = message.to_string();
-    tokio::task::spawn_blocking(move || inject(&pane, &message, vim_mode)).await?
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let req = InjectRequest {
+        pane: pane.to_string(),
+        message: message.to_string(),
+        vim_mode,
+        result_tx,
+    };
+    state.enqueue_inject(req);
+    result_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("inject queue closed"))?
 }
 
 pub fn format_session_message(from: &str, message: &str, expects_reply: bool) -> String {
@@ -403,6 +459,78 @@ pub fn format_session_message(from: &str, message: &str, expects_reply: bool) ->
     } else {
         format!("[from {from}]: {message}")
     }
+}
+
+/// Check if a pane is the only pane in its tmux window.
+pub fn is_sole_pane(pane_id: &str) -> bool {
+    // Get the window target for this pane, verifying tmux resolved our target
+    // (tmux falls back to the current pane on invalid targets with exit 0)
+    let info = match Command::new("tmux")
+        .args([
+            "display-message",
+            "-t",
+            pane_id,
+            "-p",
+            "#{pane_id}\t#{session_name}:#{window_index}",
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return false,
+    };
+
+    let Some((actual_pane, window)) = info.split_once('\t') else {
+        return false;
+    };
+
+    if actual_pane != pane_id {
+        return false;
+    }
+
+    // Count panes in that window
+    let output = match Command::new("tmux")
+        .args(["list-panes", "-t", window, "-F", "#{pane_id}"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+
+    String::from_utf8_lossy(&output.stdout).lines().count() == 1
+}
+
+/// Rename the tmux window containing a pane and disable automatic-rename.
+pub fn rename_window(pane_id: &str, name: &str) {
+    let _ = Command::new("tmux")
+        .args(["rename-window", "-t", pane_id, name])
+        .status();
+    let _ = Command::new("tmux")
+        .args([
+            "set-window-option",
+            "-t",
+            pane_id,
+            "automatic-rename",
+            "off",
+        ])
+        .status();
+}
+
+/// Re-enable automatic-rename on the tmux window containing a pane.
+pub fn enable_automatic_rename(pane_id: &str) {
+    let _ = Command::new("tmux")
+        .args(["set-window-option", "-t", pane_id, "automatic-rename", "on"])
+        .status();
+}
+
+/// Derive a tmux session name from a project directory path.
+/// Uses the directory basename with dots replaced by underscores
+/// (matching tmux-sessionizer convention).
+pub fn tmux_session_name(project_dir: &str) -> String {
+    let basename = std::path::Path::new(project_dir)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| project_dir.to_string());
+    basename.replace('.', "_")
 }
 
 #[cfg(test)]
@@ -428,5 +556,49 @@ mod tests {
     #[test]
     fn format_session_message_empty() {
         assert_eq!(format_session_message("x", "", false), "[from x]: ");
+    }
+
+    #[test]
+    fn tmux_session_name_basename() {
+        assert_eq!(
+            tmux_session_name("/home/user/code/divine-mobile"),
+            "divine-mobile"
+        );
+    }
+
+    #[test]
+    fn tmux_session_name_dots_replaced() {
+        assert_eq!(
+            tmux_session_name("/home/user/code/my.project"),
+            "my_project"
+        );
+    }
+
+    #[test]
+    fn tmux_session_name_preserves_hyphens_and_underscores() {
+        assert_eq!(tmux_session_name("/tmp/some_repo-name"), "some_repo-name");
+    }
+
+    #[test]
+    fn tmux_session_name_bare_name() {
+        assert_eq!(tmux_session_name("ouija"), "ouija");
+    }
+
+    #[test]
+    fn is_sole_pane_invalid_pane() {
+        // Non-existent pane should return false (tmux command fails)
+        assert!(!is_sole_pane("%99999"));
+    }
+
+    #[test]
+    fn rename_window_invalid_pane_no_panic() {
+        // Should not panic on non-existent pane
+        rename_window("%99999", "test");
+    }
+
+    #[test]
+    fn enable_automatic_rename_invalid_pane_no_panic() {
+        // Should not panic on non-existent pane
+        enable_automatic_rename("%99999");
     }
 }

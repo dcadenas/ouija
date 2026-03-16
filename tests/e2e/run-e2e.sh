@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 COMPOSE_LOCAL="$SCRIPT_DIR/docker-compose.yml"
 COMPOSE_NOSTR="$SCRIPT_DIR/docker-compose.nostr.yml"
+COMPOSE_INSTALL="$SCRIPT_DIR/docker-compose.install.yml"
 COMPOSE_OPTS="up --build --abort-on-container-exit --exit-code-from tests"
 
 run_local() {
@@ -14,6 +15,11 @@ run_local() {
 run_nostr() {
     echo "=== Running nostr e2e tests ==="
     docker compose -f "$COMPOSE_NOSTR" $COMPOSE_OPTS
+}
+
+run_install() {
+    echo "=== Running install e2e tests ==="
+    docker compose -f "$COMPOSE_INSTALL" $COMPOSE_OPTS
 }
 
 run_parallel() {
@@ -51,17 +57,19 @@ run_parallel() {
 case "${1:-all}" in
     local) run_local ;;
     nostr) run_nostr ;;
+    install) run_install ;;
     all) run_parallel ;;
     seq)
         run_local
         run_nostr
         ;;
     *)
-        echo "Usage: $0 [local|nostr|all|seq]"
-        echo "  local  — run local tests only"
-        echo "  nostr  — run nostr tests only"
-        echo "  all    — run both in parallel (default)"
-        echo "  seq    — run both sequentially"
+        echo "Usage: $0 [local|nostr|install|all|seq]"
+        echo "  local    — run local tests only"
+        echo "  nostr    — run nostr tests only"
+        echo "  install  — run install/preflight tests only"
+        echo "  all      — run local+nostr in parallel (default)"
+        echo "  seq      — run local+nostr sequentially"
         exit 1
         ;;
 esac

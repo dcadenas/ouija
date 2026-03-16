@@ -1,19 +1,25 @@
 # ouija
 
-Ad-hoc collaboration between live Claude Code sessions, across machines.
+Ad-hoc collaboration between live Claude Code sessions, locally or across machines. Sessions communicate through tmux injection, each stays in its own terminal, fully interactive.
+
+You've been building the auth service in one session for hours. Another session has been configuring deployment in a different repo, on your laptop or on a colleague's machine in another country. You realize each holds context the other needs. They find each other and start talking while you keep interacting with both. No restart, no re-planning, no context lost.
 
 ![Two Claude Code sessions collaborating through ouija](screenshot.png)
 
-The left session asks ouija to find out what port the auth service runs on. The right session — which just created the config file — receives the question, reads `config.toml`, and sends the answer back. Both sessions stay in their own terminals, fully interactive.
+Unlike Claude Code [agent teams](https://code.claude.com/docs/en/agent-teams), which plan a team upfront for a single task, ouija connects sessions that weren't planned together. Ad-hoc, cross-machine, no hierarchy. They're complementary: you can run agent teams inside ouija sessions.
 
-This works across machines too. Sessions on a remote node appear as `macbook/ios` — messages travel encrypted over Nostr relays, NAT-traversing, no port forwarding needed.
+## Prerequisites
+
+[tmux](https://github.com/tmux/tmux) and [Claude Code](https://docs.anthropic.com/en/docs/claude-code) on your PATH.
 
 ## Quick start
 
 ```bash
-cargo install ouija
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dcadenas/ouija/releases/latest/download/ouija-installer.sh | sh
 ouija start
 ```
+
+Or with Rust: `cargo binstall ouija` / `cargo install ouija`.
 
 This launches the daemon and auto-configures Claude Code (MCP endpoint, hooks, skills, status line). Open Claude Code inside tmux:
 
@@ -27,17 +33,17 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 
 ## What you can do
 
-**Message any session** — local or remote. Sessions discover each other automatically.
+**Message any session**, local or remote. Sessions discover each other automatically.
 
-**Spawn sessions on the fly** — `session_start("crash-ios")` creates a tmux window, launches Claude Code, and registers it. Pass a `prompt` to seed the session with context: `session_start(name="crash-ios", prompt="Investigate the iOS crash in auth module. Key context: ...")`. Works on `session_restart` too.
+**Spawn sessions on the fly.** `session_start("crash-ios")` creates a tmux window, launches Claude Code, and registers it. Pass a `prompt` to seed the session with context. Works on `session_restart` too.
 
-**Schedule tasks** — cron jobs that inject messages into sessions. If the target session is dead, the daemon revives it automatically. One-shot tasks (`once: true`) fire once then auto-delete. Test a task immediately with `task_trigger` without waiting for its schedule.
+**Schedule tasks.** Cron jobs that inject messages into sessions. If the target session is dead, the daemon revives it automatically. One-shot tasks (`once: true`) fire once then auto-delete. Test immediately with `task_trigger`.
 
-**Worktree sessions** — spawn sessions in isolated git worktrees for parallel work on the same repo without branch conflicts.
+**Worktree sessions.** Spawn sessions in isolated git worktrees for parallel work on the same repo without branch conflicts.
 
-**Human DMs** — configure your Nostr npub to control the daemon from any Nostr client. Send `/list`, `/start`, `@session message`, or bare text (routed by an LLM).
+**Human DMs.** Configure your Nostr npub to control the daemon from any Nostr client. Send `/list`, `/start`, `@session message`, or bare text (routed by an LLM).
 
-**Admin dashboard** — live at `http://localhost:7880/admin`. Manage sessions, tasks, node connections, human access, and settings.
+**Admin dashboard** at `localhost:7880/admin`. Manage sessions, tasks, node connections, human access, and settings.
 
 ## Connecting machines
 
@@ -53,15 +59,15 @@ On machine B:
 ouija connect <ticket> --name macbook
 ```
 
-Sessions on both machines discover each other. Tickets contain a connect secret — only authorized nodes can communicate.
+Sessions on both machines discover each other. Tickets contain a connect secret, only authorized nodes can communicate.
 
 ## How it works
 
 1. Each machine runs an **ouija daemon** (small Rust binary)
 2. Sessions connect via **MCP** and auto-register on startup
 3. Local messages: **tmux injection** into the target pane
-4. Remote messages: **Nostr NIP-17 private DMs** — encrypted, decoupled, NAT-traversing
-5. Node auth: **connect secret** in the ticket — unknown senders rejected
+4. Remote messages: **Nostr NIP-17 private DMs**, encrypted, decoupled, NAT-traversing
+5. Node auth: **connect secret** in the ticket, unknown senders rejected
 
 ## Security
 
@@ -86,6 +92,16 @@ Run `ouija --help` for the full command list.
 ## Data
 
 Config in `~/.config/ouija/` (settings, identity). Data in `~/.local/share/ouija/` (sessions, tasks, connections). Message metadata is logged for diagnostics (content is not logged).
+
+## Tmux integration
+
+Windows are automatically named after the ouija session when the pane is the only one in the window. Each pane also gets a `@ouija_session` user variable you can use in your tmux config for more control:
+
+```tmux
+set -g window-status-current-format '#{?@ouija_session,⊕ #{@ouija_session},#{b:pane_current_path}}'
+```
+
+Fuzzy session pickers that read tmux's display format will show ouija session names automatically. The author uses [dcadenas/tmux-sessionizer](https://github.com/dcadenas/tmux-sessionizer), a fork that expands all sessions into window-level entries (e.g. `ouija/1:⊕ daily-report`), making ouija sessions easy to find and switch to.
 
 ## Testing
 

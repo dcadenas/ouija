@@ -516,7 +516,8 @@ async fn revive_and_inject(
     let new_pane = tokio::task::spawn_blocking({
         let dir = dir.clone();
         let task_name = task.name.clone();
-        let session_name = task.session_name().to_string();
+        let window_name = task.session_name().to_string();
+        let tmux_session = crate::tmux::tmux_session_name(&dir);
         let claude_session_id = if clears_context {
             None
         } else {
@@ -526,19 +527,20 @@ async fn revive_and_inject(
         };
         move || -> anyhow::Result<String> {
             let tmux_session_exists = std::process::Command::new("tmux")
-                .args(["has-session", "-t", &session_name])
+                .args(["has-session", "-t", &tmux_session])
                 .output()
                 .is_ok_and(|o| o.status.success());
 
+            let target = format!("{tmux_session}:");
             let output = if tmux_session_exists {
                 std::process::Command::new("tmux")
                     .args([
                         "new-window",
                         "-d",
                         "-t",
-                        &session_name,
+                        &target,
                         "-n",
-                        &session_name,
+                        &window_name,
                         "-P",
                         "-F",
                         "#{pane_id}",
@@ -550,9 +552,9 @@ async fn revive_and_inject(
                         "new-session",
                         "-d",
                         "-s",
-                        &session_name,
+                        &tmux_session,
                         "-n",
-                        &session_name,
+                        &window_name,
                         "-P",
                         "-F",
                         "#{pane_id}",
@@ -626,11 +628,10 @@ async fn revive_and_inject(
 
     // Phase 2: Wait for Claude's TUI to be ready (prompt indicator appears)
     let poll_pane = new_pane.clone();
-    let tui_ready = tokio::task::spawn_blocking(move || {
-        wait_for_tui_ready(&poll_pane, TUI_READY_TIMEOUT_SECS)
-    })
-    .await
-    .unwrap_or(false);
+    let tui_ready =
+        tokio::task::spawn_blocking(move || wait_for_tui_ready(&poll_pane, TUI_READY_TIMEOUT_SECS))
+            .await
+            .unwrap_or(false);
 
     if !tui_ready {
         tracing::warn!(
@@ -674,7 +675,13 @@ fn wait_for_claude_process(pane: &str, timeout_secs: u64) -> bool {
     while std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_secs(REVIVAL_POLL_SECS));
         if let Ok(output) = std::process::Command::new("tmux")
-            .args(["display-message", "-t", pane, "-p", "#{pane_current_command}"])
+            .args([
+                "display-message",
+                "-t",
+                pane,
+                "-p",
+                "#{pane_current_command}",
+            ])
             .output()
         {
             if String::from_utf8_lossy(&output.stdout).trim() == "claude" {

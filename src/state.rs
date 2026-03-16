@@ -105,8 +105,10 @@ pub struct AppState {
     pub settings: RwLock<OuijaSettings>,
     pub scheduled_tasks: RwLock<HashMap<String, ScheduledTask>>,
     pub task_runs: RwLock<VecDeque<TaskRun>>,
-    /// Per-pane serialization locks to prevent concurrent injections.
-    pane_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-pane FIFO injection queues (each backed by a background worker).
+    pane_queues: std::sync::Mutex<
+        HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::tmux::InjectRequest>>,
+    >,
     /// Serializes log file writes to prevent interleaved lines.
     log_file_lock: std::sync::Mutex<()>,
     /// Serializes task_runs.jsonl writes.
@@ -127,6 +129,11 @@ pub struct AppState {
     pending_commands: std::sync::Mutex<Vec<(String, tokio::sync::oneshot::Sender<String>)>>,
     /// Cached tmux panes running Claude, refreshed by the reaper loop.
     cached_claude_panes: RwLock<Vec<crate::tmux::TmuxPane>>,
+    /// Monotonic counter incremented on every local session mutation.
+    /// Included in outgoing wire messages so receivers can drop stale ones.
+    wire_seq: std::sync::atomic::AtomicU64,
+    /// Per-peer last-seen sequence number for filtering stale incoming messages.
+    last_seen_seq: std::sync::Mutex<HashMap<String, u64>>,
     /// Per-fire worktree panes: pane_id → project_dir.
     /// Reaper runs `git worktree prune` when these panes die.
     pub perfire_worktree_panes: RwLock<HashMap<String, String>>,
@@ -201,6 +208,7 @@ pub struct Session {
     pub pane: Option<String>,
     pub origin: SessionOrigin,
     pub registered_at: DateTime<Utc>,
+    pub last_activity_at: DateTime<Utc>,
     pub metadata: SessionMetadata,
     /// Block interactive prompts (AskUserQuestion, EnterPlanMode).
     /// Set on tmux injection, cleared when the user types directly.
@@ -276,7 +284,7 @@ impl AppState {
             settings: RwLock::new(Default::default()),
             scheduled_tasks: RwLock::new(HashMap::new()),
             task_runs: RwLock::new(VecDeque::with_capacity(100)),
-            pane_locks: std::sync::Mutex::new(HashMap::new()),
+            pane_queues: std::sync::Mutex::new(HashMap::new()),
             log_file_lock: std::sync::Mutex::new(()),
             task_run_log_lock: std::sync::Mutex::new(()),
             connected_npubs: std::sync::Mutex::new(HashMap::new()),
@@ -287,6 +295,8 @@ impl AppState {
             pending_commands: std::sync::Mutex::new(Vec::new()),
             cached_claude_panes: RwLock::new(Vec::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
+            wire_seq: std::sync::atomic::AtomicU64::new(0),
+            last_seen_seq: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -304,7 +314,7 @@ impl AppState {
             settings: RwLock::new(settings),
             scheduled_tasks: RwLock::new(scheduled_tasks),
             task_runs: RwLock::new(VecDeque::with_capacity(MAX_TASK_RUNS)),
-            pane_locks: std::sync::Mutex::new(HashMap::new()),
+            pane_queues: std::sync::Mutex::new(HashMap::new()),
             log_file_lock: std::sync::Mutex::new(()),
             task_run_log_lock: std::sync::Mutex::new(()),
             connected_npubs: std::sync::Mutex::new(HashMap::new()),
@@ -315,7 +325,41 @@ impl AppState {
             pending_commands: std::sync::Mutex::new(Vec::new()),
             cached_claude_panes: RwLock::new(Vec::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
+            wire_seq: std::sync::atomic::AtomicU64::new(0),
+            last_seen_seq: std::sync::Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Increment the monotonic wire-message sequence counter and return the new value.
+    pub fn next_seq(&self) -> u64 {
+        self.wire_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
+
+    /// Return the current wire-message sequence counter without incrementing.
+    pub fn current_seq(&self) -> u64 {
+        self.wire_seq.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Check whether an incoming message's seq is stale relative to the last
+    /// seen seq from that daemon. If not stale, updates last_seen and returns true.
+    pub fn accept_seq(&self, daemon_id: &str, seq: u64) -> bool {
+        let mut map = self.last_seen_seq.lock().expect("last_seen_seq poisoned");
+        let last = map.get(daemon_id).copied().unwrap_or(0);
+        if seq < last {
+            // A small seq after a large one indicates a daemon restart (counter
+            // resets to 0). Accept it and reset tracking so the restarted
+            // daemon's messages aren't dropped. seq==0 also covers backward-
+            // compat messages without a seq field.
+            if seq <= 1 {
+                map.remove(daemon_id);
+                return true;
+            }
+            return false;
+        }
+        map.insert(daemon_id.to_string(), seq);
+        true
     }
 
     /// Register a connected node by npub.
@@ -385,13 +429,28 @@ impl AppState {
         session.metadata.networked
     }
 
-    /// Get or create a per-pane serialization lock.
-    pub fn pane_lock(&self, pane: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self.pane_locks.lock().expect("pane_locks poisoned");
-        locks
-            .entry(pane.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+    /// Enqueue an injection request for a pane, spawning its worker if needed.
+    pub fn enqueue_inject(&self, req: crate::tmux::InjectRequest) {
+        let pane_key = req.pane.clone();
+        let mut queues = self.pane_queues.lock().expect("pane_queues poisoned");
+
+        // Try existing channel; recover the request if the worker died.
+        let req = if let Some(tx) = queues.get(&pane_key) {
+            match tx.send(req) {
+                Ok(()) => return,
+                Err(e) => {
+                    queues.remove(&pane_key);
+                    e.0
+                }
+            }
+        } else {
+            req
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(req).expect("fresh channel cannot be closed");
+        tokio::spawn(crate::tmux::pane_inject_loop(rx));
+        queues.insert(pane_key, tx);
     }
 
     /// Return a snapshot of all active transports.
@@ -498,22 +557,30 @@ impl AppState {
 
         let mut metadata = metadata;
         metadata.last_metadata_update = Some(Utc::now());
+        let now = Utc::now();
         let session = Session {
             id: id.clone(),
             pane,
             origin: SessionOrigin::Local,
-            registered_at: Utc::now(),
+            registered_at: now,
+            last_activity_at: now,
             metadata,
             block_interactive: false,
         };
         sessions.insert(id.clone(), session.clone());
         self.persist_sessions_from(&sessions);
 
-        // Set tmux user variable so window names can show the session ID
+        // Set tmux user variable so window names can show the session ID.
+        // If the pane is the only pane in its window, also rename the window.
         if let Some(ref pane_id) = session.pane {
             let pane = pane_id.clone();
             let name = id.clone();
-            tokio::task::spawn_blocking(move || tmux_var::set(&pane, &name));
+            tokio::task::spawn_blocking(move || {
+                tmux_var::set(&pane, &name);
+                if crate::tmux::is_sole_pane(&pane) {
+                    crate::tmux::rename_window(&pane, &name);
+                }
+            });
         }
 
         // Record alias so sends to the old name get a helpful hint
@@ -538,19 +605,27 @@ impl AppState {
         }
         let mut session = sessions.remove(old_id)?;
         session.id = new_id.to_string();
-        // Update tmux user variable to new name
+        // Update tmux user variable and window name to new name
         if let Some(ref pane_id) = session.pane {
             let pane = pane_id.clone();
             let name = new_id.to_string();
-            tokio::task::spawn_blocking(move || tmux_var::set(&pane, &name));
+            tokio::task::spawn_blocking(move || {
+                tmux_var::set(&pane, &name);
+                if crate::tmux::is_sole_pane(&pane) {
+                    crate::tmux::rename_window(&pane, &name);
+                }
+            });
         }
         sessions.insert(new_id.to_string(), session.clone());
         self.persist_sessions_from(&sessions);
         drop(sessions);
         self.add_alias(old_id, new_id).await;
-        // Re-key agent ref
+        // Re-key agent ref and update its internal session_id
         let mut agents = self.session_agents.write().await;
         if let Some(agent_ref) = agents.remove(old_id) {
+            let _ = agent_ref.cast(crate::session_agent::SessionMsg::Renamed {
+                new_id: new_id.to_string(),
+            });
             agents.insert(new_id.to_string(), agent_ref);
         }
         Some(session)
@@ -593,7 +668,10 @@ impl AppState {
     ///
     /// Also updates any existing aliases that pointed to `old_id` so they
     /// resolve directly to `new_id` (no chains).
-    async fn add_alias(&self, old_id: &str, new_id: &str) {
+    pub(crate) async fn add_alias(&self, old_id: &str, new_id: &str) {
+        if old_id == new_id {
+            return;
+        }
         let mut aliases = self.session_aliases.write().await;
         // Update any alias that previously pointed to old_id
         for target in aliases.values_mut() {
@@ -627,16 +705,30 @@ impl AppState {
         }
     }
 
+    /// Clear pending replies targeting removed sessions from all remaining agents.
+    pub(crate) async fn clear_orphaned_pending_replies(&self, removed_ids: &[String]) {
+        let agents = self.session_agents.read().await;
+        for (_, agent) in agents.iter() {
+            for id in removed_ids {
+                let _ = agent
+                    .cast(crate::session_agent::SessionMsg::ClearPendingReply { from: id.clone() });
+            }
+        }
+    }
+
     pub async fn remove_session(&self, id: &str) -> Option<Session> {
         let mut sessions = self.sessions.write().await;
         let session = sessions.get(id)?;
         if matches!(session.origin, SessionOrigin::Remote(_)) {
             return None;
         }
-        // Clear tmux user variable before removing
+        // Clear tmux user variable and re-enable automatic window naming
         if let Some(ref pane_id) = session.pane {
             let pane = pane_id.clone();
-            tokio::task::spawn_blocking(move || tmux_var::clear(&pane));
+            tokio::task::spawn_blocking(move || {
+                tmux_var::clear(&pane);
+                crate::tmux::enable_automatic_rename(&pane);
+            });
         }
         let removed = sessions.remove(id);
         self.persist_sessions_from(&sessions);
@@ -645,6 +737,7 @@ impl AppState {
         if let Some(agent) = self.session_agents.write().await.remove(id) {
             agent.stop(None);
         }
+        self.clear_orphaned_pending_replies(&[id.to_string()]).await;
         removed
     }
 
@@ -677,10 +770,13 @@ impl AppState {
         let dead_ids: Vec<String> = dead_entries.iter().map(|(id, _)| id.clone()).collect();
 
         if !dead_ids.is_empty() {
-            // Clear tmux user variables for dead panes
+            // Clear tmux user variables and re-enable automatic window naming
             for (_, pane) in &dead_entries {
                 let pane = pane.clone();
-                tokio::task::spawn_blocking(move || tmux_var::clear(&pane));
+                tokio::task::spawn_blocking(move || {
+                    tmux_var::clear(&pane);
+                    crate::tmux::enable_automatic_rename(&pane);
+                });
             }
             let mut sessions = self.sessions.write().await;
             for id in &dead_ids {
@@ -696,6 +792,8 @@ impl AppState {
                     agent.stop(None);
                 }
             }
+            drop(agents);
+            self.clear_orphaned_pending_replies(&dead_ids).await;
         }
         // Clean up per-fire worktree panes that have died
         let perfire_to_check: Vec<(String, String)> = {
@@ -734,6 +832,27 @@ impl AppState {
         dead_ids
     }
 
+    /// If local session count exceeds `max_local_sessions`, return the most
+    /// idle sessions that should be closed to bring the count back to the limit.
+    pub async fn collect_excess_idle_sessions(&self) -> Vec<String> {
+        let max = self.settings.read().await.max_local_sessions as usize;
+        if max == 0 {
+            return vec![];
+        }
+        let sessions = self.sessions.read().await;
+        let mut local: Vec<_> = sessions
+            .values()
+            .filter(|s| matches!(s.origin, SessionOrigin::Local))
+            .collect();
+        if local.len() <= max {
+            return vec![];
+        }
+        // Sort by last_activity_at ascending (most idle first)
+        local.sort_by_key(|s| s.last_activity_at);
+        let excess = local.len() - max;
+        local[..excess].iter().map(|s| s.id.clone()).collect()
+    }
+
     pub fn persist_sessions_from(&self, sessions: &HashMap<String, Session>) {
         let persisted: Vec<_> = sessions
             .values()
@@ -754,23 +873,28 @@ impl AppState {
         session: &Session,
         replaced: Option<&str>,
     ) {
+        let seq = self.next_seq();
         if let Some(old_id) = replaced {
-            let msg = crate::protocol::WireMessage::SessionRemove {
-                id: old_id.to_string(),
+            let msg = crate::protocol::WireMessage::SessionRenamed {
+                old_id: old_id.to_string(),
+                new_id: session.id.clone(),
                 daemon_id: self.config.npub.clone(),
                 daemon_name: self.config.name.clone(),
+                metadata: Some(session.metadata.clone()),
+                seq,
             };
             crate::transport::broadcast(self, &msg).await;
-        }
-
-        if self.is_session_networked(session) {
+            crate::transport::broadcast_local_sessions(self).await;
+        } else if self.is_session_networked(session) {
             let msg = crate::protocol::WireMessage::SessionAnnounce {
                 id: session.id.clone(),
                 daemon_id: self.config.npub.clone(),
                 daemon_name: self.config.name.clone(),
                 metadata: Some(session.metadata.clone()),
+                seq,
             };
             crate::transport::broadcast(self, &msg).await;
+            crate::transport::broadcast_local_sessions(self).await;
         }
 
         if let Some(ref pane_id) = session.pane {
@@ -1244,18 +1368,34 @@ pub(crate) mod tests {
             let mut sessions = state.sessions.write().await;
             sessions.insert(
                 "remote/s1".into(),
-                Session {
-                    id: "remote/s1".into(),
-                    pane: None,
-                    origin: SessionOrigin::Remote("remote".into()),
-                    registered_at: Utc::now(),
-                    metadata: SessionMetadata::default(),
-                    block_interactive: false,
-                },
+                test_session(
+                    "remote/s1",
+                    None,
+                    SessionOrigin::Remote("remote".into()),
+                    SessionMetadata::default(),
+                ),
             );
         }
         assert!(state.remove_session("remote/s1").await.is_none());
         assert_eq!(state.sessions.read().await.len(), 1);
+    }
+
+    /// Helper to build a Session for tests, filling in `last_activity_at` automatically.
+    fn test_session(
+        id: &str,
+        pane: Option<&str>,
+        origin: SessionOrigin,
+        metadata: SessionMetadata,
+    ) -> Session {
+        Session {
+            id: id.into(),
+            pane: pane.map(Into::into),
+            origin,
+            registered_at: Utc::now(),
+            last_activity_at: Utc::now(),
+            metadata,
+            block_interactive: false,
+        }
     }
 
     #[tokio::test]
@@ -1322,34 +1462,30 @@ pub(crate) mod tests {
     #[test]
     fn is_session_networked_true() {
         let state = AppState::new(test_config());
-        let session = Session {
-            id: "s1".into(),
-            pane: Some("%1".into()),
-            origin: SessionOrigin::Local,
-            registered_at: Utc::now(),
-            metadata: SessionMetadata {
+        let session = test_session(
+            "s1",
+            Some("%1"),
+            SessionOrigin::Local,
+            SessionMetadata {
                 networked: true,
                 ..Default::default()
             },
-            block_interactive: false,
-        };
+        );
         assert!(state.is_session_networked(&session));
     }
 
     #[test]
     fn is_session_networked_false() {
         let state = AppState::new(test_config());
-        let session = Session {
-            id: "s1".into(),
-            pane: Some("%1".into()),
-            origin: SessionOrigin::Local,
-            registered_at: Utc::now(),
-            metadata: SessionMetadata {
+        let session = test_session(
+            "s1",
+            Some("%1"),
+            SessionOrigin::Local,
+            SessionMetadata {
                 networked: false,
                 ..Default::default()
             },
-            block_interactive: false,
-        };
+        );
         assert!(!state.is_session_networked(&session));
     }
 
@@ -1380,25 +1516,21 @@ pub(crate) mod tests {
             let mut sessions = state.sessions.write().await;
             sessions.insert(
                 "remote/s1".into(),
-                Session {
-                    id: "remote/s1".into(),
-                    pane: None,
-                    origin: SessionOrigin::Remote("npub1remote".into()),
-                    registered_at: Utc::now(),
-                    metadata: SessionMetadata::default(),
-                    block_interactive: false,
-                },
+                test_session(
+                    "remote/s1",
+                    None,
+                    SessionOrigin::Remote("npub1remote".into()),
+                    SessionMetadata::default(),
+                ),
             );
             sessions.insert(
                 "remote/s2".into(),
-                Session {
-                    id: "remote/s2".into(),
-                    pane: None,
-                    origin: SessionOrigin::Remote("npub1remote".into()),
-                    registered_at: Utc::now(),
-                    metadata: SessionMetadata::default(),
-                    block_interactive: false,
-                },
+                test_session(
+                    "remote/s2",
+                    None,
+                    SessionOrigin::Remote("npub1remote".into()),
+                    SessionMetadata::default(),
+                ),
             );
         }
         // Add node info
@@ -1521,14 +1653,12 @@ pub(crate) mod tests {
             let mut sessions = state.sessions.write().await;
             sessions.insert(
                 "remote/s1".into(),
-                Session {
-                    id: "remote/s1".into(),
-                    pane: None,
-                    origin: SessionOrigin::Remote("remote".into()),
-                    registered_at: Utc::now(),
-                    metadata: SessionMetadata::default(),
-                    block_interactive: false,
-                },
+                test_session(
+                    "remote/s1",
+                    None,
+                    SessionOrigin::Remote("remote".into()),
+                    SessionMetadata::default(),
+                ),
             );
         }
         assert!(
@@ -1583,5 +1713,110 @@ pub(crate) mod tests {
             sessions["s1"].metadata.bulletin.as_deref(),
             Some("offering review")
         );
+    }
+
+    // --- collect_excess_idle_sessions ---
+
+    #[tokio::test]
+    async fn excess_idle_disabled_when_zero() {
+        let state = AppState::new(test_config());
+        // max_local_sessions defaults to 0 (disabled)
+        state
+            .register_session("s1".into(), Some("%1".into()), SessionMetadata::default())
+            .await;
+        assert!(state.collect_excess_idle_sessions().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn excess_idle_no_eviction_at_limit() {
+        let state = AppState::new(test_config());
+        state.settings.write().await.max_local_sessions = 2;
+        state
+            .register_session("s1".into(), Some("%1".into()), SessionMetadata::default())
+            .await;
+        state
+            .register_session("s2".into(), Some("%2".into()), SessionMetadata::default())
+            .await;
+        assert!(state.collect_excess_idle_sessions().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn excess_idle_evicts_most_idle() {
+        let state = AppState::new(test_config());
+        state.settings.write().await.max_local_sessions = 2;
+
+        // Insert 3 sessions with controlled last_activity_at
+        {
+            let mut sessions = state.sessions.write().await;
+            let mut old = test_session(
+                "old",
+                Some("%1"),
+                SessionOrigin::Local,
+                SessionMetadata::default(),
+            );
+            old.last_activity_at = Utc::now() - chrono::Duration::hours(3);
+            sessions.insert("old".into(), old);
+
+            let mut mid = test_session(
+                "mid",
+                Some("%2"),
+                SessionOrigin::Local,
+                SessionMetadata::default(),
+            );
+            mid.last_activity_at = Utc::now() - chrono::Duration::hours(1);
+            sessions.insert("mid".into(), mid);
+
+            let fresh = test_session(
+                "fresh",
+                Some("%3"),
+                SessionOrigin::Local,
+                SessionMetadata::default(),
+            );
+            sessions.insert("fresh".into(), fresh);
+        }
+
+        let evicted = state.collect_excess_idle_sessions().await;
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0], "old");
+    }
+
+    #[tokio::test]
+    async fn excess_idle_ignores_remote_and_human() {
+        let state = AppState::new(test_config());
+        state.settings.write().await.max_local_sessions = 1;
+
+        // 1 local + 1 remote + 1 human = only 1 local, at limit
+        {
+            let mut sessions = state.sessions.write().await;
+            sessions.insert(
+                "local".into(),
+                test_session(
+                    "local",
+                    Some("%1"),
+                    SessionOrigin::Local,
+                    SessionMetadata::default(),
+                ),
+            );
+            sessions.insert(
+                "remote/r1".into(),
+                test_session(
+                    "remote/r1",
+                    None,
+                    SessionOrigin::Remote("npub1x".into()),
+                    SessionMetadata::default(),
+                ),
+            );
+            sessions.insert(
+                "human".into(),
+                test_session(
+                    "human",
+                    None,
+                    SessionOrigin::Human("npub1h".into()),
+                    SessionMetadata::default(),
+                ),
+            );
+        }
+
+        assert!(state.collect_excess_idle_sessions().await.is_empty());
     }
 }

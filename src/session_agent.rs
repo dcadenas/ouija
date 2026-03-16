@@ -25,6 +25,8 @@ pub enum SessionMsg {
     GetPendingReplies(ractor::RpcReplyPort<Vec<PendingReply>>),
     /// Clear a specific pending reply by sender name.
     ClearPendingReply { from: String },
+    /// Session was renamed — update internal session_id.
+    Renamed { new_id: String },
     /// Internal: idle timer expired.
     IdleTimeout,
 }
@@ -161,6 +163,14 @@ impl Actor for SessionAgent {
             SessionMsg::ClearPendingReply { from } => {
                 state.clear_pending_reply(&from);
             }
+            SessionMsg::Renamed { new_id } => {
+                tracing::info!(
+                    old = %state.session_id,
+                    new = %new_id,
+                    "session agent renamed"
+                );
+                state.session_id = new_id;
+            }
             SessionMsg::IdleTimeout => {
                 state.idle_timer = None;
                 state.idle = true;
@@ -218,12 +228,10 @@ impl SessionAgent {
             .unwrap_or(false);
 
         for from in senders {
-            let reminder = format!(
-                "You have an unanswered question from {from} — reply using session_send"
-            );
+            let reminder =
+                format!("You have an unanswered question from {from} — reply using session_send");
             let _ =
-                crate::tmux::locked_inject(&self.app_state, &state.pane, &reminder, vim_mode)
-                    .await;
+                crate::tmux::locked_inject(&self.app_state, &state.pane, &reminder, vim_mode).await;
         }
     }
 }

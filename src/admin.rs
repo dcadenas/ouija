@@ -976,6 +976,12 @@ tr:hover td {{
         </td>
       </tr>
       <tr>
+        <td>Max local sessions <span class="tip" data-tip="When exceeded, the most idle sessions are auto-closed. 0 = unlimited.">?</span></td>
+        <td style="text-align:center;">
+          <input type="number" id="max-local-sessions" value="{max_local_sessions}" min="0" max="50" style="width:60px;text-align:center;" onchange="updateSetting('max_local_sessions', parseInt(this.value))">
+        </td>
+      </tr>
+      <tr>
         <td>All sessions networked <span class="tip" data-tip="Bulk toggle: make all local sessions visible (or hidden) to remote nodes at once">?</span></td>
         <td style="text-align:center;">
           <input type="checkbox" id="bulk-networked" {bulk_networked_checked} onchange="bulkToggleNetworked(this.checked)">
@@ -1426,6 +1432,7 @@ setInterval(async () => {{
         log_empty = log_empty,
         saved_relays_json = saved_relays_json,
         idle_timeout_secs = settings.idle_timeout_secs,
+        max_local_sessions = settings.max_local_sessions,
         auto_register_checked = if settings.auto_register {
             "checked"
         } else {

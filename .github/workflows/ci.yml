@@ -33,3 +33,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker compose -f tests/e2e/docker-compose.nostr.yml up --build --abort-on-container-exit --exit-code-from tests
+
+  e2e-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose -f tests/e2e/docker-compose.install.yml up --build --abort-on-container-exit --exit-code-from tests

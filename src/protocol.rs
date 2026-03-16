@@ -32,17 +32,34 @@ pub enum WireMessage {
         daemon_name: String,
         #[serde(default)]
         metadata: Option<SessionMetadata>,
+        #[serde(default)]
+        seq: u64,
     },
     SessionList {
         sessions: Vec<SessionInfo>,
         daemon_id: String,
         daemon_name: String,
+        #[serde(default)]
+        seq: u64,
     },
     SessionRemove {
         id: String,
         daemon_id: String,
         #[serde(default)]
         daemon_name: String,
+        #[serde(default)]
+        seq: u64,
+    },
+    SessionRenamed {
+        old_id: String,
+        new_id: String,
+        daemon_id: String,
+        #[serde(default)]
+        daemon_name: String,
+        #[serde(default)]
+        metadata: Option<SessionMetadata>,
+        #[serde(default)]
+        seq: u64,
     },
     ConnectRequest {
         secret: String,
@@ -59,6 +76,33 @@ pub enum WireMessage {
         result: String,
         daemon_id: String,
     },
+}
+
+impl WireMessage {
+    /// Extract the `daemon_id` field, if present on this variant.
+    pub fn daemon_id(&self) -> Option<&str> {
+        match self {
+            Self::SessionSendAck { daemon_id, .. }
+            | Self::SessionAnnounce { daemon_id, .. }
+            | Self::SessionList { daemon_id, .. }
+            | Self::SessionRemove { daemon_id, .. }
+            | Self::SessionRenamed { daemon_id, .. }
+            | Self::Command { daemon_id, .. }
+            | Self::CommandResult { daemon_id, .. } => Some(daemon_id),
+            Self::SessionSend { .. } | Self::ConnectRequest { .. } => None,
+        }
+    }
+
+    /// Extract the monotonic sequence counter, if present on this variant.
+    pub fn seq(&self) -> Option<u64> {
+        match self {
+            Self::SessionAnnounce { seq, .. }
+            | Self::SessionList { seq, .. }
+            | Self::SessionRemove { seq, .. }
+            | Self::SessionRenamed { seq, .. } => Some(*seq),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -129,6 +173,7 @@ mod tests {
                 role: None,
                 ..Default::default()
             }),
+            seq: 1,
         };
         let decoded = round_trip(&msg);
         assert!(
@@ -144,6 +189,7 @@ mod tests {
             daemon_id: "d1".into(),
             daemon_name: String::new(),
             metadata: None,
+            seq: 0,
         };
         let decoded = round_trip(&msg);
         assert!(
@@ -166,6 +212,7 @@ mod tests {
             ],
             daemon_id: "d1".into(),
             daemon_name: "host1".into(),
+            seq: 1,
         };
         let decoded = round_trip(&msg);
         assert!(
@@ -179,6 +226,7 @@ mod tests {
             id: "s1".into(),
             daemon_id: "d1".into(),
             daemon_name: "host1".into(),
+            seq: 1,
         };
         let decoded = round_trip(&msg);
         assert!(matches!(decoded, WireMessage::SessionRemove { id, .. } if id == "s1"));
@@ -244,6 +292,36 @@ mod tests {
             decoded,
             WireMessage::CommandResult { command, result, daemon_id }
             if command == "/start foo" && result == "started" && daemon_id == "npub1abc"
+        ));
+    }
+
+    #[test]
+    fn session_renamed_round_trip() {
+        let msg = WireMessage::SessionRenamed {
+            old_id: "old".into(),
+            new_id: "new".into(),
+            daemon_id: "d1".into(),
+            daemon_name: "host1".into(),
+            metadata: None,
+            seq: 1,
+        };
+        let decoded = round_trip(&msg);
+        assert!(matches!(
+            decoded,
+            WireMessage::SessionRenamed { old_id, new_id, daemon_id, .. }
+            if old_id == "old" && new_id == "new" && daemon_id == "d1"
+        ));
+    }
+
+    #[test]
+    fn session_renamed_backward_compat() {
+        // Minimal format without daemon_name/metadata
+        let json = r#"{"type":"SessionRenamed","old_id":"a","new_id":"b","daemon_id":"d1"}"#;
+        let msg: WireMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            msg,
+            WireMessage::SessionRenamed { old_id, new_id, .. }
+            if old_id == "a" && new_id == "b"
         ));
     }
 

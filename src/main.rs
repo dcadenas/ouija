@@ -198,14 +198,17 @@ async fn main() -> anyhow::Result<()> {
         .install_default()
         .expect("failed to install rustls CryptoProvider");
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ouija=info".parse().expect("valid default filter")),
-        )
-        .init();
-
     let cli = Cli::parse();
+
+    // Daemon logs to a file in the data dir; CLI subcommands log to stderr.
+    if !matches!(cli.command, Command::Start { .. }) {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "ouija=warn".parse().expect("valid default filter")),
+            )
+            .init();
+    }
 
     match cli.command {
         Command::Start {
@@ -215,6 +218,24 @@ async fn main() -> anyhow::Result<()> {
             ticket,
             relays,
         } => {
+            // Compute data dir early so we can point tracing at it.
+            let data_dir = match data.as_deref() {
+                Some(d) => std::path::PathBuf::from(d),
+                None => config::OuijaConfig::default_data_dir(),
+            };
+            std::fs::create_dir_all(&data_dir)?;
+
+            let log_file = std::fs::File::create(data_dir.join("daemon.log"))?;
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "ouija=info".parse().expect("valid default filter")),
+                )
+                .with_writer(log_file)
+                .with_ansi(false)
+                .init();
+
+            preflight_checks();
             ensure_plugin_installed();
 
             let name = name.unwrap_or_else(|| {
@@ -267,13 +288,25 @@ async fn main() -> anyhow::Result<()> {
                     let reaped = reaper_state.reap_dead_sessions().await;
                     if !reaped.is_empty() {
                         for id in &reaped {
+                            let seq = reaper_state.next_seq();
                             let msg = crate::protocol::WireMessage::SessionRemove {
                                 id: id.clone(),
                                 daemon_id: reaper_state.config.npub.clone(),
                                 daemon_name: reaper_state.config.name.clone(),
+                                seq,
                             };
                             transport::broadcast(&reaper_state, &msg).await;
                         }
+                        transport::broadcast_local_sessions(&reaper_state).await;
+                    }
+
+                    // If over the max session limit, close the most idle ones.
+                    // Killing the pane lets the next reaper cycle clean up + broadcast.
+                    for id in reaper_state.collect_excess_idle_sessions().await {
+                        tracing::info!(
+                            "auto-closing idle session '{id}' (over max_local_sessions)"
+                        );
+                        crate::nostr_transport::admin_kill_session(&reaper_state, &id).await;
                     }
 
                     // Scan tmux, update cache, auto-register unregistered panes
@@ -442,6 +475,7 @@ async fn main() -> anyhow::Result<()> {
         Command::LogPath { data } => {
             let config = config::OuijaConfig::new("_".into(), 0, data, String::new())?;
             println!("{}", config.data_dir.join("messages.jsonl").display());
+            println!("{}", config.data_dir.join("daemon.log").display());
         }
         Command::Update => {
             update_and_restart()?;
@@ -702,6 +736,7 @@ async fn restore_persisted_sessions(state: &state::AppState) {
             pane: ps.pane.clone(),
             origin: state::SessionOrigin::Local,
             registered_at: ps.registered_at,
+            last_activity_at: ps.last_activity_at,
             metadata: ps.metadata.clone(),
             block_interactive: false,
         };
@@ -727,6 +762,7 @@ async fn register_human_sessions(state: &state::AppState) {
             pane: None,
             origin: state::SessionOrigin::Human(h.npub.clone()),
             registered_at: chrono::Utc::now(),
+            last_activity_at: chrono::Utc::now(),
             metadata: state::SessionMetadata {
                 role: Some("human".to_string()),
                 networked: false,
@@ -797,6 +833,28 @@ async fn reconnect_persisted_nodes(state: state::SharedState) {
 
     if reconnected > 0 {
         tracing::info!("reconnected to {reconnected} persisted nodes");
+    }
+}
+
+fn preflight_checks() {
+    use std::process::Command as Cmd;
+
+    if Cmd::new("tmux").arg("-V").output().is_err() {
+        eprintln!("error: tmux not found");
+        eprintln!();
+        eprintln!("ouija requires tmux. Install it:");
+        eprintln!("  apt install tmux        # Debian/Ubuntu");
+        eprintln!("  brew install tmux       # macOS");
+        eprintln!("  pacman -S tmux          # Arch");
+        std::process::exit(1);
+    }
+
+    if Cmd::new("claude").arg("--version").output().is_err() {
+        eprintln!("warning: claude not found on PATH");
+        eprintln!(
+            "  Sessions won't auto-register. Install: https://docs.anthropic.com/en/docs/claude-code"
+        );
+        eprintln!();
     }
 }
 
@@ -886,6 +944,7 @@ fn update_and_restart() -> anyhow::Result<()> {
             .unwrap_or(false)
         {
             println!("ouija updated to {latest} and running");
+            println!("admin: http://localhost:{port}/admin");
             return Ok(());
         }
         if i == 19 {
@@ -971,6 +1030,14 @@ fn try_sync_from_source(home: &std::path::Path, cache_dir: &std::path::Path) -> 
         let _ = std::fs::copy(&src, &dst);
     }
 
+    let src = source_dir.join(".claude-plugin");
+    let dst = cache_dir.join(".claude-plugin");
+    if src.is_dir() {
+        if let Err(e) = sync_dir(&src, &dst) {
+            eprintln!("warning: failed to sync plugin .claude-plugin: {e}");
+        }
+    }
+
     true
 }
 
@@ -1010,10 +1077,7 @@ fn write_embedded_plugin_files(cache_dir: &std::path::Path) {
         ("scripts/ouija-statusline.sh", embedded::SCRIPT_STATUSLINE),
         ("scripts/ouija-unregister.sh", embedded::SCRIPT_UNREGISTER),
         ("scripts/session-diff.sh", embedded::SCRIPT_SESSION_DIFF),
-        (
-            "skills/ouija-peer-trust/SKILL.md",
-            embedded::SKILLS_PEER_TRUST,
-        ),
+        ("skills/ouija/SKILL.md", embedded::SKILLS_PEER_TRUST),
     ];
 
     for (path, content) in files {
@@ -1054,7 +1118,7 @@ mod embedded {
     pub const SCRIPT_UNREGISTER: &str = include_str!("../scripts/ouija-unregister.sh");
     pub const SCRIPT_SESSION_DIFF: &str = include_str!("../scripts/session-diff.sh");
 
-    pub const SKILLS_PEER_TRUST: &str = include_str!("../skills/ouija-peer-trust/SKILL.md");
+    pub const SKILLS_PEER_TRUST: &str = include_str!("../skills/ouija/SKILL.md");
 }
 
 /// Ensure the Claude Code plugin is installed. Called on every `ouija start`.
