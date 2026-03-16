@@ -982,6 +982,14 @@ fn try_sync_from_source(home: &std::path::Path, cache_dir: &std::path::Path) -> 
         let _ = std::fs::copy(&src, &dst);
     }
 
+    let src = source_dir.join(".claude-plugin");
+    let dst = cache_dir.join(".claude-plugin");
+    if src.is_dir() {
+        if let Err(e) = sync_dir(&src, &dst) {
+            eprintln!("warning: failed to sync plugin .claude-plugin: {e}");
+        }
+    }
+
     true
 }
 
