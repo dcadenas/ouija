@@ -462,9 +462,9 @@ mod tests {
             },
         ];
         let prompt = build_system_prompt(&[], &messages, "daniel", false);
-        assert!(prompt.contains("Recent Conversation with Human"));
+        assert!(prompt.contains("<conversation_history>"));
         assert!(prompt.contains("[10:30] daniel -> ouija: hello"));
-        assert!(prompt.contains("Inter-Session Messages"));
+        assert!(prompt.contains("<inter_session_messages>"));
         assert!(prompt.contains("inter-session noise"));
     }
 
