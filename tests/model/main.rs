@@ -668,14 +668,14 @@ fn offer_fixed_actions(o: &mut Out<FixedActor>) {
 // Property checkers
 // ---------------------------------------------------------------------------
 
-fn daemon_views(
-    actor_states: &[std::sync::Arc<OuijaState>],
-) -> Vec<(
+type DaemonView<'a> = (
     DaemonId,
-    &BTreeSet<Sid>,
-    &BTreeSet<RemoteKey>,
-    &BTreeMap<Sid, Sid>,
-)> {
+    &'a BTreeSet<Sid>,
+    &'a BTreeSet<RemoteKey>,
+    &'a BTreeMap<Sid, Sid>,
+);
+
+fn daemon_views(actor_states: &[std::sync::Arc<OuijaState>]) -> Vec<DaemonView<'_>> {
     actor_states
         .iter()
         .filter_map(|s| {
