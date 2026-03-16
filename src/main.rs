@@ -939,6 +939,7 @@ fn update_and_restart() -> anyhow::Result<()> {
             .unwrap_or(false)
         {
             println!("ouija updated to {latest} and running");
+            println!("admin: http://localhost:{port}/admin");
             return Ok(());
         }
         if i == 19 {
