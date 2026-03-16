@@ -42,7 +42,7 @@ if [ -n "$MAC_NODE" ]; then
   echo "Requesting macOS builds from ${MAC_NODE}..."
   curl -sf -X POST "${BASE}/api/send" \
     -H "Content-Type: application/json" \
-    -d "{\"from\":\"release-task\",\"to\":\"${MAC_NODE}/ouija\",\"message\":\"Release v${NEXT} published. Please: (1) git pull (2) cargo build --release --target x86_64-apple-darwin (3) cargo build --release --target aarch64-apple-darwin (4) create tarballs: for each target, mkdir ouija-{target}, cp binary in, tar czf ouija-{target}.tar.xz (5) gh release upload v${NEXT} ouija-*.tar.xz. Send results back when done.\",\"expects_reply\":false}" 2>/dev/null \
+    -d "{\"from\":\"release-task\",\"to\":\"${MAC_NODE}/ouija\",\"message\":\"Release v${NEXT} published. Build macOS binaries and upload to the GitHub release. Steps: (1) cd ~/code/ouija && git pull (2) cargo build --release --target x86_64-apple-darwin (3) cargo build --release --target aarch64-apple-darwin (4) package: for TARGET in x86_64-apple-darwin aarch64-apple-darwin; do DIR=ouija-\\\$TARGET; mkdir -p \\\$DIR; cp target/\\\$TARGET/release/ouija \\\$DIR/; tar cJf \\\$DIR.tar.xz \\\$DIR; rm -rf \\\$DIR; done (5) wait for the GitHub release to exist (CI creates it): while ! gh release view v${NEXT} --repo dcadenas/ouija >/dev/null 2>&1; do echo waiting for release...; sleep 15; done (6) upload: gh release upload v${NEXT} --repo dcadenas/ouija ouija-x86_64-apple-darwin.tar.xz ouija-aarch64-apple-darwin.tar.xz (7) clean up tarballs. IMPORTANT: do NOT use gh release create. Only use gh release upload. The CI workflow creates the release.\",\"expects_reply\":false}" 2>/dev/null \
     && echo "macOS build request sent" \
     || echo "warning: could not send macOS build request"
 else
