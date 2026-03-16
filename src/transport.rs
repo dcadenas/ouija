@@ -98,7 +98,7 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8], sender_npub:
 
             // Resolve bare `from` to daemon-prefixed key so replies route
             // back across machines (e.g. "ouija" -> "locota/ouija").
-            let (target, display_from) = {
+            let (target, display_from, sender_known) = {
                 let sessions = state.sessions.read().await;
                 let target = sessions.get(&to).and_then(|session| match &session.origin {
                     SessionOrigin::Local if session.metadata.networked => {
@@ -112,15 +112,16 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8], sender_npub:
                     }
                     _ => None,
                 });
-                let display_from = sessions
+                let remote_match = sessions
                     .iter()
                     .find(|(_, s)| {
                         matches!(&s.origin, SessionOrigin::Remote(_))
                             && crate::state::strip_remote_prefix(&s.id) == from.as_str()
                     })
-                    .map(|(key, _)| key.clone())
-                    .unwrap_or_else(|| from.clone());
-                (target, display_from)
+                    .map(|(key, _)| key.clone());
+                let sender_known = remote_match.is_some();
+                let display_from = remote_match.unwrap_or_else(|| from.clone());
+                (target, display_from, sender_known)
             };
 
             match target {
@@ -136,7 +137,7 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8], sender_npub:
                             s.block_interactive = true;
                         }
                     }
-                    if delivered && expects_reply {
+                    if delivered && expects_reply && sender_known {
                         state
                             .notify_agent(
                                 &to,
@@ -287,6 +288,19 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8], sender_npub:
 
             drop(sessions);
 
+            // Clear orphaned pending replies for all removed remote sessions.
+            // Pending replies track bare session names (from wire messages),
+            // so strip the daemon prefix from removed keys.
+            let mut removed_bare: Vec<String> = stale
+                .iter()
+                .chain(announce_dupes.iter())
+                .map(|key| crate::state::strip_remote_prefix(key).to_string())
+                .collect();
+            removed_bare.dedup();
+            if !removed_bare.is_empty() {
+                state.clear_orphaned_pending_replies(&removed_bare).await;
+            }
+
             state.nodes.write().await.insert(
                 daemon_id.clone(),
                 crate::state::NodeInfo {
@@ -316,12 +330,19 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8], sender_npub:
             let display_name = display_name(&daemon_name, &daemon_id);
             let key = crate::state::remote_session_key(display_name, &id);
             tracing::info!("remote session removed: {key} from daemon {daemon_id}");
-            let mut sessions = state.sessions.write().await;
-            if sessions
-                .get(&key)
-                .is_some_and(|s| matches!(&s.origin, SessionOrigin::Remote(d) if d == &daemon_id))
-            {
-                sessions.remove(&key);
+            let removed = {
+                let mut sessions = state.sessions.write().await;
+                if sessions
+                    .get(&key)
+                    .is_some_and(|s| matches!(&s.origin, SessionOrigin::Remote(d) if d == &daemon_id))
+                {
+                    sessions.remove(&key).is_some()
+                } else {
+                    false
+                }
+            };
+            if removed {
+                state.clear_orphaned_pending_replies(&[id]).await;
             }
         }
         WireMessage::SessionRenamed {

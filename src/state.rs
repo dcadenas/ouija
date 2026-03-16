@@ -699,7 +699,7 @@ impl AppState {
     }
 
     /// Clear pending replies targeting removed sessions from all remaining agents.
-    async fn clear_orphaned_pending_replies(&self, removed_ids: &[String]) {
+    pub(crate) async fn clear_orphaned_pending_replies(&self, removed_ids: &[String]) {
         let agents = self.session_agents.read().await;
         for (_, agent) in agents.iter() {
             for id in removed_ids {

@@ -675,11 +675,13 @@ impl Actor for ReplyActor {
 
             ReplyMsg::DeliverMsg { from_sid, from_daemon, to_sid } if from_daemon != my_id => {
                 let s = state.to_mut();
-                let ReplyState::Daemon { local, pending_replies, .. } = s else { return };
-                if local.contains(&to_sid) {
-                    pending_replies.entry(to_sid).or_default().insert(
-                        RemoteKey { daemon: from_daemon, id: from_sid },
-                    );
+                let ReplyState::Daemon { local, remote, pending_replies, .. } = s else { return };
+                let sender = RemoteKey { daemon: from_daemon, id: from_sid };
+                // Only track pending reply if the sender is a known remote
+                // session. A DeliverMsg arriving after the sender's SessionList
+                // removal would otherwise re-create the orphan.
+                if local.contains(&to_sid) && remote.contains(&sender) {
+                    pending_replies.entry(to_sid).or_default().insert(sender);
                 }
             }
 
@@ -688,15 +690,24 @@ impl Actor for ReplyActor {
                     if seq < *last_seen.get(&daemon).unwrap_or(&0) { return; }
                 }
                 let s = state.to_mut();
-                let ReplyState::Daemon { last_seen, remote, .. } = s else { return };
+                let ReplyState::Daemon { last_seen, remote, pending_replies, .. } = s else { return };
                 last_seen.insert(daemon, seq);
                 let expected: BTreeSet<RemoteKey> = sessions
                     .iter().map(|&sid| RemoteKey { daemon, id: sid }).collect();
                 for key in &expected { remote.insert(*key); }
+                // Collect removed remote sessions before retain.
+                let removed: BTreeSet<RemoteKey> = remote.iter()
+                    .filter(|k| k.daemon == daemon && !expected.contains(k))
+                    .copied()
+                    .collect();
                 remote.retain(|k| k.daemon != daemon || expected.contains(k));
-                // NOTE: Does NOT clear pending replies referencing removed
-                // remote sessions. This matches real code and is the
-                // cross-daemon orphan bug being tested.
+                // Clear pending replies referencing removed remote sessions
+                // (fix for cross-daemon orphan bug).
+                if !removed.is_empty() {
+                    for set in pending_replies.values_mut() {
+                        set.retain(|rk| !removed.contains(rk));
+                    }
+                }
             }
 
             _ => {}
@@ -885,18 +896,18 @@ mod tests {
 
     // -- Reply model tests --------------------------------------------------
 
-    /// Bug 3: Cross-daemon orphaned pending replies.
-    /// Removing a session on one daemon doesn't clear pending replies
-    /// referencing it on the other daemon.
+    /// Fix for Bug 3: Cross-daemon orphaned pending replies.
+    /// SessionList reconciliation now clears pending replies referencing
+    /// removed remote sessions.
     #[test]
-    fn bug_cross_daemon_orphaned_pending_replies() {
+    fn fix_cross_daemon_orphaned_pending_replies() {
         let checker = build_reply_model().checker().spawn_bfs().join();
         assert!(
-            checker.discovery("no orphaned pending replies").is_some(),
-            "Expected orphaned pending reply from cross-daemon session removal"
+            checker.discovery("no orphaned pending replies").is_none(),
+            "Fix verified: no orphaned pending replies from cross-daemon session removal"
         );
         println!(
-            "Bug confirmed: cross-daemon orphaned pending replies. States: {}, unique: {}",
+            "Fix verified: no orphaned pending replies. States: {}, unique: {}",
             checker.state_count(), checker.unique_state_count(),
         );
     }
