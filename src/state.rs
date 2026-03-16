@@ -658,6 +658,18 @@ impl AppState {
         }
     }
 
+    /// Clear pending replies targeting removed sessions from all remaining agents.
+    async fn clear_orphaned_pending_replies(&self, removed_ids: &[String]) {
+        let agents = self.session_agents.read().await;
+        for (_, agent) in agents.iter() {
+            for id in removed_ids {
+                let _ = agent.cast(crate::session_agent::SessionMsg::ClearPendingReply {
+                    from: id.clone(),
+                });
+            }
+        }
+    }
+
     pub async fn remove_session(&self, id: &str) -> Option<Session> {
         let mut sessions = self.sessions.write().await;
         let session = sessions.get(id)?;
@@ -679,6 +691,7 @@ impl AppState {
         if let Some(agent) = self.session_agents.write().await.remove(id) {
             agent.stop(None);
         }
+        self.clear_orphaned_pending_replies(&[id.to_string()]).await;
         removed
     }
 
@@ -733,6 +746,8 @@ impl AppState {
                     agent.stop(None);
                 }
             }
+            drop(agents);
+            self.clear_orphaned_pending_replies(&dead_ids).await;
         }
         // Clean up per-fire worktree panes that have died
         let perfire_to_check: Vec<(String, String)> = {
