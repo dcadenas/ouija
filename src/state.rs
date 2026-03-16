@@ -348,6 +348,14 @@ impl AppState {
         let mut map = self.last_seen_seq.lock().expect("last_seen_seq poisoned");
         let last = map.get(daemon_id).copied().unwrap_or(0);
         if seq < last {
+            // A small seq after a large one indicates a daemon restart (counter
+            // resets to 0). Accept it and reset tracking so the restarted
+            // daemon's messages aren't dropped. seq==0 also covers backward-
+            // compat messages without a seq field.
+            if seq <= 1 {
+                map.remove(daemon_id);
+                return true;
+            }
             return false;
         }
         map.insert(daemon_id.to_string(), seq);
