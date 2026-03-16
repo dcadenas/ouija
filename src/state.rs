@@ -105,8 +105,8 @@ pub struct AppState {
     pub settings: RwLock<OuijaSettings>,
     pub scheduled_tasks: RwLock<HashMap<String, ScheduledTask>>,
     pub task_runs: RwLock<VecDeque<TaskRun>>,
-    /// Per-pane serialization locks to prevent concurrent injections.
-    pane_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Per-pane FIFO injection queues (each backed by a background worker).
+    pane_queues: std::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::tmux::InjectRequest>>>,
     /// Serializes log file writes to prevent interleaved lines.
     log_file_lock: std::sync::Mutex<()>,
     /// Serializes task_runs.jsonl writes.
@@ -277,7 +277,7 @@ impl AppState {
             settings: RwLock::new(Default::default()),
             scheduled_tasks: RwLock::new(HashMap::new()),
             task_runs: RwLock::new(VecDeque::with_capacity(100)),
-            pane_locks: std::sync::Mutex::new(HashMap::new()),
+            pane_queues: std::sync::Mutex::new(HashMap::new()),
             log_file_lock: std::sync::Mutex::new(()),
             task_run_log_lock: std::sync::Mutex::new(()),
             connected_npubs: std::sync::Mutex::new(HashMap::new()),
@@ -305,7 +305,7 @@ impl AppState {
             settings: RwLock::new(settings),
             scheduled_tasks: RwLock::new(scheduled_tasks),
             task_runs: RwLock::new(VecDeque::with_capacity(MAX_TASK_RUNS)),
-            pane_locks: std::sync::Mutex::new(HashMap::new()),
+            pane_queues: std::sync::Mutex::new(HashMap::new()),
             log_file_lock: std::sync::Mutex::new(()),
             task_run_log_lock: std::sync::Mutex::new(()),
             connected_npubs: std::sync::Mutex::new(HashMap::new()),
@@ -386,13 +386,28 @@ impl AppState {
         session.metadata.networked
     }
 
-    /// Get or create a per-pane serialization lock.
-    pub fn pane_lock(&self, pane: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self.pane_locks.lock().expect("pane_locks poisoned");
-        locks
-            .entry(pane.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+    /// Enqueue an injection request for a pane, spawning its worker if needed.
+    pub fn enqueue_inject(&self, req: crate::tmux::InjectRequest) {
+        let pane_key = req.pane.clone();
+        let mut queues = self.pane_queues.lock().expect("pane_queues poisoned");
+
+        // Try existing channel; recover the request if the worker died.
+        let req = if let Some(tx) = queues.get(&pane_key) {
+            match tx.send(req) {
+                Ok(()) => return,
+                Err(e) => {
+                    queues.remove(&pane_key);
+                    e.0
+                }
+            }
+        } else {
+            req
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(req).expect("fresh channel cannot be closed");
+        tokio::spawn(crate::tmux::pane_inject_loop(rx));
+        queues.insert(pane_key, tx);
     }
 
     /// Return a snapshot of all active transports.

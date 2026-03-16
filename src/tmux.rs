@@ -21,6 +21,10 @@ const PASTE_SETTLE_MS: u64 = 300;
 const VERIFY_DELAY_MS: u64 = 100;
 /// Delay after dismissing autocomplete for Escape to settle.
 const ESCAPE_SETTLE_MS: u64 = 100;
+/// Max retry attempts for pane injection (pane busy / mid-output).
+const MAX_INJECT_RETRIES: u32 = 3;
+/// Base delay for exponential backoff between retries (500ms, 1s, 2s).
+const RETRY_BASE_MS: u64 = 500;
 
 #[derive(Debug, Clone)]
 pub struct TmuxPane {
@@ -379,21 +383,70 @@ fn inject_text(pane: &str, message: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Inject a message while holding the pane lock (async wrapper).
+/// A queued injection request sent to the per-pane background worker.
+pub struct InjectRequest {
+    pub pane: String,
+    pub message: String,
+    pub vim_mode: bool,
+    pub result_tx: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+}
+
+/// Background worker that drains the FIFO queue for a single pane.
 ///
-/// Acquires the per-pane mutex from `state`, then runs the blocking
-/// injection on a dedicated thread. Returns `Ok(())` on success.
+/// Messages are processed in order. On failure, retries with exponential
+/// backoff before reporting the error back to the caller.
+pub async fn pane_inject_loop(mut rx: tokio::sync::mpsc::UnboundedReceiver<InjectRequest>) {
+    while let Some(req) = rx.recv().await {
+        let mut attempts = 0u32;
+        let result = loop {
+            let pane = req.pane.clone();
+            let message = req.message.clone();
+            let vim_mode = req.vim_mode;
+            match tokio::task::spawn_blocking(move || inject(&pane, &message, vim_mode)).await {
+                Ok(Ok(())) => break Ok(()),
+                Ok(Err(e)) => {
+                    attempts += 1;
+                    if attempts >= MAX_INJECT_RETRIES {
+                        break Err(e);
+                    }
+                    let delay = RETRY_BASE_MS * 2u64.pow(attempts - 1);
+                    tracing::warn!(
+                        pane = %req.pane,
+                        attempt = attempts,
+                        retry_ms = delay,
+                        "inject failed, retrying: {e}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+                Err(e) => break Err(anyhow::anyhow!("spawn_blocking join error: {e}")),
+            }
+        };
+        let _ = req.result_tx.send(result);
+    }
+}
+
+/// Enqueue a message for injection into a tmux pane.
+///
+/// Messages are queued in a per-pane FIFO and processed by a background
+/// worker. Ordering is preserved and messages are never lost. On injection
+/// failure the worker retries with backoff before returning the error.
 pub async fn locked_inject(
     state: &crate::state::AppState,
     pane: &str,
     message: &str,
     vim_mode: bool,
 ) -> anyhow::Result<()> {
-    let lock = state.pane_lock(pane);
-    let _guard = lock.lock().await;
-    let pane = pane.to_string();
-    let message = message.to_string();
-    tokio::task::spawn_blocking(move || inject(&pane, &message, vim_mode)).await?
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let req = InjectRequest {
+        pane: pane.to_string(),
+        message: message.to_string(),
+        vim_mode,
+        result_tx,
+    };
+    state.enqueue_inject(req);
+    result_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("inject queue closed"))?
 }
 
 pub fn format_session_message(from: &str, message: &str, expects_reply: bool) -> String {
