@@ -106,7 +106,9 @@ pub struct AppState {
     pub scheduled_tasks: RwLock<HashMap<String, ScheduledTask>>,
     pub task_runs: RwLock<VecDeque<TaskRun>>,
     /// Per-pane FIFO injection queues (each backed by a background worker).
-    pane_queues: std::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::tmux::InjectRequest>>>,
+    pane_queues: std::sync::Mutex<
+        HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::tmux::InjectRequest>>,
+    >,
     /// Serializes log file writes to prevent interleaved lines.
     log_file_lock: std::sync::Mutex<()>,
     /// Serializes task_runs.jsonl writes.

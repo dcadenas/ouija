@@ -192,7 +192,11 @@ fn check_known_app(pane: &str) -> anyhow::Result<()> {
     };
 
     if !KNOWN_APPS.iter().any(|&app| cmd == app) {
-        tracing::warn!(pane, cmd, "pane is not running a known app — injecting anyway");
+        tracing::warn!(
+            pane,
+            cmd,
+            "pane is not running a known app — injecting anyway"
+        );
     }
     Ok(())
 }

@@ -848,7 +848,9 @@ fn preflight_checks() {
 
     if Cmd::new("claude").arg("--version").output().is_err() {
         eprintln!("warning: claude not found on PATH");
-        eprintln!("  Sessions won't auto-register. Install: https://docs.anthropic.com/en/docs/claude-code");
+        eprintln!(
+            "  Sessions won't auto-register. Install: https://docs.anthropic.com/en/docs/claude-code"
+        );
         eprintln!();
     }
 }
@@ -1072,10 +1074,7 @@ fn write_embedded_plugin_files(cache_dir: &std::path::Path) {
         ("scripts/ouija-statusline.sh", embedded::SCRIPT_STATUSLINE),
         ("scripts/ouija-unregister.sh", embedded::SCRIPT_UNREGISTER),
         ("scripts/session-diff.sh", embedded::SCRIPT_SESSION_DIFF),
-        (
-            "skills/ouija/SKILL.md",
-            embedded::SKILLS_PEER_TRUST,
-        ),
+        ("skills/ouija/SKILL.md", embedded::SKILLS_PEER_TRUST),
     ];
 
     for (path, content) in files {
