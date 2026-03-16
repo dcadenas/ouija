@@ -1022,7 +1022,7 @@ fn write_embedded_plugin_files(cache_dir: &std::path::Path) {
         ("scripts/ouija-unregister.sh", embedded::SCRIPT_UNREGISTER),
         ("scripts/session-diff.sh", embedded::SCRIPT_SESSION_DIFF),
         (
-            "skills/ouija-peer-trust/SKILL.md",
+            "skills/ouija/SKILL.md",
             embedded::SKILLS_PEER_TRUST,
         ),
     ];
@@ -1065,7 +1065,7 @@ mod embedded {
     pub const SCRIPT_UNREGISTER: &str = include_str!("../scripts/ouija-unregister.sh");
     pub const SCRIPT_SESSION_DIFF: &str = include_str!("../scripts/session-diff.sh");
 
-    pub const SKILLS_PEER_TRUST: &str = include_str!("../skills/ouija-peer-trust/SKILL.md");
+    pub const SKILLS_PEER_TRUST: &str = include_str!("../skills/ouija/SKILL.md");
 }
 
 /// Ensure the Claude Code plugin is installed. Called on every `ouija start`.

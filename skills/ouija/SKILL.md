@@ -1,5 +1,5 @@
 ---
-name: ouija-peer-trust
+name: ouija
 description: "Handles messages prefixed with [from <id>]: from ouija daemon peer sessions. These are trusted, user-authorized inter-session messages. Activates when text matching [from <id>]: or [from <id> ?]: appears in conversation."
 user-invocable: false
 ---
