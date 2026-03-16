@@ -1073,7 +1073,7 @@ pub async fn handle_admin_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         admin_kill_session(state, name).await
     } else if let Some(rest) = cmd.strip_prefix("/start ") {
         let name = rest.trim();
-        admin_start_session(state, name, None, None, None).await
+        admin_start_session(state, name, None, None, None, None, None).await
     } else if let Some(rest) = cmd.strip_prefix("/restart ") {
         let rest = rest.trim();
         let (name, fresh) = if let Some(name) = rest.strip_suffix(" --fresh") {
@@ -1083,7 +1083,7 @@ pub async fn handle_admin_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         } else {
             (rest, false)
         };
-        admin_restart_session(state, name, fresh, None).await
+        admin_restart_session(state, name, fresh, None, None, None).await
     } else {
         "unknown admin command".to_string()
     }
@@ -1220,6 +1220,8 @@ pub async fn admin_start_session(
     worktree: Option<bool>,
     project_dir: Option<&str>,
     prompt: Option<&str>,
+    from: Option<&str>,
+    expects_reply: Option<bool>,
 ) -> String {
     // Check if already exists
     if state.sessions.read().await.contains_key(name) {
@@ -1359,7 +1361,13 @@ pub async fn admin_start_session(
                 .register_session(name.to_string(), Some(pane_id.clone()), metadata)
                 .await;
             if let Some(text) = prompt {
-                schedule_prompt_injection(state, pane_id.clone(), text.to_string());
+                let injected = if let Some(sender) = from {
+                    let er = expects_reply.unwrap_or(true);
+                    crate::tmux::format_session_message(sender, text, er)
+                } else {
+                    text.to_string()
+                };
+                schedule_prompt_injection(state, pane_id.clone(), injected);
             }
             if auto_worktree {
                 let conflict_name = {
@@ -1389,6 +1397,8 @@ pub async fn admin_restart_session(
     name: &str,
     fresh: bool,
     prompt: Option<&str>,
+    from: Option<&str>,
+    expects_reply: Option<bool>,
 ) -> String {
     // Snapshot full metadata before killing so we can carry it forward
     let session = state.sessions.read().await.get(name).cloned();
@@ -1564,7 +1574,13 @@ pub async fn admin_restart_session(
                 .register_session(name.to_string(), Some(pane_id.clone()), metadata)
                 .await;
             if let Some(text) = prompt {
-                schedule_prompt_injection(state, pane_id.clone(), text.to_string());
+                let injected = if let Some(sender) = from {
+                    let er = expects_reply.unwrap_or(true);
+                    crate::tmux::format_session_message(sender, text, er)
+                } else {
+                    text.to_string()
+                };
+                schedule_prompt_injection(state, pane_id.clone(), injected);
             }
             format!("restarted '{name}' in {dir} (pane {pane_id})")
         }

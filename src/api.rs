@@ -1307,6 +1307,10 @@ pub struct SessionNameBody {
     project_dir: Option<String>,
     #[serde(default)]
     prompt: Option<String>,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    expects_reply: Option<bool>,
 }
 
 pub async fn kill_session(
@@ -1327,6 +1331,8 @@ pub async fn start_session(
         body.worktree,
         body.project_dir.as_deref(),
         body.prompt.as_deref(),
+        body.from.as_deref(),
+        body.expects_reply,
     )
     .await;
     (StatusCode::OK, Json(json!({ "result": result })))
@@ -1342,6 +1348,8 @@ pub async fn restart_session(
         &body.name,
         fresh,
         body.prompt.as_deref(),
+        body.from.as_deref(),
+        body.expects_reply,
     )
     .await;
     (StatusCode::OK, Json(json!({ "result": result })))

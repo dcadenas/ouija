@@ -149,6 +149,15 @@ pub struct SessionNameParams {
     /// The text is sent to the pane once claude is ready.
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Sender session ID. When provided with a prompt, the prompt is prefixed
+    /// with `[from <from> ?]:` so the new session knows who initiated it and
+    /// can reply. Works like session_send's from parameter.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Whether a reply is expected when `from` is set.
+    /// Defaults to true when `from` is present.
+    #[serde(default)]
+    pub expects_reply: Option<bool>,
 }
 
 #[tool_router]
@@ -739,6 +748,8 @@ impl OuijaMcp {
         &self,
         Parameters(params): Parameters<SessionNameParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let from = params.from.clone();
+        let expects_reply = params.expects_reply;
         let result = if params.name.contains('/') {
             execute_command(&self.state, &params.name, "/start").await
         } else {
@@ -748,9 +759,26 @@ impl OuijaMcp {
                 params.worktree,
                 params.project_dir.as_deref(),
                 params.prompt.as_deref(),
+                params.from.as_deref(),
+                params.expects_reply,
             )
             .await
         };
+        // Track pending reply like session_send does
+        if let Some(ref sender) = from {
+            if expects_reply.unwrap_or(true) && result.starts_with("started ") {
+                self.state
+                    .notify_agent(
+                        &params.name,
+                        crate::session_agent::SessionMsg::MessageDelivered {
+                            from: sender.clone(),
+                            message: params.prompt.unwrap_or_default(),
+                            expects_reply: true,
+                        },
+                    )
+                    .await;
+            }
+        }
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
@@ -762,6 +790,8 @@ impl OuijaMcp {
         Parameters(params): Parameters<SessionNameParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let fresh = params.fresh.unwrap_or(false);
+        let from = params.from.clone();
+        let expects_reply = params.expects_reply;
         let result = if params.name.contains('/') {
             let verb = if fresh {
                 "/restart --fresh"
@@ -775,9 +805,25 @@ impl OuijaMcp {
                 &params.name,
                 fresh,
                 params.prompt.as_deref(),
+                params.from.as_deref(),
+                params.expects_reply,
             )
             .await
         };
+        if let Some(ref sender) = from {
+            if expects_reply.unwrap_or(true) && result.starts_with("restarted ") {
+                self.state
+                    .notify_agent(
+                        &params.name,
+                        crate::session_agent::SessionMsg::MessageDelivered {
+                            from: sender.clone(),
+                            message: params.prompt.unwrap_or_default(),
+                            expects_reply: true,
+                        },
+                    )
+                    .await;
+            }
+        }
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 }

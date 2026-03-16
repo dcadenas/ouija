@@ -635,6 +635,54 @@ L14_WT=$(echo "$L14_STATUS" | jq -r '.sessions[] | select(.id == "wt-sess") | .w
 assert_eq "L14: session has worktree=true in metadata" "$L14_WT" "true"
 api "$BASE" POST /api/sessions/kill -d '{"name":"wt-sess"}' >/dev/null 2>&1 || true
 
+# Install fake claude globally for prompt injection tests (L16-L18).
+# Needs to: (1) accept any args, (2) report as "claude" to pane_current_command.
+# Solution: script that exec's into a sleep binary named "claude".
+mkdir -p /tmp/fakebin
+cp /bin/sleep /tmp/fakebin/claude
+chmod +x /tmp/fakebin/claude
+printf '#!/bin/bash\nexec /tmp/fakebin/claude 3600\n' > /usr/local/bin/claude
+chmod +x /usr/local/bin/claude
+
+log "Test L16: session_start with from param prefixes prompt with [from X ?]:"
+L16=$(api "$BASE" POST /api/sessions/start -d '{"name":"from-test","prompt":"what is your status?","from":"orchestrator"}')
+assert_contains "L16: start succeeds" "$L16" "started"
+wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'from-test'"
+L16_PANE=$(session_field "$BASE" "from-test" "pane")
+wait_for 12 bash -c "tmux capture-pane -t '$L16_PANE' -p -S -30 | grep -qF '[from orchestrator ?]:'"
+L16_CONTENT=$(tmux capture-pane -t "$L16_PANE" -p -S -30)
+assert_contains "L16: prompt has [from X ?]: prefix" "$L16_CONTENT" "[from orchestrator ?]: what is your status?"
+# Kill pane directly (fake claude makes API kill slow due to /exit timeout)
+tmux kill-pane -t "$L16_PANE" 2>/dev/null || true
+api "$BASE" POST /api/remove -d '{"id":"from-test"}' >/dev/null 2>&1 || true
+
+log "Test L17: session_start with from + expects_reply=false omits ?"
+L17=$(api "$BASE" POST /api/sessions/start -d '{"name":"from-noreply","prompt":"FYI deployed v2","from":"deployer","expects_reply":false}')
+assert_contains "L17: start succeeds" "$L17" "started"
+wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'from-noreply'"
+L17_PANE=$(session_field "$BASE" "from-noreply" "pane")
+wait_for 12 bash -c "tmux capture-pane -t '$L17_PANE' -p -S -30 | grep -qF '[from deployer]:'"
+L17_CONTENT=$(tmux capture-pane -t "$L17_PANE" -p -S -30)
+assert_contains "L17: prompt has [from X]: prefix (no ?)" "$L17_CONTENT" "[from deployer]: FYI deployed v2"
+assert_not_contains "L17: no ? in prefix" "$L17_CONTENT" "[from deployer ?]:"
+tmux kill-pane -t "$L17_PANE" 2>/dev/null || true
+api "$BASE" POST /api/remove -d '{"id":"from-noreply"}' >/dev/null 2>&1 || true
+
+log "Test L18: session_start without from injects plain prompt"
+L18=$(api "$BASE" POST /api/sessions/start -d '{"name":"plain-prompt","prompt":"just a plain prompt"}')
+assert_contains "L18: start succeeds" "$L18" "started"
+wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'plain-prompt'"
+L18_PANE=$(session_field "$BASE" "plain-prompt" "pane")
+wait_for 12 bash -c "tmux capture-pane -t '$L18_PANE' -p -S -30 | grep -qF 'just a plain prompt'"
+L18_CONTENT=$(tmux capture-pane -t "$L18_PANE" -p -S -30)
+assert_contains "L18: plain prompt injected" "$L18_CONTENT" "just a plain prompt"
+assert_not_contains "L18: no [from] prefix" "$L18_CONTENT" "[from"
+tmux kill-pane -t "$L18_PANE" 2>/dev/null || true
+api "$BASE" POST /api/remove -d '{"id":"plain-prompt"}' >/dev/null 2>&1 || true
+
+# Remove fake claude to avoid slowing down subsequent kill operations
+rm -f /usr/local/bin/claude
+
 # Clean up
 api "$BASE" POST /api/sessions/kill -d '{"name":"mcp-restart"}' >/dev/null 2>&1 || true
 
