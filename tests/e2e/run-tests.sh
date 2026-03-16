@@ -117,6 +117,8 @@ mkdir -p /tmp/my-project
 REGISTER_SCRIPT=$(find_script "ouija-register.sh")
 # Enable auto-register
 api "$BASE" POST /api/settings -d '{"auto_register":true}' >/dev/null
+# Remove existing registration on PANE_A so the hook can register fresh
+api "$BASE" POST /api/remove -d '{"id":"sess-a2"}' >/dev/null 2>&1 || true
 # Run the hook — it should register a session named "my-project"
 HOOK_OUT=$(echo '{"source":"startup"}' | TMUX_PANE="$PANE_A" OUIJA_PORT=$PORT bash -c "cd /tmp/my-project && bash '$REGISTER_SCRIPT'" 2>&1)
 assert_contains "hook registers session" "$HOOK_OUT" "Registered as my-project on the ouija mesh"
@@ -142,6 +144,8 @@ api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/
 log "Test 10b2: Register hook outputs mesh state"
 # Set up: register a session with role and bulletin so the hook has peers to show
 api "$BASE" POST /api/register -d "{\"id\":\"hook-peer\",\"pane\":\"$PANE_B\",\"role\":\"testing\",\"bulletin\":\"can help with tests\"}" >/dev/null
+# Remove existing registration on PANE_A so the hook can register fresh
+api "$BASE" POST /api/remove -d '{"id":"sess-a2"}' >/dev/null 2>&1 || true
 # Run the register hook script directly, simulating a SessionStart
 SCRIPT_PATH=$(find_script "ouija-register.sh")
 HOOK_OUTPUT=$(echo '{"source":"startup"}' | TMUX_PANE="$PANE_A" OUIJA_PORT=$PORT bash -c "cd /tmp/my-project && bash '$SCRIPT_PATH'" 2>&1)
