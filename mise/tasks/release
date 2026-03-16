@@ -13,7 +13,12 @@ NEXT="$PREFIX.$((NUM + 1))"
 echo "Next version: $NEXT"
 
 # Update Cargo.toml and regenerate Cargo.lock
-sed -i "s/^version = \"$CURRENT\"/version = \"$NEXT\"/" Cargo.toml
+# macOS sed -i requires '' arg, GNU sed does not
+if [[ "$(uname)" == "Darwin" ]]; then
+  sed -i '' "s/^version = \"$CURRENT\"/version = \"$NEXT\"/" Cargo.toml
+else
+  sed -i "s/^version = \"$CURRENT\"/version = \"$NEXT\"/" Cargo.toml
+fi
 cargo check --quiet 2>/dev/null || true
 
 # Commit, tag, and push
