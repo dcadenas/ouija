@@ -44,6 +44,7 @@ ractor = { version = "0.15", default-features = false, features = ["async-trait"
 nostr-sdk = { version = "0.44", features = ["nip59"] }
 
 [dev-dependencies]
+stateright = "0.31.0"
 tempfile = "3"
 
 # The profile that 'dist' will build with
