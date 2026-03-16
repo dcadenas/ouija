@@ -70,6 +70,22 @@ pub enum WireMessage {
     },
 }
 
+impl WireMessage {
+    /// Extract the `daemon_id` field, if present on this variant.
+    pub fn daemon_id(&self) -> Option<&str> {
+        match self {
+            Self::SessionSendAck { daemon_id, .. }
+            | Self::SessionAnnounce { daemon_id, .. }
+            | Self::SessionList { daemon_id, .. }
+            | Self::SessionRemove { daemon_id, .. }
+            | Self::SessionRenamed { daemon_id, .. }
+            | Self::Command { daemon_id, .. }
+            | Self::CommandResult { daemon_id, .. } => Some(daemon_id),
+            Self::SessionSend { .. } | Self::ConnectRequest { .. } => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

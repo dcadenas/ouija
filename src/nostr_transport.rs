@@ -230,6 +230,7 @@ impl NostrTransport {
                                                     crate::transport::handle_incoming(
                                                         &state,
                                                         rumor.content.as_bytes(),
+                                                        Some(&npub),
                                                     )
                                                     .await;
                                                 }

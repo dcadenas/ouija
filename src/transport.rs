@@ -49,7 +49,10 @@ pub trait Transport: Send + Sync {
 /// Route an incoming wire message to the appropriate handler.
 ///
 /// Called by transport implementations when bytes arrive from a peer.
-pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
+/// When `sender_npub` is provided, the daemon_id field in the message is
+/// verified against the actual Nostr sender pubkey. Mismatches are logged
+/// and the message is dropped.
+pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8], sender_npub: Option<&str>) {
     let msg: WireMessage = match serde_json::from_slice(content) {
         Ok(m) => m,
         Err(e) => {
@@ -57,6 +60,19 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
             return;
         }
     };
+
+    // Verify daemon_id matches the actual Nostr sender when available.
+    if let Some(expected) = sender_npub {
+        let claimed = msg.daemon_id();
+        if let Some(claimed) = claimed {
+            if claimed != expected {
+                tracing::warn!(
+                    "daemon_id mismatch: message claims {claimed} but sender is {expected}, dropping"
+                );
+                return;
+            }
+        }
+    }
 
     match msg {
         WireMessage::SessionSend {
