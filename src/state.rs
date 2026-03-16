@@ -613,9 +613,12 @@ impl AppState {
         self.persist_sessions_from(&sessions);
         drop(sessions);
         self.add_alias(old_id, new_id).await;
-        // Re-key agent ref
+        // Re-key agent ref and update its internal session_id
         let mut agents = self.session_agents.write().await;
         if let Some(agent_ref) = agents.remove(old_id) {
+            let _ = agent_ref.cast(crate::session_agent::SessionMsg::Renamed {
+                new_id: new_id.to_string(),
+            });
             agents.insert(new_id.to_string(), agent_ref);
         }
         Some(session)
