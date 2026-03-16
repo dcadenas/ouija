@@ -77,9 +77,7 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8], sender_npub:
     // Drop stale wire messages using the monotonic sequence counter.
     if let (Some(daemon_id), Some(seq)) = (msg.daemon_id(), msg.seq()) {
         if !state.accept_seq(daemon_id, seq) {
-            tracing::debug!(
-                "dropping stale message from {daemon_id} (seq={seq} < last_seen)"
-            );
+            tracing::debug!("dropping stale message from {daemon_id} (seq={seq} < last_seen)");
             return;
         }
     }
@@ -242,9 +240,7 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8], sender_npub:
                 session_infos.iter().map(|i| i.id.as_str()).collect();
             let announce_dupes: Vec<String> = sessions
                 .iter()
-                .filter(|(_, s)| {
-                    matches!(&s.origin, SessionOrigin::Remote(d) if d == &daemon_id)
-                })
+                .filter(|(_, s)| matches!(&s.origin, SessionOrigin::Remote(d) if d == &daemon_id))
                 .filter(|(key, _)| {
                     let suffix = crate::state::strip_remote_prefix(key);
                     let canonical = crate::state::remote_session_key(&daemon_name, suffix);
@@ -332,10 +328,9 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8], sender_npub:
             tracing::info!("remote session removed: {key} from daemon {daemon_id}");
             let removed = {
                 let mut sessions = state.sessions.write().await;
-                if sessions
-                    .get(&key)
-                    .is_some_and(|s| matches!(&s.origin, SessionOrigin::Remote(d) if d == &daemon_id))
-                {
+                if sessions.get(&key).is_some_and(
+                    |s| matches!(&s.origin, SessionOrigin::Remote(d) if d == &daemon_id),
+                ) {
                     sessions.remove(&key).is_some()
                 } else {
                     false

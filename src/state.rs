@@ -339,8 +339,7 @@ impl AppState {
 
     /// Return the current wire-message sequence counter without incrementing.
     pub fn current_seq(&self) -> u64 {
-        self.wire_seq
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.wire_seq.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Check whether an incoming message's seq is stale relative to the last
@@ -703,9 +702,8 @@ impl AppState {
         let agents = self.session_agents.read().await;
         for (_, agent) in agents.iter() {
             for id in removed_ids {
-                let _ = agent.cast(crate::session_agent::SessionMsg::ClearPendingReply {
-                    from: id.clone(),
-                });
+                let _ = agent
+                    .cast(crate::session_agent::SessionMsg::ClearPendingReply { from: id.clone() });
             }
         }
     }

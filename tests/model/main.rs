@@ -38,14 +38,21 @@ use std::collections::{BTreeMap, BTreeSet};
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-enum Sid { A, B, C }
+enum Sid {
+    A,
+    B,
+    C,
+}
 const ALL_SIDS: [Sid; 3] = [Sid::A, Sid::B, Sid::C];
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct DaemonId(usize);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct RemoteKey { daemon: DaemonId, id: Sid }
+struct RemoteKey {
+    daemon: DaemonId,
+    id: Sid,
+}
 
 // ---------------------------------------------------------------------------
 // Messages
@@ -53,13 +60,37 @@ struct RemoteKey { daemon: DaemonId, id: Sid }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum Msg {
-    SessionAnnounce { id: Sid, daemon: DaemonId, seq: u8 },
-    SessionList { sessions: BTreeSet<Sid>, daemon: DaemonId, seq: u8 },
-    SessionRemove { id: Sid, daemon: DaemonId, seq: u8 },
-    SessionRenamed { old_id: Sid, new_id: Sid, daemon: DaemonId, seq: u8 },
-    Register { id: Sid },
-    Remove { id: Sid },
-    Rename { old_id: Sid, new_id: Sid },
+    SessionAnnounce {
+        id: Sid,
+        daemon: DaemonId,
+        seq: u8,
+    },
+    SessionList {
+        sessions: BTreeSet<Sid>,
+        daemon: DaemonId,
+        seq: u8,
+    },
+    SessionRemove {
+        id: Sid,
+        daemon: DaemonId,
+        seq: u8,
+    },
+    SessionRenamed {
+        old_id: Sid,
+        new_id: Sid,
+        daemon: DaemonId,
+        seq: u8,
+    },
+    Register {
+        id: Sid,
+    },
+    Remove {
+        id: Sid,
+    },
+    Rename {
+        old_id: Sid,
+        new_id: Sid,
+    },
 }
 
 impl Msg {
@@ -85,7 +116,11 @@ impl Msg {
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-enum Action { Register(Sid), Remove(Sid), Rename(Sid, Sid) }
+enum Action {
+    Register(Sid),
+    Remove(Sid),
+    Rename(Sid, Sid),
+}
 
 // ---------------------------------------------------------------------------
 // Actor — parameterized by whether generation filtering is enabled
@@ -109,7 +144,9 @@ enum OuijaState {
         /// Per-peer last-seen generation (for filtering stale messages).
         last_seen: BTreeMap<DaemonId, u8>,
     },
-    Client { actions_taken: u8 },
+    Client {
+        actions_taken: u8,
+    },
 }
 
 const MAX_CLIENT_ACTIONS: u8 = 2;
@@ -139,19 +176,47 @@ impl Actor for OuijaActor {
         }
     }
 
-    fn on_msg(&self, _id: Id, state: &mut Cow<'_, Self::State>, _src: Id, msg: Self::Msg, o: &mut Out<Self>) {
-        let OuijaState::Daemon { daemon_id: my_id, .. } = state.as_ref() else { return };
+    fn on_msg(
+        &self,
+        _id: Id,
+        state: &mut Cow<'_, Self::State>,
+        _src: Id,
+        msg: Self::Msg,
+        o: &mut Out<Self>,
+    ) {
+        let OuijaState::Daemon {
+            daemon_id: my_id, ..
+        } = state.as_ref()
+        else {
+            return;
+        };
         let my_id = *my_id;
 
         match msg {
             Msg::Register { id: sid } => {
                 let s = state.to_mut();
-                let OuijaState::Daemon { local, peers, daemon_id, seq, .. } = s else { return };
+                let OuijaState::Daemon {
+                    local,
+                    peers,
+                    daemon_id,
+                    seq,
+                    ..
+                } = s
+                else {
+                    return;
+                };
                 if local.insert(sid) {
                     *seq += 1;
                     let g = *seq;
                     for &peer in peers.iter() {
-                        o.send(peer, Msg::SessionAnnounce { id: sid, daemon: *daemon_id, seq: g });
+                        o.send(
+                            peer,
+                            Msg::SessionAnnounce {
+                                id: sid,
+                                daemon: *daemon_id,
+                                seq: g,
+                            },
+                        );
                     }
                     send_list(local, *daemon_id, g, peers, o);
                 }
@@ -159,12 +224,28 @@ impl Actor for OuijaActor {
 
             Msg::Remove { id: sid } => {
                 let s = state.to_mut();
-                let OuijaState::Daemon { local, peers, daemon_id, seq, .. } = s else { return };
+                let OuijaState::Daemon {
+                    local,
+                    peers,
+                    daemon_id,
+                    seq,
+                    ..
+                } = s
+                else {
+                    return;
+                };
                 if local.remove(&sid) {
                     *seq += 1;
                     let g = *seq;
                     for &peer in peers.iter() {
-                        o.send(peer, Msg::SessionRemove { id: sid, daemon: *daemon_id, seq: g });
+                        o.send(
+                            peer,
+                            Msg::SessionRemove {
+                                id: sid,
+                                daemon: *daemon_id,
+                                seq: g,
+                            },
+                        );
                     }
                     send_list(local, *daemon_id, g, peers, o);
                 }
@@ -172,14 +253,32 @@ impl Actor for OuijaActor {
 
             Msg::Rename { old_id, new_id } => {
                 let s = state.to_mut();
-                let OuijaState::Daemon { local, aliases, peers, daemon_id, seq, .. } = s else { return };
+                let OuijaState::Daemon {
+                    local,
+                    aliases,
+                    peers,
+                    daemon_id,
+                    seq,
+                    ..
+                } = s
+                else {
+                    return;
+                };
                 if old_id != new_id && local.remove(&old_id) {
                     local.insert(new_id);
                     add_alias(aliases, old_id, new_id);
                     *seq += 1;
                     let g = *seq;
                     for &peer in peers.iter() {
-                        o.send(peer, Msg::SessionRenamed { old_id, new_id, daemon: *daemon_id, seq: g });
+                        o.send(
+                            peer,
+                            Msg::SessionRenamed {
+                                old_id,
+                                new_id,
+                                daemon: *daemon_id,
+                                seq: g,
+                            },
+                        );
                     }
                     send_list(local, *daemon_id, g, peers, o);
                 }
@@ -191,29 +290,51 @@ impl Actor for OuijaActor {
                     Msg::SessionAnnounce { id: sid, .. } => {
                         let s = state.to_mut();
                         if let OuijaState::Daemon { remote, .. } = s {
-                            remote.insert(RemoteKey { daemon: from_daemon, id: *sid });
+                            remote.insert(RemoteKey {
+                                daemon: from_daemon,
+                                id: *sid,
+                            });
                         }
                     }
                     Msg::SessionList { sessions, .. } => {
                         let s = state.to_mut();
                         if let OuijaState::Daemon { remote, .. } = s {
                             let expected: BTreeSet<RemoteKey> = sessions
-                                .iter().map(|&sid| RemoteKey { daemon: from_daemon, id: sid }).collect();
-                            for key in &expected { remote.insert(*key); }
+                                .iter()
+                                .map(|&sid| RemoteKey {
+                                    daemon: from_daemon,
+                                    id: sid,
+                                })
+                                .collect();
+                            for key in &expected {
+                                remote.insert(*key);
+                            }
                             remote.retain(|k| k.daemon != from_daemon || expected.contains(k));
                         }
                     }
                     Msg::SessionRemove { id: sid, .. } => {
                         let s = state.to_mut();
                         if let OuijaState::Daemon { remote, .. } = s {
-                            remote.remove(&RemoteKey { daemon: from_daemon, id: *sid });
+                            remote.remove(&RemoteKey {
+                                daemon: from_daemon,
+                                id: *sid,
+                            });
                         }
                     }
                     Msg::SessionRenamed { old_id, new_id, .. } => {
                         let s = state.to_mut();
-                        if let OuijaState::Daemon { remote, aliases, .. } = s {
-                            remote.remove(&RemoteKey { daemon: from_daemon, id: *old_id });
-                            remote.insert(RemoteKey { daemon: from_daemon, id: *new_id });
+                        if let OuijaState::Daemon {
+                            remote, aliases, ..
+                        } = s
+                        {
+                            remote.remove(&RemoteKey {
+                                daemon: from_daemon,
+                                id: *old_id,
+                            });
+                            remote.insert(RemoteKey {
+                                daemon: from_daemon,
+                                id: *new_id,
+                            });
                             add_alias(aliases, *old_id, *new_id);
                         }
                     }
@@ -225,7 +346,13 @@ impl Actor for OuijaActor {
         }
     }
 
-    fn on_random(&self, _id: Id, state: &mut Cow<'_, Self::State>, random: &Self::Random, o: &mut Out<Self>) {
+    fn on_random(
+        &self,
+        _id: Id,
+        state: &mut Cow<'_, Self::State>,
+        random: &Self::Random,
+        o: &mut Out<Self>,
+    ) {
         if let OuijaActor::Client { target } = self {
             let s = state.to_mut();
             if let OuijaState::Client { actions_taken } = s {
@@ -233,11 +360,17 @@ impl Actor for OuijaActor {
                 match random {
                     Action::Register(sid) => o.send(*target, Msg::Register { id: *sid }),
                     Action::Remove(sid) => o.send(*target, Msg::Remove { id: *sid }),
-                    Action::Rename(old, new) => {
-                        o.send(*target, Msg::Rename { old_id: *old, new_id: *new })
-                    }
+                    Action::Rename(old, new) => o.send(
+                        *target,
+                        Msg::Rename {
+                            old_id: *old,
+                            new_id: *new,
+                        },
+                    ),
                 }
-                if *actions_taken < MAX_CLIENT_ACTIONS { offer_actions(o); }
+                if *actions_taken < MAX_CLIENT_ACTIONS {
+                    offer_actions(o);
+                }
             }
         }
     }
@@ -278,14 +411,35 @@ impl Actor for FixedActor {
         }
     }
 
-    fn on_msg(&self, _id: Id, state: &mut Cow<'_, Self::State>, _src: Id, msg: Self::Msg, o: &mut Out<Self>) {
-        let OuijaState::Daemon { daemon_id: my_id, .. } = state.as_ref() else { return };
+    fn on_msg(
+        &self,
+        _id: Id,
+        state: &mut Cow<'_, Self::State>,
+        _src: Id,
+        msg: Self::Msg,
+        o: &mut Out<Self>,
+    ) {
+        let OuijaState::Daemon {
+            daemon_id: my_id, ..
+        } = state.as_ref()
+        else {
+            return;
+        };
         let my_id = *my_id;
 
         match msg {
             Msg::Register { id: sid } => {
                 let s = state.to_mut();
-                let OuijaState::Daemon { local, peers, daemon_id, seq, .. } = s else { return };
+                let OuijaState::Daemon {
+                    local,
+                    peers,
+                    daemon_id,
+                    seq,
+                    ..
+                } = s
+                else {
+                    return;
+                };
                 if local.insert(sid) {
                     *seq += 1;
                     let g = *seq;
@@ -296,7 +450,16 @@ impl Actor for FixedActor {
 
             Msg::Remove { id: sid } => {
                 let s = state.to_mut();
-                let OuijaState::Daemon { local, peers, daemon_id, seq, .. } = s else { return };
+                let OuijaState::Daemon {
+                    local,
+                    peers,
+                    daemon_id,
+                    seq,
+                    ..
+                } = s
+                else {
+                    return;
+                };
                 if local.remove(&sid) {
                     *seq += 1;
                     let g = *seq;
@@ -306,7 +469,17 @@ impl Actor for FixedActor {
 
             Msg::Rename { old_id, new_id } => {
                 let s = state.to_mut();
-                let OuijaState::Daemon { local, aliases, peers, daemon_id, seq, .. } = s else { return };
+                let OuijaState::Daemon {
+                    local,
+                    aliases,
+                    peers,
+                    daemon_id,
+                    seq,
+                    ..
+                } = s
+                else {
+                    return;
+                };
                 if old_id != new_id && local.remove(&old_id) {
                     local.insert(new_id);
                     add_alias(aliases, old_id, new_id);
@@ -335,26 +508,48 @@ impl Actor for FixedActor {
                 match wire_msg {
                     Msg::SessionAnnounce { id: sid, .. } => {
                         if let OuijaState::Daemon { remote, .. } = s {
-                            remote.insert(RemoteKey { daemon: from_daemon, id: *sid });
+                            remote.insert(RemoteKey {
+                                daemon: from_daemon,
+                                id: *sid,
+                            });
                         }
                     }
                     Msg::SessionList { sessions, .. } => {
                         if let OuijaState::Daemon { remote, .. } = s {
                             let expected: BTreeSet<RemoteKey> = sessions
-                                .iter().map(|&sid| RemoteKey { daemon: from_daemon, id: sid }).collect();
-                            for key in &expected { remote.insert(*key); }
+                                .iter()
+                                .map(|&sid| RemoteKey {
+                                    daemon: from_daemon,
+                                    id: sid,
+                                })
+                                .collect();
+                            for key in &expected {
+                                remote.insert(*key);
+                            }
                             remote.retain(|k| k.daemon != from_daemon || expected.contains(k));
                         }
                     }
                     Msg::SessionRemove { id: sid, .. } => {
                         if let OuijaState::Daemon { remote, .. } = s {
-                            remote.remove(&RemoteKey { daemon: from_daemon, id: *sid });
+                            remote.remove(&RemoteKey {
+                                daemon: from_daemon,
+                                id: *sid,
+                            });
                         }
                     }
                     Msg::SessionRenamed { old_id, new_id, .. } => {
-                        if let OuijaState::Daemon { remote, aliases, .. } = s {
-                            remote.remove(&RemoteKey { daemon: from_daemon, id: *old_id });
-                            remote.insert(RemoteKey { daemon: from_daemon, id: *new_id });
+                        if let OuijaState::Daemon {
+                            remote, aliases, ..
+                        } = s
+                        {
+                            remote.remove(&RemoteKey {
+                                daemon: from_daemon,
+                                id: *old_id,
+                            });
+                            remote.insert(RemoteKey {
+                                daemon: from_daemon,
+                                id: *new_id,
+                            });
                             add_alias(aliases, *old_id, *new_id);
                         }
                     }
@@ -366,7 +561,13 @@ impl Actor for FixedActor {
         }
     }
 
-    fn on_random(&self, _id: Id, state: &mut Cow<'_, Self::State>, random: &Self::Random, o: &mut Out<Self>) {
+    fn on_random(
+        &self,
+        _id: Id,
+        state: &mut Cow<'_, Self::State>,
+        random: &Self::Random,
+        o: &mut Out<Self>,
+    ) {
         if let FixedActor::Client { target } = self {
             let s = state.to_mut();
             if let OuijaState::Client { actions_taken } = s {
@@ -374,11 +575,17 @@ impl Actor for FixedActor {
                 match random {
                     Action::Register(sid) => o.send(*target, Msg::Register { id: *sid }),
                     Action::Remove(sid) => o.send(*target, Msg::Remove { id: *sid }),
-                    Action::Rename(old, new) => {
-                        o.send(*target, Msg::Rename { old_id: *old, new_id: *new })
-                    }
+                    Action::Rename(old, new) => o.send(
+                        *target,
+                        Msg::Rename {
+                            old_id: *old,
+                            new_id: *new,
+                        },
+                    ),
                 }
-                if *actions_taken < MAX_CLIENT_ACTIONS { offer_fixed_actions(o); }
+                if *actions_taken < MAX_CLIENT_ACTIONS {
+                    offer_fixed_actions(o);
+                }
             }
         }
     }
@@ -389,33 +596,71 @@ impl Actor for FixedActor {
 // ---------------------------------------------------------------------------
 
 fn send_list(local: &BTreeSet<Sid>, did: DaemonId, seq: u8, peers: &[Id], o: &mut Out<OuijaActor>) {
-    let msg = Msg::SessionList { sessions: local.clone(), daemon: did, seq };
-    for &peer in peers { o.send(peer, msg.clone()); }
+    let msg = Msg::SessionList {
+        sessions: local.clone(),
+        daemon: did,
+        seq,
+    };
+    for &peer in peers {
+        o.send(peer, msg.clone());
+    }
 }
 
-fn send_fixed_list(local: &BTreeSet<Sid>, did: DaemonId, seq: u8, peers: &[Id], o: &mut Out<FixedActor>) {
-    let msg = Msg::SessionList { sessions: local.clone(), daemon: did, seq };
-    for &peer in peers { o.send(peer, msg.clone()); }
+fn send_fixed_list(
+    local: &BTreeSet<Sid>,
+    did: DaemonId,
+    seq: u8,
+    peers: &[Id],
+    o: &mut Out<FixedActor>,
+) {
+    let msg = Msg::SessionList {
+        sessions: local.clone(),
+        daemon: did,
+        seq,
+    };
+    for &peer in peers {
+        o.send(peer, msg.clone());
+    }
 }
 
 fn add_alias(aliases: &mut BTreeMap<Sid, Sid>, old_id: Sid, new_id: Sid) {
     for target in aliases.values_mut() {
-        if *target == old_id { *target = new_id; }
+        if *target == old_id {
+            *target = new_id;
+        }
     }
     aliases.insert(old_id, new_id);
 }
 
 fn offer_actions(o: &mut Out<OuijaActor>) {
     let mut c = Vec::new();
-    for &s in &ALL_SIDS { c.push(Action::Register(s)); c.push(Action::Remove(s)); }
-    for &a in &ALL_SIDS { for &b in &ALL_SIDS { if a != b { c.push(Action::Rename(a, b)); } } }
+    for &s in &ALL_SIDS {
+        c.push(Action::Register(s));
+        c.push(Action::Remove(s));
+    }
+    for &a in &ALL_SIDS {
+        for &b in &ALL_SIDS {
+            if a != b {
+                c.push(Action::Rename(a, b));
+            }
+        }
+    }
     o.choose_random("action", c);
 }
 
 fn offer_fixed_actions(o: &mut Out<FixedActor>) {
     let mut c = Vec::new();
-    for &s in &ALL_SIDS { c.push(Action::Register(s)); c.push(Action::Remove(s)); }
-    for &a in &ALL_SIDS { for &b in &ALL_SIDS { if a != b { c.push(Action::Rename(a, b)); } } }
+    for &s in &ALL_SIDS {
+        c.push(Action::Register(s));
+        c.push(Action::Remove(s));
+    }
+    for &a in &ALL_SIDS {
+        for &b in &ALL_SIDS {
+            if a != b {
+                c.push(Action::Rename(a, b));
+            }
+        }
+    }
     o.choose_random("action", c);
 }
 
@@ -423,48 +668,96 @@ fn offer_fixed_actions(o: &mut Out<FixedActor>) {
 // Property checkers
 // ---------------------------------------------------------------------------
 
-fn daemon_views(actor_states: &[std::sync::Arc<OuijaState>]) -> Vec<(DaemonId, &BTreeSet<Sid>, &BTreeSet<RemoteKey>, &BTreeMap<Sid, Sid>)> {
-    actor_states.iter().filter_map(|s| {
-        if let OuijaState::Daemon { daemon_id, local, remote, aliases, .. } = s.as_ref() {
-            Some((*daemon_id, local, remote, aliases))
-        } else { None }
-    }).collect()
+fn daemon_views(
+    actor_states: &[std::sync::Arc<OuijaState>],
+) -> Vec<(
+    DaemonId,
+    &BTreeSet<Sid>,
+    &BTreeSet<RemoteKey>,
+    &BTreeMap<Sid, Sid>,
+)> {
+    actor_states
+        .iter()
+        .filter_map(|s| {
+            if let OuijaState::Daemon {
+                daemon_id,
+                local,
+                remote,
+                aliases,
+                ..
+            } = s.as_ref()
+            {
+                Some((*daemon_id, local, remote, aliases))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn check_convergence<A: Actor<State = OuijaState>>(
-    _: &ActorModel<A, ()>, state: &<ActorModel<A, ()> as Model>::State,
-) -> bool where A::Msg: Ord, A::Timer: Ord {
-    if state.network.len() > 0 { return true; }
+    _: &ActorModel<A, ()>,
+    state: &<ActorModel<A, ()> as Model>::State,
+) -> bool
+where
+    A::Msg: Ord,
+    A::Timer: Ord,
+{
+    if state.network.len() > 0 {
+        return true;
+    }
     let ds = daemon_views(&state.actor_states);
     for &(src_id, src_local, _, _) in &ds {
         for &(obs_id, _, obs_remote, _) in &ds {
-            if src_id == obs_id { continue; }
-            let observed: BTreeSet<Sid> = obs_remote.iter()
-                .filter(|k| k.daemon == src_id).map(|k| k.id).collect();
-            if observed != *src_local { return false; }
+            if src_id == obs_id {
+                continue;
+            }
+            let observed: BTreeSet<Sid> = obs_remote
+                .iter()
+                .filter(|k| k.daemon == src_id)
+                .map(|k| k.id)
+                .collect();
+            if observed != *src_local {
+                return false;
+            }
         }
     }
     true
 }
 
 fn check_no_self_remote<A: Actor<State = OuijaState>>(
-    _: &ActorModel<A, ()>, state: &<ActorModel<A, ()> as Model>::State,
-) -> bool where A::Msg: Ord, A::Timer: Ord {
-    daemon_views(&state.actor_states).iter()
+    _: &ActorModel<A, ()>,
+    state: &<ActorModel<A, ()> as Model>::State,
+) -> bool
+where
+    A::Msg: Ord,
+    A::Timer: Ord,
+{
+    daemon_views(&state.actor_states)
+        .iter()
         .all(|&(did, _, remote, _)| remote.iter().all(|k| k.daemon != did))
 }
 
 fn check_alias_acyclic<A: Actor<State = OuijaState>>(
-    _: &ActorModel<A, ()>, state: &<ActorModel<A, ()> as Model>::State,
-) -> bool where A::Msg: Ord, A::Timer: Ord {
+    _: &ActorModel<A, ()>,
+    state: &<ActorModel<A, ()> as Model>::State,
+) -> bool
+where
+    A::Msg: Ord,
+    A::Timer: Ord,
+{
     for &(_, _, _, aliases) in &daemon_views(&state.actor_states) {
         for (&start, &first) in aliases {
             let mut cur = first;
             let mut vis = BTreeSet::new();
             vis.insert(start);
-            if !vis.insert(cur) { return false; }
+            if !vis.insert(cur) {
+                return false;
+            }
             while let Some(&nxt) = aliases.get(&cur) {
-                if !vis.insert(nxt) { return false; }
+                if !vis.insert(nxt) {
+                    return false;
+                }
                 cur = nxt;
             }
         }
@@ -473,15 +766,29 @@ fn check_alias_acyclic<A: Actor<State = OuijaState>>(
 }
 
 fn check_some_registered<A: Actor<State = OuijaState>>(
-    _: &ActorModel<A, ()>, state: &<ActorModel<A, ()> as Model>::State,
-) -> bool where A::Msg: Ord, A::Timer: Ord {
-    daemon_views(&state.actor_states).iter().any(|&(_, local, _, _)| !local.is_empty())
+    _: &ActorModel<A, ()>,
+    state: &<ActorModel<A, ()> as Model>::State,
+) -> bool
+where
+    A::Msg: Ord,
+    A::Timer: Ord,
+{
+    daemon_views(&state.actor_states)
+        .iter()
+        .any(|&(_, local, _, _)| !local.is_empty())
 }
 
 fn check_some_remote<A: Actor<State = OuijaState>>(
-    _: &ActorModel<A, ()>, state: &<ActorModel<A, ()> as Model>::State,
-) -> bool where A::Msg: Ord, A::Timer: Ord {
-    daemon_views(&state.actor_states).iter().any(|&(_, _, remote, _)| !remote.is_empty())
+    _: &ActorModel<A, ()>,
+    state: &<ActorModel<A, ()> as Model>::State,
+) -> bool
+where
+    A::Msg: Ord,
+    A::Timer: Ord,
+{
+    daemon_views(&state.actor_states)
+        .iter()
+        .any(|&(_, _, remote, _)| !remote.is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -491,8 +798,14 @@ fn check_some_remote<A: Actor<State = OuijaState>>(
 fn build_current_model() -> ActorModel<OuijaActor, ()> {
     let (d0, d1) = (Id::from(0usize), Id::from(1usize));
     ActorModel::new((), ())
-        .actor(OuijaActor::Daemon { daemon_id: DaemonId(0), peers: vec![d1] })
-        .actor(OuijaActor::Daemon { daemon_id: DaemonId(1), peers: vec![d0] })
+        .actor(OuijaActor::Daemon {
+            daemon_id: DaemonId(0),
+            peers: vec![d1],
+        })
+        .actor(OuijaActor::Daemon {
+            daemon_id: DaemonId(1),
+            peers: vec![d0],
+        })
         .actor(OuijaActor::Client { target: d0 })
         .actor(OuijaActor::Client { target: d1 })
         .init_network(Network::new_unordered_nonduplicating([]))
@@ -507,8 +820,14 @@ fn build_current_model() -> ActorModel<OuijaActor, ()> {
 fn build_fixed_model() -> ActorModel<FixedActor, ()> {
     let (d0, d1) = (Id::from(0usize), Id::from(1usize));
     ActorModel::new((), ())
-        .actor(FixedActor::Daemon { daemon_id: DaemonId(0), peers: vec![d1] })
-        .actor(FixedActor::Daemon { daemon_id: DaemonId(1), peers: vec![d0] })
+        .actor(FixedActor::Daemon {
+            daemon_id: DaemonId(0),
+            peers: vec![d1],
+        })
+        .actor(FixedActor::Daemon {
+            daemon_id: DaemonId(1),
+            peers: vec![d0],
+        })
         .actor(FixedActor::Client { target: d0 })
         .actor(FixedActor::Client { target: d1 })
         .init_network(Network::new_unordered_nonduplicating([]))
@@ -532,14 +851,35 @@ const REPLY_SIDS: [Sid; 2] = [Sid::A, Sid::B];
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum ReplyMsg {
-    SessionList { sessions: BTreeSet<Sid>, daemon: DaemonId, seq: u8 },
-    Register { id: Sid },
-    Remove { id: Sid },
-    Rename { old_id: Sid, new_id: Sid },
-    SendExpectingReply { from: Sid, to: Sid },
-    ReplyTo { from: Sid, to: Sid },
+    SessionList {
+        sessions: BTreeSet<Sid>,
+        daemon: DaemonId,
+        seq: u8,
+    },
+    Register {
+        id: Sid,
+    },
+    Remove {
+        id: Sid,
+    },
+    Rename {
+        old_id: Sid,
+        new_id: Sid,
+    },
+    SendExpectingReply {
+        from: Sid,
+        to: Sid,
+    },
+    ReplyTo {
+        from: Sid,
+        to: Sid,
+    },
     /// Cross-daemon message delivery expecting a reply.
-    DeliverMsg { from_sid: Sid, from_daemon: DaemonId, to_sid: Sid },
+    DeliverMsg {
+        from_sid: Sid,
+        from_daemon: DaemonId,
+        to_sid: Sid,
+    },
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -564,7 +904,9 @@ enum ReplyState {
         /// Per local session: senders (daemon, sid) that expect a reply.
         pending_replies: BTreeMap<Sid, BTreeSet<RemoteKey>>,
     },
-    Client { actions_taken: u8 },
+    Client {
+        actions_taken: u8,
+    },
 }
 
 #[derive(Clone)]
@@ -601,14 +943,35 @@ impl Actor for ReplyActor {
         }
     }
 
-    fn on_msg(&self, _id: Id, state: &mut Cow<'_, Self::State>, _src: Id, msg: Self::Msg, o: &mut Out<Self>) {
-        let ReplyState::Daemon { daemon_id: my_id, .. } = state.as_ref() else { return };
+    fn on_msg(
+        &self,
+        _id: Id,
+        state: &mut Cow<'_, Self::State>,
+        _src: Id,
+        msg: Self::Msg,
+        o: &mut Out<Self>,
+    ) {
+        let ReplyState::Daemon {
+            daemon_id: my_id, ..
+        } = state.as_ref()
+        else {
+            return;
+        };
         let my_id = *my_id;
 
         match msg {
             ReplyMsg::Register { id: sid } => {
                 let s = state.to_mut();
-                let ReplyState::Daemon { local, peers, daemon_id, seq, .. } = s else { return };
+                let ReplyState::Daemon {
+                    local,
+                    peers,
+                    daemon_id,
+                    seq,
+                    ..
+                } = s
+                else {
+                    return;
+                };
                 if local.insert(sid) {
                     *seq += 1;
                     send_reply_list(local, *daemon_id, *seq, peers, o);
@@ -617,10 +980,23 @@ impl Actor for ReplyActor {
 
             ReplyMsg::Remove { id: sid } => {
                 let s = state.to_mut();
-                let ReplyState::Daemon { local, peers, daemon_id, seq, pending_replies, .. } = s else { return };
+                let ReplyState::Daemon {
+                    local,
+                    peers,
+                    daemon_id,
+                    seq,
+                    pending_replies,
+                    ..
+                } = s
+                else {
+                    return;
+                };
                 if local.remove(&sid) {
                     pending_replies.remove(&sid);
-                    let me = RemoteKey { daemon: *daemon_id, id: sid };
+                    let me = RemoteKey {
+                        daemon: *daemon_id,
+                        id: sid,
+                    };
                     for set in pending_replies.values_mut() {
                         set.remove(&me);
                     }
@@ -631,16 +1007,35 @@ impl Actor for ReplyActor {
 
             ReplyMsg::Rename { old_id, new_id } => {
                 let s = state.to_mut();
-                let ReplyState::Daemon { local, aliases, peers, daemon_id, seq, pending_replies, .. } = s else { return };
+                let ReplyState::Daemon {
+                    local,
+                    aliases,
+                    peers,
+                    daemon_id,
+                    seq,
+                    pending_replies,
+                    ..
+                } = s
+                else {
+                    return;
+                };
                 if old_id != new_id && local.remove(&old_id) {
                     local.insert(new_id);
                     if let Some(set) = pending_replies.remove(&old_id) {
                         pending_replies.insert(new_id, set);
                     }
-                    let old_key = RemoteKey { daemon: *daemon_id, id: old_id };
-                    let new_key = RemoteKey { daemon: *daemon_id, id: new_id };
+                    let old_key = RemoteKey {
+                        daemon: *daemon_id,
+                        id: old_id,
+                    };
+                    let new_key = RemoteKey {
+                        daemon: *daemon_id,
+                        id: new_id,
+                    };
                     for set in pending_replies.values_mut() {
-                        if set.remove(&old_key) { set.insert(new_key); }
+                        if set.remove(&old_key) {
+                            set.insert(new_key);
+                        }
                     }
                     add_alias(aliases, old_id, new_id);
                     *seq += 1;
@@ -650,33 +1045,77 @@ impl Actor for ReplyActor {
 
             ReplyMsg::SendExpectingReply { from, to } => {
                 let s = state.to_mut();
-                let ReplyState::Daemon { local, remote, daemon_id, peers, pending_replies, .. } = s else { return };
-                if !local.contains(&from) { return; }
-                let sender = RemoteKey { daemon: *daemon_id, id: from };
+                let ReplyState::Daemon {
+                    local,
+                    remote,
+                    daemon_id,
+                    peers,
+                    pending_replies,
+                    ..
+                } = s
+                else {
+                    return;
+                };
+                if !local.contains(&from) {
+                    return;
+                }
+                let sender = RemoteKey {
+                    daemon: *daemon_id,
+                    id: from,
+                };
                 if local.contains(&to) {
                     pending_replies.entry(to).or_default().insert(sender);
                 } else if remote.iter().any(|rk| rk.id == to) {
                     for &peer in peers.iter() {
-                        o.send(peer, ReplyMsg::DeliverMsg {
-                            from_sid: from, from_daemon: *daemon_id, to_sid: to,
-                        });
+                        o.send(
+                            peer,
+                            ReplyMsg::DeliverMsg {
+                                from_sid: from,
+                                from_daemon: *daemon_id,
+                                to_sid: to,
+                            },
+                        );
                     }
                 }
             }
 
             ReplyMsg::ReplyTo { from, to } => {
                 let s = state.to_mut();
-                let ReplyState::Daemon { local, pending_replies, .. } = s else { return };
-                if !local.contains(&from) { return; }
+                let ReplyState::Daemon {
+                    local,
+                    pending_replies,
+                    ..
+                } = s
+                else {
+                    return;
+                };
+                if !local.contains(&from) {
+                    return;
+                }
                 if let Some(set) = pending_replies.get_mut(&from) {
                     set.retain(|rk| rk.id != to);
                 }
             }
 
-            ReplyMsg::DeliverMsg { from_sid, from_daemon, to_sid } if from_daemon != my_id => {
+            ReplyMsg::DeliverMsg {
+                from_sid,
+                from_daemon,
+                to_sid,
+            } if from_daemon != my_id => {
                 let s = state.to_mut();
-                let ReplyState::Daemon { local, remote, pending_replies, .. } = s else { return };
-                let sender = RemoteKey { daemon: from_daemon, id: from_sid };
+                let ReplyState::Daemon {
+                    local,
+                    remote,
+                    pending_replies,
+                    ..
+                } = s
+                else {
+                    return;
+                };
+                let sender = RemoteKey {
+                    daemon: from_daemon,
+                    id: from_sid,
+                };
                 // Only track pending reply if the sender is a known remote
                 // session. A DeliverMsg arriving after the sender's SessionList
                 // removal would otherwise re-create the orphan.
@@ -685,18 +1124,37 @@ impl Actor for ReplyActor {
                 }
             }
 
-            ReplyMsg::SessionList { sessions, daemon, seq } if daemon != my_id => {
+            ReplyMsg::SessionList {
+                sessions,
+                daemon,
+                seq,
+            } if daemon != my_id => {
                 if let ReplyState::Daemon { last_seen, .. } = state.as_ref() {
-                    if seq < *last_seen.get(&daemon).unwrap_or(&0) { return; }
+                    if seq < *last_seen.get(&daemon).unwrap_or(&0) {
+                        return;
+                    }
                 }
                 let s = state.to_mut();
-                let ReplyState::Daemon { last_seen, remote, pending_replies, .. } = s else { return };
+                let ReplyState::Daemon {
+                    last_seen,
+                    remote,
+                    pending_replies,
+                    ..
+                } = s
+                else {
+                    return;
+                };
                 last_seen.insert(daemon, seq);
                 let expected: BTreeSet<RemoteKey> = sessions
-                    .iter().map(|&sid| RemoteKey { daemon, id: sid }).collect();
-                for key in &expected { remote.insert(*key); }
+                    .iter()
+                    .map(|&sid| RemoteKey { daemon, id: sid })
+                    .collect();
+                for key in &expected {
+                    remote.insert(*key);
+                }
                 // Collect removed remote sessions before retain.
-                let removed: BTreeSet<RemoteKey> = remote.iter()
+                let removed: BTreeSet<RemoteKey> = remote
+                    .iter()
                     .filter(|k| k.daemon == daemon && !expected.contains(k))
                     .copied()
                     .collect();
@@ -714,7 +1172,13 @@ impl Actor for ReplyActor {
         }
     }
 
-    fn on_random(&self, _id: Id, state: &mut Cow<'_, Self::State>, random: &Self::Random, o: &mut Out<Self>) {
+    fn on_random(
+        &self,
+        _id: Id,
+        state: &mut Cow<'_, Self::State>,
+        random: &Self::Random,
+        o: &mut Out<Self>,
+    ) {
         if let Self::Client { target } = self {
             let s = state.to_mut();
             if let ReplyState::Client { actions_taken } = s {
@@ -722,19 +1186,51 @@ impl Actor for ReplyActor {
                 match random {
                     ReplyAction::Register(sid) => o.send(*target, ReplyMsg::Register { id: *sid }),
                     ReplyAction::Remove(sid) => o.send(*target, ReplyMsg::Remove { id: *sid }),
-                    ReplyAction::Rename(old, new) => o.send(*target, ReplyMsg::Rename { old_id: *old, new_id: *new }),
-                    ReplyAction::SendExpectingReply(from, to) => o.send(*target, ReplyMsg::SendExpectingReply { from: *from, to: *to }),
-                    ReplyAction::ReplyTo(from, to) => o.send(*target, ReplyMsg::ReplyTo { from: *from, to: *to }),
+                    ReplyAction::Rename(old, new) => o.send(
+                        *target,
+                        ReplyMsg::Rename {
+                            old_id: *old,
+                            new_id: *new,
+                        },
+                    ),
+                    ReplyAction::SendExpectingReply(from, to) => o.send(
+                        *target,
+                        ReplyMsg::SendExpectingReply {
+                            from: *from,
+                            to: *to,
+                        },
+                    ),
+                    ReplyAction::ReplyTo(from, to) => o.send(
+                        *target,
+                        ReplyMsg::ReplyTo {
+                            from: *from,
+                            to: *to,
+                        },
+                    ),
                 }
-                if *actions_taken < MAX_REPLY_ACTIONS { offer_reply_actions(o); }
+                if *actions_taken < MAX_REPLY_ACTIONS {
+                    offer_reply_actions(o);
+                }
             }
         }
     }
 }
 
-fn send_reply_list(local: &BTreeSet<Sid>, did: DaemonId, seq: u8, peers: &[Id], o: &mut Out<ReplyActor>) {
-    let msg = ReplyMsg::SessionList { sessions: local.clone(), daemon: did, seq };
-    for &peer in peers { o.send(peer, msg.clone()); }
+fn send_reply_list(
+    local: &BTreeSet<Sid>,
+    did: DaemonId,
+    seq: u8,
+    peers: &[Id],
+    o: &mut Out<ReplyActor>,
+) {
+    let msg = ReplyMsg::SessionList {
+        sessions: local.clone(),
+        daemon: did,
+        seq,
+    };
+    for &peer in peers {
+        o.send(peer, msg.clone());
+    }
 }
 
 fn offer_reply_actions(o: &mut Out<ReplyActor>) {
@@ -765,18 +1261,29 @@ fn check_no_orphaned_pending_replies(
     _: &ActorModel<ReplyActor, ()>,
     state: &<ActorModel<ReplyActor, ()> as Model>::State,
 ) -> bool {
-    if state.network.len() > 0 { return true; }
+    if state.network.len() > 0 {
+        return true;
+    }
     let mut all_local: BTreeMap<DaemonId, BTreeSet<Sid>> = BTreeMap::new();
     for s in &state.actor_states {
-        if let ReplyState::Daemon { daemon_id, local, .. } = s.as_ref() {
+        if let ReplyState::Daemon {
+            daemon_id, local, ..
+        } = s.as_ref()
+        {
             all_local.insert(*daemon_id, local.clone());
         }
     }
     for s in &state.actor_states {
-        if let ReplyState::Daemon { pending_replies, .. } = s.as_ref() {
+        if let ReplyState::Daemon {
+            pending_replies, ..
+        } = s.as_ref()
+        {
             for senders in pending_replies.values() {
                 for sender in senders {
-                    if !all_local.get(&sender.daemon).is_some_and(|l| l.contains(&sender.id)) {
+                    if !all_local
+                        .get(&sender.daemon)
+                        .is_some_and(|l| l.contains(&sender.id))
+                    {
                         return false;
                     }
                 }
@@ -790,18 +1297,39 @@ fn check_reply_convergence(
     _: &ActorModel<ReplyActor, ()>,
     state: &<ActorModel<ReplyActor, ()> as Model>::State,
 ) -> bool {
-    if state.network.len() > 0 { return true; }
-    let ds: Vec<_> = state.actor_states.iter().filter_map(|s| {
-        if let ReplyState::Daemon { daemon_id, local, remote, .. } = s.as_ref() {
-            Some((*daemon_id, local, remote))
-        } else { None }
-    }).collect();
+    if state.network.len() > 0 {
+        return true;
+    }
+    let ds: Vec<_> = state
+        .actor_states
+        .iter()
+        .filter_map(|s| {
+            if let ReplyState::Daemon {
+                daemon_id,
+                local,
+                remote,
+                ..
+            } = s.as_ref()
+            {
+                Some((*daemon_id, local, remote))
+            } else {
+                None
+            }
+        })
+        .collect();
     for &(src_id, src_local, _) in &ds {
         for &(obs_id, _, obs_remote) in &ds {
-            if src_id == obs_id { continue; }
-            let observed: BTreeSet<Sid> = obs_remote.iter()
-                .filter(|k| k.daemon == src_id).map(|k| k.id).collect();
-            if observed != *src_local { return false; }
+            if src_id == obs_id {
+                continue;
+            }
+            let observed: BTreeSet<Sid> = obs_remote
+                .iter()
+                .filter(|k| k.daemon == src_id)
+                .map(|k| k.id)
+                .collect();
+            if observed != *src_local {
+                return false;
+            }
         }
     }
     true
@@ -811,9 +1339,10 @@ fn check_reply_some_registered(
     _: &ActorModel<ReplyActor, ()>,
     state: &<ActorModel<ReplyActor, ()> as Model>::State,
 ) -> bool {
-    state.actor_states.iter().any(|s| {
-        matches!(s.as_ref(), ReplyState::Daemon { local, .. } if !local.is_empty())
-    })
+    state
+        .actor_states
+        .iter()
+        .any(|s| matches!(s.as_ref(), ReplyState::Daemon { local, .. } if !local.is_empty()))
 }
 
 fn check_some_pending_replies(
@@ -821,24 +1350,51 @@ fn check_some_pending_replies(
     state: &<ActorModel<ReplyActor, ()> as Model>::State,
 ) -> bool {
     state.actor_states.iter().any(|s| {
-        if let ReplyState::Daemon { pending_replies, .. } = s.as_ref() {
+        if let ReplyState::Daemon {
+            pending_replies, ..
+        } = s.as_ref()
+        {
             pending_replies.values().any(|set| !set.is_empty())
-        } else { false }
+        } else {
+            false
+        }
     })
 }
 
 fn build_reply_model() -> ActorModel<ReplyActor, ()> {
     let (d0, d1) = (Id::from(0usize), Id::from(1usize));
     ActorModel::new((), ())
-        .actor(ReplyActor::Daemon { daemon_id: DaemonId(0), peers: vec![d1] })
-        .actor(ReplyActor::Daemon { daemon_id: DaemonId(1), peers: vec![d0] })
+        .actor(ReplyActor::Daemon {
+            daemon_id: DaemonId(0),
+            peers: vec![d1],
+        })
+        .actor(ReplyActor::Daemon {
+            daemon_id: DaemonId(1),
+            peers: vec![d0],
+        })
         .actor(ReplyActor::Client { target: d0 })
         .actor(ReplyActor::Client { target: d1 })
         .init_network(Network::new_unordered_nonduplicating([]))
-        .property(Expectation::Always, "reply convergence", check_reply_convergence)
-        .property(Expectation::Always, "no orphaned pending replies", check_no_orphaned_pending_replies)
-        .property(Expectation::Sometimes, "reply registered", check_reply_some_registered)
-        .property(Expectation::Sometimes, "pending replies exist", check_some_pending_replies)
+        .property(
+            Expectation::Always,
+            "reply convergence",
+            check_reply_convergence,
+        )
+        .property(
+            Expectation::Always,
+            "no orphaned pending replies",
+            check_no_orphaned_pending_replies,
+        )
+        .property(
+            Expectation::Sometimes,
+            "reply registered",
+            check_reply_some_registered,
+        )
+        .property(
+            Expectation::Sometimes,
+            "pending replies exist",
+            check_some_pending_replies,
+        )
         .within_boundary(|_, state| state.network.len() <= 8)
 }
 
@@ -861,7 +1417,8 @@ mod tests {
         );
         println!(
             "Bug confirmed: out-of-order messages break convergence. States: {}, unique: {}",
-            checker.state_count(), checker.unique_state_count(),
+            checker.state_count(),
+            checker.unique_state_count(),
         );
     }
 
@@ -889,7 +1446,9 @@ mod tests {
         let checker = build_fixed_model().checker().spawn_bfs().join();
         println!(
             "Fixed model — States: {}, unique: {}, max depth: {}",
-            checker.state_count(), checker.unique_state_count(), checker.max_depth(),
+            checker.state_count(),
+            checker.unique_state_count(),
+            checker.max_depth(),
         );
         checker.assert_properties();
     }
@@ -908,7 +1467,8 @@ mod tests {
         );
         println!(
             "Fix verified: no orphaned pending replies. States: {}, unique: {}",
-            checker.state_count(), checker.unique_state_count(),
+            checker.state_count(),
+            checker.unique_state_count(),
         );
     }
 
