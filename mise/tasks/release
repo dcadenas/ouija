@@ -2,6 +2,9 @@
 # Bump alpha version, commit, push, publish to crates.io, then ouija update
 set -euo pipefail
 
+PORT="${OUIJA_PORT:-7880}"
+BASE="http://localhost:${PORT}"
+
 # Read current version
 CURRENT=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 echo "Current version: $CURRENT"
@@ -32,4 +35,18 @@ cargo publish
 
 # Update local daemon
 ouija update
+
+# Request macOS builds from the Mac via ouija (non-blocking, best-effort)
+MAC_NODE=$(curl -sf "${BASE}/api/nodes" 2>/dev/null | jq -r '[.[] | select(.name != null and .status == "connected") | .name] | first // empty')
+if [ -n "$MAC_NODE" ]; then
+  echo "Requesting macOS builds from ${MAC_NODE}..."
+  curl -sf -X POST "${BASE}/api/send" \
+    -H "Content-Type: application/json" \
+    -d "{\"from\":\"release-task\",\"to\":\"${MAC_NODE}/ouija\",\"message\":\"Release v${NEXT} published. Please: (1) git pull (2) cargo build --release --target x86_64-apple-darwin (3) cargo build --release --target aarch64-apple-darwin (4) create tarballs: for each target, mkdir ouija-{target}, cp binary in, tar czf ouija-{target}.tar.xz (5) gh release upload v${NEXT} ouija-*.tar.xz. Send results back when done.\",\"expects_reply\":false}" 2>/dev/null \
+    && echo "macOS build request sent" \
+    || echo "warning: could not send macOS build request"
+else
+  echo "warning: no remote Mac node connected, skipping macOS builds"
+fi
+
 echo "Released $NEXT"
