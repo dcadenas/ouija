@@ -817,6 +817,166 @@ api "$BASE" POST /api/settings -d '{"max_local_sessions":0}' >/dev/null
 api "$BASE" POST /api/remove -d '{"id":"keep-a"}' >/dev/null 2>&1 || true
 api "$BASE" POST /api/remove -d '{"id":"keep-b"}' >/dev/null 2>&1 || true
 
+# ═══════════════════════════════════════════════════════════════════
+# ALIAS RESOLUTION AFTER RENAME
+# ═══════════════════════════════════════════════════════════════════
+
+# Restart daemon with clean state and auto_register=false
+kill $DAEMON_PID 2>/dev/null || true
+wait $DAEMON_PID 2>/dev/null || true
+rm -rf /tmp/ouija-test2
+mkdir -p /tmp/ouija-test2
+echo '{"auto_register":false,"reaper_interval_secs":1}' > /tmp/ouija-test2/settings.json
+DAEMON_PID=$(start_daemon $PORT "local" /tmp/ouija-test2)
+log "Restarted daemon for alias/pending-reply tests (PID $DAEMON_PID)"
+
+log "Test 22: Send to renamed session returns alias hint"
+api "$BASE" POST /api/register -d "{\"id\":\"alias-orig\",\"pane\":\"$PANE_A\"}" >/dev/null
+api "$BASE" POST /api/register -d "{\"id\":\"alias-sender\",\"pane\":\"$PANE_B\"}" >/dev/null
+api "$BASE" POST /api/rename -d '{"old_id":"alias-orig","new_id":"alias-new"}' >/dev/null
+# Send to old name — should get error with hint
+result=$(curl -s -X POST "${BASE}/api/send" -H 'Content-Type: application/json' \
+    -d '{"from":"alias-sender","to":"alias-orig","message":"hi"}')
+assert_contains "22: error mentions rename" "$result" "was renamed to"
+assert_contains "22: error has renamed_to field" "$result" '"renamed_to":"alias-new"'
+# Clean up
+api "$BASE" POST /api/remove -d '{"id":"alias-new"}' >/dev/null 2>&1 || true
+api "$BASE" POST /api/remove -d '{"id":"alias-sender"}' >/dev/null 2>&1 || true
+
+log "Test 22b: Alias chain flattened after multiple renames"
+api "$BASE" POST /api/register -d "{\"id\":\"chain-a\",\"pane\":\"$PANE_A\"}" >/dev/null
+api "$BASE" POST /api/register -d "{\"id\":\"chain-sender\",\"pane\":\"$PANE_B\"}" >/dev/null
+api "$BASE" POST /api/rename -d '{"old_id":"chain-a","new_id":"chain-b"}' >/dev/null
+api "$BASE" POST /api/rename -d '{"old_id":"chain-b","new_id":"chain-c"}' >/dev/null
+# Send to the original name — should resolve all the way to chain-c
+result=$(curl -s -X POST "${BASE}/api/send" -H 'Content-Type: application/json' \
+    -d '{"from":"chain-sender","to":"chain-a","message":"hi"}')
+assert_contains "22b: chain resolves to final name" "$result" '"renamed_to":"chain-c"'
+# Clean up
+api "$BASE" POST /api/remove -d '{"id":"chain-c"}' >/dev/null 2>&1 || true
+api "$BASE" POST /api/remove -d '{"id":"chain-sender"}' >/dev/null 2>&1 || true
+
+log "Test 22c: Alias returns nothing when renamed target is removed"
+api "$BASE" POST /api/register -d "{\"id\":\"gone-orig\",\"pane\":\"$PANE_A\"}" >/dev/null
+api "$BASE" POST /api/register -d "{\"id\":\"gone-sender\",\"pane\":\"$PANE_B\"}" >/dev/null
+api "$BASE" POST /api/rename -d '{"old_id":"gone-orig","new_id":"gone-new"}' >/dev/null
+api "$BASE" POST /api/remove -d '{"id":"gone-new"}' >/dev/null
+# Send to old name — target gone, alias should not resolve
+result=$(curl -s -X POST "${BASE}/api/send" -H 'Content-Type: application/json' \
+    -d '{"from":"gone-sender","to":"gone-orig","message":"hi"}')
+assert_contains "22c: error for gone target" "$result" '"error"'
+assert_not_contains "22c: no rename hint for removed target" "$result" "renamed_to"
+# Clean up
+api "$BASE" POST /api/remove -d '{"id":"gone-sender"}' >/dev/null 2>&1 || true
+
+# ═══════════════════════════════════════════════════════════════════
+# PENDING REPLY CLEANUP ON SESSION REMOVAL
+# ═══════════════════════════════════════════════════════════════════
+
+log "Test 23: Pending reply cleared when sender session is removed"
+api "$BASE" POST /api/register -d "{\"id\":\"pr-target\",\"pane\":\"$PANE_A\"}" >/dev/null
+api "$BASE" POST /api/register -d "{\"id\":\"pr-sender\",\"pane\":\"$PANE_B\"}" >/dev/null
+sleep 0.5
+# Send expects_reply=true to create a pending reply on pr-target
+send_result=$(api "$BASE" POST /api/send -d '{"from":"pr-sender","to":"pr-target","message":"pending q","expects_reply":true}')
+assert_contains "23: send delivered" "$send_result" '"status":"delivered"'
+sleep 1
+PANE_A_NUM="${PANE_A#%}"
+result=$(api "$BASE" GET "/api/pane/${PANE_A_NUM}/pending-replies")
+assert_contains "23: pending reply exists before removal" "$result" '"count":1'
+# Remove the sender session — should auto-clear the pending reply
+api "$BASE" POST /api/remove -d '{"id":"pr-sender"}' >/dev/null
+sleep 1
+result=$(api "$BASE" GET "/api/pane/${PANE_A_NUM}/pending-replies")
+assert_contains "23: pending reply cleared after sender removal" "$result" '"count":0'
+# Clean up
+api "$BASE" POST /api/remove -d '{"id":"pr-target"}' >/dev/null 2>&1 || true
+
+log "Test 23b: Pending reply cleared when sender session reaped"
+PANE_EPHEMERAL=$(create_claude_pane "$FAKE_BIN")
+sleep 0.5
+api "$BASE" POST /api/register -d "{\"id\":\"pr-asker\",\"pane\":\"$PANE_A\"}" >/dev/null
+api "$BASE" POST /api/register -d "{\"id\":\"pr-ghost\",\"pane\":\"$PANE_EPHEMERAL\"}" >/dev/null
+sleep 0.5
+# Create pending reply on pr-asker from pr-ghost
+send_result=$(api "$BASE" POST /api/send -d '{"from":"pr-ghost","to":"pr-asker","message":"ghost q","expects_reply":true}')
+assert_contains "23b: send delivered" "$send_result" '"status":"delivered"'
+sleep 1
+PANE_A_NUM="${PANE_A#%}"
+result=$(api "$BASE" GET "/api/pane/${PANE_A_NUM}/pending-replies")
+assert_contains "23b: pending reply from ghost exists" "$result" '"count":1'
+# Kill the ghost's tmux pane so the reaper removes it
+tmux kill-pane -t "$PANE_EPHEMERAL" 2>/dev/null || true
+# Wait for reaper to remove pr-ghost and clear the pending reply
+wait_for 15 bash -c "! session_ids '$BASE' | grep -qF 'pr-ghost'" || true
+sleep 1
+ids_after=$(session_ids "$BASE")
+assert_not_contains "23b: ghost session reaped" "$ids_after" "pr-ghost"
+result=$(api "$BASE" GET "/api/pane/${PANE_A_NUM}/pending-replies")
+assert_contains "23b: pending reply cleared after reap" "$result" '"count":0'
+# Clean up
+api "$BASE" POST /api/remove -d '{"id":"pr-asker"}' >/dev/null 2>&1 || true
+
+# ═══════════════════════════════════════════════════════════════════
+# FIFO INJECTION QUEUE ORDERING
+# ═══════════════════════════════════════════════════════════════════
+
+log "Test 24: Multiple sequential messages arrive in FIFO order"
+api "$BASE" POST /api/register -d "{\"id\":\"fifo-target\",\"pane\":\"$PANE_A\"}" >/dev/null
+api "$BASE" POST /api/register -d "{\"id\":\"fifo-sender\",\"pane\":\"$PANE_B\"}" >/dev/null
+# Clear the pane
+tmux send-keys -t "$PANE_A" "clear" Enter
+sleep 0.5
+# Send 5 messages sequentially — FIFO queue should preserve this order
+for i in 1 2 3 4 5; do
+    api "$BASE" POST /api/send -d "{\"from\":\"fifo-sender\",\"to\":\"fifo-target\",\"message\":\"fifo-msg-$i\",\"expects_reply\":false}" >/dev/null
+done
+# Wait for all messages to arrive
+wait_for 10 bash -c "tmux capture-pane -t '$PANE_A' -p -S -30 | grep -qF 'fifo-msg-5'"
+pane_content=$(tmux capture-pane -t "$PANE_A" -p -S -30)
+# Verify all 5 messages arrived
+for i in 1 2 3 4 5; do
+    assert_contains "24: fifo-msg-$i delivered" "$pane_content" "fifo-msg-$i"
+done
+# Check ordering — each message's line number should be after the previous
+PREV_LINE=0
+ORDER_OK=1
+for i in 1 2 3 4 5; do
+    LINE=$(echo "$pane_content" | grep -n "fifo-msg-$i" | head -1 | cut -d: -f1)
+    if [ -n "$LINE" ] && [ "$LINE" -gt "$PREV_LINE" ]; then
+        PREV_LINE=$LINE
+    else
+        ORDER_OK=0
+        break
+    fi
+done
+if [ "$ORDER_OK" -eq 1 ]; then
+    pass "24: messages in FIFO order"
+else
+    fail "24: messages in FIFO order" "sequential line numbers" "$pane_content"
+fi
+# Clean up
+api "$BASE" POST /api/remove -d '{"id":"fifo-target"}' >/dev/null 2>&1 || true
+api "$BASE" POST /api/remove -d '{"id":"fifo-sender"}' >/dev/null 2>&1 || true
+
+# ═══════════════════════════════════════════════════════════════════
+# REGISTER HOOK RACE — DAEMON PRE-REGISTERS, HOOK SKIPS
+# ═══════════════════════════════════════════════════════════════════
+
+log "Test 25: Hook skips registration when pane already registered by daemon"
+REGISTER_SCRIPT=$(find_script "ouija-register.sh")
+api "$BASE" POST /api/settings -d '{"auto_register":true}' >/dev/null
+# Pre-register a session on PANE_A (simulates daemon auto-registration)
+api "$BASE" POST /api/register -d "{\"id\":\"pre-registered\",\"pane\":\"$PANE_A\"}" >/dev/null
+# Run the hook — it should detect the pane is already registered and skip
+HOOK_OUT=$(echo '{"source":"startup"}' | TMUX_PANE="$PANE_A" OUIJA_PORT=$PORT bash -c "cd /tmp/my-project && bash '$REGISTER_SCRIPT'" 2>&1)
+# Verify hook did NOT register (output should be empty or say already registered)
+ids=$(session_ids "$BASE")
+assert_not_contains "25: hook did not create duplicate session" "$ids" "my-project"
+assert_contains "25: pre-registered session still exists" "$ids" "pre-registered"
+# Clean up
+api "$BASE" POST /api/remove -d '{"id":"pre-registered"}' >/dev/null 2>&1 || true
+
 # ── Daemon logs ──────────────────────────────────────────────────────
 log "Daemon logs:"
 cat /tmp/ouija-test/daemon.log 2>/dev/null || true

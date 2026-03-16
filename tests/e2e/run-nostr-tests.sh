@@ -246,6 +246,81 @@ api "$BASE_A" POST /api/remove -d '{"id":"sess-alpha2"}' >/dev/null 2>&1 || true
 api "$BASE_C" POST /api/remove -d '{"id":"sess-gamma"}' >/dev/null 2>&1 || true
 
 # ═══════════════════════════════════════════════════════════════════
+# CROSS-DAEMON SESSION RENAME (SessionRenamed wire message)
+# ═══════════════════════════════════════════════════════════════════
+
+log "Setting up rename propagation test..."
+api "$BASE_A" POST /api/register -d "{\"id\":\"rename-src\",\"pane\":\"$PANE_A1\"}" >/dev/null
+api "$BASE_B" POST /api/register -d "{\"id\":\"rename-observer\",\"pane\":\"$PANE_B1\"}" >/dev/null
+
+# Wait for B to see A's session
+wait_for 20 bash -c "remote_session_ids '$BASE_B' | grep -qF 'alpha/rename-src'"
+assert_contains "pre-rename: B sees alpha/rename-src" "$(remote_session_ids "$BASE_B")" "alpha/rename-src"
+
+log "Test R1: SessionRenamed propagates across daemons"
+api "$BASE_A" POST /api/rename -d '{"old_id":"rename-src","new_id":"rename-dst"}' >/dev/null
+# Wait for B to see the renamed session
+wait_for 20 bash -c "remote_session_ids '$BASE_B' | grep -qF 'alpha/rename-dst'"
+remote_b=$(remote_session_ids "$BASE_B")
+assert_contains "R1: B sees alpha/rename-dst after rename" "$remote_b" "alpha/rename-dst"
+assert_not_contains "R1: old name gone from B" "$remote_b" "alpha/rename-src"
+
+log "Test R2: Cross-daemon alias resolution after rename"
+# B sends to old name — should get error with rename hint
+result=$(curl -s -X POST "${BASE_B}/api/send" -H 'Content-Type: application/json' \
+    -d '{"from":"rename-observer","to":"alpha/rename-src","message":"hi old name"}')
+assert_contains "R2: error mentions rename" "$result" "was renamed to"
+assert_contains "R2: error has renamed_to field" "$result" "rename-dst"
+
+log "Test R3: Message to renamed session succeeds with new name"
+result=$(api "$BASE_B" POST /api/send -d '{"from":"rename-observer","to":"alpha/rename-dst","message":"hello renamed"}')
+assert_contains "R3: send via gossip" "$result" "nostr"
+log "  Waiting for nostr DM delivery..."
+wait_for 10 bash -c "tmux capture-pane -t '$PANE_A1' -p -S -30 | grep -qF 'hello renamed'"
+pane_content=$(tmux capture-pane -t "$PANE_A1" -p -S -30)
+assert_contains "R3: message delivered to renamed session" "$pane_content" "hello renamed"
+
+# Cleanup
+api "$BASE_A" POST /api/remove -d '{"id":"rename-dst"}' >/dev/null 2>&1 || true
+api "$BASE_B" POST /api/remove -d '{"id":"rename-observer"}' >/dev/null 2>&1 || true
+
+# ═══════════════════════════════════════════════════════════════════
+# CROSS-DAEMON FROM-PREFIX ROUTING
+# ═══════════════════════════════════════════════════════════════════
+
+log "Setting up from-prefix routing test..."
+api "$BASE_A" POST /api/register -d "{\"id\":\"route-a\",\"pane\":\"$PANE_A1\"}" >/dev/null
+api "$BASE_B" POST /api/register -d "{\"id\":\"route-b\",\"pane\":\"$PANE_B1\"}" >/dev/null
+
+# Wait for mutual visibility
+wait_for 20 bash -c "remote_session_ids '$BASE_A' | grep -qF 'beta/route-b' && remote_session_ids '$BASE_B' | grep -qF 'alpha/route-a'"
+
+log "Test R4: Cross-daemon message shows from-prefix in pane"
+tmux send-keys -t "$PANE_A1" "clear" Enter
+sleep 0.5
+result=$(api "$BASE_B" POST /api/send -d '{"from":"route-b","to":"alpha/route-a","message":"routed hello","expects_reply":true}')
+assert_contains "R4: send via gossip" "$result" "nostr"
+wait_for 10 bash -c "tmux capture-pane -t '$PANE_A1' -p -S -30 | grep -qF 'routed hello'"
+pane_content=$(tmux capture-pane -t "$PANE_A1" -p -S -30)
+assert_contains "R4: message has from prefix" "$pane_content" "[from beta/route-b ?]:"
+assert_contains "R4: message content delivered" "$pane_content" "routed hello"
+
+log "Test R5: Cross-daemon message without expects_reply omits ?"
+tmux send-keys -t "$PANE_A1" "clear" Enter
+sleep 0.5
+result=$(api "$BASE_B" POST /api/send -d '{"from":"route-b","to":"alpha/route-a","message":"fyi only","expects_reply":false}')
+wait_for 10 bash -c "tmux capture-pane -t '$PANE_A1' -p -S -30 | grep -qF 'fyi only'"
+pane_content=$(tmux capture-pane -t "$PANE_A1" -p -S -30)
+# Check the specific line containing "fyi only" has no ? prefix
+fyi_line=$(echo "$pane_content" | grep -F "fyi only" | head -1)
+assert_contains "R5: fyi line has from prefix" "$fyi_line" "[from beta/route-b]:"
+assert_not_contains "R5: fyi line has no ? marker" "$fyi_line" "[from beta/route-b ?]:"
+
+# Cleanup
+api "$BASE_A" POST /api/remove -d '{"id":"route-a"}' >/dev/null 2>&1 || true
+api "$BASE_B" POST /api/remove -d '{"id":"route-b"}' >/dev/null 2>&1 || true
+
+# ═══════════════════════════════════════════════════════════════════
 # SINGLE-USE TICKET TEST — ticket voided after C connected
 # The ticket C used in test 11 should be invalidated. D tries to
 # reuse it and should be rejected (unauthorized).
