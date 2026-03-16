@@ -70,9 +70,11 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
                 Human { npub: String },
             }
 
-            let target = {
+            // Resolve bare `from` to daemon-prefixed key so replies route
+            // back across machines (e.g. "ouija" -> "locota/ouija").
+            let (target, display_from) = {
                 let sessions = state.sessions.read().await;
-                sessions.get(&to).and_then(|session| match &session.origin {
+                let target = sessions.get(&to).and_then(|session| match &session.origin {
                     SessionOrigin::Local if session.metadata.networked => {
                         session.pane.as_ref().map(|p| DeliveryTarget::Local {
                             pane: p.clone(),
@@ -83,12 +85,22 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
                         Some(DeliveryTarget::Human { npub: npub.clone() })
                     }
                     _ => None,
-                })
+                });
+                let display_from = sessions
+                    .iter()
+                    .find(|(_, s)| {
+                        matches!(&s.origin, SessionOrigin::Remote(_))
+                            && crate::state::strip_remote_prefix(&s.id) == from.as_str()
+                    })
+                    .map(|(key, _)| key.clone())
+                    .unwrap_or_else(|| from.clone());
+                (target, display_from)
             };
 
             match target {
                 Some(DeliveryTarget::Local { pane, vim_mode }) => {
-                    let formatted = tmux::format_session_message(&from, &message, expects_reply);
+                    let formatted =
+                        tmux::format_session_message(&display_from, &message, expects_reply);
                     let delivered = tmux::locked_inject(state, &pane, &formatted, vim_mode)
                         .await
                         .is_ok();
@@ -131,7 +143,7 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
                     broadcast(state, &ack).await;
                 }
                 Some(DeliveryTarget::Human { npub }) => {
-                    let formatted = format!("[from {from}]: {message}");
+                    let formatted = format!("[from {display_from}]: {message}");
                     let delivered = crate::nostr_transport::send_plain_dm(state, &npub, &formatted)
                         .await
                         .is_ok();
