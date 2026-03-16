@@ -439,10 +439,7 @@ pub fn is_sole_pane(pane_id: &str) -> bool {
         _ => return false,
     };
 
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .count()
-        == 1
+    String::from_utf8_lossy(&output.stdout).lines().count() == 1
 }
 
 /// Rename the tmux window containing a pane and disable automatic-rename.
@@ -464,13 +461,7 @@ pub fn rename_window(pane_id: &str, name: &str) {
 /// Re-enable automatic-rename on the tmux window containing a pane.
 pub fn enable_automatic_rename(pane_id: &str) {
     let _ = Command::new("tmux")
-        .args([
-            "set-window-option",
-            "-t",
-            pane_id,
-            "automatic-rename",
-            "on",
-        ])
+        .args(["set-window-option", "-t", pane_id, "automatic-rename", "on"])
         .status();
 }
 

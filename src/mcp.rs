@@ -332,8 +332,7 @@ impl OuijaMcp {
                                 params.expects_reply,
                             );
                             let vim_mode = session.metadata.vim_mode;
-                            match tmux::locked_inject(&self.state, pane, &formatted, vim_mode)
-                                .await
+                            match tmux::locked_inject(&self.state, pane, &formatted, vim_mode).await
                             {
                                 Ok(()) => {
                                     // Mark target as handling an injected message
@@ -373,9 +372,9 @@ impl OuijaMcp {
                                         .await;
                                     Ok(CallToolResult::success(contents))
                                 }
-                                Err(e) => Ok(CallToolResult::error(vec![Content::text(
-                                    format!("tmux inject failed: {e}"),
-                                )])),
+                                Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                                    "tmux inject failed: {e}"
+                                ))])),
                             }
                         } else {
                             Ok(CallToolResult::error(vec![Content::text(format!(
