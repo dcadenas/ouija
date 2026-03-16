@@ -89,8 +89,9 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
             match target {
                 Some(DeliveryTarget::Local { pane, vim_mode }) => {
                     let formatted = tmux::format_session_message(&from, &message, expects_reply);
-                    let delivered =
-                        tmux::locked_inject(state, &pane, &formatted, vim_mode).await.is_ok();
+                    let delivered = tmux::locked_inject(state, &pane, &formatted, vim_mode)
+                        .await
+                        .is_ok();
                     if delivered {
                         let mut sessions = state.sessions.write().await;
                         if let Some(s) = sessions.get_mut(&to) {
@@ -172,6 +173,7 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
                     pane: None,
                     origin: SessionOrigin::Remote(daemon_id),
                     registered_at: chrono::Utc::now(),
+                    last_activity_at: chrono::Utc::now(),
                     metadata: metadata.clone().unwrap_or_default(),
                     block_interactive: false,
                 });
@@ -202,6 +204,7 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
                         pane: None,
                         origin: SessionOrigin::Remote(daemon_id.clone()),
                         registered_at: chrono::Utc::now(),
+                        last_activity_at: chrono::Utc::now(),
                         metadata: info.metadata.clone().unwrap_or_default(),
                         block_interactive: false,
                     });

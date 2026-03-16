@@ -34,6 +34,8 @@ pub struct PersistedSession {
     pub id: String,
     pub pane: Option<String>,
     pub registered_at: DateTime<Utc>,
+    #[serde(default = "Utc::now")]
+    pub last_activity_at: DateTime<Utc>,
     pub metadata: SessionMetadata,
 }
 
@@ -47,6 +49,7 @@ impl PersistedSession {
             id: session.id.clone(),
             pane: session.pane.clone(),
             registered_at: session.registered_at,
+            last_activity_at: session.last_activity_at,
             metadata: session.metadata.clone(),
         })
     }
@@ -156,6 +159,9 @@ pub struct OuijaSettings {
     pub idle_timeout_secs: u64,
     #[serde(default = "default_reaper_interval")]
     pub reaper_interval_secs: u64,
+    /// Max local sessions before the most idle are auto-closed. 0 = disabled.
+    #[serde(default)]
+    pub max_local_sessions: u64,
 }
 
 fn default_true() -> bool {
@@ -179,6 +185,7 @@ impl Default for OuijaSettings {
             router: None,
             idle_timeout_secs: 180,
             reaper_interval_secs: 5,
+            max_local_sessions: 0,
         }
     }
 }
@@ -233,6 +240,7 @@ mod tests {
             pane: pane.map(|s| s.to_string()),
             origin: SessionOrigin::Local,
             registered_at: Utc::now(),
+            last_activity_at: Utc::now(),
             metadata: SessionMetadata::default(),
             block_interactive: false,
         }
@@ -244,6 +252,7 @@ mod tests {
             pane: None,
             origin: SessionOrigin::Remote(daemon.to_string()),
             registered_at: Utc::now(),
+            last_activity_at: Utc::now(),
             metadata: SessionMetadata::default(),
             block_interactive: false,
         }
@@ -277,12 +286,14 @@ mod tests {
                 id: "a".into(),
                 pane: Some("%1".into()),
                 registered_at: Utc::now(),
+                last_activity_at: Utc::now(),
                 metadata: SessionMetadata::default(),
             },
             PersistedSession {
                 id: "b".into(),
                 pane: None,
                 registered_at: Utc::now(),
+                last_activity_at: Utc::now(),
                 metadata: SessionMetadata {
                     vim_mode: true,
                     project_dir: Some("/tmp".into()),

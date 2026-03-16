@@ -201,6 +201,7 @@ pub struct Session {
     pub pane: Option<String>,
     pub origin: SessionOrigin,
     pub registered_at: DateTime<Utc>,
+    pub last_activity_at: DateTime<Utc>,
     pub metadata: SessionMetadata,
     /// Block interactive prompts (AskUserQuestion, EnterPlanMode).
     /// Set on tmux injection, cleared when the user types directly.
@@ -498,11 +499,13 @@ impl AppState {
 
         let mut metadata = metadata;
         metadata.last_metadata_update = Some(Utc::now());
+        let now = Utc::now();
         let session = Session {
             id: id.clone(),
             pane,
             origin: SessionOrigin::Local,
-            registered_at: Utc::now(),
+            registered_at: now,
+            last_activity_at: now,
             metadata,
             block_interactive: false,
         };
@@ -749,6 +752,27 @@ impl AppState {
         }
 
         dead_ids
+    }
+
+    /// If local session count exceeds `max_local_sessions`, return the most
+    /// idle sessions that should be closed to bring the count back to the limit.
+    pub async fn collect_excess_idle_sessions(&self) -> Vec<String> {
+        let max = self.settings.read().await.max_local_sessions as usize;
+        if max == 0 {
+            return vec![];
+        }
+        let sessions = self.sessions.read().await;
+        let mut local: Vec<_> = sessions
+            .values()
+            .filter(|s| matches!(s.origin, SessionOrigin::Local))
+            .collect();
+        if local.len() <= max {
+            return vec![];
+        }
+        // Sort by last_activity_at ascending (most idle first)
+        local.sort_by_key(|s| s.last_activity_at);
+        let excess = local.len() - max;
+        local[..excess].iter().map(|s| s.id.clone()).collect()
     }
 
     pub fn persist_sessions_from(&self, sessions: &HashMap<String, Session>) {
@@ -1261,18 +1285,34 @@ pub(crate) mod tests {
             let mut sessions = state.sessions.write().await;
             sessions.insert(
                 "remote/s1".into(),
-                Session {
-                    id: "remote/s1".into(),
-                    pane: None,
-                    origin: SessionOrigin::Remote("remote".into()),
-                    registered_at: Utc::now(),
-                    metadata: SessionMetadata::default(),
-                    block_interactive: false,
-                },
+                test_session(
+                    "remote/s1",
+                    None,
+                    SessionOrigin::Remote("remote".into()),
+                    SessionMetadata::default(),
+                ),
             );
         }
         assert!(state.remove_session("remote/s1").await.is_none());
         assert_eq!(state.sessions.read().await.len(), 1);
+    }
+
+    /// Helper to build a Session for tests, filling in `last_activity_at` automatically.
+    fn test_session(
+        id: &str,
+        pane: Option<&str>,
+        origin: SessionOrigin,
+        metadata: SessionMetadata,
+    ) -> Session {
+        Session {
+            id: id.into(),
+            pane: pane.map(Into::into),
+            origin,
+            registered_at: Utc::now(),
+            last_activity_at: Utc::now(),
+            metadata,
+            block_interactive: false,
+        }
     }
 
     #[tokio::test]
@@ -1339,34 +1379,30 @@ pub(crate) mod tests {
     #[test]
     fn is_session_networked_true() {
         let state = AppState::new(test_config());
-        let session = Session {
-            id: "s1".into(),
-            pane: Some("%1".into()),
-            origin: SessionOrigin::Local,
-            registered_at: Utc::now(),
-            metadata: SessionMetadata {
+        let session = test_session(
+            "s1",
+            Some("%1"),
+            SessionOrigin::Local,
+            SessionMetadata {
                 networked: true,
                 ..Default::default()
             },
-            block_interactive: false,
-        };
+        );
         assert!(state.is_session_networked(&session));
     }
 
     #[test]
     fn is_session_networked_false() {
         let state = AppState::new(test_config());
-        let session = Session {
-            id: "s1".into(),
-            pane: Some("%1".into()),
-            origin: SessionOrigin::Local,
-            registered_at: Utc::now(),
-            metadata: SessionMetadata {
+        let session = test_session(
+            "s1",
+            Some("%1"),
+            SessionOrigin::Local,
+            SessionMetadata {
                 networked: false,
                 ..Default::default()
             },
-            block_interactive: false,
-        };
+        );
         assert!(!state.is_session_networked(&session));
     }
 
@@ -1397,25 +1433,21 @@ pub(crate) mod tests {
             let mut sessions = state.sessions.write().await;
             sessions.insert(
                 "remote/s1".into(),
-                Session {
-                    id: "remote/s1".into(),
-                    pane: None,
-                    origin: SessionOrigin::Remote("npub1remote".into()),
-                    registered_at: Utc::now(),
-                    metadata: SessionMetadata::default(),
-                    block_interactive: false,
-                },
+                test_session(
+                    "remote/s1",
+                    None,
+                    SessionOrigin::Remote("npub1remote".into()),
+                    SessionMetadata::default(),
+                ),
             );
             sessions.insert(
                 "remote/s2".into(),
-                Session {
-                    id: "remote/s2".into(),
-                    pane: None,
-                    origin: SessionOrigin::Remote("npub1remote".into()),
-                    registered_at: Utc::now(),
-                    metadata: SessionMetadata::default(),
-                    block_interactive: false,
-                },
+                test_session(
+                    "remote/s2",
+                    None,
+                    SessionOrigin::Remote("npub1remote".into()),
+                    SessionMetadata::default(),
+                ),
             );
         }
         // Add node info
@@ -1538,14 +1570,12 @@ pub(crate) mod tests {
             let mut sessions = state.sessions.write().await;
             sessions.insert(
                 "remote/s1".into(),
-                Session {
-                    id: "remote/s1".into(),
-                    pane: None,
-                    origin: SessionOrigin::Remote("remote".into()),
-                    registered_at: Utc::now(),
-                    metadata: SessionMetadata::default(),
-                    block_interactive: false,
-                },
+                test_session(
+                    "remote/s1",
+                    None,
+                    SessionOrigin::Remote("remote".into()),
+                    SessionMetadata::default(),
+                ),
             );
         }
         assert!(
@@ -1600,5 +1630,110 @@ pub(crate) mod tests {
             sessions["s1"].metadata.bulletin.as_deref(),
             Some("offering review")
         );
+    }
+
+    // --- collect_excess_idle_sessions ---
+
+    #[tokio::test]
+    async fn excess_idle_disabled_when_zero() {
+        let state = AppState::new(test_config());
+        // max_local_sessions defaults to 0 (disabled)
+        state
+            .register_session("s1".into(), Some("%1".into()), SessionMetadata::default())
+            .await;
+        assert!(state.collect_excess_idle_sessions().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn excess_idle_no_eviction_at_limit() {
+        let state = AppState::new(test_config());
+        state.settings.write().await.max_local_sessions = 2;
+        state
+            .register_session("s1".into(), Some("%1".into()), SessionMetadata::default())
+            .await;
+        state
+            .register_session("s2".into(), Some("%2".into()), SessionMetadata::default())
+            .await;
+        assert!(state.collect_excess_idle_sessions().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn excess_idle_evicts_most_idle() {
+        let state = AppState::new(test_config());
+        state.settings.write().await.max_local_sessions = 2;
+
+        // Insert 3 sessions with controlled last_activity_at
+        {
+            let mut sessions = state.sessions.write().await;
+            let mut old = test_session(
+                "old",
+                Some("%1"),
+                SessionOrigin::Local,
+                SessionMetadata::default(),
+            );
+            old.last_activity_at = Utc::now() - chrono::Duration::hours(3);
+            sessions.insert("old".into(), old);
+
+            let mut mid = test_session(
+                "mid",
+                Some("%2"),
+                SessionOrigin::Local,
+                SessionMetadata::default(),
+            );
+            mid.last_activity_at = Utc::now() - chrono::Duration::hours(1);
+            sessions.insert("mid".into(), mid);
+
+            let fresh = test_session(
+                "fresh",
+                Some("%3"),
+                SessionOrigin::Local,
+                SessionMetadata::default(),
+            );
+            sessions.insert("fresh".into(), fresh);
+        }
+
+        let evicted = state.collect_excess_idle_sessions().await;
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0], "old");
+    }
+
+    #[tokio::test]
+    async fn excess_idle_ignores_remote_and_human() {
+        let state = AppState::new(test_config());
+        state.settings.write().await.max_local_sessions = 1;
+
+        // 1 local + 1 remote + 1 human = only 1 local, at limit
+        {
+            let mut sessions = state.sessions.write().await;
+            sessions.insert(
+                "local".into(),
+                test_session(
+                    "local",
+                    Some("%1"),
+                    SessionOrigin::Local,
+                    SessionMetadata::default(),
+                ),
+            );
+            sessions.insert(
+                "remote/r1".into(),
+                test_session(
+                    "remote/r1",
+                    None,
+                    SessionOrigin::Remote("npub1x".into()),
+                    SessionMetadata::default(),
+                ),
+            );
+            sessions.insert(
+                "human".into(),
+                test_session(
+                    "human",
+                    None,
+                    SessionOrigin::Human("npub1h".into()),
+                    SessionMetadata::default(),
+                ),
+            );
+        }
+
+        assert!(state.collect_excess_idle_sessions().await.is_empty());
     }
 }

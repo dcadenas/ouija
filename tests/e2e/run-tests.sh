@@ -775,6 +775,48 @@ assert_contains "idle timeout saved to disk" "$settings_json" '"idle_timeout_sec
 # Restore
 api "$BASE" POST /api/settings -d '{"idle_timeout_secs":60}' >/dev/null
 
+# ═══════════════════════════════════════════════════════════════════
+# AUTO-CLOSE IDLE SESSIONS
+# ═══════════════════════════════════════════════════════════════════
+
+log "Test 21: Max local sessions — auto-close most idle when over limit"
+# Set max to 2, then register 3 sessions. The most idle one should be closed.
+# Backdate one session so it's clearly the most idle.
+PANE_C=$(create_claude_pane "$FAKE_BIN")
+sleep 0.5
+api "$BASE" POST /api/register -d "{\"id\":\"keep-a\",\"pane\":\"$PANE_A\"}" >/dev/null
+api "$BASE" POST /api/register -d "{\"id\":\"keep-b\",\"pane\":\"$PANE_B\"}" >/dev/null
+api "$BASE" POST /api/register -d "{\"id\":\"evict-me\",\"pane\":\"$PANE_C\"}" >/dev/null
+assert_eq "21: 3 sessions before limit" "$(session_count "$BASE")" "3"
+# Backdate evict-me so it's the most idle, then restart to load it
+jq 'map(if .id == "evict-me" then .last_activity_at = "2000-01-01T00:00:00Z" else . end)' \
+    /tmp/ouija-test/sessions.json > /tmp/ouija-test/sessions.json.tmp \
+    && mv /tmp/ouija-test/sessions.json.tmp /tmp/ouija-test/sessions.json
+kill $DAEMON_PID 2>/dev/null || true
+wait $DAEMON_PID 2>/dev/null || true
+sleep 0.5
+RUST_LOG=ouija=debug ouija start --port $PORT --data /tmp/ouija-test >/tmp/ouija-test/daemon.log 2>&1 &
+DAEMON_PID=$!
+wait_for 10 curl -sf "$BASE/api/status" -o /dev/null
+# Wait for session restoration
+wait_for 10 bash -c '[ "$(session_count "'"$BASE"'")" -ge 3 ]'
+# Now set max_local_sessions=2 — the reaper should evict the most idle
+api "$BASE" POST /api/settings -d '{"max_local_sessions":2}' >/dev/null
+# Wait for reaper to close the excess session
+wait_for 15 bash -c '[ "$(session_count "'"$BASE"'")" -le 2 ]'
+ids_after=$(session_ids "$BASE")
+assert_not_contains "21: most idle session evicted" "$ids_after" "evict-me"
+assert_contains "21: active session a survived" "$ids_after" "keep-a"
+assert_contains "21: active session b survived" "$ids_after" "keep-b"
+# Verify it was logged
+daemon_log=$(cat /tmp/ouija-test/daemon.log 2>/dev/null)
+assert_contains "21: auto-close logged" "$daemon_log" "auto-closing idle session"
+# Disable
+api "$BASE" POST /api/settings -d '{"max_local_sessions":0}' >/dev/null
+# Clean up
+api "$BASE" POST /api/remove -d '{"id":"keep-a"}' >/dev/null 2>&1 || true
+api "$BASE" POST /api/remove -d '{"id":"keep-b"}' >/dev/null 2>&1 || true
+
 # ── Daemon logs ──────────────────────────────────────────────────────
 log "Daemon logs:"
 cat /tmp/ouija-test/daemon.log 2>/dev/null || true

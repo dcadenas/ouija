@@ -873,6 +873,7 @@ pub struct SettingsUpdateBody {
     projects_dir: Option<String>,
     idle_timeout_secs: Option<u64>,
     reaper_interval_secs: Option<u64>,
+    max_local_sessions: Option<u64>,
 }
 
 pub async fn update_settings(
@@ -891,6 +892,9 @@ pub async fn update_settings(
     }
     if let Some(v) = body.reaper_interval_secs {
         settings.reaper_interval_secs = v;
+    }
+    if let Some(v) = body.max_local_sessions {
+        settings.max_local_sessions = v;
     }
     if let Err(e) = crate::persistence::save_settings(&state.config.config_dir, &settings) {
         tracing::warn!("failed to save settings: {e}");
@@ -1227,6 +1231,7 @@ pub async fn add_human(
             pane: None,
             origin: crate::state::SessionOrigin::Human(body.npub.clone()),
             registered_at: chrono::Utc::now(),
+            last_activity_at: chrono::Utc::now(),
             metadata: crate::state::SessionMetadata {
                 role: Some("human".to_string()),
                 networked: false,
@@ -1437,11 +1442,14 @@ pub async fn session_stopped(
 ) -> StatusCode {
     let pane_id = format!("%{pane}");
     let session_id = {
-        let sessions = state.sessions.read().await;
+        let mut sessions = state.sessions.write().await;
         sessions
-            .values()
+            .values_mut()
             .find(|s| s.pane.as_deref() == Some(&pane_id))
-            .map(|s| s.id.clone())
+            .map(|s| {
+                s.last_activity_at = chrono::Utc::now();
+                s.id.clone()
+            })
     };
     if let Some(id) = session_id {
         state
@@ -1462,6 +1470,7 @@ pub async fn session_active(
         .find(|s| s.pane.as_deref() == Some(&pane_id))
         .map(|s| {
             s.block_interactive = false;
+            s.last_activity_at = chrono::Utc::now();
             s.id.clone()
         });
     drop(sessions);

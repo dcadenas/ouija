@@ -276,6 +276,15 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
 
+                    // If over the max session limit, close the most idle ones.
+                    // Killing the pane lets the next reaper cycle clean up + broadcast.
+                    for id in reaper_state.collect_excess_idle_sessions().await {
+                        tracing::info!(
+                            "auto-closing idle session '{id}' (over max_local_sessions)"
+                        );
+                        crate::nostr_transport::admin_kill_session(&reaper_state, &id).await;
+                    }
+
                     // Scan tmux, update cache, auto-register unregistered panes
                     reaper_state.scan_and_autoregister_panes().await;
 
@@ -702,6 +711,7 @@ async fn restore_persisted_sessions(state: &state::AppState) {
             pane: ps.pane.clone(),
             origin: state::SessionOrigin::Local,
             registered_at: ps.registered_at,
+            last_activity_at: ps.last_activity_at,
             metadata: ps.metadata.clone(),
             block_interactive: false,
         };
@@ -727,6 +737,7 @@ async fn register_human_sessions(state: &state::AppState) {
             pane: None,
             origin: state::SessionOrigin::Human(h.npub.clone()),
             registered_at: chrono::Utc::now(),
+            last_activity_at: chrono::Utc::now(),
             metadata: state::SessionMetadata {
                 role: Some("human".to_string()),
                 networked: false,
