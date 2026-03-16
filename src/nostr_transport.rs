@@ -932,10 +932,9 @@ async fn route_human_message(state: &AppState, from: &str, to: &str, message: &s
                     // Human messages always expect a reply
                     let formatted = crate::tmux::format_session_message(from, message, true);
                     let vim_mode = session.metadata.vim_mode;
-                    let delivered =
-                        crate::tmux::locked_inject(state, pane, &formatted, vim_mode)
-                            .await
-                            .is_ok();
+                    let delivered = crate::tmux::locked_inject(state, pane, &formatted, vim_mode)
+                        .await
+                        .is_ok();
                     if delivered {
                         let mut sessions = state.sessions.write().await;
                         if let Some(s) = sessions.get_mut(to) {
@@ -1166,7 +1165,8 @@ pub async fn admin_kill_session(state: &std::sync::Arc<AppState>, name: &str) ->
                     .status();
 
                 // Poll up to 10s for claude process to exit
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(PROCESS_EXIT_TIMEOUT_SECS);
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(PROCESS_EXIT_TIMEOUT_SECS);
                 let mut exited = false;
                 while std::time::Instant::now() < deadline {
                     std::thread::sleep(std::time::Duration::from_secs(1));
@@ -1266,18 +1266,19 @@ pub async fn admin_start_session(
         return format!("failed to create {dir}: {e}");
     }
 
-    let session_name = name.to_string();
+    let tmux_session = crate::tmux::tmux_session_name(&dir);
+    let window_name = name.to_string();
     let start_result = tokio::task::spawn_blocking({
         let dir = dir.clone();
-        let session_name = session_name.clone();
+        let tmux_session = tmux_session.clone();
+        let window_name = window_name.clone();
         move || -> anyhow::Result<String> {
             use std::process::Command;
 
-            // If a tmux session with this name exists, add a window to it;
-            // otherwise create a new tmux session. Window name matches ouija
-            // session name so the user gets visual identification.
+            // Name tmux session after project directory (grouping related
+            // sessions), and windows after the ouija session name.
             let tmux_session_exists = Command::new("tmux")
-                .args(["has-session", "-t", &session_name])
+                .args(["has-session", "-t", &tmux_session])
                 .output()
                 .is_ok_and(|o| o.status.success());
 
@@ -1287,9 +1288,9 @@ pub async fn admin_start_session(
                         "new-window",
                         "-d",
                         "-t",
-                        &session_name,
+                        &tmux_session,
                         "-n",
-                        &session_name,
+                        &window_name,
                         "-P",
                         "-F",
                         "#{pane_id}",
@@ -1308,9 +1309,9 @@ pub async fn admin_start_session(
                         "new-session",
                         "-d",
                         "-s",
-                        &session_name,
+                        &tmux_session,
                         "-n",
-                        &session_name,
+                        &window_name,
                         "-P",
                         "-F",
                         "#{pane_id}",
@@ -1341,7 +1342,7 @@ pub async fn admin_start_session(
                 format!(
                     "cd {} && claude --dangerously-skip-permissions --worktree {}",
                     crate::scheduler::shell_escape(&dir),
-                    crate::scheduler::shell_escape(&session_name),
+                    crate::scheduler::shell_escape(&window_name),
                 )
             } else {
                 format!(
@@ -1451,10 +1452,12 @@ pub async fn admin_restart_session(
 
     let worktree_flag = prev_metadata.as_ref().is_some_and(|m| m.worktree);
 
-    let session_name = name.to_string();
+    let tmux_session = crate::tmux::tmux_session_name(&dir);
+    let window_name = name.to_string();
     let start_result = tokio::task::spawn_blocking({
         let dir = dir.clone();
-        let session_name = session_name.clone();
+        let window_name = window_name.clone();
+        let tmux_session = tmux_session.clone();
         let existing_pane = existing_pane.clone();
         move || -> anyhow::Result<String> {
             use std::process::Command;
@@ -1468,7 +1471,7 @@ pub async fn admin_restart_session(
                 format!(
                     "cd {} && claude --dangerously-skip-permissions {resume_flag} --worktree {}",
                     crate::scheduler::shell_escape(&dir),
-                    crate::scheduler::shell_escape(&session_name),
+                    crate::scheduler::shell_escape(&window_name),
                 )
             } else {
                 format!(
@@ -1502,7 +1505,7 @@ pub async fn admin_restart_session(
 
             // Fallback: add window to existing tmux session, or create new one
             let tmux_session_exists = Command::new("tmux")
-                .args(["has-session", "-t", &session_name])
+                .args(["has-session", "-t", &tmux_session])
                 .output()
                 .is_ok_and(|o| o.status.success());
 
@@ -1512,9 +1515,9 @@ pub async fn admin_restart_session(
                         "new-window",
                         "-d",
                         "-t",
-                        &session_name,
+                        &tmux_session,
                         "-n",
-                        &session_name,
+                        &window_name,
                         "-P",
                         "-F",
                         "#{pane_id}",
@@ -1526,9 +1529,9 @@ pub async fn admin_restart_session(
                         "new-session",
                         "-d",
                         "-s",
-                        &session_name,
+                        &tmux_session,
                         "-n",
-                        &session_name,
+                        &window_name,
                         "-P",
                         "-F",
                         "#{pane_id}",

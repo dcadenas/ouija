@@ -160,8 +160,7 @@ pub fn pane_alive(pane_id: &str) -> bool {
         Err(_) => return false,
     };
 
-    ProcessTree::snapshot()
-        .is_some_and(|t| t.has_claude_descendant(pane_pid))
+    ProcessTree::snapshot().is_some_and(|t| t.has_claude_descendant(pane_pid))
 }
 
 /// Log a warning if the pane is not running a known app (e.g. `claude`).
@@ -405,6 +404,17 @@ pub fn format_session_message(from: &str, message: &str, expects_reply: bool) ->
     }
 }
 
+/// Derive a tmux session name from a project directory path.
+/// Uses the directory basename with dots replaced by underscores
+/// (matching tmux-sessionizer convention).
+pub fn tmux_session_name(project_dir: &str) -> String {
+    let basename = std::path::Path::new(project_dir)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| project_dir.to_string());
+    basename.replace('.', "_")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,5 +438,31 @@ mod tests {
     #[test]
     fn format_session_message_empty() {
         assert_eq!(format_session_message("x", "", false), "[from x]: ");
+    }
+
+    #[test]
+    fn tmux_session_name_basename() {
+        assert_eq!(
+            tmux_session_name("/home/user/code/divine-mobile"),
+            "divine-mobile"
+        );
+    }
+
+    #[test]
+    fn tmux_session_name_dots_replaced() {
+        assert_eq!(
+            tmux_session_name("/home/user/code/my.project"),
+            "my_project"
+        );
+    }
+
+    #[test]
+    fn tmux_session_name_preserves_hyphens_and_underscores() {
+        assert_eq!(tmux_session_name("/tmp/some_repo-name"), "some_repo-name");
+    }
+
+    #[test]
+    fn tmux_session_name_bare_name() {
+        assert_eq!(tmux_session_name("ouija"), "ouija");
     }
 }

@@ -680,6 +680,31 @@ assert_not_contains "L18: no [from] prefix" "$L18_CONTENT" "[from"
 tmux kill-pane -t "$L18_PANE" 2>/dev/null || true
 api "$BASE" POST /api/remove -d '{"id":"plain-prompt"}' >/dev/null 2>&1 || true
 
+log "Test L19: Sessions sharing project_dir are grouped in same tmux session"
+mkdir -p /tmp/projects/grouped-repo
+L19A=$(api "$BASE" POST /api/sessions/start -d '{"name":"group-a","project_dir":"/tmp/projects/grouped-repo"}')
+assert_contains "L19a: first start succeeds" "$L19A" "started"
+wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'group-a'"
+L19A_PANE=$(session_field "$BASE" "group-a" "pane")
+# Get the tmux session name of the first pane
+L19A_TMUX_SESS=$(tmux display-message -t "$L19A_PANE" -p '#{session_name}')
+assert_eq "L19a: tmux session named after directory" "$L19A_TMUX_SESS" "grouped-repo"
+L19B=$(api "$BASE" POST /api/sessions/start -d '{"name":"group-b","project_dir":"/tmp/projects/grouped-repo","worktree":true}')
+assert_contains "L19b: second start succeeds" "$L19B" "started"
+wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'group-b'"
+L19B_PANE=$(session_field "$BASE" "group-b" "pane")
+L19B_TMUX_SESS=$(tmux display-message -t "$L19B_PANE" -p '#{session_name}')
+assert_eq "L19b: second session in same tmux session" "$L19B_TMUX_SESS" "$L19A_TMUX_SESS"
+# Verify window names match ouija session names
+L19A_WIN=$(tmux display-message -t "$L19A_PANE" -p '#{window_name}')
+L19B_WIN=$(tmux display-message -t "$L19B_PANE" -p '#{window_name}')
+assert_eq "L19c: first window named after ouija session" "$L19A_WIN" "group-a"
+assert_eq "L19d: second window named after ouija session" "$L19B_WIN" "group-b"
+tmux kill-pane -t "$L19A_PANE" 2>/dev/null || true
+tmux kill-pane -t "$L19B_PANE" 2>/dev/null || true
+api "$BASE" POST /api/remove -d '{"id":"group-a"}' >/dev/null 2>&1 || true
+api "$BASE" POST /api/remove -d '{"id":"group-b"}' >/dev/null 2>&1 || true
+
 # Remove fake claude to avoid slowing down subsequent kill operations
 rm -f /usr/local/bin/claude
 
