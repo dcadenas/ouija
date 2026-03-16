@@ -44,6 +44,15 @@ pub enum WireMessage {
         #[serde(default)]
         daemon_name: String,
     },
+    SessionRenamed {
+        old_id: String,
+        new_id: String,
+        daemon_id: String,
+        #[serde(default)]
+        daemon_name: String,
+        #[serde(default)]
+        metadata: Option<SessionMetadata>,
+    },
     ConnectRequest {
         secret: String,
         #[serde(default)]
@@ -244,6 +253,35 @@ mod tests {
             decoded,
             WireMessage::CommandResult { command, result, daemon_id }
             if command == "/start foo" && result == "started" && daemon_id == "npub1abc"
+        ));
+    }
+
+    #[test]
+    fn session_renamed_round_trip() {
+        let msg = WireMessage::SessionRenamed {
+            old_id: "old".into(),
+            new_id: "new".into(),
+            daemon_id: "d1".into(),
+            daemon_name: "host1".into(),
+            metadata: None,
+        };
+        let decoded = round_trip(&msg);
+        assert!(matches!(
+            decoded,
+            WireMessage::SessionRenamed { old_id, new_id, daemon_id, .. }
+            if old_id == "old" && new_id == "new" && daemon_id == "d1"
+        ));
+    }
+
+    #[test]
+    fn session_renamed_backward_compat() {
+        // Minimal format without daemon_name/metadata
+        let json = r#"{"type":"SessionRenamed","old_id":"a","new_id":"b","daemon_id":"d1"}"#;
+        let msg: WireMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            msg,
+            WireMessage::SessionRenamed { old_id, new_id, .. }
+            if old_id == "a" && new_id == "b"
         ));
     }
 

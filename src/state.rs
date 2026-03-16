@@ -607,7 +607,7 @@ impl AppState {
     ///
     /// Also updates any existing aliases that pointed to `old_id` so they
     /// resolve directly to `new_id` (no chains).
-    async fn add_alias(&self, old_id: &str, new_id: &str) {
+    pub(crate) async fn add_alias(&self, old_id: &str, new_id: &str) {
         let mut aliases = self.session_aliases.write().await;
         // Update any alias that previously pointed to old_id
         for target in aliases.values_mut() {
@@ -796,15 +796,15 @@ impl AppState {
         replaced: Option<&str>,
     ) {
         if let Some(old_id) = replaced {
-            let msg = crate::protocol::WireMessage::SessionRemove {
-                id: old_id.to_string(),
+            let msg = crate::protocol::WireMessage::SessionRenamed {
+                old_id: old_id.to_string(),
+                new_id: session.id.clone(),
                 daemon_id: self.config.npub.clone(),
                 daemon_name: self.config.name.clone(),
+                metadata: Some(session.metadata.clone()),
             };
             crate::transport::broadcast(self, &msg).await;
-        }
-
-        if self.is_session_networked(session) {
+        } else if self.is_session_networked(session) {
             let msg = crate::protocol::WireMessage::SessionAnnounce {
                 id: session.id.clone(),
                 daemon_id: self.config.npub.clone(),

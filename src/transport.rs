@@ -262,6 +262,39 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8]) {
                 sessions.remove(&key);
             }
         }
+        WireMessage::SessionRenamed {
+            old_id,
+            new_id,
+            daemon_id,
+            daemon_name,
+            metadata,
+        } => {
+            let display = display_name(&daemon_name, &daemon_id);
+            let old_key = crate::state::remote_session_key(display, &old_id);
+            let new_key = crate::state::remote_session_key(display, &new_id);
+            tracing::info!("remote session renamed: {old_key} -> {new_key}");
+
+            let mut sessions = state.sessions.write().await;
+            let old_session = sessions.remove(&old_key);
+            let new_session = crate::state::Session {
+                id: new_key.clone(),
+                pane: None,
+                origin: SessionOrigin::Remote(daemon_id),
+                registered_at: old_session
+                    .as_ref()
+                    .map(|s| s.registered_at)
+                    .unwrap_or_else(chrono::Utc::now),
+                last_activity_at: chrono::Utc::now(),
+                metadata: metadata
+                    .unwrap_or_else(|| old_session.map(|s| s.metadata).unwrap_or_default()),
+                block_interactive: false,
+            };
+            sessions.insert(new_key.clone(), new_session);
+            drop(sessions);
+
+            state.add_alias(&old_key, &new_key).await;
+            state.add_alias(&old_id, &new_id).await;
+        }
         WireMessage::Command { command, daemon_id } => {
             tracing::info!("received command from {daemon_id}: {command}");
             let result = crate::nostr_transport::handle_admin_command(state, &command).await;

@@ -1283,12 +1283,13 @@ pub async fn admin_start_session(
                 .is_ok_and(|o| o.status.success());
 
             let pane_id = if tmux_session_exists {
+                let target = format!("{tmux_session}:");
                 let output = Command::new("tmux")
                     .args([
                         "new-window",
                         "-d",
                         "-t",
-                        &tmux_session,
+                        &target,
                         "-n",
                         &window_name,
                         "-P",
@@ -1509,13 +1510,14 @@ pub async fn admin_restart_session(
                 .output()
                 .is_ok_and(|o| o.status.success());
 
+            let target = format!("{tmux_session}:");
             let output = if tmux_session_exists {
                 Command::new("tmux")
                     .args([
                         "new-window",
                         "-d",
                         "-t",
-                        &tmux_session,
+                        &target,
                         "-n",
                         &window_name,
                         "-P",

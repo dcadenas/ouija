@@ -641,22 +641,14 @@ pub async fn rename(
     }
     match state.rename_session(&body.old_id, &body.new_id).await {
         Some(session) => {
-            // Notify peers: remove old name, announce new if networked
-            let remove_msg = crate::protocol::WireMessage::SessionRemove {
-                id: body.old_id.clone(),
+            let msg = crate::protocol::WireMessage::SessionRenamed {
+                old_id: body.old_id.clone(),
+                new_id: body.new_id.clone(),
                 daemon_id: state.config.npub.clone(),
                 daemon_name: state.config.name.clone(),
+                metadata: Some(session.metadata.clone()),
             };
-            transport::broadcast(&state, &remove_msg).await;
-            if state.is_session_networked(&session) {
-                let announce_msg = crate::protocol::WireMessage::SessionAnnounce {
-                    id: session.id.clone(),
-                    daemon_id: state.config.npub.clone(),
-                    daemon_name: state.config.name.clone(),
-                    metadata: Some(session.metadata.clone()),
-                };
-                transport::broadcast(&state, &announce_msg).await;
-            }
+            transport::broadcast(&state, &msg).await;
             (
                 StatusCode::OK,
                 Json(json!({ "renamed": body.old_id, "to": body.new_id })),
