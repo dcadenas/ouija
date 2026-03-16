@@ -223,6 +223,27 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8], sender_npub:
 
             let mut sessions = state.sessions.write().await;
 
+            // Remove stale entries from a prior SessionAnnounce that used a
+            // different prefix (e.g. daemon_id when daemon_name was empty).
+            let raw_ids: std::collections::HashSet<&str> =
+                session_infos.iter().map(|i| i.id.as_str()).collect();
+            let announce_dupes: Vec<String> = sessions
+                .iter()
+                .filter(|(_, s)| {
+                    matches!(&s.origin, SessionOrigin::Remote(d) if d == &daemon_id)
+                })
+                .filter(|(key, _)| {
+                    let suffix = crate::state::strip_remote_prefix(key);
+                    let canonical = crate::state::remote_session_key(&daemon_name, suffix);
+                    raw_ids.contains(suffix) && **key != canonical
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in &announce_dupes {
+                sessions.remove(key);
+                tracing::info!("removed announce-race duplicate: {key}");
+            }
+
             for info in &session_infos {
                 let key = crate::state::remote_session_key(&daemon_name, &info.id);
                 let entry = sessions
