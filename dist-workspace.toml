@@ -13,4 +13,4 @@ pr-run-mode = "skip"
 installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax)
 # macOS builds handled by remote Mac via ouija messaging (see mise/tasks/release)
-targets = ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+targets = ["x86_64-unknown-linux-gnu"]
