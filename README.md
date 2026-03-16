@@ -8,10 +8,14 @@ You've been building the auth service in one session for hours. Another session 
 
 Unlike Claude Code [agent teams](https://code.claude.com/docs/en/agent-teams), which plan a team upfront for a single task, ouija connects sessions that weren't planned together. Ad-hoc, cross-machine, no hierarchy. They're complementary: you can run agent teams inside ouija sessions.
 
+## Prerequisites
+
+[tmux](https://github.com/tmux/tmux) and [Claude Code](https://docs.anthropic.com/en/docs/claude-code) on your PATH.
+
 ## Quick start
 
 ```bash
-cargo install ouija
+cargo binstall ouija   # or: cargo install ouija
 ouija start
 ```
 

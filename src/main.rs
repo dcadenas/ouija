@@ -215,6 +215,7 @@ async fn main() -> anyhow::Result<()> {
             ticket,
             relays,
         } => {
+            preflight_checks();
             ensure_plugin_installed();
 
             let name = name.unwrap_or_else(|| {
@@ -808,6 +809,26 @@ async fn reconnect_persisted_nodes(state: state::SharedState) {
 
     if reconnected > 0 {
         tracing::info!("reconnected to {reconnected} persisted nodes");
+    }
+}
+
+fn preflight_checks() {
+    use std::process::Command as Cmd;
+
+    if Cmd::new("tmux").arg("-V").output().is_err() {
+        eprintln!("error: tmux not found");
+        eprintln!();
+        eprintln!("ouija requires tmux. Install it:");
+        eprintln!("  apt install tmux        # Debian/Ubuntu");
+        eprintln!("  brew install tmux       # macOS");
+        eprintln!("  pacman -S tmux          # Arch");
+        std::process::exit(1);
+    }
+
+    if Cmd::new("claude").arg("--version").output().is_err() {
+        eprintln!("warning: claude not found on PATH");
+        eprintln!("  Sessions won't auto-register. Install: https://docs.anthropic.com/en/docs/claude-code");
+        eprintln!();
     }
 }
 
