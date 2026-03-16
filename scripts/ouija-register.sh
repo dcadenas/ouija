@@ -1,7 +1,7 @@
 #!/bin/bash
 # Auto-register this Claude Code session with the ouija daemon.
 # Runs as a SessionStart hook on both startup and resume.
-# On resume, skips if the pane is already registered.
+# Skips if the pane is already registered (avoids overwriting daemon pre-registration).
 
 PANE="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}' 2>/dev/null)}"
 [ -z "$PANE" ] && exit 0
@@ -19,10 +19,8 @@ STATUS=$(curl -sf "${BASE}/api/status" 2>/dev/null) || exit 0
 AUTO=$(curl -sf "${BASE}/api/settings" 2>/dev/null | jq -r 'if .auto_register == false then "false" else "true" end')
 [ "$AUTO" = "false" ] && exit 0
 
-# On resume, skip if this pane already has a registration
-if [ "$SOURCE" = "resume" ] || [ "$SOURCE" = "compact" ] || [ "$SOURCE" = "clear" ]; then
-  echo "$STATUS" | grep -q "\"pane\":\"${PANE}\"" && exit 0
-fi
+# Skip if this pane already has a registration (avoids racing with daemon pre-registration)
+echo "$STATUS" | grep -q "\"pane\":\"${PANE}\"" && exit 0
 
 # Auto-name from directory basename, sanitized
 NAME=$(basename "$PWD" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/^-//;s/-$//')
