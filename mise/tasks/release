@@ -16,10 +16,11 @@ echo "Next version: $NEXT"
 sed -i "s/^version = \"$CURRENT\"/version = \"$NEXT\"/" Cargo.toml
 cargo check --quiet 2>/dev/null || true
 
-# Commit and push
+# Commit, tag, and push
 git add Cargo.toml Cargo.lock
 git commit -m "v$NEXT"
-git push
+git tag "v$NEXT"
+git push && git push origin "v$NEXT"
 
 # Publish
 cargo publish
