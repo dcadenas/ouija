@@ -1,0 +1,28 @@
+#!/bin/bash
+# Bump alpha version, commit, push, publish to crates.io, then ouija update
+set -euo pipefail
+
+# Read current version
+CURRENT=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+echo "Current version: $CURRENT"
+
+# Bump alpha number: 0.1.0-alpha.65 -> 0.1.0-alpha.66
+PREFIX=$(echo "$CURRENT" | sed 's/\.[0-9]*$//')
+NUM=$(echo "$CURRENT" | grep -o '[0-9]*$')
+NEXT="$PREFIX.$((NUM + 1))"
+echo "Next version: $NEXT"
+
+# Update Cargo.toml
+sed -i "s/^version = \"$CURRENT\"/version = \"$NEXT\"/" Cargo.toml
+
+# Commit and push
+git add Cargo.toml Cargo.lock
+git commit -m "v$NEXT"
+git push
+
+# Publish
+cargo publish
+
+# Update local daemon
+ouija update
+echo "Released $NEXT"
