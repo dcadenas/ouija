@@ -288,13 +288,16 @@ async fn main() -> anyhow::Result<()> {
                     let reaped = reaper_state.reap_dead_sessions().await;
                     if !reaped.is_empty() {
                         for id in &reaped {
+                            let seq = reaper_state.next_seq();
                             let msg = crate::protocol::WireMessage::SessionRemove {
                                 id: id.clone(),
                                 daemon_id: reaper_state.config.npub.clone(),
                                 daemon_name: reaper_state.config.name.clone(),
+                                seq,
                             };
                             transport::broadcast(&reaper_state, &msg).await;
                         }
+                        transport::broadcast_local_sessions(&reaper_state).await;
                     }
 
                     // If over the max session limit, close the most idle ones.

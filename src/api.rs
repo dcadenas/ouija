@@ -641,14 +641,17 @@ pub async fn rename(
     }
     match state.rename_session(&body.old_id, &body.new_id).await {
         Some(session) => {
+            let seq = state.next_seq();
             let msg = crate::protocol::WireMessage::SessionRenamed {
                 old_id: body.old_id.clone(),
                 new_id: body.new_id.clone(),
                 daemon_id: state.config.npub.clone(),
                 daemon_name: state.config.name.clone(),
                 metadata: Some(session.metadata.clone()),
+                seq,
             };
             transport::broadcast(&state, &msg).await;
+            transport::broadcast_local_sessions(&state).await;
             (
                 StatusCode::OK,
                 Json(json!({ "renamed": body.old_id, "to": body.new_id })),
@@ -672,12 +675,15 @@ pub async fn remove(
 ) -> (StatusCode, Json<serde_json::Value>) {
     match state.remove_session(&body.id).await {
         Some(_) => {
+            let seq = state.next_seq();
             let msg = crate::protocol::WireMessage::SessionRemove {
                 id: body.id.clone(),
                 daemon_id: state.config.npub.clone(),
                 daemon_name: state.config.name.clone(),
+                seq,
             };
             transport::broadcast(&state, &msg).await;
+            transport::broadcast_local_sessions(&state).await;
             (StatusCode::OK, Json(json!({ "removed": body.id })))
         }
         None => (

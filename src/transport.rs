@@ -74,6 +74,16 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8], sender_npub:
         }
     }
 
+    // Drop stale wire messages using the monotonic sequence counter.
+    if let (Some(daemon_id), Some(seq)) = (msg.daemon_id(), msg.seq()) {
+        if !state.accept_seq(daemon_id, seq) {
+            tracing::debug!(
+                "dropping stale message from {daemon_id} (seq={seq} < last_seen)"
+            );
+            return;
+        }
+    }
+
     match msg {
         WireMessage::SessionSend {
             from,
@@ -189,6 +199,7 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8], sender_npub:
             daemon_id,
             daemon_name,
             metadata,
+            ..
         } => {
             let display_name = display_name(&daemon_name, &daemon_id);
             let key = crate::state::remote_session_key(display_name, &id);
@@ -213,6 +224,7 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8], sender_npub:
             sessions: session_infos,
             daemon_id,
             daemon_name,
+            ..
         } => {
             let ids: Vec<&str> = session_infos.iter().map(|i| i.id.as_str()).collect();
             tracing::info!("received session list from {daemon_name} ({daemon_id}): {ids:?}",);
@@ -299,6 +311,7 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8], sender_npub:
             id,
             daemon_id,
             daemon_name,
+            ..
         } => {
             let display_name = display_name(&daemon_name, &daemon_id);
             let key = crate::state::remote_session_key(display_name, &id);
@@ -317,6 +330,7 @@ pub async fn handle_incoming(state: &Arc<AppState>, content: &[u8], sender_npub:
             daemon_id,
             daemon_name,
             metadata,
+            ..
         } => {
             let display = display_name(&daemon_name, &daemon_id);
             let old_key = crate::state::remote_session_key(display, &old_id);
@@ -388,6 +402,7 @@ pub async fn broadcast_local_sessions(state: &AppState) {
         sessions: local_infos,
         daemon_id: state.config.npub.clone(),
         daemon_name: state.config.name.clone(),
+        seq: state.current_seq(),
     };
     broadcast(state, &msg).await;
 }

@@ -129,6 +129,11 @@ pub struct AppState {
     pending_commands: std::sync::Mutex<Vec<(String, tokio::sync::oneshot::Sender<String>)>>,
     /// Cached tmux panes running Claude, refreshed by the reaper loop.
     cached_claude_panes: RwLock<Vec<crate::tmux::TmuxPane>>,
+    /// Monotonic counter incremented on every local session mutation.
+    /// Included in outgoing wire messages so receivers can drop stale ones.
+    wire_seq: std::sync::atomic::AtomicU64,
+    /// Per-peer last-seen sequence number for filtering stale incoming messages.
+    last_seen_seq: std::sync::Mutex<HashMap<String, u64>>,
     /// Per-fire worktree panes: pane_id → project_dir.
     /// Reaper runs `git worktree prune` when these panes die.
     pub perfire_worktree_panes: RwLock<HashMap<String, String>>,
@@ -290,6 +295,8 @@ impl AppState {
             pending_commands: std::sync::Mutex::new(Vec::new()),
             cached_claude_panes: RwLock::new(Vec::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
+            wire_seq: std::sync::atomic::AtomicU64::new(0),
+            last_seen_seq: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -318,7 +325,34 @@ impl AppState {
             pending_commands: std::sync::Mutex::new(Vec::new()),
             cached_claude_panes: RwLock::new(Vec::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
+            wire_seq: std::sync::atomic::AtomicU64::new(0),
+            last_seen_seq: std::sync::Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Increment the monotonic wire-message sequence counter and return the new value.
+    pub fn next_seq(&self) -> u64 {
+        self.wire_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
+
+    /// Return the current wire-message sequence counter without incrementing.
+    pub fn current_seq(&self) -> u64 {
+        self.wire_seq
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Check whether an incoming message's seq is stale relative to the last
+    /// seen seq from that daemon. If not stale, updates last_seen and returns true.
+    pub fn accept_seq(&self, daemon_id: &str, seq: u64) -> bool {
+        let mut map = self.last_seen_seq.lock().expect("last_seen_seq poisoned");
+        let last = map.get(daemon_id).copied().unwrap_or(0);
+        if seq < last {
+            return false;
+        }
+        map.insert(daemon_id.to_string(), seq);
+        true
     }
 
     /// Register a connected node by npub.
@@ -625,6 +659,9 @@ impl AppState {
     /// Also updates any existing aliases that pointed to `old_id` so they
     /// resolve directly to `new_id` (no chains).
     pub(crate) async fn add_alias(&self, old_id: &str, new_id: &str) {
+        if old_id == new_id {
+            return;
+        }
         let mut aliases = self.session_aliases.write().await;
         // Update any alias that previously pointed to old_id
         for target in aliases.values_mut() {
@@ -827,6 +864,7 @@ impl AppState {
         session: &Session,
         replaced: Option<&str>,
     ) {
+        let seq = self.next_seq();
         if let Some(old_id) = replaced {
             let msg = crate::protocol::WireMessage::SessionRenamed {
                 old_id: old_id.to_string(),
@@ -834,16 +872,20 @@ impl AppState {
                 daemon_id: self.config.npub.clone(),
                 daemon_name: self.config.name.clone(),
                 metadata: Some(session.metadata.clone()),
+                seq,
             };
             crate::transport::broadcast(self, &msg).await;
+            crate::transport::broadcast_local_sessions(self).await;
         } else if self.is_session_networked(session) {
             let msg = crate::protocol::WireMessage::SessionAnnounce {
                 id: session.id.clone(),
                 daemon_id: self.config.npub.clone(),
                 daemon_name: self.config.name.clone(),
                 metadata: Some(session.metadata.clone()),
+                seq,
             };
             crate::transport::broadcast(self, &msg).await;
+            crate::transport::broadcast_local_sessions(self).await;
         }
 
         if let Some(ref pane_id) = session.pane {

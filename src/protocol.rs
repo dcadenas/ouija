@@ -32,17 +32,23 @@ pub enum WireMessage {
         daemon_name: String,
         #[serde(default)]
         metadata: Option<SessionMetadata>,
+        #[serde(default)]
+        seq: u64,
     },
     SessionList {
         sessions: Vec<SessionInfo>,
         daemon_id: String,
         daemon_name: String,
+        #[serde(default)]
+        seq: u64,
     },
     SessionRemove {
         id: String,
         daemon_id: String,
         #[serde(default)]
         daemon_name: String,
+        #[serde(default)]
+        seq: u64,
     },
     SessionRenamed {
         old_id: String,
@@ -52,6 +58,8 @@ pub enum WireMessage {
         daemon_name: String,
         #[serde(default)]
         metadata: Option<SessionMetadata>,
+        #[serde(default)]
+        seq: u64,
     },
     ConnectRequest {
         secret: String,
@@ -82,6 +90,17 @@ impl WireMessage {
             | Self::Command { daemon_id, .. }
             | Self::CommandResult { daemon_id, .. } => Some(daemon_id),
             Self::SessionSend { .. } | Self::ConnectRequest { .. } => None,
+        }
+    }
+
+    /// Extract the monotonic sequence counter, if present on this variant.
+    pub fn seq(&self) -> Option<u64> {
+        match self {
+            Self::SessionAnnounce { seq, .. }
+            | Self::SessionList { seq, .. }
+            | Self::SessionRemove { seq, .. }
+            | Self::SessionRenamed { seq, .. } => Some(*seq),
+            _ => None,
         }
     }
 }
@@ -154,6 +173,7 @@ mod tests {
                 role: None,
                 ..Default::default()
             }),
+            seq: 1,
         };
         let decoded = round_trip(&msg);
         assert!(
@@ -169,6 +189,7 @@ mod tests {
             daemon_id: "d1".into(),
             daemon_name: String::new(),
             metadata: None,
+            seq: 0,
         };
         let decoded = round_trip(&msg);
         assert!(
@@ -191,6 +212,7 @@ mod tests {
             ],
             daemon_id: "d1".into(),
             daemon_name: "host1".into(),
+            seq: 1,
         };
         let decoded = round_trip(&msg);
         assert!(
@@ -204,6 +226,7 @@ mod tests {
             id: "s1".into(),
             daemon_id: "d1".into(),
             daemon_name: "host1".into(),
+            seq: 1,
         };
         let decoded = round_trip(&msg);
         assert!(matches!(decoded, WireMessage::SessionRemove { id, .. } if id == "s1"));
@@ -280,6 +303,7 @@ mod tests {
             daemon_id: "d1".into(),
             daemon_name: "host1".into(),
             metadata: None,
+            seq: 1,
         };
         let decoded = round_trip(&msg);
         assert!(matches!(
