@@ -404,6 +404,76 @@ pub fn format_session_message(from: &str, message: &str, expects_reply: bool) ->
     }
 }
 
+/// Check if a pane is the only pane in its tmux window.
+pub fn is_sole_pane(pane_id: &str) -> bool {
+    // Get the window target for this pane, verifying tmux resolved our target
+    // (tmux falls back to the current pane on invalid targets with exit 0)
+    let info = match Command::new("tmux")
+        .args([
+            "display-message",
+            "-t",
+            pane_id,
+            "-p",
+            "#{pane_id}\t#{session_name}:#{window_index}",
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return false,
+    };
+
+    let Some((actual_pane, window)) = info.split_once('\t') else {
+        return false;
+    };
+
+    if actual_pane != pane_id {
+        return false;
+    }
+
+    // Count panes in that window
+    let output = match Command::new("tmux")
+        .args(["list-panes", "-t", window, "-F", "#{pane_id}"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .count()
+        == 1
+}
+
+/// Rename the tmux window containing a pane and disable automatic-rename.
+pub fn rename_window(pane_id: &str, name: &str) {
+    let _ = Command::new("tmux")
+        .args(["rename-window", "-t", pane_id, name])
+        .status();
+    let _ = Command::new("tmux")
+        .args([
+            "set-window-option",
+            "-t",
+            pane_id,
+            "automatic-rename",
+            "off",
+        ])
+        .status();
+}
+
+/// Re-enable automatic-rename on the tmux window containing a pane.
+pub fn enable_automatic_rename(pane_id: &str) {
+    let _ = Command::new("tmux")
+        .args([
+            "set-window-option",
+            "-t",
+            pane_id,
+            "automatic-rename",
+            "on",
+        ])
+        .status();
+}
+
 /// Derive a tmux session name from a project directory path.
 /// Uses the directory basename with dots replaced by underscores
 /// (matching tmux-sessionizer convention).
@@ -464,5 +534,23 @@ mod tests {
     #[test]
     fn tmux_session_name_bare_name() {
         assert_eq!(tmux_session_name("ouija"), "ouija");
+    }
+
+    #[test]
+    fn is_sole_pane_invalid_pane() {
+        // Non-existent pane should return false (tmux command fails)
+        assert!(!is_sole_pane("%99999"));
+    }
+
+    #[test]
+    fn rename_window_invalid_pane_no_panic() {
+        // Should not panic on non-existent pane
+        rename_window("%99999", "test");
+    }
+
+    #[test]
+    fn enable_automatic_rename_invalid_pane_no_panic() {
+        // Should not panic on non-existent pane
+        enable_automatic_rename("%99999");
     }
 }

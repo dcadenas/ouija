@@ -509,11 +509,17 @@ impl AppState {
         sessions.insert(id.clone(), session.clone());
         self.persist_sessions_from(&sessions);
 
-        // Set tmux user variable so window names can show the session ID
+        // Set tmux user variable so window names can show the session ID.
+        // If the pane is the only pane in its window, also rename the window.
         if let Some(ref pane_id) = session.pane {
             let pane = pane_id.clone();
             let name = id.clone();
-            tokio::task::spawn_blocking(move || tmux_var::set(&pane, &name));
+            tokio::task::spawn_blocking(move || {
+                tmux_var::set(&pane, &name);
+                if crate::tmux::is_sole_pane(&pane) {
+                    crate::tmux::rename_window(&pane, &name);
+                }
+            });
         }
 
         // Record alias so sends to the old name get a helpful hint
@@ -538,11 +544,16 @@ impl AppState {
         }
         let mut session = sessions.remove(old_id)?;
         session.id = new_id.to_string();
-        // Update tmux user variable to new name
+        // Update tmux user variable and window name to new name
         if let Some(ref pane_id) = session.pane {
             let pane = pane_id.clone();
             let name = new_id.to_string();
-            tokio::task::spawn_blocking(move || tmux_var::set(&pane, &name));
+            tokio::task::spawn_blocking(move || {
+                tmux_var::set(&pane, &name);
+                if crate::tmux::is_sole_pane(&pane) {
+                    crate::tmux::rename_window(&pane, &name);
+                }
+            });
         }
         sessions.insert(new_id.to_string(), session.clone());
         self.persist_sessions_from(&sessions);
@@ -633,10 +644,13 @@ impl AppState {
         if matches!(session.origin, SessionOrigin::Remote(_)) {
             return None;
         }
-        // Clear tmux user variable before removing
+        // Clear tmux user variable and re-enable automatic window naming
         if let Some(ref pane_id) = session.pane {
             let pane = pane_id.clone();
-            tokio::task::spawn_blocking(move || tmux_var::clear(&pane));
+            tokio::task::spawn_blocking(move || {
+                tmux_var::clear(&pane);
+                crate::tmux::enable_automatic_rename(&pane);
+            });
         }
         let removed = sessions.remove(id);
         self.persist_sessions_from(&sessions);
@@ -677,10 +691,13 @@ impl AppState {
         let dead_ids: Vec<String> = dead_entries.iter().map(|(id, _)| id.clone()).collect();
 
         if !dead_ids.is_empty() {
-            // Clear tmux user variables for dead panes
+            // Clear tmux user variables and re-enable automatic window naming
             for (_, pane) in &dead_entries {
                 let pane = pane.clone();
-                tokio::task::spawn_blocking(move || tmux_var::clear(&pane));
+                tokio::task::spawn_blocking(move || {
+                    tmux_var::clear(&pane);
+                    crate::tmux::enable_automatic_rename(&pane);
+                });
             }
             let mut sessions = self.sessions.write().await;
             for id in &dead_ids {
