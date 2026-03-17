@@ -415,6 +415,75 @@ impl AppState {
                         crate::transport::broadcast(&state, &reply).await;
                     });
                 }
+                Effect::ExecuteSessionStart {
+                    name,
+                    worktree,
+                    project_dir,
+                    prompt,
+                    from,
+                    expects_reply,
+                    daemon_id: sender_id,
+                } => {
+                    tracing::info!("received session_start from {sender_id}: {name}");
+                    let state = Arc::clone(self);
+                    let name = name.clone();
+                    let worktree = *worktree;
+                    let project_dir = project_dir.clone();
+                    let prompt = prompt.clone();
+                    let from = from.clone();
+                    let expects_reply = *expects_reply;
+                    tokio::spawn(async move {
+                        let result = crate::nostr_transport::admin_start_session(
+                            &state,
+                            &name,
+                            worktree,
+                            project_dir.as_deref(),
+                            prompt.as_deref(),
+                            from.as_deref(),
+                            expects_reply,
+                        )
+                        .await;
+                        let reply = crate::protocol::WireMessage::CommandResult {
+                            command: format!("/start {name}"),
+                            result,
+                            daemon_id: state.config.npub.clone(),
+                        };
+                        crate::transport::broadcast(&state, &reply).await;
+                    });
+                }
+                Effect::ExecuteSessionRestart {
+                    name,
+                    fresh,
+                    prompt,
+                    from,
+                    expects_reply,
+                    daemon_id: sender_id,
+                } => {
+                    tracing::info!("received session_restart from {sender_id}: {name}");
+                    let state = Arc::clone(self);
+                    let name = name.clone();
+                    let fresh = fresh.unwrap_or(false);
+                    let prompt = prompt.clone();
+                    let from = from.clone();
+                    let expects_reply = *expects_reply;
+                    tokio::spawn(async move {
+                        let result = crate::nostr_transport::admin_restart_session(
+                            &state,
+                            &name,
+                            fresh,
+                            prompt.as_deref(),
+                            from.as_deref(),
+                            expects_reply,
+                        )
+                        .await;
+                        let reply = crate::protocol::WireMessage::CommandResult {
+                            command: format!("/restart {name}"),
+                            result,
+                            daemon_id: state.config.npub.clone(),
+                        };
+                        crate::transport::broadcast(&state, &reply).await;
+                    });
+                }
                 Effect::DeliverCommandResult {
                     daemon_id,
                     command,

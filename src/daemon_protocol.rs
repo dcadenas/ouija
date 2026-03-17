@@ -207,6 +207,23 @@ pub enum Effect {
         command: String,
         daemon_id: String,
     },
+    ExecuteSessionStart {
+        name: String,
+        worktree: Option<bool>,
+        project_dir: Option<String>,
+        prompt: Option<String>,
+        from: Option<String>,
+        expects_reply: Option<bool>,
+        daemon_id: String,
+    },
+    ExecuteSessionRestart {
+        name: String,
+        fresh: Option<bool>,
+        prompt: Option<String>,
+        from: Option<String>,
+        expects_reply: Option<bool>,
+        daemon_id: String,
+    },
     DeliverCommandResult {
         daemon_id: String,
         command: String,
@@ -852,6 +869,44 @@ impl DaemonState {
             }
             WireMessage::Command { command, daemon_id } => {
                 vec![Effect::ExecuteCommand { command, daemon_id }]
+            }
+            WireMessage::SessionStart {
+                name,
+                project_dir,
+                worktree,
+                prompt,
+                from,
+                expects_reply,
+                daemon_id,
+                ..
+            } => {
+                vec![Effect::ExecuteSessionStart {
+                    name,
+                    worktree,
+                    project_dir,
+                    prompt,
+                    from,
+                    expects_reply,
+                    daemon_id,
+                }]
+            }
+            WireMessage::SessionRestart {
+                name,
+                fresh,
+                prompt,
+                from,
+                expects_reply,
+                daemon_id,
+                ..
+            } => {
+                vec![Effect::ExecuteSessionRestart {
+                    name,
+                    fresh,
+                    prompt,
+                    from,
+                    expects_reply,
+                    daemon_id,
+                }]
             }
             WireMessage::CommandResult {
                 command,

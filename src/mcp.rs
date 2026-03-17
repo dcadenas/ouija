@@ -647,7 +647,16 @@ impl OuijaMcp {
         let from = params.from.clone();
         let expects_reply = params.expects_reply;
         let result = if params.name.contains('/') {
-            execute_command(&self.state, &params.name, "/start").await
+            execute_session_start(
+                &self.state,
+                &params.name,
+                params.worktree,
+                params.project_dir.as_deref(),
+                params.prompt.as_deref(),
+                params.from.as_deref(),
+                params.expects_reply,
+            )
+            .await
         } else {
             crate::nostr_transport::admin_start_session(
                 &self.state,
@@ -689,12 +698,15 @@ impl OuijaMcp {
         let from = params.from.clone();
         let expects_reply = params.expects_reply;
         let result = if params.name.contains('/') {
-            let verb = if fresh {
-                "/restart --fresh"
-            } else {
-                "/restart"
-            };
-            execute_command(&self.state, &params.name, verb).await
+            execute_session_restart(
+                &self.state,
+                &params.name,
+                fresh,
+                params.prompt.as_deref(),
+                params.from.as_deref(),
+                params.expects_reply,
+            )
+            .await
         } else {
             crate::nostr_transport::admin_restart_session(
                 &self.state,
@@ -887,6 +899,106 @@ message rather than starting a new one.
 ///
 /// If `name` contains a `/` (e.g. "macbook/crash-cache"), the command is
 /// forwarded to the remote daemon. Otherwise it runs locally.
+/// Send a structured SessionStart wire message to a remote node.
+async fn execute_session_start(
+    state: &Arc<AppState>,
+    name: &str,
+    worktree: Option<bool>,
+    project_dir: Option<&str>,
+    prompt: Option<&str>,
+    from: Option<&str>,
+    expects_reply: Option<bool>,
+) -> String {
+    let Some((node_name, session_name)) = name.split_once('/') else {
+        return "expected node/name format".to_string();
+    };
+    let daemon_id = {
+        let nodes = state.nodes.read().await;
+        nodes
+            .values()
+            .find(|n| n.name == node_name)
+            .map(|n| n.daemon_id.clone())
+    };
+    if daemon_id.is_none() {
+        return format!("node '{node_name}' not found");
+    }
+
+    let command_key = format!("/start {session_name}");
+    let rx = state.register_pending_command(command_key);
+
+    let proto = state.protocol.read().await;
+    let seq = proto.wire_seq;
+    drop(proto);
+
+    let wire = crate::protocol::WireMessage::SessionStart {
+        name: session_name.to_string(),
+        project_dir: project_dir.map(String::from),
+        worktree,
+        prompt: prompt.map(String::from),
+        from: from.map(String::from),
+        expects_reply,
+        daemon_id: state.config.npub.clone(),
+        seq,
+    };
+    if !crate::transport::broadcast(state, &wire).await {
+        return "P2P not connected".to_string();
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => "command channel closed".to_string(),
+        Err(_) => "timeout waiting for remote response".to_string(),
+    }
+}
+
+/// Send a structured SessionRestart wire message to a remote node.
+async fn execute_session_restart(
+    state: &Arc<AppState>,
+    name: &str,
+    fresh: bool,
+    prompt: Option<&str>,
+    from: Option<&str>,
+    expects_reply: Option<bool>,
+) -> String {
+    let Some((node_name, session_name)) = name.split_once('/') else {
+        return "expected node/name format".to_string();
+    };
+    let daemon_id = {
+        let nodes = state.nodes.read().await;
+        nodes
+            .values()
+            .find(|n| n.name == node_name)
+            .map(|n| n.daemon_id.clone())
+    };
+    if daemon_id.is_none() {
+        return format!("node '{node_name}' not found");
+    }
+
+    let command_key = format!("/restart {session_name}");
+    let rx = state.register_pending_command(command_key);
+
+    let proto = state.protocol.read().await;
+    let seq = proto.wire_seq;
+    drop(proto);
+
+    let wire = crate::protocol::WireMessage::SessionRestart {
+        name: session_name.to_string(),
+        fresh: Some(fresh),
+        prompt: prompt.map(String::from),
+        from: from.map(String::from),
+        expects_reply,
+        daemon_id: state.config.npub.clone(),
+        seq,
+    };
+    if !crate::transport::broadcast(state, &wire).await {
+        return "P2P not connected".to_string();
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => "command channel closed".to_string(),
+        Err(_) => "timeout waiting for remote response".to_string(),
+    }
+}
+
 async fn execute_command(state: &Arc<AppState>, name: &str, verb: &str) -> String {
     if let Some((node_name, session_name)) = name.split_once('/') {
         // Find daemon_id for this node name
