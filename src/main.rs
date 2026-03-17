@@ -269,6 +269,11 @@ async fn main() -> anyhow::Result<()> {
                 project_index::refresh_index(&index_state).await;
             });
 
+            // Restore persisted sessions synchronously before the reaper loop
+            // starts, so auto-register doesn't overwrite custom names.
+            restore_persisted_sessions(&state).await;
+            register_human_sessions(&state).await;
+
             // Setup nostr transport in the background so HTTP starts immediately.
             let bg_state = state.clone();
             tokio::spawn(async move {
@@ -741,9 +746,6 @@ async fn setup_nostr_transport(
             return;
         }
     };
-
-    restore_persisted_sessions(state).await;
-    register_human_sessions(state).await;
 
     if let Some(ticket) = ticket
         && let Err(e) = transport.connect(ticket, state.clone(), true).await

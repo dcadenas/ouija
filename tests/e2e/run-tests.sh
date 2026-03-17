@@ -279,6 +279,32 @@ done
 # Restore auto_register
 api "$BASE" POST /api/settings -d '{"auto_register":true}' >/dev/null
 
+log "Test 12d: Custom session names survive restart with auto-register ON"
+# Register a session with a custom name that differs from its directory basename
+api "$BASE" POST /api/register -d "{\"id\":\"my-custom-name\",\"pane\":\"$PANE_A\",\"metadata\":{\"project_dir\":\"/tmp\"}}" >/dev/null
+ids_before=$(session_ids "$BASE")
+assert_contains "custom name registered" "$ids_before" "my-custom-name"
+# Restart daemon WITH auto_register enabled — the bug would overwrite "my-custom-name" with "tmp"
+kill $DAEMON_PID 2>/dev/null || true
+wait $DAEMON_PID 2>/dev/null || true
+sleep 0.5
+echo '{"auto_register":true,"reaper_interval_secs":1}' > /tmp/ouija-test/settings.json
+RUST_LOG=ouija=debug ouija start --port $PORT --data /tmp/ouija-test >/tmp/daemon-restart2.log 2>&1 &
+DAEMON_PID=$!
+wait_for 10 curl -sf "$BASE/api/status" -o /dev/null
+# Wait for session restoration
+for i in $(seq 1 50); do
+    ids_after=$(session_ids "$BASE")
+    if echo "$ids_after" | grep -qF "my-custom-name"; then break; fi
+    sleep 0.2
+done
+ids_after=$(session_ids "$BASE")
+assert_contains "custom name survives restart" "$ids_after" "my-custom-name"
+assert_not_contains "auto-register did not overwrite with basename" "$ids_after" " tmp"
+# Clean up: remove custom session and disable auto_register for remaining tests
+api "$BASE" POST /api/remove -d '{"id":"my-custom-name"}' >/dev/null 2>&1 || true
+api "$BASE" POST /api/settings -d '{"auto_register":false}' >/dev/null
+
 # ═══════════════════════════════════════════════════════════════════
 # MCP PROTOCOL TESTS
 # ═══════════════════════════════════════════════════════════════════
