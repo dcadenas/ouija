@@ -32,7 +32,6 @@ pub enum SessionMsg {
 }
 
 /// Per-session behavioral state owned by the agent.
-#[allow(dead_code)]
 pub struct SessionAgentState {
     pub session_id: String,
     pub pane: String,
@@ -79,6 +78,7 @@ pub struct SessionAgent {
 }
 
 /// Arguments passed when spawning the agent.
+#[derive(Debug)]
 pub struct SessionAgentArgs {
     pub session_id: String,
     pub pane: String,
@@ -220,9 +220,10 @@ impl SessionAgent {
     async fn send_reminders(&self, senders: &[String], state: &SessionAgentState) {
         let vim_mode = self
             .app_state
-            .sessions
+            .protocol
             .read()
             .await
+            .sessions
             .get(&state.session_id)
             .map(|s| s.metadata.vim_mode)
             .unwrap_or(false);

@@ -2,6 +2,7 @@ use axum::extract::State;
 use axum::response::Html;
 use chrono::{DateTime, Utc};
 
+use crate::daemon_protocol::{Origin, SessionEntry};
 use crate::state::SharedState;
 
 /// Format a timestamp as `HH:MM:SS` with the full date in a `title` tooltip.
@@ -14,7 +15,8 @@ fn time_with_date(dt: &DateTime<Utc>) -> String {
 }
 
 pub async fn dashboard(State(state): State<SharedState>) -> Html<String> {
-    let sessions = state.sessions.read().await;
+    let proto = state.protocol.read().await;
+    let sessions = &proto.sessions;
     let nodes = state.nodes.read().await;
     let log = state.message_log.read().await;
     let transports = state.transports().await;
@@ -30,13 +32,13 @@ pub async fn dashboard(State(state): State<SharedState>) -> Html<String> {
 
     let mut local_sessions: Vec<_> = sessions
         .values()
-        .filter(|s| matches!(s.origin, crate::state::SessionOrigin::Local))
+        .filter(|s| matches!(s.origin, Origin::Local))
         .collect();
     local_sessions.sort_by_key(|s| &s.id);
 
     let mut remote_sessions: Vec<_> = sessions
         .values()
-        .filter(|s| matches!(s.origin, crate::state::SessionOrigin::Remote(_)))
+        .filter(|s| matches!(s.origin, Origin::Remote(_)))
         .collect();
     remote_sessions.sort_by_key(|s| &s.id);
 
@@ -69,7 +71,12 @@ pub async fn dashboard(State(state): State<SharedState>) -> Html<String> {
         } else {
             format!("<br><small class=\"dim\">{}</small>", details.join(" · "))
         };
-        let time = time_with_date(&s.registered_at);
+        let time = if s.registered_at > 0 {
+            let dt = DateTime::from_timestamp(s.registered_at, 0).unwrap_or_default();
+            time_with_date(&dt)
+        } else {
+            "N/A".to_string()
+        };
         let networked_checked = if s.metadata.networked { "checked" } else { "" };
         let actions = format!(
             r#"<button class="btn-sm" onclick="renameSession('{id}')">rename</button> <button class="btn-sm btn-danger" onclick="removeSession('{id}')">remove</button>"#,
@@ -88,10 +95,8 @@ pub async fn dashboard(State(state): State<SharedState>) -> Html<String> {
     }
 
     // Group remote sessions by node name, keeping full session data for tooltips
-    let mut remote_by_node: std::collections::BTreeMap<
-        String,
-        Vec<(&str, &crate::state::Session)>,
-    > = std::collections::BTreeMap::new();
+    let mut remote_by_node: std::collections::BTreeMap<String, Vec<(&str, &SessionEntry)>> =
+        std::collections::BTreeMap::new();
     for s in &remote_sessions {
         let (node_name, session_name) = s.id.split_once('/').unwrap_or(("unknown", s.id.as_str()));
         remote_by_node

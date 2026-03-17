@@ -11,6 +11,15 @@ use crate::state::SharedState;
 use crate::tmux;
 use crate::transport;
 
+/// Max description length before truncation.
+const MAX_DESCRIPTION_LEN: usize = 200;
+/// Max characters of npub to display as fallback node name.
+const NPUB_DISPLAY_LEN: usize = 16;
+/// Timeout for peer connect handshake.
+const CONNECT_TIMEOUT_SECS: u64 = 10;
+/// Max task runs to return in the list endpoint.
+const MAX_TASK_RUNS_RETURNED: usize = 50;
+
 /// Extract a short project description from a project directory.
 ///
 /// Tries in order: `Cargo.toml` description field, `package.json` description,
@@ -52,8 +61,8 @@ pub(crate) fn extract_project_description(project_dir: &str) -> Option<String> {
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
-            let truncated = if trimmed.len() > 200 {
-                format!("{}...", &trimmed[..200])
+            let truncated = if trimmed.len() > MAX_DESCRIPTION_LEN {
+                format!("{}...", &trimmed[..MAX_DESCRIPTION_LEN])
             } else {
                 trimmed.to_string()
             };
@@ -65,13 +74,15 @@ pub(crate) fn extract_project_description(project_dir: &str) -> Option<String> {
 }
 
 pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value> {
-    let sessions = state.sessions.read().await;
+    let proto = state.protocol.read().await;
     let nodes = state.nodes.read().await;
     let transports = state.transports().await;
 
-    let sessions_list: Vec<_> = sessions
+    let sessions_list: Vec<_> = proto
+        .sessions
         .values()
         .map(|s| {
+            let stale = s.metadata.is_stale();
             json!({
                 "id": s.id,
                 "pane": s.pane,
@@ -83,10 +94,11 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
                 "networked": s.metadata.networked,
                 "worktree": s.metadata.worktree,
                 "last_metadata_update": s.metadata.last_metadata_update,
-                "stale": s.metadata.is_stale(),
+                "stale": stale,
             })
         })
         .collect();
+    drop(proto);
 
     let nodes_list: Vec<_> = nodes
         .values()
@@ -290,7 +302,10 @@ pub async fn connect(
     // Check for duplicate connection by npub
     let peer_npub = extract_npub(&body.ticket);
     if let Some(ref npub) = peer_npub {
-        let node_name = body.name.as_deref().unwrap_or(&npub[..16.min(npub.len())]);
+        let node_name = body
+            .name
+            .as_deref()
+            .unwrap_or(&npub[..NPUB_DISPLAY_LEN.min(npub.len())]);
         if let Err(existing) = state.try_add_node(npub, node_name) {
             let msg = format!("already connected to this daemon as '{existing}'");
             tracing::info!("connect rejected: {msg}");
@@ -317,7 +332,12 @@ pub async fn connect(
     };
 
     let connect_fut = t.connect(&body.ticket, state.clone(), true);
-    match tokio::time::timeout(std::time::Duration::from_secs(10), connect_fut).await {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS),
+        connect_fut,
+    )
+    .await
+    {
         Err(_) => {
             tracing::warn!("connect timed out after 10s waiting for peer");
             return (
@@ -424,43 +444,43 @@ pub async fn register(
             );
         }
     }
-    // Try the requested ID first; on conflict (same name, different pane),
-    // auto-suffix with -2, -3, etc. instead of returning 409.
-    let base_id = body.id;
-    let mut id = base_id.clone();
-    let mut suffix = 2u32;
-    let (session, replaced) = loop {
-        let result = state
-            .register_session(id.clone(), body.pane.clone(), metadata.clone())
-            .await;
-        match result {
-            crate::state::RegisterResult::Ok { session, replaced } => {
-                break (session, replaced);
-            }
-            crate::state::RegisterResult::Conflict { .. } => {
-                id = format!("{base_id}-{suffix}");
-                suffix += 1;
-                if suffix > 100 {
-                    return (
-                        StatusCode::CONFLICT,
-                        Json(json!({
-                            "error": "could not find available session name",
-                        })),
-                    );
-                }
-            }
+    let proto_meta = crate::daemon_protocol::SessionMeta {
+        project_dir: metadata.project_dir.clone(),
+        role: metadata.role.clone(),
+        bulletin: metadata.bulletin.clone(),
+        networked: metadata.networked,
+        worktree: metadata.worktree,
+        vim_mode: metadata.vim_mode,
+        ..Default::default()
+    };
+    let effects = state
+        .apply_and_execute(crate::daemon_protocol::Event::Register {
+            id: body.id.clone(),
+            pane: body.pane.clone(),
+            metadata: proto_meta,
+        })
+        .await;
+    let (session_id, _replaced) = match effects.iter().find_map(|e| match e {
+        crate::daemon_protocol::Effect::RegisterOk {
+            session_id,
+            replaced,
+        } => Some((session_id.clone(), replaced.clone())),
+        _ => None,
+    }) {
+        Some(ok) => ok,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "unexpected register result" })),
+            );
         }
     };
-
-    state
-        .announce_and_activate(&session, replaced.as_deref())
-        .await;
 
     (
         StatusCode::OK,
         Json(json!({
-            "registered": session.id,
-            "pane": session.pane,
+            "registered": session_id,
+            "pane": body.pane,
         })),
     )
 }
@@ -481,8 +501,9 @@ pub async fn send_msg(
     if body.from == body.to {
         let suffix = format!("/{}", body.to);
         let prefix = format!("{}/", body.to);
-        let sessions = state.sessions.read().await;
-        let suggestions: Vec<&str> = sessions
+        let proto = state.protocol.read().await;
+        let suggestions: Vec<&str> = proto
+            .sessions
             .keys()
             .filter(|k| k.ends_with(&suffix) || k.starts_with(&prefix))
             .map(|k| k.as_str())
@@ -500,126 +521,39 @@ pub async fn send_msg(
             Json(json!({ "error": format!("cannot send a message to yourself. {hint}") })),
         );
     }
-    let sessions = state.sessions.read().await;
-    let target = sessions.get(&body.to).cloned();
-    drop(sessions);
+    let effects = state
+        .apply_and_execute(crate::daemon_protocol::Event::Send {
+            from: body.from,
+            to: body.to,
+            message: body.message,
+            expects_reply: body.expects_reply,
+        })
+        .await;
 
-    match target {
-        Some(session) => match &session.origin {
-            crate::state::SessionOrigin::Local => {
-                if let Some(pane) = &session.pane {
-                    let formatted =
-                        tmux::format_session_message(&body.from, &body.message, body.expects_reply);
-                    let vim_mode = session.metadata.vim_mode;
-                    match tmux::locked_inject(&state, pane, &formatted, vim_mode).await {
-                        Ok(()) => {
-                            if body.expects_reply {
-                                state
-                                    .notify_agent(
-                                        &body.to,
-                                        crate::session_agent::SessionMsg::MessageDelivered {
-                                            from: body.from.clone(),
-                                            message: body.message.clone(),
-                                            expects_reply: true,
-                                        },
-                                    )
-                                    .await;
-                            }
-                            state
-                                .notify_agent(
-                                    &body.from,
-                                    crate::session_agent::SessionMsg::ReplySent {
-                                        to: body.to.clone(),
-                                    },
-                                )
-                                .await;
-                            state
-                                .log_message(body.from, body.to, body.message, true, "tmux")
-                                .await;
-                            (
-                                StatusCode::OK,
-                                Json(json!({ "status": "delivered", "method": "tmux" })),
-                            )
-                        }
-                        Err(e) => (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(json!({ "error": e.to_string() })),
-                        ),
-                    }
-                } else {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({ "error": "session has no tmux pane" })),
-                    )
-                }
-            }
-            crate::state::SessionOrigin::Remote(_) => {
-                let wire_to = crate::state::strip_remote_prefix(&body.to).to_string();
-                let wire_msg = crate::protocol::WireMessage::SessionSend {
-                    from: body.from.clone(),
-                    to: wire_to.clone(),
-                    message: body.message.clone(),
-                    expects_reply: body.expects_reply,
-                };
-                if transport::broadcast(&state, &wire_msg).await {
-                    // Clear pending reply using stripped name (inbound stores short name)
-                    state
-                        .notify_agent(
-                            &body.from,
-                            crate::session_agent::SessionMsg::ReplySent {
-                                to: wire_to.clone(),
-                            },
-                        )
-                        .await;
-                    state
-                        .log_message(body.from, body.to, body.message, true, "nostr")
-                        .await;
-                    (
-                        StatusCode::OK,
-                        Json(json!({ "status": "sent", "method": "nostr" })),
-                    )
-                } else {
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(json!({ "error": "P2P not connected" })),
-                    )
-                }
-            }
-            crate::state::SessionOrigin::Human(npub) => {
-                let formatted = format!("[from {}]: {}", body.from, body.message);
-                match crate::nostr_transport::send_plain_dm(&state, npub, &formatted).await {
-                    Ok(()) => {
-                        state
-                            .log_message(body.from, body.to, body.message, true, "nostr-dm")
-                            .await;
-                        (
-                            StatusCode::OK,
-                            Json(json!({ "status": "delivered", "method": "nostr-dm" })),
-                        )
-                    }
-                    Err(e) => (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(json!({ "error": format!("DM delivery failed: {e}") })),
-                    ),
-                }
-            }
-        },
-        None => {
-            if let Some(new_id) = state.resolve_alias(&body.to).await {
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({
-                        "error": format!("session '{}' was renamed to '{}'", body.to, new_id),
-                        "renamed_to": new_id,
-                    })),
-                )
-            } else {
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({ "error": format!("session '{}' not found", body.to) })),
-                )
-            }
+    if let Some(method) = effects.iter().find_map(|e| match e {
+        crate::daemon_protocol::Effect::SendDelivered { method, .. } => Some(method.clone()),
+        _ => None,
+    }) {
+        (
+            StatusCode::OK,
+            Json(json!({ "status": "delivered", "method": method })),
+        )
+    } else if let Some((reason, renamed_to)) = effects.iter().find_map(|e| match e {
+        crate::daemon_protocol::Effect::SendFailed {
+            reason, renamed_to, ..
+        } => Some((reason.clone(), renamed_to.clone())),
+        _ => None,
+    }) {
+        let mut body = json!({ "error": reason });
+        if let Some(new_id) = renamed_to {
+            body["renamed_to"] = json!(new_id);
         }
+        (StatusCode::NOT_FOUND, Json(body))
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "unexpected send result" })),
+        )
     }
 }
 
@@ -633,34 +567,29 @@ pub async fn rename(
     State(state): State<SharedState>,
     Json(body): Json<RenameBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if body.new_id.contains('/') {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "session ID must not contain '/'" })),
-        );
-    }
-    match state.rename_session(&body.old_id, &body.new_id).await {
-        Some(session) => {
-            let seq = state.next_seq();
-            let msg = crate::protocol::WireMessage::SessionRenamed {
-                old_id: body.old_id.clone(),
-                new_id: body.new_id.clone(),
-                daemon_id: state.config.npub.clone(),
-                daemon_name: state.config.name.clone(),
-                metadata: Some(session.metadata.clone()),
-                seq,
-            };
-            transport::broadcast(&state, &msg).await;
-            transport::broadcast_local_sessions(&state).await;
-            (
-                StatusCode::OK,
-                Json(json!({ "renamed": body.old_id, "to": body.new_id })),
-            )
-        }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("session '{}' not found", body.old_id) })),
-        ),
+    let effects = state
+        .apply_and_execute(crate::daemon_protocol::Event::Rename {
+            old_id: body.old_id.clone(),
+            new_id: body.new_id.clone(),
+        })
+        .await;
+    if effects
+        .iter()
+        .any(|e| matches!(e, crate::daemon_protocol::Effect::RenameOk { .. }))
+    {
+        (
+            StatusCode::OK,
+            Json(json!({ "renamed": body.old_id, "to": body.new_id })),
+        )
+    } else {
+        let reason = effects
+            .iter()
+            .find_map(|e| match e {
+                crate::daemon_protocol::Effect::RenameFailed { reason } => Some(reason.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| format!("session '{}' not found", body.old_id));
+        (StatusCode::NOT_FOUND, Json(json!({ "error": reason })))
     }
 }
 
@@ -673,23 +602,25 @@ pub async fn remove(
     State(state): State<SharedState>,
     Json(body): Json<RemoveBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.remove_session(&body.id).await {
-        Some(_) => {
-            let seq = state.next_seq();
-            let msg = crate::protocol::WireMessage::SessionRemove {
-                id: body.id.clone(),
-                daemon_id: state.config.npub.clone(),
-                daemon_name: state.config.name.clone(),
-                seq,
-            };
-            transport::broadcast(&state, &msg).await;
-            transport::broadcast_local_sessions(&state).await;
-            (StatusCode::OK, Json(json!({ "removed": body.id })))
-        }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("session '{}' not found", body.id) })),
-        ),
+    let effects = state
+        .apply_and_execute(crate::daemon_protocol::Event::Remove {
+            id: body.id.clone(),
+        })
+        .await;
+    if effects
+        .iter()
+        .any(|e| matches!(e, crate::daemon_protocol::Effect::RemoveOk { .. }))
+    {
+        (StatusCode::OK, Json(json!({ "removed": body.id })))
+    } else {
+        let reason = effects
+            .iter()
+            .find_map(|e| match e {
+                crate::daemon_protocol::Effect::RemoveFailed { reason } => Some(reason.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| format!("session '{}' not found", body.id));
+        (StatusCode::NOT_FOUND, Json(json!({ "error": reason })))
     }
 }
 
@@ -706,64 +637,47 @@ pub async fn update_session(
     State(state): State<SharedState>,
     Json(body): Json<SessionUpdateBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let mut sessions = state.sessions.write().await;
-    let Some(session) = sessions.get_mut(&body.id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("session '{}' not found", body.id) })),
-        );
-    };
-    if matches!(session.origin, crate::state::SessionOrigin::Remote(_)) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "cannot update remote session" })),
-        );
-    }
-    let mut changed = false;
-    if let Some(v) = body.networked {
-        if session.metadata.networked != v {
-            session.metadata.networked = v;
-            changed = true;
+    // Validate session exists and is not remote
+    {
+        let proto = state.protocol.read().await;
+        let Some(session) = proto.sessions.get(&body.id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("session '{}' not found", body.id) })),
+            );
+        };
+        if matches!(session.origin, crate::daemon_protocol::Origin::Remote(_)) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "cannot update remote session" })),
+            );
         }
     }
-    let mut metadata_changed = false;
-    if let Some(r) = body.role {
-        session.metadata.role = Some(r);
-        metadata_changed = true;
-    }
-    if let Some(p) = body.project_dir {
-        session.metadata.project_dir = Some(p);
-        metadata_changed = true;
-    }
-    if let Some(b) = body.bulletin {
-        session.metadata.bulletin = Some(b);
-        metadata_changed = true;
-    }
-    if metadata_changed {
-        session.metadata.last_metadata_update = Some(chrono::Utc::now());
-        changed = true;
-    }
-    let session_snapshot = session.clone();
-    if changed {
-        state.persist_sessions_from(&sessions);
-    }
-    drop(sessions);
 
-    // Re-broadcast so peers see the updated session list
-    if changed {
-        transport::broadcast_local_sessions(&state).await;
-    }
+    state
+        .apply_and_execute(crate::daemon_protocol::Event::UpdateMetadata {
+            id: body.id.clone(),
+            role: body.role,
+            bulletin: body.bulletin,
+            project_dir: body.project_dir,
+            networked: body.networked,
+        })
+        .await;
 
-    (
-        StatusCode::OK,
-        Json(json!({
-            "updated": session_snapshot.id,
-            "networked": session_snapshot.metadata.networked,
-            "role": session_snapshot.metadata.role,
-            "bulletin": session_snapshot.metadata.bulletin,
-            "project_dir": session_snapshot.metadata.project_dir,
-        })),
-    )
+    let proto = state.protocol.read().await;
+    let response = if let Some(s) = proto.sessions.get(&body.id) {
+        json!({
+            "updated": s.id,
+            "networked": s.metadata.networked,
+            "role": s.metadata.role,
+            "bulletin": s.metadata.bulletin,
+            "project_dir": s.metadata.project_dir,
+        })
+    } else {
+        json!({ "updated": body.id })
+    };
+
+    (StatusCode::OK, Json(response))
 }
 
 #[derive(Debug, Deserialize)]
@@ -918,22 +832,20 @@ pub async fn bulk_update_sessions(
     State(state): State<SharedState>,
     Json(body): Json<BulkSessionUpdateBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let mut sessions = state.sessions.write().await;
     let mut count = 0;
-    for session in sessions.values_mut() {
-        if matches!(session.origin, crate::state::SessionOrigin::Local) {
-            if let Some(v) = body.networked {
-                if session.metadata.networked != v {
-                    session.metadata.networked = v;
-                    count += 1;
+    {
+        let mut proto = state.protocol.write().await;
+        for session in proto.sessions.values_mut() {
+            if matches!(session.origin, crate::daemon_protocol::Origin::Local) {
+                if let Some(v) = body.networked {
+                    if session.metadata.networked != v {
+                        session.metadata.networked = v;
+                        count += 1;
+                    }
                 }
             }
         }
     }
-    if count > 0 {
-        state.persist_sessions_from(&sessions);
-    }
-    drop(sessions);
     if count > 0 {
         transport::broadcast_local_sessions(&state).await;
     }
@@ -1142,7 +1054,7 @@ pub async fn list_task_runs(
         .iter()
         .rev()
         .filter(|r| query.task.as_ref().is_none_or(|id| r.task_id == *id))
-        .take(50)
+        .take(MAX_TASK_RUNS_RETURNED)
         .map(|r| {
             json!({
                 "task_id": r.task_id,
@@ -1183,10 +1095,11 @@ pub async fn add_human(
 
     // Reject if name conflicts with an existing non-human session
     {
-        let sessions = state.sessions.read().await;
-        if sessions
+        let proto = state.protocol.read().await;
+        if proto
+            .sessions
             .get(&name)
-            .is_some_and(|s| !matches!(s.origin, crate::state::SessionOrigin::Human(_)))
+            .is_some_and(|s| !matches!(s.origin, crate::daemon_protocol::Origin::Human(_)))
         {
             return (
                 StatusCode::CONFLICT,
@@ -1220,23 +1133,23 @@ pub async fn add_human(
     }
     drop(settings);
 
-    // Register the session
-    let mut sessions = state.sessions.write().await;
-    sessions
-        .entry(name.clone())
-        .or_insert_with(|| crate::state::Session {
-            id: name.clone(),
-            pane: None,
-            origin: crate::state::SessionOrigin::Human(body.npub.clone()),
-            registered_at: chrono::Utc::now(),
-            last_activity_at: chrono::Utc::now(),
-            metadata: crate::state::SessionMetadata {
-                role: Some("human".to_string()),
-                networked: false,
+    // Register the human session in protocol state
+    {
+        let mut proto = state.protocol.write().await;
+        proto.sessions.entry(name.clone()).or_insert_with(|| {
+            crate::daemon_protocol::SessionEntry {
+                id: name.clone(),
+                pane: None,
+                origin: crate::daemon_protocol::Origin::Human(body.npub.clone()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    role: Some("human".to_string()),
+                    networked: false,
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            block_interactive: false,
+            }
         });
+    }
 
     (
         StatusCode::OK,
@@ -1268,13 +1181,16 @@ pub async fn remove_human(
     }
     drop(settings);
 
-    // Remove the session
-    let mut sessions = state.sessions.write().await;
-    if sessions
-        .get(&body.name)
-        .is_some_and(|s| matches!(s.origin, crate::state::SessionOrigin::Human(_)))
+    // Remove the session from protocol state
     {
-        sessions.remove(&body.name);
+        let mut proto = state.protocol.write().await;
+        if proto
+            .sessions
+            .get(&body.name)
+            .is_some_and(|s| matches!(s.origin, crate::daemon_protocol::Origin::Human(_)))
+        {
+            proto.sessions.remove(&body.name);
+        }
     }
 
     (StatusCode::OK, Json(json!({ "status": "removed" })))
@@ -1359,30 +1275,18 @@ pub async fn restart_session(
 }
 
 pub async fn get_block_interactive(
-    State(state): State<SharedState>,
-    axum::extract::Path(pane): axum::extract::Path<String>,
+    State(_state): State<SharedState>,
+    axum::extract::Path(_pane): axum::extract::Path<String>,
 ) -> Json<serde_json::Value> {
-    let pane_id = format!("%{pane}");
-    let sessions = state.sessions.read().await;
-    let blocked = sessions
-        .values()
-        .find(|s| s.pane.as_deref() == Some(&pane_id))
-        .is_some_and(|s| s.block_interactive);
-    Json(json!({ "block_interactive": blocked }))
+    // block_interactive is no longer tracked in protocol state
+    Json(json!({ "block_interactive": false }))
 }
 
 pub async fn clear_block_interactive(
-    State(state): State<SharedState>,
-    axum::extract::Path(pane): axum::extract::Path<String>,
+    State(_state): State<SharedState>,
+    axum::extract::Path(_pane): axum::extract::Path<String>,
 ) -> StatusCode {
-    let pane_id = format!("%{pane}");
-    let mut sessions = state.sessions.write().await;
-    if let Some(session) = sessions
-        .values_mut()
-        .find(|s| s.pane.as_deref() == Some(&pane_id))
-    {
-        session.block_interactive = false;
-    }
+    // block_interactive is no longer tracked in protocol state
     StatusCode::OK
 }
 
@@ -1392,8 +1296,9 @@ pub async fn get_pending_replies(
 ) -> Json<serde_json::Value> {
     let pane_id = format!("%{pane}");
     let session_id = {
-        let sessions = state.sessions.read().await;
-        sessions
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
             .values()
             .find(|s| s.pane.as_deref() == Some(&pane_id))
             .map(|s| s.id.clone())
@@ -1415,12 +1320,14 @@ pub async fn delete_pending_reply(
     axum::extract::Path((pane, from)): axum::extract::Path<(String, String)>,
 ) -> StatusCode {
     let pane_id = format!("%{pane}");
-    let sessions = state.sessions.read().await;
-    let session_id = sessions
-        .iter()
-        .find(|(_, s)| s.pane.as_deref() == Some(&pane_id))
-        .map(|(id, _)| id.clone());
-    drop(sessions);
+    let session_id = {
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .values()
+            .find(|s| s.pane.as_deref() == Some(&pane_id))
+            .map(|s| s.id.clone())
+    };
     if let Some(id) = session_id {
         state
             .notify_agent(
@@ -1440,14 +1347,12 @@ pub async fn session_stopped(
 ) -> StatusCode {
     let pane_id = format!("%{pane}");
     let session_id = {
-        let mut sessions = state.sessions.write().await;
-        sessions
-            .values_mut()
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .values()
             .find(|s| s.pane.as_deref() == Some(&pane_id))
-            .map(|s| {
-                s.last_activity_at = chrono::Utc::now();
-                s.id.clone()
-            })
+            .map(|s| s.id.clone())
     };
     if let Some(id) = session_id {
         state
@@ -1462,16 +1367,14 @@ pub async fn session_active(
     axum::extract::Path(pane): axum::extract::Path<String>,
 ) -> StatusCode {
     let pane_id = format!("%{pane}");
-    let mut sessions = state.sessions.write().await;
-    let session_id = sessions
-        .values_mut()
-        .find(|s| s.pane.as_deref() == Some(&pane_id))
-        .map(|s| {
-            s.block_interactive = false;
-            s.last_activity_at = chrono::Utc::now();
-            s.id.clone()
-        });
-    drop(sessions);
+    let session_id = {
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .values()
+            .find(|s| s.pane.as_deref() == Some(&pane_id))
+            .map(|s| s.id.clone())
+    };
     if let Some(id) = session_id {
         state
             .notify_agent(&id, crate::session_agent::SessionMsg::Active)

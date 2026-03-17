@@ -1,9 +1,15 @@
+use crate::daemon_protocol::Origin;
 use crate::persistence::RouterConfig;
-use crate::state::{AppState, LogEntry, SessionOrigin};
+use crate::state::{AppState, LogEntry};
 
 /// Timeout for LLM router API requests.
 const ROUTER_API_TIMEOUT_SECS: u64 = 30;
+/// Max inter-session messages to include in the router prompt.
+const MAX_INTER_SESSION_MESSAGES: usize = 10;
+/// Max message length before truncation in router context.
+const MAX_MESSAGE_PREVIEW_LEN: usize = 200;
 
+/// LLM-produced routing action for an inbound human message.
 #[derive(Debug, PartialEq)]
 pub enum RouterDecision {
     Route { targets: Vec<String> },
@@ -11,6 +17,7 @@ pub enum RouterDecision {
     DirectAnswer(String),
 }
 
+/// Lightweight view of a session for the router prompt.
 #[derive(Debug)]
 pub struct SessionSnapshot {
     pub id: String,
@@ -21,6 +28,7 @@ pub struct SessionSnapshot {
     pub bulletin: Option<String>,
 }
 
+/// Truncated message record included in the router prompt.
 #[derive(Debug)]
 pub struct MessageSnapshot {
     pub timestamp: String,
@@ -130,7 +138,12 @@ fn build_system_prompt(
     if !session_msgs.is_empty() {
         // Only include a small tail of inter-session traffic
         prompt.push_str("\n<inter_session_messages>\n");
-        for m in session_msgs.iter().rev().take(10).rev() {
+        for m in session_msgs
+            .iter()
+            .rev()
+            .take(MAX_INTER_SESSION_MESSAGES)
+            .rev()
+        {
             prompt.push_str(&format!(
                 "[{}] {} -> {}: {}\n",
                 m.timestamp, m.from, m.to, m.message
@@ -246,6 +259,9 @@ async fn call_api(
         .ok_or_else(|| anyhow::anyhow!("no text in API response"))
 }
 
+/// Parse an LLM response into a [`RouterDecision`].
+///
+/// Returns `None` if the text does not match any expected format.
 pub fn parse_response(text: &str) -> Option<RouterDecision> {
     let text = text.trim();
 
@@ -290,8 +306,9 @@ pub async fn gather_context(
     state: &AppState,
     human_name: &str,
 ) -> (Vec<SessionSnapshot>, Vec<MessageSnapshot>) {
-    let sessions = state.sessions.read().await;
-    let session_snapshots: Vec<SessionSnapshot> = sessions
+    let proto = state.protocol.read().await;
+    let session_snapshots: Vec<SessionSnapshot> = proto
+        .sessions
         .values()
         .filter(|s| s.id != human_name)
         .map(|s| SessionSnapshot {
@@ -303,7 +320,7 @@ pub async fn gather_context(
             bulletin: s.metadata.bulletin.clone(),
         })
         .collect();
-    drop(sessions);
+    drop(proto);
 
     let log = state.message_log.read().await;
     let message_snapshots: Vec<MessageSnapshot> = log
@@ -312,16 +329,16 @@ pub async fn gather_context(
             timestamp: e.timestamp.format("%H:%M").to_string(),
             from: e.from.clone(),
             to: e.to.clone(),
-            message: truncate(&e.message, 200),
+            message: truncate(&e.message, MAX_MESSAGE_PREVIEW_LEN),
         })
         .collect();
 
     (session_snapshots, message_snapshots)
 }
 
-fn origin_label(origin: &SessionOrigin) -> String {
+fn origin_label(origin: &Origin) -> String {
     match origin {
-        SessionOrigin::Remote(d) => format!("remote/{d}"),
+        Origin::Remote(d) => format!("remote/{d}"),
         other => other.label().to_string(),
     }
 }

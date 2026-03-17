@@ -4,6 +4,10 @@
 //! liveness properties of session management. Abstracts away tmux injection
 //! and Nostr transport.
 //!
+//! This is the abstract model using enum Sid/DaemonId types. A second model
+//! using the real `DaemonState` lives in `src/daemon_protocol.rs` as
+//! `stateright_model` — it exercises production `apply()` directly.
+//!
 //! ## Bugs found
 //!
 //! 1. **Out-of-order message race**: SessionAnnounce, SessionList, and
@@ -14,19 +18,27 @@
 //!
 //! 2. **Alias self-loops**: `add_alias` creates self-loops (e.g. C→C) when
 //!    local and remote renames interact with overlapping session IDs.
-//!    The real code tolerates this (one-hop resolve + existence check), but
-//!    the alias map becomes logically inconsistent.
-//!
-//! ## Fix verified
-//!
-//! Adding a monotonic generation counter to all wire messages from a daemon,
-//! and having receivers drop messages with generation < last seen from that
-//! daemon, restores convergence.
+//!    Fixed: `add_alias` now retains only entries where key != value.
 //!
 //! 3. **Cross-daemon orphaned pending replies**: When a session is removed,
 //!    pending reply cleanup only runs on the local daemon. Remote daemons
 //!    that received expects_reply messages from the removed session retain
 //!    stale pending reply entries.
+//!
+//! 4. **accept_seq restart bypass** (found by real-DaemonState model):
+//!    `accept_seq` had a `seq <= 1` special case for daemon restarts that
+//!    also accepted stale messages, resetting the generation counter. A stale
+//!    SessionAnnounce{seq=1} arriving after a SessionList{seq=2} would reset
+//!    `last_seen_seq`, letting the old SessionList{seq=1} through and
+//!    overwriting correct remote state.
+//!    Fixed: removed the seq<=1 bypass; daemon restarts now use
+//!    timestamp-based wire_seq so new incarnations always have higher seqs.
+//!
+//! ## Fixes verified
+//!
+//! - Generation counter (strict `seq < last` rejection) restores convergence.
+//! - `add_alias` self-loop removal makes alias maps acyclic.
+//! - SessionList reconciliation clears orphaned pending replies.
 
 use stateright::actor::{Actor, ActorModel, Id, Network, Out};
 use stateright::{Checker, Expectation, Model};

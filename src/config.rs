@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 
+/// Daemon startup configuration (name, port, paths, identity).
 #[derive(Clone, Debug)]
 pub struct OuijaConfig {
     pub name: String,

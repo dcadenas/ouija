@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::SessionMetadata;
 
+/// A session's identity and optional metadata for wire exchange.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: String,
@@ -9,6 +10,7 @@ pub struct SessionInfo {
     pub metadata: Option<SessionMetadata>,
 }
 
+/// Tagged JSON message exchanged between daemons over Nostr.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WireMessage {

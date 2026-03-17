@@ -29,6 +29,7 @@ fn save_json<T: Serialize>(path: &Path, value: &T, pretty: bool) -> Result<()> {
     atomic_write(path, data.as_bytes())
 }
 
+/// On-disk representation of a local session for restart recovery.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PersistedSession {
     pub id: String,
@@ -55,6 +56,7 @@ impl PersistedSession {
     }
 }
 
+/// On-disk representation of a remote node connection.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PersistedConnection {
     pub ticket: String,
@@ -67,20 +69,40 @@ pub struct PersistedConnection {
 
 // --- Sessions ---
 
+/// Load persisted sessions from `sessions.json`.
+///
+/// # Errors
+///
+/// Returns an error if the file exists but contains invalid JSON.
 pub fn load_sessions(data_dir: &Path) -> Result<Vec<PersistedSession>> {
     load_json(&data_dir.join("sessions.json"), vec![])
 }
 
+/// Atomically write sessions to `sessions.json`.
+///
+/// # Errors
+///
+/// Returns an error if serialization or file I/O fails.
 pub fn save_sessions(data_dir: &Path, sessions: &[PersistedSession]) -> Result<()> {
     save_json(&data_dir.join("sessions.json"), &sessions, false)
 }
 
 // --- Connections ---
 
+/// Load persisted connections from `connections.json`.
+///
+/// # Errors
+///
+/// Returns an error if the file exists but contains invalid JSON.
 pub fn load_connections(data_dir: &Path) -> Result<Vec<PersistedConnection>> {
     load_json(&data_dir.join("connections.json"), vec![])
 }
 
+/// Add or update a connection, deduplicating by npub or ticket.
+///
+/// # Errors
+///
+/// Returns an error if reading or writing `connections.json` fails.
 pub fn add_connection(
     data_dir: &Path,
     ticket: &str,
@@ -102,6 +124,11 @@ pub fn add_connection(
     save_json(&data_dir.join("connections.json"), &conns, false)
 }
 
+/// Remove the `connections.json` file, if it exists.
+///
+/// # Errors
+///
+/// Returns an error if file removal fails for reasons other than not found.
 pub fn clear_connections(data_dir: &Path) -> Result<()> {
     match std::fs::remove_file(data_dir.join("connections.json")) {
         Ok(()) => Ok(()),
@@ -112,6 +139,7 @@ pub fn clear_connections(data_dir: &Path) -> Result<()> {
 
 // --- Settings ---
 
+/// Configuration for a human Nostr user who can interact via DMs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HumanSession {
     pub npub: String,
@@ -125,6 +153,7 @@ pub struct HumanSession {
     pub welcomed: bool,
 }
 
+/// LLM router configuration for dispatching bare-text human DMs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RouterConfig {
     /// Explicit API key. If absent, falls back to `ROUTER_API_KEY` or `GEMINI_API_KEY` env var.
@@ -144,6 +173,7 @@ fn default_router_base_url() -> String {
     "https://generativelanguage.googleapis.com/v1beta/openai".to_string()
 }
 
+/// User-configurable daemon settings persisted in `settings.json`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OuijaSettings {
     #[serde(default = "default_true")]
@@ -190,26 +220,51 @@ impl Default for OuijaSettings {
     }
 }
 
+/// Load settings from `settings.json`, using defaults if missing.
+///
+/// # Errors
+///
+/// Returns an error if the file exists but contains invalid JSON.
 pub fn load_settings(data_dir: &Path) -> Result<OuijaSettings> {
     load_json(&data_dir.join("settings.json"), OuijaSettings::default())
 }
 
+/// Atomically write settings to `settings.json` (pretty-printed).
+///
+/// # Errors
+///
+/// Returns an error if serialization or file I/O fails.
 pub fn save_settings(data_dir: &Path, settings: &OuijaSettings) -> Result<()> {
     save_json(&data_dir.join("settings.json"), settings, true)
 }
 
 // --- Scheduled Tasks ---
 
+/// Load scheduled tasks from `tasks.json` into a map keyed by ID.
+///
+/// # Errors
+///
+/// Returns an error if the file exists but contains invalid JSON.
 pub fn load_tasks(data_dir: &Path) -> Result<HashMap<String, ScheduledTask>> {
     let tasks: Vec<ScheduledTask> = load_json(&data_dir.join("tasks.json"), vec![])?;
     Ok(crate::scheduler::tasks_to_map(tasks))
 }
 
+/// Atomically write scheduled tasks to `tasks.json`.
+///
+/// # Errors
+///
+/// Returns an error if serialization or file I/O fails.
 pub fn save_tasks(data_dir: &Path, tasks: &HashMap<String, ScheduledTask>) -> Result<()> {
     let list: Vec<&ScheduledTask> = tasks.values().collect();
     save_json(&data_dir.join("tasks.json"), &list, false)
 }
 
+/// Append a task run record to `task_runs.jsonl`.
+///
+/// # Errors
+///
+/// Returns an error if serialization or file I/O fails.
 pub fn append_task_run(data_dir: &Path, run: &TaskRun) -> Result<()> {
     let path = data_dir.join("task_runs.jsonl");
     let line = serde_json::to_string(run)?;
@@ -242,7 +297,6 @@ mod tests {
             registered_at: Utc::now(),
             last_activity_at: Utc::now(),
             metadata: SessionMetadata::default(),
-            block_interactive: false,
         }
     }
 
@@ -254,7 +308,6 @@ mod tests {
             registered_at: Utc::now(),
             last_activity_at: Utc::now(),
             metadata: SessionMetadata::default(),
-            block_interactive: false,
         }
     }
 

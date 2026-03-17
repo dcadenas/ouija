@@ -242,6 +242,13 @@ fn prompt_text(pane: &str) -> anyhow::Result<String> {
     Ok(text)
 }
 
+/// Inject a message into a tmux pane via paste-buffer.
+///
+/// Optionally enters vim INSERT mode first, then verifies delivery.
+///
+/// # Errors
+///
+/// Returns an error if tmux commands fail or the pane does not exist.
 pub fn inject(pane: &str, message: &str, vim_mode: bool) -> anyhow::Result<()> {
     let t0 = Instant::now();
     check_known_app(pane)?;
@@ -453,50 +460,13 @@ pub async fn locked_inject(
         .map_err(|_| anyhow::anyhow!("inject queue closed"))?
 }
 
+/// Format a message with sender tag for pane injection.
 pub fn format_session_message(from: &str, message: &str, expects_reply: bool) -> String {
     if expects_reply {
         format!("[from {from} ?]: {message}")
     } else {
         format!("[from {from}]: {message}")
     }
-}
-
-/// Check if a pane is the only pane in its tmux window.
-pub fn is_sole_pane(pane_id: &str) -> bool {
-    // Get the window target for this pane, verifying tmux resolved our target
-    // (tmux falls back to the current pane on invalid targets with exit 0)
-    let info = match Command::new("tmux")
-        .args([
-            "display-message",
-            "-t",
-            pane_id,
-            "-p",
-            "#{pane_id}\t#{session_name}:#{window_index}",
-        ])
-        .output()
-    {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => return false,
-    };
-
-    let Some((actual_pane, window)) = info.split_once('\t') else {
-        return false;
-    };
-
-    if actual_pane != pane_id {
-        return false;
-    }
-
-    // Count panes in that window
-    let output = match Command::new("tmux")
-        .args(["list-panes", "-t", window, "-F", "#{pane_id}"])
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return false,
-    };
-
-    String::from_utf8_lossy(&output.stdout).lines().count() == 1
 }
 
 /// Rename the tmux window containing a pane and disable automatic-rename.
@@ -582,12 +552,6 @@ mod tests {
     #[test]
     fn tmux_session_name_bare_name() {
         assert_eq!(tmux_session_name("ouija"), "ouija");
-    }
-
-    #[test]
-    fn is_sole_pane_invalid_pane() {
-        // Non-existent pane should return false (tmux command fails)
-        assert!(!is_sole_pane("%99999"));
     }
 
     #[test]
