@@ -37,13 +37,15 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 
 **Spawn sessions on the fly.** `session_start("crash-ios")` creates a tmux window, launches Claude Code, and registers it. Pass a `prompt` to seed the session with context. Works on `session_restart` too.
 
-**Schedule tasks.** Cron jobs that inject messages into sessions. If the target session is dead, the daemon revives it automatically. One-shot tasks (`once: true`) fire once then auto-delete. Test immediately with `task_trigger`.
+**Run long-lived sessions.** Sessions persist across daemon restarts, get auto-revived by scheduled tasks, and maintain their names and context. A session that's been investigating a memory leak for hours keeps all that context available to other sessions that discover it later.
+
+**Schedule tasks.** Cron jobs that inject messages into sessions. If the target session is dead, the daemon revives it automatically. Use this for daily reports, periodic checks, or recurring maintenance. One-shot tasks (`once: true`) fire once then auto-delete.
 
 **Worktree sessions.** Spawn sessions in isolated git worktrees for parallel work on the same repo without branch conflicts.
 
 **Nostr DMs.** If you use Nostr, configure your npub to control the daemon from any Nostr client. Send `/list`, `/start`, `@session message`, or bare text (routed by an LLM).
 
-**Dashboard** at `localhost:7880`. Manage sessions, tasks, node connections, human access, and settings.
+**Dashboard** at `localhost:7880`. Manage sessions, tasks, node connections, and settings.
 
 ## Connecting machines
 
@@ -59,7 +61,21 @@ On machine B:
 ouija connect <ticket> --name macbook
 ```
 
-Sessions on both machines discover each other. Tickets contain a connect secret, only authorized nodes can communicate.
+Sessions on both machines discover each other. Tickets contain a connect secret, only authorized nodes can communicate. After connecting, both nodes remember each other and auto-reconnect on restart.
+
+## Message protocol
+
+Sessions communicate through XML messages injected into tmux panes:
+
+```xml
+<msg from="auth" id="47" reply="true">what port does the gateway use?</msg>
+```
+
+Messages can reference earlier ones for conversation threading:
+- `re="47"` — progress update on task 47
+- `re="47" done="true"` — task 47 is complete
+
+The daemon assigns unique IDs to every message, tracks pending replies, and nudges sessions that haven't responded. Sessions interact with the protocol through MCP tools (`session_send`, `session_list`, etc.) — the XML is handled automatically.
 
 ## How it works
 
@@ -68,6 +84,8 @@ Sessions on both machines discover each other. Tickets contain a connect secret,
 3. Local messages: **tmux injection** into the target pane
 4. Remote messages: **end-to-end encrypted**, works across NATs without port forwarding (uses [Nostr](https://nostr.com) relays as transport)
 5. Node auth: **connect secret** in the ticket, unknown senders rejected
+
+All session state transitions go through a pure state machine (`DaemonProtocol`) that's [formally verified](tests/model/main.rs) using [Stateright](https://github.com/stateright/stateright) model checking.
 
 ## Security
 
@@ -84,7 +102,7 @@ ouija start          # start the daemon
 ouija stop           # stop it
 ouija update         # install latest from crates.io, restart
 ouija nodes          # list self and connected nodes
-ouija config ...     # manage settings, human sessions, router
+ouija config ...     # manage settings, Nostr DM users, router
 ```
 
 Run `ouija --help` for the full command list.
@@ -106,7 +124,7 @@ Fuzzy session pickers that read tmux's display format will show ouija session na
 ## Testing
 
 ```bash
-# All tests (unit + local e2e + nostr e2e, all in Docker)
+# All tests (unit + local e2e + nostr e2e + install, all in Docker)
 tests/e2e/run-e2e.sh
 
 # Only local e2e
@@ -114,4 +132,7 @@ tests/e2e/run-e2e.sh local
 
 # Only nostr P2P e2e (relay + 4 daemons + auth tests)
 tests/e2e/run-e2e.sh nostr
+
+# Install/preflight tests (clean machine, no Rust)
+tests/e2e/run-e2e.sh install
 ```
