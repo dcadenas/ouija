@@ -764,8 +764,9 @@ impl AppState {
         if local.len() <= max {
             return vec![];
         }
-        // Sort by registration time so oldest sessions are evicted first
-        local.sort_by_key(|s| s.registered_at);
+        // Sort by last activity (oldest activity first) so the most idle sessions are evicted.
+        // Use last_metadata_update as the activity signal, falling back to registered_at.
+        local.sort_by_key(|s| s.metadata.last_metadata_update.unwrap_or(s.registered_at));
         let excess = local.len() - max;
         local[..excess].iter().map(|s| s.id.clone()).collect()
     }
