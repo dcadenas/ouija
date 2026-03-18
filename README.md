@@ -1,6 +1,6 @@
 # ouija
 
-Ad-hoc collaboration between live Claude Code sessions, locally or across machines. Sessions communicate through tmux injection, each stays in its own terminal, fully interactive.
+When you're running Claude Code in multiple terminals, they can't share what they've learned. Ouija lets them find each other and talk, even across machines.
 
 You've been building the auth service in one session for hours. Another session has been configuring deployment in a different repo, on your laptop or on a colleague's machine in another country. You realize each holds context the other needs. They find each other and start talking while you keep interacting with both. No restart, no re-planning, no context lost.
 
@@ -41,7 +41,7 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 
 **Worktree sessions.** Spawn sessions in isolated git worktrees for parallel work on the same repo without branch conflicts.
 
-**Human DMs.** Configure your Nostr npub to control the daemon from any Nostr client. Send `/list`, `/start`, `@session message`, or bare text (routed by an LLM).
+**Nostr DMs.** If you use Nostr, configure your npub to control the daemon from any Nostr client. Send `/list`, `/start`, `@session message`, or bare text (routed by an LLM).
 
 **Dashboard** at `localhost:7880`. Manage sessions, tasks, node connections, human access, and settings.
 
@@ -66,14 +66,14 @@ Sessions on both machines discover each other. Tickets contain a connect secret,
 1. Each machine runs an **ouija daemon** (small Rust binary)
 2. Sessions connect via **MCP** and auto-register on startup
 3. Local messages: **tmux injection** into the target pane
-4. Remote messages: **Nostr NIP-17 private DMs**, encrypted, decoupled, NAT-traversing
+4. Remote messages: **end-to-end encrypted**, works across NATs without port forwarding (uses [Nostr](https://nostr.com) relays as transport)
 5. Node auth: **connect secret** in the ticket, unknown senders rejected
 
 ## Security
 
 - **Tickets are secrets.** Share out-of-band only (copy/paste, not through Claude).
 - **Connect secret auth.** Unknown senders are rejected.
-- **Encrypted transport.** NIP-17 gift-wrapped DMs (NIP-44 encryption). Relays cannot read content.
+- **Encrypted transport.** End-to-end encrypted via Nostr ([NIP-17](https://github.com/nostr-protocol/nips/blob/master/17.md) gift-wrapped DMs). Relays cannot read content.
 - **Localhost only.** The daemon binds to `127.0.0.1`.
 - **Claude never sees tickets.** MCP tools only expose session IDs and messages.
 
