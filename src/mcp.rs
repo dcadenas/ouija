@@ -13,13 +13,15 @@ use crate::scheduler;
 use crate::state::AppState;
 use crate::tmux;
 
-#[derive(Clone)]
+/// MCP server exposing session and task tools.
+#[derive(Clone, Debug)]
 pub struct OuijaMcp {
     state: Arc<AppState>,
     tool_router: ToolRouter<Self>,
 }
 
 impl OuijaMcp {
+    /// Create an MCP server instance backed by shared state.
     pub fn new(state: Arc<AppState>) -> Self {
         Self {
             state,
@@ -28,6 +30,7 @@ impl OuijaMcp {
     }
 }
 
+/// Parameters for the `session_register` MCP tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SessionRegisterParams {
     /// A short identifier for this session (e.g. "relay", "web", "api")
@@ -54,12 +57,14 @@ pub struct SessionRegisterParams {
     pub claude_session_id: Option<String>,
 }
 
+/// Parameters for the `session_unregister` MCP tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SessionUnregisterParams {
     /// Session ID to unregister
     pub id: String,
 }
 
+/// Parameters for the `session_send` MCP tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SessionSendParams {
     /// Your session ID (the sender)
@@ -69,10 +74,19 @@ pub struct SessionSendParams {
     /// Message to send
     pub message: String,
     /// Whether the sender expects a reply from the target.
-    /// If true, the message prefix includes `?` and the daemon tracks the pending reply.
+    /// If true, the message prefix includes `reply="true"` and the daemon tracks the pending reply.
     pub expects_reply: bool,
+    /// Message ID this is responding to. With `done=true`, clears the pending reply.
+    /// Without `done`, marks progress without clearing.
+    #[serde(default)]
+    pub responds_to: Option<u64>,
+    /// Whether this completes the referenced task. Only meaningful with responds_to.
+    /// If true, clears the pending reply. If false (default), marks progress without clearing.
+    #[serde(default)]
+    pub done: bool,
 }
 
+/// Parameters for the `session_update` MCP tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SessionUpdateParams {
     /// Session ID to update
@@ -86,6 +100,7 @@ pub struct SessionUpdateParams {
     pub bulletin: Option<String>,
 }
 
+/// Parameters for the `clear_pending_reply` MCP tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ClearPendingReplyParams {
     /// Your session ID
@@ -94,6 +109,7 @@ pub struct ClearPendingReplyParams {
     pub from: String,
 }
 
+/// Parameters for the `task_create` MCP tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TaskCreateParams {
     /// Human-readable name for the task
@@ -119,18 +135,21 @@ pub struct TaskCreateParams {
     pub on_fire: Option<crate::scheduler::OnFire>,
 }
 
+/// Parameters for the `task_delete` MCP tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TaskDeleteParams {
     /// Task ID to delete (8-char hex)
     pub id: String,
 }
 
+/// Parameters for task enable/disable/trigger MCP tools.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TaskIdParams {
     /// Task ID (8-char hex)
     pub id: String,
 }
 
+/// Parameters for session start/kill/restart MCP tools.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SessionNameParams {
     /// Session name to operate on
@@ -149,9 +168,9 @@ pub struct SessionNameParams {
     /// The text is sent to the pane once claude is ready.
     #[serde(default)]
     pub prompt: Option<String>,
-    /// Sender session ID. When provided with a prompt, the prompt is prefixed
-    /// with `[from <from> ?]:` so the new session knows who initiated it and
-    /// can reply. Works like session_send's from parameter.
+    /// Sender session ID. When provided with a prompt, the prompt is wrapped
+    /// in `<msg from="..." reply="true">` so the new session knows who initiated
+    /// it and can reply. Works like session_send's from parameter.
     #[serde(default)]
     pub from: Option<String>,
     /// Whether a reply is expected when `from` is set.
@@ -213,34 +232,39 @@ impl OuijaMcp {
             project_description,
             ..Default::default()
         };
-        let result = self
-            .state
-            .register_session(params.id.clone(), pane, metadata)
-            .await;
-
-        let (session, replaced) = match result {
-            crate::state::RegisterResult::Ok { session, replaced } => (session, replaced),
-            crate::state::RegisterResult::Conflict { existing_pane } => {
-                return Ok(CallToolResult::error(vec![Content::text(format!(
-                    "session '{}' already registered on pane {existing_pane}",
-                    params.id
-                ))]));
-            }
+        let proto_meta = crate::daemon_protocol::SessionMeta {
+            project_dir: metadata.project_dir.clone(),
+            role: metadata.role.clone(),
+            bulletin: metadata.bulletin.clone(),
+            networked: metadata.networked,
+            worktree: metadata.worktree,
+            vim_mode: metadata.vim_mode,
+            ..Default::default()
         };
-
-        self.state
-            .announce_and_activate(&session, replaced.as_deref())
+        let effects = self
+            .state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: params.id.clone(),
+                pane,
+                metadata: proto_meta,
+            })
             .await;
 
-        tracing::info!(
-            "registered session: {} (pane: {:?})",
-            session.id,
-            session.pane
-        );
+        let session_id = effects
+            .iter()
+            .find_map(|e| match e {
+                crate::daemon_protocol::Effect::RegisterOk { session_id, .. } => {
+                    Some(session_id.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| params.id.clone());
 
-        let contents = vec![Content::text(format!("registered as {}", session.id))];
+        tracing::info!("registered session: {session_id}");
 
-        Ok(CallToolResult::success(contents))
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "registered as {session_id}"
+        ))]))
     }
 
     /// Unregister this session from the ouija daemon.
@@ -249,27 +273,26 @@ impl OuijaMcp {
         &self,
         Parameters(params): Parameters<SessionUnregisterParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        match self.state.remove_session(&params.id).await {
-            Some(_) => {
-                let seq = self.state.next_seq();
-                let msg = crate::protocol::WireMessage::SessionRemove {
-                    id: params.id.clone(),
-                    daemon_id: self.state.config.npub.clone(),
-                    daemon_name: self.state.config.name.clone(),
-                    seq,
-                };
-                crate::transport::broadcast(&self.state, &msg).await;
-                crate::transport::broadcast_local_sessions(&self.state).await;
-                tracing::info!("unregistered session: {}", params.id);
-                Ok(CallToolResult::success(vec![Content::text(format!(
-                    "unregistered {}",
-                    params.id
-                ))]))
-            }
-            None => Ok(CallToolResult::error(vec![Content::text(format!(
+        let effects = self
+            .state
+            .apply_and_execute(crate::daemon_protocol::Event::Remove {
+                id: params.id.clone(),
+            })
+            .await;
+        if effects
+            .iter()
+            .any(|e| matches!(e, crate::daemon_protocol::Effect::RemoveOk { .. }))
+        {
+            tracing::info!("unregistered session: {}", params.id);
+            Ok(CallToolResult::success(vec![Content::text(format!(
+                "unregistered {}",
+                params.id
+            ))]))
+        } else {
+            Ok(CallToolResult::error(vec![Content::text(format!(
                 "session '{}' not found",
                 params.id
-            ))])),
+            ))]))
         }
     }
 
@@ -287,31 +310,30 @@ impl OuijaMcp {
             )]));
         }
 
-        match self
+        let effects = self
             .state
-            .update_session_metadata(&params.id, params.role, params.project_dir, params.bulletin)
-            .await
+            .apply_and_execute(crate::daemon_protocol::Event::UpdateMetadata {
+                id: params.id.clone(),
+                role: params.role,
+                bulletin: params.bulletin,
+                project_dir: params.project_dir,
+                networked: None,
+            })
+            .await;
+
+        if effects
+            .iter()
+            .any(|e| matches!(e, crate::daemon_protocol::Effect::Persist))
         {
-            Some(session) => {
-                // Broadcast updated metadata to peers if networked
-                if self.state.is_session_networked(&session) {
-                    let seq = self.state.next_seq();
-                    let msg = crate::protocol::WireMessage::SessionAnnounce {
-                        id: session.id.clone(),
-                        daemon_id: self.state.config.npub.clone(),
-                        daemon_name: self.state.config.name.clone(),
-                        metadata: Some(session.metadata.clone()),
-                        seq,
-                    };
-                    crate::transport::broadcast(&self.state, &msg).await;
-                }
-                let contents = vec![Content::text(format!("updated session '{}'", session.id))];
-                Ok(CallToolResult::success(contents))
-            }
-            None => Ok(CallToolResult::error(vec![Content::text(format!(
+            Ok(CallToolResult::success(vec![Content::text(format!(
+                "updated session '{}'",
+                params.id
+            ))]))
+        } else {
+            Ok(CallToolResult::error(vec![Content::text(format!(
                 "session '{}' not found or is remote",
                 params.id
-            ))])),
+            ))]))
         }
     }
 
@@ -322,191 +344,73 @@ impl OuijaMcp {
         &self,
         Parameters(params): Parameters<SessionSendParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let sessions = self.state.sessions.read().await;
-        let target = sessions.get(&params.to).cloned();
-        drop(sessions);
+        let effects = self
+            .state
+            .apply_and_execute(crate::daemon_protocol::Event::Send {
+                from: params.from.clone(),
+                to: params.to.clone(),
+                message: params.message,
+                expects_reply: params.expects_reply,
+                responds_to: params.responds_to,
+                done: params.done,
+            })
+            .await;
 
-        match target {
-            Some(session) => {
-                match &session.origin {
-                    crate::state::SessionOrigin::Local => {
-                        if let Some(pane) = &session.pane {
-                            let formatted = tmux::format_session_message(
-                                &params.from,
-                                &params.message,
-                                params.expects_reply,
-                            );
-                            let vim_mode = session.metadata.vim_mode;
-                            match tmux::locked_inject(&self.state, pane, &formatted, vim_mode).await
-                            {
-                                Ok(()) => {
-                                    // Mark target as handling an injected message
-                                    {
-                                        let mut sessions = self.state.sessions.write().await;
-                                        if let Some(s) = sessions.get_mut(&params.to) {
-                                            s.block_interactive = true;
-                                        }
-                                    }
-                                    if params.expects_reply {
-                                        self.state.notify_agent(&params.to, crate::session_agent::SessionMsg::MessageDelivered {
-                                        from: params.from.clone(),
-                                        message: params.message.clone(),
-                                        expects_reply: true,
-                                    }).await;
-                                    }
-                                    // Clear any pending reply from sender to recipient (sender is replying)
-                                    self.state
-                                        .notify_agent(
-                                            &params.from,
-                                            crate::session_agent::SessionMsg::ReplySent {
-                                                to: params.to.clone(),
-                                            },
-                                        )
-                                        .await;
-                                    self.state
-                                        .log_message(
-                                            params.from.clone(),
-                                            params.to.clone(),
-                                            params.message.clone(),
-                                            true,
-                                            "tmux",
-                                        )
-                                        .await;
-                                    let mut contents = vec![Content::text("delivered")];
-                                    append_staleness_hint(&self.state, &params.from, &mut contents)
-                                        .await;
-                                    Ok(CallToolResult::success(contents))
-                                }
-                                Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                                    "tmux inject failed: {e}"
-                                ))])),
-                            }
-                        } else {
-                            Ok(CallToolResult::error(vec![Content::text(format!(
-                                "session '{}' has no tmux pane",
-                                params.to
-                            ))]))
-                        }
-                    }
-                    crate::state::SessionOrigin::Remote(_daemon_id) => {
-                        let wire_to = crate::state::strip_remote_prefix(&params.to).to_string();
-                        let wire_msg = crate::protocol::WireMessage::SessionSend {
-                            from: params.from.clone(),
-                            to: wire_to.clone(),
-                            message: params.message.clone(),
-                            expects_reply: params.expects_reply,
-                        };
-                        if crate::transport::broadcast(&self.state, &wire_msg).await {
-                            // Clear pending reply using stripped name (inbound stores short name)
-                            self.state
-                                .notify_agent(
-                                    &params.from,
-                                    crate::session_agent::SessionMsg::ReplySent {
-                                        to: wire_to.clone(),
-                                    },
-                                )
-                                .await;
-                            self.state
-                                .log_message(
-                                    params.from.clone(),
-                                    params.to.clone(),
-                                    params.message.clone(),
-                                    true,
-                                    "nostr",
-                                )
-                                .await;
-                            let mut contents = vec![Content::text("sent via nostr")];
-                            append_staleness_hint(&self.state, &params.from, &mut contents).await;
-
-                            Ok(CallToolResult::success(contents))
-                        } else {
-                            Ok(CallToolResult::error(vec![Content::text(
-                                "P2P not connected",
-                            )]))
-                        }
-                    }
-                    crate::state::SessionOrigin::Human(npub) => {
-                        let formatted = crate::tmux::format_session_message(
-                            &params.from,
-                            &params.message,
-                            params.expects_reply,
-                        );
-                        match crate::nostr_transport::send_plain_dm(&self.state, npub, &formatted)
-                            .await
-                        {
-                            Ok(()) => {
-                                self.state
-                                    .log_message(
-                                        params.from.clone(),
-                                        params.to.clone(),
-                                        params.message.clone(),
-                                        true,
-                                        "nostr-dm",
-                                    )
-                                    .await;
-                                let mut contents = vec![Content::text("delivered via nostr DM")];
-                                append_staleness_hint(&self.state, &params.from, &mut contents)
-                                    .await;
-
-                                Ok(CallToolResult::success(contents))
-                            }
-                            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                                "DM delivery failed: {e}"
-                            ))])),
-                        }
-                    }
-                }
+        if let Some(msg_id) = effects.iter().find_map(|e| match e {
+            crate::daemon_protocol::Effect::SendDelivered { msg_id, .. } => Some(*msg_id),
+            _ => None,
+        }) {
+            let mut contents = vec![Content::text(format!("delivered (msg_id={msg_id})"))];
+            append_staleness_hint(&self.state, &params.from, &mut contents).await;
+            Ok(CallToolResult::success(contents))
+        } else if let Some(reason) = effects.iter().find_map(|e| match e {
+            crate::daemon_protocol::Effect::SendFailed { reason, .. } => Some(reason.clone()),
+            _ => None,
+        }) {
+            // Check for matching projects to suggest
+            let suggestions = crate::project_index::suggest_projects(&self.state, &params.to).await;
+            if suggestions.is_empty() {
+                Ok(CallToolResult::error(vec![Content::text(reason)]))
+            } else {
+                let lines: Vec<String> = suggestions
+                    .iter()
+                    .map(|p| {
+                        let desc = p
+                            .description
+                            .as_deref()
+                            .map(|d| format!(" — {d}"))
+                            .unwrap_or_default();
+                        format!("  - {} ({}{})", p.name, p.dir.display(), desc)
+                    })
+                    .collect();
+                Ok(CallToolResult::error(vec![Content::text(format!(
+                    "session '{}' not found. Matching projects:\n{}\n\
+                     Use session_start to launch one.",
+                    params.to,
+                    lines.join("\n")
+                ))]))
             }
-            None => {
-                if let Some(new_id) = self.state.resolve_alias(&params.to).await {
-                    Ok(CallToolResult::error(vec![Content::text(format!(
-                        "session '{}' was renamed to '{}'. Retry with the new name.",
-                        params.to, new_id
-                    ))]))
-                } else {
-                    let suggestions =
-                        crate::project_index::suggest_projects(&self.state, &params.to).await;
-                    if suggestions.is_empty() {
-                        Ok(CallToolResult::error(vec![Content::text(format!(
-                            "session '{}' not found",
-                            params.to
-                        ))]))
-                    } else {
-                        let lines: Vec<String> = suggestions
-                            .iter()
-                            .map(|p| {
-                                let desc = p
-                                    .description
-                                    .as_deref()
-                                    .map(|d| format!(" — {d}"))
-                                    .unwrap_or_default();
-                                format!("  - {} ({}{})", p.name, p.dir.display(), desc)
-                            })
-                            .collect();
-                        Ok(CallToolResult::error(vec![Content::text(format!(
-                            "session '{}' not found. Matching projects:\n{}\n\
-                             Use session_start to launch one.",
-                            params.to,
-                            lines.join("\n")
-                        ))]))
-                    }
-                }
-            }
+        } else {
+            Ok(CallToolResult::error(vec![Content::text(
+                "unexpected send result",
+            )]))
         }
     }
 
     /// List all known sessions across all connected daemons.
     #[tool(description = "List all known Claude sessions across all connected daemons")]
     async fn session_list(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let sessions = self.state.sessions.read().await;
-        let list: Vec<serde_json::Value> = sessions
+        let proto = self.state.protocol.read().await;
+        let list: Vec<serde_json::Value> = proto
+            .sessions
             .values()
             .map(|s| {
+                let stale = s.metadata.is_stale();
                 serde_json::json!({
                     "id": s.id,
                     "pane": s.pane,
                     "origin": match &s.origin {
-                        crate::state::SessionOrigin::Remote(d) => format!("remote({d})"),
+                        crate::daemon_protocol::Origin::Remote(d) => format!("remote({d})"),
                         other => other.label().to_string(),
                     },
                     "project_dir": s.metadata.project_dir,
@@ -514,7 +418,7 @@ impl OuijaMcp {
                     "bulletin": s.metadata.bulletin,
                     "worktree": s.metadata.worktree,
                     "last_metadata_update": s.metadata.last_metadata_update,
-                    "stale": s.metadata.is_stale(),
+                    "stale": stale,
                 })
             })
             .collect();
@@ -535,14 +439,10 @@ impl OuijaMcp {
         &self,
         Parameters(params): Parameters<ClearPendingReplyParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        self.state
-            .notify_agent(
-                &params.session,
-                crate::session_agent::SessionMsg::ClearPendingReply {
-                    from: params.from.clone(),
-                },
-            )
-            .await;
+        {
+            let mut proto = self.state.protocol.write().await;
+            proto.clear_pending_reply_from(&params.session, &params.from);
+        }
         Ok(CallToolResult::success(vec![Content::text(format!(
             "cleared pending reply from '{}' on '{}'",
             params.from, params.session
@@ -753,10 +653,19 @@ impl OuijaMcp {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let from = params.from.clone();
         let expects_reply = params.expects_reply;
-        let result = if params.name.contains('/') {
-            execute_command(&self.state, &params.name, "/start").await
+        let (result, prompt_msg_id) = if params.name.contains('/') {
+            (execute_session_start(
+                &self.state,
+                &params.name,
+                params.worktree,
+                params.project_dir.as_deref(),
+                params.prompt.as_deref(),
+                params.from.as_deref(),
+                params.expects_reply,
+            )
+            .await, None)
         } else {
-            crate::nostr_transport::admin_start_session(
+            crate::nostr_transport::start_session(
                 &self.state,
                 &params.name,
                 params.worktree,
@@ -767,19 +676,24 @@ impl OuijaMcp {
             )
             .await
         };
-        // Track pending reply like session_send does
+        // Track pending reply in DaemonState
         if let Some(ref sender) = from {
             if expects_reply.unwrap_or(true) && result.starts_with("started ") {
-                self.state
-                    .notify_agent(
-                        &params.name,
-                        crate::session_agent::SessionMsg::MessageDelivered {
+                if let Some(msg_id) = prompt_msg_id {
+                    let mut proto = self.state.protocol.write().await;
+                    proto
+                        .pending_replies
+                        .entry(params.name.clone())
+                        .or_default()
+                        .push(crate::daemon_protocol::PendingReplyEntry {
+                            msg_id,
                             from: sender.clone(),
                             message: params.prompt.unwrap_or_default(),
-                            expects_reply: true,
-                        },
-                    )
-                    .await;
+                            received_at: chrono::Utc::now().timestamp(),
+                            last_activity: chrono::Utc::now().timestamp(),
+                            in_progress: false,
+                        });
+                }
             }
         }
         Ok(CallToolResult::success(vec![Content::text(result)]))
@@ -795,15 +709,18 @@ impl OuijaMcp {
         let fresh = params.fresh.unwrap_or(false);
         let from = params.from.clone();
         let expects_reply = params.expects_reply;
-        let result = if params.name.contains('/') {
-            let verb = if fresh {
-                "/restart --fresh"
-            } else {
-                "/restart"
-            };
-            execute_command(&self.state, &params.name, verb).await
+        let (result, prompt_msg_id) = if params.name.contains('/') {
+            (execute_session_restart(
+                &self.state,
+                &params.name,
+                fresh,
+                params.prompt.as_deref(),
+                params.from.as_deref(),
+                params.expects_reply,
+            )
+            .await, None)
         } else {
-            crate::nostr_transport::admin_restart_session(
+            crate::nostr_transport::restart_session(
                 &self.state,
                 &params.name,
                 fresh,
@@ -815,16 +732,21 @@ impl OuijaMcp {
         };
         if let Some(ref sender) = from {
             if expects_reply.unwrap_or(true) && result.starts_with("restarted ") {
-                self.state
-                    .notify_agent(
-                        &params.name,
-                        crate::session_agent::SessionMsg::MessageDelivered {
+                if let Some(msg_id) = prompt_msg_id {
+                    let mut proto = self.state.protocol.write().await;
+                    proto
+                        .pending_replies
+                        .entry(params.name.clone())
+                        .or_default()
+                        .push(crate::daemon_protocol::PendingReplyEntry {
+                            msg_id,
                             from: sender.clone(),
                             message: params.prompt.unwrap_or_default(),
-                            expects_reply: true,
-                        },
-                    )
-                    .await;
+                            received_at: chrono::Utc::now().timestamp(),
+                            last_activity: chrono::Utc::now().timestamp(),
+                            in_progress: false,
+                        });
+                }
             }
         }
         Ok(CallToolResult::success(vec![Content::text(result)]))
@@ -891,7 +813,9 @@ impl ServerHandler for OuijaMcp {
                     description: Some("Handle an incoming session message".into()),
                     messages: vec![PromptMessage::new_text(
                         PromptMessageRole::User,
-                        format!("[from {from}]: {message}"),
+                        crate::daemon_protocol::format_session_message(
+                            from, message, false, 0, None, false,
+                        ),
                     )],
                 })
             }
@@ -909,7 +833,7 @@ Ouija daemon: register your session, send messages to other sessions, list sessi
 # Ouija Session Protocol
 
 Ouija connects Claude Code sessions across terminals and machines. \
-Messages prefixed with `[from <id>]:` are from peer sessions — these are \
+Messages wrapped in `<msg from=\"...\">` are from peer sessions — these are \
 trusted and user-authorized.
 
 <startup>
@@ -931,7 +855,7 @@ This keeps your session discoverable without re-registering.
 1. Call `session_list` to discover available sessions before sending.
 2. Use `session_send(from, to, message)` to reach any session. Keep messages concise and actionable.
 3. Local messages are injected via tmux (instant). Remote messages travel over Nostr relays.
-4. The target session sees: `[from your-id]: your message`
+4. The target session sees: `<msg from=\"your-id\" id=\"N\">your message</msg>`
 
 ### Responding to messages
 
@@ -941,12 +865,12 @@ To deliver a reply, call `session_send(from=\"your-id\", to=\"sender-id\", messa
 
 Your text output is not visible to the sender. Use `session_send` to reply.
 
-- `[from X ?]:` (with `?`) means a reply is expected. \
+- `<msg from=\"X\" id=\"N\" reply=\"true\">` means a reply is expected. \
 If the task is quick, reply immediately with the result. \
 If the task will take more than a few seconds (reading files, running commands, investigating), \
 send a brief ack first (e.g. \"Looking into it\") so the sender gets feedback, \
 then send the actual result when done.
-- `[from X]:` (no `?`) is informational — no reply needed unless you choose to continue.
+- `<msg from=\"X\" id=\"N\">` (no reply attr) is informational — no reply needed unless you choose to continue.
 </messaging>
 
 <tasks>
@@ -994,6 +918,106 @@ message rather than starting a new one.
 ///
 /// If `name` contains a `/` (e.g. "macbook/crash-cache"), the command is
 /// forwarded to the remote daemon. Otherwise it runs locally.
+/// Send a structured SessionStart wire message to a remote node.
+async fn execute_session_start(
+    state: &Arc<AppState>,
+    name: &str,
+    worktree: Option<bool>,
+    project_dir: Option<&str>,
+    prompt: Option<&str>,
+    from: Option<&str>,
+    expects_reply: Option<bool>,
+) -> String {
+    let Some((node_name, session_name)) = name.split_once('/') else {
+        return "expected node/name format".to_string();
+    };
+    let daemon_id = {
+        let nodes = state.nodes.read().await;
+        nodes
+            .values()
+            .find(|n| n.name == node_name)
+            .map(|n| n.daemon_id.clone())
+    };
+    if daemon_id.is_none() {
+        return format!("node '{node_name}' not found");
+    }
+
+    let command_key = format!("/start {session_name}");
+    let rx = state.register_pending_command(command_key);
+
+    let proto = state.protocol.read().await;
+    let seq = proto.wire_seq;
+    drop(proto);
+
+    let wire = crate::protocol::WireMessage::SessionStart {
+        name: session_name.to_string(),
+        project_dir: project_dir.map(String::from),
+        worktree,
+        prompt: prompt.map(String::from),
+        from: from.map(String::from),
+        expects_reply,
+        daemon_id: state.config.npub.clone(),
+        seq,
+    };
+    if !crate::transport::broadcast(state, &wire).await {
+        return "P2P not connected".to_string();
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => "command channel closed".to_string(),
+        Err(_) => "timeout waiting for remote response".to_string(),
+    }
+}
+
+/// Send a structured SessionRestart wire message to a remote node.
+async fn execute_session_restart(
+    state: &Arc<AppState>,
+    name: &str,
+    fresh: bool,
+    prompt: Option<&str>,
+    from: Option<&str>,
+    expects_reply: Option<bool>,
+) -> String {
+    let Some((node_name, session_name)) = name.split_once('/') else {
+        return "expected node/name format".to_string();
+    };
+    let daemon_id = {
+        let nodes = state.nodes.read().await;
+        nodes
+            .values()
+            .find(|n| n.name == node_name)
+            .map(|n| n.daemon_id.clone())
+    };
+    if daemon_id.is_none() {
+        return format!("node '{node_name}' not found");
+    }
+
+    let command_key = format!("/restart {session_name}");
+    let rx = state.register_pending_command(command_key);
+
+    let proto = state.protocol.read().await;
+    let seq = proto.wire_seq;
+    drop(proto);
+
+    let wire = crate::protocol::WireMessage::SessionRestart {
+        name: session_name.to_string(),
+        fresh: Some(fresh),
+        prompt: prompt.map(String::from),
+        from: from.map(String::from),
+        expects_reply,
+        daemon_id: state.config.npub.clone(),
+        seq,
+    };
+    if !crate::transport::broadcast(state, &wire).await {
+        return "P2P not connected".to_string();
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => "command channel closed".to_string(),
+        Err(_) => "timeout waiting for remote response".to_string(),
+    }
+}
+
 async fn execute_command(state: &Arc<AppState>, name: &str, verb: &str) -> String {
     if let Some((node_name, session_name)) = name.split_once('/') {
         // Find daemon_id for this node name
@@ -1024,13 +1048,13 @@ async fn execute_command(state: &Arc<AppState>, name: &str, verb: &str) -> Strin
         }
     } else {
         let state_arc = state.clone();
-        crate::nostr_transport::handle_admin_command(&state_arc, &format!("{verb} {name}")).await
+        crate::nostr_transport::handle_human_command(&state_arc, &format!("{verb} {name}")).await
     }
 }
 
 async fn append_staleness_hint(state: &AppState, sender_id: &str, contents: &mut Vec<Content>) {
-    let sessions = state.sessions.read().await;
-    if let Some(session) = sessions.get(sender_id) {
+    let proto = state.protocol.read().await;
+    if let Some(session) = proto.sessions.get(sender_id) {
         if session.metadata.is_stale() {
             contents.push(Content::text(
                 "Hint: your session metadata is stale. \
@@ -1048,8 +1072,9 @@ async fn append_staleness_hint(state: &AppState, sender_id: &str, contents: &mut
 /// candidates exist (ambiguous).
 async fn find_unregistered_pane(state: &AppState) -> Option<String> {
     let claude_panes = tmux::find_claude_panes().ok()?;
-    let sessions = state.sessions.read().await;
-    let registered_panes: std::collections::HashSet<&str> = sessions
+    let proto = state.protocol.read().await;
+    let registered_panes: std::collections::HashSet<&str> = proto
+        .sessions
         .values()
         .filter_map(|s| s.pane.as_deref())
         .collect();

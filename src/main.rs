@@ -1,6 +1,7 @@
 mod admin;
 mod api;
 mod config;
+pub mod daemon_protocol;
 mod mcp;
 mod nostr_transport;
 mod persistence;
@@ -115,28 +116,25 @@ enum Command {
 enum ConfigAction {
     /// Set a config value (e.g. ouija config set auto_register false)
     Set { key: String, value: String },
-    /// Add a human Nostr session
+    /// Add a Nostr DM user (human who can control the daemon via DMs)
     AddHuman {
-        /// The human's Nostr public key (npub1...)
+        /// The user's Nostr public key (npub1...)
         #[arg(long)]
         npub: String,
-        /// Session name for this human
+        /// Display name for this user
         #[arg(long)]
         name: String,
-        /// Grant admin privileges
-        #[arg(long)]
-        admin: bool,
         /// Default session to route unprefixed messages to
         #[arg(long)]
         default_session: Option<String>,
     },
-    /// Remove a human Nostr session
+    /// Remove a Nostr DM user
     RemoveHuman {
-        /// Name of the human session to remove
+        /// Name of the user to remove
         #[arg(long)]
         name: String,
     },
-    /// List configured human sessions
+    /// List configured Nostr DM users
     ListHumans,
     /// Configure the LLM router for human DMs
     SetRouter {
@@ -268,6 +266,11 @@ async fn main() -> anyhow::Result<()> {
                 project_index::refresh_index(&index_state).await;
             });
 
+            // Restore persisted sessions synchronously before the reaper loop
+            // starts, so auto-register doesn't overwrite custom names.
+            restore_persisted_sessions(&state).await;
+            register_human_sessions(&state).await;
+
             // Setup nostr transport in the background so HTTP starts immediately.
             let bg_state = state.clone();
             tokio::spawn(async move {
@@ -284,21 +287,73 @@ async fn main() -> anyhow::Result<()> {
                     let interval = reaper_state.settings.read().await.reaper_interval_secs;
                     tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
 
-                    // Reap dead local sessions and announce removals
-                    let reaped = reaper_state.reap_dead_sessions().await;
-                    if !reaped.is_empty() {
-                        for id in &reaped {
-                            let seq = reaper_state.next_seq();
-                            let msg = crate::protocol::WireMessage::SessionRemove {
-                                id: id.clone(),
-                                daemon_id: reaper_state.config.npub.clone(),
-                                daemon_name: reaper_state.config.name.clone(),
-                                seq,
-                            };
-                            transport::broadcast(&reaper_state, &msg).await;
+                    // Reap dead local sessions via protocol
+                    let panes_to_check: Vec<(String, String)> = {
+                        let proto = reaper_state.protocol.read().await;
+                        let now = chrono::Utc::now().timestamp();
+                        proto
+                            .sessions
+                            .values()
+                            .filter(|s| {
+                                matches!(s.origin, crate::daemon_protocol::Origin::Local)
+                                    && s.pane.is_some()
+                                    && (s.registered_at == 0 || now - s.registered_at > 15)
+                            })
+                            .filter_map(|s| Some((s.id.clone(), s.pane.clone()?)))
+                            .collect()
+                    };
+                    let dead_ids: Vec<String> = if !panes_to_check.is_empty() {
+                        let dead = tokio::task::spawn_blocking(move || {
+                            panes_to_check
+                                .into_iter()
+                                .filter(|(_, pane)| !crate::tmux::pane_alive(pane))
+                                .map(|(id, _)| id)
+                                .collect::<Vec<_>>()
+                        })
+                        .await
+                        .unwrap_or_default();
+                        if !dead.is_empty() {
+                            reaper_state
+                                .apply_and_execute(crate::daemon_protocol::Event::ReapDead {
+                                    dead_ids: dead.clone(),
+                                })
+                                .await;
                         }
-                        transport::broadcast_local_sessions(&reaper_state).await;
+                        dead
+                    } else {
+                        vec![]
+                    };
+                    // Clean up per-fire worktree panes
+                    let perfire_to_check: Vec<(String, String)> = {
+                        let pf = reaper_state.perfire_worktree_panes.read().await;
+                        pf.iter().map(|(p, d)| (p.clone(), d.clone())).collect()
+                    };
+                    if !perfire_to_check.is_empty() {
+                        let dead_perfire = tokio::task::spawn_blocking(move || {
+                            perfire_to_check
+                                .into_iter()
+                                .filter(|(pane, _)| !crate::tmux::pane_alive(pane))
+                                .collect::<Vec<_>>()
+                        })
+                        .await
+                        .unwrap_or_default();
+                        if !dead_perfire.is_empty() {
+                            let mut pf = reaper_state.perfire_worktree_panes.write().await;
+                            for (pane_id, project_dir) in dead_perfire {
+                                pf.remove(&pane_id);
+                                tracing::info!(
+                                    "per-fire worktree pane {pane_id} died, pruning worktrees in {project_dir}"
+                                );
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    std::process::Command::new("git")
+                                        .args(["-C", &project_dir, "worktree", "prune"])
+                                        .status()
+                                })
+                                .await;
+                            }
+                        }
                     }
+                    let _ = dead_ids; // suppress unused warning
 
                     // If over the max session limit, close the most idle ones.
                     // Killing the pane lets the next reaper cycle clean up + broadcast.
@@ -306,7 +361,7 @@ async fn main() -> anyhow::Result<()> {
                         tracing::info!(
                             "auto-closing idle session '{id}' (over max_local_sessions)"
                         );
-                        crate::nostr_transport::admin_kill_session(&reaper_state, &id).await;
+                        crate::nostr_transport::kill_session(&reaper_state, &id).await;
                     }
 
                     // Scan tmux, update cache, auto-register unregistered panes
@@ -494,7 +549,6 @@ async fn main() -> anyhow::Result<()> {
             Some(ConfigAction::AddHuman {
                 npub,
                 name,
-                admin,
                 default_session,
             }) => {
                 if !npub.starts_with("npub1") {
@@ -504,17 +558,16 @@ async fn main() -> anyhow::Result<()> {
                 std::fs::create_dir_all(&config_dir)?;
                 let mut settings = persistence::load_settings(&config_dir)?;
                 if settings.human_sessions.iter().any(|h| h.name == name) {
-                    anyhow::bail!("human session '{name}' already exists");
+                    anyhow::bail!("Nostr DM user '{name}' already exists");
                 }
                 settings.human_sessions.push(persistence::HumanSession {
                     npub,
                     name: name.clone(),
-                    admin,
                     default_session,
                     welcomed: false,
                 });
                 persistence::save_settings(&config_dir, &settings)?;
-                println!("added human session '{name}'");
+                println!("added Nostr DM user '{name}'");
             }
             Some(ConfigAction::RemoveHuman { name }) => {
                 let config_dir = config::OuijaConfig::default_config_dir();
@@ -522,18 +575,18 @@ async fn main() -> anyhow::Result<()> {
                 let before = settings.human_sessions.len();
                 settings.human_sessions.retain(|h| h.name != name);
                 if settings.human_sessions.len() == before {
-                    anyhow::bail!("human session '{name}' not found");
+                    anyhow::bail!("Nostr DM user '{name}' not found");
                 }
                 persistence::save_settings(&config_dir, &settings)?;
-                println!("removed human session '{name}'");
+                println!("removed Nostr DM user '{name}'");
             }
             Some(ConfigAction::ListHumans) => {
                 let config_dir = config::OuijaConfig::default_config_dir();
                 let settings = persistence::load_settings(&config_dir)?;
                 if settings.human_sessions.is_empty() {
-                    println!("no human sessions configured");
+                    println!("no Nostr DM users configured");
                 } else {
-                    println!("{:<12} {:<20} {:<8} DEFAULT", "NAME", "NPUB", "ADMIN");
+                    println!("{:<12} {:<20} DEFAULT", "NAME", "NPUB");
                     for h in &settings.human_sessions {
                         let npub_short = if h.npub.len() > 16 {
                             format!("{}...", &h.npub[..16])
@@ -541,10 +594,7 @@ async fn main() -> anyhow::Result<()> {
                             h.npub.clone()
                         };
                         let default = h.default_session.as_deref().unwrap_or("--");
-                        println!(
-                            "{:<12} {:<20} {:<8} {}",
-                            h.name, npub_short, h.admin, default
-                        );
+                        println!("{:<12} {:<20} {}", h.name, npub_short, default);
                     }
                 }
             }
@@ -689,9 +739,6 @@ async fn setup_nostr_transport(
         }
     };
 
-    restore_persisted_sessions(state).await;
-    register_human_sessions(state).await;
-
     if let Some(ticket) = ticket
         && let Err(e) = transport.connect(ticket, state.clone(), true).await
     {
@@ -729,18 +776,26 @@ async fn restore_persisted_sessions(state: &state::AppState) {
         return;
     }
 
-    let mut state_sessions = state.sessions.write().await;
+    let mut proto = state.protocol.write().await;
     for ps in &alive {
-        let session = state::Session {
+        let entry = crate::daemon_protocol::SessionEntry {
             id: ps.id.clone(),
             pane: ps.pane.clone(),
-            origin: state::SessionOrigin::Local,
-            registered_at: ps.registered_at,
-            last_activity_at: ps.last_activity_at,
-            metadata: ps.metadata.clone(),
-            block_interactive: false,
+            origin: crate::daemon_protocol::Origin::Local,
+            metadata: crate::daemon_protocol::SessionMeta {
+                project_dir: ps.metadata.project_dir.clone(),
+                role: ps.metadata.role.clone(),
+                bulletin: ps.metadata.bulletin.clone(),
+                networked: ps.metadata.networked,
+                worktree: ps.metadata.worktree,
+                vim_mode: ps.metadata.vim_mode,
+                claude_session_id: ps.metadata.claude_session_id.clone(),
+                project_description: ps.metadata.project_description.clone(),
+                last_metadata_update: ps.metadata.last_metadata_update.map(|dt| dt.timestamp()),
+            },
+            ..Default::default()
         };
-        state_sessions.insert(ps.id.clone(), session);
+        proto.sessions.insert(ps.id.clone(), entry);
     }
     tracing::info!("restored {} persisted sessions", alive.len());
 }
@@ -751,26 +806,24 @@ async fn register_human_sessions(state: &state::AppState) {
         return;
     }
 
-    let mut sessions = state.sessions.write().await;
+    let mut proto = state.protocol.write().await;
     for h in &humans {
-        if sessions.contains_key(&h.name) {
+        if proto.sessions.contains_key(&h.name) {
             tracing::debug!("human session '{}' already registered", h.name);
             continue;
         }
-        let session = state::Session {
+        let entry = crate::daemon_protocol::SessionEntry {
             id: h.name.clone(),
             pane: None,
-            origin: state::SessionOrigin::Human(h.npub.clone()),
-            registered_at: chrono::Utc::now(),
-            last_activity_at: chrono::Utc::now(),
-            metadata: state::SessionMetadata {
+            origin: crate::daemon_protocol::Origin::Human(h.npub.clone()),
+            metadata: crate::daemon_protocol::SessionMeta {
                 role: Some("human".to_string()),
                 networked: false,
                 ..Default::default()
             },
-            block_interactive: false,
+            ..Default::default()
         };
-        sessions.insert(h.name.clone(), session);
+        proto.sessions.insert(h.name.clone(), entry);
         tracing::info!("registered human session: {}", h.name);
     }
 }
@@ -784,16 +837,14 @@ async fn reconnect_persisted_nodes(state: state::SharedState) {
         }
     };
 
-    if conns.is_empty() {
-        return;
-    }
-
     let Some(transport) = state.transport_by_name("nostr").await else {
         tracing::warn!("skipping node reconnection: nostr transport not active");
         return;
     };
 
     let mut reconnected = 0;
+    let mut connected_npubs = std::collections::HashSet::new();
+
     for conn in &conns {
         // Skip legacy (non-nostr) connections
         if !conn.ticket.starts_with("nprofile1") {
@@ -812,6 +863,7 @@ async fn reconnect_persisted_nodes(state: state::SharedState) {
             .clone()
             .or_else(|| crate::api::extract_npub(&conn.ticket));
         if let Some(ref npub) = npub {
+            connected_npubs.insert(npub.clone());
             let node_name = conn
                 .node_name
                 .as_deref()
@@ -828,6 +880,60 @@ async fn reconnect_persisted_nodes(state: state::SharedState) {
         match transport.connect(&conn.ticket, state.clone(), false).await {
             Ok(()) => reconnected += 1,
             Err(e) => tracing::warn!("failed to reconnect to {label}: {e}"),
+        }
+    }
+
+    // Fallback: reconnect peers from peer_pubkeys.json not in connections.json.
+    // This handles the case where the receiving side never persisted connection
+    // info (pre-fix) or where connections.json was lost.
+    let peer_pubkeys = nostr_transport::load_peer_pubkeys(&state.config.data_dir);
+    let relay_urls = nostr_transport::load_relays(&state.config.data_dir);
+    if !peer_pubkeys.is_empty() && !relay_urls.is_empty() {
+        use nostr_sdk::prelude::*;
+        let relay_parsed: Vec<RelayUrl> = relay_urls
+            .iter()
+            .filter_map(|u| RelayUrl::parse(u).ok())
+            .collect();
+
+        for pubkey in &peer_pubkeys {
+            let npub = match pubkey.to_bech32() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            if connected_npubs.contains(&npub) {
+                continue;
+            }
+
+            let label = &npub[..16.min(npub.len())];
+            if let Err(existing) = state.try_add_node(&npub, label) {
+                tracing::info!(
+                    "skipping duplicate peer_pubkey connection to {label} (already connected as '{existing}')"
+                );
+                continue;
+            }
+
+            let profile = Nip19Profile::new(*pubkey, relay_parsed.clone());
+            let nprofile = match profile.to_bech32() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            tracing::info!("reconnecting to peer_pubkey {label}...");
+            match transport.connect(&nprofile, state.clone(), false).await {
+                Ok(()) => {
+                    // Persist so future reconnects use connections.json directly
+                    if let Err(e) = persistence::add_connection(
+                        &state.config.data_dir,
+                        &nprofile,
+                        None,
+                        Some(&npub),
+                    ) {
+                        tracing::warn!("failed to persist fallback connection: {e}");
+                    }
+                    reconnected += 1;
+                }
+                Err(e) => tracing::warn!("failed to reconnect to peer_pubkey {label}: {e}"),
+            }
         }
     }
 
@@ -889,9 +995,44 @@ fn update_and_restart() -> anyhow::Result<()> {
 
     let latest = fetch_latest_crate_version("ouija")?;
     let current = env!("CARGO_PKG_VERSION");
+    let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
+    let status_url = format!("http://localhost:{port}/api/status");
+    let daemon_alive = Cmd::new("curl")
+        .args(["-sf", &status_url])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
     if latest == current {
         println!("already on latest version ({current})");
         refresh_plugin_cache(&latest);
+        if !daemon_alive {
+            println!("daemon is not running — starting it...");
+            Cmd::new("ouija")
+                .arg("start")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .context("failed to spawn ouija start")?;
+            for i in 0..20 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if Cmd::new("curl")
+                    .args(["-sf", &status_url])
+                    .stdout(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+                if i == 19 {
+                    eprintln!("warning: daemon did not start within 10s");
+                }
+            }
+        }
+        println!("dashboard: http://localhost:{port}");
         return Ok(());
     }
     println!("updating ouija {current} -> {latest}...");
@@ -932,7 +1073,6 @@ fn update_and_restart() -> anyhow::Result<()> {
         .spawn()
         .context("failed to spawn ouija start")?;
 
-    let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
     let status_url = format!("http://localhost:{port}/api/status");
     for i in 0..20 {
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -944,7 +1084,7 @@ fn update_and_restart() -> anyhow::Result<()> {
             .unwrap_or(false)
         {
             println!("ouija updated to {latest} and running");
-            println!("admin: http://localhost:{port}/admin");
+            println!("dashboard: http://localhost:{port}");
             return Ok(());
         }
         if i == 19 {

@@ -62,6 +62,7 @@ impl OnFire {
     }
 }
 
+/// A cron-driven task that injects messages into sessions.
 #[derive(Clone, Debug, Serialize)]
 pub struct ScheduledTask {
     pub id: String,
@@ -175,6 +176,7 @@ impl<'de> serde::Deserialize<'de> for ScheduledTask {
     }
 }
 
+/// Outcome of a single scheduled task execution.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskRunStatus {
@@ -182,6 +184,7 @@ pub enum TaskRunStatus {
     Failed,
 }
 
+/// Record of a completed task execution with status and context.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaskRun {
     pub task_id: String,
@@ -222,6 +225,10 @@ impl TaskRun {
 }
 
 /// Validate a cron expression and return a human-readable description.
+///
+/// # Errors
+///
+/// Returns the parse error as a `String` if `expr` is not valid cron syntax.
 pub fn validate_cron(expr: &str) -> Result<String, String> {
     let cron = expr.parse::<Cron>().map_err(|e| format!("{e}"))?;
     Ok(cron.pattern.to_string())
@@ -326,8 +333,8 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask, formatted:
 
     // Look up session
     let session = {
-        let sessions = state.sessions.read().await;
-        sessions.get(session_name).cloned()
+        let proto = state.protocol.read().await;
+        proto.sessions.get(session_name).cloned()
     };
 
     // Session not found — create from scratch if task has enough info
@@ -343,7 +350,7 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask, formatted:
     };
 
     // Only handle local sessions
-    if !matches!(session.origin, crate::state::SessionOrigin::Local) {
+    if !matches!(session.origin, crate::daemon_protocol::Origin::Local) {
         return TaskRun::failed(task, "cannot target remote sessions".into());
     }
 
@@ -450,8 +457,8 @@ async fn respawn_and_inject(
 
     // Clear claude_session_id since we started fresh
     {
-        let mut sessions = state.sessions.write().await;
-        if let Some(s) = sessions.get_mut(task.session_name()) {
+        let mut proto = state.protocol.write().await;
+        if let Some(s) = proto.sessions.get_mut(task.session_name()) {
             s.metadata.claude_session_id = None;
         }
     }
@@ -484,8 +491,8 @@ async fn revive_from_task(
     match revive_and_inject(state, task, project_dir, formatted).await {
         Ok(new_pane) => {
             if task.on_fire.clears_context() {
-                let mut sessions = state.sessions.write().await;
-                if let Some(s) = sessions.get_mut(task.session_name()) {
+                let mut proto = state.protocol.write().await;
+                if let Some(s) = proto.sessions.get_mut(task.session_name()) {
                     s.metadata.claude_session_id = None;
                 }
             }
@@ -640,16 +647,16 @@ async fn revive_and_inject(
     }
 
     // Re-register session with new pane (same ID, so dedup check won't fire)
-    let metadata = crate::state::SessionMetadata {
+    let proto_meta = crate::daemon_protocol::SessionMeta {
         project_dir: project_dir.map(String::from),
         ..Default::default()
     };
     state
-        .register_session(
-            task.session_name().to_string(),
-            Some(new_pane.clone()),
-            metadata,
-        )
+        .apply_and_execute(crate::daemon_protocol::Event::Register {
+            id: task.session_name().to_string(),
+            pane: Some(new_pane.clone()),
+            metadata: proto_meta,
+        })
         .await;
 
     // Track disposable worktree panes for reaper cleanup
@@ -714,8 +721,13 @@ pub(crate) fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Create a new `ScheduledTask` with computed `next_run`.
-#[allow(clippy::too_many_arguments)]
+/// Create a new enabled `ScheduledTask` with computed `next_run`.
+///
+/// The task is assigned a random hex ID and starts with zero runs.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "flat parameters clearer than a builder for internal API"
+)]
 pub fn new_task(
     name: String,
     cron: String,

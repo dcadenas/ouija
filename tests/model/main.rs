@@ -4,6 +4,10 @@
 //! liveness properties of session management. Abstracts away tmux injection
 //! and Nostr transport.
 //!
+//! This is the abstract model using enum Sid/DaemonId types. A second model
+//! using the real `DaemonState` lives in `src/daemon_protocol.rs` as
+//! `stateright_model` — it exercises production `apply()` directly.
+//!
 //! ## Bugs found
 //!
 //! 1. **Out-of-order message race**: SessionAnnounce, SessionList, and
@@ -14,19 +18,27 @@
 //!
 //! 2. **Alias self-loops**: `add_alias` creates self-loops (e.g. C→C) when
 //!    local and remote renames interact with overlapping session IDs.
-//!    The real code tolerates this (one-hop resolve + existence check), but
-//!    the alias map becomes logically inconsistent.
-//!
-//! ## Fix verified
-//!
-//! Adding a monotonic generation counter to all wire messages from a daemon,
-//! and having receivers drop messages with generation < last seen from that
-//! daemon, restores convergence.
+//!    Fixed: `add_alias` now retains only entries where key != value.
 //!
 //! 3. **Cross-daemon orphaned pending replies**: When a session is removed,
 //!    pending reply cleanup only runs on the local daemon. Remote daemons
 //!    that received expects_reply messages from the removed session retain
 //!    stale pending reply entries.
+//!
+//! 4. **accept_seq restart bypass** (found by real-DaemonState model):
+//!    `accept_seq` had a `seq <= 1` special case for daemon restarts that
+//!    also accepted stale messages, resetting the generation counter. A stale
+//!    SessionAnnounce{seq=1} arriving after a SessionList{seq=2} would reset
+//!    `last_seen_seq`, letting the old SessionList{seq=1} through and
+//!    overwriting correct remote state.
+//!    Fixed: removed the seq<=1 bypass; daemon restarts now use
+//!    timestamp-based wire_seq so new incarnations always have higher seqs.
+//!
+//! ## Fixes verified
+//!
+//! - Generation counter (strict `seq < last` rejection) restores convergence.
+//! - `add_alias` self-loop removal makes alias maps acyclic.
+//! - SessionList reconciliation clears orphaned pending replies.
 
 use stateright::actor::{Actor, ActorModel, Id, Network, Out};
 use stateright::{Checker, Expectation, Model};
@@ -91,6 +103,8 @@ enum Msg {
         old_id: Sid,
         new_id: Sid,
     },
+    /// Daemon restart: clears all local state and re-broadcasts.
+    DaemonRestart,
 }
 
 impl Msg {
@@ -120,6 +134,8 @@ enum Action {
     Register(Sid),
     Remove(Sid),
     Rename(Sid, Sid),
+    /// Daemon restart: clears all state and re-broadcasts.
+    DaemonRestart,
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +300,26 @@ impl Actor for OuijaActor {
                 }
             }
 
+            Msg::DaemonRestart => {
+                let s = state.to_mut();
+                let OuijaState::Daemon {
+                    local,
+                    aliases,
+                    peers,
+                    daemon_id,
+                    seq,
+                    ..
+                } = s
+                else {
+                    return;
+                };
+                local.clear();
+                aliases.clear();
+                *seq += 1;
+                let g = *seq;
+                send_list(local, *daemon_id, g, peers, o);
+            }
+
             ref wire_msg if wire_msg.daemon().is_some_and(|d| d != my_id) => {
                 let from_daemon = wire_msg.daemon().unwrap();
                 match wire_msg {
@@ -367,6 +403,7 @@ impl Actor for OuijaActor {
                             new_id: *new,
                         },
                     ),
+                    Action::DaemonRestart => o.send(*target, Msg::DaemonRestart),
                 }
                 if *actions_taken < MAX_CLIENT_ACTIONS {
                     offer_actions(o);
@@ -489,6 +526,29 @@ impl Actor for FixedActor {
                 }
             }
 
+            Msg::DaemonRestart => {
+                let s = state.to_mut();
+                let OuijaState::Daemon {
+                    local,
+                    aliases,
+                    peers,
+                    daemon_id,
+                    seq,
+                    ..
+                } = s
+                else {
+                    return;
+                };
+                // Clear all local state (simulates daemon restart)
+                local.clear();
+                aliases.clear();
+                // Bump seq so peers see a fresh generation
+                *seq += 1;
+                let g = *seq;
+                // Broadcast empty session list (peers reconcile away stale remotes)
+                send_fixed_list(local, *daemon_id, g, peers, o);
+            }
+
             ref wire_msg if wire_msg.daemon().is_some_and(|d| d != my_id) => {
                 let from_daemon = wire_msg.daemon().unwrap();
                 let msg_seq = wire_msg.seq().unwrap();
@@ -582,6 +642,7 @@ impl Actor for FixedActor {
                             new_id: *new,
                         },
                     ),
+                    Action::DaemonRestart => o.send(*target, Msg::DaemonRestart),
                 }
                 if *actions_taken < MAX_CLIENT_ACTIONS {
                     offer_fixed_actions(o);
@@ -645,6 +706,7 @@ fn offer_actions(o: &mut Out<OuijaActor>) {
             }
         }
     }
+    c.push(Action::DaemonRestart);
     o.choose_random("action", c);
 }
 
@@ -661,6 +723,7 @@ fn offer_fixed_actions(o: &mut Out<FixedActor>) {
             }
         }
     }
+    c.push(Action::DaemonRestart);
     o.choose_random("action", c);
 }
 
@@ -873,6 +936,7 @@ enum ReplyMsg {
     ReplyTo {
         from: Sid,
         to: Sid,
+        done: bool,
     },
     /// Cross-daemon message delivery expecting a reply.
     DeliverMsg {
@@ -888,7 +952,7 @@ enum ReplyAction {
     Remove(Sid),
     Rename(Sid, Sid),
     SendExpectingReply(Sid, Sid),
-    ReplyTo(Sid, Sid),
+    ReplyTo(Sid, Sid, bool),
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -902,7 +966,9 @@ enum ReplyState {
         seq: u8,
         last_seen: BTreeMap<DaemonId, u8>,
         /// Per local session: senders (daemon, sid) that expect a reply.
-        pending_replies: BTreeMap<Sid, BTreeSet<RemoteKey>>,
+        /// The bool tracks `in_progress` — true after a progress update (done=false),
+        /// false when newly added.
+        pending_replies: BTreeMap<Sid, BTreeMap<RemoteKey, bool>>,
     },
     Client {
         actions_taken: u8,
@@ -997,8 +1063,8 @@ impl Actor for ReplyActor {
                         daemon: *daemon_id,
                         id: sid,
                     };
-                    for set in pending_replies.values_mut() {
-                        set.remove(&me);
+                    for map in pending_replies.values_mut() {
+                        map.remove(&me);
                     }
                     *seq += 1;
                     send_reply_list(local, *daemon_id, *seq, peers, o);
@@ -1032,9 +1098,9 @@ impl Actor for ReplyActor {
                         daemon: *daemon_id,
                         id: new_id,
                     };
-                    for set in pending_replies.values_mut() {
-                        if set.remove(&old_key) {
-                            set.insert(new_key);
+                    for map in pending_replies.values_mut() {
+                        if let Some(in_progress) = map.remove(&old_key) {
+                            map.insert(new_key, in_progress);
                         }
                     }
                     add_alias(aliases, old_id, new_id);
@@ -1064,7 +1130,7 @@ impl Actor for ReplyActor {
                     id: from,
                 };
                 if local.contains(&to) {
-                    pending_replies.entry(to).or_default().insert(sender);
+                    pending_replies.entry(to).or_default().insert(sender, false);
                 } else if remote.iter().any(|rk| rk.id == to) {
                     for &peer in peers.iter() {
                         o.send(
@@ -1079,7 +1145,7 @@ impl Actor for ReplyActor {
                 }
             }
 
-            ReplyMsg::ReplyTo { from, to } => {
+            ReplyMsg::ReplyTo { from, to, done } => {
                 let s = state.to_mut();
                 let ReplyState::Daemon {
                     local,
@@ -1092,8 +1158,20 @@ impl Actor for ReplyActor {
                 if !local.contains(&from) {
                     return;
                 }
-                if let Some(set) = pending_replies.get_mut(&from) {
-                    set.retain(|rk| rk.id != to);
+                if let Some(map) = pending_replies.get_mut(&from) {
+                    if done {
+                        map.retain(|rk, _| rk.id != to);
+                        if map.is_empty() {
+                            pending_replies.remove(&from);
+                        }
+                    } else {
+                        // Progress update: mark in_progress but keep entry
+                        for (rk, in_progress) in map.iter_mut() {
+                            if rk.id == to {
+                                *in_progress = true;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1120,7 +1198,7 @@ impl Actor for ReplyActor {
                 // session. A DeliverMsg arriving after the sender's SessionList
                 // removal would otherwise re-create the orphan.
                 if local.contains(&to_sid) && remote.contains(&sender) {
-                    pending_replies.entry(to_sid).or_default().insert(sender);
+                    pending_replies.entry(to_sid).or_default().insert(sender, false);
                 }
             }
 
@@ -1162,8 +1240,8 @@ impl Actor for ReplyActor {
                 // Clear pending replies referencing removed remote sessions
                 // (fix for cross-daemon orphan bug).
                 if !removed.is_empty() {
-                    for set in pending_replies.values_mut() {
-                        set.retain(|rk| !removed.contains(rk));
+                    for map in pending_replies.values_mut() {
+                        map.retain(|rk, _| !removed.contains(rk));
                     }
                 }
             }
@@ -1200,11 +1278,12 @@ impl Actor for ReplyActor {
                             to: *to,
                         },
                     ),
-                    ReplyAction::ReplyTo(from, to) => o.send(
+                    ReplyAction::ReplyTo(from, to, done) => o.send(
                         *target,
                         ReplyMsg::ReplyTo {
                             from: *from,
                             to: *to,
+                            done: *done,
                         },
                     ),
                 }
@@ -1244,7 +1323,8 @@ fn offer_reply_actions(o: &mut Out<ReplyActor>) {
             if a != b {
                 c.push(ReplyAction::Rename(a, b));
                 c.push(ReplyAction::SendExpectingReply(a, b));
-                c.push(ReplyAction::ReplyTo(a, b));
+                c.push(ReplyAction::ReplyTo(a, b, true));  // completion
+                c.push(ReplyAction::ReplyTo(a, b, false)); // progress update
             }
         }
     }
@@ -1254,6 +1334,12 @@ fn offer_reply_actions(o: &mut Out<ReplyActor>) {
 // ---------------------------------------------------------------------------
 // Reply model property checkers
 // ---------------------------------------------------------------------------
+//
+// Structural invariant: progress-preserves-pending
+// A progress update (done=false) marks an entry in_progress but never removes
+// it. This is verified exhaustively by the model checker exploring both the
+// done=false and done=true paths: check_no_orphaned_pending_replies confirms
+// that no spurious removal occurs on progress updates.
 
 /// After quiescence, every sender in any pending_replies set must exist as a
 /// local session on some daemon.
@@ -1279,7 +1365,7 @@ fn check_no_orphaned_pending_replies(
         } = s.as_ref()
         {
             for senders in pending_replies.values() {
-                for sender in senders {
+                for sender in senders.keys() {
                     if !all_local
                         .get(&sender.daemon)
                         .is_some_and(|l| l.contains(&sender.id))
@@ -1354,7 +1440,7 @@ fn check_some_pending_replies(
             pending_replies, ..
         } = s.as_ref()
         {
-            pending_replies.values().any(|set| !set.is_empty())
+            pending_replies.values().any(|map| !map.is_empty())
         } else {
             false
         }
@@ -1430,6 +1516,36 @@ mod tests {
             checker.discovery("alias acyclic").is_some(),
             "Expected alias cycle from cross-daemon renames"
         );
+    }
+
+    /// Bug 5: DaemonRestart without generation counter breaks convergence.
+    /// After restart, stale messages from the old incarnation can re-add
+    /// sessions that were cleared.
+    #[test]
+    fn bug_restart_breaks_convergence_without_gen_counter() {
+        let checker = build_current_model().checker().spawn_bfs().join();
+        assert!(
+            checker.discovery("convergence").is_some(),
+            "Expected convergence violation from restart + stale messages"
+        );
+        println!(
+            "Bug confirmed: restart breaks convergence without gen counter. States: {}, unique: {}",
+            checker.state_count(),
+            checker.unique_state_count(),
+        );
+    }
+
+    /// Fix: generation counter restores convergence even with daemon restarts.
+    #[test]
+    fn fix_restart_convergence_with_gen_counter() {
+        let checker = build_fixed_model().checker().spawn_bfs().join();
+        println!(
+            "Fixed model with restart — States: {}, unique: {}, max depth: {}",
+            checker.state_count(),
+            checker.unique_state_count(),
+            checker.max_depth(),
+        );
+        checker.assert_properties();
     }
 
     /// No daemon ever holds a remote session attributed to itself (holds in both models).

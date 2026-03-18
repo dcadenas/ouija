@@ -43,7 +43,7 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 
 **Human DMs.** Configure your Nostr npub to control the daemon from any Nostr client. Send `/list`, `/start`, `@session message`, or bare text (routed by an LLM).
 
-**Admin dashboard** at `localhost:7880/admin`. Manage sessions, tasks, node connections, human access, and settings.
+**Dashboard** at `localhost:7880`. Manage sessions, tasks, node connections, human access, and settings.
 
 ## Connecting machines
 

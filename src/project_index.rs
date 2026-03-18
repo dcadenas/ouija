@@ -11,6 +11,7 @@ const MAX_FILE_PREVIEW_BYTES: usize = 500;
 /// Maximum length of a project description line before truncation.
 const MAX_DESC_LENGTH: usize = 120;
 
+/// Metadata about a discovered project directory.
 #[derive(Clone, Debug, Serialize)]
 pub struct ProjectInfo {
     pub name: String,

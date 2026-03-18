@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 
+/// Daemon startup configuration (name, port, paths, identity).
 #[derive(Clone, Debug)]
 pub struct OuijaConfig {
     pub name: String,
@@ -13,14 +14,17 @@ pub struct OuijaConfig {
 }
 
 impl OuijaConfig {
+    /// Return the platform-default config directory.
     pub fn default_config_dir() -> PathBuf {
         dirs_config_dir().unwrap_or_else(|_| PathBuf::from("."))
     }
 
+    /// Return the platform-default data directory.
     pub fn default_data_dir() -> PathBuf {
         dirs_data_dir().unwrap_or_else(|_| PathBuf::from("."))
     }
 
+    /// Build a config from CLI args, creating directories as needed.
     pub fn new(
         name: String,
         port: u16,

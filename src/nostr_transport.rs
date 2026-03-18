@@ -18,6 +18,8 @@ const SEEN_EVENTS_CACHE_LIMIT: usize = 2048;
 const PROCESS_EXIT_TIMEOUT_SECS: u64 = 10;
 /// Delay before injecting a prompt into a freshly started pane.
 const PROMPT_INJECT_DELAY_SECS: u64 = 5;
+/// Length threshold for truncating npub display strings.
+const NPUB_TRUNCATE_LEN: usize = 20;
 
 /// Nostr-based transport using NIP-17 private direct messages.
 ///
@@ -31,6 +33,15 @@ pub struct NostrTransport {
     connect_secret: RwLock<String>,
     data_dir: PathBuf,
     ready: AtomicBool,
+}
+
+impl std::fmt::Debug for NostrTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NostrTransport")
+            .field("data_dir", &self.data_dir)
+            .field("ready", &self.ready.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 impl NostrTransport {
@@ -156,7 +167,7 @@ impl NostrTransport {
                             && event.kind == Kind::GiftWrap
                         {
                             {
-                                let mut seen = seen_events.lock().unwrap();
+                                let mut seen = seen_events.lock().expect("seen_events mutex poisoned");
                                 if !seen.insert(event.id) {
                                     tracing::debug!(
                                         "skipping duplicate gift-wrap event {}",
@@ -216,6 +227,34 @@ impl NostrTransport {
                                                                 .merge_relays(&relays)
                                                                 .await;
                                                         }
+
+                                                        // Persist connection so we can reconnect after restart
+                                                        {
+                                                            let peer_relay_urls: Vec<RelayUrl> = relays
+                                                                .iter()
+                                                                .filter_map(|u| RelayUrl::parse(u).ok())
+                                                                .collect();
+                                                            let relay_urls = if peer_relay_urls.is_empty() {
+                                                                let urls = transport.relay_urls.read().await;
+                                                                urls.iter()
+                                                                    .filter_map(|u| RelayUrl::parse(u).ok())
+                                                                    .collect()
+                                                            } else {
+                                                                peer_relay_urls
+                                                            };
+                                                            let profile = Nip19Profile::new(sender, relay_urls);
+                                                            if let Ok(nprofile) = profile.to_bech32() {
+                                                                if let Err(e) = crate::persistence::add_connection(
+                                                                    &state.config.data_dir,
+                                                                    &nprofile,
+                                                                    None,
+                                                                    Some(&npub),
+                                                                ) {
+                                                                    tracing::warn!("failed to persist inbound connection: {e}");
+                                                                }
+                                                            }
+                                                        }
+
                                                         crate::transport::broadcast_local_sessions(
                                                             &state,
                                                         )
@@ -519,21 +558,10 @@ async fn handle_human_message(
                 tracing::warn!("failed to send status to {human_name}: {e}");
             }
         }
-        HumanCommand::Admin(cmd) => {
-            let is_admin = state
-                .settings
-                .read()
-                .await
-                .human_sessions
-                .iter()
-                .any(|h| h.name == human_name && h.admin);
-            if !is_admin {
-                let _ = send_plain_dm(state, npub, "admin access required").await;
-                return;
-            }
-            let reply = handle_admin_command(state, &cmd).await;
+        HumanCommand::Command(cmd) => {
+            let reply = handle_human_command(state, &cmd).await;
             if let Err(e) = send_plain_dm(state, npub, &reply).await {
-                tracing::warn!("failed to send admin reply to {human_name}: {e}");
+                tracing::warn!("failed to send command reply to {human_name}: {e}");
             }
         }
         HumanCommand::SendTo(target, message) => {
@@ -569,24 +597,17 @@ async fn handle_human_message(
                     .await;
 
                 let (sessions, messages) = crate::router::gather_context(state, human_name).await;
-                let is_admin = state
-                    .settings
-                    .read()
-                    .await
-                    .human_sessions
-                    .iter()
-                    .any(|h| h.name == human_name && h.admin);
                 match crate::router::classify(
-                    config, &message, &sessions, &messages, human_name, is_admin,
+                    config, &message, &sessions, &messages, human_name,
                 )
                 .await
                 {
                     Ok(Some(crate::router::RouterDecision::Route { targets })) => {
                         let valid_targets: Vec<String> = {
-                            let known = state.sessions.read().await;
+                            let proto = state.protocol.read().await;
                             targets
                                 .into_iter()
-                                .filter(|t| known.contains_key(t))
+                                .filter(|t| proto.sessions.contains_key(t))
                                 .collect()
                         };
                         if !valid_targets.is_empty() {
@@ -716,7 +737,7 @@ enum HumanCommand {
     List,
     SetDefault(String),
     Status,
-    Admin(String),
+    Command(String),
     SendTo(String, String),
     SendDefault(String),
 }
@@ -737,7 +758,7 @@ fn parse_human_command(text: &str) -> HumanCommand {
             return HumanCommand::SetDefault(id.to_string());
         }
     }
-    // Admin commands
+    // Session/node management commands
     if text.starts_with("/connect ")
         || text.starts_with("/disconnect ")
         || text.starts_with("/nodes")
@@ -746,7 +767,7 @@ fn parse_human_command(text: &str) -> HumanCommand {
         || text.starts_with("/start ")
         || text.starts_with("/restart ")
     {
-        return HumanCommand::Admin(text.to_string());
+        return HumanCommand::Command(text.to_string());
     }
     // @target message — tolerates optional space after @, trailing punctuation on target
     if let Some(rest) = text.strip_prefix('@') {
@@ -798,33 +819,23 @@ async fn format_help_message(state: &AppState, human_name: &str) -> String {
         lines.push("  <message>          — send to default session (none set)".to_string());
     }
     lines.push("  @<id> <message>    — send to specific session".to_string());
-
-    let is_admin = state
-        .settings
-        .read()
-        .await
-        .human_sessions
-        .iter()
-        .any(|h| h.name == human_name && h.admin);
-    if is_admin {
-        lines.push(String::new());
-        lines.push("Admin:".to_string());
-        lines.push("  /kill <session>    — kill a session".to_string());
-        lines.push("  /start <name>      — start new session".to_string());
-        lines.push(
-            "  /restart <name> [--fresh]  — restart a session (--fresh: no prior context)"
-                .to_string(),
-        );
-        lines.push("  /connect <ticket>  — connect to peer".to_string());
-        lines.push("  /nodes             — list connected nodes".to_string());
-        lines.push("  /task list|trigger — manage tasks".to_string());
-    }
+    lines.push(String::new());
+    lines.push("Management:".to_string());
+    lines.push("  /kill <session>    — kill a session".to_string());
+    lines.push("  /start <name>      — start new session".to_string());
+    lines.push(
+        "  /restart <name> [--fresh]  — restart a session (--fresh: no prior context)"
+            .to_string(),
+    );
+    lines.push("  /connect <ticket>  — connect to peer".to_string());
+    lines.push("  /nodes             — list connected nodes".to_string());
+    lines.push("  /task list|trigger — manage tasks".to_string());
 
     lines.join("\n")
 }
 
 async fn format_session_list(state: &AppState, human_name: &str) -> String {
-    let sessions = state.sessions.read().await;
+    let proto = state.protocol.read().await;
     let default = state
         .settings
         .read()
@@ -835,7 +846,7 @@ async fn format_session_list(state: &AppState, human_name: &str) -> String {
         .and_then(|h| h.default_session.clone());
 
     let mut lines = Vec::new();
-    for s in sessions.values() {
+    for s in proto.sessions.values() {
         // Don't show the asking human their own session
         if s.id == human_name {
             continue;
@@ -865,7 +876,12 @@ async fn format_session_list(state: &AppState, human_name: &str) -> String {
 
 async fn set_default_session(state: &AppState, human_name: &str, session_id: &str) -> String {
     // Verify session exists
-    let exists = state.sessions.read().await.contains_key(session_id);
+    let exists = state
+        .protocol
+        .read()
+        .await
+        .sessions
+        .contains_key(session_id);
     if !exists {
         return format!("session '{session_id}' not found");
     }
@@ -890,21 +906,24 @@ async fn set_default_session(state: &AppState, human_name: &str, session_id: &st
 }
 
 async fn format_status(state: &AppState) -> String {
-    let sessions = state.sessions.read().await;
+    let proto = state.protocol.read().await;
     let nodes = state.nodes.read().await;
     let transports = state.transports().await;
 
-    let local = sessions
+    let local = proto
+        .sessions
         .values()
-        .filter(|s| matches!(s.origin, crate::state::SessionOrigin::Local))
+        .filter(|s| matches!(s.origin, crate::daemon_protocol::Origin::Local))
         .count();
-    let remote = sessions
+    let remote = proto
+        .sessions
         .values()
-        .filter(|s| matches!(s.origin, crate::state::SessionOrigin::Remote(_)))
+        .filter(|s| matches!(s.origin, crate::daemon_protocol::Origin::Remote(_)))
         .count();
-    let human = sessions
+    let human = proto
+        .sessions
         .values()
-        .filter(|s| matches!(s.origin, crate::state::SessionOrigin::Human(_)))
+        .filter(|s| matches!(s.origin, crate::daemon_protocol::Origin::Human(_)))
         .count();
 
     let p2p = if transports.values().any(|t| t.is_ready()) {
@@ -922,26 +941,24 @@ async fn format_status(state: &AppState) -> String {
 
 async fn route_human_message(state: &AppState, from: &str, to: &str, message: &str) {
     // Use the same send path as the API
-    let sessions = state.sessions.read().await;
-    let target = sessions.get(to).cloned();
-    drop(sessions);
+    let target = state.protocol.read().await.sessions.get(to).cloned();
 
     match target {
         Some(session) => match &session.origin {
-            crate::state::SessionOrigin::Local => {
+            crate::daemon_protocol::Origin::Local => {
                 if let Some(pane) = &session.pane {
                     // Human messages always expect a reply
-                    let formatted = crate::tmux::format_session_message(from, message, true);
+                    let msg_id = {
+                        let mut proto = state.protocol.write().await;
+                        proto.next_seq()
+                    };
+                    let formatted = crate::daemon_protocol::format_session_message(
+                        from, message, true, msg_id, None, false,
+                    );
                     let vim_mode = session.metadata.vim_mode;
                     let delivered = crate::tmux::locked_inject(state, pane, &formatted, vim_mode)
                         .await
                         .is_ok();
-                    if delivered {
-                        let mut sessions = state.sessions.write().await;
-                        if let Some(s) = sessions.get_mut(to) {
-                            s.block_interactive = true;
-                        }
-                    }
                     state
                         .log_message(
                             from.to_string(),
@@ -953,13 +970,20 @@ async fn route_human_message(state: &AppState, from: &str, to: &str, message: &s
                         .await;
                 }
             }
-            crate::state::SessionOrigin::Remote(_) => {
-                let wire_to = crate::state::strip_remote_prefix(to).to_string();
+            crate::daemon_protocol::Origin::Remote(_) => {
+                let wire_to = crate::daemon_protocol::strip_remote_prefix(to).to_string();
+                let msg_id = {
+                    let mut proto = state.protocol.write().await;
+                    proto.next_seq()
+                };
                 let wire_msg = crate::protocol::WireMessage::SessionSend {
                     from: from.to_string(),
                     to: wire_to,
                     message: message.to_string(),
                     expects_reply: true,
+                    msg_id,
+                    responds_to: None,
+                    done: false,
                 };
                 let sent = crate::transport::broadcast(state, &wire_msg).await;
                 state
@@ -972,7 +996,7 @@ async fn route_human_message(state: &AppState, from: &str, to: &str, message: &s
                     )
                     .await;
             }
-            crate::state::SessionOrigin::Human(npub) => {
+            crate::daemon_protocol::Origin::Human(npub) => {
                 // Human-to-human relay
                 let formatted = format!("[from {from}]: {message}");
                 let delivered = send_plain_dm(state, npub, &formatted).await.is_ok();
@@ -993,7 +1017,8 @@ async fn route_human_message(state: &AppState, from: &str, to: &str, message: &s
     }
 }
 
-pub async fn handle_admin_command(state: &std::sync::Arc<AppState>, cmd: &str) -> String {
+/// Dispatch a human DM command (e.g. /connect, /kill, /start).
+pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -> String {
     if let Some(ticket) = cmd.strip_prefix("/connect ") {
         let ticket = ticket.trim();
         let transport = match state.transport_by_name("nostr").await {
@@ -1023,7 +1048,7 @@ pub async fn handle_admin_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         }
     } else if cmd.starts_with("/nodes") {
         let npub_short = |s: &str| -> String {
-            if s.len() > 20 {
+            if s.len() > NPUB_TRUNCATE_LEN {
                 format!("{}…{}", &s[..10], &s[s.len() - 6..])
             } else {
                 s.to_string()
@@ -1045,7 +1070,10 @@ pub async fn handle_admin_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         }
         lines.join("\n")
     } else if cmd.starts_with("/task ") {
-        let rest = cmd.strip_prefix("/task ").unwrap().trim();
+        let rest = cmd
+            .strip_prefix("/task ")
+            .expect("prefix checked by starts_with")
+            .trim();
         if rest == "list" {
             let tasks = state.scheduled_tasks.read().await;
             if tasks.is_empty() {
@@ -1079,10 +1107,10 @@ pub async fn handle_admin_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         }
     } else if let Some(name) = cmd.strip_prefix("/kill ") {
         let name = name.trim();
-        admin_kill_session(state, name).await
+        kill_session(state, name).await
     } else if let Some(rest) = cmd.strip_prefix("/start ") {
         let name = rest.trim();
-        admin_start_session(state, name, None, None, None, None, None).await
+        start_session(state, name, None, None, None, None, None).await.0
     } else if let Some(rest) = cmd.strip_prefix("/restart ") {
         let rest = rest.trim();
         let (name, fresh) = if let Some(name) = rest.strip_suffix(" --fresh") {
@@ -1092,18 +1120,19 @@ pub async fn handle_admin_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         } else {
             (rest, false)
         };
-        admin_restart_session(state, name, fresh, None, None, None).await
+        restart_session(state, name, fresh, None, None, None).await.0
     } else {
-        "unknown admin command".to_string()
+        "unknown command".to_string()
     }
 }
 
-pub async fn admin_kill_session(state: &std::sync::Arc<AppState>, name: &str) -> String {
-    let session = state.sessions.read().await.get(name).cloned();
+/// Kill the Claude process in a named session's pane.
+pub async fn kill_session(state: &std::sync::Arc<AppState>, name: &str) -> String {
+    let session = state.protocol.read().await.sessions.get(name).cloned();
     let Some(session) = session else {
         return format!("session '{name}' not found");
     };
-    if !matches!(session.origin, crate::state::SessionOrigin::Local) {
+    if !matches!(session.origin, crate::daemon_protocol::Origin::Local) {
         return format!("'{name}' is not a local session");
     }
     let Some(pane) = &session.pane else {
@@ -1173,7 +1202,7 @@ pub async fn admin_kill_session(state: &std::sync::Arc<AppState>, name: &str) ->
                     std::thread::sleep(std::time::Duration::from_secs(1));
                     // Check if process still exists
                     let status = Command::new("kill").args(["-0", &pid.to_string()]).status();
-                    if status.is_err() || !status.unwrap().success() {
+                    if !status.is_ok_and(|s| s.success()) {
                         exited = true;
                         break;
                     }
@@ -1220,11 +1249,16 @@ pub async fn admin_kill_session(state: &std::sync::Arc<AppState>, name: &str) ->
     })
     .await;
 
-    state.remove_session(name).await;
+    state
+        .apply_and_execute(crate::daemon_protocol::Event::Remove {
+            id: name.to_string(),
+        })
+        .await;
     format!("{msg}, session '{name}' removed")
 }
 
-pub async fn admin_start_session(
+/// Start a new session in a tmux pane, optionally in a worktree.
+pub async fn start_session(
     state: &std::sync::Arc<AppState>,
     name: &str,
     worktree: Option<bool>,
@@ -1232,10 +1266,10 @@ pub async fn admin_start_session(
     prompt: Option<&str>,
     from: Option<&str>,
     expects_reply: Option<bool>,
-) -> String {
+) -> (String, Option<u64>) {
     // Check if already exists
-    if state.sessions.read().await.contains_key(name) {
-        return format!("session '{name}' already exists");
+    if state.protocol.read().await.sessions.contains_key(name) {
+        return (format!("session '{name}' already exists"), None);
     }
 
     let dir = if let Some(pd) = project_dir {
@@ -1253,9 +1287,9 @@ pub async fn admin_start_session(
     let (worktree, auto_worktree) = match worktree {
         Some(wt) => (wt, false),
         None => {
-            let sessions = state.sessions.read().await;
-            let conflict = sessions.values().any(|s| {
-                matches!(s.origin, crate::state::SessionOrigin::Local)
+            let proto = state.protocol.read().await;
+            let conflict = proto.sessions.values().any(|s| {
+                matches!(s.origin, crate::daemon_protocol::Origin::Local)
                     && s.metadata.project_dir.as_deref() == Some(dir.as_str())
             });
             (conflict, conflict)
@@ -1264,7 +1298,7 @@ pub async fn admin_start_session(
 
     // Create directory if it doesn't exist
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        return format!("failed to create {dir}: {e}");
+        return (format!("failed to create {dir}: {e}"), None);
     }
 
     let tmux_session = crate::tmux::tmux_session_name(&dir);
@@ -1364,18 +1398,28 @@ pub async fn admin_start_session(
     match start_result {
         Ok(Ok(pane_id)) => {
             // Register immediately so the session is visible right away
-            let metadata = crate::state::SessionMetadata {
+            let proto_meta = crate::daemon_protocol::SessionMeta {
                 project_dir: Some(dir.clone()),
                 worktree,
                 ..Default::default()
             };
             state
-                .register_session(name.to_string(), Some(pane_id.clone()), metadata)
+                .apply_and_execute(crate::daemon_protocol::Event::Register {
+                    id: name.to_string(),
+                    pane: Some(pane_id.clone()),
+                    metadata: proto_meta,
+                })
                 .await;
+            let mut prompt_msg_id = None;
             if let Some(text) = prompt {
                 let injected = if let Some(sender) = from {
                     let er = expects_reply.unwrap_or(true);
-                    crate::tmux::format_session_message(sender, text, er)
+                    let msg_id = {
+                        let mut proto = state.protocol.write().await;
+                        proto.next_seq()
+                    };
+                    prompt_msg_id = Some(msg_id);
+                    crate::daemon_protocol::format_session_message(sender, text, er, msg_id, None, false)
                 } else {
                     text.to_string()
                 };
@@ -1383,8 +1427,9 @@ pub async fn admin_start_session(
             }
             if auto_worktree {
                 let conflict_name = {
-                    let sessions = state.sessions.read().await;
-                    sessions
+                    let proto = state.protocol.read().await;
+                    proto
+                        .sessions
                         .values()
                         .find(|s| {
                             s.id != name && s.metadata.project_dir.as_deref() == Some(dir.as_str())
@@ -1392,36 +1437,42 @@ pub async fn admin_start_session(
                         .map(|s| s.id.clone())
                         .unwrap_or_default()
                 };
-                format!(
+                (format!(
                     "started '{name}' in {dir} (pane {pane_id}, worktree: auto-enabled — session '{conflict_name}' shares this directory)"
-                )
+                ), prompt_msg_id)
             } else {
-                format!("started '{name}' in {dir} (pane {pane_id})")
+                (format!("started '{name}' in {dir} (pane {pane_id})"), prompt_msg_id)
             }
         }
-        Ok(Err(e)) => format!("start failed: {e}"),
-        Err(e) => format!("start failed: {e}"),
+        Ok(Err(e)) => (format!("start failed: {e}"), None),
+        Err(e) => (format!("start failed: {e}"), None),
     }
 }
 
-pub async fn admin_restart_session(
+/// Kill and restart a session, preserving metadata unless `fresh`.
+pub async fn restart_session(
     state: &std::sync::Arc<AppState>,
     name: &str,
     fresh: bool,
     prompt: Option<&str>,
     from: Option<&str>,
     expects_reply: Option<bool>,
-) -> String {
+) -> (String, Option<u64>) {
     // Snapshot full metadata before killing so we can carry it forward
-    let session = state.sessions.read().await.get(name).cloned();
+    let session = state.protocol.read().await.sessions.get(name).cloned();
     let prev_metadata = session.as_ref().map(|s| s.metadata.clone());
 
     // Capture existing pane before killing
     let existing_pane = session.as_ref().and_then(|s| s.pane.clone());
 
-    // Remove the ouija session record (agent cleanup etc) but don't touch tmux
+    // Remove old session record (agent cleanup, tmux var, worktree).
+    // The subsequent Register re-creates it with the new pane.
     if session.is_some() {
-        state.remove_session(name).await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Remove {
+                id: name.to_string(),
+            })
+            .await;
     }
 
     let projects_dir = state.settings.read().await.projects_dir.clone();
@@ -1437,7 +1488,7 @@ pub async fn admin_restart_session(
         .unwrap_or_else(|| format!("{base}/{name}"));
 
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        return format!("failed to create {dir}: {e}");
+        return (format!("failed to create {dir}: {e}"), None);
     }
 
     let resume_id = if fresh {
@@ -1571,36 +1622,53 @@ pub async fn admin_restart_session(
 
     match start_result {
         Ok(Ok(pane_id)) => {
-            let metadata = match prev_metadata {
-                Some(mut m) => {
-                    m.project_dir = Some(dir.clone());
-                    m.last_metadata_update = None;
-                    if fresh {
-                        m.claude_session_id = None;
-                    }
-                    m
-                }
-                None => crate::state::SessionMetadata {
+            let proto_meta = match prev_metadata {
+                Some(ref m) => crate::daemon_protocol::SessionMeta {
+                    project_dir: Some(dir.clone()),
+                    role: m.role.clone(),
+                    bulletin: m.bulletin.clone(),
+                    networked: m.networked,
+                    worktree: m.worktree,
+                    vim_mode: m.vim_mode,
+                    claude_session_id: if fresh {
+                        None
+                    } else {
+                        m.claude_session_id.clone()
+                    },
+                    project_description: m.project_description.clone(),
+                    last_metadata_update: None,
+                },
+                None => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),
                     ..Default::default()
                 },
             };
             state
-                .register_session(name.to_string(), Some(pane_id.clone()), metadata)
+                .apply_and_execute(crate::daemon_protocol::Event::Register {
+                    id: name.to_string(),
+                    pane: Some(pane_id.clone()),
+                    metadata: proto_meta,
+                })
                 .await;
+            let mut prompt_msg_id = None;
             if let Some(text) = prompt {
                 let injected = if let Some(sender) = from {
                     let er = expects_reply.unwrap_or(true);
-                    crate::tmux::format_session_message(sender, text, er)
+                    let msg_id = {
+                        let mut proto = state.protocol.write().await;
+                        proto.next_seq()
+                    };
+                    prompt_msg_id = Some(msg_id);
+                    crate::daemon_protocol::format_session_message(sender, text, er, msg_id, None, false)
                 } else {
                     text.to_string()
                 };
                 schedule_prompt_injection(state, pane_id.clone(), injected);
             }
-            format!("restarted '{name}' in {dir} (pane {pane_id})")
+            (format!("restarted '{name}' in {dir} (pane {pane_id})"), prompt_msg_id)
         }
-        Ok(Err(e)) => format!("restart failed: {e}"),
-        Err(e) => format!("restart failed: {e}"),
+        Ok(Err(e)) => (format!("restart failed: {e}"), None),
+        Err(e) => (format!("restart failed: {e}"), None),
     }
 }
 
@@ -1779,7 +1847,8 @@ fn generate_secret() -> String {
     let bytes: [u8; 16] = ::rand::random();
     let mut s = String::with_capacity(32);
     for b in bytes {
-        write!(s, "{b:02x}").unwrap();
+        // Writing hex to a String is infallible.
+        write!(s, "{b:02x}").expect("String write failed");
     }
     s
 }
@@ -1814,7 +1883,7 @@ pub fn save_relays(data_dir: &Path, relays: &[String]) -> anyhow::Result<()> {
 // --- Peer pubkey persistence ---
 
 /// Load authorized peer pubkeys from disk.
-fn load_peer_pubkeys(data_dir: &Path) -> HashSet<PublicKey> {
+pub(crate) fn load_peer_pubkeys(data_dir: &Path) -> HashSet<PublicKey> {
     let path = data_dir.join("peer_pubkeys.json");
     if !path.exists() {
         return HashSet::new();
@@ -1954,26 +2023,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_admin_connect() {
+    fn parse_command_connect() {
         match parse_human_command("/connect nprofile1abc") {
-            HumanCommand::Admin(cmd) => assert_eq!(cmd, "/connect nprofile1abc"),
-            other => panic!("expected Admin, got {other:?}"),
+            HumanCommand::Command(cmd) => assert_eq!(cmd, "/connect nprofile1abc"),
+            other => panic!("expected Command, got {other:?}"),
         }
     }
 
     #[test]
-    fn parse_admin_nodes() {
+    fn parse_command_nodes() {
         assert!(matches!(
             parse_human_command("/nodes"),
-            HumanCommand::Admin(_)
+            HumanCommand::Command(_)
         ));
     }
 
     #[test]
-    fn parse_admin_task() {
+    fn parse_command_task() {
         assert!(matches!(
             parse_human_command("/task list"),
-            HumanCommand::Admin(_)
+            HumanCommand::Command(_)
         ));
     }
 

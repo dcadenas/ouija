@@ -25,11 +25,13 @@ if [ -n "$PANE" ]; then
   fi
 fi
 
-# Peer count (all other sessions: local + remote, excluding self)
+# Peer counts (local + remote, excluding self)
 if [ -n "$MY_ID" ]; then
-  PEERS=$(echo "$STATUS" | jq --arg me "$MY_ID" '[.sessions[] | select(.id != $me)] | length' 2>/dev/null)
+  LOCAL_PEERS=$(echo "$STATUS" | jq --arg me "$MY_ID" '[.sessions[] | select(.id != $me and .origin == "local")] | length' 2>/dev/null)
+  REMOTE_PEERS=$(echo "$STATUS" | jq '[.sessions[] | select(.origin != "local" and .origin != "human")] | length' 2>/dev/null)
 else
-  PEERS=$(echo "$STATUS" | jq '.sessions | length' 2>/dev/null)
+  LOCAL_PEERS=$(echo "$STATUS" | jq '[.sessions[] | select(.origin == "local")] | length' 2>/dev/null)
+  REMOTE_PEERS=$(echo "$STATUS" | jq '[.sessions[] | select(.origin != "local" and .origin != "human")] | length' 2>/dev/null)
 fi
 
 # Version
@@ -50,7 +52,11 @@ else
   PARTS+=("ouija id: \033[33munregistered\033[0m")
 fi
 
-PARTS+=("peers: ${PEERS:-0}")
+if [ "${REMOTE_PEERS:-0}" -gt 0 ]; then
+  PARTS+=("peers: ${LOCAL_PEERS:-0} local + ${REMOTE_PEERS} remote")
+else
+  PARTS+=("peers: ${LOCAL_PEERS:-0}")
+fi
 
 if [ -n "$DAEMON_V" ] && [ -n "$PLUGIN_V" ] && [ "$DAEMON_V" != "$PLUGIN_V" ]; then
   PARTS+=("\033[33m⚠ daemon=${DAEMON_V} plugin=${PLUGIN_V}\033[0m")

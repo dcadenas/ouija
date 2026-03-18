@@ -2,6 +2,7 @@ use axum::extract::State;
 use axum::response::Html;
 use chrono::{DateTime, Utc};
 
+use crate::daemon_protocol::{Origin, SessionEntry};
 use crate::state::SharedState;
 
 /// Format a timestamp as `HH:MM:SS` with the full date in a `title` tooltip.
@@ -13,8 +14,10 @@ fn time_with_date(dt: &DateTime<Utc>) -> String {
     )
 }
 
+/// Render the dashboard HTML page.
 pub async fn dashboard(State(state): State<SharedState>) -> Html<String> {
-    let sessions = state.sessions.read().await;
+    let proto = state.protocol.read().await;
+    let sessions = &proto.sessions;
     let nodes = state.nodes.read().await;
     let log = state.message_log.read().await;
     let transports = state.transports().await;
@@ -30,13 +33,13 @@ pub async fn dashboard(State(state): State<SharedState>) -> Html<String> {
 
     let mut local_sessions: Vec<_> = sessions
         .values()
-        .filter(|s| matches!(s.origin, crate::state::SessionOrigin::Local))
+        .filter(|s| matches!(s.origin, Origin::Local))
         .collect();
     local_sessions.sort_by_key(|s| &s.id);
 
     let mut remote_sessions: Vec<_> = sessions
         .values()
-        .filter(|s| matches!(s.origin, crate::state::SessionOrigin::Remote(_)))
+        .filter(|s| matches!(s.origin, Origin::Remote(_)))
         .collect();
     remote_sessions.sort_by_key(|s| &s.id);
 
@@ -69,7 +72,12 @@ pub async fn dashboard(State(state): State<SharedState>) -> Html<String> {
         } else {
             format!("<br><small class=\"dim\">{}</small>", details.join(" · "))
         };
-        let time = time_with_date(&s.registered_at);
+        let time = if s.registered_at > 0 {
+            let dt = DateTime::from_timestamp(s.registered_at, 0).unwrap_or_default();
+            time_with_date(&dt)
+        } else {
+            "N/A".to_string()
+        };
         let networked_checked = if s.metadata.networked { "checked" } else { "" };
         let actions = format!(
             r#"<button class="btn-sm" onclick="renameSession('{id}')">rename</button> <button class="btn-sm btn-danger" onclick="removeSession('{id}')">remove</button>"#,
@@ -88,10 +96,8 @@ pub async fn dashboard(State(state): State<SharedState>) -> Html<String> {
     }
 
     // Group remote sessions by node name, keeping full session data for tooltips
-    let mut remote_by_node: std::collections::BTreeMap<
-        String,
-        Vec<(&str, &crate::state::Session)>,
-    > = std::collections::BTreeMap::new();
+    let mut remote_by_node: std::collections::BTreeMap<String, Vec<(&str, &SessionEntry)>> =
+        std::collections::BTreeMap::new();
     for s in &remote_sessions {
         let (node_name, session_name) = s.id.split_once('/').unwrap_or(("unknown", s.id.as_str()));
         remote_by_node
@@ -144,17 +150,12 @@ pub async fn dashboard(State(state): State<SharedState>) -> Html<String> {
         }
     }
 
-    // --- Human Sessions ---
+    // --- Nostr DM Access ---
     let mut humans_html = String::new();
     for h in &settings.human_sessions {
-        let admin_badge = if h.admin {
-            r#"<span class="badge badge-local" style="font-size:10px;">admin</span>"#
-        } else {
-            ""
-        };
         let default_sess = h.default_session.as_deref().unwrap_or("--");
         humans_html.push_str(&format!(
-            r#"<tr><td class="id-cell">{name}</td><td class="dim" style="font-size:11px;">{npub}</td><td>{default_sess}</td><td>{admin_badge}</td><td><button class="btn-sm btn-danger" onclick="removeHuman('{name}')">remove</button></td></tr>"#,
+            r#"<tr><td class="id-cell">{name}</td><td class="dim" style="font-size:11px;">{npub}</td><td>{default_sess}</td><td><button class="btn-sm btn-danger" onclick="removeHuman('{name}')">remove</button></td></tr>"#,
             name = html_escape(&h.name),
             npub = html_escape(&truncate_npub(&h.npub)),
             default_sess = html_escape(default_sess),
@@ -162,7 +163,7 @@ pub async fn dashboard(State(state): State<SharedState>) -> Html<String> {
     }
     if settings.human_sessions.is_empty() {
         humans_html.push_str(
-            r#"<tr><td colspan="5" class="empty">No human sessions. Add one below or use <b>ouija config add-human</b></td></tr>"#,
+            r#"<tr><td colspan="4" class="empty">No Nostr DM users. Add one below or use <b>ouija config add-human</b></td></tr>"#,
         );
     }
 
@@ -873,21 +874,20 @@ tr:hover td {{
 <div class="section" data-section="human-sessions">
   <div class="section-head" onclick="toggleSection(this)">
     <span class="toggle {humans_toggle}">&#9654;</span>
-    <h2>Human Sessions</h2>
+    <h2>Nostr DM Access</h2>
     <span class="count {humans_count_class}">{human_count}</span>
     <span class="section-sub">Nostr users who can DM this daemon</span>
   </div>
   <div class="section-body {humans_collapsed}">
     <table>
-      <tr><th>Name</th><th>Npub</th><th>Default <span class="tip" data-tip="Session that receives bare messages (no @target prefix)">?</span></th><th>Admin</th><th></th></tr>
+      <tr><th>Name</th><th>Npub</th><th>Default <span class="tip" data-tip="Session that receives bare messages (no @target prefix)">?</span></th><th></th></tr>
       {humans_html}
     </table>
     <div style="margin-top:12px;">
-      <div class="label">Add human session</div>
+      <div class="label">Add Nostr DM user</div>
       <form onsubmit="addHuman(event)" style="display:flex; gap:8px; flex-wrap:wrap;">
         <input type="text" id="human-name" placeholder="name" style="width:120px; background:#0c0e14; color:#c4c9d4; border:1px solid #1e2230; border-radius:4px; padding:7px 10px; font-family:'JetBrains Mono',monospace; font-size:12px; outline:none;">
         <input type="text" id="human-npub" placeholder="npub1..." style="flex:1; min-width:200px; background:#0c0e14; color:#c4c9d4; border:1px solid #1e2230; border-radius:4px; padding:7px 10px; font-family:'JetBrains Mono',monospace; font-size:12px; outline:none;">
-        <label style="display:flex; align-items:center; gap:4px; font-size:12px; color:#6b7280;"><input type="checkbox" id="human-admin"> admin</label>
         <button type="submit" class="btn-sm" style="padding:7px 16px;">Add</button>
       </form>
     </div>
@@ -928,7 +928,7 @@ tr:hover td {{
   <h2>Pairing <span class="section-sub" style="display:inline; margin-left:12px;">Connect to another machine for cross-node messaging</span></h2>
   <div class="warn">&#9888; Tickets are secrets &mdash; share out-of-band only (copy/paste, not through Claude).</div>
   {ticket_section}
-  <div class="label">Connect to node <span class="tip" data-tip="Paste a ticket from another machine's 'ouija ticket' command or admin dashboard to establish a P2P link">?</span></div>
+  <div class="label">Connect to node <span class="tip" data-tip="Paste a ticket from another machine's 'ouija ticket' command or dashboard to establish a P2P link">?</span></div>
   <form onsubmit="connectNode(event)">
     <div class="connect-row">
       <input type="text" id="ticket-input" placeholder="Paste a ticket from another machine" autocomplete="off">
@@ -1290,14 +1290,13 @@ async function addHuman(e) {{
   e.preventDefault();
   const name = document.getElementById('human-name').value.trim();
   const npub = document.getElementById('human-npub').value.trim();
-  const admin = document.getElementById('human-admin').checked;
   if (!name || !npub) {{ alert('Name and npub are required'); return; }}
   if (!npub.startsWith('npub1')) {{ alert('Npub must start with npub1'); return; }}
   try {{
     const resp = await fetch('/api/humans', {{
       method: 'POST',
       headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{name, npub, admin}})
+      body: JSON.stringify({{name, npub}})
     }});
     if (resp.ok) location.reload();
     else {{
@@ -1308,7 +1307,7 @@ async function addHuman(e) {{
 }}
 
 async function removeHuman(name) {{
-  if (!confirm('Remove human session "' + name + '"?')) return;
+  if (!confirm('Remove Nostr DM user "' + name + '"?')) return;
   try {{
     const resp = await fetch('/api/humans', {{
       method: 'DELETE',
@@ -1465,7 +1464,7 @@ setInterval(async () => {{
 
             if let Some(ticket) = &nostr_ticket {
                 format!(
-                    r#"<div class="label">Your ticket <span class="tip" data-tip="Share this with another machine to let it connect. Run 'ouija connect &lt;ticket&gt;' on the other machine, or paste it into their admin dashboard.">?</span></div>
+                    r#"<div class="label">Your ticket <span class="tip" data-tip="Share this with another machine to let it connect. Run 'ouija connect &lt;ticket&gt;' on the other machine, or paste it into their dashboard.">?</span></div>
 <div class="ticket-value">{ticket}</div>
 <div class="ticket-actions">
   <button class="btn-sm" onclick="copyTicket(this)">copy</button>

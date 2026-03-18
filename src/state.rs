@@ -12,11 +12,7 @@ use crate::config::OuijaConfig;
 use crate::persistence::OuijaSettings;
 use crate::project_index::ProjectInfo;
 use crate::scheduler::{ScheduledTask, TaskRun};
-use crate::tmux_var;
 use crate::transport::Transport;
-
-/// Grace period before a local session's tmux pane is checked for liveness.
-const REAPER_GRACE_SECS: i64 = 15;
 
 /// Sanitize a name into a valid session ID (lowercase alphanumeric + dashes).
 pub fn sanitize_session_id(name: &str) -> String {
@@ -56,16 +52,6 @@ pub fn resolve_project_root(path: &str) -> &str {
     }
 }
 
-/// A pending reply that a session owes to a sender.
-#[derive(Clone, Debug)]
-pub struct PendingReply {
-    pub from: String,
-    pub message: String,
-    pub received_at: DateTime<Utc>,
-    /// Whether the session has already been reminded about this pending reply.
-    pub reminded: bool,
-}
-
 /// Named transport map keyed by transport name (e.g. "nostr").
 type TransportMap = HashMap<String, Arc<dyn Transport>>;
 
@@ -81,23 +67,14 @@ impl std::fmt::Display for DuplicateNode {
 
 impl std::error::Error for DuplicateNode {}
 
-/// Result of [`AppState::register_session`].
-#[derive(Debug)]
-pub enum RegisterResult {
-    Ok {
-        session: Box<Session>,
-        /// The old session ID if this registration replaced an existing one on the same pane.
-        replaced: Option<String>,
-    },
-    /// Another local session already owns this ID on a different pane.
-    Conflict { existing_pane: String },
-}
-
+/// Thread-safe shared reference to the daemon's application state.
 pub type SharedState = Arc<AppState>;
 
+/// Central daemon state holding sessions, nodes, and transports.
 pub struct AppState {
     pub config: OuijaConfig,
-    pub sessions: RwLock<HashMap<String, Session>>,
+    /// Pure protocol state machine — source of truth for all sessions.
+    pub protocol: RwLock<crate::daemon_protocol::DaemonState>,
     pub nodes: RwLock<HashMap<String, NodeInfo>>,
     pub message_log: RwLock<VecDeque<LogEntry>>,
     pub log_file: PathBuf,
@@ -116,9 +93,6 @@ pub struct AppState {
     /// Connected remote daemon npubs, prevents duplicate connections.
     /// Maps npub -> node name.
     connected_npubs: std::sync::Mutex<HashMap<String, String>>,
-    /// Tracks old session names after rename/re-register (old_id → new_id).
-    session_aliases: RwLock<HashMap<String, String>>,
-    /// Pane IDs suppressed from auto-register (cleared on daemon restart).
     /// Debounce: last time we reciprocated a session list to each node.
     last_reciprocated: std::sync::Mutex<HashMap<String, std::time::Instant>>,
     /// Active session agents, keyed by session ID.
@@ -129,19 +103,20 @@ pub struct AppState {
     pending_commands: std::sync::Mutex<Vec<(String, tokio::sync::oneshot::Sender<String>)>>,
     /// Cached tmux panes running Claude, refreshed by the reaper loop.
     cached_claude_panes: RwLock<Vec<crate::tmux::TmuxPane>>,
-    /// Monotonic counter incremented on every local session mutation.
-    /// Included in outgoing wire messages so receivers can drop stale ones.
-    wire_seq: std::sync::atomic::AtomicU64,
-    /// Per-peer last-seen sequence number for filtering stale incoming messages.
-    last_seen_seq: std::sync::Mutex<HashMap<String, u64>>,
     /// Per-fire worktree panes: pane_id → project_dir.
     /// Reaper runs `git worktree prune` when these panes die.
     pub perfire_worktree_panes: RwLock<HashMap<String, String>>,
 }
 
-/// Metadata becomes stale after 30 minutes without an update.
-const METADATA_STALE_SECS: i64 = 1800;
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
 
+/// Mutable metadata describing a session's configuration and context.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionMetadata {
     #[serde(default)]
@@ -175,17 +150,6 @@ fn default_true() -> bool {
     true
 }
 
-impl SessionMetadata {
-    /// Returns `true` if metadata has never been explicitly set or is older
-    /// than [`METADATA_STALE_SECS`].
-    pub fn is_stale(&self) -> bool {
-        match self.last_metadata_update {
-            None => true,
-            Some(ts) => Utc::now().signed_duration_since(ts).num_seconds() > METADATA_STALE_SECS,
-        }
-    }
-}
-
 impl Default for SessionMetadata {
     fn default() -> Self {
         Self {
@@ -202,6 +166,7 @@ impl Default for SessionMetadata {
     }
 }
 
+/// A registered Claude Code session bound to a tmux pane.
 #[derive(Clone, Debug, Serialize)]
 pub struct Session {
     pub id: String,
@@ -210,12 +175,9 @@ pub struct Session {
     pub registered_at: DateTime<Utc>,
     pub last_activity_at: DateTime<Utc>,
     pub metadata: SessionMetadata,
-    /// Block interactive prompts (AskUserQuestion, EnterPlanMode).
-    /// Set on tmux injection, cleared when the user types directly.
-    #[serde(skip)]
-    pub block_interactive: bool,
 }
 
+/// Where a session originated: local tmux, remote node, or human.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SessionOrigin {
     Local,
@@ -224,17 +186,7 @@ pub enum SessionOrigin {
     Human(String),
 }
 
-impl SessionOrigin {
-    /// Short label for JSON APIs: `"local"`, `"remote"`, `"human"`.
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Local => "local",
-            Self::Remote(_) => "remote",
-            Self::Human(_) => "human",
-        }
-    }
-}
-
+/// Metadata for a connected remote daemon node.
 #[derive(Clone, Debug, Serialize)]
 pub struct NodeInfo {
     pub name: String,
@@ -242,6 +194,7 @@ pub struct NodeInfo {
     pub connected_at: DateTime<Utc>,
 }
 
+/// A recorded inter-session message for the admin log.
 #[derive(Clone, Debug, Serialize)]
 pub struct LogEntry {
     pub timestamp: DateTime<Utc>,
@@ -251,19 +204,14 @@ pub struct LogEntry {
     pub delivered: bool,
 }
 
-pub fn remote_session_key(daemon_name: &str, raw_id: &str) -> String {
-    format!("{daemon_name}/{raw_id}")
-}
-
-pub fn strip_remote_prefix(prefixed_id: &str) -> &str {
-    prefixed_id
-        .split_once('/')
-        .map(|(_, raw)| raw)
-        .unwrap_or(prefixed_id)
-}
-
+/// Max message log entries retained in memory.
 const MAX_LOG: usize = 100;
+/// Max task run records retained in memory.
 const MAX_TASK_RUNS: usize = 200;
+/// Max suffix number when resolving auto-registration name conflicts.
+const MAX_NAME_SUFFIX: u32 = 100;
+/// Reciprocation debounce interval to prevent session list ping-pong.
+const RECIPROCATE_DEBOUNCE_SECS: u64 = 30;
 
 impl AppState {
     #[cfg(test)]
@@ -276,27 +224,27 @@ impl AppState {
                 data_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
                 config_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
             },
-            sessions: RwLock::new(HashMap::new()),
+            protocol: RwLock::new(crate::daemon_protocol::DaemonState::new(
+                "npub1test".into(),
+                "test".into(),
+            )),
             nodes: RwLock::new(HashMap::new()),
-            message_log: RwLock::new(VecDeque::with_capacity(100)),
+            message_log: RwLock::new(VecDeque::with_capacity(MAX_LOG)),
             log_file: std::path::PathBuf::from("/tmp/ouija-test-agent/messages.jsonl"),
             transports: RwLock::new(HashMap::new()),
             settings: RwLock::new(Default::default()),
             scheduled_tasks: RwLock::new(HashMap::new()),
-            task_runs: RwLock::new(VecDeque::with_capacity(100)),
+            task_runs: RwLock::new(VecDeque::with_capacity(MAX_TASK_RUNS)),
             pane_queues: std::sync::Mutex::new(HashMap::new()),
             log_file_lock: std::sync::Mutex::new(()),
             task_run_log_lock: std::sync::Mutex::new(()),
             connected_npubs: std::sync::Mutex::new(HashMap::new()),
-            session_aliases: RwLock::new(HashMap::new()),
             last_reciprocated: std::sync::Mutex::new(HashMap::new()),
             session_agents: RwLock::new(HashMap::new()),
             project_index: RwLock::new(HashMap::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
             cached_claude_panes: RwLock::new(Vec::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
-            wire_seq: std::sync::atomic::AtomicU64::new(0),
-            last_seen_seq: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -304,9 +252,11 @@ impl AppState {
         let log_file = config.data_dir.join("messages.jsonl");
         let settings = crate::persistence::load_settings(&config.config_dir).unwrap_or_default();
         let scheduled_tasks = crate::persistence::load_tasks(&config.data_dir).unwrap_or_default();
+        let protocol =
+            crate::daemon_protocol::DaemonState::new(config.npub.clone(), config.name.clone());
         Arc::new(Self {
             config,
-            sessions: RwLock::new(HashMap::new()),
+            protocol: RwLock::new(protocol),
             nodes: RwLock::new(HashMap::new()),
             message_log: RwLock::new(VecDeque::with_capacity(MAX_LOG)),
             log_file,
@@ -318,48 +268,322 @@ impl AppState {
             log_file_lock: std::sync::Mutex::new(()),
             task_run_log_lock: std::sync::Mutex::new(()),
             connected_npubs: std::sync::Mutex::new(HashMap::new()),
-            session_aliases: RwLock::new(HashMap::new()),
             last_reciprocated: std::sync::Mutex::new(HashMap::new()),
             session_agents: RwLock::new(HashMap::new()),
             project_index: RwLock::new(HashMap::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
             cached_claude_panes: RwLock::new(Vec::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
-            wire_seq: std::sync::atomic::AtomicU64::new(0),
-            last_seen_seq: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
-    /// Increment the monotonic wire-message sequence counter and return the new value.
-    pub fn next_seq(&self) -> u64 {
-        self.wire_seq
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1
+    /// Apply a protocol event and execute all resulting effects.
+    ///
+    /// The pure state transition happens under the protocol lock.
+    /// Effects are executed after the lock is released.
+    pub fn apply_and_execute(
+        self: &Arc<Self>,
+        event: crate::daemon_protocol::Event,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Vec<crate::daemon_protocol::Effect>> + Send + '_>,
+    > {
+        Box::pin(self._apply_and_execute(event))
     }
 
-    /// Return the current wire-message sequence counter without incrementing.
-    pub fn current_seq(&self) -> u64 {
-        self.wire_seq.load(std::sync::atomic::Ordering::Relaxed)
-    }
+    async fn _apply_and_execute(
+        self: &Arc<Self>,
+        event: crate::daemon_protocol::Event,
+    ) -> Vec<crate::daemon_protocol::Effect> {
+        use crate::daemon_protocol::{Effect, LogLevel};
 
-    /// Check whether an incoming message's seq is stale relative to the last
-    /// seen seq from that daemon. If not stale, updates last_seen and returns true.
-    pub fn accept_seq(&self, daemon_id: &str, seq: u64) -> bool {
-        let mut map = self.last_seen_seq.lock().expect("last_seen_seq poisoned");
-        let last = map.get(daemon_id).copied().unwrap_or(0);
-        if seq < last {
-            // A small seq after a large one indicates a daemon restart (counter
-            // resets to 0). Accept it and reset tracking so the restarted
-            // daemon's messages aren't dropped. seq==0 also covers backward-
-            // compat messages without a seq field.
-            if seq <= 1 {
-                map.remove(daemon_id);
-                return true;
+        let effects = {
+            let mut state = self.protocol.write().await;
+            state.apply(event)
+        };
+
+        for effect in &effects {
+            match effect {
+                Effect::Broadcast(msg) => {
+                    crate::transport::broadcast(self, msg).await;
+                }
+                Effect::BroadcastSessionList => {
+                    crate::transport::broadcast_local_sessions(self).await;
+                }
+                Effect::InjectMessage {
+                    pane,
+                    message,
+                    vim_mode,
+                } => {
+                    let _ = crate::tmux::locked_inject(self, pane, message, *vim_mode).await;
+                }
+                Effect::SetTmuxVar { pane, value, .. } => {
+                    let p = pane.clone();
+                    let v = value.clone();
+                    tokio::task::spawn_blocking(move || crate::tmux_var::set(&p, &v));
+                }
+                Effect::ClearTmuxVar { pane, .. } => {
+                    let p = pane.clone();
+                    tokio::task::spawn_blocking(move || crate::tmux_var::clear(&p));
+                }
+                Effect::RenameWindow { pane, name } => {
+                    let p = pane.clone();
+                    let n = name.clone();
+                    tokio::task::spawn_blocking(move || crate::tmux::rename_window(&p, &n));
+                }
+                Effect::EnableAutoRename { pane } => {
+                    let p = pane.clone();
+                    tokio::task::spawn_blocking(move || crate::tmux::enable_automatic_rename(&p));
+                }
+                Effect::SpawnAgent { session_id, pane } => {
+                    self.spawn_session_agent(session_id, pane).await;
+                }
+                Effect::StopAgent { session_id } => {
+                    if let Some(agent) = self
+                        .session_agents
+                        .write()
+                        .await
+                        .remove(session_id.as_str())
+                    {
+                        agent.stop(None);
+                    }
+                }
+                Effect::RenameAgent { old_id, new_id } => {
+                    let mut agents = self.session_agents.write().await;
+                    if let Some(agent) = agents.remove(old_id.as_str()) {
+                        let _ = agent.cast(crate::session_agent::SessionMsg::Renamed {
+                            new_id: new_id.clone(),
+                        });
+                        agents.insert(new_id.clone(), agent);
+                    }
+                }
+                Effect::ClearPendingReplies { removed_ids } => {
+                    self.clear_orphaned_pending_replies(removed_ids).await;
+                }
+                Effect::Persist => {
+                    let proto = self.protocol.read().await;
+                    self.persist_protocol_state(&proto);
+                }
+                Effect::CleanupWorktree { project_dir } => {
+                    let dir = project_dir.clone();
+                    tokio::task::spawn(async move {
+                        Self::cleanup_worktree_dir(&dir).await;
+                    });
+                }
+                Effect::SendToHuman { npub, message } => {
+                    let _ = crate::nostr_transport::send_plain_dm(self, npub, message).await;
+                }
+                Effect::ExecuteCommand { command, daemon_id } => {
+                    tracing::info!("received command from {daemon_id}: {command}");
+                    // Spawn as detached task to break async recursion chain
+                    // (command → start_session → revive_or_start_pane → apply_and_execute)
+                    let state = Arc::clone(self);
+                    let cmd = command.clone();
+                    tokio::spawn(async move {
+                        let result =
+                            crate::nostr_transport::handle_human_command(&state, &cmd).await;
+                        let reply = crate::protocol::WireMessage::CommandResult {
+                            command: cmd,
+                            result,
+                            daemon_id: state.config.npub.clone(),
+                        };
+                        crate::transport::broadcast(&state, &reply).await;
+                    });
+                }
+                Effect::ExecuteSessionStart {
+                    name,
+                    worktree,
+                    project_dir,
+                    prompt,
+                    from,
+                    expects_reply,
+                    daemon_id: sender_id,
+                } => {
+                    tracing::info!("received session_start from {sender_id}: {name}");
+                    let state = Arc::clone(self);
+                    let name = name.clone();
+                    let worktree = *worktree;
+                    let project_dir = project_dir.clone();
+                    let prompt = prompt.clone();
+                    let from = from.clone();
+                    let expects_reply = *expects_reply;
+                    tokio::spawn(async move {
+                        let (result, _prompt_msg_id) = crate::nostr_transport::start_session(
+                            &state,
+                            &name,
+                            worktree,
+                            project_dir.as_deref(),
+                            prompt.as_deref(),
+                            from.as_deref(),
+                            expects_reply,
+                        )
+                        .await;
+                        let reply = crate::protocol::WireMessage::CommandResult {
+                            command: format!("/start {name}"),
+                            result,
+                            daemon_id: state.config.npub.clone(),
+                        };
+                        crate::transport::broadcast(&state, &reply).await;
+                    });
+                }
+                Effect::ExecuteSessionRestart {
+                    name,
+                    fresh,
+                    prompt,
+                    from,
+                    expects_reply,
+                    daemon_id: sender_id,
+                } => {
+                    tracing::info!("received session_restart from {sender_id}: {name}");
+                    let state = Arc::clone(self);
+                    let name = name.clone();
+                    let fresh = fresh.unwrap_or(false);
+                    let prompt = prompt.clone();
+                    let from = from.clone();
+                    let expects_reply = *expects_reply;
+                    tokio::spawn(async move {
+                        let (result, _prompt_msg_id) = crate::nostr_transport::restart_session(
+                            &state,
+                            &name,
+                            fresh,
+                            prompt.as_deref(),
+                            from.as_deref(),
+                            expects_reply,
+                        )
+                        .await;
+                        let reply = crate::protocol::WireMessage::CommandResult {
+                            command: format!("/restart {name}"),
+                            result,
+                            daemon_id: state.config.npub.clone(),
+                        };
+                        crate::transport::broadcast(&state, &reply).await;
+                    });
+                }
+                Effect::DeliverCommandResult {
+                    daemon_id,
+                    command,
+                    result,
+                } => {
+                    tracing::info!("command result from {daemon_id}: {command} -> {result}");
+                    self.deliver_command_result(daemon_id, command, result)
+                        .await;
+                }
+                Effect::RecordNode {
+                    daemon_id,
+                    daemon_name,
+                } => {
+                    self.nodes.write().await.insert(
+                        daemon_id.clone(),
+                        NodeInfo {
+                            name: daemon_name.clone(),
+                            daemon_id: daemon_id.clone(),
+                            connected_at: Utc::now(),
+                        },
+                    );
+                }
+                Effect::Reciprocate { daemon_id } => {
+                    if self.should_reciprocate(daemon_id) {
+                        tracing::info!("reciprocating session list to {daemon_id}");
+                        crate::transport::broadcast_local_sessions(self).await;
+                    }
+                }
+                Effect::LogMessage {
+                    from,
+                    to,
+                    message,
+                    delivered,
+                    transport,
+                } => {
+                    self.log_message(
+                        from.clone(),
+                        to.clone(),
+                        message.clone(),
+                        *delivered,
+                        transport,
+                    )
+                    .await;
+                }
+                Effect::Log { level, message } => match level {
+                    LogLevel::Info => tracing::info!("{message}"),
+                    LogLevel::Warn => tracing::warn!("{message}"),
+                    LogLevel::Debug => tracing::debug!("{message}"),
+                },
+                // Result effects handled by callers, not executed
+                Effect::RegisterOk { .. }
+                | Effect::SendDelivered { .. }
+                | Effect::SendFailed { .. }
+                | Effect::RenameOk { .. }
+                | Effect::RenameFailed { .. }
+                | Effect::RemoveOk { .. }
+                | Effect::RemoveFailed { .. } => {}
             }
-            return false;
         }
-        map.insert(daemon_id.to_string(), seq);
-        true
+
+        effects
+    }
+
+    /// Persist protocol state sessions to disk.
+    fn persist_protocol_state(&self, proto: &crate::daemon_protocol::DaemonState) {
+        // Convert DaemonState sessions to the persisted Session format
+        let sessions: HashMap<String, Session> = proto
+            .sessions
+            .iter()
+            .map(|(k, entry)| {
+                let session = Session {
+                    id: entry.id.clone(),
+                    pane: entry.pane.clone(),
+                    origin: match &entry.origin {
+                        crate::daemon_protocol::Origin::Local => SessionOrigin::Local,
+                        crate::daemon_protocol::Origin::Remote(d) => {
+                            SessionOrigin::Remote(d.clone())
+                        }
+                        crate::daemon_protocol::Origin::Human(n) => SessionOrigin::Human(n.clone()),
+                    },
+                    registered_at: Utc::now(),
+                    last_activity_at: Utc::now(),
+                    metadata: SessionMetadata {
+                        vim_mode: entry.metadata.vim_mode,
+                        project_dir: entry.metadata.project_dir.clone(),
+                        role: entry.metadata.role.clone(),
+                        networked: entry.metadata.networked,
+                        bulletin: entry.metadata.bulletin.clone(),
+                        worktree: entry.metadata.worktree,
+                        ..Default::default()
+                    },
+                };
+                (k.clone(), session)
+            })
+            .collect();
+        self.persist_sessions_from(&sessions);
+    }
+
+    /// Clean up a git worktree directory if it has no uncommitted changes.
+    async fn cleanup_worktree_dir(dir: &str) {
+        let dir_owned = dir.to_string();
+        let repo = match dir.find("/.claude/worktrees/") {
+            Some(i) => dir[..i].to_string(),
+            None => return,
+        };
+        let dir_clone = dir_owned.clone();
+        let has_changes = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("git")
+                .args(["-C", &dir_clone, "status", "--porcelain"])
+                .output()
+                .map(|o| !o.stdout.is_empty())
+                .unwrap_or(true)
+        })
+        .await
+        .unwrap_or(true);
+        if has_changes {
+            tracing::info!("worktree {dir_owned} has uncommitted changes, keeping it");
+            return;
+        }
+        tracing::info!("cleaning up worktree: {dir_owned}");
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = std::process::Command::new("git")
+                .args(["-C", &repo, "worktree", "remove", &dir_owned, "--force"])
+                .status();
+        })
+        .await;
     }
 
     /// Register a connected node by npub.
@@ -399,17 +623,17 @@ impl AppState {
         self.nodes.write().await.remove(daemon_id);
 
         // Remove all remote sessions from this daemon
-        let mut sessions = self.sessions.write().await;
-        let to_remove: Vec<String> = sessions
+        let mut proto = self.protocol.write().await;
+        let to_remove: Vec<String> = proto.sessions
             .iter()
-            .filter(|(_, s)| matches!(&s.origin, SessionOrigin::Remote(d) if d == daemon_id))
+            .filter(|(_, s)| matches!(&s.origin, crate::daemon_protocol::Origin::Remote(d) if d == daemon_id))
             .map(|(key, _)| key.clone())
             .collect();
         let count = to_remove.len();
         for key in &to_remove {
-            sessions.remove(key);
+            proto.sessions.remove(key);
         }
-        drop(sessions);
+        drop(proto);
 
         // Remove from persisted connections
         if let Ok(mut conns) = crate::persistence::load_connections(&self.config.data_dir) {
@@ -422,11 +646,6 @@ impl AppState {
         }
 
         count
-    }
-
-    /// Check if a session should be visible to remote nodes.
-    pub fn is_session_networked(&self, session: &Session) -> bool {
-        session.metadata.networked
     }
 
     /// Enqueue an injection request for a pane, spawning its worker if needed.
@@ -500,202 +719,20 @@ impl AppState {
 
     /// Send a message to a session's agent (if it exists).
     pub async fn notify_agent(&self, session_id: &str, msg: crate::session_agent::SessionMsg) {
-        let agents = self.session_agents.read().await;
-        if let Some(agent) = agents.get(session_id) {
+        let agent = {
+            let agents = self.session_agents.read().await;
+            agents.get(session_id).cloned()
+        };
+        if let Some(agent) = agent {
             let _ = agent.cast(msg);
         }
     }
 
-    /// Register (or re-register) a session.
-    ///
-    /// If the pane is already registered under a different name, the old
-    /// session is removed and its ID is returned in `replaced`.
-    pub async fn register_session(
-        &self,
-        id: String,
-        pane: Option<String>,
-        metadata: SessionMetadata,
-    ) -> RegisterResult {
-        let mut sessions = self.sessions.write().await;
-
-        // Reject if same ID is already registered on a different pane
-        if let Some(ref new_pane) = pane {
-            if let Some(existing) = sessions.get(&id) {
-                if matches!(existing.origin, SessionOrigin::Local) {
-                    if let Some(ref old_pane) = existing.pane {
-                        if old_pane != new_pane {
-                            tracing::warn!(
-                                "session '{id}' already registered on pane {old_pane}, rejecting registration from {new_pane}"
-                            );
-                            return RegisterResult::Conflict {
-                                existing_pane: old_pane.clone(),
-                            };
-                        }
-                    }
-                }
-            }
-        }
-
-        // Dedup: if this pane is already registered under a different ID, remove the old entry
-        let replaced = if let Some(ref pane_id) = pane {
-            let old_key = sessions
-                .iter()
-                .find(|(key, s)| {
-                    *key != &id
-                        && matches!(s.origin, SessionOrigin::Local)
-                        && s.pane.as_deref() == Some(pane_id)
-                })
-                .map(|(key, _)| key.clone());
-            if let Some(ref old_key) = old_key {
-                tracing::info!("pane {pane_id} re-registered: removing old session '{old_key}'");
-                sessions.remove(old_key);
-            }
-            old_key
-        } else {
-            None
-        };
-
-        let mut metadata = metadata;
-        metadata.last_metadata_update = Some(Utc::now());
-        let now = Utc::now();
-        let session = Session {
-            id: id.clone(),
-            pane,
-            origin: SessionOrigin::Local,
-            registered_at: now,
-            last_activity_at: now,
-            metadata,
-            block_interactive: false,
-        };
-        sessions.insert(id.clone(), session.clone());
-        self.persist_sessions_from(&sessions);
-
-        // Set tmux user variable so window names can show the session ID.
-        // If the pane is the only pane in its window, also rename the window.
-        if let Some(ref pane_id) = session.pane {
-            let pane = pane_id.clone();
-            let name = id.clone();
-            tokio::task::spawn_blocking(move || {
-                tmux_var::set(&pane, &name);
-                if crate::tmux::is_sole_pane(&pane) {
-                    crate::tmux::rename_window(&pane, &name);
-                }
-            });
-        }
-
-        // Record alias so sends to the old name get a helpful hint
-        if let Some(ref old_key) = replaced {
-            self.add_alias(old_key, &id).await;
-        }
-
-        RegisterResult::Ok {
-            session: Box::new(session),
-            replaced,
-        }
-    }
-
-    pub async fn rename_session(&self, old_id: &str, new_id: &str) -> Option<Session> {
-        if new_id.contains('/') {
-            return None;
-        }
-        let mut sessions = self.sessions.write().await;
-        let session = sessions.get(old_id)?;
-        if matches!(session.origin, SessionOrigin::Remote(_)) {
-            return None;
-        }
-        let mut session = sessions.remove(old_id)?;
-        session.id = new_id.to_string();
-        // Update tmux user variable and window name to new name
-        if let Some(ref pane_id) = session.pane {
-            let pane = pane_id.clone();
-            let name = new_id.to_string();
-            tokio::task::spawn_blocking(move || {
-                tmux_var::set(&pane, &name);
-                if crate::tmux::is_sole_pane(&pane) {
-                    crate::tmux::rename_window(&pane, &name);
-                }
-            });
-        }
-        sessions.insert(new_id.to_string(), session.clone());
-        self.persist_sessions_from(&sessions);
-        drop(sessions);
-        self.add_alias(old_id, new_id).await;
-        // Re-key agent ref and update its internal session_id
-        let mut agents = self.session_agents.write().await;
-        if let Some(agent_ref) = agents.remove(old_id) {
-            let _ = agent_ref.cast(crate::session_agent::SessionMsg::Renamed {
-                new_id: new_id.to_string(),
-            });
-            agents.insert(new_id.to_string(), agent_ref);
-        }
-        Some(session)
-    }
-
-    /// Update a local session's role, project_dir, and/or bulletin.
-    ///
-    /// Stamps `last_metadata_update` and persists. Returns the updated
-    /// session, or `None` if the session doesn't exist or is remote.
-    pub async fn update_session_metadata(
-        &self,
-        id: &str,
-        role: Option<String>,
-        project_dir: Option<String>,
-        bulletin: Option<String>,
-    ) -> Option<Session> {
-        let mut sessions = self.sessions.write().await;
-        let session = sessions.get_mut(id)?;
-        if matches!(session.origin, SessionOrigin::Remote(_)) {
-            return None;
-        }
-        if let Some(r) = role {
-            session.metadata.role = Some(r);
-        }
-        if let Some(p) = project_dir {
-            session.metadata.project_dir = Some(p);
-        }
-        if let Some(b) = bulletin {
-            session.metadata.bulletin = Some(b);
-        }
-        session.metadata.last_metadata_update = Some(Utc::now());
-        let snapshot = session.clone();
-        self.persist_sessions_from(&sessions);
-        drop(sessions);
-
-        Some(snapshot)
-    }
-
-    /// Record an alias from an old session name to a new one.
-    ///
-    /// Also updates any existing aliases that pointed to `old_id` so they
-    /// resolve directly to `new_id` (no chains).
-    pub(crate) async fn add_alias(&self, old_id: &str, new_id: &str) {
-        if old_id == new_id {
-            return;
-        }
-        let mut aliases = self.session_aliases.write().await;
-        // Update any alias that previously pointed to old_id
-        for target in aliases.values_mut() {
-            if *target == old_id {
-                *target = new_id.to_string();
-            }
-        }
-        aliases.insert(old_id.to_string(), new_id.to_string());
-    }
-
-    /// Look up what a stale session name was renamed to.
-    ///
-    /// Returns the current name only if that session still exists.
-    pub async fn resolve_alias(&self, id: &str) -> Option<String> {
-        let new_id = self.session_aliases.read().await.get(id)?.clone();
-        if self.sessions.read().await.contains_key(&new_id) {
-            Some(new_id)
-        } else {
-            None
-        }
-    }
-
     /// Query a session agent for its pending replies (RPC).
-    pub async fn query_agent_pending_replies(&self, session_id: &str) -> Vec<PendingReply> {
+    pub async fn query_agent_pending_replies(
+        &self,
+        session_id: &str,
+    ) -> Vec<crate::daemon_protocol::PendingReplyEntry> {
         let agents = self.session_agents.read().await;
         if let Some(agent) = agents.get(session_id) {
             ractor::call!(agent, crate::session_agent::SessionMsg::GetPendingReplies)
@@ -705,131 +742,10 @@ impl AppState {
         }
     }
 
-    /// Clear pending replies targeting removed sessions from all remaining agents.
+    /// Clear pending replies targeting removed sessions from protocol state.
     pub(crate) async fn clear_orphaned_pending_replies(&self, removed_ids: &[String]) {
-        let agents = self.session_agents.read().await;
-        for (_, agent) in agents.iter() {
-            for id in removed_ids {
-                let _ = agent
-                    .cast(crate::session_agent::SessionMsg::ClearPendingReply { from: id.clone() });
-            }
-        }
-    }
-
-    pub async fn remove_session(&self, id: &str) -> Option<Session> {
-        let mut sessions = self.sessions.write().await;
-        let session = sessions.get(id)?;
-        if matches!(session.origin, SessionOrigin::Remote(_)) {
-            return None;
-        }
-        // Clear tmux user variable and re-enable automatic window naming
-        if let Some(ref pane_id) = session.pane {
-            let pane = pane_id.clone();
-            tokio::task::spawn_blocking(move || {
-                tmux_var::clear(&pane);
-                crate::tmux::enable_automatic_rename(&pane);
-            });
-        }
-        let removed = sessions.remove(id);
-        self.persist_sessions_from(&sessions);
-        drop(sessions);
-        // Stop session agent
-        if let Some(agent) = self.session_agents.write().await.remove(id) {
-            agent.stop(None);
-        }
-        self.clear_orphaned_pending_replies(&[id.to_string()]).await;
-        removed
-    }
-
-    /// Remove local sessions whose tmux panes have died.
-    pub async fn reap_dead_sessions(&self) -> Vec<String> {
-        let now = Utc::now();
-        let grace_secs = REAPER_GRACE_SECS;
-        let panes_to_check: Vec<(String, String)> = {
-            let sessions = self.sessions.read().await;
-            sessions
-                .values()
-                .filter(|s| {
-                    matches!(s.origin, SessionOrigin::Local)
-                        && s.pane.is_some()
-                        && now.signed_duration_since(s.registered_at).num_seconds() > grace_secs
-                })
-                .map(|s| (s.id.clone(), s.pane.clone().unwrap()))
-                .collect()
-        };
-
-        let dead_entries = tokio::task::spawn_blocking(move || {
-            panes_to_check
-                .into_iter()
-                .filter(|(_, pane)| !crate::tmux::pane_alive(pane))
-                .collect::<Vec<_>>()
-        })
-        .await
-        .unwrap_or_default();
-
-        let dead_ids: Vec<String> = dead_entries.iter().map(|(id, _)| id.clone()).collect();
-
-        if !dead_ids.is_empty() {
-            // Clear tmux user variables and re-enable automatic window naming
-            for (_, pane) in &dead_entries {
-                let pane = pane.clone();
-                tokio::task::spawn_blocking(move || {
-                    tmux_var::clear(&pane);
-                    crate::tmux::enable_automatic_rename(&pane);
-                });
-            }
-            let mut sessions = self.sessions.write().await;
-            for id in &dead_ids {
-                sessions.remove(id);
-                tracing::info!("reaped dead session: {id}");
-            }
-            self.persist_sessions_from(&sessions);
-            drop(sessions);
-            // Stop agents for reaped sessions
-            let mut agents = self.session_agents.write().await;
-            for id in &dead_ids {
-                if let Some(agent) = agents.remove(id.as_str()) {
-                    agent.stop(None);
-                }
-            }
-            drop(agents);
-            self.clear_orphaned_pending_replies(&dead_ids).await;
-        }
-        // Clean up per-fire worktree panes that have died
-        let perfire_to_check: Vec<(String, String)> = {
-            let pf = self.perfire_worktree_panes.read().await;
-            pf.iter()
-                .map(|(pane, dir)| (pane.clone(), dir.clone()))
-                .collect()
-        };
-        if !perfire_to_check.is_empty() {
-            let dead_perfire = tokio::task::spawn_blocking(move || {
-                perfire_to_check
-                    .into_iter()
-                    .filter(|(pane, _)| !crate::tmux::pane_alive(pane))
-                    .collect::<Vec<_>>()
-            })
-            .await
-            .unwrap_or_default();
-
-            if !dead_perfire.is_empty() {
-                let mut pf = self.perfire_worktree_panes.write().await;
-                for (pane_id, project_dir) in dead_perfire {
-                    pf.remove(&pane_id);
-                    tracing::info!(
-                        "per-fire worktree pane {pane_id} died, pruning worktrees in {project_dir}"
-                    );
-                    let _ = tokio::task::spawn_blocking(move || {
-                        std::process::Command::new("git")
-                            .args(["-C", &project_dir, "worktree", "prune"])
-                            .status()
-                    })
-                    .await;
-                }
-            }
-        }
-
-        dead_ids
+        let mut proto = self.protocol.write().await;
+        proto.clear_orphaned_replies(removed_ids);
     }
 
     /// If local session count exceeds `max_local_sessions`, return the most
@@ -839,16 +755,17 @@ impl AppState {
         if max == 0 {
             return vec![];
         }
-        let sessions = self.sessions.read().await;
-        let mut local: Vec<_> = sessions
+        let proto = self.protocol.read().await;
+        let mut local: Vec<_> = proto
+            .sessions
             .values()
-            .filter(|s| matches!(s.origin, SessionOrigin::Local))
+            .filter(|s| matches!(s.origin, crate::daemon_protocol::Origin::Local))
             .collect();
         if local.len() <= max {
             return vec![];
         }
-        // Sort by last_activity_at ascending (most idle first)
-        local.sort_by_key(|s| s.last_activity_at);
+        // Sort by registration time so oldest sessions are evicted first
+        local.sort_by_key(|s| s.registered_at);
         let excess = local.len() - max;
         local[..excess].iter().map(|s| s.id.clone()).collect()
     }
@@ -865,41 +782,6 @@ impl AppState {
 
     pub async fn cached_claude_panes(&self) -> Vec<crate::tmux::TmuxPane> {
         self.cached_claude_panes.read().await.clone()
-    }
-
-    /// Broadcast removal/announcement and spawn session agent after registration.
-    pub async fn announce_and_activate(
-        self: &Arc<Self>,
-        session: &Session,
-        replaced: Option<&str>,
-    ) {
-        let seq = self.next_seq();
-        if let Some(old_id) = replaced {
-            let msg = crate::protocol::WireMessage::SessionRenamed {
-                old_id: old_id.to_string(),
-                new_id: session.id.clone(),
-                daemon_id: self.config.npub.clone(),
-                daemon_name: self.config.name.clone(),
-                metadata: Some(session.metadata.clone()),
-                seq,
-            };
-            crate::transport::broadcast(self, &msg).await;
-            crate::transport::broadcast_local_sessions(self).await;
-        } else if self.is_session_networked(session) {
-            let msg = crate::protocol::WireMessage::SessionAnnounce {
-                id: session.id.clone(),
-                daemon_id: self.config.npub.clone(),
-                daemon_name: self.config.name.clone(),
-                metadata: Some(session.metadata.clone()),
-                seq,
-            };
-            crate::transport::broadcast(self, &msg).await;
-            crate::transport::broadcast_local_sessions(self).await;
-        }
-
-        if let Some(ref pane_id) = session.pane {
-            self.spawn_session_agent(&session.id, pane_id).await;
-        }
     }
 
     /// Scan tmux for Claude panes, update cache, and auto-register unregistered ones.
@@ -925,13 +807,15 @@ impl AppState {
 
         // Build lookup tables from current sessions (single lock acquisition)
         let (registered_panes, id_to_pane) = {
-            let sessions = self.sessions.read().await;
-            let registered: std::collections::HashSet<String> = sessions
+            let proto = self.protocol.read().await;
+            let registered: std::collections::HashSet<String> = proto
+                .sessions
                 .values()
-                .filter(|s| matches!(s.origin, SessionOrigin::Local))
+                .filter(|s| matches!(s.origin, crate::daemon_protocol::Origin::Local))
                 .filter_map(|s| s.pane.clone())
                 .collect();
-            let id_to_pane: std::collections::HashMap<String, Option<String>> = sessions
+            let id_to_pane: std::collections::HashMap<String, Option<String>> = proto
+                .sessions
                 .iter()
                 .map(|(id, s)| (id.clone(), s.pane.clone()))
                 .collect();
@@ -964,33 +848,29 @@ impl AppState {
             let mut suffix = 2u32;
             while let Some(existing_pane) = id_to_pane.get(&id) {
                 if existing_pane.as_deref() == Some(pane.pane_id.as_str()) {
-                    break; // Same pane, register_session handles idempotent update
+                    break; // Same pane, protocol handles idempotent update
                 }
                 id = format!("{base_id}-{suffix}");
                 suffix += 1;
-                if suffix > 100 {
+                if suffix > MAX_NAME_SUFFIX {
                     tracing::warn!("could not find available name for pane {}", pane.pane_id);
                     break;
                 }
             }
 
-            let description = crate::api::extract_project_description(project_root);
-            let metadata = SessionMetadata {
+            let proto_meta = crate::daemon_protocol::SessionMeta {
                 project_dir: Some(project_root.to_string()),
                 role: Some(format!("working on {basename}")),
-                project_description: description,
                 ..Default::default()
             };
 
             tracing::info!("auto-registering pane {} as '{id}'", pane.pane_id);
-            let result = self
-                .register_session(id.clone(), Some(pane.pane_id.clone()), metadata)
-                .await;
-
-            if let RegisterResult::Ok { session, replaced } = result {
-                self.announce_and_activate(&session, replaced.as_deref())
-                    .await;
-            }
+            self.apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: id.clone(),
+                pane: Some(pane.pane_id.clone()),
+                metadata: proto_meta,
+            })
+            .await;
         }
     }
 
@@ -1004,7 +884,8 @@ impl AppState {
             .expect("last_reciprocated poisoned");
         let now = std::time::Instant::now();
         if let Some(last) = map.get(daemon_id) {
-            if now.duration_since(*last) < std::time::Duration::from_secs(30) {
+            if now.duration_since(*last) < std::time::Duration::from_secs(RECIPROCATE_DEBOUNCE_SECS)
+            {
                 return false;
             }
         }
@@ -1044,10 +925,11 @@ impl AppState {
 
     pub async fn local_session_hash(&self) -> u64 {
         use std::hash::{Hash, Hasher};
-        let sessions = self.sessions.read().await;
-        let mut entries: Vec<(&str, bool, Option<&str>, Option<&str>)> = sessions
+        let proto = self.protocol.read().await;
+        let mut entries: Vec<(&str, bool, Option<&str>, Option<&str>)> = proto
+            .sessions
             .values()
-            .filter(|s| matches!(s.origin, SessionOrigin::Local))
+            .filter(|s| matches!(s.origin, crate::daemon_protocol::Origin::Local))
             .map(|s| {
                 (
                     s.id.as_str(),
@@ -1162,26 +1044,6 @@ pub(crate) mod tests {
     // --- Pure functions ---
 
     #[test]
-    fn remote_session_key_format() {
-        assert_eq!(remote_session_key("daemon1", "sess"), "daemon1/sess");
-    }
-
-    #[test]
-    fn strip_remote_prefix_with_slash() {
-        assert_eq!(strip_remote_prefix("daemon1/sess"), "sess");
-    }
-
-    #[test]
-    fn strip_remote_prefix_no_slash() {
-        assert_eq!(strip_remote_prefix("local-id"), "local-id");
-    }
-
-    #[test]
-    fn strip_remote_prefix_multiple_slashes() {
-        assert_eq!(strip_remote_prefix("a/b/c"), "b/c");
-    }
-
-    #[test]
     fn resolve_project_root_normal_path() {
         assert_eq!(
             resolve_project_root("/Users/dan/code/myproject"),
@@ -1219,19 +1081,24 @@ pub(crate) mod tests {
         }
     }
 
+    /// Helper: register a session via the protocol path.
+    async fn proto_register(state: &Arc<AppState>, id: &str, pane: Option<&str>) {
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: id.into(),
+                pane: pane.map(Into::into),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+    }
+
     #[tokio::test]
     async fn register_session_basic() {
         let state = AppState::new(test_config());
-        let result = state
-            .register_session("s1".into(), Some("%1".into()), SessionMetadata::default())
-            .await;
-        let RegisterResult::Ok { session, .. } = result else {
-            panic!("expected Ok");
-        };
-        assert_eq!(session.id, "s1");
-        assert_eq!(session.pane.as_deref(), Some("%1"));
+        proto_register(&state, "s1", Some("%1")).await;
 
-        let sessions = state.sessions.read().await;
+        let proto = state.protocol.read().await;
+        let sessions = &proto.sessions;
         assert_eq!(sessions.len(), 1);
         assert!(sessions.contains_key("s1"));
     }
@@ -1239,91 +1106,74 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn register_session_dedup_by_pane() {
         let state = AppState::new(test_config());
-        let r1 = state
-            .register_session("old".into(), Some("%1".into()), SessionMetadata::default())
-            .await;
-        let RegisterResult::Ok { replaced, .. } = r1 else {
-            panic!("expected Ok");
-        };
-        assert!(replaced.is_none());
+        proto_register(&state, "old", Some("%1")).await;
+        proto_register(&state, "new", Some("%1")).await;
 
-        let r2 = state
-            .register_session("new".into(), Some("%1".into()), SessionMetadata::default())
-            .await;
-        let RegisterResult::Ok { replaced, .. } = r2 else {
-            panic!("expected Ok");
-        };
-        assert_eq!(replaced.as_deref(), Some("old"));
-
-        let sessions = state.sessions.read().await;
+        let proto = state.protocol.read().await;
+        let sessions = &proto.sessions;
         assert_eq!(sessions.len(), 1);
         assert!(sessions.contains_key("new"));
         assert!(!sessions.contains_key("old"));
     }
 
     #[tokio::test]
-    async fn register_session_same_id_different_pane_conflicts() {
+    async fn register_session_same_id_different_pane_updates() {
         let state = AppState::new(test_config());
-        state
-            .register_session("s1".into(), Some("%1".into()), SessionMetadata::default())
-            .await;
-        let r2 = state
-            .register_session("s1".into(), Some("%2".into()), SessionMetadata::default())
+        proto_register(&state, "s1", Some("%1")).await;
+        let effects = state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "s1".into(),
+                pane: Some("%2".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
             .await;
 
+        // Re-registering same ID with new pane succeeds (e.g. restart)
         assert!(
-            matches!(r2, RegisterResult::Conflict { existing_pane } if existing_pane == "%1"),
-            "same ID on different pane should conflict"
+            effects
+                .iter()
+                .any(|e| matches!(e, crate::daemon_protocol::Effect::RegisterOk { .. }))
         );
 
-        // Original session should be unchanged
-        let sessions = state.sessions.read().await;
+        let proto = state.protocol.read().await;
+        let sessions = &proto.sessions;
         assert_eq!(sessions.len(), 1);
-        let s = sessions.get("s1").unwrap();
-        assert_eq!(s.pane.as_deref(), Some("%1"));
+        assert_eq!(sessions.get("s1").unwrap().pane.as_deref(), Some("%2"));
     }
 
     #[tokio::test]
     async fn register_session_same_id_same_pane_updates() {
         let state = AppState::new(test_config());
+        proto_register(&state, "s1", Some("%1")).await;
         state
-            .register_session(
-                "s1".into(),
-                Some("%1".into()),
-                SessionMetadata {
-                    vim_mode: false,
-                    ..Default::default()
-                },
-            )
-            .await;
-        let r2 = state
-            .register_session(
-                "s1".into(),
-                Some("%1".into()),
-                SessionMetadata {
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "s1".into(),
+                pane: Some("%1".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
                     vim_mode: true,
                     ..Default::default()
                 },
-            )
+            })
             .await;
 
-        let RegisterResult::Ok { session, .. } = r2 else {
-            panic!("same ID + same pane should succeed");
-        };
-        assert!(session.metadata.vim_mode);
+        let proto = state.protocol.read().await;
+        let sessions = &proto.sessions;
+        assert!(sessions.get("s1").unwrap().metadata.vim_mode);
     }
 
     #[tokio::test]
     async fn rename_session_basic() {
         let state = AppState::new(test_config());
+        proto_register(&state, "old", Some("%1")).await;
         state
-            .register_session("old".into(), Some("%1".into()), SessionMetadata::default())
+            .apply_and_execute(crate::daemon_protocol::Event::Rename {
+                old_id: "old".into(),
+                new_id: "new".into(),
+            })
             .await;
-        let renamed = state.rename_session("old", "new").await;
-        assert!(renamed.is_some());
-        assert_eq!(renamed.unwrap().id, "new");
 
-        let sessions = state.sessions.read().await;
+        let proto = state.protocol.read().await;
+        let sessions = &proto.sessions;
         assert!(!sessions.contains_key("old"));
         assert!(sessions.contains_key("new"));
     }
@@ -1331,118 +1181,101 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn rename_session_rejects_slash() {
         let state = AppState::new(test_config());
-        state
-            .register_session("s1".into(), Some("%1".into()), SessionMetadata::default())
+        proto_register(&state, "s1", Some("%1")).await;
+        let effects = state
+            .apply_and_execute(crate::daemon_protocol::Event::Rename {
+                old_id: "s1".into(),
+                new_id: "has/slash".into(),
+            })
             .await;
-        assert!(state.rename_session("s1", "has/slash").await.is_none());
-        assert!(state.sessions.read().await.contains_key("s1"));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, crate::daemon_protocol::Effect::RenameFailed { .. }))
+        );
+        assert!(state.protocol.read().await.sessions.contains_key("s1"));
     }
 
     #[tokio::test]
     async fn rename_nonexistent_returns_none() {
         let state = AppState::new(test_config());
-        assert!(state.rename_session("nope", "new").await.is_none());
+        let effects = state
+            .apply_and_execute(crate::daemon_protocol::Event::Rename {
+                old_id: "nope".into(),
+                new_id: "new".into(),
+            })
+            .await;
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, crate::daemon_protocol::Effect::RenameFailed { .. }))
+        );
     }
 
     #[tokio::test]
     async fn remove_session_basic() {
         let state = AppState::new(test_config());
+        proto_register(&state, "s1", Some("%1")).await;
         state
-            .register_session("s1".into(), Some("%1".into()), SessionMetadata::default())
+            .apply_and_execute(crate::daemon_protocol::Event::Remove { id: "s1".into() })
             .await;
-        let removed = state.remove_session("s1").await;
-        assert!(removed.is_some());
-        assert!(state.sessions.read().await.is_empty());
+        assert!(state.protocol.read().await.sessions.is_empty());
     }
 
     #[tokio::test]
-    async fn remove_nonexistent_returns_none() {
+    async fn remove_nonexistent_is_noop() {
         let state = AppState::new(test_config());
-        assert!(state.remove_session("nope").await.is_none());
+        let effects = state
+            .apply_and_execute(crate::daemon_protocol::Event::Remove { id: "nope".into() })
+            .await;
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, crate::daemon_protocol::Effect::RemoveFailed { .. }))
+        );
     }
 
     #[tokio::test]
-    async fn remove_remote_session_returns_none() {
+    async fn remove_remote_session_fails() {
         let state = AppState::new(test_config());
         {
-            let mut sessions = state.sessions.write().await;
-            sessions.insert(
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
                 "remote/s1".into(),
-                test_session(
-                    "remote/s1",
-                    None,
-                    SessionOrigin::Remote("remote".into()),
-                    SessionMetadata::default(),
-                ),
+                crate::daemon_protocol::SessionEntry {
+                    id: "remote/s1".into(),
+                    origin: crate::daemon_protocol::Origin::Remote("remote".into()),
+                    ..Default::default()
+                },
             );
         }
-        assert!(state.remove_session("remote/s1").await.is_none());
-        assert_eq!(state.sessions.read().await.len(), 1);
+        let effects = state
+            .apply_and_execute(crate::daemon_protocol::Event::Remove {
+                id: "remote/s1".into(),
+            })
+            .await;
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, crate::daemon_protocol::Effect::RemoveFailed { .. }))
+        );
+        assert_eq!(state.protocol.read().await.sessions.len(), 1);
     }
 
-    /// Helper to build a Session for tests, filling in `last_activity_at` automatically.
-    fn test_session(
+    /// Helper to build a SessionEntry for tests.
+    fn test_entry(
         id: &str,
         pane: Option<&str>,
-        origin: SessionOrigin,
-        metadata: SessionMetadata,
-    ) -> Session {
-        Session {
+        origin: crate::daemon_protocol::Origin,
+        metadata: crate::daemon_protocol::SessionMeta,
+    ) -> crate::daemon_protocol::SessionEntry {
+        crate::daemon_protocol::SessionEntry {
             id: id.into(),
             pane: pane.map(Into::into),
             origin,
-            registered_at: Utc::now(),
-            last_activity_at: Utc::now(),
             metadata,
-            block_interactive: false,
+            ..Default::default()
         }
-    }
-
-    #[tokio::test]
-    async fn resolve_alias_after_rename() {
-        let state = AppState::new(test_config());
-        state
-            .register_session("old".into(), Some("%1".into()), SessionMetadata::default())
-            .await;
-        state.rename_session("old", "new").await;
-        assert_eq!(state.resolve_alias("old").await.as_deref(), Some("new"));
-    }
-
-    #[tokio::test]
-    async fn resolve_alias_after_dedup() {
-        let state = AppState::new(test_config());
-        state
-            .register_session("old".into(), Some("%1".into()), SessionMetadata::default())
-            .await;
-        state
-            .register_session("new".into(), Some("%1".into()), SessionMetadata::default())
-            .await;
-        assert_eq!(state.resolve_alias("old").await.as_deref(), Some("new"));
-    }
-
-    #[tokio::test]
-    async fn resolve_alias_chain_flattened() {
-        let state = AppState::new(test_config());
-        state
-            .register_session("a".into(), Some("%1".into()), SessionMetadata::default())
-            .await;
-        state.rename_session("a", "b").await;
-        state.rename_session("b", "c").await;
-        // Both old names resolve directly to the final name
-        assert_eq!(state.resolve_alias("a").await.as_deref(), Some("c"));
-        assert_eq!(state.resolve_alias("b").await.as_deref(), Some("c"));
-    }
-
-    #[tokio::test]
-    async fn resolve_alias_returns_none_if_target_gone() {
-        let state = AppState::new(test_config());
-        state
-            .register_session("old".into(), Some("%1".into()), SessionMetadata::default())
-            .await;
-        state.rename_session("old", "new").await;
-        state.remove_session("new").await;
-        // Target no longer exists, alias should not resolve
-        assert!(state.resolve_alias("old").await.is_none());
     }
 
     #[tokio::test]
@@ -1457,51 +1290,17 @@ pub(crate) mod tests {
         assert_eq!(log.len(), MAX_LOG);
     }
 
-    // --- Networked filtering ---
-
-    #[test]
-    fn is_session_networked_true() {
-        let state = AppState::new(test_config());
-        let session = test_session(
-            "s1",
-            Some("%1"),
-            SessionOrigin::Local,
-            SessionMetadata {
-                networked: true,
-                ..Default::default()
-            },
-        );
-        assert!(state.is_session_networked(&session));
-    }
-
-    #[test]
-    fn is_session_networked_false() {
-        let state = AppState::new(test_config());
-        let session = test_session(
-            "s1",
-            Some("%1"),
-            SessionOrigin::Local,
-            SessionMetadata {
-                networked: false,
-                ..Default::default()
-            },
-        );
-        assert!(!state.is_session_networked(&session));
-    }
-
     #[tokio::test]
     async fn local_session_hash_changes_on_networked_toggle() {
         let state = AppState::new(test_config());
-        state
-            .register_session("s1".into(), Some("%1".into()), SessionMetadata::default())
-            .await;
+        proto_register(&state, "s1", Some("%1")).await;
 
         let hash_networked = state.local_session_hash().await;
 
         // Toggle s1 to non-networked
         {
-            let mut sessions = state.sessions.write().await;
-            sessions.get_mut("s1").unwrap().metadata.networked = false;
+            let mut proto = state.protocol.write().await;
+            proto.sessions.get_mut("s1").unwrap().metadata.networked = false;
         }
         let hash_not_networked = state.local_session_hash().await;
 
@@ -1513,23 +1312,23 @@ pub(crate) mod tests {
         let state = AppState::new(test_config());
         // Add a remote session
         {
-            let mut sessions = state.sessions.write().await;
-            sessions.insert(
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
                 "remote/s1".into(),
-                test_session(
+                test_entry(
                     "remote/s1",
                     None,
-                    SessionOrigin::Remote("npub1remote".into()),
-                    SessionMetadata::default(),
+                    crate::daemon_protocol::Origin::Remote("npub1remote".into()),
+                    crate::daemon_protocol::SessionMeta::default(),
                 ),
             );
-            sessions.insert(
+            proto.sessions.insert(
                 "remote/s2".into(),
-                test_session(
+                test_entry(
                     "remote/s2",
                     None,
-                    SessionOrigin::Remote("npub1remote".into()),
-                    SessionMetadata::default(),
+                    crate::daemon_protocol::Origin::Remote("npub1remote".into()),
+                    crate::daemon_protocol::SessionMeta::default(),
                 ),
             );
         }
@@ -1546,7 +1345,7 @@ pub(crate) mod tests {
 
         let removed = state.disconnect_node("npub1remote").await;
         assert_eq!(removed, 2);
-        assert!(state.sessions.read().await.is_empty());
+        assert!(state.protocol.read().await.sessions.is_empty());
         assert!(state.nodes.read().await.is_empty());
     }
 
@@ -1581,116 +1380,43 @@ pub(crate) mod tests {
         assert!(matches!(origin, SessionOrigin::Human(npub) if npub == "npub1xyz"));
     }
 
-    // --- Metadata staleness ---
-
-    #[test]
-    fn is_stale_when_never_set() {
-        let meta = SessionMetadata::default();
-        assert!(meta.is_stale());
-    }
-
-    #[test]
-    fn is_stale_when_recent() {
-        let meta = SessionMetadata {
-            last_metadata_update: Some(Utc::now()),
-            ..Default::default()
-        };
-        assert!(!meta.is_stale());
-    }
-
-    #[test]
-    fn is_stale_when_old() {
-        let old = Utc::now() - chrono::Duration::seconds(METADATA_STALE_SECS + 1);
-        let meta = SessionMetadata {
-            last_metadata_update: Some(old),
-            ..Default::default()
-        };
-        assert!(meta.is_stale());
-    }
-
-    #[test]
-    fn backward_compat_missing_last_metadata_update() {
-        // Old JSON without last_metadata_update should deserialize with None
-        let json = r#"{"vim_mode": false, "networked": true}"#;
-        let meta: SessionMetadata = serde_json::from_str(json).unwrap();
-        assert!(meta.last_metadata_update.is_none());
-        assert!(meta.is_stale());
-    }
-
     #[tokio::test]
-    async fn register_session_stamps_metadata_update() {
+    async fn update_session_metadata_sets_role() {
         let state = AppState::new(test_config());
-        let result = state
-            .register_session("s1".into(), Some("%1".into()), SessionMetadata::default())
-            .await;
-        let RegisterResult::Ok { session, .. } = result else {
-            panic!("expected Ok");
-        };
-        assert!(session.metadata.last_metadata_update.is_some());
-        assert!(!session.metadata.is_stale());
-    }
+        proto_register(&state, "s1", Some("%1")).await;
 
-    #[tokio::test]
-    async fn update_session_metadata_sets_role_and_stamps() {
-        let state = AppState::new(test_config());
         state
-            .register_session("s1".into(), Some("%1".into()), SessionMetadata::default())
+            .apply_and_execute(crate::daemon_protocol::Event::UpdateMetadata {
+                id: "s1".into(),
+                role: Some("debugging auth".into()),
+                bulletin: None,
+                project_dir: None,
+                networked: None,
+            })
             .await;
 
-        let updated = state
-            .update_session_metadata("s1", Some("debugging auth".into()), None, None)
-            .await;
-        assert!(updated.is_some());
-        let s = updated.unwrap();
-        assert_eq!(s.metadata.role.as_deref(), Some("debugging auth"));
-        assert!(!s.metadata.is_stale());
-    }
-
-    #[tokio::test]
-    async fn update_session_metadata_remote_returns_none() {
-        let state = AppState::new(test_config());
-        {
-            let mut sessions = state.sessions.write().await;
-            sessions.insert(
-                "remote/s1".into(),
-                test_session(
-                    "remote/s1",
-                    None,
-                    SessionOrigin::Remote("remote".into()),
-                    SessionMetadata::default(),
-                ),
-            );
-        }
-        assert!(
-            state
-                .update_session_metadata("remote/s1", Some("role".into()), None, None)
-                .await
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn update_session_metadata_nonexistent_returns_none() {
-        let state = AppState::new(test_config());
-        assert!(
-            state
-                .update_session_metadata("nope", Some("role".into()), None, None)
-                .await
-                .is_none()
+        let proto = state.protocol.read().await;
+        assert_eq!(
+            proto.sessions["s1"].metadata.role.as_deref(),
+            Some("debugging auth")
         );
     }
 
     #[tokio::test]
     async fn local_session_hash_changes_on_role_update() {
         let state = AppState::new(test_config());
-        state
-            .register_session("s1".into(), Some("%1".into()), SessionMetadata::default())
-            .await;
+        proto_register(&state, "s1", Some("%1")).await;
 
         let hash_before = state.local_session_hash().await;
 
         state
-            .update_session_metadata("s1", Some("new role".into()), None, None)
+            .apply_and_execute(crate::daemon_protocol::Event::UpdateMetadata {
+                id: "s1".into(),
+                role: Some("new role".into()),
+                bulletin: None,
+                project_dir: None,
+                networked: None,
+            })
             .await;
 
         let hash_after = state.local_session_hash().await;
@@ -1700,17 +1426,21 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn update_metadata_sets_bulletin() {
         let state = AppState::new(test_config());
+        proto_register(&state, "s1", Some("%1")).await;
+
         state
-            .register_session("s1".into(), Some("%1".into()), SessionMetadata::default())
+            .apply_and_execute(crate::daemon_protocol::Event::UpdateMetadata {
+                id: "s1".into(),
+                role: None,
+                bulletin: Some("offering review".into()),
+                project_dir: None,
+                networked: None,
+            })
             .await;
 
-        let result = state
-            .update_session_metadata("s1", None, None, Some("offering review".into()))
-            .await;
-        assert!(result.is_some());
-        let sessions = state.sessions.read().await;
+        let proto = state.protocol.read().await;
         assert_eq!(
-            sessions["s1"].metadata.bulletin.as_deref(),
+            proto.sessions["s1"].metadata.bulletin.as_deref(),
             Some("offering review")
         );
     }
@@ -1721,9 +1451,7 @@ pub(crate) mod tests {
     async fn excess_idle_disabled_when_zero() {
         let state = AppState::new(test_config());
         // max_local_sessions defaults to 0 (disabled)
-        state
-            .register_session("s1".into(), Some("%1".into()), SessionMetadata::default())
-            .await;
+        proto_register(&state, "s1", Some("%1")).await;
         assert!(state.collect_excess_idle_sessions().await.is_empty());
     }
 
@@ -1731,88 +1459,60 @@ pub(crate) mod tests {
     async fn excess_idle_no_eviction_at_limit() {
         let state = AppState::new(test_config());
         state.settings.write().await.max_local_sessions = 2;
-        state
-            .register_session("s1".into(), Some("%1".into()), SessionMetadata::default())
-            .await;
-        state
-            .register_session("s2".into(), Some("%2".into()), SessionMetadata::default())
-            .await;
+        proto_register(&state, "s1", Some("%1")).await;
+        proto_register(&state, "s2", Some("%2")).await;
         assert!(state.collect_excess_idle_sessions().await.is_empty());
     }
 
     #[tokio::test]
-    async fn excess_idle_evicts_most_idle() {
+    async fn excess_idle_evicts_when_over_limit() {
+        use crate::daemon_protocol::{Origin, SessionMeta};
         let state = AppState::new(test_config());
         state.settings.write().await.max_local_sessions = 2;
 
-        // Insert 3 sessions with controlled last_activity_at
+        // Insert 3 local sessions
         {
-            let mut sessions = state.sessions.write().await;
-            let mut old = test_session(
-                "old",
-                Some("%1"),
-                SessionOrigin::Local,
-                SessionMetadata::default(),
-            );
-            old.last_activity_at = Utc::now() - chrono::Duration::hours(3);
-            sessions.insert("old".into(), old);
-
-            let mut mid = test_session(
-                "mid",
-                Some("%2"),
-                SessionOrigin::Local,
-                SessionMetadata::default(),
-            );
-            mid.last_activity_at = Utc::now() - chrono::Duration::hours(1);
-            sessions.insert("mid".into(), mid);
-
-            let fresh = test_session(
-                "fresh",
-                Some("%3"),
-                SessionOrigin::Local,
-                SessionMetadata::default(),
-            );
-            sessions.insert("fresh".into(), fresh);
+            let mut proto = state.protocol.write().await;
+            for name in &["a", "b", "c"] {
+                proto.sessions.insert(
+                    name.to_string(),
+                    test_entry(name, Some("%1"), Origin::Local, SessionMeta::default()),
+                );
+            }
         }
 
         let evicted = state.collect_excess_idle_sessions().await;
         assert_eq!(evicted.len(), 1);
-        assert_eq!(evicted[0], "old");
     }
 
     #[tokio::test]
     async fn excess_idle_ignores_remote_and_human() {
+        use crate::daemon_protocol::{Origin, SessionMeta};
         let state = AppState::new(test_config());
         state.settings.write().await.max_local_sessions = 1;
 
-        // 1 local + 1 remote + 1 human = only 1 local, at limit
         {
-            let mut sessions = state.sessions.write().await;
-            sessions.insert(
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
                 "local".into(),
-                test_session(
-                    "local",
-                    Some("%1"),
-                    SessionOrigin::Local,
-                    SessionMetadata::default(),
-                ),
+                test_entry("local", Some("%1"), Origin::Local, SessionMeta::default()),
             );
-            sessions.insert(
+            proto.sessions.insert(
                 "remote/r1".into(),
-                test_session(
+                test_entry(
                     "remote/r1",
                     None,
-                    SessionOrigin::Remote("npub1x".into()),
-                    SessionMetadata::default(),
+                    Origin::Remote("npub1x".into()),
+                    SessionMeta::default(),
                 ),
             );
-            sessions.insert(
+            proto.sessions.insert(
                 "human".into(),
-                test_session(
+                test_entry(
                     "human",
                     None,
-                    SessionOrigin::Human("npub1h".into()),
-                    SessionMetadata::default(),
+                    Origin::Human("npub1h".into()),
+                    SessionMeta::default(),
                 ),
             );
         }

@@ -124,12 +124,12 @@ log "  Waiting for removal propagation..."
 wait_for 20 bash -c "! session_ids '$BASE_B' | grep -qF 'alpha/sess-alpha'"
 assert_not_contains "B no longer has alpha/sess-alpha" "$(session_ids "$BASE_B")" "alpha/sess-alpha"
 
-log "Test 9: Admin dashboard shows nostr transport"
-curl -sL --max-time 5 "$BASE_A/admin" > /tmp/admin-page.html 2>/dev/null || true
-if grep -qiF "nostr" /tmp/admin-page.html 2>/dev/null; then
-    pass "admin A shows nostr"
+log "Test 9: Dashboard shows nostr transport"
+curl -sL --max-time 5 "$BASE_A/" > /tmp/dashboard-page.html 2>/dev/null || true
+if grep -qiF "nostr" /tmp/dashboard-page.html 2>/dev/null; then
+    pass "dashboard A shows nostr"
 else
-    fail "admin A shows nostr" "contains 'nostr'" "$(wc -c < /tmp/admin-page.html 2>/dev/null || echo 0) bytes, first 300: $(head -c 300 /tmp/admin-page.html 2>/dev/null)"
+    fail "dashboard A shows nostr" "contains 'nostr'" "$(wc -c < /tmp/dashboard-page.html 2>/dev/null || echo 0) bytes, first 300: $(head -c 300 /tmp/dashboard-page.html 2>/dev/null)"
 fi
 
 # Cleanup remaining sessions
@@ -302,7 +302,7 @@ result=$(api "$BASE_B" POST /api/send -d '{"from":"route-b","to":"alpha/route-a"
 assert_contains "R4: send via gossip" "$result" "nostr"
 wait_for 10 bash -c "tmux capture-pane -t '$PANE_A1' -p -S -30 | grep -qF 'routed hello'"
 pane_content=$(tmux capture-pane -t "$PANE_A1" -p -S -30)
-assert_contains "R4: message has from prefix" "$pane_content" "[from beta/route-b ?]:"
+assert_contains "R4: message has from prefix" "$pane_content" '<msg from="beta/route-b"'
 assert_contains "R4: message content delivered" "$pane_content" "routed hello"
 
 log "Test R5: Cross-daemon message without expects_reply omits ?"
@@ -313,8 +313,8 @@ wait_for 10 bash -c "tmux capture-pane -t '$PANE_A1' -p -S -30 | grep -qF 'fyi o
 pane_content=$(tmux capture-pane -t "$PANE_A1" -p -S -30)
 # Check the specific line containing "fyi only" has no ? prefix
 fyi_line=$(echo "$pane_content" | grep -F "fyi only" | head -1)
-assert_contains "R5: fyi line has from prefix" "$fyi_line" "[from beta/route-b]:"
-assert_not_contains "R5: fyi line has no ? marker" "$fyi_line" "[from beta/route-b ?]:"
+assert_contains "R5: fyi line has from prefix" "$fyi_line" '<msg from="beta/route-b"'
+assert_not_contains "R5: fyi line has no reply attr" "$fyi_line" 'reply="true"'
 
 # Cleanup
 api "$BASE_A" POST /api/remove -d '{"id":"route-a"}' >/dev/null 2>&1 || true
@@ -429,7 +429,7 @@ DAEMON_A_NPUB=$(api "$BASE_A" GET /api/status | jq -r '.daemon_id // ""')
 log "Daemon A npub: $DAEMON_A_NPUB"
 
 log "Test H1: Add human session to daemon A"
-H1=$(api "$BASE_A" POST /api/humans -d "{\"name\":\"testhuman\",\"npub\":\"$HUMAN_NPUB\",\"admin\":true}")
+H1=$(api "$BASE_A" POST /api/humans -d "{\"name\":\"testhuman\",\"npub\":\"$HUMAN_NPUB\"}")
 assert_contains "H1: add human" "$H1" '"status":"added"'
 
 log "Test H2: Human appears in session list"
@@ -528,7 +528,7 @@ wait_for 15 bash -c "tmux capture-pane -t '$PANE_A1' -p -S -30 | grep -qF 'bare 
 pane_content=$(tmux capture-pane -t "$PANE_A1" -p -S -30)
 assert_contains "H7: bare text delivered to default session" "$pane_content" "bare text message"
 
-log "Test H8: Inbound admin /nodes command"
+log "Test H8: Inbound /nodes command"
 human-dm-helper recv "$RELAY_URL" --nsec "$HUMAN_NSEC" --timeout 20 > /tmp/human-nodes.txt 2>/tmp/human-nodes-err.txt &
 HUMAN_NODES_PID=$!
 sleep 3

@@ -9,6 +9,7 @@ use crate::mcp::OuijaMcp;
 use crate::state::SharedState;
 use crate::{admin, api};
 
+/// Start the HTTP/MCP server on the configured port.
 pub async fn run(state: SharedState) -> anyhow::Result<()> {
     let port = state.config.port;
     let name = state.config.name.clone();
@@ -25,6 +26,7 @@ pub async fn run(state: SharedState) -> anyhow::Result<()> {
 
     let app = Router::new()
         .nest_service("/mcp", mcp_service)
+        .route("/", get(admin::dashboard))
         .route("/admin", get(admin::dashboard))
         .route("/api/status", get(api::status))
         .route("/api/ticket", get(api::ticket))
@@ -82,9 +84,9 @@ pub async fn run(state: SharedState) -> anyhow::Result<()> {
 
     let addr = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&addr).await?;
+    println!("ouija daemon '{name}' listening on http://localhost:{port}");
     tracing::info!("ouija daemon '{name}' listening on {addr}");
-    tracing::info!("  MCP:   http://localhost:{port}/mcp");
-    tracing::info!("  Admin: http://localhost:{port}/admin");
+    tracing::info!("  MCP: http://localhost:{port}/mcp");
     axum::serve(listener, app).await?;
 
     Ok(())

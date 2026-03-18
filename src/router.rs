@@ -1,9 +1,15 @@
+use crate::daemon_protocol::Origin;
 use crate::persistence::RouterConfig;
-use crate::state::{AppState, LogEntry, SessionOrigin};
+use crate::state::{AppState, LogEntry};
 
 /// Timeout for LLM router API requests.
 const ROUTER_API_TIMEOUT_SECS: u64 = 30;
+/// Max inter-session messages to include in the router prompt.
+const MAX_INTER_SESSION_MESSAGES: usize = 10;
+/// Max message length before truncation in router context.
+const MAX_MESSAGE_PREVIEW_LEN: usize = 200;
 
+/// LLM-produced routing action for an inbound human message.
 #[derive(Debug, PartialEq)]
 pub enum RouterDecision {
     Route { targets: Vec<String> },
@@ -11,6 +17,7 @@ pub enum RouterDecision {
     DirectAnswer(String),
 }
 
+/// Lightweight view of a session for the router prompt.
 #[derive(Debug)]
 pub struct SessionSnapshot {
     pub id: String,
@@ -21,6 +28,7 @@ pub struct SessionSnapshot {
     pub bulletin: Option<String>,
 }
 
+/// Truncated message record included in the router prompt.
 #[derive(Debug)]
 pub struct MessageSnapshot {
     pub timestamp: String,
@@ -39,9 +47,8 @@ pub async fn classify(
     sessions: &[SessionSnapshot],
     messages: &[MessageSnapshot],
     human_name: &str,
-    is_admin: bool,
 ) -> Result<Option<RouterDecision>, String> {
-    let system_prompt = build_system_prompt(sessions, messages, human_name, is_admin);
+    let system_prompt = build_system_prompt(sessions, messages, human_name);
     let response = call_api(config, &system_prompt, message)
         .await
         .map_err(|e| e.to_string())?;
@@ -53,7 +60,6 @@ fn build_system_prompt(
     sessions: &[SessionSnapshot],
     messages: &[MessageSnapshot],
     human_name: &str,
-    is_admin: bool,
 ) -> String {
     let mut prompt = String::from(
         "<role>\n\
@@ -66,7 +72,7 @@ fn build_system_prompt(
          </role>\n\n\
          <context>\n\
          When you route a message, the daemon delivers the human's original message verbatim to\n\
-         the target session(s) via tmux injection. The session then sees it as `[from <human>]: <message>`\n\
+         the target session(s) via tmux injection. The session then sees it as `<msg from=\"<human>\" ...>message</msg>`\n\
          and can respond. You do not need to rewrite or summarize the message — just pick the target(s).\n\n\
          Use the session list to understand what each session is working on (role, project directory,\n\
          project description). Use the message log to understand conversation context — who has been\n\
@@ -130,7 +136,12 @@ fn build_system_prompt(
     if !session_msgs.is_empty() {
         // Only include a small tail of inter-session traffic
         prompt.push_str("\n<inter_session_messages>\n");
-        for m in session_msgs.iter().rev().take(10).rev() {
+        for m in session_msgs
+            .iter()
+            .rev()
+            .take(MAX_INTER_SESSION_MESSAGES)
+            .rev()
+        {
             prompt.push_str(&format!(
                 "[{}] {} -> {}: {}\n",
                 m.timestamp, m.from, m.to, m.message
@@ -147,21 +158,16 @@ fn build_system_prompt(
          /help              — show help message\n\
          /list              — show sessions\n\
          /default <id>      — set default session\n\
-         /status            — daemon status\n",
-    );
-    if is_admin {
-        prompt.push_str(
-            "\
+         /status            — daemon status\n\
          /kill <session>    — kill a session\n\
          /start <name>      — start new session\n\
          /restart <name>    — restart a session\n\
          /connect <ticket>  — connect to peer\n\
          /nodes             — list connected nodes\n\
          /task list         — list scheduled tasks\n\
-         /task trigger <id> — trigger a task\n",
-        );
-    }
-    prompt.push_str("</commands>\n");
+         /task trigger <id> — trigger a task\n\
+         </commands>\n",
+    );
 
     prompt.push_str(&format!(
         "\n<instructions>\n\
@@ -246,6 +252,9 @@ async fn call_api(
         .ok_or_else(|| anyhow::anyhow!("no text in API response"))
 }
 
+/// Parse an LLM response into a [`RouterDecision`].
+///
+/// Returns `None` if the text does not match any expected format.
 pub fn parse_response(text: &str) -> Option<RouterDecision> {
     let text = text.trim();
 
@@ -290,8 +299,9 @@ pub async fn gather_context(
     state: &AppState,
     human_name: &str,
 ) -> (Vec<SessionSnapshot>, Vec<MessageSnapshot>) {
-    let sessions = state.sessions.read().await;
-    let session_snapshots: Vec<SessionSnapshot> = sessions
+    let proto = state.protocol.read().await;
+    let session_snapshots: Vec<SessionSnapshot> = proto
+        .sessions
         .values()
         .filter(|s| s.id != human_name)
         .map(|s| SessionSnapshot {
@@ -303,7 +313,7 @@ pub async fn gather_context(
             bulletin: s.metadata.bulletin.clone(),
         })
         .collect();
-    drop(sessions);
+    drop(proto);
 
     let log = state.message_log.read().await;
     let message_snapshots: Vec<MessageSnapshot> = log
@@ -312,16 +322,16 @@ pub async fn gather_context(
             timestamp: e.timestamp.format("%H:%M").to_string(),
             from: e.from.clone(),
             to: e.to.clone(),
-            message: truncate(&e.message, 200),
+            message: truncate(&e.message, MAX_MESSAGE_PREVIEW_LEN),
         })
         .collect();
 
     (session_snapshots, message_snapshots)
 }
 
-fn origin_label(origin: &SessionOrigin) -> String {
+fn origin_label(origin: &Origin) -> String {
     match origin {
-        SessionOrigin::Remote(d) => format!("remote/{d}"),
+        Origin::Remote(d) => format!("remote/{d}"),
         other => other.label().to_string(),
     }
 }
@@ -430,7 +440,7 @@ mod tests {
             project_description: Some("A web app".into()),
             bulletin: None,
         }];
-        let prompt = build_system_prompt(&sessions, &[], "daniel", false);
+        let prompt = build_system_prompt(&sessions, &[], "daniel");
         assert!(prompt.contains("web (local)"));
         assert!(prompt.contains("building frontend"));
         assert!(prompt.contains("~/code/web"));
@@ -440,7 +450,7 @@ mod tests {
 
     #[test]
     fn prompt_handles_empty() {
-        let prompt = build_system_prompt(&[], &[], "daniel", false);
+        let prompt = build_system_prompt(&[], &[], "daniel");
         assert!(prompt.contains("(none)"));
         assert!(prompt.contains("(no recent messages)"));
     }
@@ -461,7 +471,7 @@ mod tests {
                 message: "inter-session noise".into(),
             },
         ];
-        let prompt = build_system_prompt(&[], &messages, "daniel", false);
+        let prompt = build_system_prompt(&[], &messages, "daniel");
         assert!(prompt.contains("<conversation_history>"));
         assert!(prompt.contains("[10:30] daniel -> ouija: hello"));
         assert!(prompt.contains("<inter_session_messages>"));
@@ -469,18 +479,11 @@ mod tests {
     }
 
     #[test]
-    fn prompt_commands_non_admin() {
-        let prompt = build_system_prompt(&[], &[], "daniel", false);
+    fn prompt_includes_all_commands() {
+        let prompt = build_system_prompt(&[], &[], "daniel");
         assert!(prompt.contains("/help"));
         assert!(prompt.contains("/list"));
         assert!(prompt.contains("COMMAND"));
-        assert!(!prompt.contains("/kill"));
-        assert!(!prompt.contains("/start"));
-    }
-
-    #[test]
-    fn prompt_commands_admin() {
-        let prompt = build_system_prompt(&[], &[], "daniel", true);
         assert!(prompt.contains("/kill"));
         assert!(prompt.contains("/start"));
         assert!(prompt.contains("/restart"));
