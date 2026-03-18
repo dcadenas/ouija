@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::SessionMetadata;
 
+/// A session's identity and optional metadata for wire exchange.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: String,
@@ -9,6 +10,7 @@ pub struct SessionInfo {
     pub metadata: Option<SessionMetadata>,
 }
 
+/// Tagged JSON message exchanged between daemons over Nostr.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WireMessage {
@@ -18,6 +20,10 @@ pub enum WireMessage {
         message: String,
         #[serde(default)]
         expects_reply: bool,
+        #[serde(default)]
+        msg_id: u64,
+        #[serde(default)]
+        responds_to: Option<u64>,
     },
     SessionSendAck {
         from: String,
@@ -76,6 +82,36 @@ pub enum WireMessage {
         result: String,
         daemon_id: String,
     },
+    SessionStart {
+        name: String,
+        #[serde(default)]
+        project_dir: Option<String>,
+        #[serde(default)]
+        worktree: Option<bool>,
+        #[serde(default)]
+        prompt: Option<String>,
+        #[serde(default)]
+        from: Option<String>,
+        #[serde(default)]
+        expects_reply: Option<bool>,
+        daemon_id: String,
+        #[serde(default)]
+        seq: u64,
+    },
+    SessionRestart {
+        name: String,
+        #[serde(default)]
+        fresh: Option<bool>,
+        #[serde(default)]
+        prompt: Option<String>,
+        #[serde(default)]
+        from: Option<String>,
+        #[serde(default)]
+        expects_reply: Option<bool>,
+        daemon_id: String,
+        #[serde(default)]
+        seq: u64,
+    },
 }
 
 impl WireMessage {
@@ -88,7 +124,9 @@ impl WireMessage {
             | Self::SessionRemove { daemon_id, .. }
             | Self::SessionRenamed { daemon_id, .. }
             | Self::Command { daemon_id, .. }
-            | Self::CommandResult { daemon_id, .. } => Some(daemon_id),
+            | Self::CommandResult { daemon_id, .. }
+            | Self::SessionStart { daemon_id, .. }
+            | Self::SessionRestart { daemon_id, .. } => Some(daemon_id),
             Self::SessionSend { .. } | Self::ConnectRequest { .. } => None,
         }
     }
@@ -99,7 +137,9 @@ impl WireMessage {
             Self::SessionAnnounce { seq, .. }
             | Self::SessionList { seq, .. }
             | Self::SessionRemove { seq, .. }
-            | Self::SessionRenamed { seq, .. } => Some(*seq),
+            | Self::SessionRenamed { seq, .. }
+            | Self::SessionStart { seq, .. }
+            | Self::SessionRestart { seq, .. } => Some(*seq),
             _ => None,
         }
     }
@@ -121,10 +161,12 @@ mod tests {
             to: "b".into(),
             message: "hello".into(),
             expects_reply: false,
+            msg_id: 0,
+            responds_to: None,
         };
         let decoded = round_trip(&msg);
         assert!(
-            matches!(decoded, WireMessage::SessionSend { from, to, message, expects_reply }
+            matches!(decoded, WireMessage::SessionSend { from, to, message, expects_reply, .. }
             if from == "a" && to == "b" && message == "hello" && !expects_reply)
         );
     }
@@ -136,6 +178,8 @@ mod tests {
             to: "b".into(),
             message: "hello".into(),
             expects_reply: true,
+            msg_id: 0,
+            responds_to: None,
         };
         let decoded = round_trip(&msg);
         assert!(matches!(decoded, WireMessage::SessionSend { expects_reply, .. } if expects_reply));
@@ -261,6 +305,8 @@ mod tests {
             to: "b".into(),
             message: "hi".into(),
             expects_reply: false,
+            msg_id: 0,
+            responds_to: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"SessionSend\""));
@@ -331,5 +377,105 @@ mod tests {
         let json = r#"{"type":"Command","command":"/start bar"}"#;
         let msg: WireMessage = serde_json::from_str(json).unwrap();
         assert!(matches!(msg, WireMessage::Command { command, .. } if command == "/start bar"));
+    }
+
+    #[test]
+    fn session_start_round_trip() {
+        let msg = WireMessage::SessionStart {
+            name: "test-session".into(),
+            project_dir: Some("/home/user/project".into()),
+            worktree: Some(true),
+            prompt: Some("do the thing".into()),
+            from: Some("caller".into()),
+            expects_reply: Some(true),
+            daemon_id: "npub1abc".into(),
+            seq: 42,
+        };
+        let decoded = round_trip(&msg);
+        assert!(matches!(
+            decoded,
+            WireMessage::SessionStart {
+                name, project_dir, worktree, prompt, from, expects_reply, daemon_id, seq
+            }
+            if name == "test-session"
+                && project_dir.as_deref() == Some("/home/user/project")
+                && worktree == Some(true)
+                && prompt.as_deref() == Some("do the thing")
+                && from.as_deref() == Some("caller")
+                && expects_reply == Some(true)
+                && daemon_id == "npub1abc"
+                && seq == 42
+        ));
+    }
+
+    #[test]
+    fn session_start_minimal() {
+        // Only required fields
+        let msg = WireMessage::SessionStart {
+            name: "foo".into(),
+            project_dir: None,
+            worktree: None,
+            prompt: None,
+            from: None,
+            expects_reply: None,
+            daemon_id: "npub1abc".into(),
+            seq: 0,
+        };
+        let decoded = round_trip(&msg);
+        assert!(matches!(
+            decoded,
+            WireMessage::SessionStart { name, project_dir, worktree, .. }
+            if name == "foo" && project_dir.is_none() && worktree.is_none()
+        ));
+    }
+
+    #[test]
+    fn session_start_backward_compat() {
+        // Old daemon without optional fields should deserialize with defaults
+        let json = r#"{"type":"SessionStart","name":"foo","daemon_id":"npub1abc"}"#;
+        let msg: WireMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            msg,
+            WireMessage::SessionStart { name, project_dir, worktree, seq, .. }
+            if name == "foo" && project_dir.is_none() && worktree.is_none() && seq == 0
+        ));
+    }
+
+    #[test]
+    fn session_restart_round_trip() {
+        let msg = WireMessage::SessionRestart {
+            name: "test-session".into(),
+            fresh: Some(true),
+            prompt: Some("check status".into()),
+            from: Some("caller".into()),
+            expects_reply: Some(false),
+            daemon_id: "npub1abc".into(),
+            seq: 7,
+        };
+        let decoded = round_trip(&msg);
+        assert!(matches!(
+            decoded,
+            WireMessage::SessionRestart {
+                name, fresh, prompt, from, expects_reply, daemon_id, seq
+            }
+            if name == "test-session"
+                && fresh == Some(true)
+                && prompt.as_deref() == Some("check status")
+                && from.as_deref() == Some("caller")
+                && expects_reply == Some(false)
+                && daemon_id == "npub1abc"
+                && seq == 7
+        ));
+    }
+
+    #[test]
+    fn session_restart_backward_compat() {
+        let json = r#"{"type":"SessionRestart","name":"bar","daemon_id":"npub1xyz"}"#;
+        let msg: WireMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            msg,
+            WireMessage::SessionRestart { name, fresh, seq, .. }
+            if name == "bar" && fresh.is_none() && seq == 0
+        ));
     }
 }

@@ -4,7 +4,8 @@ use chrono::{DateTime, Utc};
 use ractor::concurrency::JoinHandle;
 use ractor::{Actor, ActorProcessingErr, ActorRef, MessagingErr};
 
-use crate::state::{AppState, PendingReply};
+use crate::daemon_protocol::PendingReplyEntry;
+use crate::state::AppState;
 
 /// Messages the session agent handles.
 #[derive(Debug)]
@@ -13,18 +14,8 @@ pub enum SessionMsg {
     Stopped,
     /// User typed (UserPromptSubmit) — cancel idle, mark active.
     Active,
-    /// A message was injected into this session's pane.
-    MessageDelivered {
-        from: String,
-        message: String,
-        expects_reply: bool,
-    },
-    /// This session sent a reply to someone.
-    ReplySent { to: String },
-    /// Query: return current pending replies (RPC).
-    GetPendingReplies(ractor::RpcReplyPort<Vec<PendingReply>>),
-    /// Clear a specific pending reply by sender name.
-    ClearPendingReply { from: String },
+    /// Query: return current pending replies from DaemonState (RPC).
+    GetPendingReplies(ractor::RpcReplyPort<Vec<PendingReplyEntry>>),
     /// Session was renamed — update internal session_id.
     Renamed { new_id: String },
     /// Internal: idle timer expired.
@@ -32,18 +23,27 @@ pub enum SessionMsg {
 }
 
 /// Per-session behavioral state owned by the agent.
-#[allow(dead_code)]
 pub struct SessionAgentState {
     pub session_id: String,
     pub pane: String,
     pub idle: bool,
     pub last_stopped_at: Option<DateTime<Utc>>,
     pub last_active_at: Option<DateTime<Utc>>,
-    pub pending_replies: Vec<PendingReply>,
     idle_timer: Option<JoinHandle<Result<(), MessagingErr<SessionMsg>>>>,
 }
 
+impl std::fmt::Debug for SessionAgentState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionAgentState")
+            .field("session_id", &self.session_id)
+            .field("pane", &self.pane)
+            .field("idle", &self.idle)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SessionAgentState {
+    /// Create initial agent state for a session and pane.
     pub fn new(session_id: String, pane: String) -> Self {
         Self {
             session_id,
@@ -51,34 +51,20 @@ impl SessionAgentState {
             idle: false,
             last_stopped_at: None,
             last_active_at: None,
-            pending_replies: Vec::new(),
             idle_timer: None,
         }
-    }
-
-    pub fn add_pending_reply(&mut self, from: &str, message: &str) {
-        if !self.pending_replies.iter().any(|p| p.from == from) {
-            self.pending_replies.push(PendingReply {
-                from: from.to_string(),
-                message: message.to_string(),
-                received_at: Utc::now(),
-                reminded: false,
-            });
-        }
-    }
-
-    pub fn clear_pending_reply(&mut self, from: &str) {
-        self.pending_replies.retain(|p| p.from != from);
     }
 }
 
 /// The actor struct. Holds a reference to shared app state for reading
 /// session metadata and performing tmux injection.
+#[derive(Debug)]
 pub struct SessionAgent {
     pub app_state: Arc<AppState>,
 }
 
 /// Arguments passed when spawning the agent.
+#[derive(Debug)]
 pub struct SessionAgentArgs {
     pub session_id: String,
     pub pane: String,
@@ -119,21 +105,24 @@ impl Actor for SessionAgent {
                 );
 
                 // Nudge about pending replies older than idle_timeout
-                let cutoff = Utc::now() - chrono::Duration::seconds(timeout as i64);
-                let overdue: Vec<String> = state
+                let cutoff = Utc::now().timestamp() - timeout as i64;
+                let pending = self
+                    .app_state
+                    .protocol
+                    .read()
+                    .await
                     .pending_replies
+                    .get(&state.session_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let overdue: Vec<String> = pending
                     .iter()
-                    .filter(|p| !p.reminded && p.received_at < cutoff)
+                    .filter(|p| p.received_at < cutoff)
                     .map(|p| p.from.clone())
                     .collect();
 
                 if !overdue.is_empty() {
                     self.send_reminders(&overdue, state).await;
-                    for p in &mut state.pending_replies {
-                        if !p.reminded && p.received_at < cutoff {
-                            p.reminded = true;
-                        }
-                    }
                 }
             }
             SessionMsg::Active => {
@@ -143,25 +132,19 @@ impl Actor for SessionAgent {
                     h.abort();
                 }
             }
-            SessionMsg::MessageDelivered {
-                from,
-                message,
-                expects_reply,
-            } => {
-                if expects_reply {
-                    state.add_pending_reply(&from, &message);
-                }
-            }
-            SessionMsg::ReplySent { to } => {
-                state.clear_pending_reply(&to);
-            }
             SessionMsg::GetPendingReplies(reply) => {
                 if !reply.is_closed() {
-                    let _ = reply.send(state.pending_replies.clone());
+                    let pending = self
+                        .app_state
+                        .protocol
+                        .read()
+                        .await
+                        .pending_replies
+                        .get(&state.session_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let _ = reply.send(pending);
                 }
-            }
-            SessionMsg::ClearPendingReply { from } => {
-                state.clear_pending_reply(&from);
             }
             SessionMsg::Renamed { new_id } => {
                 tracing::info!(
@@ -174,31 +157,33 @@ impl Actor for SessionAgent {
             SessionMsg::IdleTimeout => {
                 state.idle_timer = None;
                 state.idle = true;
+
+                // Read pending replies from DaemonState
+                let pending = self
+                    .app_state
+                    .protocol
+                    .read()
+                    .await
+                    .pending_replies
+                    .get(&state.session_id)
+                    .cloned()
+                    .unwrap_or_default();
+
                 tracing::debug!(
                     session = %state.session_id,
-                    pending = state.pending_replies.len(),
+                    pending = pending.len(),
                     "idle timeout fired"
                 );
 
-                let unreminded: Vec<String> = state
-                    .pending_replies
-                    .iter()
-                    .filter(|p| !p.reminded)
-                    .map(|p| p.from.clone())
-                    .collect();
+                let senders: Vec<String> = pending.iter().map(|p| p.from.clone()).collect();
 
-                if !unreminded.is_empty() {
+                if !senders.is_empty() {
                     tracing::info!(
                         session = %state.session_id,
-                        count = unreminded.len(),
+                        count = senders.len(),
                         "reminding about unanswered pending replies"
                     );
-                    self.send_reminders(&unreminded, state).await;
-                    for p in &mut state.pending_replies {
-                        if !p.reminded {
-                            p.reminded = true;
-                        }
-                    }
+                    self.send_reminders(&senders, state).await;
                 }
             }
         }
@@ -220,9 +205,10 @@ impl SessionAgent {
     async fn send_reminders(&self, senders: &[String], state: &SessionAgentState) {
         let vim_mode = self
             .app_state
-            .sessions
+            .protocol
             .read()
             .await
+            .sessions
             .get(&state.session_id)
             .map(|s| s.metadata.vim_mode)
             .unwrap_or(false);
@@ -245,24 +231,6 @@ mod tests {
     fn agent_state_starts_not_idle() {
         let state = SessionAgentState::new("test-sess".into(), "%1".into());
         assert!(!state.idle);
-        assert!(state.pending_replies.is_empty());
-    }
-
-    #[test]
-    fn agent_state_tracks_pending_replies() {
-        let mut state = SessionAgentState::new("test-sess".into(), "%1".into());
-        state.add_pending_reply("sender-a", "hello?");
-        assert_eq!(state.pending_replies.len(), 1);
-        // Duplicate sender is ignored
-        state.add_pending_reply("sender-a", "hello again?");
-        assert_eq!(state.pending_replies.len(), 1);
-        // Different sender is added
-        state.add_pending_reply("sender-b", "hey");
-        assert_eq!(state.pending_replies.len(), 2);
-        // Clear
-        state.clear_pending_reply("sender-a");
-        assert_eq!(state.pending_replies.len(), 1);
-        assert_eq!(state.pending_replies[0].from, "sender-b");
     }
 
     #[tokio::test]

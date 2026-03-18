@@ -302,7 +302,7 @@ result=$(api "$BASE_B" POST /api/send -d '{"from":"route-b","to":"alpha/route-a"
 assert_contains "R4: send via gossip" "$result" "nostr"
 wait_for 10 bash -c "tmux capture-pane -t '$PANE_A1' -p -S -30 | grep -qF 'routed hello'"
 pane_content=$(tmux capture-pane -t "$PANE_A1" -p -S -30)
-assert_contains "R4: message has from prefix" "$pane_content" "[from beta/route-b ?]:"
+assert_contains "R4: message has from prefix" "$pane_content" '<msg from="beta/route-b"'
 assert_contains "R4: message content delivered" "$pane_content" "routed hello"
 
 log "Test R5: Cross-daemon message without expects_reply omits ?"
@@ -313,8 +313,8 @@ wait_for 10 bash -c "tmux capture-pane -t '$PANE_A1' -p -S -30 | grep -qF 'fyi o
 pane_content=$(tmux capture-pane -t "$PANE_A1" -p -S -30)
 # Check the specific line containing "fyi only" has no ? prefix
 fyi_line=$(echo "$pane_content" | grep -F "fyi only" | head -1)
-assert_contains "R5: fyi line has from prefix" "$fyi_line" "[from beta/route-b]:"
-assert_not_contains "R5: fyi line has no ? marker" "$fyi_line" "[from beta/route-b ?]:"
+assert_contains "R5: fyi line has from prefix" "$fyi_line" '<msg from="beta/route-b"'
+assert_not_contains "R5: fyi line has no reply attr" "$fyi_line" 'reply="true"'
 
 # Cleanup
 api "$BASE_A" POST /api/remove -d '{"id":"route-a"}' >/dev/null 2>&1 || true

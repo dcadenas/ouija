@@ -9,6 +9,7 @@ use crate::mcp::OuijaMcp;
 use crate::state::SharedState;
 use crate::{admin, api};
 
+/// Start the HTTP/MCP server on the configured port.
 pub async fn run(state: SharedState) -> anyhow::Result<()> {
     let port = state.config.port;
     let name = state.config.name.clone();
@@ -82,9 +83,11 @@ pub async fn run(state: SharedState) -> anyhow::Result<()> {
 
     let addr = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&addr).await?;
+    println!("ouija daemon '{name}' listening on http://localhost:{port}");
+    println!("  admin: http://localhost:{port}/admin");
     tracing::info!("ouija daemon '{name}' listening on {addr}");
     tracing::info!("  MCP:   http://localhost:{port}/mcp");
-    tracing::info!("  Admin: http://localhost:{port}/admin");
+    tracing::info!("  admin: http://localhost:{port}/admin");
     axum::serve(listener, app).await?;
 
     Ok(())

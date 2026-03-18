@@ -4,6 +4,10 @@
 //! liveness properties of session management. Abstracts away tmux injection
 //! and Nostr transport.
 //!
+//! This is the abstract model using enum Sid/DaemonId types. A second model
+//! using the real `DaemonState` lives in `src/daemon_protocol.rs` as
+//! `stateright_model` — it exercises production `apply()` directly.
+//!
 //! ## Bugs found
 //!
 //! 1. **Out-of-order message race**: SessionAnnounce, SessionList, and
@@ -14,19 +18,27 @@
 //!
 //! 2. **Alias self-loops**: `add_alias` creates self-loops (e.g. C→C) when
 //!    local and remote renames interact with overlapping session IDs.
-//!    The real code tolerates this (one-hop resolve + existence check), but
-//!    the alias map becomes logically inconsistent.
-//!
-//! ## Fix verified
-//!
-//! Adding a monotonic generation counter to all wire messages from a daemon,
-//! and having receivers drop messages with generation < last seen from that
-//! daemon, restores convergence.
+//!    Fixed: `add_alias` now retains only entries where key != value.
 //!
 //! 3. **Cross-daemon orphaned pending replies**: When a session is removed,
 //!    pending reply cleanup only runs on the local daemon. Remote daemons
 //!    that received expects_reply messages from the removed session retain
 //!    stale pending reply entries.
+//!
+//! 4. **accept_seq restart bypass** (found by real-DaemonState model):
+//!    `accept_seq` had a `seq <= 1` special case for daemon restarts that
+//!    also accepted stale messages, resetting the generation counter. A stale
+//!    SessionAnnounce{seq=1} arriving after a SessionList{seq=2} would reset
+//!    `last_seen_seq`, letting the old SessionList{seq=1} through and
+//!    overwriting correct remote state.
+//!    Fixed: removed the seq<=1 bypass; daemon restarts now use
+//!    timestamp-based wire_seq so new incarnations always have higher seqs.
+//!
+//! ## Fixes verified
+//!
+//! - Generation counter (strict `seq < last` rejection) restores convergence.
+//! - `add_alias` self-loop removal makes alias maps acyclic.
+//! - SessionList reconciliation clears orphaned pending replies.
 
 use stateright::actor::{Actor, ActorModel, Id, Network, Out};
 use stateright::{Checker, Expectation, Model};
@@ -91,6 +103,8 @@ enum Msg {
         old_id: Sid,
         new_id: Sid,
     },
+    /// Daemon restart: clears all local state and re-broadcasts.
+    DaemonRestart,
 }
 
 impl Msg {
@@ -120,6 +134,8 @@ enum Action {
     Register(Sid),
     Remove(Sid),
     Rename(Sid, Sid),
+    /// Daemon restart: clears all state and re-broadcasts.
+    DaemonRestart,
 }
 
 // ---------------------------------------------------------------------------
@@ -284,6 +300,26 @@ impl Actor for OuijaActor {
                 }
             }
 
+            Msg::DaemonRestart => {
+                let s = state.to_mut();
+                let OuijaState::Daemon {
+                    local,
+                    aliases,
+                    peers,
+                    daemon_id,
+                    seq,
+                    ..
+                } = s
+                else {
+                    return;
+                };
+                local.clear();
+                aliases.clear();
+                *seq += 1;
+                let g = *seq;
+                send_list(local, *daemon_id, g, peers, o);
+            }
+
             ref wire_msg if wire_msg.daemon().is_some_and(|d| d != my_id) => {
                 let from_daemon = wire_msg.daemon().unwrap();
                 match wire_msg {
@@ -367,6 +403,7 @@ impl Actor for OuijaActor {
                             new_id: *new,
                         },
                     ),
+                    Action::DaemonRestart => o.send(*target, Msg::DaemonRestart),
                 }
                 if *actions_taken < MAX_CLIENT_ACTIONS {
                     offer_actions(o);
@@ -489,6 +526,29 @@ impl Actor for FixedActor {
                 }
             }
 
+            Msg::DaemonRestart => {
+                let s = state.to_mut();
+                let OuijaState::Daemon {
+                    local,
+                    aliases,
+                    peers,
+                    daemon_id,
+                    seq,
+                    ..
+                } = s
+                else {
+                    return;
+                };
+                // Clear all local state (simulates daemon restart)
+                local.clear();
+                aliases.clear();
+                // Bump seq so peers see a fresh generation
+                *seq += 1;
+                let g = *seq;
+                // Broadcast empty session list (peers reconcile away stale remotes)
+                send_fixed_list(local, *daemon_id, g, peers, o);
+            }
+
             ref wire_msg if wire_msg.daemon().is_some_and(|d| d != my_id) => {
                 let from_daemon = wire_msg.daemon().unwrap();
                 let msg_seq = wire_msg.seq().unwrap();
@@ -582,6 +642,7 @@ impl Actor for FixedActor {
                             new_id: *new,
                         },
                     ),
+                    Action::DaemonRestart => o.send(*target, Msg::DaemonRestart),
                 }
                 if *actions_taken < MAX_CLIENT_ACTIONS {
                     offer_fixed_actions(o);
@@ -645,6 +706,7 @@ fn offer_actions(o: &mut Out<OuijaActor>) {
             }
         }
     }
+    c.push(Action::DaemonRestart);
     o.choose_random("action", c);
 }
 
@@ -661,6 +723,7 @@ fn offer_fixed_actions(o: &mut Out<FixedActor>) {
             }
         }
     }
+    c.push(Action::DaemonRestart);
     o.choose_random("action", c);
 }
 
@@ -1430,6 +1493,36 @@ mod tests {
             checker.discovery("alias acyclic").is_some(),
             "Expected alias cycle from cross-daemon renames"
         );
+    }
+
+    /// Bug 5: DaemonRestart without generation counter breaks convergence.
+    /// After restart, stale messages from the old incarnation can re-add
+    /// sessions that were cleared.
+    #[test]
+    fn bug_restart_breaks_convergence_without_gen_counter() {
+        let checker = build_current_model().checker().spawn_bfs().join();
+        assert!(
+            checker.discovery("convergence").is_some(),
+            "Expected convergence violation from restart + stale messages"
+        );
+        println!(
+            "Bug confirmed: restart breaks convergence without gen counter. States: {}, unique: {}",
+            checker.state_count(),
+            checker.unique_state_count(),
+        );
+    }
+
+    /// Fix: generation counter restores convergence even with daemon restarts.
+    #[test]
+    fn fix_restart_convergence_with_gen_counter() {
+        let checker = build_fixed_model().checker().spawn_bfs().join();
+        println!(
+            "Fixed model with restart — States: {}, unique: {}, max depth: {}",
+            checker.state_count(),
+            checker.unique_state_count(),
+            checker.max_depth(),
+        );
+        checker.assert_properties();
     }
 
     /// No daemon ever holds a remote session attributed to itself (holds in both models).

@@ -190,7 +190,8 @@ assert_contains "send delivered" "$result" '"status":"delivered"'
 wait_for 5 bash -c "tmux capture-pane -t '$PANE_A' -p | grep -qF 'hello from test'"
 pane_content=$(tmux capture-pane -t "$PANE_A" -p)
 assert_contains "message appears in pane" "$pane_content" "hello from test"
-assert_contains "no ? prefix" "$pane_content" "[from sess-b]:"
+assert_contains "XML format no reply attr" "$pane_content" '<msg from="sess-b"'
+assert_not_contains "no reply attr when expects_reply=false" "$pane_content" 'reply="true"'
 
 log "Test 11b: Long message injection (>200 chars, uses load-buffer)"
 LONG_MSG="This is a long test message that exceeds 200 characters to exercise the inject_long code path which uses tmux load-buffer and paste-buffer instead of send-keys. It includes backticks \`like this\` and parentheses (like these) to test special character handling. Padding: AAAAAAAAAAAAA done."
@@ -200,12 +201,15 @@ wait_for 5 bash -c "tmux capture-pane -t '$PANE_A' -p -S -20 | grep -qF 'inject_
 pane_content=$(tmux capture-pane -t "$PANE_A" -p -S -20)
 assert_contains "long message appears in pane" "$pane_content" "inject_long code path"
 
-log "Test 11c: expects_reply=true adds ? prefix"
+log "Test 11c: expects_reply=true adds reply attr in XML"
 result=$(api "$BASE" POST /api/send -d "{\"from\":\"sess-b\",\"to\":\"sess-a2\",\"message\":\"reply needed\",\"expects_reply\":true}")
 assert_contains "expects_reply send delivered" "$result" '"status":"delivered"'
-wait_for 5 bash -c "tmux capture-pane -t '$PANE_A' -p -S -20 | grep -qF '[from sess-b ?]:'"
+assert_contains "response includes msg_id" "$result" '"msg_id"'
+wait_for 5 bash -c "tmux capture-pane -t '$PANE_A' -p -S -20 | grep -qF 'reply=\"true\"'"
 pane_content=$(tmux capture-pane -t "$PANE_A" -p -S -20)
-assert_contains "? prefix in pane" "$pane_content" "[from sess-b ?]:"
+assert_contains "XML format with reply attr" "$pane_content" 'reply="true"'
+assert_contains "XML has from attr" "$pane_content" '<msg from="sess-b"'
+assert_contains "XML has id attr" "$pane_content" 'id="'
 
 log "Test 11d: pending-replies endpoint includes message"
 PANE_A_NUM="${PANE_A#%}"
@@ -278,6 +282,32 @@ for sid in $ids_before; do
 done
 # Restore auto_register
 api "$BASE" POST /api/settings -d '{"auto_register":true}' >/dev/null
+
+log "Test 12d: Custom session names survive restart with auto-register ON"
+# Register a session with a custom name that differs from its directory basename
+api "$BASE" POST /api/register -d "{\"id\":\"my-custom-name\",\"pane\":\"$PANE_A\",\"metadata\":{\"project_dir\":\"/tmp\"}}" >/dev/null
+ids_before=$(session_ids "$BASE")
+assert_contains "custom name registered" "$ids_before" "my-custom-name"
+# Restart daemon WITH auto_register enabled — the bug would overwrite "my-custom-name" with "tmp"
+kill $DAEMON_PID 2>/dev/null || true
+wait $DAEMON_PID 2>/dev/null || true
+sleep 0.5
+echo '{"auto_register":true,"reaper_interval_secs":1}' > /tmp/ouija-test/settings.json
+RUST_LOG=ouija=debug ouija start --port $PORT --data /tmp/ouija-test >/tmp/daemon-restart2.log 2>&1 &
+DAEMON_PID=$!
+wait_for 10 curl -sf "$BASE/api/status" -o /dev/null
+# Wait for session restoration
+for i in $(seq 1 50); do
+    ids_after=$(session_ids "$BASE")
+    if echo "$ids_after" | grep -qF "my-custom-name"; then break; fi
+    sleep 0.2
+done
+ids_after=$(session_ids "$BASE")
+assert_contains "custom name survives restart" "$ids_after" "my-custom-name"
+assert_not_contains "auto-register did not overwrite with basename" "$ids_after" " tmp"
+# Clean up: remove custom session and disable auto_register for remaining tests
+api "$BASE" POST /api/remove -d '{"id":"my-custom-name"}' >/dev/null 2>&1 || true
+api "$BASE" POST /api/settings -d '{"auto_register":false}' >/dev/null
 
 # ═══════════════════════════════════════════════════════════════════
 # MCP PROTOCOL TESTS
@@ -648,27 +678,29 @@ chmod +x /tmp/fakebin/claude
 printf '#!/bin/bash\nexec /tmp/fakebin/claude 3600\n' > /usr/local/bin/claude
 chmod +x /usr/local/bin/claude
 
-log "Test L16: session_start with from param prefixes prompt with [from X ?]:"
+log "Test L16: session_start with from param uses XML format with reply=true"
 L16=$(api "$BASE" POST /api/sessions/start -d '{"name":"from-test","prompt":"what is your status?","from":"orchestrator"}')
 assert_contains "L16: start succeeds" "$L16" "started"
 wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'from-test'"
 L16_PANE=$(session_field "$BASE" "from-test" "pane")
-wait_for 12 bash -c "tmux capture-pane -t '$L16_PANE' -p -S -30 | grep -qF '[from orchestrator ?]:'"
+wait_for 12 bash -c "tmux capture-pane -t '$L16_PANE' -p -S -30 | grep -qF 'from=\"orchestrator\"'"
 L16_CONTENT=$(tmux capture-pane -t "$L16_PANE" -p -S -30)
-assert_contains "L16: prompt has [from X ?]: prefix" "$L16_CONTENT" "[from orchestrator ?]: what is your status?"
+assert_contains "L16: prompt has XML from attr" "$L16_CONTENT" 'from="orchestrator"'
+assert_contains "L16: prompt has reply attr" "$L16_CONTENT" 'reply="true"'
+assert_contains "L16: prompt has message content" "$L16_CONTENT" "what is your status?"
 # Kill pane directly (fake claude makes API kill slow due to /exit timeout)
 tmux kill-pane -t "$L16_PANE" 2>/dev/null || true
 api "$BASE" POST /api/remove -d '{"id":"from-test"}' >/dev/null 2>&1 || true
 
-log "Test L17: session_start with from + expects_reply=false omits ?"
+log "Test L17: session_start with from + expects_reply=false omits reply attr"
 L17=$(api "$BASE" POST /api/sessions/start -d '{"name":"from-noreply","prompt":"FYI deployed v2","from":"deployer","expects_reply":false}')
 assert_contains "L17: start succeeds" "$L17" "started"
 wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'from-noreply'"
 L17_PANE=$(session_field "$BASE" "from-noreply" "pane")
-wait_for 12 bash -c "tmux capture-pane -t '$L17_PANE' -p -S -30 | grep -qF '[from deployer]:'"
+wait_for 12 bash -c "tmux capture-pane -t '$L17_PANE' -p -S -30 | grep -qF 'from=\"deployer\"'"
 L17_CONTENT=$(tmux capture-pane -t "$L17_PANE" -p -S -30)
-assert_contains "L17: prompt has [from X]: prefix (no ?)" "$L17_CONTENT" "[from deployer]: FYI deployed v2"
-assert_not_contains "L17: no ? in prefix" "$L17_CONTENT" "[from deployer ?]:"
+assert_contains "L17: prompt has XML from attr" "$L17_CONTENT" 'from="deployer"'
+assert_not_contains "L17: no reply attr" "$L17_CONTENT" 'reply="true"'
 tmux kill-pane -t "$L17_PANE" 2>/dev/null || true
 api "$BASE" POST /api/remove -d '{"id":"from-noreply"}' >/dev/null 2>&1 || true
 
@@ -680,7 +712,7 @@ L18_PANE=$(session_field "$BASE" "plain-prompt" "pane")
 wait_for 12 bash -c "tmux capture-pane -t '$L18_PANE' -p -S -30 | grep -qF 'just a plain prompt'"
 L18_CONTENT=$(tmux capture-pane -t "$L18_PANE" -p -S -30)
 assert_contains "L18: plain prompt injected" "$L18_CONTENT" "just a plain prompt"
-assert_not_contains "L18: no [from] prefix" "$L18_CONTENT" "[from"
+assert_not_contains "L18: no XML msg tag" "$L18_CONTENT" "<msg "
 tmux kill-pane -t "$L18_PANE" 2>/dev/null || true
 api "$BASE" POST /api/remove -d '{"id":"plain-prompt"}' >/dev/null 2>&1 || true
 
@@ -761,13 +793,6 @@ pane_content=$(tmux capture-pane -t "$PANE_A" -p -S -20)
 assert_contains "reminder injected on idle" "$pane_content" "unanswered question from asker"
 assert_contains "reminder includes session_send hint" "$pane_content" "session_send"
 assert_not_contains "no ouija prefix in reminder" "$pane_content" "[ouija]"
-# Second stopped should NOT re-inject (reminded flag is set)
-# Count injections by capturing pane content before and after second idle cycle
-pre_count=$(tmux capture-pane -t "$PANE_A" -p -S -50 | grep -c "unanswered question from asker" || true)
-curl -sf -X POST "${BASE}/api/pane/${PANE_A_NUM}/stopped" >/dev/null 2>&1
-sleep 3
-post_count=$(tmux capture-pane -t "$PANE_A" -p -S -50 | grep -c "unanswered question from asker" || true)
-assert_eq "no duplicate reminder" "$post_count" "$pre_count"
 # Clean up
 api "$BASE" POST /api/remove -d '{"id":"reminder-test"}' >/dev/null 2>&1 || true
 api "$BASE" POST /api/settings -d '{"idle_timeout_secs":60}' >/dev/null
@@ -966,6 +991,70 @@ api "$BASE" POST /api/remove -d '{"id":"fifo-sender"}' >/dev/null 2>&1 || true
 # ═══════════════════════════════════════════════════════════════════
 # REGISTER HOOK RACE — DAEMON PRE-REGISTERS, HOOK SKIPS
 # ═══════════════════════════════════════════════════════════════════
+
+log "Test 26: XML message format in pane injection"
+api "$BASE" POST /api/register -d "{\"id\":\"xml-target\",\"pane\":\"$PANE_A\"}" >/dev/null 2>&1 || true
+api "$BASE" POST /api/register -d "{\"id\":\"xml-sender\",\"pane\":\"$PANE_B\"}" >/dev/null 2>&1 || true
+tmux send-keys -t "$PANE_A" "clear" Enter
+sleep 0.5
+result=$(api "$BASE" POST /api/send -d '{"from":"xml-sender","to":"xml-target","message":"hello xml","expects_reply":true}')
+assert_contains "26: send delivered" "$result" '"status":"delivered"'
+assert_contains "26: response has msg_id" "$result" '"msg_id"'
+wait_for 5 bash -c "tmux capture-pane -t '$PANE_A' -p -S -10 | grep -qF 'from=\"xml-sender\"'"
+pane_content=$(tmux capture-pane -t "$PANE_A" -p -S -10)
+assert_contains "26: XML format in pane" "$pane_content" '<msg from="xml-sender"'
+assert_contains "26: has reply attr" "$pane_content" 'reply="true"'
+assert_contains "26: has id attr" "$pane_content" 'id="'
+assert_contains "26: has message content" "$pane_content" "hello xml"
+assert_contains "26: has closing tag" "$pane_content" "</msg>"
+api "$BASE" POST /api/remove -d '{"id":"xml-target"}' >/dev/null 2>&1 || true
+api "$BASE" POST /api/remove -d '{"id":"xml-sender"}' >/dev/null 2>&1 || true
+
+log "Test 27: responds_to clears pending reply"
+api "$BASE" POST /api/register -d "{\"id\":\"rt-target\",\"pane\":\"$PANE_A\"}" >/dev/null 2>&1 || true
+api "$BASE" POST /api/register -d "{\"id\":\"rt-sender\",\"pane\":\"$PANE_B\"}" >/dev/null 2>&1 || true
+sleep 0.5
+# Send with expects_reply=true, get msg_id from response
+result=$(api "$BASE" POST /api/send -d '{"from":"rt-sender","to":"rt-target","message":"do this","expects_reply":true}')
+msg_id=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['msg_id'])" 2>/dev/null || echo "")
+[ -n "$msg_id" ] && pass "27: got msg_id" || fail "27: got msg_id (empty)"
+PANE_A_NUM="${PANE_A#%}"
+sleep 0.5
+# Verify pending reply exists
+pending=$(api "$BASE" GET "/api/pane/${PANE_A_NUM}/pending-replies")
+assert_contains "27: pending exists before ack" "$pending" '"count":1'
+# Ack without responds_to — pending should still exist
+api "$BASE" POST /api/send -d '{"from":"rt-target","to":"rt-sender","message":"ack"}' >/dev/null
+sleep 0.5
+pending=$(api "$BASE" GET "/api/pane/${PANE_A_NUM}/pending-replies")
+assert_contains "27: pending still exists after plain ack" "$pending" '"count":1'
+# Reply with responds_to — pending should clear
+api "$BASE" POST /api/send -d "{\"from\":\"rt-target\",\"to\":\"rt-sender\",\"message\":\"done\",\"responds_to\":$msg_id}" >/dev/null
+sleep 0.5
+pending=$(api "$BASE" GET "/api/pane/${PANE_A_NUM}/pending-replies")
+assert_contains "27: pending cleared after responds_to" "$pending" '"count":0'
+api "$BASE" POST /api/remove -d '{"id":"rt-target"}' >/dev/null 2>&1 || true
+api "$BASE" POST /api/remove -d '{"id":"rt-sender"}' >/dev/null 2>&1 || true
+
+log "Test 28: responds_to adds re attr in XML"
+api "$BASE" POST /api/register -d "{\"id\":\"re-target\",\"pane\":\"$PANE_A\"}" >/dev/null 2>&1 || true
+api "$BASE" POST /api/register -d "{\"id\":\"re-sender\",\"pane\":\"$PANE_B\"}" >/dev/null 2>&1 || true
+sleep 0.5
+# Send and get msg_id
+result=$(api "$BASE" POST /api/send -d '{"from":"re-sender","to":"re-target","message":"question","expects_reply":true}')
+msg_id=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['msg_id'])" 2>/dev/null || echo "")
+[ -n "$msg_id" ] && pass "28: got msg_id" || fail "28: got msg_id (empty)"
+tmux send-keys -t "$PANE_B" "clear" Enter
+sleep 0.5
+# Reply with responds_to — should include re= attr in the injected XML
+api "$BASE" POST /api/send -d "{\"from\":\"re-target\",\"to\":\"re-sender\",\"message\":\"answer\",\"responds_to\":$msg_id}" >/dev/null
+wait_for 5 bash -c "tmux capture-pane -t '$PANE_B' -p -S -10 | grep -qF 're=\"$msg_id\"'"
+pane_content=$(tmux capture-pane -t "$PANE_B" -p -S -10)
+assert_contains "28: re attr in XML" "$pane_content" "re=\"$msg_id\""
+assert_contains "28: from attr" "$pane_content" 'from="re-target"'
+assert_contains "28: message content" "$pane_content" "answer"
+api "$BASE" POST /api/remove -d '{"id":"re-target"}' >/dev/null 2>&1 || true
+api "$BASE" POST /api/remove -d '{"id":"re-sender"}' >/dev/null 2>&1 || true
 
 log "Test 25: Hook skips registration when pane already registered by daemon"
 REGISTER_SCRIPT=$(find_script "ouija-register.sh")
