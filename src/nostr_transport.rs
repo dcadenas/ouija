@@ -1283,8 +1283,13 @@ pub async fn start_session(
         format!("{base}/{name}")
     };
 
-    // Auto-enable worktree if another session shares this directory
+    // Auto-enable worktree if another session shares this directory AND it's a git repo
+    let is_git_repo = std::path::Path::new(&dir).join(".git").exists();
     let (worktree, auto_worktree) = match worktree {
+        Some(wt) if wt && !is_git_repo => {
+            tracing::warn!("worktree requested but {dir} is not a git repo, disabling");
+            (false, false)
+        }
         Some(wt) => (wt, false),
         None => {
             let proto = state.protocol.read().await;
@@ -1292,7 +1297,11 @@ pub async fn start_session(
                 matches!(s.origin, crate::daemon_protocol::Origin::Local)
                     && s.metadata.project_dir.as_deref() == Some(dir.as_str())
             });
-            (conflict, conflict)
+            if conflict && !is_git_repo {
+                tracing::warn!("directory conflict for {dir} but not a git repo, skipping auto-worktree");
+            }
+            let auto = conflict && is_git_repo;
+            (auto, auto)
         }
     };
 
