@@ -4,7 +4,7 @@ When you're running Claude Code in multiple terminals, they can't share what the
 
 You've been building the auth service in one session for hours. Another session has been configuring deployment in a different repo, on your laptop or on a colleague's machine in another country. You realize each holds context the other needs. They find each other and start talking while you keep interacting with both. No restart, no re-planning, no context lost.
 
-![Two Claude Code sessions collaborating through ouija](screenshot.png)
+![The auth-service session asks deploy-infra what port the gateway runs on. Deploy-infra reads its docker-compose.yml and replies. Both sessions stay interactive in their own terminals.](screenshot.png)
 
 Unlike Claude Code [agent teams](https://code.claude.com/docs/en/agent-teams), which plan a team upfront for a single task, ouija connects sessions that weren't planned together. Ad-hoc, cross-machine, no hierarchy. They're complementary: you can run agent teams inside ouija sessions.
 
@@ -29,13 +29,13 @@ tmux new-session && claude
 
 Sessions auto-register using the working directory name (e.g. `/code/api` becomes `api`). Start talking:
 
-> "Use ouija to ask api what port the auth service runs on"
+> "Use ouija to ask deploy what port the gateway is exposed on"
 
 ## What you can do
 
 **Message any session**, local or remote. Sessions discover each other automatically.
 
-**Spawn sessions on the fly.** `session_start("crash-ios")` creates a tmux window, launches Claude Code, and registers it. Pass a `prompt` to seed the session with context. Works on `session_restart` too.
+**Spawn sessions on the fly.** `session_start("gateway-debug")` creates a tmux window, launches Claude Code, and registers it. Pass a `prompt` to seed the session with context. Works on `session_restart` too.
 
 **Run long-lived sessions.** Sessions persist across daemon restarts, get auto-revived by scheduled tasks, and maintain their names and context. A session that's been investigating a memory leak for hours keeps all that context available to other sessions that discover it later.
 
