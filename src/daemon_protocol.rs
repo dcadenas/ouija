@@ -865,7 +865,16 @@ impl DaemonState {
                 msg_id,
                 responds_to,
                 done,
-            } => self.apply_incoming_send(&from, &to, &message, expects_reply, msg_id, responds_to, done),
+            } => self.apply_incoming_send(
+                &from,
+                &to,
+                &message,
+                expects_reply,
+                msg_id,
+                responds_to,
+                done,
+                sender_npub.as_deref(),
+            ),
             WireMessage::SessionSendAck {
                 from,
                 to,
@@ -978,6 +987,7 @@ impl DaemonState {
         msg_id: u64,
         responds_to: Option<u64>,
         done: bool,
+        sender_npub: Option<&str>,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
         // Use remote msg_id if provided, otherwise assign a local one
@@ -1000,7 +1010,9 @@ impl DaemonState {
             }
         }
 
-        // Resolve bare `from` to daemon-prefixed key
+        // Resolve bare `from` to daemon-prefixed remote session key.
+        // First try exact match in known remote sessions.
+        // If not found, derive prefix from any remote session sharing the sender's npub.
         let remote_match = self
             .sessions
             .iter()
@@ -1008,7 +1020,20 @@ impl DaemonState {
                 matches!(&s.origin, Origin::Remote(_)) && strip_remote_prefix(&s.id) == from
             })
             .map(|(key, _)| key.clone());
-        let display_from = remote_match.unwrap_or_else(|| from.to_string());
+        let display_from = remote_match.unwrap_or_else(|| {
+            // Session not in our list — derive prefix from sender's daemon npub
+            if let Some(npub) = sender_npub {
+                if let Some((key, _)) = self
+                    .sessions
+                    .iter()
+                    .find(|(_, s)| matches!(&s.origin, Origin::Remote(d) if d == npub))
+                {
+                    let prefix = key.split('/').next().unwrap_or(from);
+                    return format!("{prefix}/{from}");
+                }
+            }
+            from.to_string()
+        });
 
         let target = self.sessions.get(to).cloned();
 
@@ -1347,8 +1372,14 @@ impl DaemonState {
         match &session.origin {
             Origin::Local => {
                 if let Some(ref pane) = session.pane {
-                    let formatted =
-                        format_session_message(from, message, expects_reply, msg_id, responds_to, done);
+                    let formatted = format_session_message(
+                        from,
+                        message,
+                        expects_reply,
+                        msg_id,
+                        responds_to,
+                        done,
+                    );
                     effects.push(Effect::InjectMessage {
                         pane: pane.clone(),
                         message: formatted,
@@ -1471,10 +1502,16 @@ mod tests {
     #[test]
     fn format_message_done_attribute() {
         let msg = format_session_message("a", "hello", false, 1, Some(47), true);
-        assert!(msg.contains(r#"done="true""#), "done=true must appear in XML: {msg}");
+        assert!(
+            msg.contains(r#"done="true""#),
+            "done=true must appear in XML: {msg}"
+        );
 
         let msg_no_done = format_session_message("a", "hello", false, 1, Some(47), false);
-        assert!(!msg_no_done.contains("done"), "done must not appear when false: {msg_no_done}");
+        assert!(
+            !msg_no_done.contains("done"),
+            "done must not appear when false: {msg_no_done}"
+        );
     }
 
     #[test]
