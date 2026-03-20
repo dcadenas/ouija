@@ -818,6 +818,7 @@ pub async fn update_settings(
     if let Some(v) = body.auto_register {
         settings.auto_register = v;
     }
+    let projects_dir_changed = body.projects_dir.is_some();
     if let Some(v) = body.projects_dir {
         settings.projects_dir = Some(v);
     }
@@ -837,6 +838,16 @@ pub async fn update_settings(
             Json(json!({ "error": format!("failed to save: {e}") })),
         );
     }
+    // Drop the write lock before spawning the refresh
+    drop(settings);
+    // Rebuild project index when projects_dir changes
+    if projects_dir_changed {
+        let s = state.clone();
+        tokio::spawn(async move {
+            crate::project_index::refresh_index(&s).await;
+        });
+    }
+    let settings = state.settings.read().await;
     (
         StatusCode::OK,
         Json(json!({

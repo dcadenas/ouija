@@ -378,6 +378,49 @@ assert_contains "same-id re-register succeeds" "$result" "registered as mcp-ok"
 api "$BASE" POST /api/remove -d '{"id":"mcp-ok"}' >/dev/null 2>&1 || true
 api "$BASE" POST /api/remove -d '{"id":"mcp-target"}' >/dev/null 2>&1 || true
 
+log "Test 19c: MCP session_rename — rename preserves session"
+api "$BASE" POST /api/register -d "{\"id\":\"rename-src\",\"pane\":\"$PANE_A\",\"role\":\"tester\"}" >/dev/null
+result=$(mcp_call_tool "$BASE" "session_rename" '{"old_id":"rename-src","new_id":"rename-dst"}')
+assert_contains "19c: rename succeeded" "$result" "renamed 'rename-src' to 'rename-dst'"
+ids=$(session_ids "$BASE")
+assert_contains "19c: new name present" "$ids" "rename-dst"
+assert_not_contains "19c: old name gone" "$ids" "rename-src"
+# Verify role preserved after rename
+role_after=$(session_field "$BASE" "rename-dst" "role")
+assert_eq "19c: role preserved after rename" "$role_after" "tester"
+
+log "Test 19d: MCP session_send to old name returns alias hint"
+api "$BASE" POST /api/register -d "{\"id\":\"rename-sender\",\"pane\":\"$PANE_B\"}" >/dev/null
+result=$(mcp_call_tool "$BASE" "session_send" '{"from":"rename-sender","to":"rename-src","message":"hello old name","expects_reply":false}')
+assert_contains "19d: error mentions rename" "$result" "was renamed to"
+# Cleanup
+api "$BASE" POST /api/remove -d '{"id":"rename-dst"}' >/dev/null 2>&1 || true
+api "$BASE" POST /api/remove -d '{"id":"rename-sender"}' >/dev/null 2>&1 || true
+
+log "Test 19e: MCP session_send auto-starts session from project index"
+# Create a temp project directory
+AUTOSTART_DIR=$(mktemp -d)
+mkdir -p "$AUTOSTART_DIR/autostart-proj"
+# Configure projects_dir
+api "$BASE" POST /api/settings -d "{\"projects_dir\":\"$AUTOSTART_DIR\"}" >/dev/null
+# Wait for project index to refresh
+sleep 2
+# Register a sender session
+api "$BASE" POST /api/register -d "{\"id\":\"autostart-sender\",\"pane\":\"$PANE_A\"}" >/dev/null
+# Send to a session name that matches the project (session doesn't exist yet)
+result=$(mcp_call_tool "$BASE" "session_send" '{"from":"autostart-sender","to":"autostart-proj","message":"hello auto","expects_reply":false}')
+assert_contains "19e: auto-started" "$result" "auto-started"
+# Verify the session was created
+wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'autostart-proj'"
+ids=$(session_ids "$BASE")
+assert_contains "19e: session registered" "$ids" "autostart-proj"
+# Cleanup: kill the auto-started session, remove temp dir
+api "$BASE" POST /api/sessions/kill -d '{"name":"autostart-proj"}' >/dev/null 2>&1 || true
+api "$BASE" POST /api/remove -d '{"id":"autostart-sender"}' >/dev/null 2>&1 || true
+rm -rf "$AUTOSTART_DIR"
+# Restore projects_dir
+api "$BASE" POST /api/settings -d '{"projects_dir":"/tmp/projects"}' >/dev/null
+
 # ══════════════════════════════════════════════════════════════════════
 # ── Scheduled Tasks ─────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════

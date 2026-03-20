@@ -100,6 +100,15 @@ pub struct SessionUpdateParams {
     pub bulletin: Option<String>,
 }
 
+/// Parameters for the `session_rename` MCP tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SessionRenameParams {
+    /// Current session ID to rename
+    pub old_id: String,
+    /// New session ID
+    pub new_id: String,
+}
+
 /// Parameters for the `clear_pending_reply` MCP tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ClearPendingReplyParams {
@@ -337,13 +346,53 @@ impl OuijaMcp {
         }
     }
 
+    /// Atomically rename a session, preserving metadata, pane, and pending replies.
+    #[tool(
+        description = "Rename a session. The old name becomes an alias that hints callers to use the new name."
+    )]
+    async fn session_rename(
+        &self,
+        Parameters(params): Parameters<SessionRenameParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let effects = self
+            .state
+            .apply_and_execute(crate::daemon_protocol::Event::Rename {
+                old_id: params.old_id.clone(),
+                new_id: params.new_id.clone(),
+            })
+            .await;
+        if effects
+            .iter()
+            .any(|e| matches!(e, crate::daemon_protocol::Effect::RenameOk { .. }))
+        {
+            Ok(CallToolResult::success(vec![Content::text(format!(
+                "renamed '{}' to '{}'",
+                params.old_id, params.new_id
+            ))]))
+        } else {
+            let reason = effects
+                .iter()
+                .find_map(|e| match e {
+                    crate::daemon_protocol::Effect::RenameFailed { reason } => {
+                        Some(reason.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| format!("session '{}' not found", params.old_id));
+            Ok(CallToolResult::error(vec![Content::text(reason)]))
+        }
+    }
+
     /// Send a message to another Claude session. If the target is on this machine,
     /// it will be injected into their tmux pane. If remote, it goes over the network.
+    /// If the target session doesn't exist but exactly one matching project is found,
+    /// the session is auto-started with the message as the initial prompt.
     #[tool(description = "Send a message to another Claude session")]
     async fn session_send(
         &self,
         Parameters(params): Parameters<SessionSendParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let message_copy = params.message.clone();
         let effects = self
             .state
             .apply_and_execute(crate::daemon_protocol::Event::Send {
@@ -367,9 +416,35 @@ impl OuijaMcp {
             crate::daemon_protocol::Effect::SendFailed { reason, .. } => Some(reason.clone()),
             _ => None,
         }) {
-            // Check for matching projects to suggest
+            // Check for matching projects — auto-start if exactly one match
             let suggestions = crate::project_index::suggest_projects(&self.state, &params.to).await;
-            if suggestions.is_empty() {
+            if suggestions.len() == 1 {
+                // Auto-start the session with the message as prompt
+                let project = &suggestions[0];
+                let project_dir = project.dir.to_string_lossy().to_string();
+                let (start_result, _prompt_msg_id) =
+                    crate::nostr_transport::start_session(
+                        &self.state,
+                        &params.to,
+                        None,
+                        Some(&project_dir),
+                        Some(&message_copy),
+                        Some(&params.from),
+                        Some(params.expects_reply),
+                    )
+                    .await;
+                if start_result.starts_with("started ") {
+                    Ok(CallToolResult::success(vec![Content::text(format!(
+                        "auto-started session '{}' in {} with your message as prompt",
+                        params.to, project_dir
+                    ))]))
+                } else {
+                    Ok(CallToolResult::error(vec![Content::text(format!(
+                        "session '{}' not found; auto-start failed: {}",
+                        params.to, start_result
+                    ))]))
+                }
+            } else if suggestions.is_empty() {
                 Ok(CallToolResult::error(vec![Content::text(reason)]))
             } else {
                 let lines: Vec<String> = suggestions
