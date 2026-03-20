@@ -993,16 +993,17 @@ impl DaemonState {
         // Use remote msg_id if provided, otherwise assign a local one
         let local_msg_id = if msg_id > 0 { msg_id } else { self.next_seq() };
 
-        // Three-tier reply handling
+        // Three-tier reply handling — pending is keyed by the session that
+        // owes the reply (from), not the recipient of this wire message (to).
         if let Some(re_id) = responds_to {
             if done {
-                if let Some(pending) = self.pending_replies.get_mut(to) {
+                if let Some(pending) = self.pending_replies.get_mut(from) {
                     pending.retain(|p| p.msg_id != re_id);
                     if pending.is_empty() {
-                        self.pending_replies.remove(to);
+                        self.pending_replies.remove(from);
                     }
                 }
-            } else if let Some(pending) = self.pending_replies.get_mut(to) {
+            } else if let Some(pending) = self.pending_replies.get_mut(from) {
                 if let Some(entry) = pending.iter_mut().find(|p| p.msg_id == re_id) {
                     entry.last_activity = chrono::Utc::now().timestamp();
                     entry.in_progress = true;
@@ -1899,6 +1900,59 @@ mod tests {
                 .get("target")
                 .is_some_and(|v| v.iter().any(|p| p.msg_id == msg_id)),
             "done reply must clear pending"
+        );
+    }
+
+    #[test]
+    fn cross_daemon_pending_reply_cleared_by_local_done() {
+        // Remote A sends to local B with expects_reply via wire.
+        // B replies locally with responds_to + done=true.
+        // Pending on B must be cleared.
+        let mut state = DaemonState::new_for_model("d2".into(), "host2".into());
+        state.apply(Event::Register {
+            id: "B".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                networked: true,
+                ..Default::default()
+            },
+        });
+
+        // Remote A sends to local B via wire
+        let _effects = state.apply(Event::IncomingWire {
+            msg: crate::protocol::WireMessage::SessionSend {
+                from: "A".into(),
+                to: "B".into(),
+                message: "do this".into(),
+                expects_reply: true,
+                msg_id: 42,
+                responds_to: None,
+                done: false,
+            },
+            sender_npub: Some("npub1remote".into()),
+        });
+        // Verify pending was stored
+        assert!(
+            state.pending_replies.contains_key("B"),
+            "pending should be stored for local target"
+        );
+        assert_eq!(state.pending_replies["B"][0].msg_id, 42);
+
+        // B replies locally with done=true
+        state.apply(Event::Send {
+            from: "B".into(),
+            to: "A".into(),
+            message: "all done".into(),
+            expects_reply: false,
+            responds_to: Some(42),
+            done: true,
+        });
+        assert!(
+            !state
+                .pending_replies
+                .get("B")
+                .is_some_and(|v| v.iter().any(|p| p.msg_id == 42)),
+            "done reply must clear cross-daemon pending"
         );
     }
 
