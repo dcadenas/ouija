@@ -392,7 +392,6 @@ impl OuijaMcp {
         &self,
         Parameters(params): Parameters<SessionSendParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let message_copy = params.message.clone();
         let effects = self
             .state
             .apply_and_execute(crate::daemon_protocol::Event::Send {
@@ -422,18 +421,36 @@ impl OuijaMcp {
                 // Auto-start the session with the message as prompt
                 let project = &suggestions[0];
                 let project_dir = project.dir.to_string_lossy().to_string();
-                let (start_result, _prompt_msg_id) =
+                let (start_result, prompt_msg_id) =
                     crate::nostr_transport::start_session(
                         &self.state,
                         &params.to,
                         None,
                         Some(&project_dir),
-                        Some(&message_copy),
+                        None, // prompt not available (message consumed by Event::Send)
                         Some(&params.from),
                         Some(params.expects_reply),
                     )
                     .await;
                 if start_result.starts_with("started ") {
+                    // Track pending reply like session_start does
+                    if params.expects_reply {
+                        if let Some(msg_id) = prompt_msg_id {
+                            let mut proto = self.state.protocol.write().await;
+                            proto
+                                .pending_replies
+                                .entry(params.to.clone())
+                                .or_default()
+                                .push(crate::daemon_protocol::PendingReplyEntry {
+                                    msg_id,
+                                    from: params.from.clone(),
+                                    message: String::new(),
+                                    received_at: chrono::Utc::now().timestamp(),
+                                    last_activity: chrono::Utc::now().timestamp(),
+                                    in_progress: false,
+                                });
+                        }
+                    }
                     Ok(CallToolResult::success(vec![Content::text(format!(
                         "auto-started session '{}' in {} with your message as prompt",
                         params.to, project_dir

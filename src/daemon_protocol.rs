@@ -3255,12 +3255,7 @@ mod stateright_model {
                     };
                     let effects = ds.apply(event);
                     normalize_timestamps(ds);
-                    *last_send_result = None; // non-send event clears stale result
-                    update_pending_tracking(
-                        ds,
-                        prev_pending_reply_counts,
-                        pending_reply_counts,
-                    );
+                    *last_send_result = None;
                     *last_event_type = LastEvent::Other;
                     route_effects(ds, &effects, peers, o);
                 }
@@ -4008,13 +4003,22 @@ mod stateright_model {
         _: &ActorModel<ModelActor, ()>,
         state: &<ActorModel<ModelActor, ()> as Model>::State,
     ) -> bool {
+        // Collect (daemon_id, last_send_result) pairs for daemon actors only
+        let daemon_info: Vec<(&str, Option<&SendOutcome>)> = state
+            .actor_states
+            .iter()
+            .filter_map(|s| match s.as_ref() {
+                ModelState::Daemon {
+                    ds,
+                    last_send_result,
+                    ..
+                } => Some((ds.daemon_id.as_str(), last_send_result.as_ref())),
+                _ => None,
+            })
+            .collect();
         let all_ds = daemon_states(&state.actor_states);
-        for (i, ds_state) in state.actor_states.iter().enumerate() {
-            if let ModelState::Daemon {
-                last_send_result: Some(SendOutcome::Delivered { to, .. }),
-                ..
-            } = ds_state.as_ref()
-            {
+        for (i, (_daemon_id, send_result)) in daemon_info.iter().enumerate() {
+            if let Some(SendOutcome::Delivered { to, .. }) = send_result {
                 for (j, ds) in all_ds.iter().enumerate() {
                     if i != j
                         && ds.sessions.values().any(|s| {
