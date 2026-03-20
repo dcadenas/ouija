@@ -3061,11 +3061,31 @@ mod stateright_model {
 
     #[derive(Clone, Debug, Eq, Hash, PartialEq)]
     enum ModelState {
-        Daemon { ds: DaemonState, peers: Vec<Id> },
+        Daemon {
+            ds: DaemonState,
+            peers: Vec<Id>,
+            last_send_result: Option<SendOutcome>,
+            pending_reply_counts: BTreeMap<String, usize>,
+            prev_pending_reply_counts: BTreeMap<String, usize>,
+            last_event_type: LastEvent,
+        },
         Driver { actions_taken: u8 },
     }
 
     const MAX_DRIVER_ACTIONS: u8 = 2;
+
+    #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    enum SendOutcome {
+        Delivered { from: String, to: String, msg_id: u64 },
+        Failed { from: String, to: String, renamed_to: Option<String> },
+    }
+
+    #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    enum LastEvent {
+        ReplyDone,
+        ReplyProgress,
+        Other,
+    }
 
     impl Actor for ModelActor {
         type Msg = ModelMsg;
@@ -3083,6 +3103,10 @@ mod stateright_model {
                 } => ModelState::Daemon {
                     ds: DaemonState::new_for_model(daemon_id.clone(), daemon_name.clone()),
                     peers: peers.clone(),
+                    last_send_result: None,
+                    pending_reply_counts: BTreeMap::new(),
+                    prev_pending_reply_counts: BTreeMap::new(),
+                    last_event_type: LastEvent::Other,
                 },
                 Self::SessionDriver { .. } => {
                     offer_actions(o);
@@ -3103,14 +3127,14 @@ mod stateright_model {
                 return;
             }
             let s = state.to_mut();
-            let ModelState::Daemon { ds, peers } = s else {
+            let ModelState::Daemon { ds, peers, .. } = s else {
                 return;
             };
 
             let event = match msg {
                 ModelMsg::Register { id } => Event::Register {
-                    id,
-                    pane: None,
+                    id: id.clone(),
+                    pane: Some(format!("model-pane-{id}")),
                     metadata: SessionMeta {
                         networked: true,
                         ..Default::default()
