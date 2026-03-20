@@ -2993,7 +2993,7 @@ mod stateright_model {
     use std::borrow::Cow;
     use std::collections::BTreeSet;
 
-    const SESSION_IDS: [&str; 3] = ["A", "B", "C"];
+    const SESSION_IDS: [&str; 2] = ["A", "B"];
 
     // -- Messages (must be Hash+Eq+Ord for Stateright) -----------------------
 
@@ -3036,6 +3036,28 @@ mod stateright_model {
             daemon_name: String,
             seq: u64,
         },
+        // Session messaging
+        Send {
+            from: String,
+            to: String,
+            message: String,
+            expects_reply: bool,
+        },
+        Reply {
+            from: String,
+            to: String,
+            msg_id: u64,
+            done: bool,
+        },
+        WireSessionSend {
+            from: String,
+            to: String,
+            message: String,
+            expects_reply: bool,
+            msg_id: u64,
+            responds_to: Option<u64>,
+            done: bool,
+        },
     }
 
     #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -3043,6 +3065,8 @@ mod stateright_model {
         Register(String),
         Remove(String),
         Rename(String, String),
+        Send { from: String, to: String, expects_reply: bool },
+        Reply { from: String, to: String, msg_id: u64, done: bool },
     }
 
     // -- Actor & State -------------------------------------------------------
@@ -3127,124 +3151,209 @@ mod stateright_model {
                 return;
             }
             let s = state.to_mut();
-            let ModelState::Daemon { ds, peers, .. } = s else {
+            let ModelState::Daemon {
+                ds,
+                peers,
+                last_send_result,
+                pending_reply_counts,
+                prev_pending_reply_counts,
+                last_event_type,
+            } = s
+            else {
                 return;
             };
 
-            let event = match msg {
-                ModelMsg::Register { id } => Event::Register {
-                    id: id.clone(),
-                    pane: Some(format!("model-pane-{id}")),
-                    metadata: SessionMeta {
-                        networked: true,
-                        ..Default::default()
-                    },
-                },
-                ModelMsg::Remove { id } => Event::Remove { id },
-                ModelMsg::Rename { old_id, new_id } => Event::Rename { old_id, new_id },
-                ModelMsg::WireAnnounce {
-                    id,
-                    daemon_id,
-                    daemon_name,
-                    seq,
-                } => Event::IncomingWire {
-                    msg: WireMessage::SessionAnnounce {
-                        id,
-                        daemon_id,
-                        daemon_name,
-                        metadata: None,
-                        seq,
-                    },
-                    sender_npub: None,
-                },
-                ModelMsg::WireList {
-                    sessions,
-                    daemon_id,
-                    daemon_name,
-                    seq,
-                } => Event::IncomingWire {
-                    msg: WireMessage::SessionList {
-                        sessions: sessions
-                            .into_iter()
-                            .map(|id| SessionInfo { id, metadata: None })
-                            .collect(),
-                        daemon_id,
-                        daemon_name,
-                        seq,
-                    },
-                    sender_npub: None,
-                },
-                ModelMsg::WireRemove {
-                    id,
-                    daemon_id,
-                    daemon_name,
-                    seq,
-                } => Event::IncomingWire {
-                    msg: WireMessage::SessionRemove {
-                        id,
-                        daemon_id,
-                        daemon_name,
-                        seq,
-                    },
-                    sender_npub: None,
-                },
-                ModelMsg::WireRenamed {
-                    old_id,
-                    new_id,
-                    daemon_id,
-                    daemon_name,
-                    seq,
-                } => Event::IncomingWire {
-                    msg: WireMessage::SessionRenamed {
-                        old_id,
-                        new_id,
-                        daemon_id,
-                        daemon_name,
-                        metadata: None,
-                        seq,
-                    },
-                    sender_npub: None,
-                },
-            };
-
-            let effects = ds.apply(event);
-
-            // Zero out registered_at for deterministic state hashing
-            for entry in ds.sessions.values_mut() {
-                entry.registered_at = 0;
-            }
-
-            // Route broadcast effects to peers
-            for effect in &effects {
-                match effect {
-                    Effect::Broadcast(wire_msg) => {
-                        if let Some(model_msg) = wire_to_msg(wire_msg) {
-                            for &peer in peers.iter() {
-                                o.send(peer, model_msg.clone());
-                            }
+            match msg {
+                // -- Register / Remove / Rename / Wire* shared path --
+                ModelMsg::Register { .. }
+                | ModelMsg::Remove { .. }
+                | ModelMsg::Rename { .. }
+                | ModelMsg::WireAnnounce { .. }
+                | ModelMsg::WireList { .. }
+                | ModelMsg::WireRemove { .. }
+                | ModelMsg::WireRenamed { .. } => {
+                    let event = match msg {
+                        ModelMsg::Register { id } => Event::Register {
+                            id: id.clone(),
+                            pane: Some(format!("model-pane-{id}")),
+                            metadata: SessionMeta {
+                                networked: true,
+                                ..Default::default()
+                            },
+                        },
+                        ModelMsg::Remove { id } => Event::Remove { id },
+                        ModelMsg::Rename { old_id, new_id } => {
+                            Event::Rename { old_id, new_id }
                         }
-                    }
-                    Effect::BroadcastSessionList => {
-                        let session_ids: BTreeSet<String> = ds
-                            .sessions
-                            .values()
-                            .filter(|s| matches!(s.origin, Origin::Local) && s.metadata.networked)
-                            .map(|s| s.id.clone())
-                            .collect();
-                        // Match runtime: skip broadcast if list is empty
-                        if !session_ids.is_empty() {
-                            let msg = ModelMsg::WireList {
-                                sessions: session_ids,
-                                daemon_id: ds.daemon_id.clone(),
-                                daemon_name: ds.daemon_name.clone(),
-                                seq: ds.wire_seq,
-                            };
-                            for &peer in peers.iter() {
-                                o.send(peer, msg.clone());
-                            }
-                        }
-                    }
-                    _ => {}
+                        ModelMsg::WireAnnounce {
+                            id,
+                            daemon_id,
+                            daemon_name,
+                            seq,
+                        } => Event::IncomingWire {
+                            msg: WireMessage::SessionAnnounce {
+                                id,
+                                daemon_id,
+                                daemon_name,
+                                metadata: None,
+                                seq,
+                            },
+                            sender_npub: None,
+                        },
+                        ModelMsg::WireList {
+                            sessions,
+                            daemon_id,
+                            daemon_name,
+                            seq,
+                        } => Event::IncomingWire {
+                            msg: WireMessage::SessionList {
+                                sessions: sessions
+                                    .into_iter()
+                                    .map(|id| SessionInfo {
+                                        id,
+                                        metadata: None,
+                                    })
+                                    .collect(),
+                                daemon_id,
+                                daemon_name,
+                                seq,
+                            },
+                            sender_npub: None,
+                        },
+                        ModelMsg::WireRemove {
+                            id,
+                            daemon_id,
+                            daemon_name,
+                            seq,
+                        } => Event::IncomingWire {
+                            msg: WireMessage::SessionRemove {
+                                id,
+                                daemon_id,
+                                daemon_name,
+                                seq,
+                            },
+                            sender_npub: None,
+                        },
+                        ModelMsg::WireRenamed {
+                            old_id,
+                            new_id,
+                            daemon_id,
+                            daemon_name,
+                            seq,
+                        } => Event::IncomingWire {
+                            msg: WireMessage::SessionRenamed {
+                                old_id,
+                                new_id,
+                                daemon_id,
+                                daemon_name,
+                                metadata: None,
+                                seq,
+                            },
+                            sender_npub: None,
+                        },
+                        _ => unreachable!(),
+                    };
+                    let effects = ds.apply(event);
+                    normalize_timestamps(ds);
+                    update_pending_tracking(
+                        ds,
+                        prev_pending_reply_counts,
+                        pending_reply_counts,
+                    );
+                    *last_event_type = LastEvent::Other;
+                    route_effects(ds, &effects, peers, o);
+                }
+
+                // -- Send (local API call) --
+                ModelMsg::Send {
+                    from,
+                    to,
+                    message,
+                    expects_reply,
+                } => {
+                    let event = Event::Send {
+                        from,
+                        to,
+                        message,
+                        expects_reply,
+                        responds_to: None,
+                        done: false,
+                    };
+                    let effects = ds.apply(event);
+                    normalize_timestamps(ds);
+                    *last_send_result = extract_send_outcome(&effects);
+                    update_pending_tracking(
+                        ds,
+                        prev_pending_reply_counts,
+                        pending_reply_counts,
+                    );
+                    *last_event_type = LastEvent::Other;
+                    route_effects(ds, &effects, peers, o);
+                }
+
+                // -- Reply (local API call responding to a pending msg) --
+                ModelMsg::Reply {
+                    from,
+                    to,
+                    msg_id,
+                    done,
+                } => {
+                    let event = Event::Send {
+                        from,
+                        to,
+                        message: "model-reply".into(),
+                        expects_reply: false,
+                        responds_to: Some(msg_id),
+                        done,
+                    };
+                    let effects = ds.apply(event);
+                    normalize_timestamps(ds);
+                    *last_send_result = extract_send_outcome(&effects);
+                    update_pending_tracking(
+                        ds,
+                        prev_pending_reply_counts,
+                        pending_reply_counts,
+                    );
+                    *last_event_type = if done {
+                        LastEvent::ReplyDone
+                    } else {
+                        LastEvent::ReplyProgress
+                    };
+                    route_effects(ds, &effects, peers, o);
+                }
+
+                // -- WireSessionSend (cross-daemon delivery, receiving side) --
+                ModelMsg::WireSessionSend {
+                    from,
+                    to,
+                    message,
+                    expects_reply,
+                    msg_id,
+                    responds_to,
+                    done,
+                } => {
+                    let event = Event::IncomingWire {
+                        msg: WireMessage::SessionSend {
+                            from,
+                            to,
+                            message,
+                            expects_reply,
+                            msg_id,
+                            responds_to,
+                            done,
+                        },
+                        sender_npub: None,
+                    };
+                    let effects = ds.apply(event);
+                    normalize_timestamps(ds);
+                    // Do NOT set last_send_result — this is the receiving side
+                    update_pending_tracking(
+                        ds,
+                        prev_pending_reply_counts,
+                        pending_reply_counts,
+                    );
+                    *last_event_type = LastEvent::Other;
+                    route_effects(ds, &effects, peers, o);
                 }
             }
         }
@@ -3261,13 +3370,44 @@ mod stateright_model {
                 if let ModelState::Driver { actions_taken } = s {
                     *actions_taken += 1;
                     match random {
-                        ModelAction::Register(id) => o.send(*target, ModelMsg::Register { id: id.clone() }),
-                        ModelAction::Remove(id) => o.send(*target, ModelMsg::Remove { id: id.clone() }),
+                        ModelAction::Register(id) => {
+                            o.send(*target, ModelMsg::Register { id: id.clone() })
+                        }
+                        ModelAction::Remove(id) => {
+                            o.send(*target, ModelMsg::Remove { id: id.clone() })
+                        }
                         ModelAction::Rename(old, new) => o.send(
                             *target,
                             ModelMsg::Rename {
                                 old_id: old.clone(),
                                 new_id: new.clone(),
+                            },
+                        ),
+                        ModelAction::Send {
+                            from,
+                            to,
+                            expects_reply,
+                        } => o.send(
+                            *target,
+                            ModelMsg::Send {
+                                from: from.clone(),
+                                to: to.clone(),
+                                message: "model-msg".into(),
+                                expects_reply: *expects_reply,
+                            },
+                        ),
+                        ModelAction::Reply {
+                            from,
+                            to,
+                            msg_id,
+                            done,
+                        } => o.send(
+                            *target,
+                            ModelMsg::Reply {
+                                from: from.clone(),
+                                to: to.clone(),
+                                msg_id: *msg_id,
+                                done: *done,
                             },
                         ),
                     }
@@ -3280,6 +3420,94 @@ mod stateright_model {
     }
 
     // -- Helpers -------------------------------------------------------------
+
+    fn normalize_timestamps(ds: &mut DaemonState) {
+        for entry in ds.sessions.values_mut() {
+            entry.registered_at = 0;
+        }
+        for entries in ds.pending_replies.values_mut() {
+            for e in entries.iter_mut() {
+                e.received_at = 0;
+                e.last_activity = 0;
+            }
+        }
+    }
+
+    fn extract_send_outcome(effects: &[Effect]) -> Option<SendOutcome> {
+        effects.iter().find_map(|e| match e {
+            Effect::SendDelivered {
+                from, to, msg_id, ..
+            } => Some(SendOutcome::Delivered {
+                from: from.clone(),
+                to: to.clone(),
+                msg_id: *msg_id,
+            }),
+            Effect::SendFailed {
+                from,
+                to,
+                renamed_to,
+                ..
+            } => Some(SendOutcome::Failed {
+                from: from.clone(),
+                to: to.clone(),
+                renamed_to: renamed_to.clone(),
+            }),
+            _ => None,
+        })
+    }
+
+    fn update_pending_tracking(
+        ds: &DaemonState,
+        prev_counts: &mut BTreeMap<String, usize>,
+        curr_counts: &mut BTreeMap<String, usize>,
+    ) {
+        *prev_counts = curr_counts.clone();
+        curr_counts.clear();
+        for (k, v) in &ds.pending_replies {
+            curr_counts.insert(k.clone(), v.len());
+        }
+    }
+
+    fn route_effects(
+        ds: &DaemonState,
+        effects: &[Effect],
+        peers: &[Id],
+        o: &mut Out<ModelActor>,
+    ) {
+        for effect in effects {
+            match effect {
+                Effect::Broadcast(wire_msg) => {
+                    if let Some(model_msg) = wire_to_msg(wire_msg) {
+                        for &peer in peers.iter() {
+                            o.send(peer, model_msg.clone());
+                        }
+                    }
+                }
+                Effect::BroadcastSessionList => {
+                    let session_ids: BTreeSet<String> = ds
+                        .sessions
+                        .values()
+                        .filter(|s| {
+                            matches!(s.origin, Origin::Local) && s.metadata.networked
+                        })
+                        .map(|s| s.id.clone())
+                        .collect();
+                    if !session_ids.is_empty() {
+                        let msg = ModelMsg::WireList {
+                            sessions: session_ids,
+                            daemon_id: ds.daemon_id.clone(),
+                            daemon_name: ds.daemon_name.clone(),
+                            seq: ds.wire_seq,
+                        };
+                        for &peer in peers.iter() {
+                            o.send(peer, msg.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 
     fn wire_to_msg(wire: &WireMessage) -> Option<ModelMsg> {
         match wire {
@@ -3321,8 +3549,25 @@ mod stateright_model {
                 daemon_name: daemon_name.clone(),
                 seq: *seq,
             }),
+            WireMessage::SessionSend {
+                from,
+                to,
+                message,
+                expects_reply,
+                msg_id,
+                responds_to,
+                done,
+            } => Some(ModelMsg::WireSessionSend {
+                from: from.clone(),
+                to: to.clone(),
+                message: message.clone(),
+                expects_reply: *expects_reply,
+                msg_id: *msg_id,
+                responds_to: *responds_to,
+                done: *done,
+            }),
             // SessionList is handled via BroadcastSessionList effect, not here.
-            // Other variants (SessionSend, SessionSendAck, etc.) are not modeled.
+            // SessionSendAck is not modeled (it's an ack, no state change needed).
             _ => None,
         }
     }
@@ -3337,6 +3582,32 @@ mod stateright_model {
             for &b in &SESSION_IDS {
                 if a != b {
                     c.push(ModelAction::Rename(a.to_string(), b.to_string()));
+                    // Send with expects_reply true and false
+                    c.push(ModelAction::Send {
+                        from: a.to_string(),
+                        to: b.to_string(),
+                        expects_reply: true,
+                    });
+                    c.push(ModelAction::Send {
+                        from: a.to_string(),
+                        to: b.to_string(),
+                        expects_reply: false,
+                    });
+                    // Reply with msg_id 1..=4, done true and false
+                    for msg_id in 1..=4u64 {
+                        c.push(ModelAction::Reply {
+                            from: a.to_string(),
+                            to: b.to_string(),
+                            msg_id,
+                            done: true,
+                        });
+                        c.push(ModelAction::Reply {
+                            from: a.to_string(),
+                            to: b.to_string(),
+                            msg_id,
+                            done: false,
+                        });
+                    }
                 }
             }
         }
