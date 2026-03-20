@@ -19,8 +19,6 @@ const VIM_BACKSPACE_MS: u64 = 50;
 const PASTE_SETTLE_MS: u64 = 300;
 /// Delay before verification capture.
 const VERIFY_DELAY_MS: u64 = 100;
-/// Delay after dismissing autocomplete for Escape to settle.
-const ESCAPE_SETTLE_MS: u64 = 100;
 /// Max retry attempts for pane injection (pane busy / mid-output).
 const MAX_INJECT_RETRIES: u32 = 3;
 /// Base delay for exponential backoff between retries (500ms, 1s, 2s).
@@ -374,13 +372,6 @@ fn inject_text(pane: &str, message: &str) -> anyhow::Result<()> {
     // Claude Code's React/Ink runtime needs time to handle the bracketed
     // paste; 50ms is too short, 300ms is reliable in testing.
     thread::sleep(Duration::from_millis(PASTE_SETTLE_MS));
-
-    // Dismiss autocomplete popup — without this, Enter gets swallowed by
-    // the dropdown instead of submitting the input.
-    let _ = Command::new("tmux")
-        .args(["send-keys", "-t", pane, "Escape"])
-        .status();
-    thread::sleep(Duration::from_millis(ESCAPE_SETTLE_MS));
 
     let status = Command::new("tmux")
         .args(["send-keys", "-t", pane, "Enter"])
