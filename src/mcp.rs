@@ -768,26 +768,15 @@ impl OuijaMcp {
             )
             .await
         };
-        // Track pending reply in DaemonState
-        if let Some(ref sender) = from {
-            if expects_reply.unwrap_or(true) && result.starts_with("started ") {
-                if let Some(msg_id) = prompt_msg_id {
-                    let mut proto = self.state.protocol.write().await;
-                    proto
-                        .pending_replies
-                        .entry(params.name.clone())
-                        .or_default()
-                        .push(crate::daemon_protocol::PendingReplyEntry {
-                            msg_id,
-                            from: sender.clone(),
-                            message: params.prompt.unwrap_or_default(),
-                            received_at: chrono::Utc::now().timestamp(),
-                            last_activity: chrono::Utc::now().timestamp(),
-                            in_progress: false,
-                        });
-                }
-            }
-        }
+        track_pending_reply(
+            &self.state,
+            &params.name,
+            from.as_deref(),
+            expects_reply,
+            prompt_msg_id,
+            params.prompt.as_deref(),
+        )
+        .await;
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
@@ -822,25 +811,15 @@ impl OuijaMcp {
             )
             .await
         };
-        if let Some(ref sender) = from {
-            if expects_reply.unwrap_or(true) && result.starts_with("restarted ") {
-                if let Some(msg_id) = prompt_msg_id {
-                    let mut proto = self.state.protocol.write().await;
-                    proto
-                        .pending_replies
-                        .entry(params.name.clone())
-                        .or_default()
-                        .push(crate::daemon_protocol::PendingReplyEntry {
-                            msg_id,
-                            from: sender.clone(),
-                            message: params.prompt.unwrap_or_default(),
-                            received_at: chrono::Utc::now().timestamp(),
-                            last_activity: chrono::Utc::now().timestamp(),
-                            in_progress: false,
-                        });
-                }
-            }
-        }
+        track_pending_reply(
+            &self.state,
+            &params.name,
+            from.as_deref(),
+            expects_reply,
+            prompt_msg_id,
+            params.prompt.as_deref(),
+        )
+        .await;
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 }
@@ -1005,11 +984,67 @@ message rather than starting a new one.
 </lifecycle_rules>
 ";
 
+/// Track a pending reply after a successful session start/restart.
+/// Called from session_start, session_restart, and session_send auto-start.
+async fn track_pending_reply(
+    state: &Arc<AppState>,
+    session_name: &str,
+    from: Option<&str>,
+    expects_reply: Option<bool>,
+    prompt_msg_id: Option<u64>,
+    prompt: Option<&str>,
+) {
+    let Some(sender) = from else { return };
+    if !expects_reply.unwrap_or(true) {
+        return;
+    }
+    let Some(msg_id) = prompt_msg_id else { return };
+    let mut proto = state.protocol.write().await;
+    proto
+        .pending_replies
+        .entry(session_name.to_string())
+        .or_default()
+        .push(crate::daemon_protocol::PendingReplyEntry {
+            msg_id,
+            from: sender.to_string(),
+            message: prompt.unwrap_or_default().to_string(),
+            received_at: chrono::Utc::now().timestamp(),
+            last_activity: chrono::Utc::now().timestamp(),
+            in_progress: false,
+        });
+}
+
+/// Send a structured wire message to a remote node and wait for the response.
+/// Shared by session_start and session_restart for remote (node/name) targets.
+async fn execute_remote_command(
+    state: &Arc<AppState>,
+    name: &str,
+    wire_msg: crate::protocol::WireMessage,
+    command_key: String,
+) -> String {
+    let Some((node_name, _)) = name.split_once('/') else {
+        return "expected node/name format".to_string();
+    };
+    let node_exists = {
+        let nodes = state.nodes.read().await;
+        nodes.values().any(|n| n.name == node_name)
+    };
+    if !node_exists {
+        return format!("node '{node_name}' not found");
+    }
+
+    let rx = state.register_pending_command(command_key);
+    if !crate::transport::broadcast(state, &wire_msg).await {
+        return "P2P not connected".to_string();
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => "command channel closed".to_string(),
+        Err(_) => "timeout waiting for remote response".to_string(),
+    }
+}
+
 /// If the sender's metadata is stale, append a hint nudging them to update.
-/// Execute a command locally or forward to a remote node.
-///
-/// If `name` contains a `/` (e.g. "macbook/crash-cache"), the command is
-/// forwarded to the remote daemon. Otherwise it runs locally.
 /// Send a structured SessionStart wire message to a remote node.
 async fn execute_session_start(
     state: &Arc<AppState>,
@@ -1020,27 +1055,8 @@ async fn execute_session_start(
     from: Option<&str>,
     expects_reply: Option<bool>,
 ) -> String {
-    let Some((node_name, session_name)) = name.split_once('/') else {
-        return "expected node/name format".to_string();
-    };
-    let daemon_id = {
-        let nodes = state.nodes.read().await;
-        nodes
-            .values()
-            .find(|n| n.name == node_name)
-            .map(|n| n.daemon_id.clone())
-    };
-    if daemon_id.is_none() {
-        return format!("node '{node_name}' not found");
-    }
-
-    let command_key = format!("/start {session_name}");
-    let rx = state.register_pending_command(command_key);
-
-    let proto = state.protocol.read().await;
-    let seq = proto.wire_seq;
-    drop(proto);
-
+    let session_name = name.split_once('/').map(|(_, s)| s).unwrap_or(name);
+    let seq = state.protocol.read().await.wire_seq;
     let wire = crate::protocol::WireMessage::SessionStart {
         name: session_name.to_string(),
         project_dir: project_dir.map(String::from),
@@ -1051,14 +1067,7 @@ async fn execute_session_start(
         daemon_id: state.config.npub.clone(),
         seq,
     };
-    if !crate::transport::broadcast(state, &wire).await {
-        return "P2P not connected".to_string();
-    }
-    match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => "command channel closed".to_string(),
-        Err(_) => "timeout waiting for remote response".to_string(),
-    }
+    execute_remote_command(state, name, wire, format!("/start {session_name}")).await
 }
 
 /// Send a structured SessionRestart wire message to a remote node.
@@ -1070,27 +1079,8 @@ async fn execute_session_restart(
     from: Option<&str>,
     expects_reply: Option<bool>,
 ) -> String {
-    let Some((node_name, session_name)) = name.split_once('/') else {
-        return "expected node/name format".to_string();
-    };
-    let daemon_id = {
-        let nodes = state.nodes.read().await;
-        nodes
-            .values()
-            .find(|n| n.name == node_name)
-            .map(|n| n.daemon_id.clone())
-    };
-    if daemon_id.is_none() {
-        return format!("node '{node_name}' not found");
-    }
-
-    let command_key = format!("/restart {session_name}");
-    let rx = state.register_pending_command(command_key);
-
-    let proto = state.protocol.read().await;
-    let seq = proto.wire_seq;
-    drop(proto);
-
+    let session_name = name.split_once('/').map(|(_, s)| s).unwrap_or(name);
+    let seq = state.protocol.read().await.wire_seq;
     let wire = crate::protocol::WireMessage::SessionRestart {
         name: session_name.to_string(),
         fresh: Some(fresh),
@@ -1100,14 +1090,7 @@ async fn execute_session_restart(
         daemon_id: state.config.npub.clone(),
         seq,
     };
-    if !crate::transport::broadcast(state, &wire).await {
-        return "P2P not connected".to_string();
-    }
-    match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => "command channel closed".to_string(),
-        Err(_) => "timeout waiting for remote response".to_string(),
-    }
+    execute_remote_command(state, name, wire, format!("/restart {session_name}")).await
 }
 
 async fn execute_command(state: &Arc<AppState>, name: &str, verb: &str) -> String {
