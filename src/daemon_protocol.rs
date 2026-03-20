@@ -2998,7 +2998,7 @@ mod stateright_model {
     // -- Messages (must be Hash+Eq+Ord for Stateright) -----------------------
 
     #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-    enum Msg {
+    enum ModelMsg {
         // Client → Daemon
         Register {
             id: String,
@@ -3039,7 +3039,7 @@ mod stateright_model {
     }
 
     #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-    enum Action {
+    enum ModelAction {
         Register(String),
         Remove(String),
         Rename(String, String),
@@ -3048,30 +3048,30 @@ mod stateright_model {
     // -- Actor & State -------------------------------------------------------
 
     #[derive(Clone)]
-    enum RealActor {
+    enum ModelActor {
         Daemon {
             daemon_id: String,
             daemon_name: String,
             peers: Vec<Id>,
         },
-        Client {
+        SessionDriver {
             target: Id,
         },
     }
 
     #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-    enum RealState {
+    enum ModelState {
         Daemon { ds: DaemonState, peers: Vec<Id> },
-        Client { actions_taken: u8 },
+        Driver { actions_taken: u8 },
     }
 
-    const MAX_CLIENT_ACTIONS: u8 = 2;
+    const MAX_DRIVER_ACTIONS: u8 = 2;
 
-    impl Actor for RealActor {
-        type Msg = Msg;
-        type State = RealState;
+    impl Actor for ModelActor {
+        type Msg = ModelMsg;
+        type State = ModelState;
         type Timer = ();
-        type Random = Action;
+        type Random = ModelAction;
         type Storage = ();
 
         fn on_start(&self, _id: Id, _: &Option<()>, o: &mut Out<Self>) -> Self::State {
@@ -3080,13 +3080,13 @@ mod stateright_model {
                     daemon_id,
                     daemon_name,
                     peers,
-                } => RealState::Daemon {
+                } => ModelState::Daemon {
                     ds: DaemonState::new_for_model(daemon_id.clone(), daemon_name.clone()),
                     peers: peers.clone(),
                 },
-                Self::Client { .. } => {
+                Self::SessionDriver { .. } => {
                     offer_actions(o);
-                    RealState::Client { actions_taken: 0 }
+                    ModelState::Driver { actions_taken: 0 }
                 }
             }
         }
@@ -3099,16 +3099,16 @@ mod stateright_model {
             msg: Self::Msg,
             o: &mut Out<Self>,
         ) {
-            if !matches!(state.as_ref(), RealState::Daemon { .. }) {
+            if !matches!(state.as_ref(), ModelState::Daemon { .. }) {
                 return;
             }
             let s = state.to_mut();
-            let RealState::Daemon { ds, peers } = s else {
+            let ModelState::Daemon { ds, peers } = s else {
                 return;
             };
 
             let event = match msg {
-                Msg::Register { id } => Event::Register {
+                ModelMsg::Register { id } => Event::Register {
                     id,
                     pane: None,
                     metadata: SessionMeta {
@@ -3116,9 +3116,9 @@ mod stateright_model {
                         ..Default::default()
                     },
                 },
-                Msg::Remove { id } => Event::Remove { id },
-                Msg::Rename { old_id, new_id } => Event::Rename { old_id, new_id },
-                Msg::WireAnnounce {
+                ModelMsg::Remove { id } => Event::Remove { id },
+                ModelMsg::Rename { old_id, new_id } => Event::Rename { old_id, new_id },
+                ModelMsg::WireAnnounce {
                     id,
                     daemon_id,
                     daemon_name,
@@ -3133,7 +3133,7 @@ mod stateright_model {
                     },
                     sender_npub: None,
                 },
-                Msg::WireList {
+                ModelMsg::WireList {
                     sessions,
                     daemon_id,
                     daemon_name,
@@ -3150,7 +3150,7 @@ mod stateright_model {
                     },
                     sender_npub: None,
                 },
-                Msg::WireRemove {
+                ModelMsg::WireRemove {
                     id,
                     daemon_id,
                     daemon_name,
@@ -3164,7 +3164,7 @@ mod stateright_model {
                     },
                     sender_npub: None,
                 },
-                Msg::WireRenamed {
+                ModelMsg::WireRenamed {
                     old_id,
                     new_id,
                     daemon_id,
@@ -3209,7 +3209,7 @@ mod stateright_model {
                             .collect();
                         // Match runtime: skip broadcast if list is empty
                         if !session_ids.is_empty() {
-                            let msg = Msg::WireList {
+                            let msg = ModelMsg::WireList {
                                 sessions: session_ids,
                                 daemon_id: ds.daemon_id.clone(),
                                 daemon_name: ds.daemon_name.clone(),
@@ -3232,22 +3232,22 @@ mod stateright_model {
             random: &Self::Random,
             o: &mut Out<Self>,
         ) {
-            if let Self::Client { target } = self {
+            if let Self::SessionDriver { target } = self {
                 let s = state.to_mut();
-                if let RealState::Client { actions_taken } = s {
+                if let ModelState::Driver { actions_taken } = s {
                     *actions_taken += 1;
                     match random {
-                        Action::Register(id) => o.send(*target, Msg::Register { id: id.clone() }),
-                        Action::Remove(id) => o.send(*target, Msg::Remove { id: id.clone() }),
-                        Action::Rename(old, new) => o.send(
+                        ModelAction::Register(id) => o.send(*target, ModelMsg::Register { id: id.clone() }),
+                        ModelAction::Remove(id) => o.send(*target, ModelMsg::Remove { id: id.clone() }),
+                        ModelAction::Rename(old, new) => o.send(
                             *target,
-                            Msg::Rename {
+                            ModelMsg::Rename {
                                 old_id: old.clone(),
                                 new_id: new.clone(),
                             },
                         ),
                     }
-                    if *actions_taken < MAX_CLIENT_ACTIONS {
+                    if *actions_taken < MAX_DRIVER_ACTIONS {
                         offer_actions(o);
                     }
                 }
@@ -3257,7 +3257,7 @@ mod stateright_model {
 
     // -- Helpers -------------------------------------------------------------
 
-    fn wire_to_msg(wire: &WireMessage) -> Option<Msg> {
+    fn wire_to_msg(wire: &WireMessage) -> Option<ModelMsg> {
         match wire {
             WireMessage::SessionAnnounce {
                 id,
@@ -3265,7 +3265,7 @@ mod stateright_model {
                 daemon_name,
                 seq,
                 ..
-            } => Some(Msg::WireAnnounce {
+            } => Some(ModelMsg::WireAnnounce {
                 id: id.clone(),
                 daemon_id: daemon_id.clone(),
                 daemon_name: daemon_name.clone(),
@@ -3277,7 +3277,7 @@ mod stateright_model {
                 daemon_name,
                 seq,
                 ..
-            } => Some(Msg::WireRemove {
+            } => Some(ModelMsg::WireRemove {
                 id: id.clone(),
                 daemon_id: daemon_id.clone(),
                 daemon_name: daemon_name.clone(),
@@ -3290,7 +3290,7 @@ mod stateright_model {
                 daemon_name,
                 seq,
                 ..
-            } => Some(Msg::WireRenamed {
+            } => Some(ModelMsg::WireRenamed {
                 old_id: old_id.clone(),
                 new_id: new_id.clone(),
                 daemon_id: daemon_id.clone(),
@@ -3303,16 +3303,16 @@ mod stateright_model {
         }
     }
 
-    fn offer_actions(o: &mut Out<RealActor>) {
+    fn offer_actions(o: &mut Out<ModelActor>) {
         let mut c = Vec::new();
         for &id in &SESSION_IDS {
-            c.push(Action::Register(id.to_string()));
-            c.push(Action::Remove(id.to_string()));
+            c.push(ModelAction::Register(id.to_string()));
+            c.push(ModelAction::Remove(id.to_string()));
         }
         for &a in &SESSION_IDS {
             for &b in &SESSION_IDS {
                 if a != b {
-                    c.push(Action::Rename(a.to_string(), b.to_string()));
+                    c.push(ModelAction::Rename(a.to_string(), b.to_string()));
                 }
             }
         }
@@ -3321,11 +3321,11 @@ mod stateright_model {
 
     // -- Property checkers ---------------------------------------------------
 
-    fn daemon_states(actor_states: &[std::sync::Arc<RealState>]) -> Vec<&DaemonState> {
+    fn daemon_states(actor_states: &[std::sync::Arc<ModelState>]) -> Vec<&DaemonState> {
         actor_states
             .iter()
             .filter_map(|s| match s.as_ref() {
-                RealState::Daemon { ds, .. } => Some(ds),
+                ModelState::Daemon { ds, .. } => Some(ds),
                 _ => None,
             })
             .collect()
@@ -3334,8 +3334,8 @@ mod stateright_model {
     /// After quiescence, each daemon's local sessions match every other daemon's
     /// remote view of that daemon.
     fn check_convergence(
-        _: &ActorModel<RealActor, ()>,
-        state: &<ActorModel<RealActor, ()> as Model>::State,
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
     ) -> bool {
         if state.network.len() > 0 {
             return true;
@@ -3368,8 +3368,8 @@ mod stateright_model {
 
     /// No daemon stores a remote session attributed to itself.
     fn check_no_self_remote(
-        _: &ActorModel<RealActor, ()>,
-        state: &<ActorModel<RealActor, ()> as Model>::State,
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
     ) -> bool {
         daemon_states(&state.actor_states).iter().all(|ds| {
             ds.sessions
@@ -3380,8 +3380,8 @@ mod stateright_model {
 
     /// Alias chains never form cycles.
     fn check_alias_acyclic(
-        _: &ActorModel<RealActor, ()>,
-        state: &<ActorModel<RealActor, ()> as Model>::State,
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
     ) -> bool {
         for ds in daemon_states(&state.actor_states) {
             for (start, first) in &ds.aliases {
@@ -3403,8 +3403,8 @@ mod stateright_model {
     }
 
     fn check_some_registered(
-        _: &ActorModel<RealActor, ()>,
-        state: &<ActorModel<RealActor, ()> as Model>::State,
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
     ) -> bool {
         daemon_states(&state.actor_states).iter().any(|ds| {
             ds.sessions
@@ -3414,8 +3414,8 @@ mod stateright_model {
     }
 
     fn check_some_remote(
-        _: &ActorModel<RealActor, ()>,
-        state: &<ActorModel<RealActor, ()> as Model>::State,
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
     ) -> bool {
         daemon_states(&state.actor_states).iter().any(|ds| {
             ds.sessions
@@ -3427,8 +3427,8 @@ mod stateright_model {
     /// Re-registering the same session ID produces the same final state
     /// regardless of how many times it's applied.
     fn check_register_idempotent(
-        _: &ActorModel<RealActor, ()>,
-        state: &<ActorModel<RealActor, ()> as Model>::State,
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
     ) -> bool {
         for ds in daemon_states(&state.actor_states) {
             for (id, entry) in &ds.sessions {
@@ -3450,8 +3450,8 @@ mod stateright_model {
 
     /// wire_seq is monotonically increasing (never decreases).
     fn check_seq_monotonic(
-        _: &ActorModel<RealActor, ()>,
-        state: &<ActorModel<RealActor, ()> as Model>::State,
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
     ) -> bool {
         for ds in daemon_states(&state.actor_states) {
             // wire_seq should equal the number of local mutations (each increments it)
@@ -3472,8 +3472,8 @@ mod stateright_model {
     /// Metadata updates don't affect convergence: remote session existence
     /// matches local session existence regardless of metadata content.
     fn check_metadata_does_not_affect_convergence(
-        _: &ActorModel<RealActor, ()>,
-        state: &<ActorModel<RealActor, ()> as Model>::State,
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
     ) -> bool {
         // This is a structural check: remote entries should only exist if the
         // source daemon has a corresponding local session. Already covered by
@@ -3496,21 +3496,21 @@ mod stateright_model {
 
     // -- Model builder -------------------------------------------------------
 
-    fn build_real_model() -> ActorModel<RealActor, ()> {
+    fn build_model() -> ActorModel<ModelActor, ()> {
         let (d0, d1) = (Id::from(0usize), Id::from(1usize));
         ActorModel::new((), ())
-            .actor(RealActor::Daemon {
+            .actor(ModelActor::Daemon {
                 daemon_id: "npub0".into(),
                 daemon_name: "host0".into(),
                 peers: vec![d1],
             })
-            .actor(RealActor::Daemon {
+            .actor(ModelActor::Daemon {
                 daemon_id: "npub1".into(),
                 daemon_name: "host1".into(),
                 peers: vec![d0],
             })
-            .actor(RealActor::Client { target: d0 })
-            .actor(RealActor::Client { target: d1 })
+            .actor(ModelActor::SessionDriver { target: d0 })
+            .actor(ModelActor::SessionDriver { target: d1 })
             .init_network(Network::new_unordered_nonduplicating([]))
             .property(Expectation::Always, "no self-remote", check_no_self_remote)
             .property(Expectation::Always, "convergence", check_convergence)
@@ -3540,8 +3540,8 @@ mod stateright_model {
 
     /// All pending reply entries reference sessions that exist somewhere.
     fn check_pending_replies_valid(
-        _: &ActorModel<RealActor, ()>,
-        state: &<ActorModel<RealActor, ()> as Model>::State,
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
     ) -> bool {
         let ds = daemon_states(&state.actor_states);
         for d in &ds {
@@ -3565,10 +3565,10 @@ mod stateright_model {
     // -- Tests ---------------------------------------------------------------
 
     #[test]
-    fn real_daemon_state_bfs() {
+    fn model_check_bfs() {
         use std::time::Instant;
         let start = Instant::now();
-        let checker = build_real_model().checker().spawn_bfs().join();
+        let checker = build_model().checker().spawn_bfs().join();
         let elapsed = start.elapsed();
         println!(
             "Real DaemonState model — states: {}, unique: {}, depth: {}, time: {:.1}s",
