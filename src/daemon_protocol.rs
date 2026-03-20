@@ -3255,6 +3255,7 @@ mod stateright_model {
                     };
                     let effects = ds.apply(event);
                     normalize_timestamps(ds);
+                    *last_send_result = None; // non-send event clears stale result
                     update_pending_tracking(
                         ds,
                         prev_pending_reply_counts,
@@ -3346,7 +3347,7 @@ mod stateright_model {
                     };
                     let effects = ds.apply(event);
                     normalize_timestamps(ds);
-                    // Do NOT set last_send_result — this is the receiving side
+                    *last_send_result = None; // receiving side, clear stale result
                     update_pending_tracking(
                         ds,
                         prev_pending_reply_counts,
@@ -3826,8 +3827,38 @@ mod stateright_model {
                 "pending replies valid",
                 check_pending_replies_valid,
             )
+            .property(
+                Expectation::Always,
+                "send failure implies unreachable",
+                check_send_failure_implies_unreachable,
+            )
+            .property(
+                Expectation::Always,
+                "no spurious pending removal",
+                check_no_spurious_pending_removal,
+            )
+            .property(
+                Expectation::Always,
+                "alias send hints",
+                check_alias_send_hints,
+            )
             .property(Expectation::Sometimes, "registered", check_some_registered)
             .property(Expectation::Sometimes, "remote visible", check_some_remote)
+            .property(
+                Expectation::Sometimes,
+                "pending replies exist",
+                check_some_pending_replies,
+            )
+            .property(
+                Expectation::Sometimes,
+                "some deliveries",
+                check_some_deliveries,
+            )
+            .property(
+                Expectation::Sometimes,
+                "cross-daemon delivery",
+                check_cross_daemon_delivery,
+            )
             .within_boundary(|_, state| state.network.len() <= 12)
     }
 
@@ -3855,6 +3886,147 @@ mod stateright_model {
             }
         }
         true
+    }
+
+    /// Property 8: If send failed and target wasn't renamed, then the sending
+    /// daemon itself does not have that target as a reachable session (local
+    /// networked with a pane, keyed exactly by that ID).
+    fn check_send_failure_implies_unreachable(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        for ds_state in &state.actor_states {
+            if let ModelState::Daemon {
+                ds,
+                last_send_result:
+                    Some(SendOutcome::Failed {
+                        to,
+                        renamed_to: None,
+                        ..
+                    }),
+                ..
+            } = ds_state.as_ref()
+            {
+                // The sending daemon shouldn't have `to` as a directly
+                // addressable session (exact key match — how apply_send
+                // resolves targets).
+                if ds.sessions.contains_key(to.as_str()) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Property 10: If last event was ReplyProgress (done=false), pending count
+    /// must not decrease.
+    fn check_no_spurious_pending_removal(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        for ds_state in &state.actor_states {
+            if let ModelState::Daemon {
+                pending_reply_counts,
+                prev_pending_reply_counts,
+                last_event_type,
+                ..
+            } = ds_state.as_ref()
+            {
+                if matches!(last_event_type, LastEvent::ReplyProgress) {
+                    for (session, &count) in pending_reply_counts {
+                        let prev = prev_pending_reply_counts
+                            .get(session)
+                            .copied()
+                            .unwrap_or(0);
+                        if count < prev {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Property 11: If send failed and the sending daemon can resolve an alias
+    /// for the target (alias exists AND the alias target is in sessions),
+    /// renamed_to must be Some.
+    fn check_alias_send_hints(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        for ds_state in &state.actor_states {
+            if let ModelState::Daemon {
+                ds,
+                last_send_result:
+                    Some(SendOutcome::Failed {
+                        to, renamed_to, ..
+                    }),
+                ..
+            } = ds_state.as_ref()
+            {
+                // resolve_alias returns Some only when the alias target
+                // exists in sessions — matching exactly what apply_send does.
+                if ds.resolve_alias(to.as_str()).is_some()
+                    && renamed_to.is_none()
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Liveness: some state has pending replies.
+    fn check_some_pending_replies(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        daemon_states(&state.actor_states)
+            .iter()
+            .any(|ds| ds.pending_replies.values().any(|v| !v.is_empty()))
+    }
+
+    /// Liveness: some send was delivered.
+    fn check_some_deliveries(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        state.actor_states.iter().any(|s| {
+            matches!(
+                s.as_ref(),
+                ModelState::Daemon {
+                    last_send_result: Some(SendOutcome::Delivered { .. }),
+                    ..
+                }
+            )
+        })
+    }
+
+    /// Liveness: a message was delivered cross-daemon.
+    fn check_cross_daemon_delivery(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        let all_ds = daemon_states(&state.actor_states);
+        for (i, ds_state) in state.actor_states.iter().enumerate() {
+            if let ModelState::Daemon {
+                last_send_result: Some(SendOutcome::Delivered { to, .. }),
+                ..
+            } = ds_state.as_ref()
+            {
+                for (j, ds) in all_ds.iter().enumerate() {
+                    if i != j
+                        && ds.sessions.values().any(|s| {
+                            matches!(s.origin, Origin::Local) && s.id == *to
+                        })
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     // -- Tests ---------------------------------------------------------------
