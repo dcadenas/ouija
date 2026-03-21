@@ -79,9 +79,6 @@ pub struct SessionMeta {
     /// Unix timestamp; 0 in model tests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_metadata_update: Option<i64>,
-    /// Port for HTTP API backends (e.g. opencode serve).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub serve_port: Option<u16>,
 }
 
 /// Metadata becomes stale after 30 minutes without an update.
@@ -110,7 +107,6 @@ impl Default for SessionMeta {
             backend: None,
             project_description: None,
             last_metadata_update: None,
-            serve_port: None,
         }
     }
 }
@@ -370,7 +366,6 @@ fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>) -> Sessio
             backend: m.backend.clone(),
             project_description: m.project_description.clone(),
             last_metadata_update: m.last_metadata_update.map(|ts| ts.timestamp()),
-            serve_port: None,
         },
         None => SessionMeta::default(),
     }

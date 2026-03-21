@@ -112,6 +112,7 @@ pub struct AppState {
     pub perfire_worktree_panes: RwLock<HashMap<String, String>>,
     pub backends: crate::backend::BackendRegistry,
     pub http_client: reqwest::Client,
+    pub opencode_serve: crate::backend::opencode::OpenCodeServe,
 }
 
 impl std::fmt::Debug for AppState {
@@ -257,6 +258,7 @@ impl AppState {
             perfire_worktree_panes: RwLock::new(HashMap::new()),
             backends: crate::backend::BackendRegistry::default_registry(),
             http_client: reqwest::Client::new(),
+            opencode_serve: crate::backend::opencode::OpenCodeServe::new(),
         })
     }
 
@@ -288,6 +290,7 @@ impl AppState {
             perfire_worktree_panes: RwLock::new(HashMap::new()),
             backends: crate::backend::BackendRegistry::default_registry(),
             http_client: reqwest::Client::new(),
+            opencode_serve: crate::backend::opencode::OpenCodeServe::new(),
         })
     }
 

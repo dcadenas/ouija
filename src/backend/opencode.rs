@@ -1,6 +1,151 @@
 use std::path::Path;
+use std::sync::Mutex;
+
+use anyhow::Context;
 
 use super::{CodingAssistant, DeliveryMode, InjectConfig, ResumeOpts, StartOpts};
+
+/// Manages a shared `opencode serve` instance for the daemon.
+///
+/// One serve process runs per ouija daemon. Individual sessions create
+/// opencode sessions via the HTTP API and run `opencode attach` in their
+/// tmux panes.
+pub struct OpenCodeServe {
+    port: Mutex<Option<u16>>,
+    process_pid: Mutex<Option<u32>>,
+}
+
+impl std::fmt::Debug for OpenCodeServe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenCodeServe")
+            .field("port", &self.port.lock().unwrap())
+            .field("process_pid", &self.process_pid.lock().unwrap())
+            .finish()
+    }
+}
+
+impl OpenCodeServe {
+    pub fn new() -> Self {
+        Self {
+            port: Mutex::new(None),
+            process_pid: Mutex::new(None),
+        }
+    }
+
+    /// Ensure the serve process is running. Returns the port.
+    /// Starts the process if not already running, or restarts if the
+    /// health check fails.
+    pub async fn ensure_running(&self, daemon_port: u16) -> anyhow::Result<u16> {
+        // Check if already running and healthy (drop the guard before await)
+        let existing_port = { *self.port.lock().unwrap() };
+        if let Some(port) = existing_port {
+            let health = reqwest::Client::new()
+                .get(format!("http://127.0.0.1:{port}/health"))
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await;
+            if health.is_ok() {
+                return Ok(port);
+            }
+            // Serve died, clear state and restart
+            tracing::warn!("opencode serve on port {port} failed health check, restarting");
+            *self.port.lock().unwrap() = None;
+            *self.process_pid.lock().unwrap() = None;
+        }
+
+        let serve_port = daemon_port + 320;
+
+        let child = std::process::Command::new("opencode")
+            .args([
+                "serve",
+                "--port",
+                &serve_port.to_string(),
+                "--hostname",
+                "127.0.0.1",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("failed to start opencode serve")?;
+
+        let pid = child.id();
+        {
+            *self.process_pid.lock().unwrap() = Some(pid);
+            *self.port.lock().unwrap() = Some(serve_port);
+        }
+
+        // Wait for readiness by polling the health endpoint
+        let client = reqwest::Client::new();
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if std::time::Instant::now() > deadline {
+                anyhow::bail!(
+                    "opencode serve did not become ready within 30s on port {serve_port}"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let resp = client
+                .get(format!("http://127.0.0.1:{serve_port}/health"))
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await;
+            if resp.is_ok() {
+                tracing::info!("opencode serve ready on port {serve_port} (pid {pid})");
+                break;
+            }
+        }
+
+        Ok(serve_port)
+    }
+
+    /// Create a new opencode session on the shared serve instance.
+    pub async fn create_session(&self, client: &reqwest::Client) -> anyhow::Result<String> {
+        let port = self
+            .port
+            .lock()
+            .unwrap()
+            .ok_or_else(|| anyhow::anyhow!("opencode serve not running"))?;
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/session"))
+            .json(&serde_json::json!({}))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("opencode session creation failed {status}: {body}");
+        }
+        let body: serde_json::Value = resp.json().await?;
+        body["id"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("no session id in opencode response"))
+    }
+
+    /// Get the current port, if serve is running.
+    pub fn port(&self) -> Option<u16> {
+        *self.port.lock().unwrap()
+    }
+
+    /// Stop the serve process.
+    pub fn stop(&self) {
+        if let Some(pid) = self.process_pid.lock().unwrap().take() {
+            tracing::info!("stopping opencode serve (pid {pid})");
+            let _ = std::process::Command::new("kill")
+                .arg(pid.to_string())
+                .status();
+        }
+        *self.port.lock().unwrap() = None;
+    }
+}
+
+impl Drop for OpenCodeServe {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
 
 #[derive(Debug)]
 pub struct OpenCode;
@@ -27,14 +172,17 @@ impl CodingAssistant for OpenCode {
     }
 
     fn build_start_command(&self, opts: &StartOpts) -> String {
+        // Placeholder: HttpApi sessions use the shared serve, so this is
+        // only called as a fallback. The actual attach command is built
+        // by start_session/restart_session after creating the opencode session.
         let escaped_dir = crate::scheduler::shell_escape(&opts.project_dir);
-        format!("cd {escaped_dir} && opencode serve --port 0 &")
+        format!("cd {escaped_dir} && echo 'waiting for opencode attach...'")
     }
 
     fn build_resume_command(&self, opts: &ResumeOpts) -> Option<String> {
-        // opencode persists sessions server-side; resume is handled via HTTP API
+        // Resume is handled via HTTP API on the shared serve
         let escaped_dir = crate::scheduler::shell_escape(&opts.project_dir);
-        Some(format!("cd {escaped_dir} && opencode serve --port 0 &"))
+        Some(format!("cd {escaped_dir} && echo 'waiting for opencode attach...'"))
     }
 
     fn detect_session_id(&self, _project_dir: &str) -> Option<String> {
@@ -121,7 +269,8 @@ mod tests {
             project_dir: "/home/user/myproject".to_string(),
             worktree: None,
         });
-        assert_eq!(cmd, "cd '/home/user/myproject' && opencode serve --port 0 &");
+        // HttpApi backends use shared serve; start command is a placeholder
+        assert!(cmd.contains("/home/user/myproject"));
     }
 
     #[test]
@@ -132,10 +281,7 @@ mod tests {
             worktree: None,
         });
         assert!(cmd.is_some());
-        assert_eq!(
-            cmd.unwrap(),
-            "cd '/home/user/myproject' && opencode serve --port 0 &"
-        );
+        assert!(cmd.unwrap().contains("/home/user/myproject"));
     }
 
     #[test]

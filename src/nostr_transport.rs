@@ -1413,19 +1413,24 @@ pub async fn start_session(
 
     match start_result {
         Ok(Ok(pane_id)) => {
-            let (serve_port, backend_session_id) =
-                setup_http_api_session(&pane_id, &backend, &state.http_client).await;
-
-            // Launch the interactive TUI in the pane so the user can
-            // watch and interact with the session (serve continues in
-            // the background).
-            launch_attach_tui(&pane_id, &backend, serve_port.as_ref(), backend_session_id.as_deref());
+            // For HttpApi backends, use the shared opencode serve instance
+            let backend_session_id =
+                if matches!(backend.delivery_mode(), crate::backend::DeliveryMode::HttpApi { .. }) {
+                    match setup_shared_serve_session(state, &pane_id, &dir).await {
+                        Ok(sid) => Some(sid),
+                        Err(e) => {
+                            tracing::warn!("shared serve session setup failed: {e}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
 
             let proto_meta = crate::daemon_protocol::SessionMeta {
                 project_dir: Some(dir.clone()),
                 worktree,
                 backend: Some(backend_name.clone()),
-                serve_port,
                 backend_session_id,
                 ..Default::default()
             };
@@ -1678,8 +1683,19 @@ pub async fn restart_session(
 
     match start_result {
         Ok(Ok(pane_id)) => {
-            let (serve_port, mut backend_session_id) =
-                setup_http_api_session(&pane_id, &backend, &state.http_client).await;
+            // For HttpApi backends, use the shared opencode serve instance
+            let mut backend_session_id =
+                if matches!(backend.delivery_mode(), crate::backend::DeliveryMode::HttpApi { .. }) {
+                    match setup_shared_serve_session(state, &pane_id, &dir).await {
+                        Ok(sid) => Some(sid),
+                        Err(e) => {
+                            tracing::warn!("shared serve session setup failed: {e}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
 
             // Fall back to the previous session ID when not fresh
             if backend_session_id.is_none() && !fresh {
@@ -1687,9 +1703,6 @@ pub async fn restart_session(
                     .as_ref()
                     .and_then(|m| m.backend_session_id.clone());
             }
-
-            // Launch the interactive TUI in the pane
-            launch_attach_tui(&pane_id, &backend, serve_port.as_ref(), backend_session_id.as_deref());
 
             let proto_meta = match prev_metadata {
                 Some(ref m) => crate::daemon_protocol::SessionMeta {
@@ -1703,13 +1716,11 @@ pub async fn restart_session(
                     backend: Some(backend_name.clone()),
                     project_description: m.project_description.clone(),
                     last_metadata_update: None,
-                    serve_port,
                 },
                 None => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),
                     backend: Some(backend_name.clone()),
                     backend_session_id,
-                    serve_port,
                     ..Default::default()
                 },
             };
@@ -1742,135 +1753,41 @@ pub async fn restart_session(
     }
 }
 
-/// Poll a tmux pane's output for an HTTP API "listening on" message and extract the port.
+/// Ensure the shared opencode serve is running, create a session on it, and
+/// launch `opencode attach` in the tmux pane.
 ///
-/// Used by HttpApi backends (e.g. `opencode serve --port 0`) that print their
-/// auto-assigned port on startup. Returns `Some(port)` if found within `timeout_secs`,
-/// otherwise `None`.
-fn wait_for_serve_ready(pane: &str, timeout_secs: u64) -> Option<u16> {
-    use std::process::Command;
-    use std::time::{Duration, Instant};
-
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    while Instant::now() < deadline {
-        std::thread::sleep(Duration::from_secs(1));
-        if let Ok(output) = Command::new("tmux")
-            .args(["capture-pane", "-t", pane, "-p", "-S", "-20"])
-            .output()
-        {
-            let text = String::from_utf8_lossy(&output.stdout);
-            for line in text.lines() {
-                if line.contains("listening on") {
-                    // Expected format: "... listening on http://HOST:PORT"
-                    if let Some(port_str) = line.rsplit(':').next() {
-                        if let Ok(port) = port_str.trim().parse::<u16>() {
-                            return Some(port);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Create a new session on an opencode HTTP API server.
-///
-/// Posts to `POST /session` and returns the session ID from the response.
-async fn create_opencode_session(client: &reqwest::Client, port: u16) -> anyhow::Result<String> {
-    let resp = client
-        .post(format!("http://127.0.0.1:{port}/session"))
-        .json(&serde_json::json!({}))
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
+/// Returns the opencode session ID on success.
+async fn setup_shared_serve_session(
+    state: &std::sync::Arc<AppState>,
+    pane_id: &str,
+    project_dir: &str,
+) -> anyhow::Result<String> {
+    let port = state
+        .opencode_serve
+        .ensure_running(state.config.port)
         .await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("opencode session creation failed {status}: {body}");
-    }
-    let body: serde_json::Value = resp.json().await?;
-    body["id"]
-        .as_str()
-        .map(String::from)
-        .ok_or_else(|| anyhow::anyhow!("no session id in opencode response"))
-}
 
-/// Wait for an HttpApi backend to become ready and create a session.
-///
-/// Returns `(serve_port, backend_session_id)`. For non-HttpApi backends or
-/// on failure, returns `(None, None)`.
-async fn setup_http_api_session(
-    pane_id: &str,
-    backend: &std::sync::Arc<dyn crate::backend::CodingAssistant>,
-    http_client: &reqwest::Client,
-) -> (Option<u16>, Option<String>) {
-    let serve_port = match backend.delivery_mode() {
-        crate::backend::DeliveryMode::HttpApi { .. } => {
-            let pane_clone = pane_id.to_string();
-            match tokio::task::spawn_blocking(move || wait_for_serve_ready(&pane_clone, 30)).await {
-                Ok(Some(port)) => {
-                    tracing::info!("HttpApi backend ready on port {port}");
-                    Some(port)
-                }
-                Ok(None) => {
-                    tracing::warn!("HttpApi backend did not report a port within timeout");
-                    None
-                }
-                Err(e) => {
-                    tracing::warn!("failed to wait for HttpApi readiness: {e}");
-                    None
-                }
-            }
-        }
-        crate::backend::DeliveryMode::TuiInjection => None,
-    };
+    let session_id = state
+        .opencode_serve
+        .create_session(&state.http_client)
+        .await?;
 
-    let backend_session_id = if let Some(port) = serve_port {
-        match create_opencode_session(http_client, port).await {
-            Ok(id) => {
-                tracing::info!("created opencode session {id} on port {port}");
-                Some(id)
-            }
-            Err(e) => {
-                tracing::warn!("failed to create opencode session: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    tracing::info!("created opencode session {session_id} on shared serve (port {port})");
 
-    (serve_port, backend_session_id)
-}
-
-/// For HttpApi backends, send the `attach` command into the tmux pane so the user
-/// sees the interactive conversation TUI instead of raw server logs.
-///
-/// The serve process is already running in the background (started with `&`).
-/// This replaces the bare shell prompt with the full TUI.
-fn launch_attach_tui(
-    pane_id: &str,
-    backend: &std::sync::Arc<dyn crate::backend::CodingAssistant>,
-    serve_port: Option<&u16>,
-    backend_session_id: Option<&str>,
-) {
-    let attach_base = match backend.delivery_mode() {
-        crate::backend::DeliveryMode::HttpApi { attach_command, .. } => attach_command,
-        _ => return,
-    };
-    let (Some(&port), Some(session_id)) = (serve_port, backend_session_id) else {
-        return;
-    };
-    let attach_cmd = format!("{attach_base} http://127.0.0.1:{port} --session {session_id}");
+    let escaped_dir = crate::scheduler::shell_escape(project_dir);
+    let attach_cmd = format!(
+        "opencode attach http://127.0.0.1:{port} --session {session_id} --dir {escaped_dir}"
+    );
     let pane = pane_id.to_string();
     tokio::task::spawn_blocking(move || {
-        // Small delay so the backgrounded serve process is fully ready
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        // Small delay so the pane shell is ready
+        std::thread::sleep(std::time::Duration::from_millis(300));
         let _ = std::process::Command::new("tmux")
             .args(["send-keys", "-t", &pane, &attach_cmd, "Enter"])
             .status();
     });
+
+    Ok(session_id)
 }
 
 /// Inject a prompt into a pane after a short delay, giving the backend time to start.

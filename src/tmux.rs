@@ -504,23 +504,19 @@ async fn deliver_via_http(
     session_id: &str,
     message: &str,
 ) -> anyhow::Result<()> {
-    let proto = state.protocol.read().await;
-    let session = proto
-        .sessions
-        .get(session_id)
-        .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
+    let port = state
+        .opencode_serve
+        .port()
+        .ok_or_else(|| anyhow::anyhow!("opencode serve not running"))?;
 
-    let port = session
-        .metadata
-        .serve_port
-        .ok_or_else(|| anyhow::anyhow!("no serve_port for session {session_id}"))?;
-    let oc_session_id = session
-        .metadata
-        .backend_session_id
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("no backend_session_id for session {session_id}"))?;
-
-    drop(proto); // release lock before HTTP call
+    let oc_session_id = {
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .get(session_id)
+            .and_then(|s| s.metadata.backend_session_id.clone())
+            .ok_or_else(|| anyhow::anyhow!("no backend_session_id for session {session_id}"))?
+    };
 
     let client = state.http_client.clone();
     let body = serde_json::json!({
