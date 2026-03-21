@@ -1,17 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
-# ── Guard: require API key ────────────────────────────────────────
-if [ -z "${OPENROUTER_API_KEY:-}" ]; then
-    echo "OPENROUTER_API_KEY not set — skipping opencode e2e tests"
-    echo "To run: OPENROUTER_API_KEY=your-key bash tests/e2e/run-e2e.sh opencode"
-    exit 0
-fi
-
 # ── Guard: require Docker ─────────────────────────────────────────
 if [ -z "${OUIJA_E2E:-}" ] && [ ! -f /.dockerenv ]; then
     echo "ERROR: e2e tests require Docker for tmux isolation." >&2
-    echo "Run:  OPENROUTER_API_KEY=your-key bash tests/e2e/run-e2e.sh opencode" >&2
+    echo "Run:  bash tests/e2e/run-e2e.sh opencode" >&2
     exit 1
 fi
 
@@ -33,14 +26,7 @@ mkdir -p /root/.config/opencode
 cat > /root/.config/opencode/opencode.json << CONF
 {
   "\$schema": "https://opencode.ai/config.json",
-  "provider": {
-    "openrouter": {
-      "options": {
-        "apiKey": "{env:OPENROUTER_API_KEY}"
-      }
-    }
-  },
-  "model": "openrouter/nvidia/nemotron-3-nano-30b-a3b:free",
+  "model": "opencode/gpt-5-nano",
   "mcp": {
     "ouija": {
       "type": "remote",
