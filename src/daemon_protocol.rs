@@ -70,8 +70,10 @@ pub struct SessionMeta {
     pub networked: bool,
     pub worktree: bool,
     pub vim_mode: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "claude_session_id")]
+    pub backend_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claude_session_id: Option<String>,
+    pub backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_description: Option<String>,
     /// Unix timestamp; 0 in model tests.
@@ -101,7 +103,8 @@ impl Default for SessionMeta {
             networked: true, // sessions are networked by default
             worktree: false,
             vim_mode: false,
-            claude_session_id: None,
+            backend_session_id: None,
+            backend: None,
             project_description: None,
             last_metadata_update: None,
         }
@@ -358,7 +361,8 @@ fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>) -> Sessio
             networked: m.networked,
             worktree: m.worktree,
             vim_mode: m.vim_mode,
-            claude_session_id: m.claude_session_id.clone(),
+            backend_session_id: m.backend_session_id.clone(),
+            backend: m.backend.clone(),
             project_description: m.project_description.clone(),
             last_metadata_update: m.last_metadata_update.map(|ts| ts.timestamp()),
         },

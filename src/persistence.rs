@@ -576,7 +576,7 @@ mod tests {
             run_count: 0,
             project_dir: None,
             once: false,
-            claude_session_id: None,
+            backend_session_id: None,
             on_fire: crate::scheduler::OnFire::ContinueSession,
         };
         tasks.insert(task.id.clone(), task);

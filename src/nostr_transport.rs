@@ -1505,7 +1505,7 @@ pub async fn restart_session(
     } else {
         prev_metadata
             .as_ref()
-            .and_then(|m| m.claude_session_id.clone())
+            .and_then(|m| m.backend_session_id.clone())
             .or_else(|| detect_claude_session_id(&dir))
     };
     if let Some(ref sid) = resume_id {
@@ -1639,11 +1639,12 @@ pub async fn restart_session(
                     networked: m.networked,
                     worktree: m.worktree,
                     vim_mode: m.vim_mode,
-                    claude_session_id: if fresh {
+                    backend_session_id: if fresh {
                         None
                     } else {
-                        m.claude_session_id.clone()
+                        m.backend_session_id.clone()
                     },
+                    backend: m.backend.clone(),
                     project_description: m.project_description.clone(),
                     last_metadata_update: None,
                 },

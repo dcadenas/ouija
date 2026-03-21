@@ -52,9 +52,10 @@ pub struct SessionRegisterParams {
     /// What this session needs, offers, or is working on.
     /// Used to discover collaboration opportunities with other sessions.
     pub bulletin: Option<String>,
-    /// Claude Code conversation/session ID (UUID) for `--resume` on restart.
+    /// Coding assistant conversation/session ID (UUID) for `--resume` on restart.
     /// If provided, restart will use `--resume <id>` instead of `--continue`.
-    pub claude_session_id: Option<String>,
+    #[serde(alias = "claude_session_id")]
+    pub backend_session_id: Option<String>,
 }
 
 /// Parameters for the `session_unregister` MCP tool.
@@ -135,8 +136,9 @@ pub struct TaskCreateParams {
     /// If true, the task fires once then auto-deletes itself.
     #[serde(default)]
     pub once: Option<bool>,
-    /// Claude session ID for --resume on revival (instead of --continue).
-    pub claude_session_id: Option<String>,
+    /// Backend session ID for --resume on revival (instead of --continue).
+    #[serde(alias = "claude_session_id")]
+    pub backend_session_id: Option<String>,
     /// What happens each time the task fires.
     /// Variants: continue_session (default), new_session, persistent_worktree, disposable_worktree.
     /// For persistent_worktree, set clear_context to control conversation persistence.
@@ -237,7 +239,7 @@ impl OuijaMcp {
             role: params.role,
             bulletin: params.bulletin,
             networked: params.networked.unwrap_or(true),
-            claude_session_id: params.claude_session_id,
+            backend_session_id: params.backend_session_id,
             project_description,
             ..Default::default()
         };
@@ -562,7 +564,7 @@ impl OuijaMcp {
                     "last_status": t.last_status,
                     "run_count": t.run_count,
                     "once": t.once,
-                    "claude_session_id": t.claude_session_id,
+                    "backend_session_id": t.backend_session_id,
                 })
             })
             .collect();
@@ -591,7 +593,7 @@ impl OuijaMcp {
             params.message,
             params.project_dir,
             params.once.unwrap_or(false),
-            params.claude_session_id,
+            params.backend_session_id,
             params.on_fire.unwrap_or_default(),
         );
 

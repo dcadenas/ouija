@@ -413,7 +413,8 @@ pub struct RegisterBody {
     /// Defaults to true if omitted.
     #[serde(default)]
     networked: Option<bool>,
-    claude_session_id: Option<String>,
+    #[serde(alias = "claude_session_id")]
+    backend_session_id: Option<String>,
 }
 
 /// Register a new local session with optional metadata.
@@ -437,7 +438,7 @@ pub async fn register(
         role: body.role,
         bulletin: body.bulletin,
         networked: body.networked.unwrap_or(true),
-        claude_session_id: body.claude_session_id,
+        backend_session_id: body.backend_session_id,
         project_description,
         ..Default::default()
     };
@@ -949,7 +950,7 @@ pub async fn list_tasks(State(state): State<SharedState>) -> Json<serde_json::Va
                 "run_count": t.run_count,
                 "project_dir": t.project_dir,
                 "once": t.once,
-                "claude_session_id": t.claude_session_id,
+                "backend_session_id": t.backend_session_id,
                 "on_fire": t.on_fire,
             })
         })
@@ -966,7 +967,8 @@ pub struct CreateTaskBody {
     project_dir: Option<String>,
     #[serde(default)]
     once: Option<bool>,
-    claude_session_id: Option<String>,
+    #[serde(alias = "claude_session_id")]
+    backend_session_id: Option<String>,
     #[serde(default)]
     on_fire: Option<crate::scheduler::OnFire>,
 }
@@ -990,7 +992,7 @@ pub async fn create_task(
         body.message,
         body.project_dir,
         body.once.unwrap_or(false),
-        body.claude_session_id,
+        body.backend_session_id,
         body.on_fire.unwrap_or_default(),
     );
 

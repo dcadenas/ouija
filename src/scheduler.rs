@@ -83,8 +83,8 @@ pub struct ScheduledTask {
     pub project_dir: Option<String>,
     #[serde(default)]
     pub once: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claude_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "claude_session_id")]
+    pub backend_session_id: Option<String>,
     #[serde(default)]
     pub on_fire: OnFire,
 }
@@ -126,8 +126,8 @@ impl<'de> serde::Deserialize<'de> for ScheduledTask {
             project_dir: Option<String>,
             #[serde(default)]
             once: bool,
-            #[serde(default)]
-            claude_session_id: Option<String>,
+            #[serde(default, alias = "claude_session_id")]
+            backend_session_id: Option<String>,
             #[serde(default)]
             on_fire: Option<OnFire>,
             #[serde(default)]
@@ -170,7 +170,7 @@ impl<'de> serde::Deserialize<'de> for ScheduledTask {
             run_count: raw.run_count,
             project_dir: raw.project_dir,
             once: raw.once,
-            claude_session_id: raw.claude_session_id,
+            backend_session_id: raw.backend_session_id,
             on_fire,
         })
     }
@@ -455,11 +455,11 @@ async fn respawn_and_inject(
         Err(e) => return TaskRun::failed(task, e.to_string()),
     }
 
-    // Clear claude_session_id since we started fresh
+    // Clear backend_session_id since we started fresh
     {
         let mut proto = state.protocol.write().await;
         if let Some(s) = proto.sessions.get_mut(task.session_name()) {
-            s.metadata.claude_session_id = None;
+            s.metadata.backend_session_id = None;
         }
     }
 
@@ -493,7 +493,7 @@ async fn revive_from_task(
             if task.on_fire.clears_context() {
                 let mut proto = state.protocol.write().await;
                 if let Some(s) = proto.sessions.get_mut(task.session_name()) {
-                    s.metadata.claude_session_id = None;
+                    s.metadata.backend_session_id = None;
                 }
             }
             TaskRun::ok(task, Some(new_pane))
@@ -525,10 +525,10 @@ async fn revive_and_inject(
         let task_name = task.name.clone();
         let window_name = task.session_name().to_string();
         let tmux_session = crate::tmux::tmux_session_name(&dir);
-        let claude_session_id = if clears_context {
+        let backend_session_id = if clears_context {
             None
         } else {
-            task.claude_session_id
+            task.backend_session_id
                 .clone()
                 .or_else(|| crate::nostr_transport::detect_claude_session_id(&dir))
         };
@@ -588,7 +588,7 @@ async fn revive_and_inject(
                 .status();
 
             // Launch claude in the project dir with --dangerously-skip-permissions
-            let cmd = match (&claude_session_id, clears_context) {
+            let cmd = match (&backend_session_id, clears_context) {
                 (_, true) => format!(
                     "cd {} && claude --dangerously-skip-permissions",
                     shell_escape(&dir),
@@ -735,7 +735,7 @@ pub fn new_task(
     message: String,
     project_dir: Option<String>,
     once: bool,
-    claude_session_id: Option<String>,
+    backend_session_id: Option<String>,
     on_fire: OnFire,
 ) -> ScheduledTask {
     let next_run = compute_next_run(&cron);
@@ -753,7 +753,7 @@ pub fn new_task(
         run_count: 0,
         project_dir,
         once,
-        claude_session_id,
+        backend_session_id,
         on_fire,
     }
 }
@@ -814,7 +814,7 @@ mod tests {
             run_count: 0,
             project_dir: Some("/tmp".into()),
             once: false,
-            claude_session_id: None,
+            backend_session_id: None,
             on_fire: OnFire::ContinueSession,
         };
         let json = serde_json::to_string(&task).unwrap();
@@ -875,7 +875,7 @@ mod tests {
             run_count: 0,
             project_dir: Some("/tmp/project".into()),
             once: false,
-            claude_session_id: None,
+            backend_session_id: None,
             on_fire: OnFire::DisposableWorktree,
         };
         let json = serde_json::to_string(&task).unwrap();

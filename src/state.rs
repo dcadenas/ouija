@@ -132,9 +132,12 @@ pub struct SessionMetadata {
     /// When the session's role/project_dir was last explicitly set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_metadata_update: Option<DateTime<Utc>>,
-    /// Claude Code conversation/session ID (UUID) for `--resume` on restart.
+    /// Coding assistant conversation/session ID (UUID) for `--resume` on restart.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "claude_session_id")]
+    pub backend_session_id: Option<String>,
+    /// Which coding assistant backend this session uses (e.g. "claude-code").
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub claude_session_id: Option<String>,
+    pub backend: Option<String>,
     /// Short project description extracted from Cargo.toml, package.json, or README.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_description: Option<String>,
@@ -159,7 +162,8 @@ impl Default for SessionMetadata {
             role: None,
             networked: true,
             last_metadata_update: None,
-            claude_session_id: None,
+            backend_session_id: None,
+            backend: None,
             project_description: None,
             bulletin: None,
             worktree: false,
