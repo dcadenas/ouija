@@ -83,10 +83,6 @@ pub async fn broadcast_local_sessions(state: &AppState) {
     let seq = proto.wire_seq;
     drop(proto);
 
-    if local_infos.is_empty() {
-        return;
-    }
-
     let msg = WireMessage::SessionList {
         sessions: local_infos,
         daemon_id: state.config.npub.clone(),

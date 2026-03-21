@@ -3488,16 +3488,14 @@ mod stateright_model {
                         })
                         .map(|s| s.id.clone())
                         .collect();
-                    if !session_ids.is_empty() {
-                        let msg = ModelMsg::WireList {
-                            sessions: session_ids,
-                            daemon_id: ds.daemon_id.clone(),
-                            daemon_name: ds.daemon_name.clone(),
-                            seq: ds.wire_seq,
-                        };
-                        for &peer in peers.iter() {
-                            o.send(peer, msg.clone());
-                        }
+                    let msg = ModelMsg::WireList {
+                        sessions: session_ids,
+                        daemon_id: ds.daemon_id.clone(),
+                        daemon_name: ds.daemon_name.clone(),
+                        seq: ds.wire_seq,
+                    };
+                    for &peer in peers.iter() {
+                        o.send(peer, msg.clone());
                     }
                 }
                 _ => {}
