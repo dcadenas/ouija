@@ -693,6 +693,7 @@ api "$BASE" DELETE "/api/tasks/$L13_ID" >/dev/null
 log "Test L15: Auto-worktree when directory conflicts"
 # Register a session with project_dir that will conflict with a new session_start
 mkdir -p /tmp/projects/auto-wt-test
+git init /tmp/projects/auto-wt-test >/dev/null 2>&1
 api "$BASE" POST /api/register -d "{\"id\":\"existing-sess\",\"pane\":\"$PANE_A\",\"project_dir\":\"/tmp/projects/auto-wt-test\"}" >/dev/null
 L15=$(api "$BASE" POST /api/sessions/start -d '{"name":"auto-wt-test"}')
 assert_contains "L15: start succeeds" "$L15" "started"
@@ -704,6 +705,8 @@ api "$BASE" POST /api/sessions/kill -d '{"name":"auto-wt-test"}' >/dev/null 2>&1
 api "$BASE" POST /api/remove -d '{"id":"existing-sess"}' >/dev/null 2>&1 || true
 
 log "Test L14: Start session with worktree=true"
+mkdir -p /tmp/projects/wt-sess
+git init /tmp/projects/wt-sess >/dev/null 2>&1
 L14=$(api "$BASE" POST /api/sessions/start -d '{"name":"wt-sess","worktree":true}')
 assert_contains "L14: start worktree session" "$L14" "started"
 L14_STATUS=$(api "$BASE" GET /api/status)
@@ -725,8 +728,8 @@ L16=$(api "$BASE" POST /api/sessions/start -d '{"name":"from-test","prompt":"wha
 assert_contains "L16: start succeeds" "$L16" "started"
 wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'from-test'"
 L16_PANE=$(session_field "$BASE" "from-test" "pane")
-wait_for 12 bash -c "tmux capture-pane -t '$L16_PANE' -p -S -30 | grep -qF 'from=\"orchestrator\"'"
-L16_CONTENT=$(tmux capture-pane -t "$L16_PANE" -p -S -30)
+wait_for 12 bash -c "tmux capture-pane -t '$L16_PANE' -p -J -S -30 | grep -qF 'from=\"orchestrator\"'"
+L16_CONTENT=$(tmux capture-pane -t "$L16_PANE" -p -J -S -30)
 assert_contains "L16: prompt has XML from attr" "$L16_CONTENT" 'from="orchestrator"'
 assert_contains "L16: prompt has reply attr" "$L16_CONTENT" 'reply="true"'
 assert_contains "L16: prompt has message content" "$L16_CONTENT" "what is your status?"
@@ -739,8 +742,8 @@ L17=$(api "$BASE" POST /api/sessions/start -d '{"name":"from-noreply","prompt":"
 assert_contains "L17: start succeeds" "$L17" "started"
 wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'from-noreply'"
 L17_PANE=$(session_field "$BASE" "from-noreply" "pane")
-wait_for 12 bash -c "tmux capture-pane -t '$L17_PANE' -p -S -30 | grep -qF 'from=\"deployer\"'"
-L17_CONTENT=$(tmux capture-pane -t "$L17_PANE" -p -S -30)
+wait_for 12 bash -c "tmux capture-pane -t '$L17_PANE' -p -J -S -30 | grep -qF 'from=\"deployer\"'"
+L17_CONTENT=$(tmux capture-pane -t "$L17_PANE" -p -J -S -30)
 assert_contains "L17: prompt has XML from attr" "$L17_CONTENT" 'from="deployer"'
 assert_not_contains "L17: no reply attr" "$L17_CONTENT" 'reply="true"'
 tmux kill-pane -t "$L17_PANE" 2>/dev/null || true
@@ -751,8 +754,8 @@ L18=$(api "$BASE" POST /api/sessions/start -d '{"name":"plain-prompt","prompt":"
 assert_contains "L18: start succeeds" "$L18" "started"
 wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'plain-prompt'"
 L18_PANE=$(session_field "$BASE" "plain-prompt" "pane")
-wait_for 12 bash -c "tmux capture-pane -t '$L18_PANE' -p -S -30 | grep -qF 'just a plain prompt'"
-L18_CONTENT=$(tmux capture-pane -t "$L18_PANE" -p -S -30)
+wait_for 12 bash -c "tmux capture-pane -t '$L18_PANE' -p -J -S -30 | grep -qF 'just a plain prompt'"
+L18_CONTENT=$(tmux capture-pane -t "$L18_PANE" -p -J -S -30)
 assert_contains "L18: plain prompt injected" "$L18_CONTENT" "just a plain prompt"
 assert_not_contains "L18: no XML msg tag" "$L18_CONTENT" "<msg "
 tmux kill-pane -t "$L18_PANE" 2>/dev/null || true
