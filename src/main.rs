@@ -282,6 +282,9 @@ async fn main() -> anyhow::Result<()> {
             tokio::spawn(async move {
                 let mut last_session_hash: u64 = 0;
                 let mut first_run = true;
+                let mut heartbeat_counter: u64 = 0;
+                // Re-announce every HEARTBEAT_CYCLES reaper ticks (~60s at default 10s interval)
+                const HEARTBEAT_CYCLES: u64 = 6;
 
                 loop {
                     let interval = reaper_state.settings.read().await.reaper_interval_secs;
@@ -367,12 +370,19 @@ async fn main() -> anyhow::Result<()> {
                     // Scan tmux, update cache, auto-register unregistered panes
                     reaper_state.scan_and_autoregister_panes().await;
 
-                    // Broadcast full session list only on startup or when it changes
+                    // Broadcast full session list on startup, when it changes,
+                    // or periodically as a heartbeat so peers reconnect after
+                    // relay disconnections or daemon restarts.
+                    heartbeat_counter += 1;
                     let current_hash = reaper_state.local_session_hash().await;
-                    if first_run || current_hash != last_session_hash {
+                    let heartbeat_due = heartbeat_counter >= HEARTBEAT_CYCLES;
+                    if first_run || current_hash != last_session_hash || heartbeat_due {
                         transport::broadcast_local_sessions(&reaper_state).await;
                         last_session_hash = current_hash;
                         first_run = false;
+                        if heartbeat_due {
+                            heartbeat_counter = 0;
+                        }
                     }
                 }
             });
