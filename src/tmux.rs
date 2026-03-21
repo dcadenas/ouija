@@ -468,22 +468,123 @@ pub async fn locked_inject(
     vim_mode: bool,
 ) -> anyhow::Result<()> {
     let backend = state.backend_for_session(session_id).await;
-    let config = backend.inject_config();
-    let tui_pattern = backend.tui_ready_pattern().map(String::from);
 
-    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    let req = InjectRequest {
-        pane: pane.to_string(),
-        message: message.to_string(),
-        vim_mode,
-        inject_config: config,
-        tui_pattern,
-        result_tx,
-    };
-    state.enqueue_inject(req);
-    result_rx
-        .await
-        .map_err(|_| anyhow::anyhow!("inject queue closed"))?
+    match backend.delivery_mode() {
+        crate::backend::DeliveryMode::HttpApi { .. } => {
+            deliver_via_http(state, session_id, message).await
+        }
+        crate::backend::DeliveryMode::TuiInjection => {
+            let config = backend.inject_config();
+            let tui_pattern = backend.tui_ready_pattern().map(String::from);
+
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let req = InjectRequest {
+                pane: pane.to_string(),
+                message: message.to_string(),
+                vim_mode,
+                inject_config: config,
+                tui_pattern,
+                result_tx,
+            };
+            state.enqueue_inject(req);
+            result_rx
+                .await
+                .map_err(|_| anyhow::anyhow!("inject queue closed"))?
+        }
+    }
+}
+
+/// Deliver a message to an opencode session via its HTTP API.
+///
+/// Uses the `prompt_async` endpoint which returns immediately without waiting
+/// for the LLM to finish processing. Falls back to spawning the synchronous
+/// `/message` call in a background task if `prompt_async` is not available.
+async fn deliver_via_http(
+    state: &crate::state::AppState,
+    session_id: &str,
+    message: &str,
+) -> anyhow::Result<()> {
+    let proto = state.protocol.read().await;
+    let session = proto
+        .sessions
+        .get(session_id)
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} not found"))?;
+
+    let port = session
+        .metadata
+        .serve_port
+        .ok_or_else(|| anyhow::anyhow!("no serve_port for session {session_id}"))?;
+    let oc_session_id = session
+        .metadata
+        .backend_session_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("no backend_session_id for session {session_id}"))?;
+
+    drop(proto); // release lock before HTTP call
+
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "parts": [{"type": "text", "text": message}]
+    });
+
+    // Try prompt_async first (returns immediately)
+    let async_url = format!(
+        "http://127.0.0.1:{port}/session/{oc_session_id}/prompt_async"
+    );
+    let resp = client
+        .post(&async_url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            tracing::info!(session_id, port, "delivered message via prompt_async");
+            return Ok(());
+        }
+        Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+            tracing::debug!("prompt_async not available, falling back to /message");
+        }
+        Ok(r) => {
+            let status = r.status();
+            let text = r.text().await.unwrap_or_default();
+            tracing::warn!("prompt_async returned {status}: {text}, falling back to /message");
+        }
+        Err(e) => {
+            tracing::warn!("prompt_async request failed: {e}, falling back to /message");
+        }
+    }
+
+    // Fallback: spawn /message in a background task so we don't block
+    let msg_url = format!(
+        "http://127.0.0.1:{port}/session/{oc_session_id}/message"
+    );
+    let body_clone = body.clone();
+    tokio::spawn(async move {
+        let result = reqwest::Client::new()
+            .post(&msg_url)
+            .json(&body_clone)
+            .timeout(std::time::Duration::from_secs(300))
+            .send()
+            .await;
+        match result {
+            Ok(r) if r.status().is_success() => {
+                tracing::info!(port, "delivered message via /message (background)");
+            }
+            Ok(r) => {
+                let status = r.status();
+                let text = r.text().await.unwrap_or_default();
+                tracing::warn!("opencode /message returned {status}: {text}");
+            }
+            Err(e) => {
+                tracing::warn!("opencode /message request failed: {e}");
+            }
+        }
+    });
+
+    tracing::info!(session_id, port, "spawned message delivery via /message (background)");
+    Ok(())
 }
 
 /// Rename the tmux window containing a pane and disable automatic-rename.

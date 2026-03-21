@@ -1439,11 +1439,28 @@ pub async fn start_session(
                 crate::backend::DeliveryMode::TuiInjection => None,
             };
 
+            // Create an opencode session via the HTTP API if a serve_port is available
+            let backend_session_id = if let Some(port) = serve_port {
+                match create_opencode_session(port).await {
+                    Ok(id) => {
+                        tracing::info!("created opencode session {id} on port {port}");
+                        Some(id)
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to create opencode session: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             let proto_meta = crate::daemon_protocol::SessionMeta {
                 project_dir: Some(dir.clone()),
                 worktree,
                 backend: Some(backend_name.clone()),
                 serve_port,
+                backend_session_id,
                 ..Default::default()
             };
             state
@@ -1708,6 +1725,33 @@ pub async fn restart_session(
                 crate::backend::DeliveryMode::TuiInjection => None,
             };
 
+            // Create an opencode session via the HTTP API if a serve_port is available
+            let backend_session_id = if let Some(port) = serve_port {
+                match create_opencode_session(port).await {
+                    Ok(id) => {
+                        tracing::info!("created opencode session {id} on port {port} (restart)");
+                        Some(id)
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to create opencode session (restart): {e}");
+                        // Fall back to previous session ID if not fresh
+                        if fresh {
+                            None
+                        } else {
+                            prev_metadata
+                                .as_ref()
+                                .and_then(|m| m.backend_session_id.clone())
+                        }
+                    }
+                }
+            } else if fresh {
+                None
+            } else {
+                prev_metadata
+                    .as_ref()
+                    .and_then(|m| m.backend_session_id.clone())
+            };
+
             let proto_meta = match prev_metadata {
                 Some(ref m) => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),
@@ -1716,11 +1760,7 @@ pub async fn restart_session(
                     networked: m.networked,
                     worktree: m.worktree,
                     vim_mode: m.vim_mode,
-                    backend_session_id: if fresh {
-                        None
-                    } else {
-                        m.backend_session_id.clone()
-                    },
+                    backend_session_id,
                     backend: Some(backend_name.clone()),
                     project_description: m.project_description.clone(),
                     last_metadata_update: None,
@@ -1729,6 +1769,7 @@ pub async fn restart_session(
                 None => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),
                     backend: Some(backend_name.clone()),
+                    backend_session_id,
                     serve_port,
                     ..Default::default()
                 },
@@ -1792,6 +1833,29 @@ fn wait_for_serve_ready(pane: &str, timeout_secs: u64) -> Option<u16> {
         }
     }
     None
+}
+
+/// Create a new session on an opencode HTTP API server.
+///
+/// Posts to `POST /session` and returns the session ID from the response.
+async fn create_opencode_session(port: u16) -> anyhow::Result<String> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/session"))
+        .json(&serde_json::json!({}))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("opencode session creation failed {status}: {body}");
+    }
+    let body: serde_json::Value = resp.json().await?;
+    body["id"]
+        .as_str()
+        .map(String::from)
+        .ok_or_else(|| anyhow::anyhow!("no session id in opencode response"))
 }
 
 /// Inject a prompt into a pane after a short delay, giving the backend time to start.
