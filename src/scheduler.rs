@@ -9,9 +9,9 @@ use crate::tmux;
 
 /// How often the scheduler checks for due tasks.
 const SCHEDULER_TICK_SECS: u64 = 15;
-/// Max time to wait for claude to start in a revived pane.
+/// Max time to wait for the backend to start in a revived pane.
 const REVIVAL_TIMEOUT_SECS: u64 = 30;
-/// Extra time to wait for Claude's TUI prompt after process appears.
+/// Extra time to wait for the backend's TUI prompt after process appears.
 const TUI_READY_TIMEOUT_SECS: u64 = 30;
 /// Interval between readiness polls during session revival.
 const REVIVAL_POLL_SECS: u64 = 2;
@@ -411,7 +411,7 @@ async fn inject_into_pane(
     }
 }
 
-/// Respawn claude in an existing pane (for clears_context on a live session).
+/// Respawn the backend in an existing pane (for clears_context on a live session).
 async fn respawn_and_inject(
     state: &SharedState,
     task: &ScheduledTask,
@@ -425,21 +425,18 @@ async fn respawn_and_inject(
     let is_disposable = task.on_fire.is_disposable_worktree();
     let task_name = task.name.clone();
 
-    let claude_cmd = {
-        let base = format!(
-            "cd {} && claude --dangerously-skip-permissions",
-            shell_escape(&dir),
-        );
-        if uses_worktree {
+    let claude_cmd = state.backend.build_start_command(&crate::backend::StartOpts {
+        project_dir: dir.to_string(),
+        worktree: if uses_worktree {
             if is_disposable {
-                format!("{base} --worktree")
+                Some(crate::backend::WorktreeMode::Disposable)
             } else {
-                format!("{base} --worktree {}", shell_escape(&task_name))
+                Some(crate::backend::WorktreeMode::Named(task_name.clone()))
             }
         } else {
-            base
-        }
-    };
+            None
+        },
+    });
 
     let respawn_result = tokio::task::spawn_blocking({
         let pane_id = pane_id.clone();
@@ -472,10 +469,17 @@ async fn respawn_and_inject(
         }
     }
 
-    // Wait for claude to start, then inject
+    // Wait for the backend process to start, then inject
     let poll_pane = pane_id.clone();
+    let process_names: Vec<String> = state
+        .backend
+        .process_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let ready = tokio::task::spawn_blocking(move || {
-        wait_for_claude_process(&poll_pane, REVIVAL_TIMEOUT_SECS)
+        let name_refs: Vec<&str> = process_names.iter().map(|s| s.as_str()).collect();
+        wait_for_process(&poll_pane, &name_refs, REVIVAL_TIMEOUT_SECS)
     })
     .await
     .unwrap_or(false);
@@ -511,7 +515,7 @@ async fn revive_from_task(
     }
 }
 
-/// Revive a dead session: create new tmux window, launch claude, re-register, inject.
+/// Revive a dead session: create new tmux window, launch the backend, re-register, inject.
 async fn revive_and_inject(
     state: &SharedState,
     task: &ScheduledTask,
@@ -526,21 +530,48 @@ async fn revive_and_inject(
     let uses_worktree = task.on_fire.uses_worktree();
     let is_disposable = task.on_fire.is_disposable_worktree();
 
+    // Build the launch command before entering the blocking closure.
+    let worktree = if uses_worktree {
+        if is_disposable {
+            Some(crate::backend::WorktreeMode::Disposable)
+        } else {
+            Some(crate::backend::WorktreeMode::Named(task.name.clone()))
+        }
+    } else {
+        None
+    };
+    let launch_cmd = if clears_context {
+        state.backend.build_start_command(&crate::backend::StartOpts {
+            project_dir: dir.clone(),
+            worktree,
+        })
+    } else {
+        let session_id = task
+            .backend_session_id
+            .clone()
+            .or_else(|| state.backend.detect_session_id(&dir));
+        state
+            .backend
+            .build_resume_command(&crate::backend::ResumeOpts {
+                project_dir: dir.clone(),
+                session_id,
+                worktree,
+            })
+            .unwrap_or_else(|| {
+                state.backend.build_start_command(&crate::backend::StartOpts {
+                    project_dir: dir.clone(),
+                    worktree: None,
+                })
+            })
+    };
+
     // Create named tmux session/window for the revived session.
     // If a tmux session with the target name exists, add a window to it;
     // otherwise create a new tmux session. Both get the ouija session name.
     let new_pane = tokio::task::spawn_blocking({
         let dir = dir.clone();
-        let task_name = task.name.clone();
         let window_name = task.session_name().to_string();
         let tmux_session = crate::tmux::tmux_session_name(&dir);
-        let backend_session_id = if clears_context {
-            None
-        } else {
-            task.backend_session_id
-                .clone()
-                .or_else(|| crate::nostr_transport::detect_claude_session_id(&dir))
-        };
         move || -> anyhow::Result<String> {
             let tmux_session_exists = std::process::Command::new("tmux")
                 .args(["has-session", "-t", &tmux_session])
@@ -596,33 +627,9 @@ async fn revive_and_inject(
                 ])
                 .status();
 
-            // Launch claude in the project dir with --dangerously-skip-permissions
-            let cmd = match (&backend_session_id, clears_context) {
-                (_, true) => format!(
-                    "cd {} && claude --dangerously-skip-permissions",
-                    shell_escape(&dir),
-                ),
-                (Some(sid), false) => format!(
-                    "cd {} && claude --dangerously-skip-permissions --resume {}",
-                    shell_escape(&dir),
-                    shell_escape(sid),
-                ),
-                (None, false) => format!(
-                    "cd {} && claude --dangerously-skip-permissions --continue",
-                    shell_escape(&dir),
-                ),
-            };
-            let cmd = if uses_worktree {
-                if is_disposable {
-                    format!("{cmd} --worktree")
-                } else {
-                    format!("{cmd} --worktree {}", shell_escape(&task_name))
-                }
-            } else {
-                cmd
-            };
+            // Launch the backend in the project dir
             std::process::Command::new("tmux")
-                .args(["send-keys", "-t", &pane_id, &cmd, "Enter"])
+                .args(["send-keys", "-t", &pane_id, &launch_cmd, "Enter"])
                 .status()?;
 
             Ok(pane_id)
@@ -630,29 +637,43 @@ async fn revive_and_inject(
     })
     .await??;
 
-    // Phase 1: Wait for claude process to appear in the pane
+    // Phase 1: Wait for the backend process to appear in the pane
     let poll_pane = new_pane.clone();
+    let process_names: Vec<String> = state
+        .backend
+        .process_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let backend_name = state.backend.name().to_string();
+    let tui_pattern = state.backend.tui_ready_pattern().map(String::from);
     let process_ready = tokio::task::spawn_blocking(move || {
-        wait_for_claude_process(&poll_pane, REVIVAL_TIMEOUT_SECS)
+        let name_refs: Vec<&str> = process_names.iter().map(|s| s.as_str()).collect();
+        wait_for_process(&poll_pane, &name_refs, REVIVAL_TIMEOUT_SECS)
     })
     .await
     .unwrap_or(false);
 
     if !process_ready {
-        anyhow::bail!("claude did not start within {REVIVAL_TIMEOUT_SECS}s in pane {new_pane}");
+        anyhow::bail!(
+            "{backend_name} did not start within {REVIVAL_TIMEOUT_SECS}s in pane {new_pane}"
+        );
     }
 
-    // Phase 2: Wait for Claude's TUI to be ready (prompt indicator appears)
-    let poll_pane = new_pane.clone();
-    let tui_ready =
-        tokio::task::spawn_blocking(move || wait_for_tui_ready(&poll_pane, TUI_READY_TIMEOUT_SECS))
-            .await
-            .unwrap_or(false);
+    // Phase 2: Wait for the backend's TUI to be ready (prompt indicator appears)
+    if let Some(pattern) = tui_pattern {
+        let poll_pane = new_pane.clone();
+        let tui_ready = tokio::task::spawn_blocking(move || {
+            wait_for_tui_ready(&poll_pane, Some(&pattern), TUI_READY_TIMEOUT_SECS)
+        })
+        .await
+        .unwrap_or(false);
 
-    if !tui_ready {
-        tracing::warn!(
-            "Claude TUI prompt not detected within {TUI_READY_TIMEOUT_SECS}s in pane {new_pane}, proceeding anyway"
-        );
+        if !tui_ready {
+            tracing::warn!(
+                "{backend_name} TUI prompt not detected within {TUI_READY_TIMEOUT_SECS}s in pane {new_pane}, proceeding anyway"
+            );
+        }
     }
 
     // Re-register session with new pane (same ID, so dedup check won't fire)
@@ -685,8 +706,8 @@ async fn revive_and_inject(
     Ok(new_pane)
 }
 
-/// Poll a pane until `claude` appears as the current command (blocking).
-fn wait_for_claude_process(pane: &str, timeout_secs: u64) -> bool {
+/// Poll a pane until one of `names` appears as the current command (blocking).
+fn wait_for_process(pane: &str, names: &[&str], timeout_secs: u64) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     while std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_secs(REVIVAL_POLL_SECS));
@@ -700,7 +721,9 @@ fn wait_for_claude_process(pane: &str, timeout_secs: u64) -> bool {
             ])
             .output()
         {
-            if String::from_utf8_lossy(&output.stdout).trim() == "claude" {
+            let current = String::from_utf8_lossy(&output.stdout);
+            let current = current.trim();
+            if names.contains(&current) {
                 return true;
             }
         }
@@ -708,8 +731,12 @@ fn wait_for_claude_process(pane: &str, timeout_secs: u64) -> bool {
     false
 }
 
-/// Poll a pane until Claude's TUI prompt indicator (❯) appears (blocking).
-fn wait_for_tui_ready(pane: &str, timeout_secs: u64) -> bool {
+/// Poll a pane until the TUI prompt pattern appears (blocking).
+/// If `pattern` is `None`, returns `true` immediately (no TUI readiness check).
+fn wait_for_tui_ready(pane: &str, pattern: Option<&str>, timeout_secs: u64) -> bool {
+    let Some(pattern) = pattern else {
+        return true;
+    };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     while std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_secs(REVIVAL_POLL_SECS));
@@ -717,7 +744,7 @@ fn wait_for_tui_ready(pane: &str, timeout_secs: u64) -> bool {
             .args(["capture-pane", "-t", pane, "-p", "-S", "-20"])
             .output()
         {
-            if String::from_utf8_lossy(&output.stdout).contains('\u{276F}') {
+            if String::from_utf8_lossy(&output.stdout).contains(pattern) {
                 return true;
             }
         }
