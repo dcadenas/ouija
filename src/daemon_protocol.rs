@@ -3086,7 +3086,7 @@ mod stateright_model {
     #[derive(Clone, Debug, Eq, Hash, PartialEq)]
     enum ModelState {
         Daemon {
-            ds: DaemonState,
+            ds: Box<DaemonState>,
             peers: Vec<Id>,
             last_send_result: Option<SendOutcome>,
             pending_reply_counts: BTreeMap<String, usize>,
@@ -3125,7 +3125,7 @@ mod stateright_model {
                     daemon_name,
                     peers,
                 } => ModelState::Daemon {
-                    ds: DaemonState::new_for_model(daemon_id.clone(), daemon_name.clone()),
+                    ds: Box::new(DaemonState::new_for_model(daemon_id.clone(), daemon_name.clone())),
                     peers: peers.clone(),
                     last_send_result: None,
                     pending_reply_counts: BTreeMap::new(),
@@ -3616,7 +3616,7 @@ mod stateright_model {
         actor_states
             .iter()
             .filter_map(|s| match s.as_ref() {
-                ModelState::Daemon { ds, .. } => Some(ds),
+                ModelState::Daemon { ds, .. } => Some(ds.as_ref()),
                 _ => None,
             })
             .collect()
