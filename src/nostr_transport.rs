@@ -16,8 +16,6 @@ const RELAY_CONNECT_TIMEOUT_SECS: u64 = 5;
 const SEEN_EVENTS_CACHE_LIMIT: usize = 2048;
 /// Timeout for the claude process to exit after sending /exit.
 const PROCESS_EXIT_TIMEOUT_SECS: u64 = 10;
-/// Delay before injecting a prompt into a freshly started pane.
-const PROMPT_INJECT_DELAY_SECS: u64 = 5;
 /// Length threshold for truncating npub display strings.
 const NPUB_TRUNCATE_LEN: usize = 20;
 
@@ -1139,8 +1137,11 @@ pub async fn kill_session(state: &std::sync::Arc<AppState>, name: &str) -> Strin
         return format!("'{name}' has no pane");
     };
 
-    // Get the pane's PID and find the claude process
+    // Get the pane's PID and find the backend process
     let pane = pane.clone();
+    let process_names: Vec<String> = state.backend.process_names().iter().map(|s| s.to_string()).collect();
+    let exit_cmd = state.backend.exit_command().map(String::from);
+    let cli_name = state.backend.cli_name().to_string();
     let kill_result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
         use std::process::Command;
 
@@ -1153,7 +1154,7 @@ pub async fn kill_session(state: &std::sync::Arc<AppState>, name: &str) -> Strin
         }
         let pane_pid: u32 = String::from_utf8_lossy(&output.stdout).trim().parse()?;
 
-        // Find claude process in the tree
+        // Find backend process in the tree
         let output = Command::new("ps").args(["-eo", "pid,ppid,comm"]).output()?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let mut children: std::collections::HashMap<u32, Vec<u32>> =
@@ -1174,12 +1175,12 @@ pub async fn kill_session(state: &std::sync::Arc<AppState>, name: &str) -> Strin
             names.insert(pid, comm.to_string());
         }
 
-        // BFS to find claude PID
+        // BFS to find backend PID
         let mut stack = vec![pane_pid];
-        let mut claude_pid = None;
+        let mut backend_pid = None;
         while let Some(pid) = stack.pop() {
-            if names.get(&pid).is_some_and(|n| n == "claude") {
-                claude_pid = Some(pid);
+            if names.get(&pid).is_some_and(|n| process_names.iter().any(|pn| pn == n)) {
+                backend_pid = Some(pid);
                 break;
             }
             if let Some(kids) = children.get(&pid) {
@@ -1187,24 +1188,26 @@ pub async fn kill_session(state: &std::sync::Arc<AppState>, name: &str) -> Strin
             }
         }
 
-        match claude_pid {
+        match backend_pid {
             Some(pid) => {
-                // Graceful: send /exit first, give Claude time to shut down cleanly
-                let _ = Command::new("tmux")
-                    .args(["send-keys", "-t", &pane, "/exit", "Enter"])
-                    .status();
-
-                // Poll up to 10s for claude process to exit
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_secs(PROCESS_EXIT_TIMEOUT_SECS);
+                // Graceful: send exit command if backend supports it
                 let mut exited = false;
-                while std::time::Instant::now() < deadline {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    // Check if process still exists
-                    let status = Command::new("kill").args(["-0", &pid.to_string()]).status();
-                    if !status.is_ok_and(|s| s.success()) {
-                        exited = true;
-                        break;
+                if let Some(ref exit) = exit_cmd {
+                    let _ = Command::new("tmux")
+                        .args(["send-keys", "-t", &pane, exit, "Enter"])
+                        .status();
+
+                    // Poll up to 10s for process to exit
+                    let deadline = std::time::Instant::now()
+                        + std::time::Duration::from_secs(PROCESS_EXIT_TIMEOUT_SECS);
+                    while std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        // Check if process still exists
+                        let status = Command::new("kill").args(["-0", &pid.to_string()]).status();
+                        if !status.is_ok_and(|s| s.success()) {
+                            exited = true;
+                            break;
+                        }
                     }
                 }
 
@@ -1222,13 +1225,13 @@ pub async fn kill_session(state: &std::sync::Arc<AppState>, name: &str) -> Strin
                 } else {
                     "SIGTERM"
                 };
-                Ok(format!("killed claude (pid {pid}, {method})"))
+                Ok(format!("killed {cli_name} (pid {pid}, {method})"))
             }
             None => {
                 let _ = Command::new("tmux")
                     .args(["kill-pane", "-t", &pane])
                     .status();
-                Ok("no claude process found".to_string())
+                Ok(format!("no {cli_name} process found"))
             }
         }
     })
@@ -1312,8 +1315,16 @@ pub async fn start_session(
 
     let tmux_session = crate::tmux::tmux_session_name(&dir);
     let window_name = name.to_string();
+    let worktree_mode = if worktree {
+        Some(crate::backend::WorktreeMode::Named(window_name.clone()))
+    } else {
+        None
+    };
+    let backend_cmd = state.backend.build_start_command(&crate::backend::StartOpts {
+        project_dir: dir.clone(),
+        worktree: worktree_mode,
+    });
     let start_result = tokio::task::spawn_blocking({
-        let dir = dir.clone();
         let tmux_session = tmux_session.clone();
         let window_name = window_name.clone();
         move || -> anyhow::Result<String> {
@@ -1382,19 +1393,8 @@ pub async fn start_session(
                 ])
                 .status();
 
-            // Launch claude
-            let cmd = if worktree {
-                format!(
-                    "cd {} && claude --dangerously-skip-permissions --worktree {}",
-                    crate::scheduler::shell_escape(&dir),
-                    crate::scheduler::shell_escape(&window_name),
-                )
-            } else {
-                format!(
-                    "cd {} && claude --dangerously-skip-permissions",
-                    crate::scheduler::shell_escape(&dir),
-                )
-            };
+            // Launch backend
+            let cmd = backend_cmd;
             Command::new("tmux")
                 .args(["send-keys", "-t", &pane_id, &cmd, "Enter"])
                 .status()?;
@@ -1506,41 +1506,43 @@ pub async fn restart_session(
         prev_metadata
             .as_ref()
             .and_then(|m| m.backend_session_id.clone())
-            .or_else(|| detect_claude_session_id(&dir))
+            .or_else(|| state.backend.detect_session_id(&dir))
     };
     if let Some(ref sid) = resume_id {
         tracing::info!("restart '{name}': using --resume {sid}");
     }
 
     let worktree_flag = prev_metadata.as_ref().is_some_and(|m| m.worktree);
+    let worktree_mode = if worktree_flag {
+        Some(crate::backend::WorktreeMode::Named(name.to_string()))
+    } else {
+        None
+    };
+
+    let claude_cmd = if fresh {
+        state.backend.build_start_command(&crate::backend::StartOpts {
+            project_dir: dir.clone(),
+            worktree: worktree_mode,
+        })
+    } else {
+        state.backend.build_resume_command(&crate::backend::ResumeOpts {
+            project_dir: dir.clone(),
+            session_id: resume_id,
+            worktree: worktree_mode,
+        }).unwrap_or_else(|| state.backend.build_start_command(&crate::backend::StartOpts {
+            project_dir: dir.clone(),
+            worktree: None,
+        }))
+    };
 
     let tmux_session = crate::tmux::tmux_session_name(&dir);
     let window_name = name.to_string();
     let start_result = tokio::task::spawn_blocking({
-        let dir = dir.clone();
         let window_name = window_name.clone();
         let tmux_session = tmux_session.clone();
         let existing_pane = existing_pane.clone();
         move || -> anyhow::Result<String> {
             use std::process::Command;
-
-            let resume_flag = match (&resume_id, fresh) {
-                (_, true) => String::new(),
-                (Some(sid), false) => format!("--resume {}", crate::scheduler::shell_escape(sid)),
-                (None, false) => "--continue".to_string(),
-            };
-            let claude_cmd = if worktree_flag {
-                format!(
-                    "cd {} && claude --dangerously-skip-permissions {resume_flag} --worktree {}",
-                    crate::scheduler::shell_escape(&dir),
-                    crate::scheduler::shell_escape(&window_name),
-                )
-            } else {
-                format!(
-                    "cd {} && claude --dangerously-skip-permissions {resume_flag}",
-                    crate::scheduler::shell_escape(&dir),
-                )
-            };
 
             // Try respawn-pane on existing pane — kills the process and restarts
             // in-place, keeping the same pane ID and tmux session intact
@@ -1682,55 +1684,17 @@ pub async fn restart_session(
     }
 }
 
-/// Inject a prompt into a pane after a short delay, giving claude time to start.
+/// Inject a prompt into a pane after a short delay, giving the backend time to start.
 fn schedule_prompt_injection(state: &std::sync::Arc<AppState>, pane_id: String, prompt: String) {
+    let delay_secs = state.backend.inject_config().startup_inject_delay_secs;
     let state = state.clone();
     tokio::spawn(async move {
-        // Wait for claude to initialize in the pane
-        tokio::time::sleep(std::time::Duration::from_secs(PROMPT_INJECT_DELAY_SECS)).await;
+        // Wait for backend to initialize in the pane
+        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
         if let Err(e) = crate::tmux::locked_inject(&state, &pane_id, &prompt, false).await {
             tracing::warn!("prompt injection into {pane_id} failed: {e}");
         }
     });
-}
-
-/// Auto-detect the Claude session ID from the most recently modified JSONL
-/// in `~/.claude/projects/<project_slug>/`. The project slug is the absolute
-/// path with `/` replaced by `-`.
-pub fn detect_claude_session_id(project_dir: &str) -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    // Claude encodes project dirs as: absolute path with / replaced by -
-    // e.g. /home/daniel/code/ouija -> -home-daniel-code-ouija
-    let slug = project_dir.replace('/', "-");
-    let sessions_dir = std::path::PathBuf::from(&home)
-        .join(".claude")
-        .join("projects")
-        .join(&slug);
-    if !sessions_dir.is_dir() {
-        return None;
-    }
-
-    // Find the most recently modified .jsonl file
-    let mut newest: Option<(std::time::SystemTime, String)> = None;
-    let entries = std::fs::read_dir(&sessions_dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let modified = entry.metadata().ok()?.modified().ok()?;
-        let stem = path.file_stem()?.to_str()?.to_string();
-        if newest.as_ref().is_none_or(|(t, _)| modified > *t) {
-            newest = Some((modified, stem));
-        }
-    }
-
-    let (_, session_id) = newest?;
-    tracing::debug!(
-        "auto-detected claude session {session_id} from {}",
-        sessions_dir.display()
-    );
-    Some(session_id)
 }
 
 /// Send a plain-text NIP-17 DM to a human's npub.
