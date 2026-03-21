@@ -43,10 +43,10 @@ impl BackendRegistry {
             .expect("default backend must exist")
     }
 
-    pub fn all_process_names(&self) -> Vec<&str> {
+    pub fn all_process_names(&self) -> Vec<String> {
         self.backends
             .iter()
-            .flat_map(|b| b.process_names().iter().copied())
+            .flat_map(|b| b.process_names().iter().map(|s| s.to_string()))
             .collect()
     }
 }

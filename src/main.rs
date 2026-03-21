@@ -311,10 +311,7 @@ async fn main() -> anyhow::Result<()> {
                     let dead_ids: Vec<String> = if !panes_to_check.is_empty() {
                         let names: Vec<String> = reaper_state
                             .backends
-                            .all_process_names()
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect();
+                            .all_process_names();
                         let dead = tokio::task::spawn_blocking(move || {
                             let name_refs: Vec<&str> =
                                 names.iter().map(|s| s.as_str()).collect();
@@ -347,10 +344,7 @@ async fn main() -> anyhow::Result<()> {
                     if !perfire_to_check.is_empty() {
                         let names: Vec<String> = reaper_state
                             .backends
-                            .all_process_names()
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect();
+                            .all_process_names();
                         let dead_perfire = tokio::task::spawn_blocking(move || {
                             let name_refs: Vec<&str> =
                                 names.iter().map(|s| s.as_str()).collect();
@@ -798,10 +792,7 @@ async fn restore_persisted_sessions(state: &state::AppState) {
     // Check pane liveness on blocking thread
     let names: Vec<String> = state
         .backends
-        .all_process_names()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+        .all_process_names();
     let alive = tokio::task::spawn_blocking(move || {
         let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         sessions

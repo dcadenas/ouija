@@ -833,10 +833,7 @@ impl AppState {
     pub async fn scan_and_autoregister_panes(self: &Arc<Self>) {
         let names: Vec<String> = self
             .backends
-            .all_process_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+            .all_process_names();
         let panes = match tokio::task::spawn_blocking(move || {
             let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
             crate::tmux::find_assistant_panes(&name_refs)

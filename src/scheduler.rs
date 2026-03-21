@@ -363,10 +363,7 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask, formatted:
     let pane_id = pane.clone();
     let names: Vec<String> = state
         .backends
-        .all_process_names()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+        .all_process_names();
     let alive = tokio::task::spawn_blocking(move || {
         let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         tmux::pane_alive(&pane_id, &name_refs)

@@ -447,7 +447,9 @@ pub async fn register(
         ..Default::default()
     };
     if let Some(ref p) = body.pane {
-        if !crate::tmux::pane_alive(p, &state.backends.all_process_names()) {
+        let names = state.backends.all_process_names();
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        if !crate::tmux::pane_alive(p, &refs) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": format!("pane {p} does not exist") })),
