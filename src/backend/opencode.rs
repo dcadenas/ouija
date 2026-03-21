@@ -1,9 +1,36 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::Context;
 
 use super::{CodingAssistant, DeliveryMode, InjectConfig, ResumeOpts, StartOpts};
+
+/// Find the opencode binary by checking common locations and PATH.
+fn which_opencode() -> Option<PathBuf> {
+    // Check common install locations first (avoids spawning `which`)
+    if let Ok(home) = std::env::var("HOME") {
+        let p = PathBuf::from(&home).join(".local/bin/opencode");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    for loc in ["/usr/local/bin/opencode", "/usr/bin/opencode"] {
+        let p = PathBuf::from(loc);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // Fall back to PATH lookup
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in path_var.split(':') {
+            let p = PathBuf::from(dir).join("opencode");
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
 
 /// Manages a shared `opencode serve` instance for the daemon.
 ///
@@ -40,7 +67,7 @@ impl OpenCodeServe {
         let existing_port = { *self.port.lock().unwrap() };
         if let Some(port) = existing_port {
             let health = reqwest::Client::new()
-                .get(format!("http://127.0.0.1:{port}/health"))
+                .get(format!("http://127.0.0.1:{port}/global/health"))
                 .timeout(std::time::Duration::from_secs(2))
                 .send()
                 .await;
@@ -55,18 +82,25 @@ impl OpenCodeServe {
 
         let serve_port = daemon_port + 320;
 
-        let child = std::process::Command::new("opencode")
-            .args([
-                "serve",
-                "--port",
-                &serve_port.to_string(),
-                "--hostname",
-                "127.0.0.1",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .context("failed to start opencode serve")?;
+        let opencode_bin = which_opencode().unwrap_or_else(|| PathBuf::from("opencode"));
+        tracing::info!("starting opencode serve on port {serve_port} (binary: {})", opencode_bin.display());
+        let mut cmd = std::process::Command::new(&opencode_bin);
+        cmd.args([
+            "serve",
+            "--port",
+            &serve_port.to_string(),
+            "--hostname",
+            "127.0.0.1",
+        ]);
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        // Ensure PATH includes common opencode install locations
+        if let Ok(path) = std::env::var("PATH") {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+            let extra = format!("{home}/.local/bin:/usr/local/bin:{path}");
+            cmd.env("PATH", extra);
+        }
+        let child = cmd.spawn().context("failed to spawn opencode serve")?;
 
         let pid = child.id();
         {
@@ -80,13 +114,23 @@ impl OpenCodeServe {
             std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             if std::time::Instant::now() > deadline {
+                // Try to read stderr for clues
+                if let Some(pid) = *self.process_pid.lock().unwrap() {
+                    let status = std::process::Command::new("kill")
+                        .args(["-0", &pid.to_string()])
+                        .status();
+                    tracing::error!(
+                        "opencode serve timed out on port {serve_port}, process alive: {:?}",
+                        status.map(|s| s.success())
+                    );
+                }
                 anyhow::bail!(
                     "opencode serve did not become ready within 30s on port {serve_port}"
                 );
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             let resp = client
-                .get(format!("http://127.0.0.1:{serve_port}/health"))
+                .get(format!("http://127.0.0.1:{serve_port}/global/global/health"))
                 .timeout(std::time::Duration::from_secs(2))
                 .send()
                 .await;

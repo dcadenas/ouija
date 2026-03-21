@@ -138,7 +138,11 @@ fi
 
 # ═══════════════════════════════════════════════════════════════════
 # OUIJA INTEGRATION TESTS — session_start + session_send via HTTP API
+# Stop the standalone serve first so the shared serve can start cleanly.
 # ═══════════════════════════════════════════════════════════════════
+log "Stopping standalone opencode serve for integration tests"
+pkill -f "opencode serve --port $OPENCODE_PORT" 2>/dev/null || true
+sleep 2
 
 log "Test 7: ouija session_start with backend=opencode"
 start_result=$(mcp_call_tool "$BASE" "session_start" \
@@ -178,35 +182,34 @@ fi
 log "Test 10: opencode received and processed the message"
 # Wait for the LLM to respond
 sleep 15
-# Find the opencode serve port from the daemon log
-OC_SERVE_PORT=$(grep "HttpApi backend ready on port" /tmp/ouija-test/daemon.log 2>/dev/null | tail -1 | grep -o "port [0-9]*" | grep -o "[0-9]*")
-if [ -n "$OC_SERVE_PORT" ]; then
-    # Check messages on the opencode session
-    oc_sessions=$(curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/session" 2>/dev/null || echo '[]')
-    oc_msg_text=$(echo "$oc_sessions" | jq -r '.[].id' 2>/dev/null | head -1)
-    if [ -n "$oc_msg_text" ]; then
-        # Get messages from the first session
-        first_session=$(echo "$oc_sessions" | jq -r '.[0].id' 2>/dev/null)
-        msgs=$(curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/session/${first_session}/message" 2>/dev/null || echo '[]')
-        response_text=$(echo "$msgs" | jq -r '.[] | select(.info.role == "assistant") | .parts[] | select(.type == "text") | .text' 2>/dev/null | tr '[:upper:]' '[:lower:]' | head -5)
+# The shared serve port is daemon_port + 320
+OC_SERVE_PORT=$((PORT + 320))
+# Verify it's reachable
+if curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/global/health" -o /dev/null 2>/dev/null; then
+    # Find the most recent session (the one created by session_start for oc-e2e)
+    latest_session=$(curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/session" 2>/dev/null \
+        | jq -r 'sort_by(.time.updated) | last | .id // empty' 2>/dev/null)
+    if [ -n "$latest_session" ]; then
+        msgs=$(curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/session/${latest_session}/message" 2>/dev/null || echo '[]')
+        response_text=$(echo "$msgs" | jq -r '[.[] | select(.info.role == "assistant") | .parts[]? | select(.type == "text") | .text] | join(" ")' 2>/dev/null | tr '[:upper:]' '[:lower:]')
         if echo "$response_text" | grep -qi "hello"; then
             pass "opencode LLM replied with 'hello'"
+        elif [ -n "$response_text" ]; then
+            echo -e "  ${YELLOW}WARN${NC}: LLM replied but did not say 'hello': $(echo "$response_text" | head -c 100)"
+            pass "opencode LLM replied (lenient match)"
         else
-            if [ -n "$response_text" ]; then
-                echo -e "  ${YELLOW}WARN${NC}: LLM replied but did not say 'hello': $response_text"
-                pass "opencode LLM replied (lenient match)"
-            else
-                fail "opencode response" "contains hello" "no response text found"
-            fi
+            fail "opencode response" "contains hello" "no response text found (session: $latest_session)"
         fi
     else
         fail "opencode sessions" "at least one session" "none found on port $OC_SERVE_PORT"
     fi
 else
-    fail "serve port detection" "port in daemon log" "not found"
+    fail "serve health" "serve reachable on port $OC_SERVE_PORT" "health check failed"
 fi
 
 log "Test 11: ouija session_kill cleans up opencode session"
+# Re-init MCP in case the session expired during the long wait
+mcp_init "$BASE" >/dev/null 2>&1
 kill_result=$(mcp_call_tool "$BASE" "session_kill" '{"name":"oc-e2e"}')
 if echo "$kill_result" | grep -qi "killed\|removed"; then
     pass "ouija killed opencode session"

@@ -13,9 +13,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tmux curl procps jq \
     && rm -rf /var/lib/apt/lists/*
 
-# Install opencode
-RUN curl -fsSL https://opencode.ai/install | bash
-ENV PATH="/root/.local/bin:${PATH}"
+# Install opencode — installer puts it in ~/.local/bin, copy to /usr/local/bin for reliability
+RUN curl -fsSL https://opencode.ai/install | bash \
+    && cp "$(find /root -name opencode -type f 2>/dev/null | head -1)" /usr/local/bin/opencode \
+    && chmod +x /usr/local/bin/opencode
+ENV PATH="/usr/local/bin:${PATH}"
 
 COPY --from=builder /app/target/release/ouija /usr/local/bin/ouija
 COPY tests/e2e/lib.sh /lib.sh
