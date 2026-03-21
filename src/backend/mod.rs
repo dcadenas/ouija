@@ -16,18 +16,20 @@ pub enum DeliveryMode {
     },
 }
 
+#[derive(Debug)]
 pub struct StartOpts {
     pub project_dir: String,
     pub worktree: Option<WorktreeMode>,
 }
 
+#[derive(Debug)]
 pub struct ResumeOpts {
     pub project_dir: String,
     pub session_id: Option<String>,
     pub worktree: Option<WorktreeMode>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum WorktreeMode {
     Named(String),
     Disposable,
