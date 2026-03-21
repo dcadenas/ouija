@@ -1108,7 +1108,7 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         kill_session(state, name).await
     } else if let Some(rest) = cmd.strip_prefix("/start ") {
         let name = rest.trim();
-        start_session(state, name, None, None, None, None, None).await.0
+        start_session(state, name, None, None, None, None, None, None).await.0
     } else if let Some(rest) = cmd.strip_prefix("/restart ") {
         let rest = rest.trim();
         let (name, fresh) = if let Some(name) = rest.strip_suffix(" --fresh") {
@@ -1118,7 +1118,7 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         } else {
             (rest, false)
         };
-        restart_session(state, name, fresh, None, None, None).await.0
+        restart_session(state, name, fresh, None, None, None, None).await.0
     } else {
         "unknown command".to_string()
     }
@@ -1270,6 +1270,7 @@ pub async fn start_session(
     prompt: Option<&str>,
     from: Option<&str>,
     expects_reply: Option<bool>,
+    backend: Option<&str>,
 ) -> (String, Option<u64>) {
     // Check if already exists
     if state.protocol.read().await.sessions.contains_key(name) {
@@ -1321,11 +1322,11 @@ pub async fn start_session(
     } else {
         None
     };
-    let backend = state.backends.get(
-        state.protocol.read().await.sessions.get(name)
-            .and_then(|s| s.metadata.backend.as_deref())
-            .unwrap_or("claude-code")
-    ).unwrap_or_else(|| state.backends.default());
+    let backend = match backend {
+        Some(b) => state.backends.get(b).unwrap_or_else(|| state.backends.default()),
+        None => state.backends.default(),
+    };
+    let backend_name = backend.name().to_string();
     let backend_cmd = backend.build_start_command(&crate::backend::StartOpts {
         project_dir: dir.clone(),
         worktree: worktree_mode,
@@ -1416,6 +1417,7 @@ pub async fn start_session(
             let proto_meta = crate::daemon_protocol::SessionMeta {
                 project_dir: Some(dir.clone()),
                 worktree,
+                backend: Some(backend_name.clone()),
                 ..Default::default()
             };
             state
@@ -1472,6 +1474,7 @@ pub async fn restart_session(
     prompt: Option<&str>,
     from: Option<&str>,
     expects_reply: Option<bool>,
+    backend: Option<&str>,
 ) -> (String, Option<u64>) {
     // Snapshot full metadata before killing so we can carry it forward
     let session = state.protocol.read().await.sessions.get(name).cloned();
@@ -1506,7 +1509,18 @@ pub async fn restart_session(
         return (format!("failed to create {dir}: {e}"), None);
     }
 
-    let backend = state.backend_for_session(name).await;
+    let backend = match backend {
+        Some(b) => state.backends.get(b).unwrap_or_else(|| state.backends.default()),
+        None => {
+            // Fall back to the existing session's backend
+            let prev_backend = prev_metadata.as_ref().and_then(|m| m.backend.as_deref());
+            match prev_backend {
+                Some(b) => state.backends.get(b).unwrap_or_else(|| state.backends.default()),
+                None => state.backends.default(),
+            }
+        }
+    };
+    let backend_name = backend.name().to_string();
     let resume_id = if fresh {
         None
     } else {
@@ -1653,13 +1667,14 @@ pub async fn restart_session(
                     } else {
                         m.backend_session_id.clone()
                     },
-                    backend: m.backend.clone(),
+                    backend: Some(backend_name.clone()),
                     project_description: m.project_description.clone(),
                     last_metadata_update: None,
                     serve_port: None,
                 },
                 None => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),
+                    backend: Some(backend_name.clone()),
                     ..Default::default()
                 },
             };

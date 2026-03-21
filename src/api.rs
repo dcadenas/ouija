@@ -415,6 +415,9 @@ pub struct RegisterBody {
     networked: Option<bool>,
     #[serde(alias = "claude_session_id")]
     backend_session_id: Option<String>,
+    /// Which coding assistant backend to use (e.g. "claude-code", "codex").
+    #[serde(default)]
+    backend: Option<String>,
 }
 
 /// Register a new local session with optional metadata.
@@ -439,6 +442,7 @@ pub async fn register(
         bulletin: body.bulletin,
         networked: body.networked.unwrap_or(true),
         backend_session_id: body.backend_session_id,
+        backend: body.backend,
         project_description,
         ..Default::default()
     };
@@ -457,6 +461,7 @@ pub async fn register(
         networked: metadata.networked,
         worktree: metadata.worktree,
         vim_mode: metadata.vim_mode,
+        backend: metadata.backend.clone(),
         ..Default::default()
     };
     let effects = state
@@ -1283,6 +1288,9 @@ pub struct SessionNameBody {
     from: Option<String>,
     #[serde(default)]
     expects_reply: Option<bool>,
+    /// Which coding assistant backend to use (e.g. "claude-code", "codex").
+    #[serde(default)]
+    backend: Option<String>,
 }
 
 /// Kill the coding assistant process in a session's tmux pane.
@@ -1307,6 +1315,7 @@ pub async fn start_session(
         body.prompt.as_deref(),
         body.from.as_deref(),
         body.expects_reply,
+        body.backend.as_deref(),
     )
     .await;
     (StatusCode::OK, Json(json!({ "result": result })))
@@ -1325,6 +1334,7 @@ pub async fn restart_session(
         body.prompt.as_deref(),
         body.from.as_deref(),
         body.expects_reply,
+        body.backend.as_deref(),
     )
     .await;
     (StatusCode::OK, Json(json!({ "result": result })))

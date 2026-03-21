@@ -56,6 +56,10 @@ pub struct SessionRegisterParams {
     /// If provided, restart will use `--resume <id>` instead of `--continue`.
     #[serde(alias = "claude_session_id")]
     pub backend_session_id: Option<String>,
+    /// Which coding assistant backend to use (e.g. "claude-code", "codex").
+    /// Defaults to the configured default backend.
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 /// Parameters for the `session_unregister` MCP tool.
@@ -188,6 +192,10 @@ pub struct SessionNameParams {
     /// Defaults to true when `from` is present.
     #[serde(default)]
     pub expects_reply: Option<bool>,
+    /// Which coding assistant backend to use (e.g. "claude-code", "codex").
+    /// Defaults to the configured default backend.
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 #[tool_router]
@@ -240,6 +248,7 @@ impl OuijaMcp {
             bulletin: params.bulletin,
             networked: params.networked.unwrap_or(true),
             backend_session_id: params.backend_session_id,
+            backend: params.backend,
             project_description,
             ..Default::default()
         };
@@ -250,6 +259,7 @@ impl OuijaMcp {
             networked: metadata.networked,
             worktree: metadata.worktree,
             vim_mode: metadata.vim_mode,
+            backend: metadata.backend.clone(),
             ..Default::default()
         };
         let effects = self
@@ -432,6 +442,7 @@ impl OuijaMcp {
                         None, // prompt not available (message consumed by Event::Send)
                         Some(&params.from),
                         Some(params.expects_reply),
+                        None,
                     )
                     .await;
                 if start_result.starts_with("started ") {
@@ -767,6 +778,7 @@ impl OuijaMcp {
                 params.prompt.as_deref(),
                 params.from.as_deref(),
                 params.expects_reply,
+                params.backend.as_deref(),
             )
             .await
         };
@@ -810,6 +822,7 @@ impl OuijaMcp {
                 params.prompt.as_deref(),
                 params.from.as_deref(),
                 params.expects_reply,
+                params.backend.as_deref(),
             )
             .await
         };
