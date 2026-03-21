@@ -28,13 +28,13 @@ impl CodingAssistant for OpenCode {
 
     fn build_start_command(&self, opts: &StartOpts) -> String {
         let escaped_dir = crate::scheduler::shell_escape(&opts.project_dir);
-        format!("cd {escaped_dir} && opencode serve --port 0")
+        format!("cd {escaped_dir} && opencode serve --port 0 &")
     }
 
     fn build_resume_command(&self, opts: &ResumeOpts) -> Option<String> {
         // opencode persists sessions server-side; resume is handled via HTTP API
         let escaped_dir = crate::scheduler::shell_escape(&opts.project_dir);
-        Some(format!("cd {escaped_dir} && opencode serve --port 0"))
+        Some(format!("cd {escaped_dir} && opencode serve --port 0 &"))
     }
 
     fn detect_session_id(&self, _project_dir: &str) -> Option<String> {
@@ -121,7 +121,7 @@ mod tests {
             project_dir: "/home/user/myproject".to_string(),
             worktree: None,
         });
-        assert_eq!(cmd, "cd '/home/user/myproject' && opencode serve --port 0");
+        assert_eq!(cmd, "cd '/home/user/myproject' && opencode serve --port 0 &");
     }
 
     #[test]
@@ -134,7 +134,7 @@ mod tests {
         assert!(cmd.is_some());
         assert_eq!(
             cmd.unwrap(),
-            "cd '/home/user/myproject' && opencode serve --port 0"
+            "cd '/home/user/myproject' && opencode serve --port 0 &"
         );
     }
 

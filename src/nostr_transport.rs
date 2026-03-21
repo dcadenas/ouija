@@ -1416,6 +1416,11 @@ pub async fn start_session(
             let (serve_port, backend_session_id) =
                 setup_http_api_session(&pane_id, &backend, &state.http_client).await;
 
+            // Launch the interactive TUI in the pane so the user can
+            // watch and interact with the session (serve continues in
+            // the background).
+            launch_attach_tui(&pane_id, &backend, serve_port.as_ref(), backend_session_id.as_deref());
+
             let proto_meta = crate::daemon_protocol::SessionMeta {
                 project_dir: Some(dir.clone()),
                 worktree,
@@ -1562,6 +1567,7 @@ pub async fn restart_session(
 
     let tmux_session = crate::tmux::tmux_session_name(&dir);
     let window_name = name.to_string();
+    let is_http_api = matches!(backend.delivery_mode(), crate::backend::DeliveryMode::HttpApi { .. });
     let start_result = tokio::task::spawn_blocking({
         let window_name = window_name.clone();
         let tmux_session = tmux_session.clone();
@@ -1570,13 +1576,27 @@ pub async fn restart_session(
             use std::process::Command;
 
             // Try respawn-pane on existing pane — kills the process and restarts
-            // in-place, keeping the same pane ID and tmux session intact
+            // in-place, keeping the same pane ID and tmux session intact.
+            //
+            // For HttpApi backends the serve command is backgrounded (`&`), so
+            // we respawn with a bare shell and then send-keys instead of letting
+            // respawn-pane run the command directly (which would exit immediately).
             if let Some(ref pane) = existing_pane {
-                let output = Command::new("tmux")
-                    .args(["respawn-pane", "-k", "-t", pane, &claude_cmd])
-                    .output();
+                let respawn_args: Vec<&str> = if is_http_api {
+                    vec!["respawn-pane", "-k", "-t", pane]
+                } else {
+                    vec!["respawn-pane", "-k", "-t", pane, &claude_cmd]
+                };
+                let output = Command::new("tmux").args(&respawn_args).output();
                 match output {
                     Ok(o) if o.status.success() => {
+                        if is_http_api {
+                            // Give the fresh shell a moment to initialise
+                            std::thread::sleep(std::time::Duration::from_millis(300));
+                            let _ = Command::new("tmux")
+                                .args(["send-keys", "-t", pane, &claude_cmd, "Enter"])
+                                .status();
+                        }
                         tracing::info!("restart: respawn-pane {pane} succeeded");
                         return Ok(pane.clone());
                     }
@@ -1667,6 +1687,9 @@ pub async fn restart_session(
                     .as_ref()
                     .and_then(|m| m.backend_session_id.clone());
             }
+
+            // Launch the interactive TUI in the pane
+            launch_attach_tui(&pane_id, &backend, serve_port.as_ref(), backend_session_id.as_deref());
 
             let proto_meta = match prev_metadata {
                 Some(ref m) => crate::daemon_protocol::SessionMeta {
@@ -1819,6 +1842,35 @@ async fn setup_http_api_session(
     };
 
     (serve_port, backend_session_id)
+}
+
+/// For HttpApi backends, send the `attach` command into the tmux pane so the user
+/// sees the interactive conversation TUI instead of raw server logs.
+///
+/// The serve process is already running in the background (started with `&`).
+/// This replaces the bare shell prompt with the full TUI.
+fn launch_attach_tui(
+    pane_id: &str,
+    backend: &std::sync::Arc<dyn crate::backend::CodingAssistant>,
+    serve_port: Option<&u16>,
+    backend_session_id: Option<&str>,
+) {
+    let attach_base = match backend.delivery_mode() {
+        crate::backend::DeliveryMode::HttpApi { attach_command, .. } => attach_command,
+        _ => return,
+    };
+    let (Some(&port), Some(session_id)) = (serve_port, backend_session_id) else {
+        return;
+    };
+    let attach_cmd = format!("{attach_base} http://127.0.0.1:{port} --session {session_id}");
+    let pane = pane_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        // Small delay so the backgrounded serve process is fully ready
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let _ = std::process::Command::new("tmux")
+            .args(["send-keys", "-t", &pane, &attach_cmd, "Enter"])
+            .status();
+    });
 }
 
 /// Inject a prompt into a pane after a short delay, giving the backend time to start.
