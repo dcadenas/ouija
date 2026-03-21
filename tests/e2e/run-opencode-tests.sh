@@ -136,9 +136,96 @@ else
     fail "session count" ">=1" "$session_count"
 fi
 
+# ═══════════════════════════════════════════════════════════════════
+# OUIJA INTEGRATION TESTS — session_start + session_send via HTTP API
+# ═══════════════════════════════════════════════════════════════════
+
+log "Test 7: ouija session_start with backend=opencode"
+start_result=$(mcp_call_tool "$BASE" "session_start" \
+    '{"name":"oc-e2e","project_dir":"/tmp","backend":"opencode"}')
+if echo "$start_result" | grep -q "started.*oc-e2e"; then
+    pass "ouija started opencode session 'oc-e2e'"
+else
+    fail "session_start opencode" "contains 'started'" "$(echo "$start_result" | head -c 200)"
+fi
+
+log "Test 8: ouija detects opencode serve readiness"
+# Wait for the session to be fully registered with serve_port
+sleep 5
+oc_status=$(api "$BASE" GET /api/status)
+oc_session=$(echo "$oc_status" | jq -r '.sessions[] | select(.id == "oc-e2e")')
+if [ -n "$oc_session" ]; then
+    pass "oc-e2e session registered in ouija"
+else
+    fail "oc-e2e registration" "session exists" "not found in status"
+fi
+
+log "Test 9: ouija session_send delivers to opencode via HTTP API"
+send_result=$(mcp_call_tool "$BASE" "session_send" \
+    '{"from":"test-sender","to":"oc-e2e","message":"Reply with only the word hello","expects_reply":false}')
+if echo "$send_result" | grep -qi "delivered\|success"; then
+    pass "ouija delivered message to opencode session"
+else
+    # Check daemon log for HTTP delivery confirmation
+    sleep 5
+    if grep -q "delivered message via prompt_async.*oc-e2e" /tmp/ouija-test/daemon.log 2>/dev/null; then
+        pass "ouija delivered message via HTTP API (confirmed in daemon log)"
+    else
+        fail "session_send to opencode" "delivery via HTTP" "$(echo "$send_result" | head -c 200)"
+    fi
+fi
+
+log "Test 10: opencode received and processed the message"
+# Wait for the LLM to respond
+sleep 15
+# Find the opencode serve port from the daemon log
+OC_SERVE_PORT=$(grep "HttpApi backend ready on port" /tmp/ouija-test/daemon.log 2>/dev/null | tail -1 | grep -o "port [0-9]*" | grep -o "[0-9]*")
+if [ -n "$OC_SERVE_PORT" ]; then
+    # Check messages on the opencode session
+    oc_sessions=$(curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/session" 2>/dev/null || echo '[]')
+    oc_msg_text=$(echo "$oc_sessions" | jq -r '.[].id' 2>/dev/null | head -1)
+    if [ -n "$oc_msg_text" ]; then
+        # Get messages from the first session
+        first_session=$(echo "$oc_sessions" | jq -r '.[0].id' 2>/dev/null)
+        msgs=$(curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/session/${first_session}/message" 2>/dev/null || echo '[]')
+        response_text=$(echo "$msgs" | jq -r '.[] | select(.info.role == "assistant") | .parts[] | select(.type == "text") | .text' 2>/dev/null | tr '[:upper:]' '[:lower:]' | head -5)
+        if echo "$response_text" | grep -qi "hello"; then
+            pass "opencode LLM replied with 'hello'"
+        else
+            if [ -n "$response_text" ]; then
+                echo -e "  ${YELLOW}WARN${NC}: LLM replied but did not say 'hello': $response_text"
+                pass "opencode LLM replied (lenient match)"
+            else
+                fail "opencode response" "contains hello" "no response text found"
+            fi
+        fi
+    else
+        fail "opencode sessions" "at least one session" "none found on port $OC_SERVE_PORT"
+    fi
+else
+    fail "serve port detection" "port in daemon log" "not found"
+fi
+
+log "Test 11: ouija session_kill cleans up opencode session"
+kill_result=$(mcp_call_tool "$BASE" "session_kill" '{"name":"oc-e2e"}')
+if echo "$kill_result" | grep -qi "killed\|removed"; then
+    pass "ouija killed opencode session"
+else
+    fail "session_kill" "killed or removed" "$(echo "$kill_result" | head -c 200)"
+fi
+
+# Verify it's gone
+sleep 1
+remaining=$(api "$BASE" GET /api/status | jq -r '.sessions[] | select(.id == "oc-e2e") | .id')
+if [ -z "$remaining" ]; then
+    pass "oc-e2e session removed from ouija"
+else
+    fail "session cleanup" "session gone" "still exists"
+fi
+
 # ── Daemon logs ──────────────────────────────────────────────────
-log "Daemon logs:"
-cat /tmp/ouija-test/daemon.log 2>/dev/null || true
+log "Daemon logs (last 20 lines):"
+tail -20 /tmp/ouija-test/daemon.log 2>/dev/null || true
 
 # ── Results ──────────────────────────────────────────────────────
 print_results
