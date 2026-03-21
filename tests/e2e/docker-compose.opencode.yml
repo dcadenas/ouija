@@ -1,0 +1,7 @@
+services:
+  tests:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile.opencode
+    environment:
+      - OPENROUTER_API_KEY
