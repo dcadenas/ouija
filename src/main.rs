@@ -1,5 +1,6 @@
 mod admin;
 mod api;
+mod backend;
 mod config;
 pub mod daemon_protocol;
 mod mcp;
