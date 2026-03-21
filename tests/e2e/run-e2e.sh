@@ -29,18 +29,22 @@ run_opencode() {
 }
 
 run_parallel() {
-    echo "=== Running local + nostr e2e tests in parallel ==="
+    echo "=== Running local + nostr + opencode e2e tests in parallel ==="
     local local_log=$(mktemp)
     local nostr_log=$(mktemp)
-    local local_ok=0 nostr_ok=0
+    local opencode_log=$(mktemp)
+    local local_ok=0 nostr_ok=0 opencode_ok=0
 
     docker compose -f "$COMPOSE_LOCAL" $COMPOSE_OPTS >"$local_log" 2>&1 &
     local local_pid=$!
     docker compose -f "$COMPOSE_NOSTR" $COMPOSE_OPTS >"$nostr_log" 2>&1 &
     local nostr_pid=$!
+    docker compose -f "$COMPOSE_OPENCODE" $COMPOSE_OPTS >"$opencode_log" 2>&1 &
+    local opencode_pid=$!
 
     wait $local_pid && local_ok=1 || true
     wait $nostr_pid && nostr_ok=1 || true
+    wait $opencode_pid && opencode_ok=1 || true
 
     echo ""
     echo "=== Local test output ==="
@@ -48,14 +52,18 @@ run_parallel() {
     echo ""
     echo "=== Nostr test output ==="
     cat "$nostr_log"
-    rm -f "$local_log" "$nostr_log"
+    echo ""
+    echo "=== OpenCode test output ==="
+    cat "$opencode_log"
+    rm -f "$local_log" "$nostr_log" "$opencode_log"
 
-    if [ "$local_ok" -eq 1 ] && [ "$nostr_ok" -eq 1 ]; then
+    if [ "$local_ok" -eq 1 ] && [ "$nostr_ok" -eq 1 ] && [ "$opencode_ok" -eq 1 ]; then
         echo "=== ALL SUITES PASSED ==="
         exit 0
     else
         [ "$local_ok" -eq 0 ] && echo "=== LOCAL TESTS FAILED ==="
         [ "$nostr_ok" -eq 0 ] && echo "=== NOSTR TESTS FAILED ==="
+        [ "$opencode_ok" -eq 0 ] && echo "=== OPENCODE TESTS FAILED ==="
         exit 1
     fi
 }
@@ -69,15 +77,16 @@ case "${1:-all}" in
     seq)
         run_local
         run_nostr
+        run_opencode
         ;;
     *)
         echo "Usage: $0 [local|nostr|install|opencode|all|seq]"
         echo "  local    — run local tests only"
         echo "  nostr    — run nostr tests only"
         echo "  install  — run install/preflight tests only"
-        echo "  opencode — run opencode integration tests (requires OPENROUTER_API_KEY)"
-        echo "  all      — run local+nostr in parallel (default)"
-        echo "  seq      — run local+nostr sequentially"
+        echo "  opencode — run opencode integration tests (no API key needed)"
+        echo "  all      — run local+nostr+opencode in parallel (default)"
+        echo "  seq      — run local+nostr+opencode sequentially"
         exit 1
         ;;
 esac
