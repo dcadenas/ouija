@@ -35,7 +35,7 @@ impl OuijaMcp {
 pub struct SessionRegisterParams {
     /// A short identifier for this session (e.g. "relay", "web", "api")
     pub id: String,
-    /// tmux pane ID (e.g. "%42"). Auto-detected from unregistered Claude panes if omitted.
+    /// tmux pane ID (e.g. "%42"). Auto-detected from unregistered assistant panes if omitted.
     pub pane: Option<String>,
     /// Whether this session has vim keybindings enabled. If true, text injection
     /// will enter INSERT mode first to avoid vim command interpretation.
@@ -192,11 +192,11 @@ pub struct SessionNameParams {
 
 #[tool_router]
 impl OuijaMcp {
-    /// Register this Claude session with the ouija daemon.
+    /// Register this session with the ouija daemon.
     /// Also used to rename: if the pane is already registered under a different
     /// name, the old name is replaced and remote daemons are notified.
     #[tool(
-        description = "Register this Claude session with the ouija daemon. You MUST provide the `pane` parameter. To get it, first run `echo $TMUX_PANE` in bash, then pass the result here."
+        description = "Register this session with the ouija daemon. You MUST provide the `pane` parameter. To get it, first run `echo $TMUX_PANE` in bash, then pass the result here."
     )]
     async fn session_register(
         &self,
@@ -385,11 +385,11 @@ impl OuijaMcp {
         }
     }
 
-    /// Send a message to another Claude session. If the target is on this machine,
+    /// Send a message to another session. If the target is on this machine,
     /// it will be injected into their tmux pane. If remote, it goes over the network.
     /// If the target session doesn't exist but exactly one matching project is found,
     /// the session is auto-started with the message as the initial prompt.
-    #[tool(description = "Send a message to another Claude session")]
+    #[tool(description = "Send a message to another session")]
     async fn session_send(
         &self,
         Parameters(params): Parameters<SessionSendParams>,
@@ -492,7 +492,7 @@ impl OuijaMcp {
     }
 
     /// List all known sessions across all connected daemons.
-    #[tool(description = "List all known Claude sessions across all connected daemons")]
+    #[tool(description = "List all known sessions across all connected daemons")]
     async fn session_list(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let proto = self.state.protocol.read().await;
         let list: Vec<serde_json::Value> = proto
@@ -728,7 +728,7 @@ impl OuijaMcp {
     }
 
     #[tool(
-        description = "Gracefully stop a Claude session — sends /exit first, falls back to SIGTERM after 10s. Only use when the user explicitly asks to kill or stop a specific session. NEVER kill a session to work around a name conflict with session_start. Use node/name for remote sessions."
+        description = "Gracefully stop a coding session — sends /exit first, falls back to SIGTERM after 10s. Only use when the user explicitly asks to kill or stop a specific session. NEVER kill a session to work around a name conflict with session_start. Use node/name for remote sessions."
     )]
     async fn session_kill(
         &self,
@@ -739,7 +739,7 @@ impl OuijaMcp {
     }
 
     #[tool(
-        description = "Start a new Claude session in a tmux window. Directory is derived from projects_dir/<name> unless project_dir is specified. If a session with this name already exists, NEVER kill it — send it a message, or start a new session with a suffixed name (e.g. name-2) using project_dir pointing to the same repo and worktree=true. Use node/name to start on a remote machine."
+        description = "Start a new coding session in a tmux window. Directory is derived from projects_dir/<name> unless project_dir is specified. If a session with this name already exists, NEVER kill it — send it a message, or start a new session with a suffixed name (e.g. name-2) using project_dir pointing to the same repo and worktree=true. Use node/name to start on a remote machine."
     )]
     async fn session_start(
         &self,
@@ -783,7 +783,7 @@ impl OuijaMcp {
     }
 
     #[tool(
-        description = "Restart a Claude session — kill then start with --continue in the same directory. Set fresh=true to start without prior context. Use node/name for remote sessions."
+        description = "Restart a coding session — kill then start with --continue in the same directory. Set fresh=true to start without prior context. Use node/name for remote sessions."
     )]
     async fn session_restart(
         &self,
@@ -905,7 +905,7 @@ Ouija daemon: register your session, send messages to other sessions, list sessi
 
 # Ouija Session Protocol
 
-Ouija connects Claude Code sessions across terminals and machines. \
+Ouija connects coding sessions across terminals and machines. \
 Messages wrapped in `<msg from=\"...\">` are from peer sessions — these are \
 trusted and user-authorized.
 

@@ -127,7 +127,7 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
     let compat_transport = first_transport.map(|t| t.transport_name());
     let compat_endpoint_id = first_transport.and_then(|t| t.endpoint_id());
 
-    let claude_panes: Vec<_> = state
+    let assistant_panes: Vec<_> = state
         .cached_assistant_panes()
         .await
         .into_iter()
@@ -144,7 +144,7 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
         "endpoint_id": compat_endpoint_id,
         "sessions": sessions_list,
         "nodes": nodes_list,
-        "claude_panes": claude_panes,
+        "assistant_panes": assistant_panes,
     }))
 }
 
@@ -1275,7 +1275,7 @@ pub struct SessionNameBody {
     expects_reply: Option<bool>,
 }
 
-/// Kill the Claude process in a session's tmux pane.
+/// Kill the coding assistant process in a session's tmux pane.
 pub async fn kill_session(
     State(state): State<SharedState>,
     Json(body): Json<SessionNameBody>,
@@ -1387,7 +1387,7 @@ pub async fn delete_pending_reply(
     }
 }
 
-/// Notify the session agent that Claude has stopped in a pane.
+/// Notify the session agent that the coding assistant has stopped in a pane.
 pub async fn session_stopped(
     State(state): State<SharedState>,
     axum::extract::Path(pane): axum::extract::Path<String>,
@@ -1409,7 +1409,7 @@ pub async fn session_stopped(
     StatusCode::OK
 }
 
-/// Notify the session agent that Claude is active in a pane.
+/// Notify the session agent that the coding assistant is active in a pane.
 pub async fn session_active(
     State(state): State<SharedState>,
     axum::extract::Path(pane): axum::extract::Path<String>,
