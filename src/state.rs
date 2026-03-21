@@ -111,6 +111,7 @@ pub struct AppState {
     /// Reaper runs `git worktree prune` when these panes die.
     pub perfire_worktree_panes: RwLock<HashMap<String, String>>,
     pub backends: crate::backend::BackendRegistry,
+    pub http_client: reqwest::Client,
 }
 
 impl std::fmt::Debug for AppState {
@@ -254,13 +255,8 @@ impl AppState {
             pending_commands: std::sync::Mutex::new(Vec::new()),
             cached_assistant_panes: RwLock::new(Vec::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
-            backends: crate::backend::BackendRegistry::new(
-                vec![
-                    std::sync::Arc::new(crate::backend::claude_code::ClaudeCode),
-                    std::sync::Arc::new(crate::backend::opencode::OpenCode),
-                ],
-                "claude-code",
-            ),
+            backends: crate::backend::BackendRegistry::default_registry(),
+            http_client: reqwest::Client::new(),
         })
     }
 
@@ -290,13 +286,8 @@ impl AppState {
             pending_commands: std::sync::Mutex::new(Vec::new()),
             cached_assistant_panes: RwLock::new(Vec::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
-            backends: crate::backend::BackendRegistry::new(
-                vec![
-                    std::sync::Arc::new(crate::backend::claude_code::ClaudeCode),
-                    std::sync::Arc::new(crate::backend::opencode::OpenCode),
-                ],
-                "claude-code",
-            ),
+            backends: crate::backend::BackendRegistry::default_registry(),
+            http_client: reqwest::Client::new(),
         })
     }
 
@@ -312,11 +303,11 @@ impl AppState {
             .sessions
             .get(session_id)
             .and_then(|s| s.metadata.backend.as_deref())
-            .unwrap_or("claude-code")
-            .to_string();
-        self.backends
-            .get(&backend_name)
-            .unwrap_or_else(|| self.backends.default())
+            .map(String::from);
+        match backend_name {
+            Some(name) => self.backends.get(&name).unwrap_or_else(|| self.backends.default()),
+            None => self.backends.default(),
+        }
     }
 
     /// Apply a protocol event and execute all resulting effects.

@@ -716,15 +716,14 @@ pub async fn inject(
     State(state): State<SharedState>,
     Json(body): Json<InjectBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Resolve session ID from pane for backend lookup
     let session_id = {
         let proto = state.protocol.read().await;
-        proto
-            .sessions
-            .values()
+        match proto.sessions.values()
             .find(|s| s.pane.as_deref() == Some(&body.pane))
-            .map(|s| s.id.clone())
-            .unwrap_or_default()
+            .map(|s| s.id.clone()) {
+            Some(id) => id,
+            None => return (StatusCode::BAD_REQUEST, Json(json!({"error": "no session registered for this pane"}))),
+        }
     };
     match tmux::locked_inject(&state, &session_id, &body.pane, &body.message, body.vim_mode).await {
         Ok(()) => (StatusCode::OK, Json(json!({ "status": "injected" }))),

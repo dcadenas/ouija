@@ -522,7 +522,7 @@ async fn deliver_via_http(
 
     drop(proto); // release lock before HTTP call
 
-    let client = reqwest::Client::new();
+    let client = state.http_client.clone();
     let body = serde_json::json!({
         "parts": [{"type": "text", "text": message}]
     });
@@ -561,8 +561,9 @@ async fn deliver_via_http(
         "http://127.0.0.1:{port}/session/{oc_session_id}/message"
     );
     let body_clone = body.clone();
+    let bg_client = client.clone();
     tokio::spawn(async move {
-        let result = reqwest::Client::new()
+        let result = bg_client
             .post(&msg_url)
             .json(&body_clone)
             .timeout(std::time::Duration::from_secs(300))

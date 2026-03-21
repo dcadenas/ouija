@@ -1413,47 +1413,8 @@ pub async fn start_session(
 
     match start_result {
         Ok(Ok(pane_id)) => {
-            // Determine serve_port for HttpApi backends by waiting for readiness
-            let serve_port = match backend.delivery_mode() {
-                crate::backend::DeliveryMode::HttpApi { .. } => {
-                    let pane_clone = pane_id.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        wait_for_serve_ready(&pane_clone, 30)
-                    })
-                    .await
-                    {
-                        Ok(Some(port)) => {
-                            tracing::info!("HttpApi backend ready on port {port}");
-                            Some(port)
-                        }
-                        Ok(None) => {
-                            tracing::warn!("HttpApi backend did not report a port within timeout");
-                            None
-                        }
-                        Err(e) => {
-                            tracing::warn!("failed to wait for HttpApi readiness: {e}");
-                            None
-                        }
-                    }
-                }
-                crate::backend::DeliveryMode::TuiInjection => None,
-            };
-
-            // Create an opencode session via the HTTP API if a serve_port is available
-            let backend_session_id = if let Some(port) = serve_port {
-                match create_opencode_session(port).await {
-                    Ok(id) => {
-                        tracing::info!("created opencode session {id} on port {port}");
-                        Some(id)
-                    }
-                    Err(e) => {
-                        tracing::warn!("failed to create opencode session: {e}");
-                        None
-                    }
-                }
-            } else {
-                None
-            };
+            let (serve_port, backend_session_id) =
+                setup_http_api_session(&pane_id, &backend, &state.http_client).await;
 
             let proto_meta = crate::daemon_protocol::SessionMeta {
                 project_dir: Some(dir.clone()),
@@ -1697,60 +1658,15 @@ pub async fn restart_session(
 
     match start_result {
         Ok(Ok(pane_id)) => {
-            // Determine serve_port for HttpApi backends by waiting for readiness
-            let serve_port = match backend.delivery_mode() {
-                crate::backend::DeliveryMode::HttpApi { .. } => {
-                    let pane_clone = pane_id.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        wait_for_serve_ready(&pane_clone, 30)
-                    })
-                    .await
-                    {
-                        Ok(Some(port)) => {
-                            tracing::info!("HttpApi backend ready on port {port} (restart)");
-                            Some(port)
-                        }
-                        Ok(None) => {
-                            tracing::warn!(
-                                "HttpApi backend did not report a port within timeout (restart)"
-                            );
-                            None
-                        }
-                        Err(e) => {
-                            tracing::warn!("failed to wait for HttpApi readiness (restart): {e}");
-                            None
-                        }
-                    }
-                }
-                crate::backend::DeliveryMode::TuiInjection => None,
-            };
+            let (serve_port, mut backend_session_id) =
+                setup_http_api_session(&pane_id, &backend, &state.http_client).await;
 
-            // Create an opencode session via the HTTP API if a serve_port is available
-            let backend_session_id = if let Some(port) = serve_port {
-                match create_opencode_session(port).await {
-                    Ok(id) => {
-                        tracing::info!("created opencode session {id} on port {port} (restart)");
-                        Some(id)
-                    }
-                    Err(e) => {
-                        tracing::warn!("failed to create opencode session (restart): {e}");
-                        // Fall back to previous session ID if not fresh
-                        if fresh {
-                            None
-                        } else {
-                            prev_metadata
-                                .as_ref()
-                                .and_then(|m| m.backend_session_id.clone())
-                        }
-                    }
-                }
-            } else if fresh {
-                None
-            } else {
-                prev_metadata
+            // Fall back to the previous session ID when not fresh
+            if backend_session_id.is_none() && !fresh {
+                backend_session_id = prev_metadata
                     .as_ref()
-                    .and_then(|m| m.backend_session_id.clone())
-            };
+                    .and_then(|m| m.backend_session_id.clone());
+            }
 
             let proto_meta = match prev_metadata {
                 Some(ref m) => crate::daemon_protocol::SessionMeta {
@@ -1838,8 +1754,7 @@ fn wait_for_serve_ready(pane: &str, timeout_secs: u64) -> Option<u16> {
 /// Create a new session on an opencode HTTP API server.
 ///
 /// Posts to `POST /session` and returns the session ID from the response.
-async fn create_opencode_session(port: u16) -> anyhow::Result<String> {
-    let client = reqwest::Client::new();
+async fn create_opencode_session(client: &reqwest::Client, port: u16) -> anyhow::Result<String> {
     let resp = client
         .post(format!("http://127.0.0.1:{port}/session"))
         .json(&serde_json::json!({}))
@@ -1856,6 +1771,54 @@ async fn create_opencode_session(port: u16) -> anyhow::Result<String> {
         .as_str()
         .map(String::from)
         .ok_or_else(|| anyhow::anyhow!("no session id in opencode response"))
+}
+
+/// Wait for an HttpApi backend to become ready and create a session.
+///
+/// Returns `(serve_port, backend_session_id)`. For non-HttpApi backends or
+/// on failure, returns `(None, None)`.
+async fn setup_http_api_session(
+    pane_id: &str,
+    backend: &std::sync::Arc<dyn crate::backend::CodingAssistant>,
+    http_client: &reqwest::Client,
+) -> (Option<u16>, Option<String>) {
+    let serve_port = match backend.delivery_mode() {
+        crate::backend::DeliveryMode::HttpApi { .. } => {
+            let pane_clone = pane_id.to_string();
+            match tokio::task::spawn_blocking(move || wait_for_serve_ready(&pane_clone, 30)).await {
+                Ok(Some(port)) => {
+                    tracing::info!("HttpApi backend ready on port {port}");
+                    Some(port)
+                }
+                Ok(None) => {
+                    tracing::warn!("HttpApi backend did not report a port within timeout");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!("failed to wait for HttpApi readiness: {e}");
+                    None
+                }
+            }
+        }
+        crate::backend::DeliveryMode::TuiInjection => None,
+    };
+
+    let backend_session_id = if let Some(port) = serve_port {
+        match create_opencode_session(http_client, port).await {
+            Ok(id) => {
+                tracing::info!("created opencode session {id} on port {port}");
+                Some(id)
+            }
+            Err(e) => {
+                tracing::warn!("failed to create opencode session: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    (serve_port, backend_session_id)
 }
 
 /// Inject a prompt into a pane after a short delay, giving the backend time to start.

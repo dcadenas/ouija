@@ -24,6 +24,16 @@ impl BackendRegistry {
         }
     }
 
+    pub fn default_registry() -> Self {
+        Self::new(
+            vec![
+                Arc::new(claude_code::ClaudeCode) as _,
+                Arc::new(opencode::OpenCode) as _,
+            ],
+            "claude-code",
+        )
+    }
+
     pub fn get(&self, name: &str) -> Option<Arc<dyn CodingAssistant>> {
         self.backends.iter().find(|b| b.name() == name).cloned()
     }
