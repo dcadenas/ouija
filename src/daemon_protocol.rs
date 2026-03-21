@@ -79,6 +79,9 @@ pub struct SessionMeta {
     /// Unix timestamp; 0 in model tests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_metadata_update: Option<i64>,
+    /// Which LLM model this session is configured to use (informational only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Metadata becomes stale after 30 minutes without an update.
@@ -107,6 +110,7 @@ impl Default for SessionMeta {
             backend: None,
             project_description: None,
             last_metadata_update: None,
+            model: None,
         }
     }
 }
@@ -366,6 +370,7 @@ fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>) -> Sessio
             backend: m.backend.clone(),
             project_description: m.project_description.clone(),
             last_metadata_update: m.last_metadata_update.map(|ts| ts.timestamp()),
+            model: m.model.clone(),
         },
         None => SessionMeta::default(),
     }

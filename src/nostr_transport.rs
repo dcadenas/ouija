@@ -1108,7 +1108,7 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         kill_session(state, name).await
     } else if let Some(rest) = cmd.strip_prefix("/start ") {
         let name = rest.trim();
-        start_session(state, name, None, None, None, None, None, None).await.0
+        start_session(state, name, None, None, None, None, None, None, None).await.0
     } else if let Some(rest) = cmd.strip_prefix("/restart ") {
         let rest = rest.trim();
         let (name, fresh) = if let Some(name) = rest.strip_suffix(" --fresh") {
@@ -1118,7 +1118,7 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         } else {
             (rest, false)
         };
-        restart_session(state, name, fresh, None, None, None, None).await.0
+        restart_session(state, name, fresh, None, None, None, None, None).await.0
     } else {
         "unknown command".to_string()
     }
@@ -1271,6 +1271,7 @@ pub async fn start_session(
     from: Option<&str>,
     expects_reply: Option<bool>,
     backend: Option<&str>,
+    model: Option<&str>,
 ) -> (String, Option<u64>) {
     // Check if already exists
     if state.protocol.read().await.sessions.contains_key(name) {
@@ -1432,6 +1433,7 @@ pub async fn start_session(
                 worktree,
                 backend: Some(backend_name.clone()),
                 backend_session_id,
+                model: model.map(String::from),
                 ..Default::default()
             };
             state
@@ -1489,6 +1491,7 @@ pub async fn restart_session(
     from: Option<&str>,
     expects_reply: Option<bool>,
     backend: Option<&str>,
+    model: Option<&str>,
 ) -> (String, Option<u64>) {
     // Snapshot full metadata before killing so we can carry it forward
     let session = state.protocol.read().await.sessions.get(name).cloned();
@@ -1716,11 +1719,13 @@ pub async fn restart_session(
                     backend: Some(backend_name.clone()),
                     project_description: m.project_description.clone(),
                     last_metadata_update: None,
+                    model: model.map(String::from).or_else(|| m.model.clone()),
                 },
                 None => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),
                     backend: Some(backend_name.clone()),
                     backend_session_id,
+                    model: model.map(String::from),
                     ..Default::default()
                 },
             };

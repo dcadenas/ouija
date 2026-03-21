@@ -154,6 +154,9 @@ pub struct SessionMetadata {
     /// Whether this session runs in an isolated git worktree (backend worktree mode).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub worktree: bool,
+    /// Which LLM model this session is configured to use (informational only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -173,6 +176,7 @@ impl Default for SessionMetadata {
             project_description: None,
             bulletin: None,
             worktree: false,
+            model: None,
         }
     }
 }
@@ -455,6 +459,7 @@ impl AppState {
                             from.as_deref(),
                             expects_reply,
                             None,
+                            None,
                         )
                         .await;
                         let reply = crate::protocol::WireMessage::CommandResult {
@@ -488,6 +493,7 @@ impl AppState {
                             prompt.as_deref(),
                             from.as_deref(),
                             expects_reply,
+                            None,
                             None,
                         )
                         .await;

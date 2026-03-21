@@ -828,6 +828,7 @@ async fn restore_persisted_sessions(state: &state::AppState) {
                 backend: ps.metadata.backend.clone(),
                 project_description: ps.metadata.project_description.clone(),
                 last_metadata_update: ps.metadata.last_metadata_update.map(|dt| dt.timestamp()),
+                model: ps.metadata.model.clone(),
             },
             ..Default::default()
         };

@@ -94,6 +94,7 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
                 "bulletin": s.metadata.bulletin,
                 "networked": s.metadata.networked,
                 "worktree": s.metadata.worktree,
+                "model": s.metadata.model,
                 "last_metadata_update": s.metadata.last_metadata_update,
                 "stale": stale,
             })
@@ -1292,6 +1293,9 @@ pub struct SessionNameBody {
     /// Which coding assistant backend to use (e.g. "claude-code", "codex").
     #[serde(default)]
     backend: Option<String>,
+    /// Which LLM model to use (informational metadata only).
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// Kill the coding assistant process in a session's tmux pane.
@@ -1317,6 +1321,7 @@ pub async fn start_session(
         body.from.as_deref(),
         body.expects_reply,
         body.backend.as_deref(),
+        body.model.as_deref(),
     )
     .await;
     (StatusCode::OK, Json(json!({ "result": result })))
@@ -1336,6 +1341,7 @@ pub async fn restart_session(
         body.from.as_deref(),
         body.expects_reply,
         body.backend.as_deref(),
+        body.model.as_deref(),
     )
     .await;
     (StatusCode::OK, Json(json!({ "result": result })))

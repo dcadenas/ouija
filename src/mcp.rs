@@ -196,6 +196,10 @@ pub struct SessionNameParams {
     /// Defaults to the configured default backend.
     #[serde(default)]
     pub backend: Option<String>,
+    /// Which LLM model to use (e.g. "claude-sonnet-4-6"). Stored in session
+    /// metadata for visibility; does not control the backend's model selection.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[tool_router]
@@ -444,6 +448,7 @@ impl OuijaMcp {
                         None, // prompt not available (message consumed by Event::Send)
                         Some(&params.from),
                         Some(params.expects_reply),
+                        None,
                         None,
                     )
                     .await;
@@ -781,6 +786,7 @@ impl OuijaMcp {
                 params.from.as_deref(),
                 params.expects_reply,
                 params.backend.as_deref(),
+                params.model.as_deref(),
             )
             .await
         };
@@ -825,6 +831,7 @@ impl OuijaMcp {
                 params.from.as_deref(),
                 params.expects_reply,
                 params.backend.as_deref(),
+                params.model.as_deref(),
             )
             .await
         };
