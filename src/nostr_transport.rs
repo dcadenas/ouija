@@ -1413,11 +1413,37 @@ pub async fn start_session(
 
     match start_result {
         Ok(Ok(pane_id)) => {
-            // Register immediately so the session is visible right away
+            // Determine serve_port for HttpApi backends by waiting for readiness
+            let serve_port = match backend.delivery_mode() {
+                crate::backend::DeliveryMode::HttpApi { .. } => {
+                    let pane_clone = pane_id.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        wait_for_serve_ready(&pane_clone, 30)
+                    })
+                    .await
+                    {
+                        Ok(Some(port)) => {
+                            tracing::info!("HttpApi backend ready on port {port}");
+                            Some(port)
+                        }
+                        Ok(None) => {
+                            tracing::warn!("HttpApi backend did not report a port within timeout");
+                            None
+                        }
+                        Err(e) => {
+                            tracing::warn!("failed to wait for HttpApi readiness: {e}");
+                            None
+                        }
+                    }
+                }
+                crate::backend::DeliveryMode::TuiInjection => None,
+            };
+
             let proto_meta = crate::daemon_protocol::SessionMeta {
                 project_dir: Some(dir.clone()),
                 worktree,
                 backend: Some(backend_name.clone()),
+                serve_port,
                 ..Default::default()
             };
             state
@@ -1654,6 +1680,34 @@ pub async fn restart_session(
 
     match start_result {
         Ok(Ok(pane_id)) => {
+            // Determine serve_port for HttpApi backends by waiting for readiness
+            let serve_port = match backend.delivery_mode() {
+                crate::backend::DeliveryMode::HttpApi { .. } => {
+                    let pane_clone = pane_id.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        wait_for_serve_ready(&pane_clone, 30)
+                    })
+                    .await
+                    {
+                        Ok(Some(port)) => {
+                            tracing::info!("HttpApi backend ready on port {port} (restart)");
+                            Some(port)
+                        }
+                        Ok(None) => {
+                            tracing::warn!(
+                                "HttpApi backend did not report a port within timeout (restart)"
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            tracing::warn!("failed to wait for HttpApi readiness (restart): {e}");
+                            None
+                        }
+                    }
+                }
+                crate::backend::DeliveryMode::TuiInjection => None,
+            };
+
             let proto_meta = match prev_metadata {
                 Some(ref m) => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),
@@ -1670,11 +1724,12 @@ pub async fn restart_session(
                     backend: Some(backend_name.clone()),
                     project_description: m.project_description.clone(),
                     last_metadata_update: None,
-                    serve_port: None,
+                    serve_port,
                 },
                 None => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),
                     backend: Some(backend_name.clone()),
+                    serve_port,
                     ..Default::default()
                 },
             };
@@ -1705,6 +1760,38 @@ pub async fn restart_session(
         Ok(Err(e)) => (format!("restart failed: {e}"), None),
         Err(e) => (format!("restart failed: {e}"), None),
     }
+}
+
+/// Poll a tmux pane's output for an HTTP API "listening on" message and extract the port.
+///
+/// Used by HttpApi backends (e.g. `opencode serve --port 0`) that print their
+/// auto-assigned port on startup. Returns `Some(port)` if found within `timeout_secs`,
+/// otherwise `None`.
+fn wait_for_serve_ready(pane: &str, timeout_secs: u64) -> Option<u16> {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_secs(1));
+        if let Ok(output) = Command::new("tmux")
+            .args(["capture-pane", "-t", pane, "-p", "-S", "-20"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                if line.contains("listening on") {
+                    // Expected format: "... listening on http://HOST:PORT"
+                    if let Some(port_str) = line.rsplit(':').next() {
+                        if let Ok(port) = port_str.trim().parse::<u16>() {
+                            return Some(port);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Inject a prompt into a pane after a short delay, giving the backend time to start.
