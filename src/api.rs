@@ -128,7 +128,7 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
     let compat_endpoint_id = first_transport.and_then(|t| t.endpoint_id());
 
     let claude_panes: Vec<_> = state
-        .cached_claude_panes()
+        .cached_assistant_panes()
         .await
         .into_iter()
         .map(|p| json!({ "pane_id": p.pane_id, "session": p.session_name }))
@@ -443,7 +443,7 @@ pub async fn register(
         ..Default::default()
     };
     if let Some(ref p) = body.pane {
-        if !crate::tmux::pane_alive(p) {
+        if !crate::tmux::pane_alive(p, state.backend.process_names()) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": format!("pane {p} does not exist") })),

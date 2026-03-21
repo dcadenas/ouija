@@ -307,10 +307,20 @@ async fn main() -> anyhow::Result<()> {
                             .collect()
                     };
                     let dead_ids: Vec<String> = if !panes_to_check.is_empty() {
+                        let names: Vec<String> = reaper_state
+                            .backend
+                            .process_names()
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect();
                         let dead = tokio::task::spawn_blocking(move || {
+                            let name_refs: Vec<&str> =
+                                names.iter().map(|s| s.as_str()).collect();
                             panes_to_check
                                 .into_iter()
-                                .filter(|(_, pane)| !crate::tmux::pane_alive(pane))
+                                .filter(|(_, pane)| {
+                                    !crate::tmux::pane_alive(pane, &name_refs)
+                                })
                                 .map(|(id, _)| id)
                                 .collect::<Vec<_>>()
                         })
@@ -333,10 +343,20 @@ async fn main() -> anyhow::Result<()> {
                         pf.iter().map(|(p, d)| (p.clone(), d.clone())).collect()
                     };
                     if !perfire_to_check.is_empty() {
+                        let names: Vec<String> = reaper_state
+                            .backend
+                            .process_names()
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect();
                         let dead_perfire = tokio::task::spawn_blocking(move || {
+                            let name_refs: Vec<&str> =
+                                names.iter().map(|s| s.as_str()).collect();
                             perfire_to_check
                                 .into_iter()
-                                .filter(|(pane, _)| !crate::tmux::pane_alive(pane))
+                                .filter(|(pane, _)| {
+                                    !crate::tmux::pane_alive(pane, &name_refs)
+                                })
                                 .collect::<Vec<_>>()
                         })
                         .await
@@ -774,10 +794,21 @@ async fn restore_persisted_sessions(state: &state::AppState) {
     }
 
     // Check pane liveness on blocking thread
+    let names: Vec<String> = state
+        .backend
+        .process_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let alive = tokio::task::spawn_blocking(move || {
+        let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         sessions
             .into_iter()
-            .filter(|ps| ps.pane.as_ref().is_some_and(|p| crate::tmux::pane_alive(p)))
+            .filter(|ps| {
+                ps.pane
+                    .as_ref()
+                    .is_some_and(|p| crate::tmux::pane_alive(p, &name_refs))
+            })
             .collect::<Vec<_>>()
     })
     .await

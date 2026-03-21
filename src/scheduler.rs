@@ -361,9 +361,18 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask, formatted:
 
     // Check if pane is alive
     let pane_id = pane.clone();
-    let alive = tokio::task::spawn_blocking(move || tmux::pane_alive(&pane_id))
-        .await
-        .unwrap_or(false);
+    let names: Vec<String> = state
+        .backend
+        .process_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let alive = tokio::task::spawn_blocking(move || {
+        let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        tmux::pane_alive(&pane_id, &name_refs)
+    })
+    .await
+    .unwrap_or(false);
 
     if alive {
         if task.on_fire.clears_context() {

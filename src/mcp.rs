@@ -222,7 +222,7 @@ impl OuijaMcp {
         }
 
         if let Some(ref p) = pane {
-            if !crate::tmux::pane_alive(p) {
+            if !crate::tmux::pane_alive(p, self.state.backend.process_names()) {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
                     "pane {p} does not exist — run `echo $TMUX_PANE` to get the correct pane ID"
                 ))]));
@@ -1142,13 +1142,25 @@ async fn append_staleness_hint(state: &AppState, sender_id: &str, contents: &mut
     }
 }
 
-/// Find an unregistered Claude pane to associate with a new session.
+/// Find an unregistered assistant pane to associate with a new session.
 ///
-/// Scans all tmux panes running `claude` and returns one that isn't
-/// already registered. Falls back to `None` if zero or multiple
+/// Scans all tmux panes running the backend process and returns one that
+/// isn't already registered. Falls back to `None` if zero or multiple
 /// candidates exist (ambiguous).
 async fn find_unregistered_pane(state: &AppState) -> Option<String> {
-    let claude_panes = tmux::find_claude_panes().ok()?;
+    let names: Vec<String> = state
+        .backend
+        .process_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let assistant_panes = tokio::task::spawn_blocking(move || {
+        let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        tmux::find_assistant_panes(&name_refs)
+    })
+    .await
+    .ok()?
+    .ok()?;
     let proto = state.protocol.read().await;
     let registered_panes: std::collections::HashSet<&str> = proto
         .sessions
@@ -1156,7 +1168,7 @@ async fn find_unregistered_pane(state: &AppState) -> Option<String> {
         .filter_map(|s| s.pane.as_deref())
         .collect();
 
-    let candidates: Vec<_> = claude_panes
+    let candidates: Vec<_> = assistant_panes
         .iter()
         .filter(|p| !registered_panes.contains(p.pane_id.as_str()))
         .collect();

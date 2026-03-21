@@ -101,8 +101,8 @@ pub struct AppState {
     pub project_index: RwLock<HashMap<String, ProjectInfo>>,
     /// Pending remote command results: command string → oneshot senders.
     pending_commands: std::sync::Mutex<Vec<(String, tokio::sync::oneshot::Sender<String>)>>,
-    /// Cached tmux panes running Claude, refreshed by the reaper loop.
-    cached_claude_panes: RwLock<Vec<crate::tmux::TmuxPane>>,
+    /// Cached tmux panes running the coding assistant, refreshed by the reaper loop.
+    cached_assistant_panes: RwLock<Vec<crate::tmux::TmuxPane>>,
     /// Per-fire worktree panes: pane_id → project_dir.
     /// Reaper runs `git worktree prune` when these panes die.
     pub perfire_worktree_panes: RwLock<HashMap<String, String>>,
@@ -248,7 +248,7 @@ impl AppState {
             session_agents: RwLock::new(HashMap::new()),
             project_index: RwLock::new(HashMap::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
-            cached_claude_panes: RwLock::new(Vec::new()),
+            cached_assistant_panes: RwLock::new(Vec::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
             backend: std::sync::Arc::new(crate::backend::claude_code::ClaudeCode),
         })
@@ -278,7 +278,7 @@ impl AppState {
             session_agents: RwLock::new(HashMap::new()),
             project_index: RwLock::new(HashMap::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
-            cached_claude_panes: RwLock::new(Vec::new()),
+            cached_assistant_panes: RwLock::new(Vec::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
             backend: std::sync::Arc::new(crate::backend::claude_code::ClaudeCode),
         })
@@ -788,15 +788,24 @@ impl AppState {
         }
     }
 
-    pub async fn cached_claude_panes(&self) -> Vec<crate::tmux::TmuxPane> {
-        self.cached_claude_panes.read().await.clone()
+    pub async fn cached_assistant_panes(&self) -> Vec<crate::tmux::TmuxPane> {
+        self.cached_assistant_panes.read().await.clone()
     }
 
-    /// Scan tmux for Claude panes, update cache, and auto-register unregistered ones.
+    /// Scan tmux for assistant panes, update cache, and auto-register unregistered ones.
     pub async fn scan_and_autoregister_panes(self: &Arc<Self>) {
-        let panes = match tokio::task::spawn_blocking(crate::tmux::find_claude_panes)
-            .await
-            .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking join error: {e}")))
+        let names: Vec<String> = self
+            .backend
+            .process_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let panes = match tokio::task::spawn_blocking(move || {
+            let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+            crate::tmux::find_assistant_panes(&name_refs)
+        })
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking join error: {e}")))
         {
             Ok(p) => p,
             Err(e) => {
@@ -806,7 +815,7 @@ impl AppState {
         };
 
         // Update cache
-        *self.cached_claude_panes.write().await = panes.clone();
+        *self.cached_assistant_panes.write().await = panes.clone();
 
         let auto_register = self.settings.read().await.auto_register;
         if !auto_register {
