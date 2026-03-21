@@ -106,6 +106,7 @@ pub struct AppState {
     /// Per-fire worktree panes: pane_id → project_dir.
     /// Reaper runs `git worktree prune` when these panes die.
     pub perfire_worktree_panes: RwLock<HashMap<String, String>>,
+    pub backend: std::sync::Arc<dyn crate::backend::CodingAssistant>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -245,6 +246,7 @@ impl AppState {
             pending_commands: std::sync::Mutex::new(Vec::new()),
             cached_claude_panes: RwLock::new(Vec::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
+            backend: std::sync::Arc::new(crate::backend::claude_code::ClaudeCode),
         })
     }
 
@@ -274,6 +276,7 @@ impl AppState {
             pending_commands: std::sync::Mutex::new(Vec::new()),
             cached_claude_panes: RwLock::new(Vec::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
+            backend: std::sync::Arc::new(crate::backend::claude_code::ClaudeCode),
         })
     }
 
