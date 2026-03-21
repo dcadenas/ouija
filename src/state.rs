@@ -149,7 +149,7 @@ pub struct SessionMetadata {
     /// Used by the pairing evaluator to discover collaboration opportunities.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bulletin: Option<String>,
-    /// Whether this session runs in an isolated git worktree (claude --worktree).
+    /// Whether this session runs in an isolated git worktree (backend worktree mode).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub worktree: bool,
 }
@@ -175,7 +175,7 @@ impl Default for SessionMetadata {
     }
 }
 
-/// A registered Claude Code session bound to a tmux pane.
+/// A registered coding assistant session bound to a tmux pane.
 #[derive(Clone, Debug, Serialize)]
 pub struct Session {
     pub id: String,

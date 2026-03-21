@@ -168,7 +168,7 @@ pub struct SessionNameParams {
     /// If true, start a fresh session (no --continue/--resume).
     #[serde(default)]
     pub fresh: Option<bool>,
-    /// If true, run in an isolated git worktree (claude --worktree).
+    /// If true, run in an isolated git worktree (backend worktree mode).
     #[serde(default)]
     pub worktree: Option<bool>,
     /// Project directory to open the session in.
@@ -176,7 +176,7 @@ pub struct SessionNameParams {
     #[serde(default)]
     pub project_dir: Option<String>,
     /// Initial prompt to inject into the session after launch.
-    /// The text is sent to the pane once claude is ready.
+    /// The text is sent to the pane once the coding assistant is ready.
     #[serde(default)]
     pub prompt: Option<String>,
     /// Sender session ID. When provided with a prompt, the prompt is wrapped
