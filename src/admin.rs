@@ -91,7 +91,7 @@ pub async fn dashboard(State(state): State<SharedState>) -> Html<String> {
     }
     if local_sessions.is_empty() {
         sessions_html.push_str(
-            r#"<tr><td colspan="6" class="empty">No local sessions. Open Claude Code in tmux and say <b>"register me as web"</b></td></tr>"#,
+            r#"<tr><td colspan="6" class="empty">No local sessions. Open a coding session in tmux and say <b>"register me as web"</b></td></tr>"#,
         );
     }
 
@@ -252,7 +252,7 @@ pub async fn dashboard(State(state): State<SharedState>) -> Html<String> {
     }
     if sorted_tasks.is_empty() {
         tasks_html.push_str(
-            r#"<tr><td colspan="10" class="empty">No scheduled tasks.<br>CLI: <b>ouija task add "check-logs" "0 9 * * *" "check the error logs"</b><br>MCP: use the <b>task_create</b> tool from any Claude session</td></tr>"#,
+            r#"<tr><td colspan="10" class="empty">No scheduled tasks.<br>CLI: <b>ouija task add "check-logs" "0 9 * * *" "check the error logs"</b><br>MCP: use the <b>task_create</b> tool from any coding session</td></tr>"#,
         );
     }
 
@@ -310,7 +310,7 @@ pub async fn dashboard(State(state): State<SharedState>) -> Html<String> {
     };
 
     let log_empty = if msg_count == 0 {
-        r#"<tr><td colspan="5" class="empty">No messages yet. Send one with <b>session_send</b> from a Claude session.</td></tr>"#
+        r#"<tr><td colspan="5" class="empty">No messages yet. Send one with <b>session_send</b> from a coding session.</td></tr>"#
     } else {
         ""
     };
@@ -849,7 +849,7 @@ tr:hover td {{
     <span class="toggle open">&#9654;</span>
     <h2>Local Sessions</h2>
     <span class="count">{local_count}</span>
-    <span class="section-sub">Claude Code sessions on this machine</span>
+    <span class="section-sub">Coding sessions on this machine</span>
   </div>
   <div class="section-body">
     <table>
@@ -926,7 +926,7 @@ tr:hover td {{
 
 <div class="pairing">
   <h2>Pairing <span class="section-sub" style="display:inline; margin-left:12px;">Connect to another machine for cross-node messaging</span></h2>
-  <div class="warn">&#9888; Tickets are secrets &mdash; share out-of-band only (copy/paste, not through Claude).</div>
+  <div class="warn">&#9888; Tickets are secrets &mdash; share out-of-band only (copy/paste, not through the coding assistant).</div>
   {ticket_section}
   <div class="label">Connect to node <span class="tip" data-tip="Paste a ticket from another machine's 'ouija ticket' command or dashboard to establish a P2P link">?</span></div>
   <form onsubmit="connectNode(event)">
@@ -964,7 +964,7 @@ tr:hover td {{
     <table>
       <tr><th>Setting</th><th style="text-align:center;">Value</th></tr>
       <tr>
-        <td>Auto-register sessions <span class="tip" data-tip="When enabled, new Claude Code sessions auto-register with the mesh via the SessionStart hook">?</span></td>
+        <td>Auto-register sessions <span class="tip" data-tip="When enabled, new sessions auto-register with the mesh via the SessionStart hook">?</span></td>
         <td style="text-align:center;">
           <input type="checkbox" id="auto-register" {auto_register_checked} onchange="updateSetting('auto_register', this.checked)">
         </td>

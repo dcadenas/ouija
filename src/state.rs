@@ -43,6 +43,10 @@ pub fn expand_tilde(path: &str) -> String {
 /// Resolve a pane's cwd to the actual project root.
 /// If the path is inside a `.claude/worktrees/<branch>` directory, walk up to
 /// the repo root so autoregistration derives the project name, not the branch.
+///
+/// Phase 1: hardcoded to the Claude Code worktree layout. This function is called
+/// during auto-registration before a per-session backend is known.
+/// Phase 2: delegate to `backend.resolve_project_root(path)` once per-session backends are supported.
 pub fn resolve_project_root(path: &str) -> &str {
     // Look for `/.claude/worktrees/` in the path
     if let Some(idx) = path.find("/.claude/worktrees/") {
@@ -564,6 +568,9 @@ impl AppState {
     }
 
     /// Clean up a git worktree directory if it has no uncommitted changes.
+    ///
+    /// Phase 1: hardcoded to the Claude Code worktree path pattern (`/.claude/worktrees/`).
+    /// Phase 2: delegate to `backend.cleanup_worktree_dir(dir)` when per-session backends are supported.
     async fn cleanup_worktree_dir(dir: &str) {
         let dir_owned = dir.to_string();
         let repo = match dir.find("/.claude/worktrees/") {

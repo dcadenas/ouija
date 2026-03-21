@@ -64,7 +64,7 @@ fn build_system_prompt(
     let mut prompt = String::from(
         "<role>\n\
          You are the message router for ouija, a cross-machine AI session daemon.\n\
-         ouija manages multiple Claude Code sessions running across different machines and projects.\n\
+         ouija manages multiple coding sessions running across different machines and projects.\n\
          Each session is an AI agent working in a tmux pane on a specific codebase.\n\
          Sessions communicate via the ouija daemon using Nostr (a decentralized messaging protocol).\n\
          The human sends messages via Nostr DMs to the daemon. Your job is to read those messages,\n\

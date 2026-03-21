@@ -17,7 +17,7 @@ pub struct ProjectInfo {
     pub name: String,
     pub dir: PathBuf,
     pub description: Option<String>,
-    pub has_claude_history: bool,
+    pub has_assistant_history: bool,
 }
 
 /// Scan `projects_dir` one level deep and build a project index.
@@ -47,7 +47,9 @@ pub fn scan_projects_dir(projects_dir: &Path) -> HashMap<String, ProjectInfo> {
             continue;
         }
 
-        let has_claude_history = path.join(".claude").is_dir();
+        // Phase 1: check for .claude directory (Claude Code backend).
+        // Phase 2: delegate to backend.has_assistant_history(&path) when per-session backends are supported.
+        let has_assistant_history = path.join(".claude").is_dir();
         let description = extract_description(&path);
 
         index.insert(
@@ -56,7 +58,7 @@ pub fn scan_projects_dir(projects_dir: &Path) -> HashMap<String, ProjectInfo> {
                 name: name.to_string(),
                 dir: path,
                 description,
-                has_claude_history,
+                has_assistant_history,
             },
         );
     }
@@ -69,7 +71,9 @@ pub fn scan_projects_dir(projects_dir: &Path) -> HashMap<String, ProjectInfo> {
     index
 }
 
-/// Extract a short description from CLAUDE.md or README.md.
+/// Extract a short description from a description file or README.md.
+///
+/// Phase 2: replace the hardcoded list with `backend.description_file_priority()`.
 fn extract_description(dir: &Path) -> Option<String> {
     // Try CLAUDE.md first, then README.md
     for filename in &["CLAUDE.md", "README.md"] {
@@ -205,8 +209,8 @@ mod tests {
 
         let index = scan_projects_dir(tmp.path());
         assert_eq!(index.len(), 2);
-        assert!(index["project-a"].has_claude_history);
-        assert!(!index["project-b"].has_claude_history);
+        assert!(index["project-a"].has_assistant_history);
+        assert!(!index["project-b"].has_assistant_history);
         assert_eq!(
             index["project-b"].description.as_deref(),
             Some("A web app.")
