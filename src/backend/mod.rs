@@ -56,6 +56,12 @@ pub trait CodingAssistant: Send + Sync + std::fmt::Debug + 'static {
     fn has_project_history(&self, dir: &Path) -> bool;
     fn exit_command(&self) -> Option<&str>;
     fn install(&self) -> anyhow::Result<()>;
-    fn is_available(&self) -> bool;
+    fn is_available(&self) -> bool {
+        std::process::Command::new(self.cli_name())
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
     fn description_file_priority(&self) -> &[&str] { &["README.md"] }
 }

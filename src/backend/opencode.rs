@@ -38,20 +38,19 @@ impl CodingAssistant for OpenCode {
     }
 
     fn detect_session_id(&self, _project_dir: &str) -> Option<String> {
-        // Sessions are managed via HTTP API, not filesystem
         None
     }
 
     fn tui_ready_pattern(&self) -> Option<&str> {
-        // HttpApi mode uses health check, not TUI pattern
         None
     }
 
     fn inject_config(&self) -> InjectConfig {
+        // Fallback values if tmux injection is ever used; HttpApi mode bypasses this.
         InjectConfig {
             paste_settle_ms: 100,
             use_inner_bracketed_paste: false,
-            startup_inject_delay_secs: 3,
+            startup_inject_delay_secs: 0,
         }
     }
 
@@ -68,7 +67,6 @@ impl CodingAssistant for OpenCode {
     }
 
     fn exit_command(&self) -> Option<&str> {
-        // Kill serve process directly; no graceful TUI exit
         None
     }
 
@@ -79,22 +77,17 @@ impl CodingAssistant for OpenCode {
 
         let config_path = home.join(".config/opencode/opencode.json");
 
-        // Read existing config or start with empty object
-        let mut config: serde_json::Value = if config_path.exists() {
-            let content = std::fs::read_to_string(&config_path)?;
-            serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
-        } else {
-            serde_json::json!({
-                "$schema": "https://opencode.ai/config.json"
-            })
+        let mut config: serde_json::Value = match std::fs::read_to_string(&config_path) {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({})),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = config_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                serde_json::json!({ "$schema": "https://opencode.ai/config.json" })
+            }
+            Err(e) => return Err(e.into()),
         };
 
-        // Ensure parent directory exists
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        // Merge in ouija MCP server — do not overwrite existing servers
         let mcp = config
             .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("opencode config is not a JSON object"))?
@@ -109,19 +102,7 @@ impl CodingAssistant for OpenCode {
         }
 
         std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
-        println!(
-            "OpenCode MCP server registered in {}",
-            config_path.display()
-        );
         Ok(())
-    }
-
-    fn is_available(&self) -> bool {
-        std::process::Command::new("opencode")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
     }
 }
 

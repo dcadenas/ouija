@@ -10,7 +10,8 @@ fi
 
 # ── Guard: require Docker ─────────────────────────────────────────
 if [ -z "${OUIJA_E2E:-}" ] && [ ! -f /.dockerenv ]; then
-    echo "ERROR: e2e tests require Docker." >&2
+    echo "ERROR: e2e tests require Docker for tmux isolation." >&2
+    echo "Run:  OPENROUTER_API_KEY=your-key bash tests/e2e/run-e2e.sh opencode" >&2
     exit 1
 fi
 
@@ -72,14 +73,10 @@ fi
 log "opencode serve is ready"
 
 # ═══════════════════════════════════════════════════════════════════
-# TESTS
+# TESTS — fast tests first, then slow LLM round-trips
 # ═══════════════════════════════════════════════════════════════════
 
-log "Test 1: opencode serve health check"
-result=$(curl -sf "$OC_BASE/global/health" 2>/dev/null || echo '{}')
-assert_contains "health endpoint returns healthy" "$result" "true"
-
-log "Test 2: opencode session creation"
+log "Test 1: opencode session creation"
 session_result=$(curl -sf -X POST "$OC_BASE/session" \
     -H 'Content-Type: application/json' \
     -d '{}' 2>/dev/null || echo '{"error":"curl failed"}')
@@ -91,48 +88,40 @@ else
     SESSION_ID=""
 fi
 
-log "Test 3: send message via opencode and get response"
-if [ -n "$SESSION_ID" ]; then
-    msg_result=$(timeout 90 curl -sf -X POST "$OC_BASE/session/$SESSION_ID/message" \
-        -H 'Content-Type: application/json' \
-        -d '{"parts": [{"type": "text", "text": "Reply with only the word pong"}]}' \
-        2>/dev/null || echo '{"error":"timeout or curl failed"}')
-    # Extract text content — opencode returns an array of parts
-    msg_text=$(echo "$msg_result" | jq -r '.. | .text? // empty' 2>/dev/null | tr '[:upper:]' '[:lower:]' | head -20)
-    if echo "$msg_text" | grep -qi "pong"; then
-        pass "model replied with pong"
-    else
-        # Lenient: free models may not follow instructions perfectly
-        if echo "$msg_result" | grep -qi "error\|timeout"; then
-            fail "message response" "contains pong" "$msg_result"
-        else
-            # Got a response but it didn't contain pong — acceptable for free models
-            echo -e "  ${YELLOW}WARN${NC}: model replied but did not say 'pong': $(echo "$msg_text" | head -1)"
-            pass "model replied (lenient match)"
-        fi
-    fi
-else
-    fail "message send" "a session" "no session id from test 2"
-fi
-
-log "Test 4: ouija daemon is alive alongside opencode"
+log "Test 2: ouija daemon is alive alongside opencode"
 ouija_status=$(curl -sf "$BASE/api/status" 2>/dev/null || echo '{"error":"curl failed"}')
 assert_contains "ouija daemon responds" "$ouija_status" '"daemon"'
 
-log "Test 5: ouija MCP server accessible from opencode"
-# opencode's MCP config points to ouija — verify the MCP server is reachable
-mcp_health=$(curl -sf "$BASE/mcp" -X POST \
-    -H 'Content-Type: application/json' \
-    -H 'Accept: application/json, text/event-stream' \
-    -d '{"jsonrpc":"2.0","method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"test","version":"1.0"},"protocolVersion":"2025-03-26"},"id":1}' \
-    2>/dev/null || echo "FAILED")
+log "Test 3: ouija MCP server accessible"
+mcp_health=$(mcp_init "$BASE")
 if echo "$mcp_health" | grep -q "ouija"; then
     pass "ouija MCP server responds to initialize"
 else
     fail "ouija MCP reachable" "contains ouija" "$mcp_health"
 fi
 
-log "Test 6: send second message to same session via API"
+log "Test 4: send message via opencode API and get response"
+if [ -n "$SESSION_ID" ]; then
+    msg_result=$(timeout 90 curl -sf -X POST "$OC_BASE/session/$SESSION_ID/message" \
+        -H 'Content-Type: application/json' \
+        -d '{"parts": [{"type": "text", "text": "Reply with only the word pong"}]}' \
+        2>/dev/null || echo '{"error":"timeout or curl failed"}')
+    msg_text=$(echo "$msg_result" | jq -r '.. | .text? // empty' 2>/dev/null | tr '[:upper:]' '[:lower:]' | head -20)
+    if echo "$msg_text" | grep -qi "pong"; then
+        pass "model replied with pong"
+    else
+        if echo "$msg_result" | grep -qi "error\|timeout"; then
+            fail "message response" "contains pong" "$(echo "$msg_result" | head -c 200)"
+        else
+            echo -e "  ${YELLOW}WARN${NC}: model replied but did not say 'pong': $(echo "$msg_text" | head -1)"
+            pass "model replied (lenient match)"
+        fi
+    fi
+else
+    fail "message send" "a session" "no session id from test 1"
+fi
+
+log "Test 5: send second message to same session"
 if [ -n "$SESSION_ID" ]; then
     msg2_result=$(timeout 90 curl -sf -X POST "$OC_BASE/session/$SESSION_ID/message" \
         -H 'Content-Type: application/json' \
@@ -152,13 +141,13 @@ else
     fail "second message" "a session" "no session id"
 fi
 
-log "Test 7: opencode session list shows conversations"
+log "Test 6: opencode session list shows conversations"
 sessions=$(curl -sf "$OC_BASE/session" 2>/dev/null || echo '[]')
 session_count=$(echo "$sessions" | jq 'length' 2>/dev/null || echo 0)
 if [ "$session_count" -ge 1 ]; then
     pass "opencode has $session_count session(s)"
 else
-    fail "session count" ">=2" "$session_count"
+    fail "session count" ">=1" "$session_count"
 fi
 
 # ── Daemon logs ──────────────────────────────────────────────────

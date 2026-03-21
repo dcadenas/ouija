@@ -412,13 +412,7 @@ impl CodingAssistant for ClaudeCode {
         Ok(())
     }
 
-    fn is_available(&self) -> bool {
-        std::process::Command::new("claude")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
+    // is_available: uses default impl (runs `self.cli_name() --version`)
 
     fn description_file_priority(&self) -> &[&str] {
         &["CLAUDE.md", "README.md"]
