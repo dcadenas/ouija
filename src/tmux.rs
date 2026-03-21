@@ -471,7 +471,17 @@ pub async fn locked_inject(
 
     match backend.delivery_mode() {
         crate::backend::DeliveryMode::HttpApi { .. } => {
-            deliver_via_http(state, session_id, message).await
+            // Read backend_session_id here so deliver_via_http doesn't
+            // re-acquire the protocol lock (backend_for_session already
+            // dropped its lock).
+            let oc_session_id = {
+                let proto = state.protocol.read().await;
+                proto
+                    .sessions
+                    .get(session_id)
+                    .and_then(|s| s.metadata.backend_session_id.clone())
+            };
+            deliver_via_http(state, oc_session_id, message).await
         }
         crate::backend::DeliveryMode::TuiInjection => {
             let config = backend.inject_config();
@@ -501,7 +511,7 @@ pub async fn locked_inject(
 /// `/message` call in a background task if `prompt_async` is not available.
 async fn deliver_via_http(
     state: &crate::state::AppState,
-    session_id: &str,
+    oc_session_id: Option<String>,
     message: &str,
 ) -> anyhow::Result<()> {
     let port = state
@@ -509,14 +519,8 @@ async fn deliver_via_http(
         .port()
         .ok_or_else(|| anyhow::anyhow!("opencode serve not running"))?;
 
-    let oc_session_id = {
-        let proto = state.protocol.read().await;
-        proto
-            .sessions
-            .get(session_id)
-            .and_then(|s| s.metadata.backend_session_id.clone())
-            .ok_or_else(|| anyhow::anyhow!("no backend_session_id for session {session_id}"))?
-    };
+    let oc_session_id = oc_session_id
+        .ok_or_else(|| anyhow::anyhow!("no backend_session_id for session"))?;
 
     let client = state.http_client.clone();
     let body = serde_json::json!({
@@ -536,7 +540,7 @@ async fn deliver_via_http(
 
     match resp {
         Ok(r) if r.status().is_success() => {
-            tracing::info!(session_id, port, "delivered message via prompt_async");
+            tracing::info!(port, "delivered message via prompt_async");
             return Ok(());
         }
         Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
@@ -580,7 +584,7 @@ async fn deliver_via_http(
         }
     });
 
-    tracing::info!(session_id, port, "spawned message delivery via /message (background)");
+    tracing::info!(port, "spawned message delivery via /message (background)");
     Ok(())
 }
 
