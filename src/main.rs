@@ -237,6 +237,7 @@ async fn main() -> anyhow::Result<()> {
 
             preflight_checks();
             let _ = backend::claude_code::ClaudeCode.install();
+            let _ = backend::opencode::OpenCode.install();
 
             let name = name.unwrap_or_else(|| {
                 hostname::get()
@@ -309,8 +310,8 @@ async fn main() -> anyhow::Result<()> {
                     };
                     let dead_ids: Vec<String> = if !panes_to_check.is_empty() {
                         let names: Vec<String> = reaper_state
-                            .backend
-                            .process_names()
+                            .backends
+                            .all_process_names()
                             .iter()
                             .map(|s| s.to_string())
                             .collect();
@@ -345,8 +346,8 @@ async fn main() -> anyhow::Result<()> {
                     };
                     if !perfire_to_check.is_empty() {
                         let names: Vec<String> = reaper_state
-                            .backend
-                            .process_names()
+                            .backends
+                            .all_process_names()
                             .iter()
                             .map(|s| s.to_string())
                             .collect();
@@ -796,8 +797,8 @@ async fn restore_persisted_sessions(state: &state::AppState) {
 
     // Check pane liveness on blocking thread
     let names: Vec<String> = state
-        .backend
-        .process_names()
+        .backends
+        .all_process_names()
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -836,6 +837,7 @@ async fn restore_persisted_sessions(state: &state::AppState) {
                 backend: ps.metadata.backend.clone(),
                 project_description: ps.metadata.project_description.clone(),
                 last_metadata_update: ps.metadata.last_metadata_update.map(|dt| dt.timestamp()),
+                serve_port: None,
             },
             ..Default::default()
         };

@@ -110,7 +110,7 @@ pub struct AppState {
     /// Per-fire worktree panes: pane_id → project_dir.
     /// Reaper runs `git worktree prune` when these panes die.
     pub perfire_worktree_panes: RwLock<HashMap<String, String>>,
-    pub backend: std::sync::Arc<dyn crate::backend::CodingAssistant>,
+    pub backends: crate::backend::BackendRegistry,
 }
 
 impl std::fmt::Debug for AppState {
@@ -254,7 +254,13 @@ impl AppState {
             pending_commands: std::sync::Mutex::new(Vec::new()),
             cached_assistant_panes: RwLock::new(Vec::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
-            backend: std::sync::Arc::new(crate::backend::claude_code::ClaudeCode),
+            backends: crate::backend::BackendRegistry::new(
+                vec![
+                    std::sync::Arc::new(crate::backend::claude_code::ClaudeCode),
+                    std::sync::Arc::new(crate::backend::opencode::OpenCode),
+                ],
+                "claude-code",
+            ),
         })
     }
 
@@ -284,8 +290,33 @@ impl AppState {
             pending_commands: std::sync::Mutex::new(Vec::new()),
             cached_assistant_panes: RwLock::new(Vec::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
-            backend: std::sync::Arc::new(crate::backend::claude_code::ClaudeCode),
+            backends: crate::backend::BackendRegistry::new(
+                vec![
+                    std::sync::Arc::new(crate::backend::claude_code::ClaudeCode),
+                    std::sync::Arc::new(crate::backend::opencode::OpenCode),
+                ],
+                "claude-code",
+            ),
         })
+    }
+
+    /// Resolve the backend for a given session by looking up its metadata.
+    pub async fn backend_for_session(
+        &self,
+        session_id: &str,
+    ) -> std::sync::Arc<dyn crate::backend::CodingAssistant> {
+        let backend_name = self
+            .protocol
+            .read()
+            .await
+            .sessions
+            .get(session_id)
+            .and_then(|s| s.metadata.backend.as_deref())
+            .unwrap_or("claude-code")
+            .to_string();
+        self.backends
+            .get(&backend_name)
+            .unwrap_or_else(|| self.backends.default())
     }
 
     /// Apply a protocol event and execute all resulting effects.
@@ -321,11 +352,14 @@ impl AppState {
                     crate::transport::broadcast_local_sessions(self).await;
                 }
                 Effect::InjectMessage {
+                    session_id,
                     pane,
                     message,
                     vim_mode,
                 } => {
-                    let _ = crate::tmux::locked_inject(self, pane, message, *vim_mode).await;
+                    let _ =
+                        crate::tmux::locked_inject(self, session_id, pane, message, *vim_mode)
+                            .await;
                 }
                 Effect::SetTmuxVar { pane, value, .. } => {
                     let p = pane.clone();
@@ -802,8 +836,8 @@ impl AppState {
     /// Scan tmux for assistant panes, update cache, and auto-register unregistered ones.
     pub async fn scan_and_autoregister_panes(self: &Arc<Self>) {
         let names: Vec<String> = self
-            .backend
-            .process_names()
+            .backends
+            .all_process_names()
             .iter()
             .map(|s| s.to_string())
             .collect();

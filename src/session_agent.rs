@@ -217,7 +217,7 @@ impl SessionAgent {
             let reminder =
                 format!("You have an unanswered question from {from} — reply using session_send");
             let _ =
-                crate::tmux::locked_inject(&self.app_state, &state.pane, &reminder, vim_mode).await;
+                crate::tmux::locked_inject(&self.app_state, &state.session_id, &state.pane, &reminder, vim_mode).await;
         }
     }
 }

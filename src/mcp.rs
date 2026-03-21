@@ -222,7 +222,7 @@ impl OuijaMcp {
         }
 
         if let Some(ref p) = pane {
-            if !crate::tmux::pane_alive(p, self.state.backend.process_names()) {
+            if !crate::tmux::pane_alive(p, &self.state.backends.all_process_names()) {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
                     "pane {p} does not exist — run `echo $TMUX_PANE` to get the correct pane ID"
                 ))]));
@@ -1149,8 +1149,8 @@ async fn append_staleness_hint(state: &AppState, sender_id: &str, contents: &mut
 /// candidates exist (ambiguous).
 async fn find_unregistered_pane(state: &AppState) -> Option<String> {
     let names: Vec<String> = state
-        .backend
-        .process_names()
+        .backends
+        .all_process_names()
         .iter()
         .map(|s| s.to_string())
         .collect();

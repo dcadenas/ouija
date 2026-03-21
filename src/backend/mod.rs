@@ -2,6 +2,44 @@ pub mod claude_code;
 pub mod opencode;
 
 use std::path::Path;
+use std::sync::Arc;
+
+/// Registry of available coding assistant backends.
+///
+/// Holds all known backends and provides lookup by name plus a configurable
+/// default. Global operations (e.g. scanning for any assistant process) use
+/// `all_process_names()`, while per-session operations resolve the backend
+/// via `get(name)`.
+#[derive(Debug)]
+pub struct BackendRegistry {
+    backends: Vec<Arc<dyn CodingAssistant>>,
+    default_name: String,
+}
+
+impl BackendRegistry {
+    pub fn new(backends: Vec<Arc<dyn CodingAssistant>>, default: &str) -> Self {
+        Self {
+            backends,
+            default_name: default.to_string(),
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<Arc<dyn CodingAssistant>> {
+        self.backends.iter().find(|b| b.name() == name).cloned()
+    }
+
+    pub fn default(&self) -> Arc<dyn CodingAssistant> {
+        self.get(&self.default_name)
+            .expect("default backend must exist")
+    }
+
+    pub fn all_process_names(&self) -> Vec<&str> {
+        self.backends
+            .iter()
+            .flat_map(|b| b.process_names().iter().copied())
+            .collect()
+    }
+}
 
 /// How a backend receives messages from ouija.
 #[derive(Debug, Clone)]

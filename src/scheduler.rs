@@ -362,8 +362,8 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask, formatted:
     // Check if pane is alive
     let pane_id = pane.clone();
     let names: Vec<String> = state
-        .backend
-        .process_names()
+        .backends
+        .all_process_names()
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -405,7 +405,7 @@ async fn inject_into_pane(
     vim_mode: bool,
     formatted: &str,
 ) -> TaskRun {
-    match tmux::locked_inject(state, pane, formatted, vim_mode).await {
+    match tmux::locked_inject(state, task.session_name(), pane, formatted, vim_mode).await {
         Ok(()) => TaskRun::ok(task, None),
         Err(e) => TaskRun::failed(task, e.to_string()),
     }
@@ -425,7 +425,8 @@ async fn respawn_and_inject(
     let is_disposable = task.on_fire.is_disposable_worktree();
     let task_name = task.name.clone();
 
-    let claude_cmd = state.backend.build_start_command(&crate::backend::StartOpts {
+    let backend = state.backend_for_session(task.session_name()).await;
+    let claude_cmd = backend.build_start_command(&crate::backend::StartOpts {
         project_dir: dir.to_string(),
         worktree: if uses_worktree {
             if is_disposable {
@@ -471,8 +472,7 @@ async fn respawn_and_inject(
 
     // Wait for the backend process to start, then inject
     let poll_pane = pane_id.clone();
-    let process_names: Vec<String> = state
-        .backend
+    let process_names: Vec<String> = backend
         .process_names()
         .iter()
         .map(|s| s.to_string())
@@ -485,7 +485,7 @@ async fn respawn_and_inject(
     .unwrap_or(false);
 
     if ready {
-        let _ = tmux::locked_inject(state, &pane_id, formatted, false).await;
+        let _ = tmux::locked_inject(state, task.session_name(), &pane_id, formatted, false).await;
     }
 
     TaskRun::ok(task, None)
@@ -540,8 +540,9 @@ async fn revive_and_inject(
     } else {
         None
     };
+    let backend = state.backend_for_session(task.session_name()).await;
     let launch_cmd = if clears_context {
-        state.backend.build_start_command(&crate::backend::StartOpts {
+        backend.build_start_command(&crate::backend::StartOpts {
             project_dir: dir.clone(),
             worktree,
         })
@@ -549,16 +550,15 @@ async fn revive_and_inject(
         let session_id = task
             .backend_session_id
             .clone()
-            .or_else(|| state.backend.detect_session_id(&dir));
-        state
-            .backend
+            .or_else(|| backend.detect_session_id(&dir));
+        backend
             .build_resume_command(&crate::backend::ResumeOpts {
                 project_dir: dir.clone(),
                 session_id,
                 worktree,
             })
             .unwrap_or_else(|| {
-                state.backend.build_start_command(&crate::backend::StartOpts {
+                backend.build_start_command(&crate::backend::StartOpts {
                     project_dir: dir.clone(),
                     worktree: None,
                 })
@@ -639,14 +639,13 @@ async fn revive_and_inject(
 
     // Phase 1: Wait for the backend process to appear in the pane
     let poll_pane = new_pane.clone();
-    let process_names: Vec<String> = state
-        .backend
+    let process_names: Vec<String> = backend
         .process_names()
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let backend_name = state.backend.name().to_string();
-    let tui_pattern = state.backend.tui_ready_pattern().map(String::from);
+    let backend_name = backend.name().to_string();
+    let tui_pattern = backend.tui_ready_pattern().map(String::from);
     let process_ready = tokio::task::spawn_blocking(move || {
         let name_refs: Vec<&str> = process_names.iter().map(|s| s.as_str()).collect();
         wait_for_process(&poll_pane, &name_refs, REVIVAL_TIMEOUT_SECS)
@@ -701,7 +700,7 @@ async fn revive_and_inject(
     }
 
     // Inject the scheduled message
-    tmux::locked_inject(state, &new_pane, formatted, false).await?;
+    tmux::locked_inject(state, task.session_name(), &new_pane, formatted, false).await?;
 
     Ok(new_pane)
 }

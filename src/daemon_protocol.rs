@@ -79,6 +79,9 @@ pub struct SessionMeta {
     /// Unix timestamp; 0 in model tests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_metadata_update: Option<i64>,
+    /// Port for HTTP API backends (e.g. opencode serve).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serve_port: Option<u16>,
 }
 
 /// Metadata becomes stale after 30 minutes without an update.
@@ -107,6 +110,7 @@ impl Default for SessionMeta {
             backend: None,
             project_description: None,
             last_metadata_update: None,
+            serve_port: None,
         }
     }
 }
@@ -180,6 +184,7 @@ pub enum Effect {
         pane: String,
     },
     InjectMessage {
+        session_id: String,
         pane: String,
         message: String,
         vim_mode: bool,
@@ -365,6 +370,7 @@ fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>) -> Sessio
             backend: m.backend.clone(),
             project_description: m.project_description.clone(),
             last_metadata_update: m.last_metadata_update.map(|ts| ts.timestamp()),
+            serve_port: None,
         },
         None => SessionMeta::default(),
     }
@@ -1056,6 +1062,7 @@ impl DaemonState {
                         done,
                     );
                     effects.push(Effect::InjectMessage {
+                        session_id: to.to_string(),
                         pane: pane.clone(),
                         message: formatted,
                         vim_mode: session.metadata.vim_mode,
@@ -1386,6 +1393,7 @@ impl DaemonState {
                         done,
                     );
                     effects.push(Effect::InjectMessage {
+                        session_id: resolved_to.clone(),
                         pane: pane.clone(),
                         message: formatted,
                         vim_mode: session.metadata.vim_mode,

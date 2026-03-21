@@ -954,7 +954,7 @@ async fn route_human_message(state: &AppState, from: &str, to: &str, message: &s
                         from, message, true, msg_id, None, false,
                     );
                     let vim_mode = session.metadata.vim_mode;
-                    let delivered = crate::tmux::locked_inject(state, pane, &formatted, vim_mode)
+                    let delivered = crate::tmux::locked_inject(state, to, pane, &formatted, vim_mode)
                         .await
                         .is_ok();
                     state
@@ -1139,9 +1139,10 @@ pub async fn kill_session(state: &std::sync::Arc<AppState>, name: &str) -> Strin
 
     // Get the pane's PID and find the backend process
     let pane = pane.clone();
-    let process_names: Vec<String> = state.backend.process_names().iter().map(|s| s.to_string()).collect();
-    let exit_cmd = state.backend.exit_command().map(String::from);
-    let cli_name = state.backend.cli_name().to_string();
+    let backend = state.backend_for_session(name).await;
+    let process_names: Vec<String> = backend.process_names().iter().map(|s| s.to_string()).collect();
+    let exit_cmd = backend.exit_command().map(String::from);
+    let cli_name = backend.cli_name().to_string();
     let kill_result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
         use std::process::Command;
 
@@ -1320,7 +1321,12 @@ pub async fn start_session(
     } else {
         None
     };
-    let backend_cmd = state.backend.build_start_command(&crate::backend::StartOpts {
+    let backend = state.backends.get(
+        state.protocol.read().await.sessions.get(name)
+            .and_then(|s| s.metadata.backend.as_deref())
+            .unwrap_or("claude-code")
+    ).unwrap_or_else(|| state.backends.default());
+    let backend_cmd = backend.build_start_command(&crate::backend::StartOpts {
         project_dir: dir.clone(),
         worktree: worktree_mode,
     });
@@ -1432,7 +1438,7 @@ pub async fn start_session(
                 } else {
                     text.to_string()
                 };
-                schedule_prompt_injection(state, pane_id.clone(), injected);
+                schedule_prompt_injection(state, name, pane_id.clone(), injected);
             }
             if auto_worktree {
                 let conflict_name = {
@@ -1500,13 +1506,14 @@ pub async fn restart_session(
         return (format!("failed to create {dir}: {e}"), None);
     }
 
+    let backend = state.backend_for_session(name).await;
     let resume_id = if fresh {
         None
     } else {
         prev_metadata
             .as_ref()
             .and_then(|m| m.backend_session_id.clone())
-            .or_else(|| state.backend.detect_session_id(&dir))
+            .or_else(|| backend.detect_session_id(&dir))
     };
     if let Some(ref sid) = resume_id {
         tracing::info!("restart '{name}': using --resume {sid}");
@@ -1520,16 +1527,16 @@ pub async fn restart_session(
     };
 
     let claude_cmd = if fresh {
-        state.backend.build_start_command(&crate::backend::StartOpts {
+        backend.build_start_command(&crate::backend::StartOpts {
             project_dir: dir.clone(),
             worktree: worktree_mode,
         })
     } else {
-        state.backend.build_resume_command(&crate::backend::ResumeOpts {
+        backend.build_resume_command(&crate::backend::ResumeOpts {
             project_dir: dir.clone(),
             session_id: resume_id,
             worktree: worktree_mode,
-        }).unwrap_or_else(|| state.backend.build_start_command(&crate::backend::StartOpts {
+        }).unwrap_or_else(|| backend.build_start_command(&crate::backend::StartOpts {
             project_dir: dir.clone(),
             worktree: None,
         }))
@@ -1649,6 +1656,7 @@ pub async fn restart_session(
                     backend: m.backend.clone(),
                     project_description: m.project_description.clone(),
                     last_metadata_update: None,
+                    serve_port: None,
                 },
                 None => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),
@@ -1675,7 +1683,7 @@ pub async fn restart_session(
                 } else {
                     text.to_string()
                 };
-                schedule_prompt_injection(state, pane_id.clone(), injected);
+                schedule_prompt_injection(state, name, pane_id.clone(), injected);
             }
             (format!("restarted '{name}' in {dir} (pane {pane_id})"), prompt_msg_id)
         }
@@ -1685,13 +1693,14 @@ pub async fn restart_session(
 }
 
 /// Inject a prompt into a pane after a short delay, giving the backend time to start.
-fn schedule_prompt_injection(state: &std::sync::Arc<AppState>, pane_id: String, prompt: String) {
-    let delay_secs = state.backend.inject_config().startup_inject_delay_secs;
+fn schedule_prompt_injection(state: &std::sync::Arc<AppState>, session_name: &str, pane_id: String, prompt: String) {
+    let session_name = session_name.to_string();
     let state = state.clone();
     tokio::spawn(async move {
+        let delay_secs = state.backend_for_session(&session_name).await.inject_config().startup_inject_delay_secs;
         // Wait for backend to initialize in the pane
         tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-        if let Err(e) = crate::tmux::locked_inject(&state, &pane_id, &prompt, false).await {
+        if let Err(e) = crate::tmux::locked_inject(&state, &session_name, &pane_id, &prompt, false).await {
             tracing::warn!("prompt injection into {pane_id} failed: {e}");
         }
     });

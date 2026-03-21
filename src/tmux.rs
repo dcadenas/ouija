@@ -462,12 +462,14 @@ pub async fn pane_inject_loop(mut rx: tokio::sync::mpsc::UnboundedReceiver<Injec
 /// failure the worker retries with backoff before returning the error.
 pub async fn locked_inject(
     state: &crate::state::AppState,
+    session_id: &str,
     pane: &str,
     message: &str,
     vim_mode: bool,
 ) -> anyhow::Result<()> {
-    let config = state.backend.inject_config();
-    let tui_pattern = state.backend.tui_ready_pattern().map(String::from);
+    let backend = state.backend_for_session(session_id).await;
+    let config = backend.inject_config();
+    let tui_pattern = backend.tui_ready_pattern().map(String::from);
 
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let req = InjectRequest {

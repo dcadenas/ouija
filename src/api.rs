@@ -443,7 +443,7 @@ pub async fn register(
         ..Default::default()
     };
     if let Some(ref p) = body.pane {
-        if !crate::tmux::pane_alive(p, state.backend.process_names()) {
+        if !crate::tmux::pane_alive(p, &state.backends.all_process_names()) {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": format!("pane {p} does not exist") })),
@@ -711,7 +711,17 @@ pub async fn inject(
     State(state): State<SharedState>,
     Json(body): Json<InjectBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match tmux::locked_inject(&state, &body.pane, &body.message, body.vim_mode).await {
+    // Resolve session ID from pane for backend lookup
+    let session_id = {
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .values()
+            .find(|s| s.pane.as_deref() == Some(&body.pane))
+            .map(|s| s.id.clone())
+            .unwrap_or_default()
+    };
+    match tmux::locked_inject(&state, &session_id, &body.pane, &body.message, body.vim_mode).await {
         Ok(()) => (StatusCode::OK, Json(json!({ "status": "injected" }))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
