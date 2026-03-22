@@ -481,7 +481,14 @@ pub async fn locked_inject(
                     .get(session_id)
                     .and_then(|s| s.metadata.backend_session_id.clone())
             };
-            deliver_via_http(state, oc_session_id, message).await
+            let project_dir = {
+                let proto = state.protocol.read().await;
+                proto
+                    .sessions
+                    .get(session_id)
+                    .and_then(|s| s.metadata.project_dir.clone())
+            };
+            deliver_via_http(state, oc_session_id, project_dir.as_deref(), message).await
         }
         crate::backend::DeliveryMode::TuiInjection => {
             let config = backend.inject_config();
@@ -512,6 +519,7 @@ pub async fn locked_inject(
 async fn deliver_via_http(
     state: &crate::state::AppState,
     oc_session_id: Option<String>,
+    project_dir: Option<&str>,
     message: &str,
 ) -> anyhow::Result<()> {
     let port = state
@@ -528,15 +536,19 @@ async fn deliver_via_http(
     });
 
     // Try prompt_async first (returns immediately)
+    // Include x-opencode-directory header so the request runs in the correct
+    // Instance context — without it, events won't reach the attach TUI.
     let async_url = format!(
         "http://127.0.0.1:{port}/session/{oc_session_id}/prompt_async"
     );
-    let resp = client
+    let mut req = client
         .post(&async_url)
         .json(&body)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await;
+        .timeout(std::time::Duration::from_secs(10));
+    if let Some(dir) = project_dir {
+        req = req.header("x-opencode-directory", dir);
+    }
+    let resp = req.send().await;
 
     match resp {
         Ok(r) if r.status().is_success() => {
@@ -562,13 +574,16 @@ async fn deliver_via_http(
     );
     let body_clone = body.clone();
     let bg_client = client.clone();
+    let dir_header = project_dir.map(String::from);
     tokio::spawn(async move {
-        let result = bg_client
+        let mut req = bg_client
             .post(&msg_url)
             .json(&body_clone)
-            .timeout(std::time::Duration::from_secs(300))
-            .send()
-            .await;
+            .timeout(std::time::Duration::from_secs(300));
+        if let Some(ref dir) = dir_header {
+            req = req.header("x-opencode-directory", dir.as_str());
+        }
+        let result = req.send().await;
         match result {
             Ok(r) if r.status().is_success() => {
                 tracing::info!(port, "delivered message via /message (background)");

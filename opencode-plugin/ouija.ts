@@ -72,30 +72,33 @@ If \`session_send\` fails with "session not found", the sender disconnected. Cal
     },
 
     // --- Hook 2: Event-based signaling ---
-    event: async ({ event }) => {
-      try {
-        if (event.type === "session.status" || event.type === "session.created") {
-          // session.created has properties.info.id; session.status has properties.sessionID
-          const sid = event.properties?.sessionID || event.properties?.info?.id
-          if (!sid) return
-          // Retry resolution — ouija may still be registering the session
-          let ouijaName = "(unknown)"
-          for (let attempt = 0; attempt < 5; attempt++) {
-            ouijaName = await resolveOuijaSessionName(sid)
-            if (ouijaName !== "(unknown)") break
-            await new Promise(r => setTimeout(r, 1000))
-          }
-          if (ouijaName === "(unknown)") return
-          // Notify daemon the session is ready for prompt delivery
-          await fetch(`${base}/api/session/${encodeURIComponent(ouijaName)}/ready`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({})
-          }).catch(() => {})
-        }
+    // Note: opencode's plugin system does NOT await event hooks (fire-and-forget).
+    // We use setTimeout to detach async work from the non-awaited handler chain.
+    event: ({ event }) => {
+      if (event.type === "session.status" || event.type === "session.created") {
+        const sid = event.properties?.sessionID || event.properties?.info?.id
+        if (!sid) return
+        // Detach async work — the event handler isn't awaited by opencode
+        setTimeout(async () => {
+          try {
+            let ouijaName = "(unknown)"
+            for (let attempt = 0; attempt < 5; attempt++) {
+              ouijaName = await resolveOuijaSessionName(sid)
+              if (ouijaName !== "(unknown)") break
+              await new Promise(r => setTimeout(r, 1000))
+            }
+            if (ouijaName === "(unknown)") return
+            await fetch(`${base}/api/session/${encodeURIComponent(ouijaName)}/ready`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({})
+            })
+          } catch {}
+        }, 0)
+      }
 
-        if (event.type === "session.idle") {
-          // Notify daemon that the LLM turn ended (triggers pending reply nudges)
+      if (event.type === "session.idle") {
+        // Notify daemon that the LLM turn ended (triggers pending reply nudges)
           // Find the pane number from TMUX_PANE env var
           const pane = process.env.TMUX_PANE
           if (pane) {
