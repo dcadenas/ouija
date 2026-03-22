@@ -1824,7 +1824,7 @@ fn schedule_prompt_injection(state: &std::sync::Arc<AppState>, session_name: &st
                 let state2 = state.clone();
                 let name = session_name.clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                     let pending = state2.pending_prompts.lock().unwrap().remove(&name);
                     if let Some((pane, text)) = pending {
                         tracing::info!("readiness timeout for {name}, delivering prompt via fallback");

@@ -164,6 +164,20 @@ else
     fail "oc-e2e registration" "session exists" "not found in status"
 fi
 
+log "Test 8b: backend-session readiness endpoint resolves registered session"
+backend_sid=$(echo "$oc_status" | jq -r '.sessions[] | select(.id == "oc-e2e") | .backend_session_id // empty')
+if [ -n "$backend_sid" ]; then
+    bs_resolve=$(curl -sf -X POST "$BASE/api/backend-session/${backend_sid}/ready" \
+        -H "Content-Type: application/json" -d '{}' 2>/dev/null || echo '{"error":"failed"}')
+    if echo "$bs_resolve" | jq -r '.session // empty' 2>/dev/null | grep -q "oc-e2e"; then
+        pass "backend-session endpoint resolved oc-e2e by backend_session_id"
+    else
+        fail "backend-session resolve" "session=oc-e2e" "$(echo "$bs_resolve" | head -c 200)"
+    fi
+else
+    fail "backend_session_id" "non-empty value" "empty in status"
+fi
+
 log "Test 9: ouija session_send delivers to opencode via HTTP API"
 send_result=$(mcp_call_tool "$BASE" "session_send" \
     '{"from":"test-sender","to":"oc-e2e","message":"Reply with only the word hello","expects_reply":false}')

@@ -80,6 +80,10 @@ pub async fn run(state: SharedState) -> anyhow::Result<()> {
         .route("/api/pane/{pane}/stopped", post(api::session_stopped))
         .route("/api/pane/{pane}/active", post(api::session_active))
         .route("/api/session/{id}/ready", post(api::session_ready))
+        .route(
+            "/api/backend-session/{id}/ready",
+            post(api::backend_session_ready),
+        )
         .route("/api/projects", get(api::list_projects))
         .with_state(state);
 

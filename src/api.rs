@@ -1483,6 +1483,44 @@ pub async fn session_ready(
     }
 }
 
+/// Handle a readiness signal keyed by opencode backend session ID.
+/// Resolves the ouija session name internally, avoiding plugin-side race conditions.
+pub async fn backend_session_ready(
+    State(state): State<SharedState>,
+    axum::extract::Path(backend_sid): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    let session_name = {
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .values()
+            .find(|s| s.metadata.backend_session_id.as_deref() == Some(&backend_sid))
+            .map(|s| s.id.clone())
+    };
+    let Some(name) = session_name else {
+        return Json(json!({"delivered": false, "error": "no session with this backend_session_id"}));
+    };
+    let pending = state.pending_prompts.lock().unwrap().remove(&name);
+    if let Some((pane_id, prompt)) = pending {
+        let state2 = state.clone();
+        let sid = name.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::tmux::locked_inject(&state2, &sid, &pane_id, &prompt, false).await
+            {
+                tracing::warn!("readiness prompt delivery failed for {sid}: {e}");
+            } else {
+                tracing::info!(
+                    "delivered queued prompt to {sid} via backend readiness signal"
+                );
+            }
+        });
+        Json(json!({"delivered": true, "session": name}))
+    } else {
+        Json(json!({"delivered": false, "session": name}))
+    }
+}
+
 /// List indexed projects from the configured projects directory.
 pub async fn list_projects(
     State(state): State<SharedState>,
