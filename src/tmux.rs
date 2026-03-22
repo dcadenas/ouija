@@ -535,50 +535,41 @@ async fn deliver_via_http(
         "parts": [{"type": "text", "text": message}]
     });
 
-    // Use /message endpoint (blocks until LLM finishes).
-    // Spawn in a background task so ouija doesn't block.
-    // Include x-opencode-directory header for correct Instance scoping.
+    // Use /message endpoint via curl subprocess.
+    // opencode streams the response — reqwest drops the connection too early, cancelling
+    // the LLM. Using curl keeps the connection alive until the LLM finishes.
     let msg_url = format!(
         "http://127.0.0.1:{port}/session/{oc_session_id}/message"
     );
-    let body_clone = body.clone();
-    let bg_client = client.clone();
+    let body_str = serde_json::to_string(&body).unwrap_or_default();
     let dir_header = project_dir.map(String::from);
-    tokio::spawn(async move {
-        let mut req = bg_client
-            .post(&msg_url)
-            .json(&body_clone)
-            .timeout(std::time::Duration::from_secs(300));
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new("curl");
+        cmd.args([
+            "-sf", "-X", "POST", &msg_url,
+            "-H", "Content-Type: application/json",
+            "-d", &body_str,
+            "--max-time", "300",
+        ]);
         if let Some(ref dir) = dir_header {
-            req = req.header("x-opencode-directory", dir.as_str());
+            cmd.args(["-H", &format!("x-opencode-directory: {dir}")]);
         }
-        let result = req.send().await;
-        match result {
-            Ok(r) if r.status().is_success() => {
-                // MUST consume the full response — /message uses chunked HTTP streaming.
-                // The LLM processes while streaming; dropping the response cancels it.
-                // bytes() reads the complete body including all chunks.
-                match r.bytes().await {
-                    Ok(bytes) => {
-                        tracing::info!(port, total_bytes = bytes.len(), "delivered message via /message (background)");
-                    }
-                    Err(e) => {
-                        tracing::warn!("error reading /message response: {e}");
-                    }
-                }
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        match cmd.status() {
+            Ok(status) if status.success() => {
+                tracing::info!(port, "delivered message via /message (curl)");
             }
-            Ok(r) => {
-                let status = r.status();
-                let text = r.text().await.unwrap_or_default();
-                tracing::warn!("opencode /message returned {status}: {text}");
+            Ok(status) => {
+                tracing::warn!("opencode /message curl returned {status}");
             }
             Err(e) => {
-                tracing::warn!("opencode /message request failed: {e}");
+                tracing::warn!("opencode /message curl failed: {e}");
             }
         }
     });
 
-    tracing::info!(port, "spawned message delivery via /message (background)");
+    tracing::info!(port, "spawned message delivery via /message (curl, background)");
     Ok(())
 }
 
