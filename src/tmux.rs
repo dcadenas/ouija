@@ -535,41 +535,34 @@ async fn deliver_via_http(
         "parts": [{"type": "text", "text": message}]
     });
 
-    // Use /message endpoint via curl subprocess.
-    // opencode streams the response — reqwest drops the connection too early, cancelling
-    // the LLM. Using curl keeps the connection alive until the LLM finishes.
-    let msg_url = format!(
-        "http://127.0.0.1:{port}/session/{oc_session_id}/message"
+    // Use prompt_async — returns immediately, LLM processes in background.
+    // Include x-opencode-directory header for correct Instance scoping.
+    let async_url = format!(
+        "http://127.0.0.1:{port}/session/{oc_session_id}/prompt_async"
     );
-    let body_str = serde_json::to_string(&body).unwrap_or_default();
-    let dir_header = project_dir.map(String::from);
-    tokio::task::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new("curl");
-        cmd.args([
-            "-sf", "-X", "POST", &msg_url,
-            "-H", "Content-Type: application/json",
-            "-d", &body_str,
-            "--max-time", "300",
-        ]);
-        if let Some(ref dir) = dir_header {
-            cmd.args(["-H", &format!("x-opencode-directory: {dir}")]);
-        }
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-        match cmd.status() {
-            Ok(status) if status.success() => {
-                tracing::info!(port, "delivered message via /message (curl)");
-            }
-            Ok(status) => {
-                tracing::warn!("opencode /message curl returned {status}");
-            }
-            Err(e) => {
-                tracing::warn!("opencode /message curl failed: {e}");
-            }
-        }
-    });
+    let mut req = client
+        .post(&async_url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(10));
+    if let Some(dir) = project_dir {
+        req = req.header("x-opencode-directory", dir);
+    }
+    let resp = req.send().await;
 
-    tracing::info!(port, "spawned message delivery via /message (curl, background)");
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            tracing::info!(port, "delivered message via prompt_async");
+        }
+        Ok(r) => {
+            let status = r.status();
+            let text = r.text().await.unwrap_or_default();
+            tracing::warn!("prompt_async returned {status}: {text}");
+        }
+        Err(e) => {
+            tracing::warn!("prompt_async request failed: {e}");
+        }
+    }
+
     Ok(())
 }
 
