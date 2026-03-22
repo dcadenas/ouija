@@ -1798,19 +1798,9 @@ async fn setup_shared_serve_session(
 /// Inject a prompt into a pane after a short delay, giving the backend time to start.
 /// For HttpApi backends, queue the prompt and wait for a readiness signal from the plugin.
 fn schedule_prompt_injection(state: &std::sync::Arc<AppState>, session_name: &str, pane_id: String, prompt: String) {
-    // For HttpApi backends, queue the prompt immediately (synchronously) so the
-    // plugin's readiness signal finds it. Only the fallback timer is async.
-    // For TuiInjection, spawn the whole thing (delay + inject).
-    let backend = {
-        // Quick sync check: if session has backend="opencode" in metadata, it's HttpApi.
-        // Fall back to default (TuiInjection) if unknown.
-        let is_http = state.pending_prompts.lock().is_ok(); // always true, but we need the field to exist
-        is_http // placeholder — we need to check delivery mode without async
-    };
-    // We can't call backend_for_session (async) here synchronously.
-    // Instead, check if pending_prompts already has this session queued (it won't),
-    // or just always queue and let the inject path handle it.
-    // Simpler: always queue for all backends, let locked_inject handle delivery mode.
+    // Queue prompt synchronously so the plugin's readiness signal finds it.
+    // The spawned task determines delivery mode and either waits for the
+    // readiness signal (HttpApi) or delivers after a delay (TuiInjection).
     state.pending_prompts.lock().unwrap()
         .insert(session_name.to_string(), (pane_id.clone(), prompt.clone()));
 

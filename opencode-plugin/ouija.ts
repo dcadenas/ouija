@@ -6,7 +6,6 @@ export const OuijaPlugin: Plugin = async (ctx) => {
   const port = process.env.OUIJA_PORT || "7880"
   const base = `http://localhost:${port}`
 
-  // Check if ouija daemon is reachable
   const daemonAlive = await fetch(`${base}/api/status`)
     .then(() => true)
     .catch(() => false)
@@ -18,33 +17,28 @@ export const OuijaPlugin: Plugin = async (ctx) => {
 
   console.log(`ouija plugin v${OUIJA_VERSION}: connected to daemon at ${base}`)
 
-  // Cache for session diff
   let lastSessionState: string = ""
-
-  // Cache for resolved ouija session name (keyed by opencode session ID)
   const nameCache = new Map<string, string>()
 
-  async function resolveOuijaSessionName(opencodeSid: string): Promise<string> {
+  function resolveOuijaSessionName(opencodeSid: string, sessions: any[]): string {
     const cached = nameCache.get(opencodeSid)
     if (cached) return cached
-    try {
-      const status = await fetch(`${base}/api/status`).then(r => r.json())
-      const match = (status.sessions || []).find(
-        (s: any) => s.backend_session_id === opencodeSid
-      )
-      const name = match?.id || "(unknown)"
-      if (name !== "(unknown)") nameCache.set(opencodeSid, name)
-      return name
-    } catch {
-      return "(unknown)"
-    }
+    const match = sessions.find((s: any) => s.backend_session_id === opencodeSid)
+    const name = match?.id || "(unknown)"
+    if (name !== "(unknown)") nameCache.set(opencodeSid, name)
+    return name
+  }
+
+  async function fetchStatus(): Promise<any> {
+    return fetch(`${base}/api/status`).then(r => r.json())
   }
 
   return {
-    // --- Hook 1: Inject ouija protocol into system prompt ---
     "experimental.chat.system.transform": async (input, output) => {
-      const sid = await resolveOuijaSessionName(input.sessionID)
-      output.system.push(`
+      try {
+        const status = await fetchStatus()
+        const sid = resolveOuijaSessionName(input.sessionID, status.sessions || [])
+        output.system.push(`
 # Ouija Mesh Protocol
 
 You are session "${sid}" on the ouija mesh. Messages from peer sessions arrive as XML:
@@ -69,17 +63,14 @@ Reply protocol:
 
 If \`session_send\` fails with "session not found", the sender disconnected. Call \`clear_pending_reply(session="${sid}", from="sender-id")\` to clear it.
 `)
+      } catch {}
     },
 
-    // --- Hook 2: Event-based signaling ---
-    // Note: opencode's plugin system does NOT await event hooks (fire-and-forget).
-    // We use setTimeout to detach async work from the non-awaited handler chain.
+    // opencode does NOT await event hooks — setTimeout detaches async work.
     event: ({ event }) => {
       if (event.type === "session.status" || event.type === "session.created") {
         const sid = event.properties?.sessionID || event.properties?.info?.id
         if (!sid) return
-        // Use backend-session endpoint — daemon resolves ouija name internally,
-        // avoiding the cross-process race with session registration.
         setTimeout(async () => {
           try {
             await fetch(`${base}/api/backend-session/${encodeURIComponent(sid)}/ready`, {
@@ -104,22 +95,21 @@ If \`session_send\` fails with "session not found", the sender disconnected. Cal
       }
     },
 
-    // --- Hook 3: Mesh awareness on each message ---
     "chat.message": async (input, output) => {
       try {
-        const sid = await resolveOuijaSessionName(input.sessionID)
+        const status = await fetchStatus()
+        const sessions = status.sessions || []
+        const sid = resolveOuijaSessionName(input.sessionID, sessions)
         const messageID = output.message.id
         const sessionID = input.sessionID
 
-        const status = await fetch(`${base}/api/status`).then(r => r.json())
         const current = JSON.stringify(
-          (status.sessions || [])
+          sessions
             .map((s: any) => ({ id: s.id, role: s.role, bulletin: s.bulletin }))
             .sort((a: any, b: any) => a.id.localeCompare(b.id))
         )
 
         if (lastSessionState && current !== lastSessionState) {
-          // Compute diff
           const prev = JSON.parse(lastSessionState)
           const curr = JSON.parse(current)
           const prevIds = new Set(prev.map((s: any) => s.id))
@@ -144,9 +134,8 @@ If \`session_send\` fails with "session not found", the sender disconnected. Cal
 
         lastSessionState = current
 
-        // Check for stale metadata
         if (sid !== "(unknown)") {
-          const me = (status.sessions || []).find((s: any) => s.id === sid)
+          const me = sessions.find((s: any) => s.id === sid)
           if (me?.stale) {
             output.parts.push({
               type: "text",

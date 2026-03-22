@@ -514,8 +514,7 @@ pub async fn locked_inject(
 /// Deliver a message to an opencode session via its HTTP API.
 ///
 /// Uses the `prompt_async` endpoint which returns immediately without waiting
-/// for the LLM to finish processing. Falls back to spawning the synchronous
-/// `/message` call in a background task if `prompt_async` is not available.
+/// for the LLM to finish processing.
 async fn deliver_via_http(
     state: &crate::state::AppState,
     oc_session_id: Option<String>,

@@ -1460,27 +1460,37 @@ pub async fn session_active(
     StatusCode::OK
 }
 
+/// Deliver a pending prompt for the given session, if one is queued.
+fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool {
+    let pending = state
+        .pending_prompts
+        .lock()
+        .unwrap()
+        .remove(session_name);
+    let Some((pane_id, prompt)) = pending else {
+        return false;
+    };
+    let state = state.clone();
+    let sid = session_name.to_string();
+    tokio::spawn(async move {
+        if let Err(e) =
+            crate::tmux::locked_inject(&state, &sid, &pane_id, &prompt, false).await
+        {
+            tracing::warn!("readiness prompt delivery failed for {sid}: {e}");
+        } else {
+            tracing::info!("delivered queued prompt to {sid} via readiness signal");
+        }
+    });
+    true
+}
+
 /// Handle a readiness signal from an HttpApi session's plugin.
-/// If a prompt is queued for this session, deliver it now.
 pub async fn session_ready(
     State(state): State<SharedState>,
     axum::extract::Path(session_id): axum::extract::Path<String>,
 ) -> Json<serde_json::Value> {
-    let pending = state.pending_prompts.lock().unwrap().remove(&session_id);
-    if let Some((pane_id, prompt)) = pending {
-        let state2 = state.clone();
-        let sid = session_id.clone();
-        tokio::spawn(async move {
-            if let Err(e) = crate::tmux::locked_inject(&state2, &sid, &pane_id, &prompt, false).await {
-                tracing::warn!("readiness prompt delivery failed for {sid}: {e}");
-            } else {
-                tracing::info!("delivered queued prompt to {sid} via readiness signal");
-            }
-        });
-        Json(json!({"delivered": true}))
-    } else {
-        Json(json!({"delivered": false}))
-    }
+    let delivered = deliver_pending_prompt(&state, &session_id);
+    Json(json!({"delivered": delivered}))
 }
 
 /// Handle a readiness signal keyed by opencode backend session ID.
@@ -1500,25 +1510,8 @@ pub async fn backend_session_ready(
     let Some(name) = session_name else {
         return Json(json!({"delivered": false, "error": "no session with this backend_session_id"}));
     };
-    let pending = state.pending_prompts.lock().unwrap().remove(&name);
-    if let Some((pane_id, prompt)) = pending {
-        let state2 = state.clone();
-        let sid = name.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
-                crate::tmux::locked_inject(&state2, &sid, &pane_id, &prompt, false).await
-            {
-                tracing::warn!("readiness prompt delivery failed for {sid}: {e}");
-            } else {
-                tracing::info!(
-                    "delivered queued prompt to {sid} via backend readiness signal"
-                );
-            }
-        });
-        Json(json!({"delivered": true, "session": name}))
-    } else {
-        Json(json!({"delivered": false, "session": name}))
-    }
+    let delivered = deliver_pending_prompt(&state, &name);
+    Json(json!({"delivered": delivered, "session": name}))
 }
 
 /// List indexed projects from the configured projects directory.
