@@ -140,7 +140,7 @@ impl OpenCodeServe {
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             let resp = client
-                .get(format!("http://127.0.0.1:{serve_port}/global/global/health"))
+                .get(format!("http://127.0.0.1:{serve_port}/global/health"))
                 .timeout(std::time::Duration::from_secs(2))
                 .send()
                 .await;
