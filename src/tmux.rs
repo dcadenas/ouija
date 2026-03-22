@@ -535,40 +535,9 @@ async fn deliver_via_http(
         "parts": [{"type": "text", "text": message}]
     });
 
-    // Try prompt_async first (returns immediately)
-    // Include x-opencode-directory header so the request runs in the correct
-    // Instance context — without it, events won't reach the attach TUI.
-    let async_url = format!(
-        "http://127.0.0.1:{port}/session/{oc_session_id}/prompt_async"
-    );
-    let mut req = client
-        .post(&async_url)
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(10));
-    if let Some(dir) = project_dir {
-        req = req.header("x-opencode-directory", dir);
-    }
-    let resp = req.send().await;
-
-    match resp {
-        Ok(r) if r.status().is_success() => {
-            tracing::info!(port, "delivered message via prompt_async");
-            return Ok(());
-        }
-        Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
-            tracing::debug!("prompt_async not available, falling back to /message");
-        }
-        Ok(r) => {
-            let status = r.status();
-            let text = r.text().await.unwrap_or_default();
-            tracing::warn!("prompt_async returned {status}: {text}, falling back to /message");
-        }
-        Err(e) => {
-            tracing::warn!("prompt_async request failed: {e}, falling back to /message");
-        }
-    }
-
-    // Fallback: spawn /message in a background task so we don't block
+    // Use /message endpoint (blocks until LLM finishes).
+    // Spawn in a background task so ouija doesn't block.
+    // Include x-opencode-directory header for correct Instance scoping.
     let msg_url = format!(
         "http://127.0.0.1:{port}/session/{oc_session_id}/message"
     );
