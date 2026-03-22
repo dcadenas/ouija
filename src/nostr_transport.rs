@@ -1417,7 +1417,7 @@ pub async fn start_session(
             // For HttpApi backends, use the shared opencode serve instance
             let backend_session_id =
                 if matches!(backend.delivery_mode(), crate::backend::DeliveryMode::HttpApi { .. }) {
-                    match setup_shared_serve_session(state, &pane_id, &dir, name).await {
+                    match setup_shared_serve_session(state, &pane_id, &dir).await {
                         Ok(sid) => Some(sid),
                         Err(e) => {
                             tracing::warn!("shared serve session setup failed: {e}");
@@ -1689,7 +1689,7 @@ pub async fn restart_session(
             // For HttpApi backends, use the shared opencode serve instance
             let mut backend_session_id =
                 if matches!(backend.delivery_mode(), crate::backend::DeliveryMode::HttpApi { .. }) {
-                    match setup_shared_serve_session(state, &pane_id, &dir, name).await {
+                    match setup_shared_serve_session(state, &pane_id, &dir).await {
                         Ok(sid) => Some(sid),
                         Err(e) => {
                             tracing::warn!("shared serve session setup failed: {e}");
@@ -1766,7 +1766,6 @@ async fn setup_shared_serve_session(
     state: &std::sync::Arc<AppState>,
     pane_id: &str,
     project_dir: &str,
-    ouija_session_name: &str,
 ) -> anyhow::Result<String> {
     let port = state
         .opencode_serve
@@ -1781,9 +1780,8 @@ async fn setup_shared_serve_session(
     tracing::info!("created opencode session {session_id} on shared serve (port {port})");
 
     let escaped_dir = crate::scheduler::shell_escape(project_dir);
-    let escaped_name = crate::scheduler::shell_escape(ouija_session_name);
     let attach_cmd = format!(
-        "OUIJA_SESSION_ID={escaped_name} opencode attach http://127.0.0.1:{port} --session {session_id} --dir {escaped_dir}"
+        "opencode attach http://127.0.0.1:{port} --session {session_id} --dir {escaped_dir}"
     );
     let pane = pane_id.to_string();
     tokio::task::spawn_blocking(move || {

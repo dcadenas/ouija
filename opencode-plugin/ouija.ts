@@ -5,7 +5,6 @@ const OUIJA_VERSION = "0.1.0"
 export const OuijaPlugin: Plugin = async (ctx) => {
   const port = process.env.OUIJA_PORT || "7880"
   const base = `http://localhost:${port}`
-  const sessionId = process.env.OUIJA_SESSION_ID || ""
 
   // Check if ouija daemon is reachable
   const daemonAlive = await fetch(`${base}/api/status`)
@@ -17,15 +16,34 @@ export const OuijaPlugin: Plugin = async (ctx) => {
     return {}
   }
 
-  console.log(`ouija plugin v${OUIJA_VERSION}: connected to daemon at ${base}, session=${sessionId || "(unknown)"}`)
+  console.log(`ouija plugin v${OUIJA_VERSION}: connected to daemon at ${base}`)
 
   // Cache for session diff
   let lastSessionState: string = ""
 
+  // Cache for resolved ouija session name (keyed by opencode session ID)
+  const nameCache = new Map<string, string>()
+
+  async function resolveOuijaSessionName(opencodeSid: string): Promise<string> {
+    const cached = nameCache.get(opencodeSid)
+    if (cached) return cached
+    try {
+      const status = await fetch(`${base}/api/status`).then(r => r.json())
+      const match = (status.sessions || []).find(
+        (s: any) => s.backend_session_id === opencodeSid
+      )
+      const name = match?.id || "(unknown)"
+      if (name !== "(unknown)") nameCache.set(opencodeSid, name)
+      return name
+    } catch {
+      return "(unknown)"
+    }
+  }
+
   return {
     // --- Hook 1: Inject ouija protocol into system prompt ---
-    "experimental.chat.system.transform": async (_input, output) => {
-      const sid = process.env.OUIJA_SESSION_ID || "(unknown)"
+    "experimental.chat.system.transform": async (input, output) => {
+      const sid = await resolveOuijaSessionName(input.sessionID)
       output.system.push(`
 # Ouija Mesh Protocol
 
@@ -55,16 +73,18 @@ If \`session_send\` fails with "session not found", the sender disconnected. Cal
 
     // --- Hook 2: Event-based signaling ---
     event: async ({ event }) => {
-      if (!sessionId) return
-
       try {
         if (event.type === "session.status" || event.type === "session.created") {
+          const sid = event.properties?.sessionID
+          if (!sid) return
+          const ouijaName = await resolveOuijaSessionName(sid)
+          if (ouijaName === "(unknown)") return
           // Notify daemon the session is ready for prompt delivery
-          await fetch(`${base}/api/session/${encodeURIComponent(sessionId)}/ready`, {
+          await fetch(`${base}/api/session/${encodeURIComponent(ouijaName)}/ready`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({})
-          })
+          }).catch(() => {})
         }
 
         if (event.type === "session.idle") {
@@ -82,10 +102,10 @@ If \`session_send\` fails with "session not found", the sender disconnected. Cal
     },
 
     // --- Hook 3: Mesh awareness on each message ---
-    "chat.message": async (_input, output) => {
-      if (!sessionId) return
-
+    "chat.message": async (input, output) => {
       try {
+        const sid = await resolveOuijaSessionName(input.sessionID)
+
         const status = await fetch(`${base}/api/status`).then(r => r.json())
         const current = JSON.stringify(
           (status.sessions || [])
@@ -120,12 +140,14 @@ If \`session_send\` fails with "session not found", the sender disconnected. Cal
         lastSessionState = current
 
         // Check for stale metadata
-        const me = (status.sessions || []).find((s: any) => s.id === sessionId)
-        if (me?.stale) {
-          output.parts.push({
-            type: "text",
-            text: `[ouija] Your metadata is stale. Call session_update(id="${sessionId}", role="<what you're doing>") to stay discoverable.`
-          })
+        if (sid !== "(unknown)") {
+          const me = (status.sessions || []).find((s: any) => s.id === sid)
+          if (me?.stale) {
+            output.parts.push({
+              type: "text",
+              text: `[ouija] Your metadata is stale. Call session_update(id="${sid}", role="<what you're doing>") to stay discoverable.`
+            })
+          }
         }
       } catch {
         // Daemon unreachable — skip silently

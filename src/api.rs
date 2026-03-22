@@ -97,6 +97,8 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
                 "model": s.metadata.model,
                 "last_metadata_update": s.metadata.last_metadata_update,
                 "stale": stale,
+                "backend_session_id": s.metadata.backend_session_id,
+                "backend": s.metadata.backend,
             })
         })
         .collect();

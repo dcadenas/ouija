@@ -305,12 +305,15 @@ impl CodingAssistant for OpenCode {
         }
 
         // Add plugin to the plugin array (merge, don't overwrite)
-        let plugin_path = "./plugins/ouija.ts";
+        let plugin_file = plugins_dir.join("ouija.ts");
+        let plugin_path = format!("file://{}", plugin_file.display());
         let plugins = obj
             .entry("plugin")
             .or_insert_with(|| serde_json::json!([]));
         if let Some(arr) = plugins.as_array_mut() {
-            if !arr.iter().any(|v| v.as_str() == Some(plugin_path)) {
+            // Remove old relative-path entry if present
+            arr.retain(|v| v.as_str() != Some("./plugins/ouija.ts"));
+            if !arr.iter().any(|v| v.as_str() == Some(&plugin_path)) {
                 arr.push(serde_json::json!(plugin_path));
             }
         }
