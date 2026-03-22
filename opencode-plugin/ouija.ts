@@ -98,16 +98,15 @@ If \`session_send\` fails with "session not found", the sender disconnected. Cal
       }
 
       if (event.type === "session.idle") {
-        // Notify daemon that the LLM turn ended (triggers pending reply nudges)
-          // Find the pane number from TMUX_PANE env var
-          const pane = process.env.TMUX_PANE
-          if (pane) {
-            const paneNum = pane.replace("%", "")
-            await fetch(`${base}/api/pane/${paneNum}/stopped`, { method: "POST" })
-          }
-        }
-      } catch {
-        // Daemon may be temporarily unreachable — don't crash the plugin
+        setTimeout(async () => {
+          try {
+            const pane = process.env.TMUX_PANE
+            if (pane) {
+              const paneNum = pane.replace("%", "")
+              await fetch(`${base}/api/pane/${paneNum}/stopped`, { method: "POST" })
+            }
+          } catch {}
+        }, 0)
       }
     },
 
