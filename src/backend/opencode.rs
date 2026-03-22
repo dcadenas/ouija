@@ -5,6 +5,10 @@ use anyhow::Context;
 
 use super::{CodingAssistant, DeliveryMode, InjectConfig, ResumeOpts, StartOpts};
 
+mod embedded {
+    pub const PLUGIN_TS: &str = include_str!("../../opencode-plugin/ouija.ts");
+}
+
 /// Find the opencode binary by checking common locations and PATH.
 fn which_opencode() -> Option<PathBuf> {
     // Check common install locations first (avoids spawning `which`)
@@ -92,8 +96,14 @@ impl OpenCodeServe {
             "--hostname",
             "127.0.0.1",
         ]);
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
+        cmd.args(["--print-logs"]);
+        // Log serve output to a file for debugging plugin issues
+        let log_path = std::env::var("HOME")
+            .map(|h| PathBuf::from(h).join(".local/share/ouija/opencode-serve.log"))
+            .unwrap_or_else(|_| PathBuf::from("/tmp/opencode-serve.log"));
+        let log_file = std::fs::File::create(&log_path).ok();
+        cmd.stdout(log_file.as_ref().map_or(std::process::Stdio::null(), |f| f.try_clone().unwrap().into()));
+        cmd.stderr(log_file.map_or(std::process::Stdio::null(), |f| f.into()));
         // Ensure PATH includes common opencode install locations
         if let Ok(path) = std::env::var("PATH") {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
@@ -130,7 +140,7 @@ impl OpenCodeServe {
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             let resp = client
-                .get(format!("http://127.0.0.1:{serve_port}/global/global/health"))
+                .get(format!("http://127.0.0.1:{serve_port}/global/health"))
                 .timeout(std::time::Duration::from_secs(2))
                 .send()
                 .await;
@@ -144,7 +154,10 @@ impl OpenCodeServe {
     }
 
     /// Create a new opencode session on the shared serve instance.
-    pub async fn create_session(&self, client: &reqwest::Client) -> anyhow::Result<String> {
+    ///
+    /// The `project_dir` sets the Instance context (x-opencode-directory header)
+    /// so the session is scoped to the correct project.
+    pub async fn create_session(&self, client: &reqwest::Client, project_dir: &str) -> anyhow::Result<String> {
         let port = self
             .port
             .lock()
@@ -152,6 +165,7 @@ impl OpenCodeServe {
             .ok_or_else(|| anyhow::anyhow!("opencode serve not running"))?;
         let resp = client
             .post(format!("http://127.0.0.1:{port}/session"))
+            .header("x-opencode-directory", project_dir)
             .json(&serde_json::json!({}))
             .timeout(std::time::Duration::from_secs(10))
             .send()
@@ -267,22 +281,29 @@ impl CodingAssistant for OpenCode {
             .map(std::path::PathBuf::from)
             .map_err(|_| anyhow::anyhow!("HOME environment variable not set"))?;
 
-        let config_path = home.join(".config/opencode/opencode.json");
+        let config_dir = home.join(".config/opencode");
+        let config_path = config_dir.join("opencode.json");
+
+        // Write the plugin file
+        let plugins_dir = config_dir.join("plugins");
+        std::fs::create_dir_all(&plugins_dir)?;
+        std::fs::write(plugins_dir.join("ouija.ts"), embedded::PLUGIN_TS)?;
 
         let mut config: serde_json::Value = match std::fs::read_to_string(&config_path) {
             Ok(content) => serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({})),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(parent) = config_path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
+                std::fs::create_dir_all(&config_dir)?;
                 serde_json::json!({ "$schema": "https://opencode.ai/config.json" })
             }
             Err(e) => return Err(e.into()),
         };
 
-        let mcp = config
+        let obj = config
             .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("opencode config is not a JSON object"))?
+            .ok_or_else(|| anyhow::anyhow!("opencode config is not a JSON object"))?;
+
+        // Add MCP config
+        let mcp = obj
             .entry("mcp")
             .or_insert_with(|| serde_json::json!({}));
 
@@ -291,6 +312,20 @@ impl CodingAssistant for OpenCode {
                 "type": "remote",
                 "url": "http://localhost:7880/mcp"
             });
+        }
+
+        // Add plugin to the plugin array (merge, don't overwrite)
+        let plugin_file = plugins_dir.join("ouija.ts");
+        let plugin_path = format!("file://{}", plugin_file.display());
+        let plugins = obj
+            .entry("plugin")
+            .or_insert_with(|| serde_json::json!([]));
+        if let Some(arr) = plugins.as_array_mut() {
+            // Remove old relative-path entry if present
+            arr.retain(|v| v.as_str() != Some("./plugins/ouija.ts"));
+            if !arr.iter().any(|v| v.as_str() == Some(&plugin_path)) {
+                arr.push(serde_json::json!(plugin_path));
+            }
         }
 
         std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;

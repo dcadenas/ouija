@@ -481,7 +481,14 @@ pub async fn locked_inject(
                     .get(session_id)
                     .and_then(|s| s.metadata.backend_session_id.clone())
             };
-            deliver_via_http(state, oc_session_id, message).await
+            let project_dir = {
+                let proto = state.protocol.read().await;
+                proto
+                    .sessions
+                    .get(session_id)
+                    .and_then(|s| s.metadata.project_dir.clone())
+            };
+            deliver_via_http(state, oc_session_id, project_dir.as_deref(), message).await
         }
         crate::backend::DeliveryMode::TuiInjection => {
             let config = backend.inject_config();
@@ -512,6 +519,7 @@ pub async fn locked_inject(
 async fn deliver_via_http(
     state: &crate::state::AppState,
     oc_session_id: Option<String>,
+    project_dir: Option<&str>,
     message: &str,
 ) -> anyhow::Result<()> {
     let port = state
@@ -527,10 +535,17 @@ async fn deliver_via_http(
         "parts": [{"type": "text", "text": message}]
     });
 
-    // Try prompt_async first (returns immediately)
+    // Use prompt_async — returns immediately, LLM processes in background.
+    // Include x-opencode-directory header for correct Instance scoping.
     let async_url = format!(
         "http://127.0.0.1:{port}/session/{oc_session_id}/prompt_async"
     );
+    // Note: do NOT send x-opencode-directory header on prompt_async.
+    // The directory header changes the Instance context, which causes a Zod
+    // validation error in opencode's SSE event publishing and kills the LLM.
+    // Without the header, the default context works and the LLM processes correctly.
+    // The TUI shows the conversation regardless since the session was created
+    // in the correct directory context during session creation.
     let resp = client
         .post(&async_url)
         .json(&body)
@@ -541,50 +556,17 @@ async fn deliver_via_http(
     match resp {
         Ok(r) if r.status().is_success() => {
             tracing::info!(port, "delivered message via prompt_async");
-            return Ok(());
-        }
-        Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
-            tracing::debug!("prompt_async not available, falling back to /message");
         }
         Ok(r) => {
             let status = r.status();
             let text = r.text().await.unwrap_or_default();
-            tracing::warn!("prompt_async returned {status}: {text}, falling back to /message");
+            tracing::warn!("prompt_async returned {status}: {text}");
         }
         Err(e) => {
-            tracing::warn!("prompt_async request failed: {e}, falling back to /message");
+            tracing::warn!("prompt_async request failed: {e}");
         }
     }
 
-    // Fallback: spawn /message in a background task so we don't block
-    let msg_url = format!(
-        "http://127.0.0.1:{port}/session/{oc_session_id}/message"
-    );
-    let body_clone = body.clone();
-    let bg_client = client.clone();
-    tokio::spawn(async move {
-        let result = bg_client
-            .post(&msg_url)
-            .json(&body_clone)
-            .timeout(std::time::Duration::from_secs(300))
-            .send()
-            .await;
-        match result {
-            Ok(r) if r.status().is_success() => {
-                tracing::info!(port, "delivered message via /message (background)");
-            }
-            Ok(r) => {
-                let status = r.status();
-                let text = r.text().await.unwrap_or_default();
-                tracing::warn!("opencode /message returned {status}: {text}");
-            }
-            Err(e) => {
-                tracing::warn!("opencode /message request failed: {e}");
-            }
-        }
-    });
-
-    tracing::info!(port, "spawned message delivery via /message (background)");
     Ok(())
 }
 

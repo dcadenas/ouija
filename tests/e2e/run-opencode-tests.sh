@@ -207,6 +207,24 @@ else
     fail "serve health" "serve reachable on port $OC_SERVE_PORT" "health check failed"
 fi
 
+log "Test 10b: prompt_async delivery confirmed without errors"
+if grep -q "delivered message via prompt_async" /tmp/ouija-test/daemon.log 2>/dev/null; then
+    pass "prompt_async delivery confirmed in daemon log"
+else
+    fail "prompt_async" "delivery log entry" "not found in daemon log"
+fi
+# Also check opencode serve log for Zod errors if available
+OC_SERVE_LOG="$HOME/.local/share/ouija/opencode-serve.log"
+if [ -f "$OC_SERVE_LOG" ]; then
+    zod_errors=$(grep -c "invalid_union\|invalid_type.*received undefined" "$OC_SERVE_LOG" 2>/dev/null || echo "0")
+    if [ "$zod_errors" -eq 0 ]; then
+        pass "no Zod validation errors in opencode serve log"
+    else
+        fail "Zod errors" "0 errors" "$zod_errors errors found"
+        grep "invalid_union\|invalid_type" "$OC_SERVE_LOG" | tail -3
+    fi
+fi
+
 log "Test 11: ouija session_kill cleans up opencode session"
 # Re-init MCP in case the session expired during the long wait
 mcp_init "$BASE" >/dev/null 2>&1

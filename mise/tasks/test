@@ -23,4 +23,8 @@ log "e2e: p2p (nostr + relay)"
 docker compose -f tests/e2e/docker-compose.nostr.yml up --build --abort-on-container-exit --exit-code-from tests || fail "e2e nostr"
 docker compose -f tests/e2e/docker-compose.nostr.yml down -v
 
+log "e2e: opencode integration"
+docker compose -f tests/e2e/docker-compose.opencode.yml up --build --abort-on-container-exit --exit-code-from tests || fail "e2e opencode"
+docker compose -f tests/e2e/docker-compose.opencode.yml down -v
+
 echo -e "\n${GREEN}═══ ALL TESTS PASSED ═══${NC}\n"

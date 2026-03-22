@@ -97,6 +97,8 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
                 "model": s.metadata.model,
                 "last_metadata_update": s.metadata.last_metadata_update,
                 "stale": stale,
+                "backend_session_id": s.metadata.backend_session_id,
+                "backend": s.metadata.backend,
             })
         })
         .collect();
@@ -1456,6 +1458,29 @@ pub async fn session_active(
             .await;
     }
     StatusCode::OK
+}
+
+/// Handle a readiness signal from an HttpApi session's plugin.
+/// If a prompt is queued for this session, deliver it now.
+pub async fn session_ready(
+    State(state): State<SharedState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    let pending = state.pending_prompts.lock().unwrap().remove(&session_id);
+    if let Some((pane_id, prompt)) = pending {
+        let state2 = state.clone();
+        let sid = session_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::tmux::locked_inject(&state2, &sid, &pane_id, &prompt, false).await {
+                tracing::warn!("readiness prompt delivery failed for {sid}: {e}");
+            } else {
+                tracing::info!("delivered queued prompt to {sid} via readiness signal");
+            }
+        });
+        Json(json!({"delivered": true}))
+    } else {
+        Json(json!({"delivered": false}))
+    }
 }
 
 /// List indexed projects from the configured projects directory.
