@@ -113,6 +113,9 @@ pub struct AppState {
     pub backends: crate::backend::BackendRegistry,
     pub http_client: reqwest::Client,
     pub opencode_serve: crate::backend::opencode::OpenCodeServe,
+    /// Queued prompts waiting for a readiness signal from HttpApi sessions.
+    /// Maps session_id -> (pane_id, prompt_text).
+    pub pending_prompts: std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -263,6 +266,7 @@ impl AppState {
             backends: crate::backend::BackendRegistry::default_registry(),
             http_client: reqwest::Client::new(),
             opencode_serve: crate::backend::opencode::OpenCodeServe::new(),
+            pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -295,6 +299,7 @@ impl AppState {
             backends: crate::backend::BackendRegistry::default_registry(),
             http_client: reqwest::Client::new(),
             opencode_serve: crate::backend::opencode::OpenCodeServe::new(),
+            pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 

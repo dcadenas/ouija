@@ -5,6 +5,10 @@ use anyhow::Context;
 
 use super::{CodingAssistant, DeliveryMode, InjectConfig, ResumeOpts, StartOpts};
 
+mod embedded {
+    pub const PLUGIN_TS: &str = include_str!("../../opencode-plugin/ouija.ts");
+}
+
 /// Find the opencode binary by checking common locations and PATH.
 fn which_opencode() -> Option<PathBuf> {
     // Check common install locations first (avoids spawning `which`)
@@ -267,22 +271,29 @@ impl CodingAssistant for OpenCode {
             .map(std::path::PathBuf::from)
             .map_err(|_| anyhow::anyhow!("HOME environment variable not set"))?;
 
-        let config_path = home.join(".config/opencode/opencode.json");
+        let config_dir = home.join(".config/opencode");
+        let config_path = config_dir.join("opencode.json");
+
+        // Write the plugin file
+        let plugins_dir = config_dir.join("plugins");
+        std::fs::create_dir_all(&plugins_dir)?;
+        std::fs::write(plugins_dir.join("ouija.ts"), embedded::PLUGIN_TS)?;
 
         let mut config: serde_json::Value = match std::fs::read_to_string(&config_path) {
             Ok(content) => serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({})),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(parent) = config_path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
+                std::fs::create_dir_all(&config_dir)?;
                 serde_json::json!({ "$schema": "https://opencode.ai/config.json" })
             }
             Err(e) => return Err(e.into()),
         };
 
-        let mcp = config
+        let obj = config
             .as_object_mut()
-            .ok_or_else(|| anyhow::anyhow!("opencode config is not a JSON object"))?
+            .ok_or_else(|| anyhow::anyhow!("opencode config is not a JSON object"))?;
+
+        // Add MCP config
+        let mcp = obj
             .entry("mcp")
             .or_insert_with(|| serde_json::json!({}));
 
@@ -291,6 +302,17 @@ impl CodingAssistant for OpenCode {
                 "type": "remote",
                 "url": "http://localhost:7880/mcp"
             });
+        }
+
+        // Add plugin to the plugin array (merge, don't overwrite)
+        let plugin_path = "./plugins/ouija.ts";
+        let plugins = obj
+            .entry("plugin")
+            .or_insert_with(|| serde_json::json!([]));
+        if let Some(arr) = plugins.as_array_mut() {
+            if !arr.iter().any(|v| v.as_str() == Some(plugin_path)) {
+                arr.push(serde_json::json!(plugin_path));
+            }
         }
 
         std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;

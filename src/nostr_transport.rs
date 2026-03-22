@@ -1417,7 +1417,7 @@ pub async fn start_session(
             // For HttpApi backends, use the shared opencode serve instance
             let backend_session_id =
                 if matches!(backend.delivery_mode(), crate::backend::DeliveryMode::HttpApi { .. }) {
-                    match setup_shared_serve_session(state, &pane_id, &dir).await {
+                    match setup_shared_serve_session(state, &pane_id, &dir, name).await {
                         Ok(sid) => Some(sid),
                         Err(e) => {
                             tracing::warn!("shared serve session setup failed: {e}");
@@ -1689,7 +1689,7 @@ pub async fn restart_session(
             // For HttpApi backends, use the shared opencode serve instance
             let mut backend_session_id =
                 if matches!(backend.delivery_mode(), crate::backend::DeliveryMode::HttpApi { .. }) {
-                    match setup_shared_serve_session(state, &pane_id, &dir).await {
+                    match setup_shared_serve_session(state, &pane_id, &dir, name).await {
                         Ok(sid) => Some(sid),
                         Err(e) => {
                             tracing::warn!("shared serve session setup failed: {e}");
@@ -1766,6 +1766,7 @@ async fn setup_shared_serve_session(
     state: &std::sync::Arc<AppState>,
     pane_id: &str,
     project_dir: &str,
+    ouija_session_name: &str,
 ) -> anyhow::Result<String> {
     let port = state
         .opencode_serve
@@ -1780,8 +1781,9 @@ async fn setup_shared_serve_session(
     tracing::info!("created opencode session {session_id} on shared serve (port {port})");
 
     let escaped_dir = crate::scheduler::shell_escape(project_dir);
+    let escaped_name = crate::scheduler::shell_escape(ouija_session_name);
     let attach_cmd = format!(
-        "opencode attach http://127.0.0.1:{port} --session {session_id} --dir {escaped_dir}"
+        "OUIJA_SESSION_ID={escaped_name} opencode attach http://127.0.0.1:{port} --session {session_id} --dir {escaped_dir}"
     );
     let pane = pane_id.to_string();
     tokio::task::spawn_blocking(move || {
@@ -1796,15 +1798,36 @@ async fn setup_shared_serve_session(
 }
 
 /// Inject a prompt into a pane after a short delay, giving the backend time to start.
+/// For HttpApi backends, queue the prompt and wait for a readiness signal from the plugin.
 fn schedule_prompt_injection(state: &std::sync::Arc<AppState>, session_name: &str, pane_id: String, prompt: String) {
     let session_name = session_name.to_string();
     let state = state.clone();
     tokio::spawn(async move {
-        let delay_secs = state.backend_for_session(&session_name).await.inject_config().startup_inject_delay_secs;
-        // Wait for backend to initialize in the pane
-        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-        if let Err(e) = crate::tmux::locked_inject(&state, &session_name, &pane_id, &prompt, false).await {
-            tracing::warn!("prompt injection into {pane_id} failed: {e}");
+        let backend = state.backend_for_session(&session_name).await;
+        match backend.delivery_mode() {
+            crate::backend::DeliveryMode::HttpApi { .. } => {
+                // Queue prompt — plugin's readiness signal will trigger delivery
+                state.pending_prompts.lock().unwrap()
+                    .insert(session_name.clone(), (pane_id.clone(), prompt.clone()));
+                // Fallback: deliver after 30s if no readiness signal
+                let state2 = state.clone();
+                let name = session_name.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    let pending = state2.pending_prompts.lock().unwrap().remove(&name);
+                    if let Some((pane, text)) = pending {
+                        tracing::info!("readiness timeout for {name}, delivering prompt via fallback");
+                        let _ = crate::tmux::locked_inject(&state2, &name, &pane, &text, false).await;
+                    }
+                });
+            }
+            crate::backend::DeliveryMode::TuiInjection => {
+                let delay_secs = backend.inject_config().startup_inject_delay_secs;
+                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                if let Err(e) = crate::tmux::locked_inject(&state, &session_name, &pane_id, &prompt, false).await {
+                    tracing::warn!("prompt injection into {pane_id} failed: {e}");
+                }
+            }
         }
     });
 }
