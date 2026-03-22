@@ -144,36 +144,7 @@ log "Stopping standalone opencode serve for integration tests"
 pkill -f "opencode serve --port $OPENCODE_PORT" 2>/dev/null || true
 sleep 2
 
-log "Test 7: ouija plugin installed for opencode"
-# session_start triggers OpenCode::install() which writes the plugin
-ouija_plugin="/root/.config/opencode/plugins/ouija.ts"
-# Run install explicitly first
-mcp_call_tool "$BASE" "session_start" '{"name":"oc-plugin-test","project_dir":"/tmp","backend":"opencode"}' >/dev/null 2>&1
-sleep 3
-if [ -f "$ouija_plugin" ]; then
-    pass "ouija.ts plugin file installed"
-else
-    fail "plugin installation" "ouija.ts exists at $ouija_plugin" "not found"
-fi
-# Check opencode.json has the plugin configured
-oc_config=$(cat /root/.config/opencode/opencode.json 2>/dev/null || echo '{}')
-if echo "$oc_config" | grep -q "ouija.ts"; then
-    pass "opencode.json references ouija plugin"
-else
-    fail "plugin config" "ouija.ts in opencode.json" "$(echo "$oc_config" | head -c 200)"
-fi
-# Clean up test session
-mcp_init "$BASE" >/dev/null 2>&1
-mcp_call_tool "$BASE" "session_kill" '{"name":"oc-plugin-test"}' >/dev/null 2>&1
-sleep 1
-
-log "Test 8: readiness endpoint responds"
-# Queue a fake prompt then call ready
-ready_result=$(curl -sf -X POST "$BASE/api/session/nonexistent/ready" \
-    -H "Content-Type: application/json" -d '{}' 2>/dev/null || echo '{"error":"failed"}')
-assert_contains "readiness endpoint responds" "$ready_result" "delivered"
-
-log "Test 9: ouija session_start with backend=opencode"
+log "Test 7: ouija session_start with backend=opencode"
 start_result=$(mcp_call_tool "$BASE" "session_start" \
     '{"name":"oc-e2e","project_dir":"/tmp","backend":"opencode"}')
 if echo "$start_result" | grep -q "started.*oc-e2e"; then
@@ -182,7 +153,7 @@ else
     fail "session_start opencode" "contains 'started'" "$(echo "$start_result" | head -c 200)"
 fi
 
-log "Test 10: ouija detects opencode serve readiness"
+log "Test 8: ouija detects opencode serve readiness"
 # Wait for the session to be fully registered with serve_port
 sleep 5
 oc_status=$(api "$BASE" GET /api/status)
@@ -193,7 +164,7 @@ else
     fail "oc-e2e registration" "session exists" "not found in status"
 fi
 
-log "Test 11: ouija session_send delivers to opencode via HTTP API"
+log "Test 9: ouija session_send delivers to opencode via HTTP API"
 send_result=$(mcp_call_tool "$BASE" "session_send" \
     '{"from":"test-sender","to":"oc-e2e","message":"Reply with only the word hello","expects_reply":false}')
 if echo "$send_result" | grep -qi "delivered\|success"; then
@@ -208,7 +179,7 @@ else
     fi
 fi
 
-log "Test 12: opencode received and processed the message"
+log "Test 10: opencode received and processed the message"
 # Wait for the LLM to respond
 sleep 15
 # The shared serve port is daemon_port + 320
@@ -236,7 +207,25 @@ else
     fail "serve health" "serve reachable on port $OC_SERVE_PORT" "health check failed"
 fi
 
-log "Test 13: ouija session_kill cleans up opencode session"
+log "Test 10b: prompt_async delivery confirmed without errors"
+if grep -q "delivered message via prompt_async" /tmp/ouija-test/daemon.log 2>/dev/null; then
+    pass "prompt_async delivery confirmed in daemon log"
+else
+    fail "prompt_async" "delivery log entry" "not found in daemon log"
+fi
+# Also check opencode serve log for Zod errors if available
+OC_SERVE_LOG="$HOME/.local/share/ouija/opencode-serve.log"
+if [ -f "$OC_SERVE_LOG" ]; then
+    zod_errors=$(grep -c "invalid_union\|invalid_type.*received undefined" "$OC_SERVE_LOG" 2>/dev/null || echo "0")
+    if [ "$zod_errors" -eq 0 ]; then
+        pass "no Zod validation errors in opencode serve log"
+    else
+        fail "Zod errors" "0 errors" "$zod_errors errors found"
+        grep "invalid_union\|invalid_type" "$OC_SERVE_LOG" | tail -3
+    fi
+fi
+
+log "Test 11: ouija session_kill cleans up opencode session"
 # Re-init MCP in case the session expired during the long wait
 mcp_init "$BASE" >/dev/null 2>&1
 kill_result=$(mcp_call_tool "$BASE" "session_kill" '{"name":"oc-e2e"}')

@@ -78,17 +78,11 @@ If \`session_send\` fails with "session not found", the sender disconnected. Cal
       if (event.type === "session.status" || event.type === "session.created") {
         const sid = event.properties?.sessionID || event.properties?.info?.id
         if (!sid) return
-        // Detach async work — the event handler isn't awaited by opencode
+        // Use backend-session endpoint — daemon resolves ouija name internally,
+        // avoiding the cross-process race with session registration.
         setTimeout(async () => {
           try {
-            let ouijaName = "(unknown)"
-            for (let attempt = 0; attempt < 5; attempt++) {
-              ouijaName = await resolveOuijaSessionName(sid)
-              if (ouijaName !== "(unknown)") break
-              await new Promise(r => setTimeout(r, 1000))
-            }
-            if (ouijaName === "(unknown)") return
-            await fetch(`${base}/api/session/${encodeURIComponent(ouijaName)}/ready`, {
+            await fetch(`${base}/api/backend-session/${encodeURIComponent(sid)}/ready`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({})
@@ -114,6 +108,8 @@ If \`session_send\` fails with "session not found", the sender disconnected. Cal
     "chat.message": async (input, output) => {
       try {
         const sid = await resolveOuijaSessionName(input.sessionID)
+        const messageID = output.message.id
+        const sessionID = input.sessionID
 
         const status = await fetch(`${base}/api/status`).then(r => r.json())
         const current = JSON.stringify(
@@ -142,7 +138,7 @@ If \`session_send\` fails with "session not found", the sender disconnected. Cal
           }
 
           if (lines.length) {
-            output.parts.push({ type: "text", text: lines.join("\n") })
+            output.parts.push({ type: "text", text: lines.join("\n"), id: crypto.randomUUID(), messageID, sessionID, synthetic: true })
           }
         }
 
@@ -154,7 +150,11 @@ If \`session_send\` fails with "session not found", the sender disconnected. Cal
           if (me?.stale) {
             output.parts.push({
               type: "text",
-              text: `[ouija] Your metadata is stale. Call session_update(id="${sid}", role="<what you're doing>") to stay discoverable.`
+              text: `[ouija] Your metadata is stale. Call session_update(id="${sid}", role="<what you're doing>") to stay discoverable.`,
+              id: crypto.randomUUID(),
+              messageID,
+              sessionID,
+              synthetic: true,
             })
           }
         }
