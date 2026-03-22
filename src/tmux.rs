@@ -540,14 +540,18 @@ async fn deliver_via_http(
     let async_url = format!(
         "http://127.0.0.1:{port}/session/{oc_session_id}/prompt_async"
     );
-    let mut req = client
+    // Note: do NOT send x-opencode-directory header on prompt_async.
+    // The directory header changes the Instance context, which causes a Zod
+    // validation error in opencode's SSE event publishing and kills the LLM.
+    // Without the header, the default context works and the LLM processes correctly.
+    // The TUI shows the conversation regardless since the session was created
+    // in the correct directory context during session creation.
+    let resp = client
         .post(&async_url)
         .json(&body)
-        .timeout(std::time::Duration::from_secs(10));
-    if let Some(dir) = project_dir {
-        req = req.header("x-opencode-directory", dir);
-    }
-    let resp = req.send().await;
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await;
 
     match resp {
         Ok(r) if r.status().is_success() => {
