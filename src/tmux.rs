@@ -555,7 +555,16 @@ async fn deliver_via_http(
         let result = req.send().await;
         match result {
             Ok(r) if r.status().is_success() => {
-                tracing::info!(port, "delivered message via /message (background)");
+                // MUST read the full response body — /message uses HTTP streaming.
+                // If we drop the response early, the LLM processing is cancelled.
+                match r.text().await {
+                    Ok(body) => {
+                        tracing::info!(port, body_len = body.len(), "delivered message via /message (background)");
+                    }
+                    Err(e) => {
+                        tracing::warn!("error reading /message response: {e}");
+                    }
+                }
             }
             Ok(r) => {
                 let status = r.status();
