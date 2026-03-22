@@ -154,7 +154,10 @@ impl OpenCodeServe {
     }
 
     /// Create a new opencode session on the shared serve instance.
-    pub async fn create_session(&self, client: &reqwest::Client) -> anyhow::Result<String> {
+    ///
+    /// The `project_dir` sets the Instance context (x-opencode-directory header)
+    /// so the session is scoped to the correct project.
+    pub async fn create_session(&self, client: &reqwest::Client, project_dir: &str) -> anyhow::Result<String> {
         let port = self
             .port
             .lock()
@@ -162,6 +165,7 @@ impl OpenCodeServe {
             .ok_or_else(|| anyhow::anyhow!("opencode serve not running"))?;
         let resp = client
             .post(format!("http://127.0.0.1:{port}/session"))
+            .header("x-opencode-directory", project_dir)
             .json(&serde_json::json!({}))
             .timeout(std::time::Duration::from_secs(10))
             .send()

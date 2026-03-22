@@ -1774,7 +1774,7 @@ async fn setup_shared_serve_session(
 
     let session_id = state
         .opencode_serve
-        .create_session(&state.http_client)
+        .create_session(&state.http_client, project_dir)
         .await?;
 
     tracing::info!("created opencode session {session_id} on shared serve (port {port})");
