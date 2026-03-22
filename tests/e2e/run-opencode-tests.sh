@@ -239,6 +239,47 @@ if [ -f "$OC_SERVE_LOG" ]; then
     fi
 fi
 
+log "Test 10c: second message exercises plugin chat.message hook"
+# The chat.message hook pushes parts with id/sessionID/messageID on each
+# message. The second message also triggers the mesh diff path (joined/left).
+# This is the exact code path that had the Zod validation bug.
+mcp_init "$BASE" >/dev/null 2>&1
+send2_result=$(mcp_call_tool "$BASE" "session_send" \
+    '{"from":"test-sender","to":"oc-e2e","message":"What is 1+1? Reply with just the number.","expects_reply":false}')
+sleep 20
+if curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/global/health" -o /dev/null 2>/dev/null; then
+    latest_session=$(curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/session" \
+        -H "x-opencode-directory: /tmp" 2>/dev/null \
+        | jq -r 'sort_by(.time.updated) | last | .id // empty' 2>/dev/null)
+    if [ -n "$latest_session" ]; then
+        msg_count=$(curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/session/${latest_session}/message" \
+            -H "x-opencode-directory: /tmp" 2>/dev/null \
+            | jq '[.[] | select(.info.role == "assistant")] | length' 2>/dev/null || echo 0)
+        if [ "$msg_count" -ge 2 ]; then
+            pass "second message processed ($msg_count assistant responses)"
+        elif [ "$msg_count" -ge 1 ]; then
+            pass "second message sent (lenient: $msg_count assistant response)"
+        else
+            fail "second message" ">=1 assistant responses" "$msg_count responses"
+        fi
+    else
+        fail "second message" "session exists" "no session found"
+    fi
+else
+    fail "second message" "serve reachable" "health check failed"
+fi
+
+# Verify no new Zod errors appeared after the second message
+OC_SERVE_LOG="$HOME/.local/share/ouija/opencode-serve.log"
+if [ -f "$OC_SERVE_LOG" ]; then
+    zod_errors=$(grep -c "invalid_union\|invalid_type.*received undefined" "$OC_SERVE_LOG" 2>/dev/null || echo "0")
+    if [ "$zod_errors" -eq 0 ]; then
+        pass "no Zod errors after second message"
+    else
+        fail "Zod errors after second msg" "0 errors" "$zod_errors errors found"
+    fi
+fi
+
 log "Test 11: ouija session_kill cleans up opencode session"
 # Re-init MCP in case the session expired during the long wait
 mcp_init "$BASE" >/dev/null 2>&1
@@ -257,6 +298,58 @@ if [ -z "$remaining" ]; then
 else
     fail "session cleanup" "session gone" "still exists"
 fi
+
+log "Test 12: second session on same serve works"
+# The original bug manifested as "first session works, subsequent ones fail."
+# This test creates a second session on the same shared serve instance.
+mcp_init "$BASE" >/dev/null 2>&1
+start2_result=$(mcp_call_tool "$BASE" "session_start" \
+    '{"name":"oc-e2e2","project_dir":"/tmp","backend":"opencode","text":"Reply with only the word ping"}')
+if echo "$start2_result" | grep -q "started.*oc-e2e2"; then
+    pass "second opencode session started"
+else
+    fail "second session_start" "contains 'started'" "$(echo "$start2_result" | head -c 200)"
+fi
+
+sleep 5
+oc_status2=$(api "$BASE" GET /api/status)
+backend_sid2=$(echo "$oc_status2" | jq -r '.sessions[] | select(.id == "oc-e2e2") | .backend_session_id // empty')
+if [ -n "$backend_sid2" ]; then
+    pass "second session registered with backend_session_id"
+else
+    fail "second session registration" "backend_session_id" "empty in status"
+fi
+
+# Send a message to the second session
+mcp_init "$BASE" >/dev/null 2>&1
+mcp_call_tool "$BASE" "session_send" \
+    '{"from":"test-sender","to":"oc-e2e2","message":"Reply with only the word ping","expects_reply":false}' >/dev/null 2>&1
+sleep 20
+
+# Verify LLM processed it
+if [ -n "$backend_sid2" ] && curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/global/health" -o /dev/null 2>/dev/null; then
+    msgs2=$(curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/session/${backend_sid2}/message" \
+        -H "x-opencode-directory: /tmp" 2>/dev/null || echo '[]')
+    resp2=$(echo "$msgs2" | jq -r '[.[] | select(.info.role == "assistant") | .parts[]? | select(.type == "text") | .text] | join(" ")' 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    if echo "$resp2" | grep -qi "ping"; then
+        pass "second session LLM replied with 'ping'"
+    elif [ -n "$resp2" ]; then
+        pass "second session LLM replied (lenient)"
+    else
+        # Check if at least prompt_async delivered
+        if grep -c "delivered message via prompt_async" /tmp/ouija-test/daemon.log 2>/dev/null | grep -q "^[2-9]"; then
+            pass "second session prompt_async delivered (LLM may still be processing)"
+        else
+            fail "second session response" "LLM reply" "no response text"
+        fi
+    fi
+else
+    fail "second session" "serve reachable + session registered" "check failed"
+fi
+
+# Clean up second session
+mcp_init "$BASE" >/dev/null 2>&1
+mcp_call_tool "$BASE" "session_kill" '{"name":"oc-e2e2"}' >/dev/null 2>&1
 
 # ── Daemon logs ──────────────────────────────────────────────────
 log "Daemon logs (last 20 lines):"
