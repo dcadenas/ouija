@@ -1798,16 +1798,29 @@ async fn setup_shared_serve_session(
 /// Inject a prompt into a pane after a short delay, giving the backend time to start.
 /// For HttpApi backends, queue the prompt and wait for a readiness signal from the plugin.
 fn schedule_prompt_injection(state: &std::sync::Arc<AppState>, session_name: &str, pane_id: String, prompt: String) {
+    // For HttpApi backends, queue the prompt immediately (synchronously) so the
+    // plugin's readiness signal finds it. Only the fallback timer is async.
+    // For TuiInjection, spawn the whole thing (delay + inject).
+    let backend = {
+        // Quick sync check: if session has backend="opencode" in metadata, it's HttpApi.
+        // Fall back to default (TuiInjection) if unknown.
+        let is_http = state.pending_prompts.lock().is_ok(); // always true, but we need the field to exist
+        is_http // placeholder — we need to check delivery mode without async
+    };
+    // We can't call backend_for_session (async) here synchronously.
+    // Instead, check if pending_prompts already has this session queued (it won't),
+    // or just always queue and let the inject path handle it.
+    // Simpler: always queue for all backends, let locked_inject handle delivery mode.
+    state.pending_prompts.lock().unwrap()
+        .insert(session_name.to_string(), (pane_id.clone(), prompt.clone()));
+
     let session_name = session_name.to_string();
     let state = state.clone();
     tokio::spawn(async move {
         let backend = state.backend_for_session(&session_name).await;
         match backend.delivery_mode() {
             crate::backend::DeliveryMode::HttpApi { .. } => {
-                // Queue prompt — plugin's readiness signal will trigger delivery
-                state.pending_prompts.lock().unwrap()
-                    .insert(session_name.clone(), (pane_id.clone(), prompt.clone()));
-                // Fallback: deliver after 30s if no readiness signal
+                // Prompt already queued above. Just set up fallback timer.
                 let state2 = state.clone();
                 let name = session_name.clone();
                 tokio::spawn(async move {
@@ -1820,10 +1833,14 @@ fn schedule_prompt_injection(state: &std::sync::Arc<AppState>, session_name: &st
                 });
             }
             crate::backend::DeliveryMode::TuiInjection => {
-                let delay_secs = backend.inject_config().startup_inject_delay_secs;
-                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-                if let Err(e) = crate::tmux::locked_inject(&state, &session_name, &pane_id, &prompt, false).await {
-                    tracing::warn!("prompt injection into {pane_id} failed: {e}");
+                // Remove from queue (queued above for all backends) and deliver after delay
+                let pending = state.pending_prompts.lock().unwrap().remove(&session_name);
+                if let Some((pane_id, prompt)) = pending {
+                    let delay_secs = backend.inject_config().startup_inject_delay_secs;
+                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                    if let Err(e) = crate::tmux::locked_inject(&state, &session_name, &pane_id, &prompt, false).await {
+                        tracing::warn!("prompt injection into {pane_id} failed: {e}");
+                    }
                 }
             }
         }

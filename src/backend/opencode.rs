@@ -96,8 +96,14 @@ impl OpenCodeServe {
             "--hostname",
             "127.0.0.1",
         ]);
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
+        cmd.args(["--print-logs"]);
+        // Log serve output to a file for debugging plugin issues
+        let log_path = std::env::var("HOME")
+            .map(|h| PathBuf::from(h).join(".local/share/ouija/opencode-serve.log"))
+            .unwrap_or_else(|_| PathBuf::from("/tmp/opencode-serve.log"));
+        let log_file = std::fs::File::create(&log_path).ok();
+        cmd.stdout(log_file.as_ref().map_or(std::process::Stdio::null(), |f| f.try_clone().unwrap().into()));
+        cmd.stderr(log_file.map_or(std::process::Stdio::null(), |f| f.into()));
         // Ensure PATH includes common opencode install locations
         if let Ok(path) = std::env::var("PATH") {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());

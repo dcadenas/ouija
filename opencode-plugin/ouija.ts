@@ -75,9 +75,16 @@ If \`session_send\` fails with "session not found", the sender disconnected. Cal
     event: async ({ event }) => {
       try {
         if (event.type === "session.status" || event.type === "session.created") {
-          const sid = event.properties?.sessionID
+          // session.created has properties.info.id; session.status has properties.sessionID
+          const sid = event.properties?.sessionID || event.properties?.info?.id
           if (!sid) return
-          const ouijaName = await resolveOuijaSessionName(sid)
+          // Retry resolution — ouija may still be registering the session
+          let ouijaName = "(unknown)"
+          for (let attempt = 0; attempt < 5; attempt++) {
+            ouijaName = await resolveOuijaSessionName(sid)
+            if (ouijaName !== "(unknown)") break
+            await new Promise(r => setTimeout(r, 1000))
+          }
           if (ouijaName === "(unknown)") return
           // Notify daemon the session is ready for prompt delivery
           await fetch(`${base}/api/session/${encodeURIComponent(ouijaName)}/ready`, {
