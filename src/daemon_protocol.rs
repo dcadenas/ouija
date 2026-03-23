@@ -95,12 +95,16 @@ pub struct SessionMeta {
     /// Which LLM model this session is configured to use (informational only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Reminder text re-injected on idle. Also appended to prompt at session start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reminder: Option<String>,
+    /// Original prompt from session_start, stored for loop_next re-injection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_prompt: Option<String>,
+    /// How many times loop_next has been called on this session.
     #[serde(default)]
     pub loop_iteration: u64,
+    /// Log messages from each loop_next call. Capped at 100 entries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub loop_log: Vec<LoopLogEntry>,
 }

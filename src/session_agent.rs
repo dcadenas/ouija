@@ -192,11 +192,10 @@ impl Actor for SessionAgent {
                 }
 
                 // Append pending reply info with per-message format
-                let senders: Vec<String> = pending.iter().map(|p| p.from.clone()).collect();
-                if !senders.is_empty() {
+                if !pending.is_empty() {
                     tracing::info!(
                         session = %state.session_id,
-                        count = senders.len(),
+                        count = pending.len(),
                         "reminding about unanswered pending replies"
                     );
                     for p in &pending {
