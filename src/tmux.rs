@@ -523,8 +523,8 @@ async fn deliver_via_http(
 ) -> anyhow::Result<()> {
     let port = state.opencode_serve_port();
 
-    let oc_session_id = oc_session_id
-        .ok_or_else(|| anyhow::anyhow!("no backend_session_id for session"))?;
+    let oc_session_id =
+        oc_session_id.ok_or_else(|| anyhow::anyhow!("no backend_session_id for session"))?;
 
     let client = state.http_client.clone();
     let body = serde_json::json!({
@@ -532,9 +532,7 @@ async fn deliver_via_http(
     });
 
     // Use prompt_async — returns immediately, LLM processes in background.
-    let async_url = format!(
-        "http://127.0.0.1:{port}/session/{oc_session_id}/prompt_async"
-    );
+    let async_url = format!("http://127.0.0.1:{port}/session/{oc_session_id}/prompt_async");
     let mut req = client
         .post(&async_url)
         .json(&body)

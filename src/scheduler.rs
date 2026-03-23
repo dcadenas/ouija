@@ -83,7 +83,11 @@ pub struct ScheduledTask {
     pub project_dir: Option<String>,
     #[serde(default)]
     pub once: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "claude_session_id")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "claude_session_id"
+    )]
     pub backend_session_id: Option<String>,
     #[serde(default)]
     pub on_fire: OnFire,
@@ -361,9 +365,7 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask, formatted:
 
     // Check if pane is alive
     let pane_id = pane.clone();
-    let names: Vec<String> = state
-        .backends
-        .all_process_names();
+    let names: Vec<String> = state.backends.all_process_names();
     let alive = tokio::task::spawn_blocking(move || {
         let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         tmux::pane_alive(&pane_id, &name_refs)

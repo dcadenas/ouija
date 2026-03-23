@@ -141,7 +141,11 @@ pub struct SessionMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_metadata_update: Option<DateTime<Utc>>,
     /// Coding assistant conversation/session ID (UUID) for `--resume` on restart.
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "claude_session_id")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "claude_session_id"
+    )]
     pub backend_session_id: Option<String>,
     /// Which coding assistant backend this session uses (e.g. "claude-code").
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -330,7 +334,10 @@ impl AppState {
             .and_then(|s| s.metadata.backend.as_deref())
             .map(String::from);
         match backend_name {
-            Some(name) => self.backends.get(&name).unwrap_or_else(|| self.backends.default()),
+            Some(name) => self
+                .backends
+                .get(&name)
+                .unwrap_or_else(|| self.backends.default()),
             None => self.backends.default(),
         }
     }
@@ -373,9 +380,8 @@ impl AppState {
                     message,
                     vim_mode,
                 } => {
-                    let _ =
-                        crate::tmux::locked_inject(self, session_id, pane, message, *vim_mode)
-                            .await;
+                    let _ = crate::tmux::locked_inject(self, session_id, pane, message, *vim_mode)
+                        .await;
                 }
                 Effect::SetTmuxVar { pane, value, .. } => {
                     let p = pane.clone();
@@ -865,9 +871,7 @@ impl AppState {
 
     /// Scan tmux for assistant panes, update cache, and auto-register unregistered ones.
     pub async fn scan_and_autoregister_panes(self: &Arc<Self>) {
-        let names: Vec<String> = self
-            .backends
-            .all_process_names();
+        let names: Vec<String> = self.backends.all_process_names();
         let panes = match tokio::task::spawn_blocking(move || {
             let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
             crate::tmux::find_assistant_panes(&name_refs)

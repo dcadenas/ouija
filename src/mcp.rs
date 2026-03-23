@@ -404,9 +404,7 @@ impl OuijaMcp {
             let reason = effects
                 .iter()
                 .find_map(|e| match e {
-                    crate::daemon_protocol::Effect::RenameFailed { reason } => {
-                        Some(reason.clone())
-                    }
+                    crate::daemon_protocol::Effect::RenameFailed { reason } => Some(reason.clone()),
                     _ => None,
                 })
                 .unwrap_or_else(|| format!("session '{}' not found", params.old_id));
@@ -452,20 +450,19 @@ impl OuijaMcp {
                 // Auto-start the session with the message as prompt
                 let project = &suggestions[0];
                 let project_dir = project.dir.to_string_lossy().to_string();
-                let (start_result, prompt_msg_id) =
-                    crate::nostr_transport::start_session(
-                        &self.state,
-                        &params.to,
-                        None,
-                        Some(&project_dir),
-                        None, // prompt not available (message consumed by Event::Send)
-                        Some(&params.from),
-                        Some(params.expects_reply),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
+                let (start_result, prompt_msg_id) = crate::nostr_transport::start_session(
+                    &self.state,
+                    &params.to,
+                    None,
+                    Some(&project_dir),
+                    None, // prompt not available (message consumed by Event::Send)
+                    Some(&params.from),
+                    Some(params.expects_reply),
+                    None,
+                    None,
+                    None,
+                )
+                .await;
                 if start_result.starts_with("started ") {
                     // Track pending reply like session_start does
                     if params.expects_reply {
@@ -780,17 +777,20 @@ impl OuijaMcp {
         let from = params.from.clone();
         let expects_reply = params.expects_reply;
         let (result, prompt_msg_id) = if params.name.contains('/') {
-            (execute_session_start(
-                &self.state,
-                &params.name,
-                params.worktree,
-                params.project_dir.as_deref(),
-                params.prompt.as_deref(),
-                params.from.as_deref(),
-                params.expects_reply,
-                params.reminder.as_deref(),
+            (
+                execute_session_start(
+                    &self.state,
+                    &params.name,
+                    params.worktree,
+                    params.project_dir.as_deref(),
+                    params.prompt.as_deref(),
+                    params.from.as_deref(),
+                    params.expects_reply,
+                    params.reminder.as_deref(),
+                )
+                .await,
+                None,
             )
-            .await, None)
         } else {
             crate::nostr_transport::start_session(
                 &self.state,
@@ -829,16 +829,19 @@ impl OuijaMcp {
         let from = params.from.clone();
         let expects_reply = params.expects_reply;
         let (result, prompt_msg_id) = if params.name.contains('/') {
-            (execute_session_restart(
-                &self.state,
-                &params.name,
-                fresh,
-                params.prompt.as_deref(),
-                params.from.as_deref(),
-                params.expects_reply,
-                params.reminder.as_deref(),
+            (
+                execute_session_restart(
+                    &self.state,
+                    &params.name,
+                    fresh,
+                    params.prompt.as_deref(),
+                    params.from.as_deref(),
+                    params.expects_reply,
+                    params.reminder.as_deref(),
+                )
+                .await,
+                None,
             )
-            .await, None)
         } else {
             crate::nostr_transport::restart_session(
                 &self.state,
@@ -884,9 +887,10 @@ impl OuijaMcp {
         };
 
         let Some(meta) = meta else {
-            return Ok(CallToolResult::success(vec![Content::text(
-                format!("session '{}' not found", session_id),
-            )]));
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "session '{}' not found",
+                session_id
+            ))]));
         };
 
         let Some(ref original_prompt) = meta.original_prompt else {
@@ -953,9 +957,10 @@ impl OuijaMcp {
             .await;
         });
 
-        Ok(CallToolResult::success(vec![Content::text(
-            format!("loop_next: restarting session '{}' (iteration {})", session_id, iteration),
-        )]))
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "loop_next: restarting session '{}' (iteration {})",
+            session_id, iteration
+        ))]))
     }
 }
 
@@ -1297,9 +1302,7 @@ async fn append_staleness_hint(state: &AppState, sender_id: &str, contents: &mut
 /// isn't already registered. Falls back to `None` if zero or multiple
 /// candidates exist (ambiguous).
 async fn find_unregistered_pane(state: &AppState) -> Option<String> {
-    let names: Vec<String> = state
-        .backends
-        .all_process_names();
+    let names: Vec<String> = state.backends.all_process_names();
     let assistant_panes = tokio::task::spawn_blocking(move || {
         let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         tmux::find_assistant_panes(&name_refs)

@@ -79,7 +79,11 @@ pub struct SessionMeta {
     pub networked: bool,
     pub worktree: bool,
     pub vim_mode: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "claude_session_id")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "claude_session_id"
+    )]
     pub backend_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
@@ -3156,8 +3160,17 @@ mod stateright_model {
         Register(String),
         Remove(String),
         Rename(String, String),
-        Send { from: String, to: String, expects_reply: bool },
-        Reply { from: String, to: String, msg_id: u64, done: bool },
+        Send {
+            from: String,
+            to: String,
+            expects_reply: bool,
+        },
+        Reply {
+            from: String,
+            to: String,
+            msg_id: u64,
+            done: bool,
+        },
     }
 
     // -- Actor & State -------------------------------------------------------
@@ -3184,15 +3197,25 @@ mod stateright_model {
             prev_pending_reply_counts: BTreeMap<String, usize>,
             last_event_type: LastEvent,
         },
-        Driver { actions_taken: u8 },
+        Driver {
+            actions_taken: u8,
+        },
     }
 
     const MAX_DRIVER_ACTIONS: u8 = 2;
 
     #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
     enum SendOutcome {
-        Delivered { from: String, to: String, msg_id: u64 },
-        Failed { from: String, to: String, renamed_to: Option<String> },
+        Delivered {
+            from: String,
+            to: String,
+            msg_id: u64,
+        },
+        Failed {
+            from: String,
+            to: String,
+            renamed_to: Option<String>,
+        },
     }
 
     #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -3216,7 +3239,10 @@ mod stateright_model {
                     daemon_name,
                     peers,
                 } => ModelState::Daemon {
-                    ds: Box::new(DaemonState::new_for_model(daemon_id.clone(), daemon_name.clone())),
+                    ds: Box::new(DaemonState::new_for_model(
+                        daemon_id.clone(),
+                        daemon_name.clone(),
+                    )),
                     peers: peers.clone(),
                     last_send_result: None,
                     pending_reply_counts: BTreeMap::new(),
@@ -3273,9 +3299,7 @@ mod stateright_model {
                             },
                         },
                         ModelMsg::Remove { id } => Event::Remove { id },
-                        ModelMsg::Rename { old_id, new_id } => {
-                            Event::Rename { old_id, new_id }
-                        }
+                        ModelMsg::Rename { old_id, new_id } => Event::Rename { old_id, new_id },
                         ModelMsg::WireAnnounce {
                             id,
                             daemon_id,
@@ -3300,10 +3324,7 @@ mod stateright_model {
                             msg: WireMessage::SessionList {
                                 sessions: sessions
                                     .into_iter()
-                                    .map(|id| SessionInfo {
-                                        id,
-                                        metadata: None,
-                                    })
+                                    .map(|id| SessionInfo { id, metadata: None })
                                     .collect(),
                                 daemon_id,
                                 daemon_name,
@@ -3369,11 +3390,7 @@ mod stateright_model {
                     let effects = ds.apply(event);
                     normalize_timestamps(ds);
                     *last_send_result = extract_send_outcome(&effects);
-                    update_pending_tracking(
-                        ds,
-                        prev_pending_reply_counts,
-                        pending_reply_counts,
-                    );
+                    update_pending_tracking(ds, prev_pending_reply_counts, pending_reply_counts);
                     *last_event_type = LastEvent::Other;
                     route_effects(ds, &effects, peers, o);
                 }
@@ -3396,11 +3413,7 @@ mod stateright_model {
                     let effects = ds.apply(event);
                     normalize_timestamps(ds);
                     *last_send_result = extract_send_outcome(&effects);
-                    update_pending_tracking(
-                        ds,
-                        prev_pending_reply_counts,
-                        pending_reply_counts,
-                    );
+                    update_pending_tracking(ds, prev_pending_reply_counts, pending_reply_counts);
                     *last_event_type = if done {
                         LastEvent::ReplyDone
                     } else {
@@ -3434,11 +3447,7 @@ mod stateright_model {
                     let effects = ds.apply(event);
                     normalize_timestamps(ds);
                     *last_send_result = None; // receiving side, clear stale result
-                    update_pending_tracking(
-                        ds,
-                        prev_pending_reply_counts,
-                        pending_reply_counts,
-                    );
+                    update_pending_tracking(ds, prev_pending_reply_counts, pending_reply_counts);
                     *last_event_type = LastEvent::Other;
                     route_effects(ds, &effects, peers, o);
                 }
@@ -3555,12 +3564,7 @@ mod stateright_model {
         }
     }
 
-    fn route_effects(
-        ds: &DaemonState,
-        effects: &[Effect],
-        peers: &[Id],
-        o: &mut Out<ModelActor>,
-    ) {
+    fn route_effects(ds: &DaemonState, effects: &[Effect], peers: &[Id], o: &mut Out<ModelActor>) {
         for effect in effects {
             match effect {
                 Effect::Broadcast(wire_msg) => {
@@ -3574,9 +3578,7 @@ mod stateright_model {
                     let session_ids: BTreeSet<String> = ds
                         .sessions
                         .values()
-                        .filter(|s| {
-                            matches!(s.origin, Origin::Local) && s.metadata.networked
-                        })
+                        .filter(|s| matches!(s.origin, Origin::Local) && s.metadata.networked)
                         .map(|s| s.id.clone())
                         .collect();
                     let msg = ModelMsg::WireList {
@@ -4018,10 +4020,7 @@ mod stateright_model {
             {
                 if matches!(last_event_type, LastEvent::ReplyProgress) {
                     for (session, &count) in pending_reply_counts {
-                        let prev = prev_pending_reply_counts
-                            .get(session)
-                            .copied()
-                            .unwrap_or(0);
+                        let prev = prev_pending_reply_counts.get(session).copied().unwrap_or(0);
                         if count < prev {
                             return false;
                         }
@@ -4042,18 +4041,13 @@ mod stateright_model {
         for ds_state in &state.actor_states {
             if let ModelState::Daemon {
                 ds,
-                last_send_result:
-                    Some(SendOutcome::Failed {
-                        to, renamed_to, ..
-                    }),
+                last_send_result: Some(SendOutcome::Failed { to, renamed_to, .. }),
                 ..
             } = ds_state.as_ref()
             {
                 // resolve_alias returns Some only when the alias target
                 // exists in sessions — matching exactly what apply_send does.
-                if ds.resolve_alias(to.as_str()).is_some()
-                    && renamed_to.is_none()
-                {
+                if ds.resolve_alias(to.as_str()).is_some() && renamed_to.is_none() {
                     return false;
                 }
             }
@@ -4110,9 +4104,10 @@ mod stateright_model {
             if let Some(SendOutcome::Delivered { to, .. }) = send_result {
                 for (j, ds) in all_ds.iter().enumerate() {
                     if i != j
-                        && ds.sessions.values().any(|s| {
-                            matches!(s.origin, Origin::Local) && s.id == *to
-                        })
+                        && ds
+                            .sessions
+                            .values()
+                            .any(|s| matches!(s.origin, Origin::Local) && s.id == *to)
                     {
                         return true;
                     }

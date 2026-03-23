@@ -40,7 +40,9 @@ impl CodingAssistant for OpenCode {
     fn build_resume_command(&self, opts: &ResumeOpts) -> Option<String> {
         // Resume is handled via HTTP API on the shared serve
         let escaped_dir = crate::scheduler::shell_escape(&opts.project_dir);
-        Some(format!("cd {escaped_dir} && echo 'waiting for opencode attach...'"))
+        Some(format!(
+            "cd {escaped_dir} && echo 'waiting for opencode attach...'"
+        ))
     }
 
     fn detect_session_id(&self, _project_dir: &str) -> Option<String> {
@@ -103,9 +105,7 @@ impl CodingAssistant for OpenCode {
             .ok_or_else(|| anyhow::anyhow!("opencode config is not a JSON object"))?;
 
         // Add MCP config
-        let mcp = obj
-            .entry("mcp")
-            .or_insert_with(|| serde_json::json!({}));
+        let mcp = obj.entry("mcp").or_insert_with(|| serde_json::json!({}));
 
         if mcp.get("ouija").is_none() {
             mcp["ouija"] = serde_json::json!({
@@ -117,9 +117,7 @@ impl CodingAssistant for OpenCode {
         // Add plugin to the plugin array (merge, don't overwrite)
         let plugin_file = plugins_dir.join("ouija.ts");
         let plugin_path = format!("file://{}", plugin_file.display());
-        let plugins = obj
-            .entry("plugin")
-            .or_insert_with(|| serde_json::json!([]));
+        let plugins = obj.entry("plugin").or_insert_with(|| serde_json::json!([]));
         if let Some(arr) = plugins.as_array_mut() {
             // Remove old relative-path entry if present
             arr.retain(|v| v.as_str() != Some("./plugins/ouija.ts"));

@@ -732,14 +732,30 @@ pub async fn inject(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let session_id = {
         let proto = state.protocol.read().await;
-        match proto.sessions.values()
+        match proto
+            .sessions
+            .values()
             .find(|s| s.pane.as_deref() == Some(&body.pane))
-            .map(|s| s.id.clone()) {
+            .map(|s| s.id.clone())
+        {
             Some(id) => id,
-            None => return (StatusCode::BAD_REQUEST, Json(json!({"error": "no session registered for this pane"}))),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "no session registered for this pane"})),
+                );
+            }
         }
     };
-    match tmux::locked_inject(&state, &session_id, &body.pane, &body.message, body.vim_mode).await {
+    match tmux::locked_inject(
+        &state,
+        &session_id,
+        &body.pane,
+        &body.message,
+        body.vim_mode,
+    )
+    .await
+    {
         Ok(()) => (StatusCode::OK, Json(json!({ "status": "injected" }))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1475,20 +1491,14 @@ pub async fn session_active(
 
 /// Deliver a pending prompt for the given session, if one is queued.
 fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool {
-    let pending = state
-        .pending_prompts
-        .lock()
-        .unwrap()
-        .remove(session_name);
+    let pending = state.pending_prompts.lock().unwrap().remove(session_name);
     let Some((pane_id, prompt)) = pending else {
         return false;
     };
     let state = state.clone();
     let sid = session_name.to_string();
     tokio::spawn(async move {
-        if let Err(e) =
-            crate::tmux::locked_inject(&state, &sid, &pane_id, &prompt, false).await
-        {
+        if let Err(e) = crate::tmux::locked_inject(&state, &sid, &pane_id, &prompt, false).await {
             tracing::warn!("readiness prompt delivery failed for {sid}: {e}");
         } else {
             tracing::info!("delivered queued prompt to {sid} via readiness signal");
@@ -1521,7 +1531,9 @@ pub async fn backend_session_ready(
             .map(|s| s.id.clone())
     };
     let Some(name) = session_name else {
-        return Json(json!({"delivered": false, "error": "no session with this backend_session_id"}));
+        return Json(
+            json!({"delivered": false, "error": "no session with this backend_session_id"}),
+        );
     };
     let delivered = deliver_pending_prompt(&state, &name);
     Json(json!({"delivered": delivered, "session": name}))

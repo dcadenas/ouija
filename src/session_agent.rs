@@ -200,10 +200,7 @@ impl Actor for SessionAgent {
                         "reminding about unanswered pending replies"
                     );
                     for p in &pending {
-                        let msg = format!(
-                            "Pending reply owed: msg #{} from {}",
-                            p.msg_id, p.from
-                        );
+                        let msg = format!("Pending reply owed: msg #{} from {}", p.msg_id, p.from);
                         let _ = crate::tmux::locked_inject(
                             &self.app_state,
                             &state.session_id,
@@ -245,8 +242,14 @@ impl SessionAgent {
         for from in senders {
             let reminder =
                 format!("You have an unanswered question from {from} — reply using session_send");
-            let _ =
-                crate::tmux::locked_inject(&self.app_state, &state.session_id, &state.pane, &reminder, vim_mode).await;
+            let _ = crate::tmux::locked_inject(
+                &self.app_state,
+                &state.session_id,
+                &state.pane,
+                &reminder,
+                vim_mode,
+            )
+            .await;
         }
     }
 }

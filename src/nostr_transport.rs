@@ -595,10 +595,8 @@ async fn handle_human_message(
                     .await;
 
                 let (sessions, messages) = crate::router::gather_context(state, human_name).await;
-                match crate::router::classify(
-                    config, &message, &sessions, &messages, human_name,
-                )
-                .await
+                match crate::router::classify(config, &message, &sessions, &messages, human_name)
+                    .await
                 {
                     Ok(Some(crate::router::RouterDecision::Route { targets })) => {
                         let valid_targets: Vec<String> = {
@@ -822,8 +820,7 @@ async fn format_help_message(state: &AppState, human_name: &str) -> String {
     lines.push("  /kill <session>    — kill a session".to_string());
     lines.push("  /start <name>      — start new session".to_string());
     lines.push(
-        "  /restart <name> [--fresh]  — restart a session (--fresh: no prior context)"
-            .to_string(),
+        "  /restart <name> [--fresh]  — restart a session (--fresh: no prior context)".to_string(),
     );
     lines.push("  /connect <ticket>  — connect to peer".to_string());
     lines.push("  /nodes             — list connected nodes".to_string());
@@ -954,9 +951,10 @@ async fn route_human_message(state: &AppState, from: &str, to: &str, message: &s
                         from, message, true, msg_id, None, false,
                     );
                     let vim_mode = session.metadata.vim_mode;
-                    let delivered = crate::tmux::locked_inject(state, to, pane, &formatted, vim_mode)
-                        .await
-                        .is_ok();
+                    let delivered =
+                        crate::tmux::locked_inject(state, to, pane, &formatted, vim_mode)
+                            .await
+                            .is_ok();
                     state
                         .log_message(
                             from.to_string(),
@@ -1108,7 +1106,9 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         kill_session(state, name).await
     } else if let Some(rest) = cmd.strip_prefix("/start ") {
         let name = rest.trim();
-        start_session(state, name, None, None, None, None, None, None, None, None).await.0
+        start_session(state, name, None, None, None, None, None, None, None, None)
+            .await
+            .0
     } else if let Some(rest) = cmd.strip_prefix("/restart ") {
         let rest = rest.trim();
         let (name, fresh) = if let Some(name) = rest.strip_suffix(" --fresh") {
@@ -1118,7 +1118,9 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         } else {
             (rest, false)
         };
-        restart_session(state, name, fresh, None, None, None, None, None, None).await.0
+        restart_session(state, name, fresh, None, None, None, None, None, None)
+            .await
+            .0
     } else {
         "unknown command".to_string()
     }
@@ -1140,7 +1142,11 @@ pub async fn kill_session(state: &std::sync::Arc<AppState>, name: &str) -> Strin
     // Get the pane's PID and find the backend process
     let pane = pane.clone();
     let backend = state.backend_for_session(name).await;
-    let process_names: Vec<String> = backend.process_names().iter().map(|s| s.to_string()).collect();
+    let process_names: Vec<String> = backend
+        .process_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let exit_cmd = backend.exit_command().map(String::from);
     let cli_name = backend.cli_name().to_string();
     let kill_result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
@@ -1180,7 +1186,10 @@ pub async fn kill_session(state: &std::sync::Arc<AppState>, name: &str) -> Strin
         let mut stack = vec![pane_pid];
         let mut backend_pid = None;
         while let Some(pid) = stack.pop() {
-            if names.get(&pid).is_some_and(|n| process_names.iter().any(|pn| pn == n)) {
+            if names
+                .get(&pid)
+                .is_some_and(|n| process_names.iter().any(|pn| pn == n))
+            {
                 backend_pid = Some(pid);
                 break;
             }
@@ -1305,7 +1314,9 @@ pub async fn start_session(
                     && s.metadata.project_dir.as_deref() == Some(dir.as_str())
             });
             if conflict && !is_git_repo {
-                tracing::warn!("directory conflict for {dir} but not a git repo, skipping auto-worktree");
+                tracing::warn!(
+                    "directory conflict for {dir} but not a git repo, skipping auto-worktree"
+                );
             }
             let auto = conflict && is_git_repo;
             (auto, auto)
@@ -1325,7 +1336,10 @@ pub async fn start_session(
         None
     };
     let backend = match backend {
-        Some(b) => state.backends.get(b).unwrap_or_else(|| state.backends.default()),
+        Some(b) => state
+            .backends
+            .get(b)
+            .unwrap_or_else(|| state.backends.default()),
         None => state.backends.default(),
     };
     let backend_name = backend.name().to_string();
@@ -1416,18 +1430,20 @@ pub async fn start_session(
     match start_result {
         Ok(Ok(pane_id)) => {
             // For HttpApi backends, use the shared opencode serve instance
-            let backend_session_id =
-                if matches!(backend.delivery_mode(), crate::backend::DeliveryMode::HttpApi { .. }) {
-                    match setup_shared_serve_session(state, &pane_id, &dir).await {
-                        Ok(sid) => Some(sid),
-                        Err(e) => {
-                            tracing::warn!("shared serve session setup failed: {e}");
-                            None
-                        }
+            let backend_session_id = if matches!(
+                backend.delivery_mode(),
+                crate::backend::DeliveryMode::HttpApi { .. }
+            ) {
+                match setup_shared_serve_session(state, &pane_id, &dir).await {
+                    Ok(sid) => Some(sid),
+                    Err(e) => {
+                        tracing::warn!("shared serve session setup failed: {e}");
+                        None
                     }
-                } else {
-                    None
-                };
+                }
+            } else {
+                None
+            };
 
             let proto_meta = crate::daemon_protocol::SessionMeta {
                 project_dir: Some(dir.clone()),
@@ -1459,7 +1475,9 @@ pub async fn start_session(
                         proto.next_seq()
                     };
                     prompt_msg_id = Some(msg_id);
-                    crate::daemon_protocol::format_session_message(sender, &full_text, er, msg_id, None, false)
+                    crate::daemon_protocol::format_session_message(
+                        sender, &full_text, er, msg_id, None, false,
+                    )
                 } else {
                     full_text
                 };
@@ -1477,11 +1495,17 @@ pub async fn start_session(
                         .map(|s| s.id.clone())
                         .unwrap_or_default()
                 };
-                (format!(
-                    "started '{name}' in {dir} (pane {pane_id}, worktree: auto-enabled — session '{conflict_name}' shares this directory)"
-                ), prompt_msg_id)
+                (
+                    format!(
+                        "started '{name}' in {dir} (pane {pane_id}, worktree: auto-enabled — session '{conflict_name}' shares this directory)"
+                    ),
+                    prompt_msg_id,
+                )
             } else {
-                (format!("started '{name}' in {dir} (pane {pane_id})"), prompt_msg_id)
+                (
+                    format!("started '{name}' in {dir} (pane {pane_id})"),
+                    prompt_msg_id,
+                )
             }
         }
         Ok(Err(e)) => (format!("start failed: {e}"), None),
@@ -1535,12 +1559,18 @@ pub async fn restart_session(
     }
 
     let backend = match backend {
-        Some(b) => state.backends.get(b).unwrap_or_else(|| state.backends.default()),
+        Some(b) => state
+            .backends
+            .get(b)
+            .unwrap_or_else(|| state.backends.default()),
         None => {
             // Fall back to the existing session's backend
             let prev_backend = prev_metadata.as_ref().and_then(|m| m.backend.as_deref());
             match prev_backend {
-                Some(b) => state.backends.get(b).unwrap_or_else(|| state.backends.default()),
+                Some(b) => state
+                    .backends
+                    .get(b)
+                    .unwrap_or_else(|| state.backends.default()),
                 None => state.backends.default(),
             }
         }
@@ -1571,19 +1601,26 @@ pub async fn restart_session(
             worktree: worktree_mode,
         })
     } else {
-        backend.build_resume_command(&crate::backend::ResumeOpts {
-            project_dir: dir.clone(),
-            session_id: resume_id,
-            worktree: worktree_mode,
-        }).unwrap_or_else(|| backend.build_start_command(&crate::backend::StartOpts {
-            project_dir: dir.clone(),
-            worktree: None,
-        }))
+        backend
+            .build_resume_command(&crate::backend::ResumeOpts {
+                project_dir: dir.clone(),
+                session_id: resume_id,
+                worktree: worktree_mode,
+            })
+            .unwrap_or_else(|| {
+                backend.build_start_command(&crate::backend::StartOpts {
+                    project_dir: dir.clone(),
+                    worktree: None,
+                })
+            })
     };
 
     let tmux_session = crate::tmux::tmux_session_name(&dir);
     let window_name = name.to_string();
-    let is_http_api = matches!(backend.delivery_mode(), crate::backend::DeliveryMode::HttpApi { .. });
+    let is_http_api = matches!(
+        backend.delivery_mode(),
+        crate::backend::DeliveryMode::HttpApi { .. }
+    );
     let start_result = tokio::task::spawn_blocking({
         let window_name = window_name.clone();
         let tmux_session = tmux_session.clone();
@@ -1695,18 +1732,20 @@ pub async fn restart_session(
     match start_result {
         Ok(Ok(pane_id)) => {
             // For HttpApi backends, use the shared opencode serve instance
-            let mut backend_session_id =
-                if matches!(backend.delivery_mode(), crate::backend::DeliveryMode::HttpApi { .. }) {
-                    match setup_shared_serve_session(state, &pane_id, &dir).await {
-                        Ok(sid) => Some(sid),
-                        Err(e) => {
-                            tracing::warn!("shared serve session setup failed: {e}");
-                            None
-                        }
+            let mut backend_session_id = if matches!(
+                backend.delivery_mode(),
+                crate::backend::DeliveryMode::HttpApi { .. }
+            ) {
+                match setup_shared_serve_session(state, &pane_id, &dir).await {
+                    Ok(sid) => Some(sid),
+                    Err(e) => {
+                        tracing::warn!("shared serve session setup failed: {e}");
+                        None
                     }
-                } else {
-                    None
-                };
+                }
+            } else {
+                None
+            };
 
             // Fall back to the previous session ID when not fresh,
             // but only if the serve is reachable (the old ID may be stale
@@ -1715,10 +1754,10 @@ pub async fn restart_session(
                 if let Some(ref prev) = prev_metadata {
                     if let Some(ref prev_sid) = prev.backend_session_id {
                         let port = state.opencode_serve_port();
-                        let check_url = format!(
-                            "http://127.0.0.1:{port}/session/{prev_sid}"
-                        );
-                        match state.http_client.get(&check_url)
+                        let check_url = format!("http://127.0.0.1:{port}/session/{prev_sid}");
+                        match state
+                            .http_client
+                            .get(&check_url)
                             .timeout(std::time::Duration::from_secs(2))
                             .send()
                             .await
@@ -1750,7 +1789,10 @@ pub async fn restart_session(
                     last_metadata_update: None,
                     model: model.map(String::from).or_else(|| m.model.clone()),
                     reminder: reminder.map(String::from).or_else(|| m.reminder.clone()),
-                    original_prompt: m.original_prompt.clone().or_else(|| prompt.map(String::from)),
+                    original_prompt: m
+                        .original_prompt
+                        .clone()
+                        .or_else(|| prompt.map(String::from)),
                     loop_iteration: m.loop_iteration,
                     loop_log: m.loop_log.clone(),
                 },
@@ -1784,13 +1826,18 @@ pub async fn restart_session(
                         proto.next_seq()
                     };
                     prompt_msg_id = Some(msg_id);
-                    crate::daemon_protocol::format_session_message(sender, &full_text, er, msg_id, None, false)
+                    crate::daemon_protocol::format_session_message(
+                        sender, &full_text, er, msg_id, None, false,
+                    )
                 } else {
                     full_text
                 };
                 schedule_prompt_injection(state, name, pane_id.clone(), injected);
             }
-            (format!("restarted '{name}' in {dir} (pane {pane_id})"), prompt_msg_id)
+            (
+                format!("restarted '{name}' in {dir} (pane {pane_id})"),
+                prompt_msg_id,
+            )
         }
         Ok(Err(e)) => (format!("restart failed: {e}"), None),
         Err(e) => (format!("restart failed: {e}"), None),
@@ -1861,11 +1908,19 @@ async fn setup_shared_serve_session(
 
 /// Inject a prompt into a pane after a short delay, giving the backend time to start.
 /// For HttpApi backends, queue the prompt and wait for a readiness signal from the plugin.
-fn schedule_prompt_injection(state: &std::sync::Arc<AppState>, session_name: &str, pane_id: String, prompt: String) {
+fn schedule_prompt_injection(
+    state: &std::sync::Arc<AppState>,
+    session_name: &str,
+    pane_id: String,
+    prompt: String,
+) {
     // Queue prompt synchronously so the plugin's readiness signal finds it.
     // The spawned task determines delivery mode and either waits for the
     // readiness signal (HttpApi) or delivers after a delay (TuiInjection).
-    state.pending_prompts.lock().unwrap()
+    state
+        .pending_prompts
+        .lock()
+        .unwrap()
         .insert(session_name.to_string(), (pane_id.clone(), prompt.clone()));
 
     let session_name = session_name.to_string();
@@ -1881,8 +1936,11 @@ fn schedule_prompt_injection(state: &std::sync::Arc<AppState>, session_name: &st
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                     let pending = state2.pending_prompts.lock().unwrap().remove(&name);
                     if let Some((pane, text)) = pending {
-                        tracing::info!("readiness timeout for {name}, delivering prompt via fallback");
-                        let _ = crate::tmux::locked_inject(&state2, &name, &pane, &text, false).await;
+                        tracing::info!(
+                            "readiness timeout for {name}, delivering prompt via fallback"
+                        );
+                        let _ =
+                            crate::tmux::locked_inject(&state2, &name, &pane, &text, false).await;
                     }
                 });
             }
@@ -1892,7 +1950,10 @@ fn schedule_prompt_injection(state: &std::sync::Arc<AppState>, session_name: &st
                 if let Some((pane_id, prompt)) = pending {
                     let delay_secs = backend.inject_config().startup_inject_delay_secs;
                     tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-                    if let Err(e) = crate::tmux::locked_inject(&state, &session_name, &pane_id, &prompt, false).await {
+                    if let Err(e) =
+                        crate::tmux::locked_inject(&state, &session_name, &pane_id, &prompt, false)
+                            .await
+                    {
                         tracing::warn!("prompt injection into {pane_id} failed: {e}");
                     }
                 }
