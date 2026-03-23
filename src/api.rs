@@ -1516,25 +1516,61 @@ pub async fn session_ready(
     Json(json!({"delivered": delivered}))
 }
 
+#[derive(serde::Deserialize, Default)]
+pub struct ReadyBody {
+    pane: Option<String>,
+}
+
 /// Handle a readiness signal keyed by opencode backend session ID.
 /// Resolves the ouija session name internally, avoiding plugin-side race conditions.
+/// Falls back to pane-based lookup when the backend_session_id is unknown (soft restart).
 pub async fn backend_session_ready(
     State(state): State<SharedState>,
     axum::extract::Path(backend_sid): axum::extract::Path<String>,
+    body: Option<axum::extract::Json<ReadyBody>>,
 ) -> Json<serde_json::Value> {
+    let pane = body.and_then(|b| b.0.pane);
+
     let session_name = {
         let proto = state.protocol.read().await;
+        // Primary: lookup by backend_session_id
         proto
             .sessions
             .values()
             .find(|s| s.metadata.backend_session_id.as_deref() == Some(&backend_sid))
             .map(|s| s.id.clone())
+            // Fallback: lookup by pane (for soft restart — new session ID not yet stored)
+            .or_else(|| {
+                pane.as_ref().and_then(|p| {
+                    proto
+                        .sessions
+                        .values()
+                        .find(|s| s.pane.as_deref() == Some(p.as_str()))
+                        .map(|s| s.id.clone())
+                })
+            })
     };
+
     let Some(name) = session_name else {
         return Json(
-            json!({"delivered": false, "error": "no session with this backend_session_id"}),
+            json!({"delivered": false, "error": "no session with this backend_session_id or pane"}),
         );
     };
+
+    // Update backend_session_id if it changed (soft restart case)
+    {
+        let mut proto = state.protocol.write().await;
+        if let Some(session) = proto.sessions.get_mut(&name) {
+            if session.metadata.backend_session_id.as_deref() != Some(&backend_sid) {
+                tracing::info!(
+                    "readiness: updating backend_session_id for '{name}' to {backend_sid} (pane fallback)"
+                );
+                session.metadata.backend_session_id = Some(backend_sid.clone());
+            }
+        }
+        state.persist_protocol_state(&proto);
+    }
+
     let delivered = deliver_pending_prompt(&state, &name);
     Json(json!({"delivered": delivered, "session": name}))
 }
