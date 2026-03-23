@@ -158,32 +158,61 @@ impl Actor for SessionAgent {
                 state.idle_timer = None;
                 state.idle = true;
 
-                // Read pending replies from DaemonState
-                let pending = self
-                    .app_state
-                    .protocol
-                    .read()
-                    .await
-                    .pending_replies
-                    .get(&state.session_id)
-                    .cloned()
-                    .unwrap_or_default();
+                // Read session metadata in one lock
+                let (reminder, vim_mode, pending) = {
+                    let proto = self.app_state.protocol.read().await;
+                    let session = proto.sessions.get(&state.session_id);
+                    let reminder = session.and_then(|s| s.metadata.reminder.clone());
+                    let vim_mode = session.map(|s| s.metadata.vim_mode).unwrap_or(false);
+                    let pending = proto
+                        .pending_replies
+                        .get(&state.session_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    (reminder, vim_mode, pending)
+                };
 
                 tracing::debug!(
                     session = %state.session_id,
                     pending = pending.len(),
+                    has_reminder = reminder.is_some(),
                     "idle timeout fired"
                 );
 
-                let senders: Vec<String> = pending.iter().map(|p| p.from.clone()).collect();
+                // Inject reminder text if present (fires even without pending replies)
+                if let Some(ref reminder_text) = reminder {
+                    let _ = crate::tmux::locked_inject(
+                        &self.app_state,
+                        &state.session_id,
+                        &state.pane,
+                        reminder_text,
+                        vim_mode,
+                    )
+                    .await;
+                }
 
+                // Append pending reply info with per-message format
+                let senders: Vec<String> = pending.iter().map(|p| p.from.clone()).collect();
                 if !senders.is_empty() {
                     tracing::info!(
                         session = %state.session_id,
                         count = senders.len(),
                         "reminding about unanswered pending replies"
                     );
-                    self.send_reminders(&senders, state).await;
+                    for p in &pending {
+                        let msg = format!(
+                            "Pending reply owed: msg #{} from {}",
+                            p.msg_id, p.from
+                        );
+                        let _ = crate::tmux::locked_inject(
+                            &self.app_state,
+                            &state.session_id,
+                            &state.pane,
+                            &msg,
+                            vim_mode,
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -289,5 +318,37 @@ mod tests {
         assert!(meta.original_prompt.is_none());
         assert_eq!(meta.loop_iteration, 0);
         assert!(meta.loop_log.is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_injects_reminder_on_idle_without_pending_replies() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "test-reminder".into(),
+                pane: Some("%99".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    reminder: Some("call loop_next when done".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let agent = SessionAgent {
+            app_state: state.clone(),
+        };
+        let args = SessionAgentArgs {
+            session_id: "test-reminder".into(),
+            pane: "%99".into(),
+        };
+        state.settings.write().await.idle_timeout_secs = 1;
+
+        let (actor, handle) = Actor::spawn(None, agent, args).await.expect("spawn failed");
+        actor.cast(SessionMsg::Stopped).expect("send");
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        assert!(!handle.is_finished());
+        actor.stop(None);
+        handle.await.expect("actor failed");
     }
 }
