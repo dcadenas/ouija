@@ -1741,6 +1741,7 @@ pub async fn restart_session(
                     project_description: m.project_description.clone(),
                     last_metadata_update: None,
                     model: model.map(String::from).or_else(|| m.model.clone()),
+                    ..Default::default()
                 },
                 None => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),

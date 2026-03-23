@@ -61,6 +61,15 @@ impl Origin {
     }
 }
 
+/// A single iteration log entry from a loop_next call.
+/// Uses i64 timestamp (not DateTime<Utc>) because DaemonState requires Hash+Eq.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct LoopLogEntry {
+    pub iteration: u64,
+    pub message: Option<String>,
+    pub timestamp: i64,
+}
+
 /// Mutable metadata attached to a session (role, project, flags).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct SessionMeta {
@@ -82,6 +91,14 @@ pub struct SessionMeta {
     /// Which LLM model this session is configured to use (informational only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reminder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_prompt: Option<String>,
+    #[serde(default)]
+    pub loop_iteration: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loop_log: Vec<LoopLogEntry>,
 }
 
 /// Metadata becomes stale after 30 minutes without an update.
@@ -111,6 +128,10 @@ impl Default for SessionMeta {
             project_description: None,
             last_metadata_update: None,
             model: None,
+            reminder: None,
+            original_prompt: None,
+            loop_iteration: 0,
+            loop_log: Vec::new(),
         }
     }
 }
@@ -371,6 +392,7 @@ fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>) -> Sessio
             project_description: m.project_description.clone(),
             last_metadata_update: m.last_metadata_update.map(|ts| ts.timestamp()),
             model: m.model.clone(),
+            ..Default::default()
         },
         None => SessionMeta::default(),
     }
@@ -1490,6 +1512,15 @@ impl DaemonState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_meta_loop_fields_default() {
+        let meta = SessionMeta::default();
+        assert!(meta.reminder.is_none());
+        assert!(meta.original_prompt.is_none());
+        assert_eq!(meta.loop_iteration, 0);
+        assert!(meta.loop_log.is_empty());
+    }
 
     #[test]
     fn format_message_xml_no_reply() {
