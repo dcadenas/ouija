@@ -788,6 +788,7 @@ impl OuijaMcp {
                 params.prompt.as_deref(),
                 params.from.as_deref(),
                 params.expects_reply,
+                params.reminder.as_deref(),
             )
             .await, None)
         } else {
@@ -835,6 +836,7 @@ impl OuijaMcp {
                 params.prompt.as_deref(),
                 params.from.as_deref(),
                 params.expects_reply,
+                params.reminder.as_deref(),
             )
             .await, None)
         } else {
@@ -1199,6 +1201,7 @@ async fn execute_session_start(
     prompt: Option<&str>,
     from: Option<&str>,
     expects_reply: Option<bool>,
+    reminder: Option<&str>,
 ) -> String {
     let session_name = name.split_once('/').map(|(_, s)| s).unwrap_or(name);
     let seq = state.protocol.read().await.wire_seq;
@@ -1207,6 +1210,7 @@ async fn execute_session_start(
         project_dir: project_dir.map(String::from),
         worktree,
         prompt: prompt.map(String::from),
+        reminder: reminder.map(String::from),
         from: from.map(String::from),
         expects_reply,
         daemon_id: state.config.npub.clone(),
@@ -1223,6 +1227,7 @@ async fn execute_session_restart(
     prompt: Option<&str>,
     from: Option<&str>,
     expects_reply: Option<bool>,
+    reminder: Option<&str>,
 ) -> String {
     let session_name = name.split_once('/').map(|(_, s)| s).unwrap_or(name);
     let seq = state.protocol.read().await.wire_seq;
@@ -1230,6 +1235,7 @@ async fn execute_session_restart(
         name: session_name.to_string(),
         fresh: Some(fresh),
         prompt: prompt.map(String::from),
+        reminder: reminder.map(String::from),
         from: from.map(String::from),
         expects_reply,
         daemon_id: state.config.npub.clone(),

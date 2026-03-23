@@ -455,6 +455,7 @@ impl AppState {
                     worktree,
                     project_dir,
                     prompt,
+                    reminder,
                     from,
                     expects_reply,
                     daemon_id: sender_id,
@@ -465,6 +466,7 @@ impl AppState {
                     let worktree = *worktree;
                     let project_dir = project_dir.clone();
                     let prompt = prompt.clone();
+                    let reminder = reminder.clone();
                     let from = from.clone();
                     let expects_reply = *expects_reply;
                     tokio::spawn(async move {
@@ -478,7 +480,7 @@ impl AppState {
                             expects_reply,
                             None,
                             None,
-                            None,
+                            reminder.as_deref(),
                         )
                         .await;
                         let reply = crate::protocol::WireMessage::CommandResult {
@@ -493,6 +495,7 @@ impl AppState {
                     name,
                     fresh,
                     prompt,
+                    reminder,
                     from,
                     expects_reply,
                     daemon_id: sender_id,
@@ -502,6 +505,7 @@ impl AppState {
                     let name = name.clone();
                     let fresh = fresh.unwrap_or(false);
                     let prompt = prompt.clone();
+                    let reminder = reminder.clone();
                     let from = from.clone();
                     let expects_reply = *expects_reply;
                     tokio::spawn(async move {
@@ -514,7 +518,7 @@ impl AppState {
                             expects_reply,
                             None,
                             None,
-                            None,
+                            reminder.as_deref(),
                         )
                         .await;
                         let reply = crate::protocol::WireMessage::CommandResult {

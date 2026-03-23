@@ -93,6 +93,8 @@ pub enum WireMessage {
         #[serde(default)]
         prompt: Option<String>,
         #[serde(default)]
+        reminder: Option<String>,
+        #[serde(default)]
         from: Option<String>,
         #[serde(default)]
         expects_reply: Option<bool>,
@@ -106,6 +108,8 @@ pub enum WireMessage {
         fresh: Option<bool>,
         #[serde(default)]
         prompt: Option<String>,
+        #[serde(default)]
+        reminder: Option<String>,
         #[serde(default)]
         from: Option<String>,
         #[serde(default)]
@@ -391,6 +395,7 @@ mod tests {
             project_dir: Some("/home/user/project".into()),
             worktree: Some(true),
             prompt: Some("do the thing".into()),
+            reminder: None,
             from: Some("caller".into()),
             expects_reply: Some(true),
             daemon_id: "npub1abc".into(),
@@ -400,7 +405,7 @@ mod tests {
         assert!(matches!(
             decoded,
             WireMessage::SessionStart {
-                name, project_dir, worktree, prompt, from, expects_reply, daemon_id, seq
+                name, project_dir, worktree, prompt, from, expects_reply, daemon_id, seq, ..
             }
             if name == "test-session"
                 && project_dir.as_deref() == Some("/home/user/project")
@@ -421,6 +426,7 @@ mod tests {
             project_dir: None,
             worktree: None,
             prompt: None,
+            reminder: None,
             from: None,
             expects_reply: None,
             daemon_id: "npub1abc".into(),
@@ -452,6 +458,7 @@ mod tests {
             name: "test-session".into(),
             fresh: Some(true),
             prompt: Some("check status".into()),
+            reminder: None,
             from: Some("caller".into()),
             expects_reply: Some(false),
             daemon_id: "npub1abc".into(),
@@ -461,7 +468,7 @@ mod tests {
         assert!(matches!(
             decoded,
             WireMessage::SessionRestart {
-                name, fresh, prompt, from, expects_reply, daemon_id, seq
+                name, fresh, prompt, from, expects_reply, daemon_id, seq, ..
             }
             if name == "test-session"
                 && fresh == Some(true)
