@@ -37,11 +37,7 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 
 **Spawn sessions on the fly.** `session_start("gateway-debug")` creates a tmux window, launches a coding session, and registers it. Pass a `prompt` to seed the session with context, and `backend` to choose the assistant (`"claude-code"` or `"opencode"`). Works on `session_restart` too.
 
-**Run long-lived sessions.** Sessions persist across daemon restarts, get auto-revived by scheduled tasks, and maintain their names and context. A session that's been investigating a memory leak for hours keeps all that context available to other sessions that discover it later.
-
-**Schedule tasks.** Cron jobs that inject messages into sessions. If the target session is dead, the daemon revives it automatically. Use this for daily reports, periodic checks, or recurring maintenance. One-shot tasks (`once: true`) fire once then auto-delete.
-
-**Session loops.** Chain sessions indefinitely with clean context. Each iteration gets the same prompt and a fresh conversation — state comes from the world (files, git, APIs), not from memory. Add a `reminder` to nudge the session toward calling `loop_next` when done:
+**Long-running work.** Two complementary approaches, and they compose. **Scheduled tasks** inject messages on a cron schedule — good for periodic checks, daily reports, recurring maintenance. If the target session is dead, the daemon revives it. **Session loops** chain fresh sessions indefinitely — good for iterative work like migrations, optimization, or queue processing where clean context per iteration matters. A scheduled task can kick off a loop, or a loop can run standalone.
 
 ```
 session_start(
@@ -51,7 +47,9 @@ session_start(
 )
 ```
 
-The session converts one file, calls `loop_next`, and restarts fresh. Repeat until done. Works for incremental migrations, autoresearch-style optimization loops, queue workers, or anything that benefits from iterating with clean context.
+**Peer-to-peer collaboration.** No hierarchy. Two long-running sessions can message each other directly — one optimizing a skill while the other evaluates results, or one migrating files while the other reviews the diffs. They coordinate through `session_send`, not through a central orchestrator.
+
+**Always interactive.** Every session runs in a tmux pane. You can jump into any session at any time — watch it work, type a correction, answer a question, or take over. The session doesn't know or care whether the next input comes from a peer session or from you at the keyboard.
 
 **Worktree sessions.** Spawn sessions in isolated git worktrees for parallel work on the same repo without branch conflicts.
 
