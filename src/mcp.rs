@@ -205,6 +205,16 @@ pub struct SessionNameParams {
     pub reminder: Option<String>,
 }
 
+/// Parameters for the `loop_next` MCP tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LoopNextParams {
+    /// The session calling loop_next (same pattern as session_send's `from`).
+    pub from: String,
+    /// Log message for this iteration (visible on admin dashboard).
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
 #[tool_router]
 impl OuijaMcp {
     /// Register this session with the ouija daemon.
@@ -851,6 +861,99 @@ impl OuijaMcp {
         )
         .await;
         Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
+    #[tool(
+        description = "Advance a looping session: restart fresh with the same prompt and reminder. \
+        Fire-and-forget — the calling session is killed and respawned with clean context. \
+        The session must have been started with a prompt. \
+        Use `message` to log what this iteration accomplished (visible on admin dashboard)."
+    )]
+    async fn loop_next(
+        &self,
+        Parameters(params): Parameters<LoopNextParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let session_id = params.from.clone();
+
+        // Read session metadata
+        let meta = {
+            let proto = self.state.protocol.read().await;
+            proto.sessions.get(&session_id).map(|s| s.metadata.clone())
+        };
+
+        let Some(meta) = meta else {
+            return Ok(CallToolResult::success(vec![Content::text(
+                format!("session '{}' not found", session_id),
+            )]));
+        };
+
+        let Some(ref original_prompt) = meta.original_prompt else {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "session has no original prompt — loop_next requires a session started with a prompt",
+            )]));
+        };
+
+        // Log iteration and update pending reply timestamps
+        let iteration = meta.loop_iteration + 1;
+        {
+            let mut proto = self.state.protocol.write().await;
+            if let Some(session) = proto.sessions.get_mut(&session_id) {
+                session.metadata.loop_iteration = iteration;
+                let entry = crate::daemon_protocol::LoopLogEntry {
+                    iteration,
+                    message: params.message.clone(),
+                    timestamp: chrono::Utc::now().timestamp(),
+                };
+                session.metadata.loop_log.push(entry);
+                // Cap at 100 entries
+                if session.metadata.loop_log.len() > 100 {
+                    let drain_count = session.metadata.loop_log.len() - 100;
+                    session.metadata.loop_log.drain(..drain_count);
+                }
+            }
+            // Update last_activity on pending replies to prevent immediate nudging
+            if let Some(pending) = proto.pending_replies.get_mut(&session_id) {
+                let now = chrono::Utc::now().timestamp();
+                for entry in pending.iter_mut() {
+                    entry.last_activity = now;
+                }
+            }
+        }
+
+        let prompt = original_prompt.clone();
+        let reminder = meta.reminder.clone();
+
+        tracing::info!(
+            session = %session_id,
+            iteration,
+            message = ?params.message,
+            "loop_next: restarting session"
+        );
+
+        // Fire-and-forget: restart the session fresh with original prompt + reminder.
+        // This kills the calling process via tmux respawn-pane -k, so the MCP
+        // response never arrives. Do NOT call track_pending_reply — this is not
+        // a user-initiated session start.
+        let state = self.state.clone();
+        let sid = session_id.clone();
+        tokio::spawn(async move {
+            crate::nostr_transport::restart_session(
+                &state,
+                &sid,
+                true, // fresh
+                Some(prompt.as_str()),
+                None, // no from — not wrapped in <msg>
+                None, // no expects_reply on re-injection
+                None, // keep existing backend
+                None, // keep existing model
+                reminder.as_deref(),
+            )
+            .await;
+        });
+
+        Ok(CallToolResult::success(vec![Content::text(
+            format!("loop_next: restarting session '{}' (iteration {})", session_id, iteration),
+        )]))
     }
 }
 

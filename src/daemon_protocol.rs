@@ -1523,6 +1523,48 @@ mod tests {
     }
 
     #[test]
+    fn loop_log_entry_serde_round_trip() {
+        let entry = LoopLogEntry {
+            iteration: 3,
+            message: Some("converted foo.js".into()),
+            timestamp: 1711100000,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let decoded: LoopLogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, entry);
+    }
+
+    #[test]
+    fn loop_log_entry_optional_message() {
+        let entry = LoopLogEntry {
+            iteration: 1,
+            message: None,
+            timestamp: 1711100000,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let decoded: LoopLogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.message, None);
+    }
+
+    #[test]
+    fn loop_log_cap_at_100() {
+        let mut meta = SessionMeta::default();
+        for i in 0..110 {
+            meta.loop_log.push(LoopLogEntry {
+                iteration: i,
+                message: Some(format!("iter {i}")),
+                timestamp: 1711100000 + i as i64,
+            });
+        }
+        if meta.loop_log.len() > 100 {
+            let drain_count = meta.loop_log.len() - 100;
+            meta.loop_log.drain(..drain_count);
+        }
+        assert_eq!(meta.loop_log.len(), 100);
+        assert_eq!(meta.loop_log[0].iteration, 10);
+    }
+
+    #[test]
     fn format_message_xml_no_reply() {
         let msg = format_session_message("ouija", "hello", false, 42, None, false);
         assert_eq!(msg, r#"<msg from="ouija" id="42">hello</msg>"#);
