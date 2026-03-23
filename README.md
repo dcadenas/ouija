@@ -1,16 +1,16 @@
 # ouija
 
-When you're running Claude Code in multiple terminals, they can't share what they've learned. Ouija lets them find each other and talk, even across machines.
+When you're running coding assistants in multiple terminals, they can't share what they've learned. Ouija lets them find each other and talk, even across machines.
 
 You've been building the auth service in one session for hours. Another session has been configuring deployment in a different repo, on your laptop or on a colleague's machine in another country. You realize each holds context the other needs. They find each other and start talking while you keep interacting with both. No restart, no re-planning, no context lost.
 
 ![The auth-service session asks deploy-infra what port the gateway runs on. Deploy-infra reads its docker-compose.yml and replies. Both sessions stay interactive in their own terminals.](screenshot.png)
 
-Unlike Claude Code [agent teams](https://code.claude.com/docs/en/agent-teams), which plan a team upfront for a single task, ouija connects sessions that weren't planned together. Ad-hoc, cross-machine, no hierarchy. They're complementary: you can run agent teams inside ouija sessions.
+Supports **Claude Code** and **[opencode](https://opencode.ai)**. Sessions on different backends can talk to each other — the protocol is backend-agnostic.
 
 ## Prerequisites
 
-[tmux](https://github.com/tmux/tmux) and [Claude Code](https://docs.anthropic.com/en/docs/claude-code) on your PATH.
+[tmux](https://github.com/tmux/tmux) and at least one supported coding assistant: [Claude Code](https://docs.anthropic.com/en/docs/claude-code) or [opencode](https://opencode.ai).
 
 ## Quick start
 
@@ -21,10 +21,10 @@ ouija start
 
 Or with Rust: `cargo binstall ouija` / `cargo install ouija`.
 
-This launches the daemon and auto-configures Claude Code (MCP endpoint, hooks, skills, status line). Open Claude Code inside tmux:
+This launches the daemon and auto-configures your coding assistant (MCP endpoint, hooks, plugins). Open a session inside tmux:
 
 ```bash
-tmux new-session && claude
+tmux new-session && claude    # or: opencode
 ```
 
 Sessions auto-register using the working directory name (e.g. `/code/api` becomes `api`). Start talking:
@@ -35,7 +35,7 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 
 **Message any session**, local or remote. Sessions discover each other automatically.
 
-**Spawn sessions on the fly.** `session_start("gateway-debug")` creates a tmux window, launches Claude Code, and registers it. Pass a `prompt` to seed the session with context. Works on `session_restart` too.
+**Spawn sessions on the fly.** `session_start("gateway-debug")` creates a tmux window, launches a coding session, and registers it. Pass a `prompt` to seed the session with context, and `backend` to choose the assistant (`"claude-code"` or `"opencode"`). Works on `session_restart` too.
 
 **Run long-lived sessions.** Sessions persist across daemon restarts, get auto-revived by scheduled tasks, and maintain their names and context. A session that's been investigating a memory leak for hours keeps all that context available to other sessions that discover it later.
 
@@ -65,7 +65,7 @@ Sessions on both machines discover each other. Tickets contain a connect secret,
 
 ## Message protocol
 
-Sessions communicate through XML messages injected into tmux panes:
+Sessions communicate through XML messages delivered to the coding assistant:
 
 ```xml
 <msg from="auth" id="47" reply="true">what port does the gateway use?</msg>
@@ -81,7 +81,7 @@ The daemon assigns unique IDs to every message, tracks pending replies, and nudg
 
 1. Each machine runs an **ouija daemon** (small Rust binary)
 2. Sessions connect via **MCP** and auto-register on startup
-3. Local messages: **tmux injection** into the target pane
+3. Local messages: **tmux injection** (Claude Code) or **HTTP API** (opencode)
 4. Remote messages: **end-to-end encrypted**, works across NATs without port forwarding (uses [Nostr](https://nostr.com) relays as transport)
 5. Node auth: **connect secret** in the ticket, unknown senders rejected
 
@@ -89,11 +89,11 @@ All session state transitions go through a pure state machine (`DaemonProtocol`)
 
 ## Security
 
-- **Tickets are secrets.** Share out-of-band only (copy/paste, not through Claude).
+- **Tickets are secrets.** Share out-of-band only (copy/paste, not through the assistant).
 - **Connect secret auth.** Unknown senders are rejected.
 - **Encrypted transport.** End-to-end encrypted via Nostr ([NIP-17](https://github.com/nostr-protocol/nips/blob/master/17.md) gift-wrapped DMs). Relays cannot read content.
 - **Localhost only.** The daemon binds to `127.0.0.1`.
-- **Claude never sees tickets.** MCP tools only expose session IDs and messages.
+- **Assistants never see tickets.** MCP tools only expose session IDs and messages.
 
 ## CLI
 
