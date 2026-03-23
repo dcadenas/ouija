@@ -1196,7 +1196,7 @@ log "Test 28: loop_next via MCP increments iteration"
 iter_before=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-test") | .loop_iteration // 0')
 assert_eq "28: iteration starts at 0" "$iter_before" "0"
 # Call loop_next
-mcp_result=$(mcp_call_tool "$BASE" "loop_next" '{"from":"loop-test","message":"finished first batch"}')
+mcp_result=$(mcp_call_tool "$BASE" "loop_next" '{"from":"loop-test","message":"finished first batch","clean_context":true}')
 assert_contains "28: loop_next response" "$mcp_result" "loop_next"
 # Wait for restart to complete
 sleep 3
@@ -1231,9 +1231,9 @@ api "$BASE" POST /api/register -d "{\"id\":\"sess-b\",\"pane\":\"$PANE_B\"}" >/d
 
 log "Test 30b: loop_next with clean_context=false returns iteration without restart"
 # Start a session with a prompt for looping
-result=$(api "$BASE" POST /api/sessions/start -d "{\"name\":\"loop-norest\",\"project_dir\":\"/tmp/loop-norest-proj\",\"prompt\":\"iterate work\",\"reminder\":\"keep looping\"}")
+api "$BASE" POST /api/sessions/start -d "{\"name\":\"loop-norest\",\"project_dir\":\"/tmp/loop-norest-proj\",\"prompt\":\"iterate work\",\"reminder\":\"keep looping\"}" >/dev/null
 sleep 2
-loop_pane=$(echo "$result" | jq -r '.pane // empty')
+norest_pane=$(api "$BASE" GET /api/status | jq -r '.sessions[] | select(.id == "loop-norest") | .pane // ""')
 # Call loop_next with clean_context=false (default)
 mcp_result=$(mcp_call_tool "$BASE" "loop_next" '{"from":"loop-norest","message":"first pass"}')
 assert_contains "30b: response has iteration" "$mcp_result" "iteration 1 logged"
@@ -1254,7 +1254,7 @@ iter2=$(echo "$status2" | jq -r '.sessions[] | select(.id == "loop-norest") | .l
 assert_eq "30c: iteration is 2" "$iter2" "2"
 # Verify the pane is still the same (not restarted)
 pane_after=$(echo "$status2" | jq -r '.sessions[] | select(.id == "loop-norest") | .pane // ""')
-assert_eq "30c: pane unchanged" "$pane_after" "$loop_pane"
+assert_eq "30c: pane unchanged" "$pane_after" "$norest_pane"
 
 log "Test 30d: loop_next clean_context=false includes reminder every 10th iteration"
 # Fast-forward to iteration 10 by calling loop_next 8 more times (currently at 2)
