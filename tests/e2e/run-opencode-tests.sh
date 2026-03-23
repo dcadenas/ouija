@@ -366,6 +366,68 @@ fi
 mcp_init "$BASE" >/dev/null 2>&1
 mcp_call_tool "$BASE" "session_kill" '{"name":"oc-e2e2"}' >/dev/null 2>&1
 
+log "Test 13: soft restart creates new opencode session via HTTP API"
+# Start a session with prompt and reminder
+mcp_init "$BASE" >/dev/null 2>&1
+start13=$(mcp_call_tool "$BASE" "session_start" \
+    "{\"name\":\"oc-soft\",\"project_dir\":\"/tmp/soft-test\",\"backend\":\"opencode\",\"prompt\":\"say hello\",\"reminder\":\"call loop_next when done\"}")
+if echo "$start13" | grep -q "started.*oc-soft"; then
+    pass "13a: started session for soft restart test"
+else
+    fail "13a: session_start" "contains started" "$(echo "$start13" | head -c 200)"
+fi
+sleep 5
+# Verify session has original_prompt and reminder
+status13=$(api "$BASE" GET /api/status)
+orig13=$(echo "$status13" | jq -r '.sessions[] | select(.id == "oc-soft") | .original_prompt // ""')
+rem13=$(echo "$status13" | jq -r '.sessions[] | select(.id == "oc-soft") | .reminder // ""')
+sid13=$(echo "$status13" | jq -r '.sessions[] | select(.id == "oc-soft") | .backend_session_id // ""')
+assert_eq "13b: original_prompt stored" "$orig13" "say hello"
+assert_eq "13b: reminder stored" "$rem13" "call loop_next when done"
+if [ -n "$sid13" ]; then
+    pass "13b: backend_session_id set ($sid13)"
+else
+    fail "13b: backend_session_id" "non-empty" "empty"
+fi
+# Now restart with fresh=true — should trigger soft restart (POST /session + prompt_async)
+mcp_init "$BASE" >/dev/null 2>&1
+restart13=$(mcp_call_tool "$BASE" "session_restart" \
+    '{"name":"oc-soft","fresh":true,"prompt":"say goodbye","reminder":"call loop_next when done"}')
+if echo "$restart13" | grep -qi "soft-restarted\|restarted"; then
+    pass "13c: soft restart succeeded"
+else
+    fail "13c: soft restart" "contains restarted" "$(echo "$restart13" | head -c 200)"
+fi
+sleep 5
+# Verify backend_session_id changed (new opencode session)
+status13b=$(api "$BASE" GET /api/status)
+sid13b=$(echo "$status13b" | jq -r '.sessions[] | select(.id == "oc-soft") | .backend_session_id // ""')
+if [ -n "$sid13b" ] && [ "$sid13b" != "$sid13" ]; then
+    pass "13d: backend_session_id changed after soft restart (new: $sid13b)"
+elif [ -n "$sid13b" ]; then
+    fail "13d: backend_session_id" "different from $sid13" "same: $sid13b"
+else
+    fail "13d: backend_session_id" "non-empty" "empty after restart"
+fi
+# Verify daemon log shows soft restart HTTP flow
+if grep -q "soft restart: created new opencode session" /tmp/ouija-test/daemon.log 2>/dev/null; then
+    pass "13e: soft restart used HTTP API (daemon log confirms)"
+else
+    fail "13e: soft restart path" "HTTP API log entry" "not found in daemon log"
+fi
+# Verify prompt delivered via prompt_async
+if grep -q "soft restart: delivered prompt" /tmp/ouija-test/daemon.log 2>/dev/null; then
+    pass "13f: prompt delivered via prompt_async after soft restart"
+else
+    fail "13f: prompt delivery" "prompt_async log entry" "not found in daemon log"
+fi
+# Verify reminder and original_prompt survived
+rem13b=$(echo "$status13b" | jq -r '.sessions[] | select(.id == "oc-soft") | .reminder // ""')
+assert_eq "13g: reminder preserved after soft restart" "$rem13b" "call loop_next when done"
+# Clean up
+mcp_init "$BASE" >/dev/null 2>&1
+mcp_call_tool "$BASE" "session_kill" '{"name":"oc-soft"}' >/dev/null 2>&1
+
 # ── Daemon logs ──────────────────────────────────────────────────
 log "Daemon logs (last 20 lines):"
 tail -20 /tmp/ouija-test/daemon.log 2>/dev/null || true
