@@ -1560,13 +1560,22 @@ pub async fn restart_session(
         if is_http_api {
             if let Some(ref pane) = existing_pane {
                 if crate::tmux::pane_alive(pane, backend.process_names()) {
-                    if let Ok(result) =
-                        soft_restart_session(state, name, pane, prompt, from, expects_reply, reminder)
-                            .await
+                    if let Ok(result) = soft_restart_session(
+                        state,
+                        name,
+                        pane,
+                        prompt,
+                        from,
+                        expects_reply,
+                        reminder,
+                    )
+                    .await
                     {
                         return result;
                     }
-                    tracing::info!("soft restart failed for '{name}', falling back to hard restart");
+                    tracing::info!(
+                        "soft restart failed for '{name}', falling back to hard restart"
+                    );
                 }
             }
         }
