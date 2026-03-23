@@ -37,7 +37,9 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 
 **Spawn sessions on the fly.** `session_start("gateway-debug")` creates a tmux window, launches a coding session, and registers it. Pass a `prompt` to seed the session with context, and `backend` to choose the assistant (`"claude-code"` or `"opencode"`). Works on `session_restart` too.
 
-**Long-running work.** Two complementary approaches, and they compose. **Scheduled tasks** inject messages on a cron schedule — good for periodic checks, daily reports, recurring maintenance. If the target session is dead, the daemon revives it. **Session loops** chain fresh sessions indefinitely — good for iterative work like migrations, optimization, or queue processing where clean context per iteration matters. A scheduled task can kick off a loop, or a loop can run standalone.
+**Long-running work.** Two complementary approaches, and they compose. **Scheduled tasks** inject messages on a cron schedule — good for periodic checks, daily reports, recurring maintenance. If the target session is dead, the daemon revives it. **Session loops** iterate indefinitely — good for migrations, optimization, or queue processing.
+
+Simple loops restart with clean context each iteration:
 
 ```
 session_start(
@@ -46,6 +48,17 @@ session_start(
   reminder: "Call loop_next('converted X.js'). If no .js files remain, session_send(done=true)."
 )
 ```
+
+For [autoresearch-style](https://github.com/karpathy/autoresearch) optimization, sessions accumulate knowledge across iterations. Put instructions in an external file (editable without restarting), track results in a TSV, and use `clean_context=false` to keep context between iterations:
+
+```
+session_start(
+  prompt: "Read INSTRUCTIONS.md for your task. Read results.tsv for history. Read FINDINGS.md for what's been learned. Begin.",
+  reminder: "Call loop_next(clean_context=false) after each iteration. If context is heavy, call loop_next(clean_context=true) to restart fresh."
+)
+```
+
+The session runs one change → measure → keep/revert per iteration, logging results to a TSV. `INSTRUCTIONS.md` defines the rules and scope. `FINDINGS.md` accumulates architecture knowledge that survives across restarts. The daemon detects stalls automatically and nudges or force-restarts the session.
 
 **Peer-to-peer collaboration.** No hierarchy. Two long-running sessions can message each other directly — one optimizing a skill while the other evaluates results, or one migrating files while the other reviews the diffs. They coordinate through `session_send`, not through a central orchestrator.
 
