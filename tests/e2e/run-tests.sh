@@ -1257,20 +1257,13 @@ pane_after=$(echo "$status2" | jq -r '.sessions[] | select(.id == "loop-norest")
 assert_eq "30c: pane unchanged" "$pane_after" "$norest_pane"
 
 log "Test 30d: loop_next clean_context=false includes reminder every 10th iteration"
-# Fast-forward to iteration 10 by calling loop_next 8 more times (currently at 2)
-for i in $(seq 3 10); do
+# Currently at iteration 2. Need to reach iteration 10.
+# Calls 3-9 (7 iterations) bring us to 9, then the 10th call captures the response.
+for i in $(seq 3 9); do
     mcp_call_tool "$BASE" "loop_next" "{\"from\":\"loop-norest\",\"message\":\"pass $i\"}" >/dev/null
 done
-# The 10th call should include the reminder
-# Now at iteration 10 — the 11th call will be iteration 11. But 10 was in the seq.
-# Call once more — iteration 11. Check iteration 10 was the one with reminder.
-# Actually, re-check: the call producing iteration 10 was in the seq and output was /dev/null.
-# Let's call for iteration 20 instead (a known modulo-10 boundary)
-for i in $(seq 11 19); do
-    mcp_call_tool "$BASE" "loop_next" "{\"from\":\"loop-norest\",\"message\":\"pass $i\"}" >/dev/null
-done
-mcp_result20=$(mcp_call_tool "$BASE" "loop_next" '{"from":"loop-norest","message":"pass 20"}')
-assert_contains "30d: 20th iteration includes reminder" "$mcp_result20" "keep looping"
+mcp_result10=$(mcp_call_tool "$BASE" "loop_next" '{"from":"loop-norest","message":"pass 10"}')
+assert_contains "30d: 10th iteration includes reminder" "$mcp_result10" "keep looping"
 # Clean up
 api "$BASE" POST /api/sessions/kill -d '{"name":"loop-norest"}' >/dev/null 2>&1 || true
 sleep 1
