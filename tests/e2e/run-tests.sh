@@ -1257,11 +1257,20 @@ pane_after=$(echo "$status2" | jq -r '.sessions[] | select(.id == "loop-norest")
 assert_eq "30c: pane unchanged" "$pane_after" "$norest_pane"
 
 log "Test 30d: loop_next clean_context=false includes reminder every 10th iteration"
-# Currently at iteration 2. Need to reach iteration 10.
-# Calls 3-9 (7 iterations) bring us to 9, then the 10th call captures the response.
+# Currently at iteration 2. Fast-forward via HTTP API to avoid MCP session expiry.
+# Use the HTTP send endpoint to trigger loop_next calls reliably.
 for i in $(seq 3 9); do
+    api "$BASE" POST /api/loop-next -d "{\"from\":\"loop-norest\",\"message\":\"pass $i\"}" >/dev/null 2>&1 || \
     mcp_call_tool "$BASE" "loop_next" "{\"from\":\"loop-norest\",\"message\":\"pass $i\"}" >/dev/null
 done
+# Verify we're at iteration 9
+iter9=$(api "$BASE" GET /api/status | jq -r '.sessions[] | select(.id == "loop-norest") | .loop_iteration // 0')
+# If MCP calls dropped some iterations, catch up
+while [ "$iter9" -lt 9 ] 2>/dev/null; do
+    mcp_call_tool "$BASE" "loop_next" '{"from":"loop-norest","message":"catchup"}' >/dev/null
+    iter9=$(api "$BASE" GET /api/status | jq -r '.sessions[] | select(.id == "loop-norest") | .loop_iteration // 0')
+done
+# The 10th call should include the reminder text
 mcp_result10=$(mcp_call_tool "$BASE" "loop_next" '{"from":"loop-norest","message":"pass 10"}')
 assert_contains "30d: 10th iteration includes reminder" "$mcp_result10" "keep looping"
 # Clean up
