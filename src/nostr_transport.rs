@@ -1532,6 +1532,46 @@ pub async fn restart_session(
     // Capture existing pane before killing
     let existing_pane = session.as_ref().and_then(|s| s.pane.clone());
 
+    let backend = match backend {
+        Some(b) => state
+            .backends
+            .get(b)
+            .unwrap_or_else(|| state.backends.default()),
+        None => {
+            // Fall back to the existing session's backend
+            let prev_backend = prev_metadata.as_ref().and_then(|m| m.backend.as_deref());
+            match prev_backend {
+                Some(b) => state
+                    .backends
+                    .get(b)
+                    .unwrap_or_else(|| state.backends.default()),
+                None => state.backends.default(),
+            }
+        }
+    };
+
+    // --- Soft restart for HttpApi with live TUI ---
+    // Try /new instead of respawn-pane. If it fails, fall through to hard restart.
+    if fresh {
+        let is_http_api = matches!(
+            backend.delivery_mode(),
+            crate::backend::DeliveryMode::HttpApi { .. }
+        );
+        if is_http_api {
+            if let Some(ref pane) = existing_pane {
+                if crate::tmux::pane_alive(pane, backend.process_names()) {
+                    if let Ok(result) =
+                        soft_restart_session(state, name, pane, prompt, from, expects_reply, reminder)
+                            .await
+                    {
+                        return result;
+                    }
+                    tracing::info!("soft restart failed for '{name}', falling back to hard restart");
+                }
+            }
+        }
+    }
+
     // Remove old session record (agent cleanup, tmux var, worktree).
     // The subsequent Register re-creates it with the new pane.
     if session.is_some() {
@@ -1553,28 +1593,6 @@ pub async fn restart_session(
         .as_ref()
         .and_then(|m| m.project_dir.clone())
         .unwrap_or_else(|| format!("{base}/{name}"));
-
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        return (format!("failed to create {dir}: {e}"), None);
-    }
-
-    let backend = match backend {
-        Some(b) => state
-            .backends
-            .get(b)
-            .unwrap_or_else(|| state.backends.default()),
-        None => {
-            // Fall back to the existing session's backend
-            let prev_backend = prev_metadata.as_ref().and_then(|m| m.backend.as_deref());
-            match prev_backend {
-                Some(b) => state
-                    .backends
-                    .get(b)
-                    .unwrap_or_else(|| state.backends.default()),
-                None => state.backends.default(),
-            }
-        }
-    };
     let backend_name = backend.name().to_string();
     let resume_id = if fresh {
         None
@@ -1842,6 +1860,98 @@ pub async fn restart_session(
         Ok(Err(e)) => (format!("restart failed: {e}"), None),
         Err(e) => (format!("restart failed: {e}"), None),
     }
+}
+
+/// Soft restart for HttpApi backends: send `/new` to reset the TUI conversation
+/// without killing the process. The plugin's readiness signal discovers the new
+/// session ID via pane-based lookup.
+///
+/// Returns `Ok((status_message, prompt_msg_id))` on success.
+/// Returns `Err(())` on failure — caller should fall back to hard restart.
+async fn soft_restart_session(
+    state: &std::sync::Arc<AppState>,
+    name: &str,
+    pane: &str,
+    prompt: Option<&str>,
+    from: Option<&str>,
+    expects_reply: Option<bool>,
+    reminder: Option<&str>,
+) -> Result<(String, Option<u64>), ()> {
+    // 1. Clear backend_session_id so stale ID isn't used during transition
+    {
+        let mut proto = state.protocol.write().await;
+        if let Some(session) = proto.sessions.get_mut(name) {
+            session.metadata.backend_session_id = None;
+        }
+        state.persist_protocol_state(&proto);
+    }
+
+    // 2. Send /new to the TUI
+    let pane_clone = pane.to_string();
+    let send_result = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("tmux")
+            .args(["send-keys", "-t", &pane_clone, "/new", "Enter"])
+            .output()
+    })
+    .await;
+
+    match send_result {
+        Ok(Ok(o)) if o.status.success() => {
+            tracing::info!("soft restart: sent /new to pane {pane} for '{name}'");
+        }
+        Ok(Ok(o)) => {
+            tracing::warn!(
+                "soft restart: send-keys /new failed for {pane}: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            return Err(());
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("soft restart: send-keys /new error for {pane}: {e}");
+            return Err(());
+        }
+        Err(e) => {
+            tracing::warn!("soft restart: spawn_blocking failed: {e}");
+            return Err(());
+        }
+    }
+
+    // 3. Queue prompt for delivery via readiness signal
+    let mut prompt_msg_id = None;
+    if let Some(text) = prompt {
+        let full_text = match reminder {
+            Some(r) => format!("{text}\n\n{r}"),
+            None => text.to_string(),
+        };
+        let injected = if let Some(sender) = from {
+            let er = expects_reply.unwrap_or(true);
+            let msg_id = {
+                let mut proto = state.protocol.write().await;
+                proto.next_seq()
+            };
+            prompt_msg_id = Some(msg_id);
+            crate::daemon_protocol::format_session_message(
+                sender, &full_text, er, msg_id, None, false,
+            )
+        } else {
+            full_text
+        };
+        schedule_prompt_injection(state, name, pane.to_string(), injected);
+    }
+
+    let dir = {
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .get(name)
+            .and_then(|s| s.metadata.project_dir.clone())
+            .unwrap_or_default()
+    };
+
+    Ok((
+        format!("soft-restarted '{name}' in {dir} (pane {pane})"),
+        prompt_msg_id,
+    ))
 }
 
 /// Health-check the externally running opencode serve, create a session on it,
