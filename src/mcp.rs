@@ -1128,7 +1128,8 @@ to start a new conversation each fire while keeping the worktree
 
 <loops>
 Sessions can chain indefinitely using loop_next. Each call restarts the session \
-with clean context, re-injecting the original prompt and reminder.
+with clean context, re-injecting the original prompt and reminder. State comes from \
+the world (files, git, APIs), not from memory — each iteration is a fresh start.
 
 - `loop_next(from, message?)` — restart this session fresh. Fire-and-forget: the session \
 dies and respawns. Use `message` to log what this iteration accomplished.
@@ -1136,6 +1137,12 @@ dies and respawns. Use `message` to log what this iteration accomplished.
 to whoever started the session.
 - The `reminder` parameter on session_start provides text that is appended to the prompt \
 and re-injected on idle as a nudge.
+
+Example — a session started with:
+  prompt: \"Find the next .js file in src/ not yet converted to .ts. Convert it, run tests, commit.\"
+  reminder: \"Call loop_next('converted X.js'). If no .js files remain, session_send(done=true, message='migration complete').\"
+should convert one file, commit, then call loop_next. On the next iteration it gets the same \
+prompt with clean context, finds the next unconverted file, and repeats until none remain.
 </loops>
 
 <session_guidance>
