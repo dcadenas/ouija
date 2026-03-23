@@ -1156,22 +1156,28 @@ to start a new conversation each fire while keeping the worktree
 </tasks>
 
 <loops>
-Sessions can chain indefinitely using loop_next. Each call restarts the session \
-with clean context, re-injecting the original prompt and reminder. State comes from \
-the world (files, git, APIs), not from memory — each iteration is a fresh start.
+Sessions can chain indefinitely using loop_next. Each call logs an iteration and \
+optionally restarts the session.
 
-- `loop_next(from, message?)` — restart this session fresh. Fire-and-forget: the session \
-dies and respawns. Use `message` to log what this iteration accomplished.
+- `loop_next(from, message?, clean_context?)` — log an iteration.
+  - `clean_context=false` (default): stay in current conversation, keep accumulated context. \
+The daemon logs the iteration and returns. Every 10th iteration, the reminder is included \
+in the response to prevent context drift.
+  - `clean_context=true`: restart with fresh context (kill + respawn with prompt + reminder). \
+Fire-and-forget — the session dies and respawns.
 - To stop looping, simply don't call loop_next. Use session_send(done=true) to reply \
 to whoever started the session.
 - The `reminder` parameter on session_start provides text that is appended to the prompt \
 and re-injected on idle as a nudge.
+- The daemon detects loop stalls automatically after 3+ iterations. If no loop_next arrives \
+within 3x the average interval, the reminder is re-injected. At 10x average (or 30 min), \
+the session is force-restarted with clean context.
 
 Example — a session started with:
   prompt: \"Find the next .js file in src/ not yet converted to .ts. Convert it, run tests, commit.\"
   reminder: \"Call loop_next('converted X.js'). If no .js files remain, session_send(done=true, message='migration complete').\"
 should convert one file, commit, then call loop_next. On the next iteration it gets the same \
-prompt with clean context, finds the next unconverted file, and repeats until none remain.
+prompt, finds the next unconverted file, and repeats until none remain.
 </loops>
 
 <session_guidance>
