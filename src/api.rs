@@ -99,6 +99,10 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
                 "stale": stale,
                 "backend_session_id": s.metadata.backend_session_id,
                 "backend": s.metadata.backend,
+                "reminder": s.metadata.reminder,
+                "original_prompt": s.metadata.original_prompt,
+                "loop_iteration": s.metadata.loop_iteration,
+                "loop_log": s.metadata.loop_log,
             })
         })
         .collect();
@@ -421,6 +425,9 @@ pub struct RegisterBody {
     /// Which coding assistant backend to use (e.g. "claude-code", "codex").
     #[serde(default)]
     backend: Option<String>,
+    /// Reminder text re-injected on idle.
+    #[serde(default)]
+    reminder: Option<String>,
 }
 
 /// Register a new local session with optional metadata.
@@ -447,6 +454,7 @@ pub async fn register(
         backend_session_id: body.backend_session_id,
         backend: body.backend,
         project_description,
+        reminder: body.reminder,
         ..Default::default()
     };
     if let Some(ref p) = body.pane {
@@ -467,6 +475,7 @@ pub async fn register(
         worktree: metadata.worktree,
         vim_mode: metadata.vim_mode,
         backend: metadata.backend.clone(),
+        reminder: metadata.reminder.clone(),
         ..Default::default()
     };
     let effects = state

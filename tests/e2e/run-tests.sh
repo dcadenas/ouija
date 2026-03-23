@@ -833,11 +833,10 @@ sleep 0.5
 # Signal stopped — starts idle timer (2s)
 curl -sf -X POST "${BASE}/api/pane/${PANE_A_NUM}/stopped" >/dev/null 2>&1
 # Wait for idle timeout + reminder injection
-wait_for 8 bash -c "tmux capture-pane -t '$PANE_A' -p -S -20 | grep -qF 'unanswered question from asker'"
+wait_for 8 bash -c "tmux capture-pane -t '$PANE_A' -p -S -20 | grep -qF 'Pending reply owed'"
 pane_content=$(tmux capture-pane -t "$PANE_A" -p -S -20)
-assert_contains "reminder injected on idle" "$pane_content" "unanswered question from asker"
-assert_contains "reminder includes session_send hint" "$pane_content" "session_send"
-assert_not_contains "no ouija prefix in reminder" "$pane_content" "[ouija]"
+assert_contains "reminder injected on idle" "$pane_content" "Pending reply owed"
+assert_contains "reminder includes sender" "$pane_content" "from asker"
 # Clean up
 api "$BASE" POST /api/remove -d '{"id":"reminder-test"}' >/dev/null 2>&1 || true
 api "$BASE" POST /api/settings -d '{"idle_timeout_secs":60}' >/dev/null
@@ -1160,6 +1159,75 @@ assert_not_contains "25: hook did not create duplicate session" "$ids" "my-proje
 assert_contains "25: pre-registered session still exists" "$ids" "pre-registered"
 # Clean up
 api "$BASE" POST /api/remove -d '{"id":"pre-registered"}' >/dev/null 2>&1 || true
+
+# ═══════════════════════════════════════════════════════════════════
+# LOOP / REMINDER TESTS
+# ═══════════════════════════════════════════════════════════════════
+
+log "Test 26: Register with reminder field"
+api "$BASE" POST /api/register -d "{\"id\":\"loop-sess\",\"pane\":\"$PANE_A\",\"reminder\":\"call loop_next when done\"}" >/dev/null
+reminder=$(api "$BASE" GET /api/status | jq -r '.sessions[] | select(.id == "loop-sess") | .reminder // ""')
+assert_eq "26: reminder stored" "$reminder" "call loop_next when done"
+api "$BASE" POST /api/remove -d '{"id":"loop-sess"}' >/dev/null 2>&1 || true
+# Restore sess-a2
+api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/dev/null
+
+log "Test 27: session_start via HTTP with reminder and original_prompt"
+# Start a session with prompt + reminder
+result=$(api "$BASE" POST /api/sessions/start -d "{\"name\":\"loop-test\",\"project_dir\":\"/tmp/loop-test-proj\",\"prompt\":\"do the work\",\"reminder\":\"if done call loop_next\"}")
+assert_contains "27: session started" "$result" "started"
+# Verify original_prompt and reminder are in metadata
+sleep 1
+status=$(api "$BASE" GET /api/status)
+orig_prompt=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-test") | .original_prompt // ""')
+sess_reminder=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-test") | .reminder // ""')
+assert_eq "27: original_prompt stored" "$orig_prompt" "do the work"
+assert_eq "27: reminder stored" "$sess_reminder" "if done call loop_next"
+# Verify prompt + reminder was concatenated in pane
+loop_pane=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-test") | .pane // ""')
+if [ -n "$loop_pane" ]; then
+    wait_for 5 bash -c "tmux capture-pane -t '$loop_pane' -p 2>/dev/null | grep -qF 'if done call loop_next'"
+    pane_text=$(tmux capture-pane -t "$loop_pane" -p 2>/dev/null || true)
+    assert_contains "27: reminder in pane" "$pane_text" "if done call loop_next"
+fi
+
+log "Test 28: loop_next via MCP increments iteration"
+# First verify iteration is 0
+iter_before=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-test") | .loop_iteration // 0')
+assert_eq "28: iteration starts at 0" "$iter_before" "0"
+# Call loop_next
+mcp_result=$(mcp_call_tool "$BASE" "loop_next" '{"from":"loop-test","message":"finished first batch"}')
+assert_contains "28: loop_next response" "$mcp_result" "loop_next"
+# Wait for restart to complete
+sleep 3
+status2=$(api "$BASE" GET /api/status)
+iter_after=$(echo "$status2" | jq -r '.sessions[] | select(.id == "loop-test") | .loop_iteration // 0')
+assert_eq "28: iteration incremented to 1" "$iter_after" "1"
+# Verify loop log has the message
+log_msg=$(echo "$status2" | jq -r '.sessions[] | select(.id == "loop-test") | .loop_log[0].message // ""')
+assert_eq "28: loop log message" "$log_msg" "finished first batch"
+
+log "Test 29: loop_next preserves original_prompt across restart"
+orig_after=$(echo "$status2" | jq -r '.sessions[] | select(.id == "loop-test") | .original_prompt // ""')
+reminder_after=$(echo "$status2" | jq -r '.sessions[] | select(.id == "loop-test") | .reminder // ""')
+assert_eq "29: original_prompt preserved" "$orig_after" "do the work"
+assert_eq "29: reminder preserved" "$reminder_after" "if done call loop_next"
+
+log "Test 30: loop_next without original_prompt returns error"
+# Register a bare session (no prompt)
+api "$BASE" POST /api/register -d "{\"id\":\"bare-sess\",\"pane\":\"$PANE_B\"}" >/dev/null
+mcp_result=$(mcp_call_tool "$BASE" "loop_next" '{"from":"bare-sess"}')
+assert_contains "30: error without prompt" "$mcp_result" "no original prompt"
+# Clean up
+api "$BASE" POST /api/remove -d '{"id":"bare-sess"}' >/dev/null 2>&1 || true
+
+# Clean up loop-test session
+api "$BASE" POST /api/sessions/kill -d '{"name":"loop-test"}' >/dev/null 2>&1 || true
+sleep 1
+api "$BASE" POST /api/remove -d '{"id":"loop-test"}' >/dev/null 2>&1 || true
+# Restore
+api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/dev/null
+api "$BASE" POST /api/register -d "{\"id\":\"sess-b\",\"pane\":\"$PANE_B\"}" >/dev/null
 
 # ── Daemon logs ──────────────────────────────────────────────────────
 log "Daemon logs:"
