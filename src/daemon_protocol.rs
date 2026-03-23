@@ -116,6 +116,24 @@ impl SessionMeta {
             Some(ts) => chrono::Utc::now().timestamp() - ts > METADATA_STALE_SECS,
         }
     }
+
+    /// Fill loop fields from `source` for any field still at its default value.
+    /// Used during re-registration so the startup hook doesn't wipe loop state
+    /// that was set by session_start or carried forward by restart_session.
+    pub fn inherit_loop_fields_from(&mut self, source: &SessionMeta) {
+        if self.original_prompt.is_none() {
+            self.original_prompt = source.original_prompt.clone();
+        }
+        if self.reminder.is_none() {
+            self.reminder = source.reminder.clone();
+        }
+        if self.loop_iteration == 0 && source.loop_iteration > 0 {
+            self.loop_iteration = source.loop_iteration;
+        }
+        if self.loop_log.is_empty() && !source.loop_log.is_empty() {
+            self.loop_log = source.loop_log.clone();
+        }
+    }
 }
 
 impl Default for SessionMeta {
@@ -124,7 +142,7 @@ impl Default for SessionMeta {
             project_dir: None,
             role: None,
             bulletin: None,
-            networked: true, // sessions are networked by default
+            networked: true,
             worktree: false,
             vim_mode: false,
             backend_session_id: None,
@@ -545,22 +563,12 @@ impl DaemonState {
             None
         };
 
-        // Preserve loop state from existing session — re-registration (e.g. startup
-        // hook) shouldn't wipe fields the caller doesn't know about.
+        // Preserve loop state: the startup hook may re-register after session_start
+        // or loop_next's restart, arriving with blank metadata. Without this, the
+        // hook's Register would wipe original_prompt, reminder, and loop progress.
         let mut metadata = metadata;
         if let Some(existing) = self.sessions.get(&id) {
-            if metadata.original_prompt.is_none() {
-                metadata.original_prompt = existing.metadata.original_prompt.clone();
-            }
-            if metadata.reminder.is_none() {
-                metadata.reminder = existing.metadata.reminder.clone();
-            }
-            if metadata.loop_iteration == 0 && existing.metadata.loop_iteration > 0 {
-                metadata.loop_iteration = existing.metadata.loop_iteration;
-            }
-            if metadata.loop_log.is_empty() && !existing.metadata.loop_log.is_empty() {
-                metadata.loop_log = existing.metadata.loop_log.clone();
-            }
+            metadata.inherit_loop_fields_from(&existing.metadata);
         }
 
         // Insert session

@@ -599,7 +599,7 @@ impl AppState {
     }
 
     /// Persist protocol state sessions to disk.
-    fn persist_protocol_state(&self, proto: &crate::daemon_protocol::DaemonState) {
+    pub(crate) fn persist_protocol_state(&self, proto: &crate::daemon_protocol::DaemonState) {
         // Convert DaemonState sessions to the persisted Session format
         let sessions: HashMap<String, Session> = proto
             .sessions

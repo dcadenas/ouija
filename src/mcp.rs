@@ -941,15 +941,13 @@ impl OuijaMcp {
         // response never arrives. Do NOT call track_pending_reply — this is not
         // a user-initiated session start.
         //
-        // After restart, re-apply loop metadata. restart_session does Remove+Register
-        // which correctly carries loop fields, but the startup hook may re-register
-        // between Remove and Register (race), or after Register, wiping them. The
-        // apply_register preserve logic handles the after-Register case; this
-        // re-application handles the between case by re-stamping after everything settles.
+        // After restart_session returns (its Register is committed), we re-stamp
+        // loop fields to handle the race where the startup hook fired between
+        // Remove and Register with blank metadata. apply_register's
+        // inherit_loop_fields_from handles hooks that fire *after* this point.
         let state = self.state.clone();
         let sid = session_id.clone();
-        let loop_iteration = iteration;
-        let loop_log = meta.loop_log.clone();
+        let stash = meta.clone();
         tokio::spawn(async move {
             crate::nostr_transport::restart_session(
                 &state,
@@ -964,23 +962,17 @@ impl OuijaMcp {
             )
             .await;
 
-            // Re-stamp loop metadata after restart settles (handles race with hook)
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let mut proto = state.protocol.write().await;
-            if let Some(session) = proto.sessions.get_mut(&sid) {
-                if session.metadata.original_prompt.is_none() {
-                    session.metadata.original_prompt = Some(prompt.clone());
-                }
-                if session.metadata.reminder.is_none() {
-                    session.metadata.reminder = reminder.clone();
-                }
-                if session.metadata.loop_iteration < loop_iteration {
-                    session.metadata.loop_iteration = loop_iteration;
-                }
-                if session.metadata.loop_log.is_empty() && !loop_log.is_empty() {
-                    session.metadata.loop_log = loop_log;
+            // Re-stamp immediately — restart_session's Register is committed,
+            // so we can write the authoritative loop state now.
+            {
+                let mut proto = state.protocol.write().await;
+                if let Some(session) = proto.sessions.get_mut(&sid) {
+                    session.metadata.inherit_loop_fields_from(&stash);
                 }
             }
+            // Persist so loop state survives daemon restart
+            let proto = state.protocol.read().await;
+            state.persist_protocol_state(&proto);
         });
 
         Ok(CallToolResult::success(vec![Content::text(format!(
