@@ -103,6 +103,7 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
                 "original_prompt": s.metadata.original_prompt,
                 "loop_iteration": s.metadata.loop_iteration,
                 "loop_log": s.metadata.loop_log,
+                "last_loop_next": s.metadata.last_loop_next,
             })
         })
         .collect();

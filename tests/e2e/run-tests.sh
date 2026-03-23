@@ -1229,6 +1229,48 @@ api "$BASE" POST /api/remove -d '{"id":"loop-test"}' >/dev/null 2>&1 || true
 api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/dev/null
 api "$BASE" POST /api/register -d "{\"id\":\"sess-b\",\"pane\":\"$PANE_B\"}" >/dev/null
 
+log "Test 30b: loop_next with clean_context=false returns iteration without restart"
+# Start a session with a prompt for looping
+result=$(api "$BASE" POST /api/sessions/start -d "{\"name\":\"loop-norest\",\"project_dir\":\"/tmp/loop-norest-proj\",\"prompt\":\"iterate work\",\"reminder\":\"keep looping\"}")
+sleep 2
+loop_pane=$(echo "$result" | jq -r '.pane // empty')
+# Call loop_next with clean_context=false (default)
+mcp_result=$(mcp_call_tool "$BASE" "loop_next" '{"from":"loop-norest","message":"first pass"}')
+assert_contains "30b: response has iteration" "$mcp_result" "iteration 1 logged"
+# Verify iteration incremented
+status=$(api "$BASE" GET /api/status)
+iter=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-norest") | .loop_iteration // 0')
+assert_eq "30b: iteration is 1" "$iter" "1"
+# Verify last_loop_next is set
+last_ln=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-norest") | .last_loop_next // "null"')
+if [ "$last_ln" = "null" ]; then fail "30b: last_loop_next should be set"; else pass "30b: last_loop_next set"; fi
+
+log "Test 30c: loop_next clean_context=false increments without session restart"
+# Call again — session should still be alive (no restart)
+mcp_result2=$(mcp_call_tool "$BASE" "loop_next" '{"from":"loop-norest","message":"second pass"}')
+assert_contains "30c: response has iteration 2" "$mcp_result2" "iteration 2 logged"
+status2=$(api "$BASE" GET /api/status)
+iter2=$(echo "$status2" | jq -r '.sessions[] | select(.id == "loop-norest") | .loop_iteration // 0')
+assert_eq "30c: iteration is 2" "$iter2" "2"
+# Verify the pane is still the same (not restarted)
+pane_after=$(echo "$status2" | jq -r '.sessions[] | select(.id == "loop-norest") | .pane // ""')
+assert_eq "30c: pane unchanged" "$pane_after" "$loop_pane"
+
+log "Test 30d: loop_next clean_context=false includes reminder every 10th iteration"
+# Fast-forward to iteration 10 by calling loop_next 8 more times (currently at 2)
+for i in $(seq 3 9); do
+    mcp_call_tool "$BASE" "loop_next" "{\"from\":\"loop-norest\",\"message\":\"pass $i\"}" >/dev/null
+done
+# The 10th call should include the reminder
+mcp_result10=$(mcp_call_tool "$BASE" "loop_next" '{"from":"loop-norest","message":"pass 10"}')
+assert_contains "30d: 10th iteration includes reminder" "$mcp_result10" "keep looping"
+# Clean up
+api "$BASE" POST /api/sessions/kill -d '{"name":"loop-norest"}' >/dev/null 2>&1 || true
+sleep 1
+api "$BASE" POST /api/remove -d '{"id":"loop-norest"}' >/dev/null 2>&1 || true
+api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/dev/null
+api "$BASE" POST /api/register -d "{\"id\":\"sess-b\",\"pane\":\"$PANE_B\"}" >/dev/null
+
 log "Test 31: Re-registration preserves loop state"
 # Register a session directly with loop metadata (no session_start, avoids worktree complexity)
 api "$BASE" POST /api/register -d "{\"id\":\"reregtest\",\"pane\":\"$PANE_A\",\"reminder\":\"call loop_next when done\"}" >/dev/null
