@@ -41,6 +41,18 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 
 **Schedule tasks.** Cron jobs that inject messages into sessions. If the target session is dead, the daemon revives it automatically. Use this for daily reports, periodic checks, or recurring maintenance. One-shot tasks (`once: true`) fire once then auto-delete.
 
+**Session loops.** Chain sessions indefinitely with clean context. Each iteration gets the same prompt and a fresh conversation — state comes from the world (files, git, APIs), not from memory. Add a `reminder` to nudge the session toward calling `loop_next` when done:
+
+```
+session_start(
+  name: "migrator",
+  prompt: "Find the next .js file in src/ not yet converted to .ts. Convert it, run tests, commit.",
+  reminder: "Call loop_next('converted X.js'). If no .js files remain, session_send(done=true)."
+)
+```
+
+The session converts one file, calls `loop_next`, and restarts fresh. Repeat until done. Works for incremental migrations, autoresearch-style optimization loops, queue workers, or anything that benefits from iterating with clean context.
+
 **Worktree sessions.** Spawn sessions in isolated git worktrees for parallel work on the same repo without branch conflicts.
 
 **Nostr DMs.** If you use Nostr, configure your npub to control the daemon from any Nostr client. Send `/list`, `/start`, `@session message`, or bare text (routed by an LLM).
@@ -124,7 +136,7 @@ Fuzzy session pickers that read tmux's display format will show ouija session na
 ## Testing
 
 ```bash
-# All tests (unit + local e2e + nostr e2e + install, all in Docker)
+# All tests (unit + local e2e + nostr e2e + opencode e2e, all in Docker)
 tests/e2e/run-e2e.sh
 
 # Only local e2e
@@ -132,6 +144,9 @@ tests/e2e/run-e2e.sh local
 
 # Only nostr P2P e2e (relay + 4 daemons + auth tests)
 tests/e2e/run-e2e.sh nostr
+
+# Only opencode integration e2e
+tests/e2e/run-e2e.sh opencode
 
 # Install/preflight tests (clean machine, no Rust)
 tests/e2e/run-e2e.sh install
