@@ -107,6 +107,9 @@ pub struct SessionMeta {
     /// Log messages from each loop_next call. Capped at 100 entries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub loop_log: Vec<LoopLogEntry>,
+    /// Unix timestamp of the most recent loop_next call. Used by stall detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_loop_next: Option<i64>,
 }
 
 /// Metadata becomes stale after 30 minutes without an update.
@@ -137,6 +140,9 @@ impl SessionMeta {
         if self.loop_log.is_empty() && !source.loop_log.is_empty() {
             self.loop_log = source.loop_log.clone();
         }
+        if self.last_loop_next.is_none() && source.last_loop_next.is_some() {
+            self.last_loop_next = source.last_loop_next;
+        }
     }
 }
 
@@ -158,6 +164,7 @@ impl Default for SessionMeta {
             original_prompt: None,
             loop_iteration: 0,
             loop_log: Vec::new(),
+            last_loop_next: None,
         }
     }
 }
@@ -420,6 +427,11 @@ fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>) -> Sessio
             project_description: m.project_description.clone(),
             last_metadata_update: m.last_metadata_update.map(|ts| ts.timestamp()),
             model: m.model.clone(),
+            reminder: m.reminder.clone(),
+            original_prompt: m.original_prompt.clone(),
+            loop_iteration: m.loop_iteration,
+            loop_log: m.loop_log.clone(),
+            last_loop_next: m.last_loop_next,
             ..Default::default()
         },
         None => SessionMeta::default(),
@@ -1568,6 +1580,27 @@ mod tests {
         assert!(meta.original_prompt.is_none());
         assert_eq!(meta.loop_iteration, 0);
         assert!(meta.loop_log.is_empty());
+        assert!(meta.last_loop_next.is_none());
+    }
+
+    #[test]
+    fn inherit_loop_fields_carries_last_loop_next() {
+        let source = SessionMeta {
+            last_loop_next: Some(1711100000),
+            loop_iteration: 5,
+            original_prompt: Some("do work".into()),
+            reminder: Some("keep going".into()),
+            loop_log: vec![LoopLogEntry {
+                iteration: 5,
+                message: None,
+                timestamp: 1711100000,
+            }],
+            ..Default::default()
+        };
+        let mut target = SessionMeta::default();
+        target.inherit_loop_fields_from(&source);
+        assert_eq!(target.last_loop_next, Some(1711100000));
+        assert_eq!(target.loop_iteration, 5);
     }
 
     #[test]

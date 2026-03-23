@@ -175,6 +175,9 @@ pub struct SessionMetadata {
     /// Log messages from loop_next calls. Capped at 100.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub loop_log: Vec<crate::daemon_protocol::LoopLogEntry>,
+    /// Unix timestamp of the most recent loop_next call. Used by stall detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_loop_next: Option<i64>,
 }
 
 fn default_true() -> bool {
@@ -199,6 +202,7 @@ impl Default for SessionMetadata {
             original_prompt: None,
             loop_iteration: 0,
             loop_log: Vec::new(),
+            last_loop_next: None,
         }
     }
 }

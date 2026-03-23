@@ -213,6 +213,10 @@ pub struct LoopNextParams {
     /// Log message for this iteration (visible on admin dashboard).
     #[serde(default)]
     pub message: Option<String>,
+    /// When false (default), stay in the current conversation — just log iteration
+    /// and return. When true, restart with fresh context (kill + respawn).
+    #[serde(default)]
+    pub clean_context: bool,
 }
 
 #[tool_router]
@@ -869,8 +873,9 @@ impl OuijaMcp {
     }
 
     #[tool(
-        description = "Advance a looping session: restart fresh with the same prompt and reminder. \
-        Fire-and-forget — the calling session is killed and respawned with clean context. \
+        description = "Advance a looping session: log an iteration. \
+        With clean_context=false (default), stay in current conversation — just logs iteration and returns. \
+        With clean_context=true, restart fresh (kill + respawn with prompt + reminder). \
         The session must have been started with a prompt. \
         Use `message` to log what this iteration accomplished (visible on admin dashboard)."
     )]
@@ -900,15 +905,17 @@ impl OuijaMcp {
         };
 
         // Log iteration and update pending reply timestamps
+        let now = chrono::Utc::now().timestamp();
         let iteration = meta.loop_iteration + 1;
         {
             let mut proto = self.state.protocol.write().await;
             if let Some(session) = proto.sessions.get_mut(&session_id) {
                 session.metadata.loop_iteration = iteration;
+                session.metadata.last_loop_next = Some(now);
                 let entry = crate::daemon_protocol::LoopLogEntry {
                     iteration,
                     message: params.message.clone(),
-                    timestamp: chrono::Utc::now().timestamp(),
+                    timestamp: now,
                 };
                 session.metadata.loop_log.push(entry);
                 // Cap at 100 entries
@@ -919,74 +926,96 @@ impl OuijaMcp {
             }
             // Update last_activity on pending replies to prevent immediate nudging
             if let Some(pending) = proto.pending_replies.get_mut(&session_id) {
-                let now = chrono::Utc::now().timestamp();
                 for entry in pending.iter_mut() {
                     entry.last_activity = now;
                 }
             }
         }
 
-        let prompt = original_prompt.clone();
-        let reminder = meta.reminder.clone();
-
-        tracing::info!(
-            session = %session_id,
-            iteration,
-            message = ?params.message,
-            "loop_next: restarting session"
-        );
-
-        // Fire-and-forget: restart the session fresh with original prompt + reminder.
-        // This kills the calling process via tmux respawn-pane -k, so the MCP
-        // response never arrives. Do NOT call track_pending_reply — this is not
-        // a user-initiated session start.
-        //
-        // After restart_session returns (its Register is committed), we re-stamp
-        // loop fields to handle the race where the startup hook fired between
-        // Remove and Register with blank metadata. apply_register's
-        // inherit_loop_fields_from handles hooks that fire *after* this point.
-        let state = self.state.clone();
-        let sid = session_id.clone();
-        // Snapshot loop state AFTER the iteration increment (not from the stale `meta`)
-        let stash = {
-            let proto = self.state.protocol.read().await;
-            proto
-                .sessions
-                .get(&session_id)
-                .map(|s| s.metadata.clone())
-                .unwrap_or_default()
-        };
-        tokio::spawn(async move {
-            crate::nostr_transport::restart_session(
-                &state,
-                &sid,
-                true, // fresh
-                Some(prompt.as_str()),
-                None, // no from — not wrapped in <msg>
-                None, // no expects_reply on re-injection
-                None, // keep existing backend
-                None, // keep existing model
-                reminder.as_deref(),
-            )
+        // Notify session agent about loop progress (for stall detection)
+        self.state
+            .notify_agent(&session_id, crate::session_agent::SessionMsg::LoopProgress)
             .await;
 
-            // Re-stamp immediately — restart_session's Register is committed,
-            // so we can write the authoritative loop state now.
-            {
-                let mut proto = state.protocol.write().await;
-                if let Some(session) = proto.sessions.get_mut(&sid) {
-                    session.metadata.inherit_loop_fields_from(&stash);
+        let reminder = meta.reminder.clone();
+
+        if params.clean_context {
+            let prompt = original_prompt.clone();
+
+            tracing::info!(
+                session = %session_id,
+                iteration,
+                message = ?params.message,
+                "loop_next: restarting session (clean_context=true)"
+            );
+
+            // Fire-and-forget: restart the session fresh with original prompt + reminder.
+            // This kills the calling process via tmux respawn-pane -k, so the MCP
+            // response never arrives.
+            let state = self.state.clone();
+            let sid = session_id.clone();
+            // Snapshot loop state AFTER the iteration increment
+            let stash = {
+                let proto = self.state.protocol.read().await;
+                proto
+                    .sessions
+                    .get(&session_id)
+                    .map(|s| s.metadata.clone())
+                    .unwrap_or_default()
+            };
+            tokio::spawn(async move {
+                crate::nostr_transport::restart_session(
+                    &state,
+                    &sid,
+                    true, // fresh
+                    Some(prompt.as_str()),
+                    None, // no from — not wrapped in <msg>
+                    None, // no expects_reply on re-injection
+                    None, // keep existing backend
+                    None, // keep existing model
+                    reminder.as_deref(),
+                )
+                .await;
+
+                // Re-stamp immediately — restart_session's Register is committed,
+                // so we can write the authoritative loop state now.
+                {
+                    let mut proto = state.protocol.write().await;
+                    if let Some(session) = proto.sessions.get_mut(&sid) {
+                        session.metadata.inherit_loop_fields_from(&stash);
+                    }
+                }
+                // Persist so loop state survives daemon restart
+                let proto = state.protocol.read().await;
+                state.persist_protocol_state(&proto);
+            });
+
+            Ok(CallToolResult::success(vec![Content::text(format!(
+                "loop_next: restarting session '{}' (iteration {})",
+                session_id, iteration
+            ))]))
+        } else {
+            tracing::info!(
+                session = %session_id,
+                iteration,
+                message = ?params.message,
+                "loop_next: iteration logged (clean_context=false)"
+            );
+
+            // Persist updated loop state
+            let proto = self.state.protocol.read().await;
+            self.state.persist_protocol_state(&proto);
+
+            // Build response — include reminder every 10th iteration
+            let mut response = format!("iteration {} logged", iteration);
+            if iteration % 10 == 0 {
+                if let Some(ref reminder_text) = reminder {
+                    response.push_str(&format!("\n\nReminder: {}", reminder_text));
                 }
             }
-            // Persist so loop state survives daemon restart
-            let proto = state.protocol.read().await;
-            state.persist_protocol_state(&proto);
-        });
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "loop_next: restarting session '{}' (iteration {})",
-            session_id, iteration
-        ))]))
+            Ok(CallToolResult::success(vec![Content::text(response)]))
+        }
     }
 }
 

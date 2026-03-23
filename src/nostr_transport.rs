@@ -1822,6 +1822,7 @@ pub async fn restart_session(
                         .or_else(|| prompt.map(String::from)),
                     loop_iteration: m.loop_iteration,
                     loop_log: m.loop_log.clone(),
+                    last_loop_next: m.last_loop_next,
                 },
                 None => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),

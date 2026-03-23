@@ -20,6 +20,8 @@ pub enum SessionMsg {
     Renamed { new_id: String },
     /// Internal: idle timer expired.
     IdleTimeout,
+    /// loop_next was called — reset loop stall timer.
+    LoopProgress,
 }
 
 /// Per-session behavioral state owned by the agent.
@@ -153,6 +155,9 @@ impl Actor for SessionAgent {
                     "session agent renamed"
                 );
                 state.session_id = new_id;
+            }
+            SessionMsg::LoopProgress => {
+                // Stall detection handled in Task 3
             }
             SessionMsg::IdleTimeout => {
                 state.idle_timer = None;
@@ -327,6 +332,7 @@ mod tests {
         assert!(meta.original_prompt.is_none());
         assert_eq!(meta.loop_iteration, 0);
         assert!(meta.loop_log.is_empty());
+        assert!(meta.last_loop_next.is_none());
     }
 
     #[tokio::test]
