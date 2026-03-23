@@ -1088,6 +1088,20 @@ fn update_and_restart() -> anyhow::Result<()> {
 
     backend::claude_code::refresh_plugin_cache(&latest);
 
+    // Check if opencode serve is running — it needs a restart to pick up plugin changes
+    let serve_running = Cmd::new("pgrep")
+        .args(["-f", "opencode serve"])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if serve_running {
+        println!(
+            "note: opencode serve is running — restart it to pick up plugin changes:\n  \
+             pkill -f 'opencode serve' && opencode serve --port 8200 --hostname 127.0.0.1 &"
+        );
+    }
+
     println!("restarting daemon...");
     stop_daemon()?;
     std::thread::sleep(std::time::Duration::from_secs(1));
