@@ -1563,9 +1563,17 @@ pub async fn restart_session(
                 .as_ref()
                 .and_then(|m| m.project_dir.clone())
                 .unwrap_or_default();
-            if let Ok(result) =
-                soft_restart_session(state, name, existing_pane.as_deref(), &dir, prompt, from, expects_reply, reminder)
-                    .await
+            if let Ok(result) = soft_restart_session(
+                state,
+                name,
+                existing_pane.as_deref(),
+                &dir,
+                prompt,
+                from,
+                expects_reply,
+                reminder,
+            )
+            .await
             {
                 return result;
             }
@@ -1895,12 +1903,9 @@ async fn soft_restart_session(
             let body: serde_json::Value = r.json().await.map_err(|e| {
                 tracing::warn!("soft restart: failed to parse session response: {e}");
             })?;
-            body["id"]
-                .as_str()
-                .map(String::from)
-                .ok_or_else(|| {
-                    tracing::warn!("soft restart: no session id in opencode response");
-                })?
+            body["id"].as_str().map(String::from).ok_or_else(|| {
+                tracing::warn!("soft restart: no session id in opencode response");
+            })?
         }
         Ok(r) => {
             let status = r.status();
@@ -1950,8 +1955,7 @@ async fn soft_restart_session(
         let body = serde_json::json!({
             "parts": [{"type": "text", "text": message}]
         });
-        let async_url =
-            format!("http://127.0.0.1:{port}/session/{new_session_id}/prompt_async");
+        let async_url = format!("http://127.0.0.1:{port}/session/{new_session_id}/prompt_async");
         let resp = state
             .http_client
             .post(&async_url)
@@ -1962,7 +1966,9 @@ async fn soft_restart_session(
             .await;
         match resp {
             Ok(r) if r.status().is_success() => {
-                tracing::info!("soft restart: delivered prompt to {new_session_id} via prompt_async");
+                tracing::info!(
+                    "soft restart: delivered prompt to {new_session_id} via prompt_async"
+                );
             }
             Ok(r) => {
                 let status = r.status();
