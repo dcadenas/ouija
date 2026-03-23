@@ -1229,6 +1229,36 @@ api "$BASE" POST /api/remove -d '{"id":"loop-test"}' >/dev/null 2>&1 || true
 api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/dev/null
 api "$BASE" POST /api/register -d "{\"id\":\"sess-b\",\"pane\":\"$PANE_B\"}" >/dev/null
 
+log "Test 31: Re-registration preserves loop state"
+# Register a session directly with loop metadata (no session_start, avoids worktree complexity)
+api "$BASE" POST /api/register -d "{\"id\":\"reregtest\",\"pane\":\"$PANE_A\",\"reminder\":\"call loop_next when done\"}" >/dev/null
+# Manually set original_prompt via a second register with all fields
+# (simulates what session_start does internally)
+api "$BASE" POST /api/register -d "{\"id\":\"reregtest\",\"pane\":\"$PANE_A\",\"reminder\":\"call loop_next when done\",\"role\":\"looping\"}" >/dev/null
+# Verify fields are set
+status=$(api "$BASE" GET /api/status)
+rem=$(echo "$status" | jq -r '.sessions[] | select(.id == "reregtest") | .reminder // ""')
+role1=$(echo "$status" | jq -r '.sessions[] | select(.id == "reregtest") | .role // ""')
+assert_eq "31a: reminder set" "$rem" "call loop_next when done"
+assert_eq "31a: role set" "$role1" "looping"
+# Simulate startup hook: re-register same ID+pane with new role but NO reminder (..Default)
+api "$BASE" POST /api/register -d "{\"id\":\"reregtest\",\"pane\":\"$PANE_A\",\"role\":\"re-registered\"}" >/dev/null
+status2=$(api "$BASE" GET /api/status)
+rem2=$(echo "$status2" | jq -r '.sessions[] | select(.id == "reregtest") | .reminder // ""')
+role2=$(echo "$status2" | jq -r '.sessions[] | select(.id == "reregtest") | .role // ""')
+assert_eq "31b: reminder preserved after re-register" "$rem2" "call loop_next when done"
+assert_eq "31b: role updated" "$role2" "re-registered"
+# Same test via MCP session_register (the actual hook path)
+mcp_call_tool "$BASE" "session_register" "{\"id\":\"reregtest\",\"pane\":\"$PANE_A\",\"role\":\"hook-registered\"}" >/dev/null
+status3=$(api "$BASE" GET /api/status)
+rem3=$(echo "$status3" | jq -r '.sessions[] | select(.id == "reregtest") | .reminder // ""')
+role3=$(echo "$status3" | jq -r '.sessions[] | select(.id == "reregtest") | .role // ""')
+assert_eq "31c: reminder preserved after MCP re-register" "$rem3" "call loop_next when done"
+assert_eq "31c: role updated via MCP" "$role3" "hook-registered"
+# Clean up — restore sess-a2 on PANE_A
+api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/dev/null
+api "$BASE" POST /api/register -d "{\"id\":\"sess-b\",\"pane\":\"$PANE_B\"}" >/dev/null
+
 # ── Daemon logs ──────────────────────────────────────────────────────
 log "Daemon logs:"
 cat /tmp/ouija-test/daemon.log 2>/dev/null || true

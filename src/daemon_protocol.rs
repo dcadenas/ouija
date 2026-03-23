@@ -545,6 +545,24 @@ impl DaemonState {
             None
         };
 
+        // Preserve loop state from existing session — re-registration (e.g. startup
+        // hook) shouldn't wipe fields the caller doesn't know about.
+        let mut metadata = metadata;
+        if let Some(existing) = self.sessions.get(&id) {
+            if metadata.original_prompt.is_none() {
+                metadata.original_prompt = existing.metadata.original_prompt.clone();
+            }
+            if metadata.reminder.is_none() {
+                metadata.reminder = existing.metadata.reminder.clone();
+            }
+            if metadata.loop_iteration == 0 && existing.metadata.loop_iteration > 0 {
+                metadata.loop_iteration = existing.metadata.loop_iteration;
+            }
+            if metadata.loop_log.is_empty() && !existing.metadata.loop_log.is_empty() {
+                metadata.loop_log = existing.metadata.loop_log.clone();
+            }
+        }
+
         // Insert session
         let session = SessionEntry {
             id: id.clone(),
