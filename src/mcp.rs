@@ -1093,6 +1093,18 @@ to start a new conversation each fire while keeping the worktree
   - `disposable_worktree`: anonymous worktree created and cleaned up each fire
 </tasks>
 
+<loops>
+Sessions can chain indefinitely using loop_next. Each call restarts the session \
+with clean context, re-injecting the original prompt and reminder.
+
+- `loop_next(from, message?)` — restart this session fresh. Fire-and-forget: the session \
+dies and respawns. Use `message` to log what this iteration accomplished.
+- To stop looping, simply don't call loop_next. Use session_send(done=true) to reply \
+to whoever started the session.
+- The `reminder` parameter on session_start provides text that is appended to the prompt \
+and re-injected on idle as a nudge.
+</loops>
+
 <session_guidance>
 ## When to use ouija sessions vs agents
 
