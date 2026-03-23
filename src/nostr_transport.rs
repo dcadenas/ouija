@@ -1550,25 +1550,26 @@ pub async fn restart_session(
         }
     };
 
-    // --- Soft restart for HttpApi with live TUI ---
-    // Try /new instead of respawn-pane. If it fails, fall through to hard restart.
+    // --- Soft restart for HttpApi backends ---
+    // Create a new session on the serve via HTTP API and deliver the prompt directly.
+    // No tmux interaction needed — the LLM works in the serve, not the TUI.
     if fresh {
         let is_http_api = matches!(
             backend.delivery_mode(),
             crate::backend::DeliveryMode::HttpApi { .. }
         );
         if is_http_api {
-            if let Some(ref pane) = existing_pane {
-                if crate::tmux::pane_alive(pane, backend.process_names()) {
-                    if let Ok(result) =
-                        soft_restart_session(state, name, pane, prompt, from, expects_reply, reminder)
-                            .await
-                    {
-                        return result;
-                    }
-                    tracing::info!("soft restart failed for '{name}', falling back to hard restart");
-                }
+            let dir = prev_metadata
+                .as_ref()
+                .and_then(|m| m.project_dir.clone())
+                .unwrap_or_default();
+            if let Ok(result) =
+                soft_restart_session(state, name, existing_pane.as_deref(), &dir, prompt, from, expects_reply, reminder)
+                    .await
+            {
+                return result;
             }
+            tracing::info!("soft restart failed for '{name}', falling back to hard restart");
         }
     }
 
@@ -1862,68 +1863,77 @@ pub async fn restart_session(
     }
 }
 
-/// Soft restart for HttpApi backends: send `/new` to reset the TUI conversation
-/// without killing the process. The plugin's readiness signal discovers the new
-/// session ID via pane-based lookup.
+/// Soft restart for HttpApi backends: create a new session on the opencode serve
+/// via HTTP API and deliver the prompt directly. Then respawn the TUI attach to
+/// point at the new session so the human can interact.
 ///
 /// Returns `Ok((status_message, prompt_msg_id))` on success.
 /// Returns `Err(())` on failure — caller should fall back to hard restart.
 async fn soft_restart_session(
     state: &std::sync::Arc<AppState>,
     name: &str,
-    pane: &str,
+    pane: Option<&str>,
+    project_dir: &str,
     prompt: Option<&str>,
     from: Option<&str>,
     expects_reply: Option<bool>,
     reminder: Option<&str>,
 ) -> Result<(String, Option<u64>), ()> {
-    // 1. Clear backend_session_id so stale ID isn't used during transition
+    let port = state.opencode_serve_port();
+
+    // 1. Create a new session on the opencode serve
+    let resp = state
+        .http_client
+        .post(format!("http://127.0.0.1:{port}/session"))
+        .header("x-opencode-directory", project_dir)
+        .json(&serde_json::json!({}))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await;
+    let new_session_id = match resp {
+        Ok(r) if r.status().is_success() => {
+            let body: serde_json::Value = r.json().await.map_err(|e| {
+                tracing::warn!("soft restart: failed to parse session response: {e}");
+            })?;
+            body["id"]
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    tracing::warn!("soft restart: no session id in opencode response");
+                })?
+        }
+        Ok(r) => {
+            let status = r.status();
+            tracing::warn!("soft restart: POST /session failed with {status}");
+            return Err(());
+        }
+        Err(e) => {
+            tracing::warn!("soft restart: POST /session request failed: {e}");
+            return Err(());
+        }
+    };
+
+    tracing::info!(
+        "soft restart: created new opencode session {new_session_id} for '{name}' (port {port})"
+    );
+
+    // 2. Update backend_session_id immediately
     {
         let mut proto = state.protocol.write().await;
         if let Some(session) = proto.sessions.get_mut(name) {
-            session.metadata.backend_session_id = None;
+            session.metadata.backend_session_id = Some(new_session_id.clone());
         }
         state.persist_protocol_state(&proto);
     }
 
-    // 2. Send /new to the TUI
-    let pane_clone = pane.to_string();
-    let send_result = tokio::task::spawn_blocking(move || {
-        std::process::Command::new("tmux")
-            .args(["send-keys", "-t", &pane_clone, "/new", "Enter"])
-            .output()
-    })
-    .await;
-
-    match send_result {
-        Ok(Ok(o)) if o.status.success() => {
-            tracing::info!("soft restart: sent /new to pane {pane} for '{name}'");
-        }
-        Ok(Ok(o)) => {
-            tracing::warn!(
-                "soft restart: send-keys /new failed for {pane}: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            return Err(());
-        }
-        Ok(Err(e)) => {
-            tracing::warn!("soft restart: send-keys /new error for {pane}: {e}");
-            return Err(());
-        }
-        Err(e) => {
-            tracing::warn!("soft restart: spawn_blocking failed: {e}");
-            return Err(());
-        }
-    }
-
-    // 3. Queue prompt for delivery via readiness signal
+    // 3. Deliver prompt directly via HTTP API
     let mut prompt_msg_id = None;
     if let Some(text) = prompt {
         let full_text = match reminder {
             Some(r) => format!("{text}\n\n{r}"),
             None => text.to_string(),
         };
-        let injected = if let Some(sender) = from {
+        let message = if let Some(sender) = from {
             let er = expects_reply.unwrap_or(true);
             let msg_id = {
                 let mut proto = state.protocol.write().await;
@@ -1936,20 +1946,50 @@ async fn soft_restart_session(
         } else {
             full_text
         };
-        schedule_prompt_injection(state, name, pane.to_string(), injected);
+
+        let body = serde_json::json!({
+            "parts": [{"type": "text", "text": message}]
+        });
+        let async_url =
+            format!("http://127.0.0.1:{port}/session/{new_session_id}/prompt_async");
+        let resp = state
+            .http_client
+            .post(&async_url)
+            .header("x-opencode-directory", project_dir)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                tracing::info!("soft restart: delivered prompt to {new_session_id} via prompt_async");
+            }
+            Ok(r) => {
+                let status = r.status();
+                tracing::warn!("soft restart: prompt_async returned {status}");
+            }
+            Err(e) => {
+                tracing::warn!("soft restart: prompt_async failed: {e}");
+            }
+        }
     }
 
-    let dir = {
-        let proto = state.protocol.read().await;
-        proto
-            .sessions
-            .get(name)
-            .and_then(|s| s.metadata.project_dir.clone())
-            .unwrap_or_default()
-    };
+    // 4. Respawn the TUI attach to point at the new session
+    if let Some(pane) = pane {
+        let escaped_dir = crate::scheduler::shell_escape(project_dir);
+        let attach_cmd = format!(
+            "opencode attach http://127.0.0.1:{port} --session {new_session_id} --dir {escaped_dir}"
+        );
+        let pane = pane.to_string();
+        tokio::task::spawn_blocking(move || {
+            let _ = std::process::Command::new("tmux")
+                .args(["respawn-pane", "-k", "-t", &pane, &attach_cmd])
+                .status();
+        });
+    }
 
     Ok((
-        format!("soft-restarted '{name}' in {dir} (pane {pane})"),
+        format!("soft-restarted '{name}' in {project_dir} (session {new_session_id})"),
         prompt_msg_id,
     ))
 }

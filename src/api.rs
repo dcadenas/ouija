@@ -1518,8 +1518,6 @@ pub async fn session_ready(
 
 /// Handle a readiness signal keyed by opencode backend session ID.
 /// Resolves the ouija session name internally, avoiding plugin-side race conditions.
-/// Falls back to directory-based lookup via the opencode serve API when the
-/// backend_session_id is unknown (soft restart via `/new`).
 pub async fn backend_session_ready(
     State(state): State<SharedState>,
     axum::extract::Path(backend_sid): axum::extract::Path<String>,
@@ -1532,77 +1530,13 @@ pub async fn backend_session_ready(
             .find(|s| s.metadata.backend_session_id.as_deref() == Some(&backend_sid))
             .map(|s| s.id.clone())
     };
-
-    let session_name = match session_name {
-        Some(name) => name,
-        None => {
-            // Soft restart fallback: query opencode serve for the session's directory,
-            // then match against ouija sessions with backend_session_id=None.
-            match resolve_session_by_directory(&state, &backend_sid).await {
-                Some(name) => name,
-                None => {
-                    return Json(
-                        json!({"delivered": false, "error": "no session with this backend_session_id"}),
-                    );
-                }
-            }
-        }
+    let Some(name) = session_name else {
+        return Json(
+            json!({"delivered": false, "error": "no session with this backend_session_id"}),
+        );
     };
-
-    // Update backend_session_id if it changed (soft restart case)
-    {
-        let mut proto = state.protocol.write().await;
-        if let Some(session) = proto.sessions.get_mut(&session_name) {
-            if session.metadata.backend_session_id.as_deref() != Some(&backend_sid) {
-                tracing::info!(
-                    "readiness: updating backend_session_id for '{session_name}' to {backend_sid} (directory fallback)"
-                );
-                session.metadata.backend_session_id = Some(backend_sid.clone());
-            }
-        }
-        state.persist_protocol_state(&proto);
-    }
-
-    let delivered = deliver_pending_prompt(&state, &session_name);
-    Json(json!({"delivered": delivered, "session": session_name}))
-}
-
-/// Query the opencode serve API for a session's directory, then find the ouija
-/// session with matching project_dir and backend_session_id=None (in soft restart).
-async fn resolve_session_by_directory(
-    state: &SharedState,
-    backend_sid: &str,
-) -> Option<String> {
-    let port = state.opencode_serve_port();
-    let url = format!("http://127.0.0.1:{port}/session/{backend_sid}");
-    let resp = state
-        .http_client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(3))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let body: serde_json::Value = resp.json().await.ok()?;
-    let dir = body["dir"].as_str().or_else(|| body["directory"].as_str())?;
-
-    let proto = state.protocol.read().await;
-    proto
-        .sessions
-        .values()
-        .find(|s| {
-            s.metadata.backend_session_id.is_none()
-                && s.metadata.project_dir.as_deref() == Some(dir)
-        })
-        .map(|s| {
-            tracing::info!(
-                "readiness: resolved backend_session_id {backend_sid} to '{}' via directory '{dir}'",
-                s.id
-            );
-            s.id.clone()
-        })
+    let delivered = deliver_pending_prompt(&state, &name);
+    Json(json!({"delivered": delivered, "session": name}))
 }
 
 /// List indexed projects from the configured projects directory.
