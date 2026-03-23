@@ -947,7 +947,15 @@ impl OuijaMcp {
         // inherit_loop_fields_from handles hooks that fire *after* this point.
         let state = self.state.clone();
         let sid = session_id.clone();
-        let stash = meta.clone();
+        // Snapshot loop state AFTER the iteration increment (not from the stale `meta`)
+        let stash = {
+            let proto = self.state.protocol.read().await;
+            proto
+                .sessions
+                .get(&session_id)
+                .map(|s| s.metadata.clone())
+                .unwrap_or_default()
+        };
         tokio::spawn(async move {
             crate::nostr_transport::restart_session(
                 &state,
