@@ -1569,10 +1569,7 @@ pub async fn backend_session_ready(
 
 /// Query the opencode serve API for a session's directory, then find the ouija
 /// session with matching project_dir and backend_session_id=None (in soft restart).
-async fn resolve_session_by_directory(
-    state: &SharedState,
-    backend_sid: &str,
-) -> Option<String> {
+async fn resolve_session_by_directory(state: &SharedState, backend_sid: &str) -> Option<String> {
     let port = state.opencode_serve_port();
     let url = format!("http://127.0.0.1:{port}/session/{backend_sid}");
     let resp = state
@@ -1586,7 +1583,9 @@ async fn resolve_session_by_directory(
         return None;
     }
     let body: serde_json::Value = resp.json().await.ok()?;
-    let dir = body["dir"].as_str().or_else(|| body["directory"].as_str())?;
+    let dir = body["dir"]
+        .as_str()
+        .or_else(|| body["directory"].as_str())?;
 
     let proto = state.protocol.read().await;
     proto
