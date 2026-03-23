@@ -112,7 +112,6 @@ pub struct AppState {
     pub perfire_worktree_panes: RwLock<HashMap<String, String>>,
     pub backends: crate::backend::BackendRegistry,
     pub http_client: reqwest::Client,
-    pub opencode_serve: crate::backend::opencode::OpenCodeServe,
     /// Queued prompts waiting for a readiness signal from HttpApi sessions.
     /// Maps session_id -> (pane_id, prompt_text).
     pub pending_prompts: std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
@@ -265,7 +264,6 @@ impl AppState {
             perfire_worktree_panes: RwLock::new(HashMap::new()),
             backends: crate::backend::BackendRegistry::default_registry(),
             http_client: reqwest::Client::new(),
-            opencode_serve: crate::backend::opencode::OpenCodeServe::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -298,7 +296,6 @@ impl AppState {
             perfire_worktree_panes: RwLock::new(HashMap::new()),
             backends: crate::backend::BackendRegistry::default_registry(),
             http_client: reqwest::Client::new(),
-            opencode_serve: crate::backend::opencode::OpenCodeServe::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -1096,6 +1093,12 @@ impl AppState {
             log.pop_front();
         }
         log.push_back(entry);
+    }
+
+    /// Port where opencode serve is expected to run.
+    /// Convention: daemon_port + 320.
+    pub fn opencode_serve_port(&self) -> u16 {
+        self.config.port + 320
     }
 }
 

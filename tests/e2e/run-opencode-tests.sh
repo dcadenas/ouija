@@ -138,11 +138,26 @@ fi
 
 # ═══════════════════════════════════════════════════════════════════
 # OUIJA INTEGRATION TESTS — session_start + session_send via HTTP API
-# Stop the standalone serve first so the shared serve can start cleanly.
+# The daemon expects opencode serve on daemon_port + 320. Start it
+# on that port for integration tests (daemon does not spawn it).
 # ═══════════════════════════════════════════════════════════════════
 log "Stopping standalone opencode serve for integration tests"
 pkill -f "opencode serve --port $OPENCODE_PORT" 2>/dev/null || true
 sleep 2
+
+OC_SERVE_PORT=$((PORT + 320))
+log "Starting opencode serve on daemon-expected port $OC_SERVE_PORT"
+tmux new-window -t test
+OC_SERVE_PANE=$(tmux display-message -t test -p '#{pane_id}')
+tmux send-keys -t "$OC_SERVE_PANE" "opencode serve --port $OC_SERVE_PORT --hostname 127.0.0.1" Enter
+
+log "Waiting for opencode serve on port $OC_SERVE_PORT (up to 15s)"
+if ! wait_for 15 curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/global/health" -o /dev/null; then
+    echo "ERROR: opencode serve did not become ready on port $OC_SERVE_PORT in 15s" >&2
+    tmux capture-pane -t "$OC_SERVE_PANE" -p
+    exit 1
+fi
+log "opencode serve ready on port $OC_SERVE_PORT"
 
 log "Test 7: ouija session_start with backend=opencode"
 start_result=$(mcp_call_tool "$BASE" "session_start" \

@@ -16,6 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/ouija /usr/local/bin/ouija
+# Fake claude binary so daemon startup check passes (handles --version)
+RUN printf '#!/bin/bash\nif [ "$1" = "--version" ]; then echo "claude-fake 0.0.0"; exit 0; fi\nexec sleep 3600\n' > /usr/local/bin/claude && chmod +x /usr/local/bin/claude
 COPY scripts/ /app/scripts/
 COPY tests/e2e/lib.sh /lib.sh
 COPY tests/e2e/run-tests.sh /run-tests.sh

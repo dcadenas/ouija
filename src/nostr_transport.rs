@@ -1700,11 +1700,32 @@ pub async fn restart_session(
                     None
                 };
 
-            // Fall back to the previous session ID when not fresh
+            // Fall back to the previous session ID when not fresh,
+            // but only if the serve is reachable (the old ID may be stale
+            // if serve was restarted externally).
             if backend_session_id.is_none() && !fresh {
-                backend_session_id = prev_metadata
-                    .as_ref()
-                    .and_then(|m| m.backend_session_id.clone());
+                if let Some(ref prev) = prev_metadata {
+                    if let Some(ref prev_sid) = prev.backend_session_id {
+                        let port = state.opencode_serve_port();
+                        let check_url = format!(
+                            "http://127.0.0.1:{port}/session/{prev_sid}"
+                        );
+                        match state.http_client.get(&check_url)
+                            .timeout(std::time::Duration::from_secs(2))
+                            .send()
+                            .await
+                        {
+                            Ok(r) if r.status().is_success() => {
+                                backend_session_id = Some(prev_sid.clone());
+                            }
+                            _ => {
+                                tracing::warn!(
+                                    "previous backend_session_id {prev_sid} is stale, creating new session"
+                                );
+                            }
+                        }
+                    }
+                }
             }
 
             let proto_meta = match prev_metadata {
@@ -1758,8 +1779,8 @@ pub async fn restart_session(
     }
 }
 
-/// Ensure the shared opencode serve is running, create a session on it, and
-/// launch `opencode attach` in the tmux pane.
+/// Health-check the externally running opencode serve, create a session on it,
+/// and launch `opencode attach` in the tmux pane.
 ///
 /// Returns the opencode session ID on success.
 async fn setup_shared_serve_session(
@@ -1767,15 +1788,40 @@ async fn setup_shared_serve_session(
     pane_id: &str,
     project_dir: &str,
 ) -> anyhow::Result<String> {
-    let port = state
-        .opencode_serve
-        .ensure_running(state.config.port)
-        .await?;
+    let port = state.opencode_serve_port();
 
-    let session_id = state
-        .opencode_serve
-        .create_session(&state.http_client, project_dir)
+    // Health check: verify serve is reachable
+    let health = state
+        .http_client
+        .get(format!("http://127.0.0.1:{port}/global/health"))
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await;
+    if health.is_err() {
+        anyhow::bail!(
+            "opencode serve not running on port {port}. Start it with:\n  opencode serve --port {port}"
+        );
+    }
+
+    // Create session via HTTP API
+    let resp = state
+        .http_client
+        .post(format!("http://127.0.0.1:{port}/session"))
+        .header("x-opencode-directory", project_dir)
+        .json(&serde_json::json!({}))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
         .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("opencode session creation failed {status}: {body}");
+    }
+    let body: serde_json::Value = resp.json().await?;
+    let session_id = body["id"]
+        .as_str()
+        .map(String::from)
+        .ok_or_else(|| anyhow::anyhow!("no session id in opencode response"))?;
 
     tracing::info!("created opencode session {session_id} on shared serve (port {port})");
 

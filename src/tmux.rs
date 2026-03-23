@@ -521,10 +521,7 @@ async fn deliver_via_http(
     project_dir: Option<&str>,
     message: &str,
 ) -> anyhow::Result<()> {
-    let port = state
-        .opencode_serve
-        .port()
-        .ok_or_else(|| anyhow::anyhow!("opencode serve not running"))?;
+    let port = state.opencode_serve_port();
 
     let oc_session_id = oc_session_id
         .ok_or_else(|| anyhow::anyhow!("no backend_session_id for session"))?;

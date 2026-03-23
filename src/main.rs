@@ -260,6 +260,20 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "unknown".into());
             tracing::info!("daemon identity: {npub}");
 
+            {
+                let registry = backend::BackendRegistry::default_registry();
+                let available = registry.available();
+                if available.is_empty() {
+                    eprintln!(
+                        "error: no coding backend found in PATH. Install claude-code or opencode.\n\
+                         See: https://docs.anthropic.com/en/docs/claude-code\n\
+                         See: https://opencode.ai"
+                    );
+                    std::process::exit(1);
+                }
+                tracing::info!("available backends: {}", available.join(", "));
+            }
+
             let config = config::OuijaConfig::new(name, port, data, npub)?;
             let state = state::AppState::new(config);
 

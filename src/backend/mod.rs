@@ -43,6 +43,15 @@ impl BackendRegistry {
             .expect("default backend must exist")
     }
 
+    /// Returns names of backends whose binary is found in PATH.
+    pub fn available(&self) -> Vec<&str> {
+        self.backends
+            .iter()
+            .filter(|b| b.is_available())
+            .map(|b| b.name())
+            .collect()
+    }
+
     pub fn all_process_names(&self) -> Vec<String> {
         self.backends
             .iter()
@@ -58,9 +67,10 @@ pub enum DeliveryMode {
     TuiInjection,
     /// Messages delivered via HTTP API to a headless server process.
     HttpApi {
+        #[allow(dead_code)]
         serve_command: String,
+        #[allow(dead_code)]
         attach_command: String,
-        default_port: u16,
     },
 }
 
@@ -114,4 +124,16 @@ pub trait CodingAssistant: Send + Sync + std::fmt::Debug + 'static {
             .unwrap_or(false)
     }
     fn description_file_priority(&self) -> &[&str] { &["README.md"] }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_available_returns_backends_with_binaries() {
+        let registry = BackendRegistry::default_registry();
+        let available = registry.available();
+        assert!(available.iter().all(|name| !name.is_empty()));
+    }
 }
