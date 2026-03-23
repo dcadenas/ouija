@@ -76,7 +76,7 @@ If \`session_send\` fails with "session not found", the sender disconnected. Cal
             await fetch(`${base}/api/backend-session/${encodeURIComponent(sid)}/ready`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({})
+              body: JSON.stringify({ pane: process.env.TMUX_PANE })
             })
           } catch {}
         }, 0)
