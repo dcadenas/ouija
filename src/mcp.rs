@@ -872,13 +872,11 @@ impl OuijaMcp {
         Ok(CallToolResult::success(vec![Content::text(result)]))
     }
 
-    #[tool(
-        description = "Advance a looping session: log an iteration. \
+    #[tool(description = "Advance a looping session: log an iteration. \
         With clean_context=false (default), stay in current conversation — just logs iteration and returns. \
         With clean_context=true, restart fresh (kill + respawn with prompt + reminder). \
         The session must have been started with a prompt. \
-        Use `message` to log what this iteration accomplished (visible on admin dashboard)."
-    )]
+        Use `message` to log what this iteration accomplished (visible on admin dashboard).")]
     async fn loop_next(
         &self,
         Parameters(params): Parameters<LoopNextParams>,

@@ -19,7 +19,10 @@ pub fn compute_average_loop_interval(log: &[LoopLogEntry]) -> Option<i64> {
     if log.len() < 3 {
         return None;
     }
-    let intervals: Vec<i64> = log.windows(2).map(|w| w[1].timestamp - w[0].timestamp).collect();
+    let intervals: Vec<i64> = log
+        .windows(2)
+        .map(|w| w[1].timestamp - w[0].timestamp)
+        .collect();
     let sum: i64 = intervals.iter().sum();
     Some(sum / intervals.len() as i64)
 }
@@ -205,20 +208,17 @@ impl Actor for SessionAgent {
                 // Only activate stall detection with 3+ entries
                 if let Some(avg) = avg {
                     let mild_secs = (avg * MILD_STALL_MULTIPLIER) as u64;
-                    let hard_secs =
-                        ((avg * HARD_STALL_MULTIPLIER) as u64).min(HARD_STALL_CAP_SECS);
+                    let hard_secs = ((avg * HARD_STALL_MULTIPLIER) as u64).min(HARD_STALL_CAP_SECS);
 
                     state.loop_mild_timer = Some(
-                        myself.send_after(
-                            std::time::Duration::from_secs(mild_secs),
-                            || SessionMsg::LoopMildStall,
-                        ),
+                        myself.send_after(std::time::Duration::from_secs(mild_secs), || {
+                            SessionMsg::LoopMildStall
+                        }),
                     );
                     state.loop_hard_timer = Some(
-                        myself.send_after(
-                            std::time::Duration::from_secs(hard_secs),
-                            || SessionMsg::LoopHardStall,
-                        ),
+                        myself.send_after(std::time::Duration::from_secs(hard_secs), || {
+                            SessionMsg::LoopHardStall
+                        }),
                     );
 
                     tracing::debug!(
@@ -276,9 +276,8 @@ impl Actor for SessionAgent {
 
                 // Inject reminder text if present (fires even without pending replies)
                 if let Some(ref reminder_text) = reminder {
-                    let wrapped = format!(
-                        "<ouija-status type=\"reminder\">{reminder_text}</ouija-status>"
-                    );
+                    let wrapped =
+                        format!("<ouija-status type=\"reminder\">{reminder_text}</ouija-status>");
                     let _ = crate::tmux::locked_inject(
                         &self.app_state,
                         &state.session_id,
@@ -388,11 +387,10 @@ impl SessionAgent {
         for p in &pending {
             let origin_info = {
                 let proto = self.app_state.protocol.read().await;
-                proto.sessions.get(&p.from).and_then(|s| {
-                    s.pane
-                        .clone()
-                        .map(|pane| (pane, s.metadata.vim_mode))
-                })
+                proto
+                    .sessions
+                    .get(&p.from)
+                    .and_then(|s| s.pane.clone().map(|pane| (pane, s.metadata.vim_mode)))
             };
             if let Some((origin_pane, origin_vim)) = origin_info {
                 let notify_msg = format!(
