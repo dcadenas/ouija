@@ -53,7 +53,7 @@ REGISTERED=$(echo "$RESP" | jq -r '.registered // empty' 2>/dev/null)
 # Store in tmux pane option so the statusline can read it instantly
 tmux set-option -p -t "$PANE" @ouija_id "$REGISTERED" 2>/dev/null
 
-echo "Registered as ${REGISTERED} on the ouija mesh."
+echo "<ouija-status type=\"registered\">Registered as ${REGISTERED} on the ouija mesh.</ouija-status>"
 
 # Version mismatch check: compare daemon version vs plugin cache version
 DAEMON_VERSION=$(echo "$STATUS" | jq -r '.version // ""')
@@ -78,10 +78,12 @@ PEER_LINES=$(echo "$STATUS" | jq -r --arg self "$NAME" '
   ] | sort[] // empty' 2>/dev/null)
 
 if [ -n "$PEER_LINES" ]; then
-  echo "Other sessions on the mesh:"
-  echo "$PEER_LINES" | while IFS= read -r line; do
-    echo "  - $line"
-  done
+  PEER_OUTPUT="Other sessions on the mesh:"
+  while IFS= read -r line; do
+    PEER_OUTPUT="$PEER_OUTPUT
+  - $line"
+  done <<< "$PEER_LINES"
+  echo "<ouija-status type=\"mesh-update\">${PEER_OUTPUT}</ouija-status>"
 else
-  echo "No other sessions on the mesh."
+  echo "<ouija-status type=\"mesh-update\">No other sessions on the mesh.</ouija-status>"
 fi

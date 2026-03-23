@@ -35,9 +35,9 @@ if [ -n "$MY_SESSION" ]; then
     MY_ROLE=$(echo "$MY_SESSION" | jq -r '.role // "none"')
     MY_BULLETIN=$(echo "$MY_SESSION" | jq -r '.bulletin // ""')
     if [ -n "$MY_BULLETIN" ]; then
-      OUTPUT="[ouija] Your metadata is stale. Current: role=\"${MY_ROLE}\" | bulletin=\"${MY_BULLETIN}\". Call session_update(id=\"${MY_ID}\", role=\"<what you're doing now>\", bulletin=\"<what you can help with or need>\") if these are outdated."
+      OUTPUT="<ouija-status type=\"stale\">Your metadata is stale. Current: role=\"${MY_ROLE}\" | bulletin=\"${MY_BULLETIN}\". Call session_update(id=\"${MY_ID}\", role=\"&lt;what you're doing now&gt;\", bulletin=\"&lt;what you can help with or need&gt;\") if these are outdated.</ouija-status>"
     else
-      OUTPUT="[ouija] Your metadata is stale (role: \"${MY_ROLE}\", no bulletin). Call session_update(id=\"${MY_ID}\", role=\"<what you're doing now>\", bulletin=\"<what you can help with or need>\") to stay discoverable."
+      OUTPUT="<ouija-status type=\"stale\">Your metadata is stale (role: \"${MY_ROLE}\", no bulletin). Call session_update(id=\"${MY_ID}\", role=\"&lt;what you're doing now&gt;\", bulletin=\"&lt;what you can help with or need&gt;\") to stay discoverable.</ouija-status>"
     fi
   fi
 fi
@@ -67,11 +67,12 @@ if [ "$CURRENT" != "$PREVIOUS" ]; then
   if [ -n "$JOINED_IDS" ]; then
     [ -n "$OUTPUT" ] && OUTPUT="$OUTPUT
 "
-    OUTPUT="${OUTPUT}[ouija mesh] joined:"
+    OUTPUT="${OUTPUT}<ouija-status type=\"mesh-update\">joined:"
     while IFS= read -r sid; do
       OUTPUT="$OUTPUT
 $(fmt_session "$CURRENT" "$sid")"
     done <<< "$JOINED_IDS"
+    OUTPUT="${OUTPUT}</ouija-status>"
   fi
 
   # Left sessions
@@ -79,7 +80,7 @@ $(fmt_session "$CURRENT" "$sid")"
   if [ -n "$LEFT_IDS" ]; then
     [ -n "$OUTPUT" ] && OUTPUT="$OUTPUT
 "
-    OUTPUT="${OUTPUT}[ouija mesh] left: $(echo "$LEFT_IDS" | tr '\n' ', ' | sed 's/,$//')"
+    OUTPUT="${OUTPUT}<ouija-status type=\"mesh-update\">left: $(echo "$LEFT_IDS" | tr '\n' ', ' | sed 's/,$//')</ouija-status>"
   fi
 
   # Metadata changes on existing sessions
@@ -109,7 +110,7 @@ $(fmt_session "$CURRENT" "$sid")"
   if [ -n "$CHANGES" ]; then
     [ -n "$OUTPUT" ] && OUTPUT="$OUTPUT
 "
-    OUTPUT="${OUTPUT}[ouija mesh] updated:$CHANGES"
+    OUTPUT="${OUTPUT}<ouija-status type=\"mesh-update\">updated:$CHANGES</ouija-status>"
   fi
 fi
 

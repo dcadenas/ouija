@@ -120,11 +120,12 @@ If \`session_send\` fails with "session not found", the sender disconnected. Cal
 
           const lines: string[] = []
           if (joined.length) {
-            lines.push("[ouija mesh] joined:")
+            lines.push(`<ouija-status type="mesh-update">joined:`)
             joined.forEach((s: any) => lines.push(`  - ${s.id}${s.role ? " | " + s.role : ""}`))
+            lines.push(`</ouija-status>`)
           }
           if (left.length) {
-            lines.push(`[ouija mesh] left: ${left.map((s: any) => s.id).join(", ")}`)
+            lines.push(`<ouija-status type="mesh-update">left: ${left.map((s: any) => s.id).join(", ")}</ouija-status>`)
           }
 
           if (lines.length) {
@@ -139,7 +140,7 @@ If \`session_send\` fails with "session not found", the sender disconnected. Cal
           if (me?.stale) {
             output.parts.push({
               type: "text",
-              text: `[ouija] Your metadata is stale. Call session_update(id="${sid}", role="<what you're doing>") to stay discoverable.`,
+              text: `<ouija-status type="stale">Your metadata is stale. Call session_update(id="${sid}", role="<what you're doing>") to stay discoverable.</ouija-status>`,
               id: crypto.randomUUID(),
               messageID,
               sessionID,
