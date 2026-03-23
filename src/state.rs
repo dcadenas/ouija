@@ -159,6 +159,18 @@ pub struct SessionMetadata {
     /// Which LLM model this session is configured to use (informational only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Reminder text re-injected on idle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reminder: Option<String>,
+    /// The original prompt from session_start, stored for loop_next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_prompt: Option<String>,
+    /// How many times loop_next has been called.
+    #[serde(default)]
+    pub loop_iteration: u64,
+    /// Log messages from loop_next calls. Capped at 100.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loop_log: Vec<crate::daemon_protocol::LoopLogEntry>,
 }
 
 fn default_true() -> bool {
@@ -179,6 +191,10 @@ impl Default for SessionMetadata {
             bulletin: None,
             worktree: false,
             model: None,
+            reminder: None,
+            original_prompt: None,
+            loop_iteration: 0,
+            loop_log: Vec::new(),
         }
     }
 }
@@ -596,6 +612,10 @@ impl AppState {
                         networked: entry.metadata.networked,
                         bulletin: entry.metadata.bulletin.clone(),
                         worktree: entry.metadata.worktree,
+                        reminder: entry.metadata.reminder.clone(),
+                        original_prompt: entry.metadata.original_prompt.clone(),
+                        loop_iteration: entry.metadata.loop_iteration,
+                        loop_log: entry.metadata.loop_log.clone(),
                         ..Default::default()
                     },
                 };

@@ -281,4 +281,13 @@ mod tests {
         actor.stop(None);
         handle.await.expect("actor failed");
     }
+
+    #[test]
+    fn session_metadata_loop_fields_default() {
+        let meta = crate::state::SessionMetadata::default();
+        assert!(meta.reminder.is_none());
+        assert!(meta.original_prompt.is_none());
+        assert_eq!(meta.loop_iteration, 0);
+        assert!(meta.loop_log.is_empty());
+    }
 }
