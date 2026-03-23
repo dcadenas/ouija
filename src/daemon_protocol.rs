@@ -1408,6 +1408,14 @@ impl DaemonState {
         }
         // No responds_to = standalone ack, no pending reply interaction
 
+        // done=true means the sender is finished — clear its loop reminder
+        // so the idle timer stops nudging it.
+        if done {
+            if let Some(session) = self.sessions.get_mut(from) {
+                session.metadata.reminder = None;
+            }
+        }
+
         // Resolve alias if target not found directly
         let resolved_to = if self.sessions.contains_key(to) {
             to.to_string()
@@ -2025,6 +2033,39 @@ mod tests {
                 .get("target")
                 .is_some_and(|v| v.iter().any(|p| p.msg_id == msg_id)),
             "done reply must clear pending"
+        );
+    }
+
+    #[test]
+    fn send_done_clears_sender_reminder() {
+        let mut state = DaemonState::new_for_model("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                reminder: Some("call loop_next".into()),
+                ..Default::default()
+            },
+        });
+        state.apply(Event::Register {
+            id: "boss".into(),
+            pane: Some("%2".into()),
+            metadata: Default::default(),
+        });
+
+        // worker sends done=true
+        state.apply(Event::Send {
+            from: "worker".into(),
+            to: "boss".into(),
+            message: "all done".into(),
+            expects_reply: false,
+            responds_to: None,
+            done: true,
+        });
+
+        assert!(
+            state.sessions["worker"].metadata.reminder.is_none(),
+            "done=true must clear sender's reminder"
         );
     }
 

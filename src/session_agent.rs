@@ -181,11 +181,14 @@ impl Actor for SessionAgent {
 
                 // Inject reminder text if present (fires even without pending replies)
                 if let Some(ref reminder_text) = reminder {
+                    let wrapped = format!(
+                        "<ouija-status type=\"reminder\">{reminder_text}</ouija-status>"
+                    );
                     let _ = crate::tmux::locked_inject(
                         &self.app_state,
                         &state.session_id,
                         &state.pane,
-                        reminder_text,
+                        &wrapped,
                         vim_mode,
                     )
                     .await;
