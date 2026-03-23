@@ -478,6 +478,7 @@ impl AppState {
                             expects_reply,
                             None,
                             None,
+                            None,
                         )
                         .await;
                         let reply = crate::protocol::WireMessage::CommandResult {
@@ -511,6 +512,7 @@ impl AppState {
                             prompt.as_deref(),
                             from.as_deref(),
                             expects_reply,
+                            None,
                             None,
                             None,
                         )

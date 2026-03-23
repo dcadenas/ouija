@@ -200,6 +200,9 @@ pub struct SessionNameParams {
     /// metadata for visibility; does not control the backend's model selection.
     #[serde(default)]
     pub model: Option<String>,
+    /// Reminder text appended to prompt at start and re-injected on idle.
+    #[serde(default)]
+    pub reminder: Option<String>,
 }
 
 #[tool_router]
@@ -448,6 +451,7 @@ impl OuijaMcp {
                         None, // prompt not available (message consumed by Event::Send)
                         Some(&params.from),
                         Some(params.expects_reply),
+                        None,
                         None,
                         None,
                     )
@@ -787,6 +791,7 @@ impl OuijaMcp {
                 params.expects_reply,
                 params.backend.as_deref(),
                 params.model.as_deref(),
+                params.reminder.as_deref(),
             )
             .await
         };
@@ -832,6 +837,7 @@ impl OuijaMcp {
                 params.expects_reply,
                 params.backend.as_deref(),
                 params.model.as_deref(),
+                params.reminder.as_deref(),
             )
             .await
         };

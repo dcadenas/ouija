@@ -1108,7 +1108,7 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         kill_session(state, name).await
     } else if let Some(rest) = cmd.strip_prefix("/start ") {
         let name = rest.trim();
-        start_session(state, name, None, None, None, None, None, None, None).await.0
+        start_session(state, name, None, None, None, None, None, None, None, None).await.0
     } else if let Some(rest) = cmd.strip_prefix("/restart ") {
         let rest = rest.trim();
         let (name, fresh) = if let Some(name) = rest.strip_suffix(" --fresh") {
@@ -1118,7 +1118,7 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         } else {
             (rest, false)
         };
-        restart_session(state, name, fresh, None, None, None, None, None).await.0
+        restart_session(state, name, fresh, None, None, None, None, None, None).await.0
     } else {
         "unknown command".to_string()
     }
@@ -1272,6 +1272,7 @@ pub async fn start_session(
     expects_reply: Option<bool>,
     backend: Option<&str>,
     model: Option<&str>,
+    reminder: Option<&str>,
 ) -> (String, Option<u64>) {
     // Check if already exists
     if state.protocol.read().await.sessions.contains_key(name) {
@@ -1434,6 +1435,8 @@ pub async fn start_session(
                 backend: Some(backend_name.clone()),
                 backend_session_id,
                 model: model.map(String::from),
+                reminder: reminder.map(String::from),
+                original_prompt: prompt.map(String::from),
                 ..Default::default()
             };
             state
@@ -1445,6 +1448,10 @@ pub async fn start_session(
                 .await;
             let mut prompt_msg_id = None;
             if let Some(text) = prompt {
+                let full_text = match reminder {
+                    Some(r) => format!("{text}\n\n{r}"),
+                    None => text.to_string(),
+                };
                 let injected = if let Some(sender) = from {
                     let er = expects_reply.unwrap_or(true);
                     let msg_id = {
@@ -1452,9 +1459,9 @@ pub async fn start_session(
                         proto.next_seq()
                     };
                     prompt_msg_id = Some(msg_id);
-                    crate::daemon_protocol::format_session_message(sender, text, er, msg_id, None, false)
+                    crate::daemon_protocol::format_session_message(sender, &full_text, er, msg_id, None, false)
                 } else {
-                    text.to_string()
+                    full_text
                 };
                 schedule_prompt_injection(state, name, pane_id.clone(), injected);
             }
@@ -1492,6 +1499,7 @@ pub async fn restart_session(
     expects_reply: Option<bool>,
     backend: Option<&str>,
     model: Option<&str>,
+    reminder: Option<&str>,
 ) -> (String, Option<u64>) {
     // Snapshot full metadata before killing so we can carry it forward
     let session = state.protocol.read().await.sessions.get(name).cloned();
@@ -1741,13 +1749,18 @@ pub async fn restart_session(
                     project_description: m.project_description.clone(),
                     last_metadata_update: None,
                     model: model.map(String::from).or_else(|| m.model.clone()),
-                    ..Default::default()
+                    reminder: reminder.map(String::from).or_else(|| m.reminder.clone()),
+                    original_prompt: m.original_prompt.clone().or_else(|| prompt.map(String::from)),
+                    loop_iteration: m.loop_iteration,
+                    loop_log: m.loop_log.clone(),
                 },
                 None => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),
                     backend: Some(backend_name.clone()),
                     backend_session_id,
                     model: model.map(String::from),
+                    reminder: reminder.map(String::from),
+                    original_prompt: prompt.map(String::from),
                     ..Default::default()
                 },
             };
@@ -1760,6 +1773,10 @@ pub async fn restart_session(
                 .await;
             let mut prompt_msg_id = None;
             if let Some(text) = prompt {
+                let full_text = match reminder {
+                    Some(r) => format!("{text}\n\n{r}"),
+                    None => text.to_string(),
+                };
                 let injected = if let Some(sender) = from {
                     let er = expects_reply.unwrap_or(true);
                     let msg_id = {
@@ -1767,9 +1784,9 @@ pub async fn restart_session(
                         proto.next_seq()
                     };
                     prompt_msg_id = Some(msg_id);
-                    crate::daemon_protocol::format_session_message(sender, text, er, msg_id, None, false)
+                    crate::daemon_protocol::format_session_message(sender, &full_text, er, msg_id, None, false)
                 } else {
-                    text.to_string()
+                    full_text
                 };
                 schedule_prompt_injection(state, name, pane_id.clone(), injected);
             }

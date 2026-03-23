@@ -1298,6 +1298,8 @@ pub struct SessionNameBody {
     /// Which LLM model to use (informational metadata only).
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    reminder: Option<String>,
 }
 
 /// Kill the coding assistant process in a session's tmux pane.
@@ -1324,6 +1326,7 @@ pub async fn start_session(
         body.expects_reply,
         body.backend.as_deref(),
         body.model.as_deref(),
+        body.reminder.as_deref(),
     )
     .await;
     (StatusCode::OK, Json(json!({ "result": result })))
@@ -1344,6 +1347,7 @@ pub async fn restart_session(
         body.expects_reply,
         body.backend.as_deref(),
         body.model.as_deref(),
+        body.reminder.as_deref(),
     )
     .await;
     (StatusCode::OK, Json(json!({ "result": result })))
