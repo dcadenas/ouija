@@ -67,8 +67,8 @@ pub async fn dashboard(State(state): State<SharedState>) -> Html<String> {
         if let Some(ref b) = s.metadata.bulletin {
             details.push(format!("bulletin: {}", html_escape(b)));
         }
-        if s.metadata.loop_iteration > 0 {
-            details.push(format!("loop: iteration {}", s.metadata.loop_iteration));
+        if s.metadata.iteration > 0 {
+            details.push(format!("loop: iteration {}", s.metadata.iteration));
         }
         if let Some(ref reminder) = s.metadata.reminder {
             let truncated = if reminder.len() > 80 {

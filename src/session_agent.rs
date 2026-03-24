@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use ractor::concurrency::JoinHandle;
 use ractor::{Actor, ActorProcessingErr, ActorRef, MessagingErr};
 
-use crate::daemon_protocol::{LoopLogEntry, PendingReplyEntry};
+use crate::daemon_protocol::{IterationLogEntry, PendingReplyEntry};
 use crate::state::AppState;
 
 /// Hardcoded stall thresholds.
@@ -13,9 +13,9 @@ const HARD_STALL_MULTIPLIER: i64 = 10;
 /// Absolute cap for hard stall: 30 minutes.
 const HARD_STALL_CAP_SECS: u64 = 1800;
 
-/// Compute average interval between consecutive loop_log timestamps.
+/// Compute average interval between consecutive iteration_log timestamps.
 /// Returns None if fewer than 3 entries (insufficient data for stall detection).
-pub fn compute_average_loop_interval(log: &[LoopLogEntry]) -> Option<i64> {
+pub fn compute_average_loop_interval(log: &[IterationLogEntry]) -> Option<i64> {
     if log.len() < 3 {
         return None;
     }
@@ -195,13 +195,13 @@ impl Actor for SessionAgent {
                     h.abort();
                 }
 
-                // Compute average interval from loop_log
+                // Compute average interval from iteration_log
                 let avg = {
                     let proto = self.app_state.protocol.read().await;
                     proto
                         .sessions
                         .get(&state.session_id)
-                        .map(|s| compute_average_loop_interval(&s.metadata.loop_log))
+                        .map(|s| compute_average_loop_interval(&s.metadata.iteration_log))
                         .unwrap_or(None)
                 };
 
@@ -422,7 +422,7 @@ impl SessionAgent {
         let Some(meta) = meta else {
             return;
         };
-        let Some(ref prompt) = meta.original_prompt else {
+        let Some(ref prompt) = meta.prompt else {
             return;
         };
 
@@ -452,7 +452,7 @@ impl SessionAgent {
             {
                 let mut proto = app_state.protocol.write().await;
                 if let Some(session) = proto.sessions.get_mut(&sid) {
-                    session.metadata.inherit_loop_fields_from(&stash);
+                    session.metadata.inherit_recurrence_from(&stash);
                 }
             }
             let proto = app_state.protocol.read().await;
@@ -522,24 +522,24 @@ mod tests {
     }
 
     #[test]
-    fn session_metadata_loop_fields_default() {
+    fn session_metadata_recurrence_fields_default() {
         let meta = crate::state::SessionMetadata::default();
         assert!(meta.reminder.is_none());
-        assert!(meta.original_prompt.is_none());
-        assert_eq!(meta.loop_iteration, 0);
-        assert!(meta.loop_log.is_empty());
-        assert!(meta.last_loop_next.is_none());
+        assert!(meta.prompt.is_none());
+        assert_eq!(meta.iteration, 0);
+        assert!(meta.iteration_log.is_empty());
+        assert!(meta.last_iteration_at.is_none());
     }
 
     #[test]
     fn compute_average_interval_needs_3_entries() {
-        let log: Vec<crate::daemon_protocol::LoopLogEntry> = vec![
-            crate::daemon_protocol::LoopLogEntry {
+        let log: Vec<crate::daemon_protocol::IterationLogEntry> = vec![
+            crate::daemon_protocol::IterationLogEntry {
                 iteration: 1,
                 message: None,
                 timestamp: 100,
             },
-            crate::daemon_protocol::LoopLogEntry {
+            crate::daemon_protocol::IterationLogEntry {
                 iteration: 2,
                 message: None,
                 timestamp: 200,
@@ -551,17 +551,17 @@ mod tests {
     #[test]
     fn compute_average_interval_with_3_entries() {
         let log = vec![
-            crate::daemon_protocol::LoopLogEntry {
+            crate::daemon_protocol::IterationLogEntry {
                 iteration: 1,
                 message: None,
                 timestamp: 100,
             },
-            crate::daemon_protocol::LoopLogEntry {
+            crate::daemon_protocol::IterationLogEntry {
                 iteration: 2,
                 message: None,
                 timestamp: 200,
             },
-            crate::daemon_protocol::LoopLogEntry {
+            crate::daemon_protocol::IterationLogEntry {
                 iteration: 3,
                 message: None,
                 timestamp: 400,
@@ -573,7 +573,7 @@ mod tests {
 
     #[test]
     fn compute_average_interval_empty() {
-        let log: Vec<crate::daemon_protocol::LoopLogEntry> = vec![];
+        let log: Vec<crate::daemon_protocol::IterationLogEntry> = vec![];
         assert!(compute_average_loop_interval(&log).is_none());
     }
 

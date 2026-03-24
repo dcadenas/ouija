@@ -100,10 +100,10 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
                 "backend_session_id": s.metadata.backend_session_id,
                 "backend": s.metadata.backend,
                 "reminder": s.metadata.reminder,
-                "original_prompt": s.metadata.original_prompt,
-                "loop_iteration": s.metadata.loop_iteration,
-                "loop_log": s.metadata.loop_log,
-                "last_loop_next": s.metadata.last_loop_next,
+                "prompt": s.metadata.prompt,
+                "iteration": s.metadata.iteration,
+                "iteration_log": s.metadata.iteration_log,
+                "last_iteration_at": s.metadata.last_iteration_at,
             })
         })
         .collect();

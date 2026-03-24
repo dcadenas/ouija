@@ -17,7 +17,7 @@ const TUI_READY_TIMEOUT_SECS: u64 = 30;
 const REVIVAL_POLL_SECS: u64 = 2;
 
 /// What happens each time the task fires.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq, Hash, schemars::JsonSchema)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum OnFire {
     /// Inject into live session; revive with --continue if dead.

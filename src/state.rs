@@ -166,18 +166,21 @@ pub struct SessionMetadata {
     /// Reminder text re-injected on idle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reminder: Option<String>,
-    /// The original prompt from session_start, stored for loop_next.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub original_prompt: Option<String>,
+    /// Original prompt from session_start, stored for re-injection on iteration.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "original_prompt")]
+    pub prompt: Option<String>,
     /// How many times loop_next has been called.
-    #[serde(default)]
-    pub loop_iteration: u64,
-    /// Log messages from loop_next calls. Capped at 100.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub loop_log: Vec<crate::daemon_protocol::LoopLogEntry>,
-    /// Unix timestamp of the most recent loop_next call. Used by stall detection.
+    #[serde(default, alias = "loop_iteration")]
+    pub iteration: u64,
+    /// Log messages from each iteration. Capped at 100.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "loop_log")]
+    pub iteration_log: Vec<crate::daemon_protocol::IterationLogEntry>,
+    /// Unix timestamp of the most recent iteration. Used by stall detection.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "last_loop_next")]
+    pub last_iteration_at: Option<i64>,
+    /// What happens each time a scheduled task fires for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_loop_next: Option<i64>,
+    pub on_fire: Option<crate::scheduler::OnFire>,
 }
 
 fn default_true() -> bool {
@@ -199,10 +202,11 @@ impl Default for SessionMetadata {
             worktree: false,
             model: None,
             reminder: None,
-            original_prompt: None,
-            loop_iteration: 0,
-            loop_log: Vec::new(),
-            last_loop_next: None,
+            prompt: None,
+            iteration: 0,
+            iteration_log: Vec::new(),
+            last_iteration_at: None,
+            on_fire: None,
         }
     }
 }
@@ -629,9 +633,9 @@ impl AppState {
                         bulletin: entry.metadata.bulletin.clone(),
                         worktree: entry.metadata.worktree,
                         reminder: entry.metadata.reminder.clone(),
-                        original_prompt: entry.metadata.original_prompt.clone(),
-                        loop_iteration: entry.metadata.loop_iteration,
-                        loop_log: entry.metadata.loop_log.clone(),
+                        prompt: entry.metadata.prompt.clone(),
+                        iteration: entry.metadata.iteration,
+                        iteration_log: entry.metadata.iteration_log.clone(),
                         ..Default::default()
                     },
                 };
