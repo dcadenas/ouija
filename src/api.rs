@@ -642,6 +642,7 @@ pub async fn remove(
     let effects = state
         .apply_and_execute(crate::daemon_protocol::Event::Remove {
             id: body.id.clone(),
+            keep_worktree: false,
         })
         .await;
     if effects

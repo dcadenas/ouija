@@ -1128,6 +1128,14 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
 
 /// Kill the Claude process in a named session's pane.
 pub async fn kill_session(state: &std::sync::Arc<AppState>, name: &str) -> String {
+    kill_session_inner(state, name, false).await
+}
+
+pub async fn kill_session_keep_worktree(state: &std::sync::Arc<AppState>, name: &str) -> String {
+    kill_session_inner(state, name, true).await
+}
+
+async fn kill_session_inner(state: &std::sync::Arc<AppState>, name: &str, keep_worktree: bool) -> String {
     let session = state.protocol.read().await.sessions.get(name).cloned();
     let Some(session) = session else {
         return format!("session '{name}' not found");
@@ -1265,6 +1273,7 @@ pub async fn kill_session(state: &std::sync::Arc<AppState>, name: &str) -> Strin
     state
         .apply_and_execute(crate::daemon_protocol::Event::Remove {
             id: name.to_string(),
+            keep_worktree,
         })
         .await;
     format!("{msg}, session '{name}' removed")
@@ -1587,6 +1596,7 @@ pub async fn restart_session(
         state
             .apply_and_execute(crate::daemon_protocol::Event::Remove {
                 id: name.to_string(),
+                keep_worktree: true, // pre-restart removal — preserve worktree
             })
             .await;
     }

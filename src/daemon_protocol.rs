@@ -185,6 +185,7 @@ pub enum Event {
     },
     Remove {
         id: String,
+        keep_worktree: bool,
     },
     UpdateMetadata {
         id: String,
@@ -505,7 +506,7 @@ impl DaemonState {
         match event {
             Event::Register { id, pane, metadata } => self.apply_register(id, pane, metadata),
             Event::Rename { old_id, new_id } => self.apply_rename(&old_id, &new_id),
-            Event::Remove { id } => self.apply_remove(&id),
+            Event::Remove { id, keep_worktree } => self.apply_remove(&id, keep_worktree),
             Event::UpdateMetadata {
                 id,
                 role,
@@ -759,7 +760,7 @@ impl DaemonState {
         effects
     }
 
-    fn apply_remove(&mut self, id: &str) -> Vec<Effect> {
+    fn apply_remove(&mut self, id: &str, keep_worktree: bool) -> Vec<Effect> {
         let mut effects = Vec::new();
 
         // Check origin before removing
@@ -802,12 +803,14 @@ impl DaemonState {
             removed_ids: vec![id.to_string()],
         });
 
-        // Worktree cleanup on explicit kill (not reap)
-        if let Some(ref dir) = session.metadata.project_dir {
-            if dir.contains("/.claude/worktrees/") {
-                effects.push(Effect::CleanupWorktree {
-                    project_dir: dir.clone(),
-                });
+        // Worktree cleanup on explicit kill (not reap), unless keep_worktree is set
+        if !keep_worktree {
+            if let Some(ref dir) = session.metadata.project_dir {
+                if dir.contains("/.claude/worktrees/") {
+                    effects.push(Effect::CleanupWorktree {
+                        project_dir: dir.clone(),
+                    });
+                }
             }
         }
 
@@ -2327,7 +2330,7 @@ mod tests {
             pane: Some("%1".into()),
             metadata: Default::default(),
         });
-        let effects = state.apply(Event::Remove { id: "s1".into() });
+        let effects = state.apply(Event::Remove { id: "s1".into(), keep_worktree: false });
         assert!(!state.sessions.contains_key("s1"));
         assert!(
             effects
@@ -2355,6 +2358,7 @@ mod tests {
         );
         let effects = state.apply(Event::Remove {
             id: "remote/s1".into(),
+            keep_worktree: false,
         });
         assert!(state.sessions.contains_key("remote/s1"));
         assert!(
@@ -2375,7 +2379,7 @@ mod tests {
                 ..Default::default()
             },
         });
-        let effects = state.apply(Event::Remove { id: "wt".into() });
+        let effects = state.apply(Event::Remove { id: "wt".into(), keep_worktree: false });
         assert!(
             effects
                 .iter()
@@ -3013,7 +3017,7 @@ mod tests {
         assert_eq!(d1.aliases.get("host0/web"), Some(&"host0/frontend".into()));
 
         // d0 removes a session
-        d0.apply(Event::Remove { id: "api".into() });
+        d0.apply(Event::Remove { id: "api".into(), keep_worktree: false });
 
         // d1 receives the removal
         d1.apply(Event::IncomingWire {
@@ -3402,7 +3406,7 @@ mod stateright_model {
                                 ..Default::default()
                             },
                         },
-                        ModelMsg::Remove { id } => Event::Remove { id },
+                        ModelMsg::Remove { id } => Event::Remove { id, keep_worktree: false },
                         ModelMsg::Rename { old_id, new_id } => Event::Rename { old_id, new_id },
                         ModelMsg::WireAnnounce {
                             id,

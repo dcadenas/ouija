@@ -203,6 +203,9 @@ pub struct SessionNameParams {
     /// Reminder text appended to prompt at start and re-injected on idle.
     #[serde(default)]
     pub reminder: Option<String>,
+    /// If true, preserve the git worktree after killing the session.
+    #[serde(default)]
+    pub keep_worktree: Option<bool>,
 }
 
 /// Parameters for the `loop_next` MCP tool.
@@ -321,6 +324,7 @@ impl OuijaMcp {
             .state
             .apply_and_execute(crate::daemon_protocol::Event::Remove {
                 id: params.id.clone(),
+                keep_worktree: false,
             })
             .await;
         if effects
@@ -783,14 +787,19 @@ impl OuijaMcp {
     }
 
     #[tool(
-        description = "Gracefully stop a coding session — sends /exit first, falls back to SIGTERM after 10s. Only use when the user explicitly asks to kill or stop a specific session. NEVER kill a session to work around a name conflict with session_start. Use node/name for remote sessions."
+        description = "Gracefully stop a coding session — sends /exit first, falls back to SIGTERM after 10s. Only use when the user explicitly asks to kill or stop a specific session. NEVER kill a session to work around a name conflict with session_start. Use node/name for remote sessions. Set keep_worktree=true to preserve the git worktree after killing."
     )]
     async fn session_kill(
         &self,
         Parameters(params): Parameters<SessionNameParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let result = execute_command(&self.state, &params.name, "/kill").await;
-        Ok(CallToolResult::success(vec![Content::text(result)]))
+        if params.keep_worktree.unwrap_or(false) {
+            let result = crate::nostr_transport::kill_session_keep_worktree(&self.state, &params.name).await;
+            Ok(CallToolResult::success(vec![Content::text(result)]))
+        } else {
+            let result = execute_command(&self.state, &params.name, "/kill").await;
+            Ok(CallToolResult::success(vec![Content::text(result)]))
+        }
     }
 
     #[tool(

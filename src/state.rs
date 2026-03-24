@@ -1316,7 +1316,7 @@ pub(crate) mod tests {
         let state = AppState::new(test_config());
         proto_register(&state, "s1", Some("%1")).await;
         state
-            .apply_and_execute(crate::daemon_protocol::Event::Remove { id: "s1".into() })
+            .apply_and_execute(crate::daemon_protocol::Event::Remove { id: "s1".into(), keep_worktree: false })
             .await;
         assert!(state.protocol.read().await.sessions.is_empty());
     }
@@ -1325,7 +1325,7 @@ pub(crate) mod tests {
     async fn remove_nonexistent_is_noop() {
         let state = AppState::new(test_config());
         let effects = state
-            .apply_and_execute(crate::daemon_protocol::Event::Remove { id: "nope".into() })
+            .apply_and_execute(crate::daemon_protocol::Event::Remove { id: "nope".into(), keep_worktree: false })
             .await;
         assert!(
             effects
@@ -1351,6 +1351,7 @@ pub(crate) mod tests {
         let effects = state
             .apply_and_execute(crate::daemon_protocol::Event::Remove {
                 id: "remote/s1".into(),
+                keep_worktree: false,
             })
             .await;
         assert!(
