@@ -126,6 +126,18 @@ impl std::fmt::Debug for AppState {
 }
 
 /// Mutable metadata describing a session's configuration and context.
+///
+/// # Design: Trigger + SessionConfig + Runtime
+///
+/// SessionMetadata = SessionConfig (prompt, reminder, project_dir, on_fire) + Runtime
+/// (iteration, iteration_log, last_iteration_at) + Display (role, bulletin, vim_mode).
+/// ScheduledTask (scheduler.rs) = SessionConfig + Trigger (cron, enabled, next_run).
+/// The shared SessionConfig fields are stamped here when a task creates or revives
+/// a session.
+///
+/// The SessionConfig fields aren't a named type yet — they're copied field-by-field
+/// during the trigger→session handoff. Extracting a named SessionConfig would make
+/// this explicit, especially if a third trigger type (file watch) is added.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionMetadata {
     #[serde(default)]

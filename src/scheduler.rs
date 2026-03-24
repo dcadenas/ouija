@@ -74,6 +74,19 @@ impl OnFire {
 }
 
 /// A cron-driven task that injects messages into sessions.
+///
+/// # Design: Trigger + SessionConfig + Runtime
+///
+/// ScheduledTask = SessionConfig (prompt, reminder, project_dir, on_fire) + Trigger
+/// (cron, enabled, next_run). SessionMetadata (state.rs) = SessionConfig + Runtime
+/// (iteration, iteration_log). The shared SessionConfig fields (prompt, reminder,
+/// project_dir, on_fire) are stamped onto SessionMetadata when the task creates or
+/// revives a session — that's the handoff.
+///
+/// A third trigger type (file watch — see GitHub issue #1) would add
+/// Trigger::FileWatch alongside Trigger::Cron and the implicit Trigger::SelfDriven
+/// (loop_next). If that happens, extracting a named SessionConfig type would make
+/// the trigger→session handoff explicit instead of field-by-field copying.
 #[derive(Clone, Debug, Serialize)]
 pub struct ScheduledTask {
     pub id: String,
