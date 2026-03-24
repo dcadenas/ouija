@@ -481,7 +481,23 @@ Change `message: String` to `#[serde(default)] message: Option<String>` in Raw. 
 
 - [ ] **Step 5: Update new_task() signature** (lines 765-793)
 
-Replace `message: String` with `message: Option<String>`, add `prompt: Option<String>`, `reminder: Option<String>`.
+New signature (exact parameter order matching the test in Step 1):
+
+```rust
+pub fn new_task(
+    name: String,
+    cron: String,
+    target_session: Option<String>,
+    message: Option<String>,
+    prompt: Option<String>,
+    reminder: Option<String>,
+    once: bool,
+    backend_session_id: Option<String>,
+    on_fire: OnFire,
+) -> ScheduledTask {
+```
+
+Update the function body to use the new fields. Keep the `#[expect(clippy::too_many_arguments)]` attribute.
 
 - [ ] **Step 6: Update execute_task()** (lines 302-314)
 
@@ -492,7 +508,9 @@ let formatted = task.message.as_deref().map(format_scheduled_message);
 let run = execute_injection(state, &task, formatted.as_deref()).await;
 ```
 
-Update `execute_injection` signature to take `Option<&str>` instead of `&str`.
+Update `execute_injection` signature from `formatted: &str` to `formatted: Option<&str>`. Update all callers:
+- `execute_task()` (this function) — already returns `Option` from the `map` above
+- `inject_into_pane()`, `respawn_and_inject()`, `revive_from_task()` — update these internal callers to pass `formatted` (now `Option<&str>`) through. Inside `inject_into_pane` and `respawn_and_inject`, guard the injection with `if let Some(fmt) = formatted`.
 
 - [ ] **Step 7: Update TaskCreateParams in mcp.rs** (lines 128-151)
 
@@ -595,18 +613,24 @@ if let Some(ref prompt) = task.prompt {
 }
 ```
 
-Note: `schedule_prompt_injection` needs to be made `pub` in `nostr_transport.rs` if not already.
+- [ ] **Step 5: Make schedule_prompt_injection pub(crate)**
 
-- [ ] **Step 5: Fix respawn_and_inject() to stamp bootstrap** (after line 466)
+In `src/nostr_transport.rs:2068`, change `fn schedule_prompt_injection(` to `pub(crate) fn schedule_prompt_injection(`. This is needed for `scheduler.rs` to call it.
+
+- [ ] **Step 6: Fix respawn_and_inject() to stamp bootstrap** (after line 466)
 
 Replace the `backend_session_id` clear block with the expanded version from the spec.
 
-- [ ] **Step 6: Run `cargo test` and `cargo clippy`**
+- [ ] **Step 7: Run `cargo test` and `cargo clippy`**
 
 Run: `cargo test 2>&1 | tail -10`
 Expected: PASS
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Remove dead code: format_scheduled_message()**
+
+If `format_scheduled_message()` is now only called inside the backward compat `Option` path and clippy flags no issues, leave it. If clippy warns about unused code, remove the function and its test (`format_scheduled_message_basic`).
+
+- [ ] **Step 9: Commit**
 
 ```bash
 git add -A && git commit -m "fix scheduler: alive no-op, bootstrap on revival, prompt injection"
