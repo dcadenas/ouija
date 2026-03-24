@@ -420,11 +420,33 @@ impl OuijaMcp {
     /// it will be injected into their tmux pane. If remote, it goes over the network.
     /// If the target session doesn't exist but exactly one matching project is found,
     /// the session is auto-started with the message as the initial prompt.
-    #[tool(description = "Send a message to another session")]
+    #[tool(description = "Send a message to another session. When replying to a <msg reply=\"true\" id=\"N\">, pass that N as responds_to and set done=true to clear the pending reply and stop reminder nudges.")]
     async fn session_send(
         &self,
         Parameters(params): Parameters<SessionSendParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        // Auto-fill responds_to: when the sender omits responds_to but owes exactly
+        // one pending reply to the target, assume they're replying to that message.
+        // If multiple pending replies exist for the same target, don't guess — the
+        // LLM must be explicit. This heuristic catches the ~50% of cases where LLMs
+        // forget to pass responds_to, preventing stale reminder nudges.
+        let responds_to = if params.responds_to.is_none() {
+            let proto = self.state.protocol.read().await;
+            if let Some(pending) = proto.pending_replies.get(&params.from) {
+                let from_target: Vec<_> =
+                    pending.iter().filter(|p| p.from == params.to).collect();
+                if from_target.len() == 1 {
+                    Some(from_target[0].msg_id)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            params.responds_to
+        };
+
         let effects = self
             .state
             .apply_and_execute(crate::daemon_protocol::Event::Send {
@@ -432,7 +454,7 @@ impl OuijaMcp {
                 to: params.to.clone(),
                 message: params.message,
                 expects_reply: params.expects_reply,
-                responds_to: params.responds_to,
+                responds_to,
                 done: params.done,
             })
             .await;
