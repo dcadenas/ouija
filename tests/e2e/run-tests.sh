@@ -1236,7 +1236,7 @@ sleep 2
 norest_pane=$(api "$BASE" GET /api/status | jq -r '.sessions[] | select(.id == "loop-norest") | .pane // ""')
 # Call loop_next with clean_context=false (default)
 mcp_result=$(mcp_call_tool "$BASE" "loop_next" '{"from":"loop-norest","message":"first pass"}')
-assert_contains "30b: response has iteration" "$mcp_result" "iteration 1 logged"
+assert_contains "30b: response has iteration" "$mcp_result" '<loop iteration="1" />'
 # Verify iteration incremented
 status=$(api "$BASE" GET /api/status)
 iter=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-norest") | .loop_iteration // 0')
@@ -1248,7 +1248,7 @@ if [ "$last_ln" = "null" ]; then fail "30b: last_loop_next should be set"; else 
 log "Test 30c: loop_next clean_context=false increments without session restart"
 # Call again — session should still be alive (no restart)
 mcp_result2=$(mcp_call_tool "$BASE" "loop_next" '{"from":"loop-norest","message":"second pass"}')
-assert_contains "30c: response has iteration 2" "$mcp_result2" "iteration 2 logged"
+assert_contains "30c: response has iteration 2" "$mcp_result2" '<loop iteration="2" />'
 status2=$(api "$BASE" GET /api/status)
 iter2=$(echo "$status2" | jq -r '.sessions[] | select(.id == "loop-norest") | .loop_iteration // 0')
 assert_eq "30c: iteration is 2" "$iter2" "2"

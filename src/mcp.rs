@@ -1005,12 +1005,15 @@ impl OuijaMcp {
             self.state.persist_protocol_state(&proto);
 
             // Build response — include reminder every 10th iteration
-            let mut response = format!("iteration {} logged", iteration);
-            if iteration % 10 == 0 {
+            let response = if iteration % 10 == 0 {
                 if let Some(ref reminder_text) = reminder {
-                    response.push_str(&format!("\n\nReminder: {}", reminder_text));
+                    format!("<loop iteration=\"{iteration}\">{reminder_text}</loop>")
+                } else {
+                    format!("<loop iteration=\"{iteration}\" />")
                 }
-            }
+            } else {
+                format!("<loop iteration=\"{iteration}\" />")
+            };
 
             Ok(CallToolResult::success(vec![Content::text(response)]))
         }
@@ -1157,10 +1160,11 @@ to start a new conversation each fire while keeping the worktree
 Sessions can chain indefinitely using loop_next. Each call logs an iteration and \
 optionally restarts the session.
 
-- `loop_next(from, message?, clean_context?)` — log an iteration.
+- `loop_next(from, message?, clean_context?)` — log an iteration. Returns `<loop iteration=\"N\" />` \
+(or `<loop iteration=\"N\">reminder text</loop>` every 10th iteration).
   - `clean_context=false` (default): stay in current conversation, keep accumulated context. \
-The daemon logs the iteration and returns. Every 10th iteration, the reminder is included \
-in the response to prevent context drift.
+The daemon logs the iteration and returns. Use the iteration number for any policy your prompt \
+defines (e.g. restart every tenth iteration to shed context drift).
   - `clean_context=true`: restart with fresh context (kill + respawn with prompt + reminder). \
 Fire-and-forget — the session dies and respawns.
 - To stop looping, simply don't call loop_next. Use session_send(done=true) to reply \

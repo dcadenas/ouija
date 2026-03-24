@@ -60,6 +60,8 @@ session_start(
 
 The session runs one change → measure → keep/revert per iteration, logging results to a TSV. `INSTRUCTIONS.md` defines the rules and scope. `FINDINGS.md` accumulates architecture knowledge that survives across restarts. The daemon detects stalls automatically and nudges or force-restarts the session.
 
+**Context decay is the prompt's job.** Each `loop_next` call returns `<loop iteration="N" />` — the session sees its current iteration and can use it for any policy the prompt defines. A migration might restart every iteration. An optimization loop might accumulate context and restart every tenth iteration to shed drift. The daemon provides the counter and the `clean_context` lever; the prompt decides when to pull it.
+
 **Peer-to-peer collaboration.** No hierarchy. Two long-running sessions can message each other directly — one optimizing a skill while the other evaluates results, or one migrating files while the other reviews the diffs. They coordinate through `session_send`, not through a central orchestrator.
 
 **Always interactive.** Every session runs in a tmux pane. You can jump into any session at any time — watch it work, type a correction, answer a question, or take over. The session doesn't know or care whether the next input comes from a peer session or from you at the keyboard.
