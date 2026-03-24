@@ -13,14 +13,16 @@ These are isomorphic. Both do: "advance a recurring session -- if context is fin
 
 ## Insight
 
-The prompt is the control plane. It defines the workflow, the iteration strategy, the clean_context policy. The daemon provides dumb primitives -- the prompt orchestrates them.
+The prompt is the control plane. It defines the workflow, the iteration strategy, the clean_context policy. The daemon provides dumb primitives -- the prompt orchestrates them. Prompts can instruct the session to call `loop_next(clean_context=true)` every N iterations, or when context feels heavy, or after a certain kind of work.
 
 Two orthogonal modes of long-running sessions:
 
-- **Active** (loop_next): no idle. Session finishes work, calls loop_next, continues. The session drives its own pace. Runs forever as long as it keeps calling loop_next.
+- **Active** (loop_next): no idle. Session finishes work, calls loop_next, continues. The session drives its own pace. Runs forever as long as the daemon's plumbing keeps it going.
 - **Passive** (cron): idle between fires. Cron triggers, session wakes, does work, goes idle. Cron triggers again. Runs forever on a schedule.
 
-Both use the same machinery: prompt + reminder + on_fire + iteration tracking + stall detection. The divine-perf autoresearch experiment demonstrates the active pattern: prompt points to INSTRUCTIONS.md, session reads external state, does one iteration, writes results, calls loop_next. No per-fire "message" needed -- the prompt drives everything.
+The daemon's job is to ensure "forever" despite LLM context drift and fragility. The reminder is the primary mechanism: it tells the LLM to call `loop_next`, refresh its flow, or use `clean_context=true` when context degrades. Stall detection is the safety net when even the reminder fails -- force-restarting with a clean prompt.
+
+Both modes use the same machinery: prompt + reminder + on_fire + iteration tracking + stall detection. The divine-perf autoresearch experiment demonstrates the active pattern: prompt points to INSTRUCTIONS.md, session reads external state, does one iteration, writes results, calls loop_next. No per-fire "message" needed -- the prompt drives everything.
 
 The `message` field on ScheduledTask was a workaround for tasks not having prompts. With prompts on tasks, `message` is redundant:
 - For `new_session` / clean context: the prompt drives the work.
@@ -66,11 +68,34 @@ pub on_fire: Option<OnFire>,
 
 **Rename:** `LoopLogEntry` -> `IterationLogEntry` (serde alias on containing fields).
 
-**Rename:** `inherit_loop_fields_from()` -> `inherit_recurrence_from()` (same logic, new names).
+**Rename:** `inherit_loop_fields_from()` -> `inherit_recurrence_from()`. Updated to also inherit `on_fire`:
+
+```rust
+pub fn inherit_recurrence_from(&mut self, source: &SessionMeta) {
+    if self.prompt.is_none() {
+        self.prompt = source.prompt.clone();
+    }
+    if self.reminder.is_none() {
+        self.reminder = source.reminder.clone();
+    }
+    if self.on_fire.is_none() {
+        self.on_fire = source.on_fire.clone();
+    }
+    if self.iteration == 0 && source.iteration > 0 {
+        self.iteration = source.iteration;
+    }
+    if self.iteration_log.is_empty() && !source.iteration_log.is_empty() {
+        self.iteration_log = source.iteration_log.clone();
+    }
+    if self.last_iteration_at.is_none() && source.last_iteration_at.is_some() {
+        self.last_iteration_at = source.last_iteration_at;
+    }
+}
+```
 
 ### ScheduledTask Changes
 
-**Remove `message`** (required -> absent). Existing persisted tasks with `message` still deserialize via `#[serde(default)]` but the field is ignored for new task creation.
+**Remove `message` as a required field.** The field becomes `Option<String>` with `#[serde(default)]` for deserialization of existing persisted tasks. The custom `Deserialize` impl's inner `Raw` struct must also change `message: String` to `#[serde(default)] message: Option<String>` since the custom impl bypasses derive attributes. New tasks created via the API don't have `message`.
 
 **Add bootstrap fields:**
 
@@ -103,19 +128,21 @@ pub fn kills_alive(&self) -> bool {
 }
 ```
 
-Replace `task.on_fire.clears_context()` with `task.on_fire.kills_alive()` in the alive-session branch of `execute_injection()`. `clears_context()` remains for the dead-session revival path.
+Replace `task.on_fire.clears_context()` with `task.on_fire.kills_alive()` in the alive-session branch of `execute_injection()`. `clears_context()` remains for the dead-session revival path (determines `--continue` vs fresh start).
+
+**Update `OnFire::NewSession` doc comment:** Change from "Kill pane, start fresh conversation" to "Start fresh when dead/missing; no-op when alive (reminder handles nudging)."
 
 **Resulting behavior:**
 
 | OnFire | Alive | Dead/Missing |
 |---|---|---|
-| ContinueSession | do nothing (reminder handles nudging) | revive with --continue/--resume, apply prompt+reminder |
-| NewSession | do nothing (reminder handles nudging) | start fresh, apply prompt+reminder |
-| PersistentWorktree(clear=false) | do nothing | resume in worktree, apply prompt+reminder |
+| ContinueSession | no-op (reminder handles nudging on idle) | revive with --continue/--resume, apply prompt+reminder |
+| NewSession | no-op (reminder handles nudging on idle) | start fresh, apply prompt+reminder |
+| PersistentWorktree(clear=false) | no-op | resume in worktree, apply prompt+reminder |
 | PersistentWorktree(clear=true) | respawn in worktree | start fresh in worktree |
 | DisposableWorktree | respawn in disposable worktree | start fresh in disposable worktree |
 
-Note: for ContinueSession and NewSession, "do nothing" on alive sessions means the reminder system handles any nudging. The cron fire just ensures liveness.
+For ContinueSession and NewSession, "no-op" means the cron fire only ensures liveness. The session is alive and working; the reminder system handles nudging when it goes idle, and stall detection handles it if loop_next stalls. The cron fire still increments `run_count` and updates `last_run`/`last_status` for observability.
 
 ### Bootstrap Flow: Task Revives Session With Recurrence State
 
@@ -140,13 +167,29 @@ let proto_meta = SessionMeta {
 };
 ```
 
-`inherit_recurrence_from()` in `apply_register` merges these with any existing state.
+`inherit_recurrence_from()` in `apply_register` merges these with any existing state (iteration count, log, etc. from a previous incarnation).
 
-Same fix in `respawn_and_inject()`: stamp prompt/reminder/on_fire on session metadata after respawn.
+**Fix in `respawn_and_inject()`:** After respawning, stamp prompt/reminder/on_fire on session metadata via a direct metadata write (same pattern as the existing `backend_session_id` clear at scheduler.rs:466):
+
+```rust
+let mut proto = state.protocol.write().await;
+if let Some(s) = proto.sessions.get_mut(task.session_name()) {
+    if s.metadata.prompt.is_none() {
+        s.metadata.prompt = task.prompt.clone();
+    }
+    if s.metadata.reminder.is_none() {
+        s.metadata.reminder = task.reminder.clone();
+    }
+    if s.metadata.on_fire.is_none() {
+        s.metadata.on_fire = Some(task.on_fire.clone());
+    }
+    s.metadata.backend_session_id = None;
+}
+```
 
 ### Task Execution Flow (Revised)
 
-Without `message`, the scheduler's job simplifies to: ensure session liveness.
+The scheduler's job simplifies to: ensure session liveness.
 
 ```
 execute_injection(state, task):
@@ -161,9 +204,13 @@ execute_injection(state, task):
 
   if session alive:
     if task.on_fire.kills_alive():
-      respawn_and_inject(state, task)  # worktree modes that need fresh process
+      respawn_and_stamp(state, task)   # worktree modes that need fresh process
     else:
-      no-op                            # reminder system handles nudging
+      # Backward compat: old tasks with message but no prompt still inject
+      if task.message.is_some() && task.prompt.is_none():
+        inject_into_pane(formatted_message)
+      else:
+        no-op                          # reminder system handles nudging
     return
 
   # session dead:
@@ -173,18 +220,20 @@ execute_injection(state, task):
     revive with --continue/--resume, apply prompt+reminder
 ```
 
-The `format_scheduled_message()` wrapper and `[scheduled task]: {message}` injection are removed.
+Note: the session-not-found guard is expanded from the current `task.project_dir.is_some()` to also accept `task.prompt.is_some()`. A task with only a prompt and no project_dir uses the default directory derivation (projects_dir/task_name, same as session_start).
+
+The `format_scheduled_message()` wrapper and `[scheduled task]: {message}` injection are removed for new-style tasks. Old tasks with `message` but no `prompt` continue to use the legacy injection path.
 
 ### Prompt Injection on Revival
 
-When a task creates/revives a session with a prompt, the prompt must be injected into the pane (same as `session_start` does). The revival flow in `revive_and_inject()` needs to:
+When a task creates/revives a session with a prompt, the prompt must be injected into the pane. The revival flow in `revive_and_inject()` uses the same injection pattern as `start_session()` in `nostr_transport.rs`:
 
 1. Launch backend in new tmux pane
 2. Wait for backend readiness
 3. Re-register with prompt+reminder+on_fire in metadata
-4. If prompt is present, inject `prompt + "\n\n" + reminder` (same concatenation as `start_session`)
+4. If prompt is present, call `schedule_prompt_injection()` (the same helper `start_session` uses) which concatenates prompt + reminder and injects via the pane queue
 
-This replaces the current `message` injection step.
+This replaces the current `message` injection step and ensures consistent behavior with session_start.
 
 ### API Changes
 
@@ -205,9 +254,11 @@ This replaces the current `message` injection step.
 
 ### Stall Detection
 
-No changes needed. Stall detection watches `loop_next` calls on session metadata. Works identically regardless of trigger source.
+No changes to stall detection logic. It watches `loop_next` calls on session metadata and works identically regardless of trigger source.
 
 Pure cron tasks (no loop_next) don't need stall detection -- the cron schedule IS the heartbeat. Hybrid sessions (cron + loop_next) get stall detection naturally when the session calls loop_next.
+
+**Self-quenching note:** If a hybrid session stops calling loop_next (transitions to pure-cron), the stall timer from the last loop_next fires at most once more (injecting the reminder or force-restarting). After that, no further loop_next means no further timer setup -- stall detection quiesces on its own. No explicit cancellation needed.
 
 ### What Stays the Same
 
@@ -221,9 +272,9 @@ Pure cron tasks (no loop_next) don't need stall detection -- the cron schedule I
 
 | File | Changes |
 |---|---|
-| `daemon_protocol.rs` | Rename SessionMeta fields + aliases, LoopLogEntry -> IterationLogEntry, inherit_loop_fields_from -> inherit_recurrence_from, add on_fire |
+| `daemon_protocol.rs` | Rename SessionMeta fields + aliases, LoopLogEntry -> IterationLogEntry, inherit_loop_fields_from -> inherit_recurrence_from (add on_fire inheritance), add on_fire field, update doc comments |
 | `state.rs` | Mirror renames on SessionMetadata, add on_fire |
-| `scheduler.rs` | Add OnFire::kills_alive(), add prompt/reminder to ScheduledTask, remove message, fix execute_injection() alive path, fix revive_and_inject()/respawn_and_inject() to stamp bootstrap fields, inject prompt on revival, remove format_scheduled_message() |
+| `scheduler.rs` | Add OnFire::kills_alive(), update NewSession doc comment, add prompt/reminder to ScheduledTask + Raw struct in custom Deserialize, make message optional in both, update new_task(), fix execute_injection() alive path, fix revive_and_inject()/respawn_and_inject() to stamp bootstrap fields, use schedule_prompt_injection() for prompt injection on revival, remove format_scheduled_message() |
 | `mcp.rs` | Remove message from TaskCreateParams, add prompt/reminder, pass through to new_task(), update loop_next to renamed fields, update OUIJA_INSTRUCTIONS |
 | `api.rs` | Remove message from CreateTaskBody, add prompt/reminder, rename fields in /api/status JSON |
 | `session_agent.rs` | Update field references to new names |
@@ -232,16 +283,19 @@ Pure cron tasks (no loop_next) don't need stall detection -- the cron schedule I
 ### Migration
 
 - **Serde aliases** handle persisted session state: old field names deserialize into new fields.
-- **ScheduledTask.message** becomes `Option<String>` with `#[serde(default)]` for deserialization of existing persisted tasks. Old tasks with `message` but no `prompt` continue to work: the message is injected as before (backward compat shim in execute_injection). New tasks created via API don't have message.
-- **NewSession behavior change**: sessions that relied on NewSession to force-kill alive sessions now get no-op instead. This is intentional (the old behavior was a bug).
+- **ScheduledTask.message** becomes `Option<String>` with `#[serde(default)]` in both the main struct and the `Raw` struct inside the custom `Deserialize` impl. Old tasks with `message` but no `prompt` continue to inject the message on fire (backward compat shim in execute_injection). New tasks created via API don't have `message`.
+- **Existing `ContinueSession` tasks with `message`**: these relied on per-fire message injection as their trigger. They continue to work via the backward compat shim. To migrate: set `prompt` (session identity) and `reminder` (nudge text, replacing message). The reminder system then handles nudging on idle, and session_send handles ad-hoc communication.
+- **NewSession behavior change**: sessions that relied on NewSession to force-kill alive sessions now get no-op instead. This is intentional (the old behavior was a bug that destroyed working sessions).
 
 ### Testing
 
-1. **Serde alias migration**: deserialize old-format JSON with original_prompt/loop_iteration/loop_log/last_loop_next
-2. **OnFire::kills_alive()**: unit test (ContinueSession=false, NewSession=false, PersistentWorktree(true)=true, DisposableWorktree=true)
-3. **Task with prompt/reminder**: create via API, trigger, verify session metadata gets prompt+reminder+on_fire
-4. **NewSession alive fix**: register alive session + NewSession task, trigger, verify session NOT killed
-5. **Prompt injection on revival**: task with prompt fires on dead session, verify prompt injected into pane
-6. **Backward compat**: old task with message and no prompt still injects message on fire
-7. **Existing e2e tests pass**: tests 27-31 (loop_next), L11-L13 (on_fire), test 31 (re-registration preserves state)
-8. **Hybrid mode**: task creates session with prompt, session calls loop_next, stall detection works
+1. **Serde alias migration**: deserialize old-format JSON with original_prompt/loop_iteration/loop_log/last_loop_next -- verify new field names populated
+2. **Custom Deserialize backward compat**: deserialize old task JSON with `message` field, no `prompt` -- verify message is `Some`, prompt is `None`
+3. **OnFire::kills_alive()**: unit test (ContinueSession=false, NewSession=false, PersistentWorktree(true)=true, DisposableWorktree=true)
+4. **Task with prompt/reminder**: create via API, trigger on dead session, verify session metadata gets prompt+reminder+on_fire
+5. **NewSession alive fix**: register alive session + NewSession task, trigger, verify session NOT killed
+6. **Prompt injection on revival**: task with prompt fires on dead session, verify prompt+reminder injected into pane
+7. **Backward compat**: old task with message and no prompt still injects message on fire
+8. **inherit_recurrence_from with on_fire**: re-register a session that has on_fire set, verify on_fire preserved
+9. **Existing e2e tests pass**: tests 27-31 (loop_next), L11-L13 (on_fire), test 31 (re-registration preserves state)
+10. **Hybrid mode**: task creates session with prompt, session calls loop_next, iteration increments, stall detection works
