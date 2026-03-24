@@ -664,7 +664,7 @@ L10_IDS=$(session_ids "$BASE")
 assert_contains "L10: MCP fresh restarted session registered" "$L10_IDS" "mcp-restart"
 
 log "Test L11: Task creation with on_fire new_session"
-L11=$(api "$BASE" POST /api/tasks -d '{"name":"fresh-task","cron":"0 0 * * *","target_session":"mcp-restart","message":"test","on_fire":{"mode":"new_session"}}')
+L11=$(api "$BASE" POST /api/tasks -d '{"name":"fresh-task","cron":"0 0 * * *","target_session":"mcp-restart","prompt":"test prompt","on_fire":{"mode":"new_session"}}')
 assert_contains "L11: create new_session task returns id" "$L11" "created"
 L11_ID=$(echo "$L11" | jq -r '.created')
 L11_TASK=$(api "$BASE" GET "/api/tasks")
@@ -673,7 +673,7 @@ assert_eq "L11: task on_fire mode is new_session" "$L11_MODE" "new_session"
 api "$BASE" DELETE "/api/tasks/$L11_ID" >/dev/null
 
 log "Test L12: Task creation with persistent_worktree"
-L12=$(api "$BASE" POST /api/tasks -d '{"name":"wt-task","cron":"0 0 * * *","target_session":"mcp-restart","message":"test","on_fire":{"mode":"persistent_worktree"}}')
+L12=$(api "$BASE" POST /api/tasks -d '{"name":"wt-task","cron":"0 0 * * *","target_session":"mcp-restart","prompt":"test prompt","on_fire":{"mode":"persistent_worktree"}}')
 assert_contains "L12: create persistent worktree task returns id" "$L12" "created"
 L12_ID=$(echo "$L12" | jq -r '.created')
 L12_TASK=$(api "$BASE" GET "/api/tasks")
@@ -682,7 +682,7 @@ assert_eq "L12: task on_fire mode is persistent_worktree" "$L12_MODE" "persisten
 api "$BASE" DELETE "/api/tasks/$L12_ID" >/dev/null
 
 log "Test L13: Task creation with disposable_worktree"
-L13=$(api "$BASE" POST /api/tasks -d '{"name":"pf-task","cron":"0 0 * * *","target_session":"mcp-restart","message":"test","on_fire":{"mode":"disposable_worktree"}}')
+L13=$(api "$BASE" POST /api/tasks -d '{"name":"pf-task","cron":"0 0 * * *","target_session":"mcp-restart","prompt":"test prompt","on_fire":{"mode":"disposable_worktree"}}')
 assert_contains "L13: create disposable worktree task returns id" "$L13" "created"
 L13_ID=$(echo "$L13" | jq -r '.created')
 L13_TASK=$(api "$BASE" GET "/api/tasks")
@@ -1172,16 +1172,16 @@ api "$BASE" POST /api/remove -d '{"id":"loop-sess"}' >/dev/null 2>&1 || true
 # Restore sess-a2
 api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/dev/null
 
-log "Test 27: session_start via HTTP with reminder and original_prompt"
+log "Test 27: session_start via HTTP with reminder and prompt"
 # Start a session with prompt + reminder
 result=$(api "$BASE" POST /api/sessions/start -d "{\"name\":\"loop-test\",\"project_dir\":\"/tmp/loop-test-proj\",\"prompt\":\"do the work\",\"reminder\":\"if done call loop_next\"}")
 assert_contains "27: session started" "$result" "started"
-# Verify original_prompt and reminder are in metadata
+# Verify prompt and reminder are in metadata
 sleep 1
 status=$(api "$BASE" GET /api/status)
-orig_prompt=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-test") | .original_prompt // ""')
+orig_prompt=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-test") | .prompt // ""')
 sess_reminder=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-test") | .reminder // ""')
-assert_eq "27: original_prompt stored" "$orig_prompt" "do the work"
+assert_eq "27: prompt stored" "$orig_prompt" "do the work"
 assert_eq "27: reminder stored" "$sess_reminder" "if done call loop_next"
 # Verify prompt + reminder was concatenated in pane
 loop_pane=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-test") | .pane // ""')
@@ -1193,7 +1193,7 @@ fi
 
 log "Test 28: loop_next via MCP increments iteration"
 # First verify iteration is 0
-iter_before=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-test") | .loop_iteration // 0')
+iter_before=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-test") | .iteration // 0')
 assert_eq "28: iteration starts at 0" "$iter_before" "0"
 # Call loop_next
 mcp_result=$(mcp_call_tool "$BASE" "loop_next" '{"from":"loop-test","message":"finished first batch","clean_context":true}')
@@ -1201,23 +1201,23 @@ assert_contains "28: loop_next response" "$mcp_result" "loop_next"
 # Wait for restart to complete
 sleep 3
 status2=$(api "$BASE" GET /api/status)
-iter_after=$(echo "$status2" | jq -r '.sessions[] | select(.id == "loop-test") | .loop_iteration // 0')
+iter_after=$(echo "$status2" | jq -r '.sessions[] | select(.id == "loop-test") | .iteration // 0')
 assert_eq "28: iteration incremented to 1" "$iter_after" "1"
 # Verify loop log has the message
-log_msg=$(echo "$status2" | jq -r '.sessions[] | select(.id == "loop-test") | .loop_log[0].message // ""')
+log_msg=$(echo "$status2" | jq -r '.sessions[] | select(.id == "loop-test") | .iteration_log[0].message // ""')
 assert_eq "28: loop log message" "$log_msg" "finished first batch"
 
-log "Test 29: loop_next preserves original_prompt across restart"
-orig_after=$(echo "$status2" | jq -r '.sessions[] | select(.id == "loop-test") | .original_prompt // ""')
+log "Test 29: loop_next preserves prompt across restart"
+orig_after=$(echo "$status2" | jq -r '.sessions[] | select(.id == "loop-test") | .prompt // ""')
 reminder_after=$(echo "$status2" | jq -r '.sessions[] | select(.id == "loop-test") | .reminder // ""')
-assert_eq "29: original_prompt preserved" "$orig_after" "do the work"
+assert_eq "29: prompt preserved" "$orig_after" "do the work"
 assert_eq "29: reminder preserved" "$reminder_after" "if done call loop_next"
 
-log "Test 30: loop_next without original_prompt returns error"
+log "Test 30: loop_next without prompt returns error"
 # Register a bare session (no prompt)
 api "$BASE" POST /api/register -d "{\"id\":\"bare-sess\",\"pane\":\"$PANE_B\"}" >/dev/null
 mcp_result=$(mcp_call_tool "$BASE" "loop_next" '{"from":"bare-sess"}')
-assert_contains "30: error without prompt" "$mcp_result" "no original prompt"
+assert_contains "30: error without prompt" "$mcp_result" "no prompt"
 # Clean up
 api "$BASE" POST /api/remove -d '{"id":"bare-sess"}' >/dev/null 2>&1 || true
 
@@ -1239,18 +1239,18 @@ mcp_result=$(mcp_call_tool "$BASE" "loop_next" '{"from":"loop-norest","message":
 assert_contains "30b: response has iteration" "$mcp_result" "iteration 1 logged"
 # Verify iteration incremented
 status=$(api "$BASE" GET /api/status)
-iter=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-norest") | .loop_iteration // 0')
+iter=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-norest") | .iteration // 0')
 assert_eq "30b: iteration is 1" "$iter" "1"
-# Verify last_loop_next is set
-last_ln=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-norest") | .last_loop_next // "null"')
-if [ "$last_ln" = "null" ]; then fail "30b: last_loop_next should be set"; else pass "30b: last_loop_next set"; fi
+# Verify last_iteration_at is set
+last_ln=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-norest") | .last_iteration_at // "null"')
+if [ "$last_ln" = "null" ]; then fail "30b: last_iteration_at should be set"; else pass "30b: last_iteration_at set"; fi
 
 log "Test 30c: loop_next clean_context=false increments without session restart"
 # Call again — session should still be alive (no restart)
 mcp_result2=$(mcp_call_tool "$BASE" "loop_next" '{"from":"loop-norest","message":"second pass"}')
 assert_contains "30c: response has iteration 2" "$mcp_result2" "iteration 2 logged"
 status2=$(api "$BASE" GET /api/status)
-iter2=$(echo "$status2" | jq -r '.sessions[] | select(.id == "loop-norest") | .loop_iteration // 0')
+iter2=$(echo "$status2" | jq -r '.sessions[] | select(.id == "loop-norest") | .iteration // 0')
 assert_eq "30c: iteration is 2" "$iter2" "2"
 # Verify the pane is still the same (not restarted)
 pane_after=$(echo "$status2" | jq -r '.sessions[] | select(.id == "loop-norest") | .pane // ""')
@@ -1264,11 +1264,11 @@ for i in $(seq 3 9); do
     mcp_call_tool "$BASE" "loop_next" "{\"from\":\"loop-norest\",\"message\":\"pass $i\"}" >/dev/null
 done
 # Verify we're at iteration 9
-iter9=$(api "$BASE" GET /api/status | jq -r '.sessions[] | select(.id == "loop-norest") | .loop_iteration // 0')
+iter9=$(api "$BASE" GET /api/status | jq -r '.sessions[] | select(.id == "loop-norest") | .iteration // 0')
 # If MCP calls dropped some iterations, catch up
 while [ "$iter9" -lt 9 ] 2>/dev/null; do
     mcp_call_tool "$BASE" "loop_next" '{"from":"loop-norest","message":"catchup"}' >/dev/null
-    iter9=$(api "$BASE" GET /api/status | jq -r '.sessions[] | select(.id == "loop-norest") | .loop_iteration // 0')
+    iter9=$(api "$BASE" GET /api/status | jq -r '.sessions[] | select(.id == "loop-norest") | .iteration // 0')
 done
 # The 10th call should include the reminder text
 mcp_result10=$(mcp_call_tool "$BASE" "loop_next" '{"from":"loop-norest","message":"pass 10"}')
@@ -1283,7 +1283,7 @@ api "$BASE" POST /api/register -d "{\"id\":\"sess-b\",\"pane\":\"$PANE_B\"}" >/d
 log "Test 31: Re-registration preserves loop state"
 # Register a session directly with loop metadata (no session_start, avoids worktree complexity)
 api "$BASE" POST /api/register -d "{\"id\":\"reregtest\",\"pane\":\"$PANE_A\",\"reminder\":\"call loop_next when done\"}" >/dev/null
-# Manually set original_prompt via a second register with all fields
+# Manually set prompt via a second register with all fields
 # (simulates what session_start does internally)
 api "$BASE" POST /api/register -d "{\"id\":\"reregtest\",\"pane\":\"$PANE_A\",\"reminder\":\"call loop_next when done\",\"role\":\"looping\"}" >/dev/null
 # Verify fields are set
