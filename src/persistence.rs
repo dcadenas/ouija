@@ -567,7 +567,6 @@ mod tests {
             name: "test".into(),
             cron: "*/5 * * * *".into(),
             target_session: Some("web".into()),
-            message: Some("hello".into()),
             prompt: None,
             reminder: None,
             enabled: true,

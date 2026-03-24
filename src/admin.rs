@@ -226,20 +226,7 @@ pub async fn dashboard(State(state): State<SharedState>) -> Html<String> {
                 task_flags.join(" · ")
             )
         };
-        let msg_preview = if let Some(ref msg) = t.message {
-            if msg.len() > 50 {
-                format!(
-                    "<br><small class=\"dim\" title=\"{}\">msg: {}…</small>",
-                    html_escape(msg),
-                    html_escape(&msg[..50])
-                )
-            } else {
-                format!(
-                    "<br><small class=\"dim\">msg: {}</small>",
-                    html_escape(msg)
-                )
-            }
-        } else if let Some(ref prompt) = t.prompt {
+        let msg_preview = if let Some(ref prompt) = t.prompt {
             let preview = if prompt.len() > 50 {
                 format!("{}…", html_escape(&prompt[..50]))
             } else {

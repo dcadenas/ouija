@@ -427,7 +427,7 @@ api "$BASE" POST /api/settings -d '{"projects_dir":"/tmp/projects"}' >/dev/null
 log "Scheduled Tasks tests"
 
 # T1: Create task via API
-T1=$(api "$BASE" POST /api/tasks -d '{"name":"test-task","cron":"*/5 * * * *","target_session":"e2e-test","message":"hello from scheduler"}')
+T1=$(api "$BASE" POST /api/tasks -d '{"name":"test-task","cron":"*/5 * * * *","target_session":"e2e-test","prompt":"hello from scheduler"}')
 T1_ID=$(echo "$T1" | jq -r '.created // ""')
 assert_contains "T1: create task returns id" "$T1" "created"
 
