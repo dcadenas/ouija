@@ -1144,24 +1144,32 @@ then send the actual result when done.
 </messaging>
 
 <tasks>
-Tasks inject messages into sessions on a cron schedule. If the target session is dead, \
-the daemon revives it automatically.
+Tasks ensure sessions stay alive and working on a cron schedule. Each task has a `prompt` \
+(the work to do) and optionally a `reminder` (nudge text appended to the prompt and \
+re-injected on idle). When a task fires, if the target session is dead the daemon revives it \
+with the prompt + reminder. If the session is already alive, `continue_session` and \
+`new_session` are no-ops (the reminder handles nudging); worktree modes restart as configured.
 
 - Cron expressions are 5-field standard cron, evaluated in **UTC** \
 (e.g. `0 9 * * *` = daily 9am UTC, `*/5 * * * *` = every 5 min)
 - Set `once: true` to fire once then auto-delete (useful for reminders and one-shot checks)
 - Use `task_trigger` to test a task immediately without waiting for its schedule
 - `on_fire` controls what happens each time the task fires:
-  - `continue_session` (default): inject into live session, revive with --continue if dead
-  - `new_session`: kill pane, start fresh conversation each fire
+  - `continue_session` (default): no-op on alive sessions; revive with --continue if dead
+  - `new_session`: no-op on alive sessions; start fresh if dead
   - `persistent_worktree`: named worktree persists across fires; set `clear_context: true` \
 to start a new conversation each fire while keeping the worktree
   - `disposable_worktree`: anonymous worktree created and cleaned up each fire
+
+Tasks and loops are the same recurring session primitive with different triggers: \
+tasks use cron (passive, scheduled), loops use loop_next (active, self-driven). \
+Both rely on prompt + reminder for session bootstrap and continuity.
 </tasks>
 
 <loops>
 Sessions can chain indefinitely using loop_next. Each call logs an iteration and \
-optionally restarts the session.
+optionally restarts the session. On restart, the session's `prompt` is re-used as \
+the seed for the new conversation.
 
 - `loop_next(from, message?, clean_context?)` — log an iteration.
   - `clean_context=false` (default): stay in current conversation, keep accumulated context. \
