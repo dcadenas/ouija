@@ -1008,7 +1008,8 @@ pub struct CreateTaskBody {
     name: String,
     cron: String,
     target_session: Option<String>,
-    message: String,
+    prompt: Option<String>,
+    reminder: Option<String>,
     project_dir: Option<String>,
     #[serde(default)]
     once: Option<bool>,
@@ -1030,16 +1031,18 @@ pub async fn create_task(
         );
     }
 
-    let task = scheduler::new_task(
+    let mut task = scheduler::new_task(
         body.name,
         body.cron,
         body.target_session,
-        body.message,
-        body.project_dir,
+        None,
+        body.prompt,
+        body.reminder,
         body.once.unwrap_or(false),
         body.backend_session_id,
         body.on_fire.unwrap_or_default(),
     );
+    task.project_dir = body.project_dir;
 
     let id = task.id.clone();
     state.add_task(task).await;

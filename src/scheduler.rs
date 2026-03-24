@@ -23,7 +23,7 @@ pub enum OnFire {
     /// Inject into live session; revive with --continue if dead.
     #[default]
     ContinueSession,
-    /// Kill pane, start fresh conversation (no --continue/--resume).
+    /// Start fresh when dead/missing; no-op when alive (reminder handles nudging).
     NewSession,
     /// Named worktree that persists across fires.
     /// `clear_context: true` starts a new conversation each fire.
@@ -60,6 +60,17 @@ impl OnFire {
     pub fn is_disposable_worktree(&self) -> bool {
         matches!(self, Self::DisposableWorktree)
     }
+
+    /// Whether this mode kills an alive session's process on each fire.
+    /// Only worktree modes with context clearing need to kill alive sessions.
+    /// ContinueSession and NewSession are no-ops when alive (reminder handles nudging).
+    pub fn kills_alive(&self) -> bool {
+        match self {
+            Self::ContinueSession | Self::NewSession => false,
+            Self::PersistentWorktree { clear_context } => *clear_context,
+            Self::DisposableWorktree => true,
+        }
+    }
 }
 
 /// A cron-driven task that injects messages into sessions.
@@ -72,7 +83,14 @@ pub struct ScheduledTask {
     /// When absent or when creating a new session, `name` is used instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_session: Option<String>,
-    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Bootstrap: prompt for creating/reviving the target session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Bootstrap: reminder for the target session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reminder: Option<String>,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
     pub next_run: Option<DateTime<Utc>>,
@@ -115,7 +133,12 @@ impl<'de> serde::Deserialize<'de> for ScheduledTask {
             cron: String,
             #[serde(default)]
             target_session: Option<String>,
-            message: String,
+            #[serde(default)]
+            message: Option<String>,
+            #[serde(default)]
+            prompt: Option<String>,
+            #[serde(default)]
+            reminder: Option<String>,
             enabled: bool,
             created_at: DateTime<Utc>,
             #[serde(default)]
@@ -166,6 +189,8 @@ impl<'de> serde::Deserialize<'de> for ScheduledTask {
             cron: raw.cron,
             target_session: raw.target_session,
             message: raw.message,
+            prompt: raw.prompt,
+            reminder: raw.reminder,
             enabled: raw.enabled,
             created_at: raw.created_at,
             next_run: raw.next_run,
@@ -310,8 +335,8 @@ pub async fn execute_task(state: &SharedState, task_id: &str) {
         }
     };
 
-    let formatted = format_scheduled_message(&task.message);
-    let run = execute_injection(state, &task, &formatted).await;
+    let formatted = task.message.as_deref().map(format_scheduled_message);
+    let run = execute_injection(state, &task, formatted.as_deref()).await;
 
     // Update task state
     state
@@ -332,7 +357,7 @@ pub async fn execute_task(state: &SharedState, task_id: &str) {
 }
 
 /// Try to inject into the target session, reviving if needed.
-async fn execute_injection(state: &SharedState, task: &ScheduledTask, formatted: &str) -> TaskRun {
+async fn execute_injection(state: &SharedState, task: &ScheduledTask, formatted: Option<&str>) -> TaskRun {
     let session_name = task.session_name();
 
     // Look up session
@@ -343,7 +368,7 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask, formatted:
 
     // Session not found — create from scratch if task has enough info
     let Some(session) = session else {
-        if task.project_dir.is_some() {
+        if task.project_dir.is_some() || task.prompt.is_some() {
             tracing::info!("session '{session_name}' not found, creating from task project_dir",);
             return revive_from_task(state, task, formatted, None).await;
         }
@@ -374,18 +399,19 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask, formatted:
     .unwrap_or(false);
 
     if alive {
-        if task.on_fire.clears_context() {
-            // Respawn in-place: kill process and restart claude in the same pane
+        if task.on_fire.kills_alive() {
             let dir = task
                 .project_dir
                 .as_deref()
                 .or(session.metadata.project_dir.as_deref())
                 .unwrap_or("/tmp");
             return respawn_and_inject(state, task, pane, dir, formatted).await;
-        } else {
-            // Direct injection into live pane
-            return inject_into_pane(state, task, pane, session.metadata.vim_mode, formatted).await;
+        } else if let Some(fmt) = formatted {
+            if task.prompt.is_none() {
+                return inject_into_pane(state, task, pane, session.metadata.vim_mode, Some(fmt)).await;
+            }
         }
+        return TaskRun::ok(task, None);
     }
 
     // Pane is dead — attempt revival, falling back to session's project_dir
@@ -402,11 +428,15 @@ async fn inject_into_pane(
     task: &ScheduledTask,
     pane: &str,
     vim_mode: bool,
-    formatted: &str,
+    formatted: Option<&str>,
 ) -> TaskRun {
-    match tmux::locked_inject(state, task.session_name(), pane, formatted, vim_mode).await {
-        Ok(()) => TaskRun::ok(task, None),
-        Err(e) => TaskRun::failed(task, e.to_string()),
+    if let Some(fmt) = formatted {
+        match tmux::locked_inject(state, task.session_name(), pane, fmt, vim_mode).await {
+            Ok(()) => TaskRun::ok(task, None),
+            Err(e) => TaskRun::failed(task, e.to_string()),
+        }
+    } else {
+        TaskRun::ok(task, None)
     }
 }
 
@@ -416,7 +446,7 @@ async fn respawn_and_inject(
     task: &ScheduledTask,
     pane: &str,
     dir: &str,
-    formatted: &str,
+    formatted: Option<&str>,
 ) -> TaskRun {
     let pane_id = pane.to_string();
     let dir = dir.to_string();
@@ -461,10 +491,19 @@ async fn respawn_and_inject(
         Err(e) => return TaskRun::failed(task, e.to_string()),
     }
 
-    // Clear backend_session_id since we started fresh
+    // Stamp bootstrap metadata and clear backend_session_id since we started fresh
     {
         let mut proto = state.protocol.write().await;
         if let Some(s) = proto.sessions.get_mut(task.session_name()) {
+            if s.metadata.prompt.is_none() {
+                s.metadata.prompt = task.prompt.clone();
+            }
+            if s.metadata.reminder.is_none() {
+                s.metadata.reminder = task.reminder.clone();
+            }
+            if s.metadata.on_fire.is_none() {
+                s.metadata.on_fire = Some(task.on_fire.clone());
+            }
             s.metadata.backend_session_id = None;
         }
     }
@@ -484,7 +523,9 @@ async fn respawn_and_inject(
     .unwrap_or(false);
 
     if ready {
-        let _ = tmux::locked_inject(state, task.session_name(), &pane_id, formatted, false).await;
+        if let Some(fmt) = formatted {
+            let _ = tmux::locked_inject(state, task.session_name(), &pane_id, fmt, false).await;
+        }
     }
 
     TaskRun::ok(task, None)
@@ -496,7 +537,7 @@ async fn respawn_and_inject(
 async fn revive_from_task(
     state: &SharedState,
     task: &ScheduledTask,
-    formatted: &str,
+    formatted: Option<&str>,
     project_dir_override: Option<&str>,
 ) -> TaskRun {
     let project_dir = project_dir_override.or(task.project_dir.as_deref());
@@ -519,7 +560,7 @@ async fn revive_and_inject(
     state: &SharedState,
     task: &ScheduledTask,
     project_dir: Option<&str>,
-    formatted: &str,
+    formatted: Option<&str>,
 ) -> anyhow::Result<String> {
     let dir = project_dir
         .map(String::from)
@@ -677,6 +718,9 @@ async fn revive_and_inject(
     // Re-register session with new pane (same ID, so dedup check won't fire)
     let proto_meta = crate::daemon_protocol::SessionMeta {
         project_dir: project_dir.map(String::from),
+        prompt: task.prompt.clone(),
+        reminder: task.reminder.clone(),
+        on_fire: Some(task.on_fire.clone()),
         ..Default::default()
     };
     state
@@ -698,8 +742,16 @@ async fn revive_and_inject(
         }
     }
 
-    // Inject the scheduled message
-    tmux::locked_inject(state, task.session_name(), &new_pane, formatted, false).await?;
+    // Inject prompt (preferred) or scheduled message
+    if let Some(ref prompt) = task.prompt {
+        let full_text = match &task.reminder {
+            Some(r) => format!("{prompt}\n\n{r}"),
+            None => prompt.clone(),
+        };
+        crate::nostr_transport::schedule_prompt_injection(state, task.session_name(), new_pane.clone(), full_text);
+    } else if let Some(fmt) = formatted {
+        tmux::locked_inject(state, task.session_name(), &new_pane, fmt, false).await?;
+    }
 
     Ok(new_pane)
 }
@@ -766,8 +818,9 @@ pub fn new_task(
     name: String,
     cron: String,
     target_session: Option<String>,
-    message: String,
-    project_dir: Option<String>,
+    message: Option<String>,
+    prompt: Option<String>,
+    reminder: Option<String>,
     once: bool,
     backend_session_id: Option<String>,
     on_fire: OnFire,
@@ -779,13 +832,15 @@ pub fn new_task(
         cron,
         target_session,
         message,
+        prompt,
+        reminder,
         enabled: true,
         created_at: Utc::now(),
         next_run,
         last_run: None,
         last_status: None,
         run_count: 0,
-        project_dir,
+        project_dir: None,
         once,
         backend_session_id,
         on_fire,
@@ -839,7 +894,9 @@ mod tests {
             name: "test task".into(),
             cron: "*/5 * * * *".into(),
             target_session: Some("web".into()),
-            message: "hello".into(),
+            message: Some("hello".into()),
+            prompt: None,
+            reminder: None,
             enabled: true,
             created_at: Utc::now(),
             next_run: Some(Utc::now()),
@@ -882,7 +939,8 @@ mod tests {
             "t".into(),
             "*/1 * * * *".into(),
             Some("web".into()),
-            "hi".into(),
+            Some("hi".into()),
+            None,
             None,
             false,
             None,
@@ -900,7 +958,9 @@ mod tests {
             name: "wt-task".into(),
             cron: "0 9 * * *".into(),
             target_session: Some("web".into()),
-            message: "run checks".into(),
+            message: Some("run checks".into()),
+            prompt: None,
+            reminder: None,
             enabled: true,
             created_at: Utc::now(),
             next_run: None,
@@ -982,5 +1042,32 @@ mod tests {
         let json = r#"{"id":"x","name":"n","cron":"* * * * *","target_session":"s","message":"m","enabled":true,"created_at":"2026-01-01T00:00:00Z","run_count":0,"fresh":false}"#;
         let task: ScheduledTask = serde_json::from_str(json).unwrap();
         assert_eq!(task.on_fire, OnFire::ContinueSession);
+    }
+
+    #[test]
+    fn on_fire_kills_alive() {
+        assert!(!OnFire::ContinueSession.kills_alive());
+        assert!(!OnFire::NewSession.kills_alive());
+        assert!(!OnFire::PersistentWorktree { clear_context: false }.kills_alive());
+        assert!(OnFire::PersistentWorktree { clear_context: true }.kills_alive());
+        assert!(OnFire::DisposableWorktree.kills_alive());
+    }
+
+    #[test]
+    fn new_task_with_prompt_no_message() {
+        let task = new_task(
+            "test-task".into(),
+            "0 0 * * *".into(),
+            None,
+            None,
+            Some("do the work".into()),
+            Some("call loop_next".into()),
+            false,
+            None,
+            OnFire::NewSession,
+        );
+        assert_eq!(task.prompt.as_deref(), Some("do the work"));
+        assert_eq!(task.reminder.as_deref(), Some("call loop_next"));
+        assert!(task.message.is_none());
     }
 }

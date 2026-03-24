@@ -133,8 +133,12 @@ pub struct TaskCreateParams {
     /// Optional: inject into this existing session (only for continue_session mode).
     /// When absent, the task name is used as the session name.
     pub target_session: Option<String>,
-    /// Message to inject on each run
-    pub message: String,
+    /// Bootstrap: prompt for creating/reviving the target session.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Bootstrap: reminder for the target session.
+    #[serde(default)]
+    pub reminder: Option<String>,
     /// Override project directory for session revival
     pub project_dir: Option<String>,
     /// If true, the task fires once then auto-deletes itself.
@@ -619,16 +623,18 @@ impl OuijaMcp {
             ))]));
         }
 
-        let task = scheduler::new_task(
+        let mut task = scheduler::new_task(
             params.name,
             params.cron,
             params.target_session,
-            params.message,
-            params.project_dir,
+            None,
+            params.prompt,
+            params.reminder,
             params.once.unwrap_or(false),
             params.backend_session_id,
             params.on_fire.unwrap_or_default(),
         );
+        task.project_dir = params.project_dir;
 
         let id = task.id.clone();
         self.state.add_task(task).await;

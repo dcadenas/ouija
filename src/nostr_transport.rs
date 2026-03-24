@@ -2066,7 +2066,7 @@ async fn setup_shared_serve_session(
 
 /// Inject a prompt into a pane after a short delay, giving the backend time to start.
 /// For HttpApi backends, queue the prompt and wait for a readiness signal from the plugin.
-fn schedule_prompt_injection(
+pub(crate) fn schedule_prompt_injection(
     state: &std::sync::Arc<AppState>,
     session_name: &str,
     pane_id: String,
