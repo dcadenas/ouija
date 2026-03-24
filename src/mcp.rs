@@ -133,8 +133,12 @@ pub struct TaskCreateParams {
     /// Optional: inject into this existing session (only for continue_session mode).
     /// When absent, the task name is used as the session name.
     pub target_session: Option<String>,
-    /// Message to inject on each run
-    pub message: String,
+    /// Bootstrap: prompt for creating/reviving the target session.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Bootstrap: reminder for the target session.
+    #[serde(default)]
+    pub reminder: Option<String>,
     /// Override project directory for session revival
     pub project_dir: Option<String>,
     /// If true, the task fires once then auto-deletes itself.
@@ -645,16 +649,18 @@ impl OuijaMcp {
             ))]));
         }
 
-        let task = scheduler::new_task(
+        let mut task = scheduler::new_task(
             params.name,
             params.cron,
             params.target_session,
-            params.message,
-            params.project_dir,
+            None,
+            params.prompt,
+            params.reminder,
             params.once.unwrap_or(false),
             params.backend_session_id,
             params.on_fire.unwrap_or_default(),
         );
+        task.project_dir = params.project_dir;
 
         let id = task.id.clone();
         self.state.add_task(task).await;
@@ -927,30 +933,30 @@ impl OuijaMcp {
             ))]));
         };
 
-        let Some(ref original_prompt) = meta.original_prompt else {
+        let Some(ref prompt) = meta.prompt else {
             return Ok(CallToolResult::success(vec![Content::text(
-                "session has no original prompt — loop_next requires a session started with a prompt",
+                "session has no prompt — loop_next requires a session started with a prompt",
             )]));
         };
 
         // Log iteration and update pending reply timestamps
         let now = chrono::Utc::now().timestamp();
-        let iteration = meta.loop_iteration + 1;
+        let iteration = meta.iteration + 1;
         {
             let mut proto = self.state.protocol.write().await;
             if let Some(session) = proto.sessions.get_mut(&session_id) {
-                session.metadata.loop_iteration = iteration;
-                session.metadata.last_loop_next = Some(now);
-                let entry = crate::daemon_protocol::LoopLogEntry {
+                session.metadata.iteration = iteration;
+                session.metadata.last_iteration_at = Some(now);
+                let entry = crate::daemon_protocol::IterationLogEntry {
                     iteration,
                     message: params.message.clone(),
                     timestamp: now,
                 };
-                session.metadata.loop_log.push(entry);
+                session.metadata.iteration_log.push(entry);
                 // Cap at 100 entries
-                if session.metadata.loop_log.len() > 100 {
-                    let drain_count = session.metadata.loop_log.len() - 100;
-                    session.metadata.loop_log.drain(..drain_count);
+                if session.metadata.iteration_log.len() > 100 {
+                    let drain_count = session.metadata.iteration_log.len() - 100;
+                    session.metadata.iteration_log.drain(..drain_count);
                 }
             }
             // Update last_activity on pending replies to prevent immediate nudging
@@ -969,7 +975,7 @@ impl OuijaMcp {
         let reminder = meta.reminder.clone();
 
         if params.clean_context {
-            let prompt = original_prompt.clone();
+            let prompt = prompt.clone();
 
             tracing::info!(
                 session = %session_id,
@@ -1011,7 +1017,7 @@ impl OuijaMcp {
                 {
                     let mut proto = state.protocol.write().await;
                     if let Some(session) = proto.sessions.get_mut(&sid) {
-                        session.metadata.inherit_loop_fields_from(&stash);
+                        session.metadata.inherit_recurrence_from(&stash);
                     }
                 }
                 // Persist so loop state survives daemon restart
@@ -1172,24 +1178,32 @@ then send the actual result when done.
 </messaging>
 
 <tasks>
-Tasks inject messages into sessions on a cron schedule. If the target session is dead, \
-the daemon revives it automatically.
+Tasks ensure sessions stay alive and working on a cron schedule. Each task has a `prompt` \
+(the work to do) and optionally a `reminder` (nudge text appended to the prompt and \
+re-injected on idle). When a task fires, if the target session is dead the daemon revives it \
+with the prompt + reminder. If the session is already alive, `continue_session` and \
+`new_session` are no-ops (the reminder handles nudging); worktree modes restart as configured.
 
 - Cron expressions are 5-field standard cron, evaluated in **UTC** \
 (e.g. `0 9 * * *` = daily 9am UTC, `*/5 * * * *` = every 5 min)
 - Set `once: true` to fire once then auto-delete (useful for reminders and one-shot checks)
 - Use `task_trigger` to test a task immediately without waiting for its schedule
 - `on_fire` controls what happens each time the task fires:
-  - `continue_session` (default): inject into live session, revive with --continue if dead
-  - `new_session`: kill pane, start fresh conversation each fire
+  - `continue_session` (default): no-op on alive sessions; revive with --continue if dead
+  - `new_session`: no-op on alive sessions; start fresh if dead
   - `persistent_worktree`: named worktree persists across fires; set `clear_context: true` \
 to start a new conversation each fire while keeping the worktree
   - `disposable_worktree`: anonymous worktree created and cleaned up each fire
+
+Tasks and loops are the same recurring session primitive with different triggers: \
+tasks use cron (passive, scheduled), loops use loop_next (active, self-driven). \
+Both rely on prompt + reminder for session bootstrap and continuity.
 </tasks>
 
 <loops>
 Sessions can chain indefinitely using loop_next. Each call logs an iteration and \
-optionally restarts the session.
+optionally restarts the session. On restart, the session's `prompt` is re-used as \
+the seed for the new conversation.
 
 - `loop_next(from, message?, clean_context?)` — log an iteration. Returns `<loop iteration=\"N\" />` \
 (or `<loop iteration=\"N\">reminder text</loop>` every 10th iteration).

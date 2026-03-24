@@ -377,12 +377,12 @@ else
     fail "13a: session_start" "contains started" "$(echo "$start13" | head -c 200)"
 fi
 sleep 5
-# Verify session has original_prompt and reminder
+# Verify session has prompt and reminder
 status13=$(api "$BASE" GET /api/status)
-orig13=$(echo "$status13" | jq -r '.sessions[] | select(.id == "oc-soft") | .original_prompt // ""')
+orig13=$(echo "$status13" | jq -r '.sessions[] | select(.id == "oc-soft") | .prompt // ""')
 rem13=$(echo "$status13" | jq -r '.sessions[] | select(.id == "oc-soft") | .reminder // ""')
 sid13=$(echo "$status13" | jq -r '.sessions[] | select(.id == "oc-soft") | .backend_session_id // ""')
-assert_eq "13b: original_prompt stored" "$orig13" "say hello"
+assert_eq "13b: prompt stored" "$orig13" "say hello"
 assert_eq "13b: reminder stored" "$rem13" "call loop_next when done"
 if [ -n "$sid13" ]; then
     pass "13b: backend_session_id set ($sid13)"
@@ -421,7 +421,7 @@ if grep -q "soft restart: delivered prompt" /tmp/ouija-test/daemon.log 2>/dev/nu
 else
     fail "13f: prompt delivery" "prompt_async log entry" "not found in daemon log"
 fi
-# Verify reminder and original_prompt survived
+# Verify reminder and prompt survived
 rem13b=$(echo "$status13b" | jq -r '.sessions[] | select(.id == "oc-soft") | .reminder // ""')
 assert_eq "13g: reminder preserved after soft restart" "$rem13b" "call loop_next when done"
 # Clean up

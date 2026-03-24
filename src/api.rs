@@ -100,10 +100,10 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
                 "backend_session_id": s.metadata.backend_session_id,
                 "backend": s.metadata.backend,
                 "reminder": s.metadata.reminder,
-                "original_prompt": s.metadata.original_prompt,
-                "loop_iteration": s.metadata.loop_iteration,
-                "loop_log": s.metadata.loop_log,
-                "last_loop_next": s.metadata.last_loop_next,
+                "prompt": s.metadata.prompt,
+                "iteration": s.metadata.iteration,
+                "iteration_log": s.metadata.iteration_log,
+                "last_iteration_at": s.metadata.last_iteration_at,
             })
         })
         .collect();
@@ -1009,7 +1009,8 @@ pub struct CreateTaskBody {
     name: String,
     cron: String,
     target_session: Option<String>,
-    message: String,
+    prompt: Option<String>,
+    reminder: Option<String>,
     project_dir: Option<String>,
     #[serde(default)]
     once: Option<bool>,
@@ -1031,16 +1032,18 @@ pub async fn create_task(
         );
     }
 
-    let task = scheduler::new_task(
+    let mut task = scheduler::new_task(
         body.name,
         body.cron,
         body.target_session,
-        body.message,
-        body.project_dir,
+        None,
+        body.prompt,
+        body.reminder,
         body.once.unwrap_or(false),
         body.backend_session_id,
         body.on_fire.unwrap_or_default(),
     );
+    task.project_dir = body.project_dir;
 
     let id = task.id.clone();
     state.add_task(task).await;

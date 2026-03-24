@@ -64,20 +64,26 @@ impl Origin {
 /// A single iteration log entry from a loop_next call.
 /// Uses i64 timestamp (not DateTime<Utc>) because DaemonState requires Hash+Eq.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct LoopLogEntry {
+pub struct IterationLogEntry {
     pub iteration: u64,
     pub message: Option<String>,
     pub timestamp: i64,
 }
 
 /// Mutable metadata attached to a session (role, project, flags).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SessionMeta {
+    #[serde(default)]
     pub project_dir: Option<String>,
+    #[serde(default)]
     pub role: Option<String>,
+    #[serde(default)]
     pub bulletin: Option<String>,
+    #[serde(default)]
     pub networked: bool,
+    #[serde(default)]
     pub worktree: bool,
+    #[serde(default)]
     pub vim_mode: bool,
     #[serde(
         default,
@@ -98,18 +104,21 @@ pub struct SessionMeta {
     /// Reminder text re-injected on idle. Also appended to prompt at session start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reminder: Option<String>,
-    /// Original prompt from session_start, stored for loop_next re-injection.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub original_prompt: Option<String>,
+    /// Original prompt from session_start, stored for re-injection on iteration.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "original_prompt")]
+    pub prompt: Option<String>,
     /// How many times loop_next has been called on this session.
-    #[serde(default)]
-    pub loop_iteration: u64,
-    /// Log messages from each loop_next call. Capped at 100 entries.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub loop_log: Vec<LoopLogEntry>,
-    /// Unix timestamp of the most recent loop_next call. Used by stall detection.
+    #[serde(default, alias = "loop_iteration")]
+    pub iteration: u64,
+    /// Log messages from each iteration. Capped at 100 entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "loop_log")]
+    pub iteration_log: Vec<IterationLogEntry>,
+    /// Unix timestamp of the most recent iteration. Used by stall detection.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "last_loop_next")]
+    pub last_iteration_at: Option<i64>,
+    /// What happens each time a scheduled task fires for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_loop_next: Option<i64>,
+    pub on_fire: Option<crate::scheduler::OnFire>,
 }
 
 /// Metadata becomes stale after 30 minutes without an update.
@@ -124,24 +133,27 @@ impl SessionMeta {
         }
     }
 
-    /// Fill loop fields from `source` for any field still at its default value.
-    /// Used during re-registration so the startup hook doesn't wipe loop state
+    /// Fill recurrence fields from `source` for any field still at its default value.
+    /// Used during re-registration so the startup hook doesn't wipe recurrence state
     /// that was set by session_start or carried forward by restart_session.
-    pub fn inherit_loop_fields_from(&mut self, source: &SessionMeta) {
-        if self.original_prompt.is_none() {
-            self.original_prompt = source.original_prompt.clone();
+    pub fn inherit_recurrence_from(&mut self, source: &SessionMeta) {
+        if self.prompt.is_none() {
+            self.prompt = source.prompt.clone();
         }
         if self.reminder.is_none() {
             self.reminder = source.reminder.clone();
         }
-        if self.loop_iteration == 0 && source.loop_iteration > 0 {
-            self.loop_iteration = source.loop_iteration;
+        if self.iteration == 0 && source.iteration > 0 {
+            self.iteration = source.iteration;
         }
-        if self.loop_log.is_empty() && !source.loop_log.is_empty() {
-            self.loop_log = source.loop_log.clone();
+        if self.iteration_log.is_empty() && !source.iteration_log.is_empty() {
+            self.iteration_log = source.iteration_log.clone();
         }
-        if self.last_loop_next.is_none() && source.last_loop_next.is_some() {
-            self.last_loop_next = source.last_loop_next;
+        if self.last_iteration_at.is_none() && source.last_iteration_at.is_some() {
+            self.last_iteration_at = source.last_iteration_at;
+        }
+        if self.on_fire.is_none() {
+            self.on_fire = source.on_fire.clone();
         }
     }
 }
@@ -161,10 +173,11 @@ impl Default for SessionMeta {
             last_metadata_update: None,
             model: None,
             reminder: None,
-            original_prompt: None,
-            loop_iteration: 0,
-            loop_log: Vec::new(),
-            last_loop_next: None,
+            prompt: None,
+            iteration: 0,
+            iteration_log: Vec::new(),
+            last_iteration_at: None,
+            on_fire: None,
         }
     }
 }
@@ -429,11 +442,11 @@ fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>) -> Sessio
             last_metadata_update: m.last_metadata_update.map(|ts| ts.timestamp()),
             model: m.model.clone(),
             reminder: m.reminder.clone(),
-            original_prompt: m.original_prompt.clone(),
-            loop_iteration: m.loop_iteration,
-            loop_log: m.loop_log.clone(),
-            last_loop_next: m.last_loop_next,
-            ..Default::default()
+            prompt: m.prompt.clone(),
+            iteration: m.iteration,
+            iteration_log: m.iteration_log.clone(),
+            last_iteration_at: m.last_iteration_at,
+            on_fire: m.on_fire.clone(),
         },
         None => SessionMeta::default(),
     }
@@ -580,12 +593,12 @@ impl DaemonState {
             None
         };
 
-        // Preserve loop state: the startup hook may re-register after session_start
+        // Preserve recurrence state: the startup hook may re-register after session_start
         // or loop_next's restart, arriving with blank metadata. Without this, the
-        // hook's Register would wipe original_prompt, reminder, and loop progress.
+        // hook's Register would wipe prompt, reminder, and iteration progress.
         let mut metadata = metadata;
         if let Some(existing) = self.sessions.get(&id) {
-            metadata.inherit_loop_fields_from(&existing.metadata);
+            metadata.inherit_recurrence_from(&existing.metadata);
         }
 
         // Insert session
@@ -1577,23 +1590,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_meta_loop_fields_default() {
+    fn session_meta_recurrence_fields_default() {
         let meta = SessionMeta::default();
         assert!(meta.reminder.is_none());
-        assert!(meta.original_prompt.is_none());
-        assert_eq!(meta.loop_iteration, 0);
-        assert!(meta.loop_log.is_empty());
-        assert!(meta.last_loop_next.is_none());
+        assert!(meta.prompt.is_none());
+        assert_eq!(meta.iteration, 0);
+        assert!(meta.iteration_log.is_empty());
+        assert!(meta.last_iteration_at.is_none());
     }
 
     #[test]
-    fn inherit_loop_fields_carries_last_loop_next() {
+    fn inherit_recurrence_carries_last_iteration_at() {
         let source = SessionMeta {
-            last_loop_next: Some(1711100000),
-            loop_iteration: 5,
-            original_prompt: Some("do work".into()),
+            last_iteration_at: Some(1711100000),
+            iteration: 5,
+            prompt: Some("do work".into()),
             reminder: Some("keep going".into()),
-            loop_log: vec![LoopLogEntry {
+            iteration_log: vec![IterationLogEntry {
                 iteration: 5,
                 message: None,
                 timestamp: 1711100000,
@@ -1601,51 +1614,72 @@ mod tests {
             ..Default::default()
         };
         let mut target = SessionMeta::default();
-        target.inherit_loop_fields_from(&source);
-        assert_eq!(target.last_loop_next, Some(1711100000));
-        assert_eq!(target.loop_iteration, 5);
+        target.inherit_recurrence_from(&source);
+        assert_eq!(target.last_iteration_at, Some(1711100000));
+        assert_eq!(target.iteration, 5);
     }
 
     #[test]
     fn loop_log_entry_serde_round_trip() {
-        let entry = LoopLogEntry {
+        let entry = IterationLogEntry {
             iteration: 3,
             message: Some("converted foo.js".into()),
             timestamp: 1711100000,
         };
         let json = serde_json::to_string(&entry).unwrap();
-        let decoded: LoopLogEntry = serde_json::from_str(&json).unwrap();
+        let decoded: IterationLogEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, entry);
     }
 
     #[test]
     fn loop_log_entry_optional_message() {
-        let entry = LoopLogEntry {
+        let entry = IterationLogEntry {
             iteration: 1,
             message: None,
             timestamp: 1711100000,
         };
         let json = serde_json::to_string(&entry).unwrap();
-        let decoded: LoopLogEntry = serde_json::from_str(&json).unwrap();
+        let decoded: IterationLogEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.message, None);
     }
 
     #[test]
-    fn loop_log_cap_at_100() {
+    fn iteration_log_cap_at_100() {
         let mut meta = SessionMeta::default();
         for i in 0..110 {
-            meta.loop_log.push(LoopLogEntry {
+            meta.iteration_log.push(IterationLogEntry {
                 iteration: i,
                 message: Some(format!("iter {i}")),
                 timestamp: 1711100000 + i as i64,
             });
         }
-        if meta.loop_log.len() > 100 {
-            let drain_count = meta.loop_log.len() - 100;
-            meta.loop_log.drain(..drain_count);
+        if meta.iteration_log.len() > 100 {
+            let drain_count = meta.iteration_log.len() - 100;
+            meta.iteration_log.drain(..drain_count);
         }
-        assert_eq!(meta.loop_log.len(), 100);
-        assert_eq!(meta.loop_log[0].iteration, 10);
+        assert_eq!(meta.iteration_log.len(), 100);
+        assert_eq!(meta.iteration_log[0].iteration, 10);
+    }
+
+    #[test]
+    fn inherit_recurrence_carries_on_fire() {
+        let source = SessionMeta {
+            on_fire: Some(crate::scheduler::OnFire::NewSession),
+            ..Default::default()
+        };
+        let mut target = SessionMeta::default();
+        target.inherit_recurrence_from(&source);
+        assert_eq!(target.on_fire, Some(crate::scheduler::OnFire::NewSession));
+    }
+
+    #[test]
+    fn session_meta_serde_aliases_for_renamed_fields() {
+        let json = r#"{"original_prompt": "do work", "loop_iteration": 5, "loop_log": [{"iteration": 1, "message": null, "timestamp": 100}], "last_loop_next": 1711100000}"#;
+        let meta: SessionMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.prompt.as_deref(), Some("do work"));
+        assert_eq!(meta.iteration, 5);
+        assert_eq!(meta.iteration_log.len(), 1);
+        assert_eq!(meta.last_iteration_at, Some(1711100000));
     }
 
     #[test]

@@ -1461,7 +1461,7 @@ pub async fn start_session(
                 backend_session_id,
                 model: model.map(String::from),
                 reminder: reminder.map(String::from),
-                original_prompt: prompt.map(String::from),
+                prompt: prompt.map(String::from),
                 ..Default::default()
             };
             state
@@ -1826,13 +1826,14 @@ pub async fn restart_session(
                     last_metadata_update: None,
                     model: model.map(String::from).or_else(|| m.model.clone()),
                     reminder: reminder.map(String::from).or_else(|| m.reminder.clone()),
-                    original_prompt: m
-                        .original_prompt
+                    prompt: m
+                        .prompt
                         .clone()
                         .or_else(|| prompt.map(String::from)),
-                    loop_iteration: m.loop_iteration,
-                    loop_log: m.loop_log.clone(),
-                    last_loop_next: m.last_loop_next,
+                    iteration: m.iteration,
+                    iteration_log: m.iteration_log.clone(),
+                    last_iteration_at: m.last_iteration_at,
+                    on_fire: m.on_fire.clone(),
                 },
                 None => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),
@@ -1840,7 +1841,7 @@ pub async fn restart_session(
                     backend_session_id,
                     model: model.map(String::from),
                     reminder: reminder.map(String::from),
-                    original_prompt: prompt.map(String::from),
+                    prompt: prompt.map(String::from),
                     ..Default::default()
                 },
             };
@@ -2075,7 +2076,7 @@ async fn setup_shared_serve_session(
 
 /// Inject a prompt into a pane after a short delay, giving the backend time to start.
 /// For HttpApi backends, queue the prompt and wait for a readiness signal from the plugin.
-fn schedule_prompt_injection(
+pub(crate) fn schedule_prompt_injection(
     state: &std::sync::Arc<AppState>,
     session_name: &str,
     pane_id: String,
