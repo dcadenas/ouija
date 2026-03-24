@@ -249,9 +249,9 @@ pub fn generate_task_id() -> String {
     format!("{:08x}", rand::random::<u32>())
 }
 
-/// Format a scheduled task injection message.
-pub fn format_scheduled_message(message: &str) -> String {
-    format!("[scheduled task]: {message}")
+/// Format a scheduled task injection message as XML.
+pub fn format_scheduled_message(name: &str, id: &str, message: &str) -> String {
+    format!(r#"<task name="{name}" id="{id}">{message}</task>"#)
 }
 
 /// Run the scheduler loop, checking for due tasks every 15 seconds.
@@ -310,7 +310,7 @@ pub async fn execute_task(state: &SharedState, task_id: &str) {
         }
     };
 
-    let formatted = format_scheduled_message(&task.message);
+    let formatted = format_scheduled_message(&task.name, &task.id, &task.message);
     let run = execute_injection(state, &task, &formatted).await;
 
     // Update task state
@@ -861,8 +861,8 @@ mod tests {
     #[test]
     fn format_scheduled_message_basic() {
         assert_eq!(
-            format_scheduled_message("check logs"),
-            "[scheduled task]: check logs"
+            format_scheduled_message("check-logs", "abc12345", "check the error logs"),
+            r#"<task name="check-logs" id="abc12345">check the error logs</task>"#
         );
     }
 
