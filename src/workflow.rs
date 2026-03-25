@@ -138,8 +138,6 @@ pub async fn register_workflow(
     working_dir: Option<&str>,
 ) -> Result<WorkflowRegistration, String> {
     let path = resolve_path(workflow_path, working_dir);
-    let lock = state.workflow_lock(&path);
-    let _guard = lock.lock().await;
 
     let input = WorkflowInput {
         event: Some("register".into()),
@@ -164,8 +162,6 @@ pub async fn call_workflow(
     working_dir: Option<&str>,
 ) -> Result<String, String> {
     let path = resolve_path(workflow_path, working_dir);
-    let lock = state.workflow_lock(&path);
-    let _guard = lock.lock().await;
 
     let input = WorkflowInput {
         event: None,
@@ -210,8 +206,6 @@ pub fn notify_workflow(
 
     tokio::spawn(async move {
         let path = resolve_path(&workflow_path, working_dir.as_deref());
-        let lock = state.workflow_lock(&path);
-        let _guard = lock.lock().await;
 
         let input = WorkflowInput {
             event: Some(event.clone()),
