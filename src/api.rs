@@ -104,6 +104,9 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
                 "iteration": s.metadata.iteration,
                 "iteration_log": s.metadata.iteration_log,
                 "last_iteration_at": s.metadata.last_iteration_at,
+                "workflow": s.metadata.workflow,
+                "workflow_calls": s.metadata.workflow_calls,
+                "workflow_max_calls": s.metadata.workflow_max_calls,
             })
         })
         .collect();
@@ -429,6 +432,12 @@ pub struct RegisterBody {
     /// Reminder text re-injected on idle.
     #[serde(default)]
     reminder: Option<String>,
+    /// Path to a workflow executable.
+    #[serde(default)]
+    workflow: Option<String>,
+    /// Maximum workflow calls allowed (daemon-enforced effort budget).
+    #[serde(default)]
+    workflow_max_calls: Option<u64>,
 }
 
 /// Register a new local session with optional metadata.
@@ -477,6 +486,8 @@ pub async fn register(
         vim_mode: metadata.vim_mode,
         backend: metadata.backend.clone(),
         reminder: metadata.reminder.clone(),
+        workflow: body.workflow,
+        workflow_max_calls: body.workflow_max_calls.unwrap_or(0),
         ..Default::default()
     };
     let effects = state

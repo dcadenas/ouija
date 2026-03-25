@@ -1310,6 +1310,154 @@ assert_eq "31c: role updated via MCP" "$role3" "hook-registered"
 api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/dev/null
 api "$BASE" POST /api/register -d "{\"id\":\"sess-b\",\"pane\":\"$PANE_B\"}" >/dev/null
 
+# ═══════════════════════════════════════════════════════════════════
+# WORKFLOW ACTOR TESTS
+# ═══════════════════════════════════════════════════════════════════
+
+# Create a test workflow script
+WORKFLOW_SCRIPT="/tmp/ouija-test/test-workflow.py"
+cat > "$WORKFLOW_SCRIPT" << 'PYEOF'
+#!/usr/bin/env python3
+import json, sys, os
+from pathlib import Path
+
+STATE_FILE = os.path.join(os.environ.get("WORKFLOW_DIR", "/tmp/ouija-test"), "wf-state.json")
+
+def load_state():
+    try:
+        return json.load(open(STATE_FILE))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"calls": 0, "sessions": {}}
+
+def save_state(state):
+    json.dump(state, open(STATE_FILE, "w"))
+
+envelope = json.loads(sys.stdin.read())
+event = envelope.get("event")
+action = envelope.get("action")
+session_id = envelope.get("session_id", "unknown")
+params = envelope.get("params") or {}
+
+if event == "register":
+    state = load_state()
+    state["sessions"][session_id] = {"status": "registered"}
+    save_state(state)
+    max_calls = params.get("max_calls", 0)
+    result = {
+        "instructions": "You are a test worker. Call workflow('init') to start.",
+        "inject_on_start": "Call workflow('init') to begin.",
+    }
+    if max_calls:
+        result["max_calls"] = max_calls
+    print(json.dumps(result))
+
+elif event in ("session_died", "session_restarted"):
+    state = load_state()
+    state["sessions"][session_id] = {"status": event}
+    save_state(state)
+    print(json.dumps({}))
+
+elif action == "init":
+    state = load_state()
+    state["calls"] = state.get("calls", 0) + 1
+    save_state(state)
+    print(json.dumps({
+        "message": f"Iteration {state['calls']}. Do some work, then call workflow('done').",
+        "verify": "echo 'test passes'"
+    }))
+
+elif action == "done":
+    state = load_state()
+    state["calls"] = state.get("calls", 0) + 1
+    save_state(state)
+    print(json.dumps({"message": f"Done after {state['calls']} calls. Good work."}))
+
+elif action == "status":
+    state = load_state()
+    print(json.dumps({"message": f"calls={state.get('calls', 0)} sessions={list(state.get('sessions', {}).keys())}"}))
+
+elif action == "error_test":
+    print(json.dumps({"error": "intentional error for testing"}))
+
+else:
+    print(json.dumps({"error": f"unknown action: {action}"}))
+PYEOF
+chmod +x "$WORKFLOW_SCRIPT"
+
+log "Test 32: Workflow — register via session_start with workflow param"
+# Register a session with workflow
+api "$BASE" POST /api/register -d "{\"id\":\"wf-sess\",\"pane\":\"$PANE_A\"}" >/dev/null
+# Call MCP session_start won't work in e2e (no real backend), so test the workflow tool directly.
+# First, manually set the workflow path on the session via the REST API register with metadata:
+api "$BASE" POST /api/register -d "{\"id\":\"wf-sess\",\"pane\":\"$PANE_A\",\"workflow\":\"$WORKFLOW_SCRIPT\"}" >/dev/null
+# Verify workflow field is set
+status=$(api "$BASE" GET /api/status)
+wf=$(echo "$status" | jq -r '.sessions[] | select(.id == "wf-sess") | .workflow // ""')
+assert_eq "32: workflow path stored in metadata" "$wf" "$WORKFLOW_SCRIPT"
+
+log "Test 33: Workflow — call workflow('init') via MCP"
+result=$(mcp_call_tool "$BASE" "workflow" "{\"from\":\"wf-sess\",\"action\":\"init\"}")
+result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
+assert_contains "33: init returns iteration message" "$result_text" "Iteration"
+assert_contains "33: init includes verify criteria" "$result_text" "Verify before proceeding"
+
+log "Test 34: Workflow — call workflow('done') via MCP"
+result=$(mcp_call_tool "$BASE" "workflow" "{\"from\":\"wf-sess\",\"action\":\"done\"}")
+result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
+assert_contains "34: done returns completion message" "$result_text" "Done after"
+
+log "Test 35: Workflow — call workflow('status') via MCP"
+result=$(mcp_call_tool "$BASE" "workflow" "{\"from\":\"wf-sess\",\"action\":\"status\"}")
+result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
+assert_contains "35: status returns call count" "$result_text" "calls="
+
+log "Test 36: Workflow — workflow error propagation"
+result=$(mcp_call_tool "$BASE" "workflow" "{\"from\":\"wf-sess\",\"action\":\"error_test\"}")
+result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
+assert_contains "36: error propagated to LLM" "$result_text" "intentional error"
+
+log "Test 37: Workflow — unknown action returns error"
+result=$(mcp_call_tool "$BASE" "workflow" "{\"from\":\"wf-sess\",\"action\":\"nonexistent\"}")
+result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
+assert_contains "37: unknown action error" "$result_text" "unknown action"
+
+log "Test 38: Workflow — no workflow configured returns error"
+# sess-b has no workflow
+result=$(mcp_call_tool "$BASE" "workflow" "{\"from\":\"sess-b\",\"action\":\"init\"}")
+result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
+assert_contains "38: no workflow error" "$result_text" "no workflow configured"
+
+log "Test 39: Workflow — effort budget enforcement"
+# Register a new session with a low max_calls budget
+BUDGET_SCRIPT="/tmp/ouija-test/budget-workflow.py"
+cat > "$BUDGET_SCRIPT" << 'PYEOF2'
+#!/usr/bin/env python3
+import json, sys
+envelope = json.loads(sys.stdin.read())
+if envelope.get("event") == "register":
+    print(json.dumps({"instructions": "Budget test.", "inject_on_start": "Go.", "max_calls": 3}))
+else:
+    print(json.dumps({"message": "ok"}))
+PYEOF2
+chmod +x "$BUDGET_SCRIPT"
+api "$BASE" POST /api/register -d "{\"id\":\"budget-sess\",\"pane\":\"$PANE_B\",\"workflow\":\"$BUDGET_SCRIPT\",\"workflow_max_calls\":3}" >/dev/null
+# Make 3 calls (should succeed)
+for i in 1 2 3; do
+    result=$(mcp_call_tool "$BASE" "workflow" "{\"from\":\"budget-sess\",\"action\":\"ping\"}")
+    result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
+done
+assert_contains "39a: third call succeeds" "$result_text" "ok"
+# 4th call should be refused
+result=$(mcp_call_tool "$BASE" "workflow" "{\"from\":\"budget-sess\",\"action\":\"ping\"}")
+result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
+assert_contains "39b: fourth call refused (budget exhausted)" "$result_text" "budget exhausted"
+
+# Clean up workflow sessions
+api "$BASE" POST /api/remove -d '{"id":"wf-sess"}' >/dev/null
+api "$BASE" POST /api/remove -d '{"id":"budget-sess"}' >/dev/null
+api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/dev/null
+api "$BASE" POST /api/register -d "{\"id\":\"sess-b\",\"pane\":\"$PANE_B\"}" >/dev/null
+
 # ── Daemon logs ──────────────────────────────────────────────────────
 log "Daemon logs:"
 cat /tmp/ouija-test/daemon.log 2>/dev/null || true

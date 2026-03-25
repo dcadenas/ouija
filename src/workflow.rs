@@ -279,7 +279,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_workflow_nonzero_exit() {
-        let script = make_script("echo 'something broke' >&2; exit 1");
+        let script = make_script("cat /dev/stdin > /dev/null; echo 'something broke' >&2; exit 1");
         let input = make_input("sess-2");
         let result = execute_workflow(&script, &input, Duration::from_secs(5), None, 9999).await;
         let err = result.unwrap_err();
@@ -289,7 +289,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_workflow_invalid_json() {
-        let script = make_script("echo 'not json'");
+        let script = make_script("cat /dev/stdin > /dev/null; echo 'not json'");
         let input = make_input("sess-3");
         let result = execute_workflow(&script, &input, Duration::from_secs(5), None, 9999).await;
         let err = result.unwrap_err();
