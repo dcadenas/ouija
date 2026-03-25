@@ -455,6 +455,8 @@ impl OuijaMcp {
             params.responds_to
         };
 
+        // Clone message before Event::Send consumes it — needed for auto-start path
+        let message = params.message.clone();
         let effects = self
             .state
             .apply_and_execute(crate::daemon_protocol::Event::Send {
@@ -481,45 +483,76 @@ impl OuijaMcp {
             // Check for matching projects — auto-start if exactly one match
             let suggestions = crate::project_index::suggest_projects(&self.state, &params.to).await;
             if suggestions.len() == 1 {
-                // Auto-start the session with the message as prompt
                 let project = &suggestions[0];
                 let project_dir = project.dir.to_string_lossy().to_string();
-                let (start_result, prompt_msg_id) = crate::nostr_transport::start_session(
+                // Start the session without a prompt — the message is injected
+                // separately as proper <msg> XML so the new session parses it
+                // as a peer message rather than treating it as instructions.
+                let (start_result, _) = crate::nostr_transport::start_session(
                     &self.state,
                     &params.to,
                     None,
                     Some(&project_dir),
-                    None, // prompt not available (message consumed by Event::Send)
-                    Some(&params.from),
-                    Some(params.expects_reply),
+                    None,
+                    None,
+                    None,
                     None,
                     None,
                     None,
                 )
                 .await;
                 if start_result.starts_with("started ") {
-                    // Track pending reply like session_start does
-                    if params.expects_reply {
-                        if let Some(msg_id) = prompt_msg_id {
-                            let mut proto = self.state.protocol.write().await;
-                            proto
-                                .pending_replies
-                                .entry(params.to.clone())
-                                .or_default()
-                                .push(crate::daemon_protocol::PendingReplyEntry {
-                                    msg_id,
-                                    from: params.from.clone(),
-                                    message: String::new(),
-                                    received_at: chrono::Utc::now().timestamp(),
-                                    last_activity: chrono::Utc::now().timestamp(),
-                                    in_progress: false,
-                                });
-                        }
+                    // Format and inject the message as <msg> XML
+                    let msg_id = {
+                        let mut proto = self.state.protocol.write().await;
+                        proto.next_seq()
+                    };
+                    let formatted = crate::daemon_protocol::format_session_message(
+                        &params.from,
+                        &message,
+                        params.expects_reply,
+                        msg_id,
+                        responds_to,
+                        params.done,
+                    );
+                    if let Some(pane) = self
+                        .state
+                        .protocol
+                        .read()
+                        .await
+                        .sessions
+                        .get(&params.to)
+                        .and_then(|s| s.pane.clone())
+                    {
+                        crate::nostr_transport::schedule_prompt_injection(
+                            &self.state,
+                            &params.to,
+                            pane,
+                            formatted,
+                        );
                     }
-                    Ok(CallToolResult::success(vec![Content::text(format!(
-                        "auto-started session '{}' in {} with your message as prompt",
+                    // Track pending reply
+                    if params.expects_reply {
+                        let mut proto = self.state.protocol.write().await;
+                        proto
+                            .pending_replies
+                            .entry(params.to.clone())
+                            .or_default()
+                            .push(crate::daemon_protocol::PendingReplyEntry {
+                                msg_id,
+                                from: params.from.clone(),
+                                message: String::new(),
+                                received_at: chrono::Utc::now().timestamp(),
+                                last_activity: chrono::Utc::now().timestamp(),
+                                in_progress: false,
+                            });
+                    }
+                    let mut contents = vec![Content::text(format!(
+                        "auto-started session '{}' in {} and delivered message (msg_id={msg_id})",
                         params.to, project_dir
-                    ))]))
+                    ))];
+                    append_staleness_hint(&self.state, &params.from, &mut contents).await;
+                    Ok(CallToolResult::success(contents))
                 } else {
                     Ok(CallToolResult::error(vec![Content::text(format!(
                         "session '{}' not found; auto-start failed: {}",

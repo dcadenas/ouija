@@ -1208,37 +1208,49 @@ async fn kill_session_inner(state: &std::sync::Arc<AppState>, name: &str, keep_w
 
         match backend_pid {
             Some(pid) => {
-                // Graceful: send exit command if backend supports it
                 let mut exited = false;
-                if let Some(ref exit) = exit_cmd {
-                    let _ = Command::new("tmux")
-                        .args(["send-keys", "-t", &pane, exit, "Enter"])
+                // When preserving worktrees, skip graceful /exit — the
+                // backend may clean up its own worktree during exit.
+                // Go straight to SIGKILL to prevent cleanup handlers.
+                if keep_worktree {
+                    let _ = Command::new("kill")
+                        .args(["-9", &pid.to_string()])
                         .status();
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                } else {
+                    // Graceful: send exit command if backend supports it
+                    if let Some(ref exit) = exit_cmd {
+                        let _ = Command::new("tmux")
+                            .args(["send-keys", "-t", &pane, exit, "Enter"])
+                            .status();
 
-                    // Poll up to 10s for process to exit
-                    let deadline = std::time::Instant::now()
-                        + std::time::Duration::from_secs(PROCESS_EXIT_TIMEOUT_SECS);
-                    while std::time::Instant::now() < deadline {
-                        std::thread::sleep(std::time::Duration::from_secs(1));
-                        // Check if process still exists
-                        let status = Command::new("kill").args(["-0", &pid.to_string()]).status();
-                        if !status.is_ok_and(|s| s.success()) {
-                            exited = true;
-                            break;
+                        // Poll up to 10s for process to exit
+                        let deadline = std::time::Instant::now()
+                            + std::time::Duration::from_secs(PROCESS_EXIT_TIMEOUT_SECS);
+                        while std::time::Instant::now() < deadline {
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                            let status =
+                                Command::new("kill").args(["-0", &pid.to_string()]).status();
+                            if !status.is_ok_and(|s| s.success()) {
+                                exited = true;
+                                break;
+                            }
                         }
                     }
-                }
 
-                if !exited {
-                    // Fallback: SIGTERM
-                    let _ = Command::new("kill").arg(pid.to_string()).status();
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if !exited {
+                        // Fallback: SIGTERM
+                        let _ = Command::new("kill").arg(pid.to_string()).status();
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
                 }
 
                 let _ = Command::new("tmux")
                     .args(["kill-pane", "-t", &pane])
                     .status();
-                let method = if exited {
+                let method = if keep_worktree {
+                    "SIGKILL (worktree preserved)"
+                } else if exited {
                     "exited gracefully"
                 } else {
                     "SIGTERM"
