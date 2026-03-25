@@ -409,7 +409,14 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
                 .unwrap_or("/tmp");
             return respawn_and_inject(state, task, pane, dir).await;
         }
-        return TaskRun::ok(task, None);
+        // Verify session still exists — a concurrent kill may have removed it
+        // while we were checking pane liveness. If gone, fall through to revival.
+        if state.protocol.read().await.sessions.contains_key(session_name) {
+            return TaskRun::ok(task, None);
+        }
+        tracing::info!(
+            "session '{session_name}' disappeared during alive check, reviving"
+        );
     }
 
     // Pane is dead — attempt revival, falling back to session's project_dir
