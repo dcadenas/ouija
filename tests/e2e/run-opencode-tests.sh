@@ -40,7 +40,8 @@ cat > /root/.config/opencode/opencode.json << CONF
   "mcp": {
     "ouija": {
       "type": "remote",
-      "url": "http://localhost:${PORT}/mcp"
+      "url": "http://localhost:${PORT}/mcp",
+      "oauth": false
     }
   }
 }
@@ -55,10 +56,11 @@ DAEMON_PID=$(start_daemon $PORT "opencode-test" /tmp/ouija-test)
 log "Daemon started (PID $DAEMON_PID, logs in /tmp/ouija-test/daemon.log)"
 
 # ── Setup: opencode serve ─────────────────────────────────────────
+log "Env check: GEMINI_API_KEY=$(test -n "${GEMINI_API_KEY:-}" && echo 'set' || echo 'NOT SET'), GOOGLE_GENERATIVE_AI_API_KEY=$(test -n "${GOOGLE_GENERATIVE_AI_API_KEY:-}" && echo 'set' || echo 'NOT SET')"
 log "Starting opencode serve on port $OPENCODE_PORT"
 tmux new-window -t test
 OC_PANE=$(tmux display-message -t test -p '#{pane_id}')
-tmux send-keys -t "$OC_PANE" "opencode serve --port $OPENCODE_PORT --hostname 127.0.0.1" Enter
+tmux send-keys -t "$OC_PANE" "GOOGLE_GENERATIVE_AI_API_KEY='${GOOGLE_GENERATIVE_AI_API_KEY:-${GEMINI_API_KEY:-}}' opencode serve --port $OPENCODE_PORT --hostname 127.0.0.1" Enter
 
 log "Waiting for opencode to be ready (up to 15s)"
 if ! wait_for 15 curl -sf "$OC_BASE/global/health" -o /dev/null; then
@@ -159,7 +161,7 @@ OC_SERVE_PORT=$((PORT + 320))
 log "Starting opencode serve on daemon-expected port $OC_SERVE_PORT"
 tmux new-window -t test
 OC_SERVE_PANE=$(tmux display-message -t test -p '#{pane_id}')
-tmux send-keys -t "$OC_SERVE_PANE" "opencode serve --port $OC_SERVE_PORT --hostname 127.0.0.1" Enter
+tmux send-keys -t "$OC_SERVE_PANE" "GOOGLE_GENERATIVE_AI_API_KEY='${GOOGLE_GENERATIVE_AI_API_KEY:-${GEMINI_API_KEY:-}}' opencode serve --port $OC_SERVE_PORT --hostname 127.0.0.1" Enter
 
 log "Waiting for opencode serve on port $OC_SERVE_PORT (up to 15s)"
 if ! wait_for 15 curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/global/health" -o /dev/null; then
@@ -549,12 +551,34 @@ log "Test 15: Workflow — LLM follows workflow instructions"
 # timing issue, not a workflow bug. The workflow system is proven working with Claude Code
 # (live testing completed all tasks with async push).
 # Skip the LLM compliance test until the opencode MCP timing is resolved.
-if true; then
-    log "  Skipping LLM compliance test (opencode serve MCP timing issue — see comment)"
-    pass "15a: SKIPPED (opencode MCP timing)"
+if [ -z "${GEMINI_API_KEY:-}" ]; then
+    log "  Skipping LLM compliance test (no GEMINI_API_KEY)"
+    pass "15a: SKIPPED (no API key)"
     pass "15b: SKIPPED"
     pass "15c: SKIPPED"
 else
+# Diagnostic: check if ouija MCP tools are visible to opencode
+sleep 5  # let MCP connection establish
+OC_SERVE_PORT=$((PORT + 320))
+log "  Checking MCP tool availability..."
+# List tools via opencode session to see if ouija tools are present
+OC_WF_SID=$(api "$BASE" GET /api/status | jq -r '.sessions[] | select(.id == "oc-wf") | .backend_session_id // empty')
+if [ -n "$OC_WF_SID" ]; then
+    # Check opencode's message history for tool calls or errors
+    OC_MSGS=$(curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/session/${OC_WF_SID}/message" \
+        -H "x-opencode-directory: /tmp" 2>/dev/null || echo '[]')
+    MSG_COUNT=$(echo "$OC_MSGS" | jq 'length' 2>/dev/null || echo 0)
+    ASSISTANT_TEXT=$(echo "$OC_MSGS" | jq -r '[.[] | select(.info.role == "assistant") | .parts[]? | select(.type == "text") | .text] | join(" ")' 2>/dev/null | head -c 500)
+    TOOL_USES=$(echo "$OC_MSGS" | jq '[.[] | select(.info.role == "assistant") | .parts[]? | select(.type == "tool-invocation")] | length' 2>/dev/null || echo 0)
+    log "  opencode session $OC_WF_SID: $MSG_COUNT messages, $TOOL_USES tool invocations"
+    if [ -n "$ASSISTANT_TEXT" ]; then
+        log "  assistant said: $(echo "$ASSISTANT_TEXT" | head -c 300)"
+    fi
+fi
+# Check daemon log for MCP connection from opencode
+MCP_CONNECTS=$(grep -c "tools/list\|initialize" /tmp/ouija-test/daemon.log 2>/dev/null || echo 0)
+log "  ouija daemon: $MCP_CONNECTS MCP initialize/tools_list requests"
+
 # The real test: does the LLM call workflow('init'), do the tasks, call workflow('done')?
 # We poll the state file to see if the LLM is making progress.
 DEADLINE=$(($(date +%s) + 120))
@@ -605,6 +629,28 @@ if [ -f "$WF_STATE" ]; then
 else
     fail "15a: workflow state" "state file exists" "no state file created"
 fi
+
+# Post-mortem diagnostics
+log "  Post-mortem: checking what the LLM did..."
+OC_WF_SID=$(api "$BASE" GET /api/status | jq -r '.sessions[] | select(.id == "oc-wf") | .backend_session_id // empty')
+if [ -n "$OC_WF_SID" ]; then
+    OC_MSGS=$(curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/session/${OC_WF_SID}/message" \
+        -H "x-opencode-directory: /tmp" 2>/dev/null || echo '[]')
+    MSG_COUNT=$(echo "$OC_MSGS" | jq 'length' 2>/dev/null || echo 0)
+    TOOL_USES=$(echo "$OC_MSGS" | jq '[.[] | select(.info.role == "assistant") | .parts[]? | select(.type == "tool-invocation")] | length' 2>/dev/null || echo 0)
+    TOOL_NAMES=$(echo "$OC_MSGS" | jq -r '[.[] | select(.info.role == "assistant") | .parts[]? | select(.type == "tool-invocation") | .toolInvocation.toolName // .name // "unknown"] | unique | join(", ")' 2>/dev/null || echo "none")
+    ASSISTANT_TEXT=$(echo "$OC_MSGS" | jq -r '[.[] | select(.info.role == "assistant") | .parts[]? | select(.type == "text") | .text] | join("\n---\n")' 2>/dev/null | head -c 1000)
+    ERRORS=$(echo "$OC_MSGS" | jq -r '[.[] | select(.info.role == "assistant") | .info.error // empty | .message // empty] | map(select(. != "")) | join("; ")' 2>/dev/null || echo "none")
+    log "  session: $OC_WF_SID, messages: $MSG_COUNT, tool_uses: $TOOL_USES, tools: $TOOL_NAMES"
+    log "  errors: $ERRORS"
+    log "  assistant text: $(echo "$ASSISTANT_TEXT" | head -c 500)"
+    # Dump raw assistant message info for debugging
+    ASST_INFO=$(echo "$OC_MSGS" | jq -r '[.[] | select(.info.role == "assistant") | .info | {model: .modelID, error: (.error.message // "none"), tokens_in: .tokens.input, tokens_out: .tokens.output}] | .[0]' 2>/dev/null)
+    log "  raw assistant info: $ASST_INFO"
+fi
+MCP_CONNECTS=$(grep -c "tools/list\|initialize" /tmp/ouija-test/daemon.log 2>/dev/null || echo 0)
+WORKFLOW_CALLS=$(grep -c "workflow" /tmp/ouija-test/daemon.log 2>/dev/null || echo 0)
+log "  daemon: MCP requests=$MCP_CONNECTS, workflow mentions=$WORKFLOW_CALLS"
 fi  # end GEMINI_API_KEY guard
 
 # Clean up workflow session

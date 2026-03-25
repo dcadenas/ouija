@@ -5,3 +5,4 @@ services:
       dockerfile: tests/e2e/Dockerfile.opencode
     environment:
       - GEMINI_API_KEY
+      - GOOGLE_GENERATIVE_AI_API_KEY=${GEMINI_API_KEY}

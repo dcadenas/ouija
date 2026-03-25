@@ -110,7 +110,8 @@ impl CodingAssistant for OpenCode {
         if mcp.get("ouija").is_none() {
             mcp["ouija"] = serde_json::json!({
                 "type": "remote",
-                "url": "http://localhost:7880/mcp"
+                "url": "http://localhost:7880/mcp",
+                "oauth": false
             });
         }
 

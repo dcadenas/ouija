@@ -1466,6 +1466,7 @@ pub async fn start_session(
                 None
             };
 
+            let oc_session_id = backend_session_id.clone();
             let proto_meta = crate::daemon_protocol::SessionMeta {
                 project_dir: Some(dir.clone()),
                 worktree,
@@ -1502,7 +1503,66 @@ pub async fn start_session(
                 } else {
                     full_text
                 };
-                schedule_prompt_injection(state, name, pane_id.clone(), injected);
+                // For HttpApi backends with a backend_session_id, deliver via
+                // prompt_async directly — ensures MCP tools are available on the
+                // first prompt. Falls back to schedule_prompt_injection otherwise.
+                if let Some(ref oc_sid) = oc_session_id {
+                    if matches!(
+                        backend.delivery_mode(),
+                        crate::backend::DeliveryMode::HttpApi { .. }
+                    ) {
+                        let port = state.opencode_serve_port();
+                        let body = serde_json::json!({
+                            "parts": [{"type": "text", "text": injected}]
+                        });
+                        let url = format!(
+                            "http://127.0.0.1:{port}/session/{oc_sid}/prompt_async"
+                        );
+                        let state2 = state.clone();
+                        let dir2 = dir.clone();
+                        let name2 = name.to_string();
+                        let pane2 = pane_id.clone();
+                        tokio::spawn(async move {
+                            // Wait for opencode serve to bootstrap MCP connections
+                            // before delivering the prompt (MCP tools must be available
+                            // for the LLM to call workflow()).
+                            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                            let resp = state2
+                                .http_client
+                                .post(&url)
+                                .header("x-opencode-directory", &dir2)
+                                .json(&body)
+                                .timeout(std::time::Duration::from_secs(10))
+                                .send()
+                                .await;
+                            match resp {
+                                Ok(r) if r.status().is_success() => {
+                                    tracing::info!(
+                                        "start_session: delivered prompt to {name2} via prompt_async"
+                                    );
+                                }
+                                Ok(r) => {
+                                    tracing::warn!(
+                                        "start_session: prompt_async returned {}", r.status()
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "start_session: prompt_async failed: {e}"
+                                    );
+                                    let _ = crate::tmux::locked_inject(
+                                        &state2, &name2, &pane2, &injected, false,
+                                    )
+                                    .await;
+                                }
+                            }
+                        });
+                    } else {
+                        schedule_prompt_injection(state, name, pane_id.clone(), injected);
+                    }
+                } else {
+                    schedule_prompt_injection(state, name, pane_id.clone(), injected);
+                }
             }
             if auto_worktree {
                 let conflict_name = {
