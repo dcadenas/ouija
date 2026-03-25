@@ -1,6 +1,7 @@
 /target
 /docs/*
 !/docs/plans/
+!/docs/workflows.md
 /demo
 IDEAS.md
 firebase-debug.log

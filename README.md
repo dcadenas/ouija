@@ -76,7 +76,7 @@ LLM: workflow('result', {score: 0.91, description: "batched queries"})
   → "New best! Committed. 27 remaining. Call workflow('init') for next iteration."
 ```
 
-Workflows can coordinate multiple sessions — spawning workers and reviewers via the REST API, gating progress on test results, replacing an entire coordinator LLM with deterministic code. See [`examples/`](examples/) for a reference implementation and authoring guide.
+Workflows can coordinate multiple sessions — spawning workers and reviewers via the REST API, gating progress on test results, replacing an entire coordinator LLM with deterministic code. See the [workflow docs](docs/workflows.md) for the full architecture and [`examples/`](examples/) for a reference implementation.
 
 **Peer-to-peer collaboration.** No hierarchy. Two long-running sessions can message each other directly — one optimizing a skill while the other evaluates results, or one migrating files while the other reviews the diffs. They coordinate through `session_send`, not through a central orchestrator.
 
