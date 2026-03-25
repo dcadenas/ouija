@@ -1311,70 +1311,98 @@ api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/
 api "$BASE" POST /api/register -d "{\"id\":\"sess-b\",\"pane\":\"$PANE_B\"}" >/dev/null
 
 # ═══════════════════════════════════════════════════════════════════
-# WORKFLOW ACTOR TESTS
+# WORKFLOW ACTOR TESTS — Full User Journey
+# One workflow script, two sessions, tests: happy path, shared state,
+# lifecycle events, crash recovery, effort budget, verify field.
 # ═══════════════════════════════════════════════════════════════════
 
-# Create a test workflow script
-WORKFLOW_SCRIPT="/tmp/ouija-test/test-workflow.py"
-cat > "$WORKFLOW_SCRIPT" << 'PYEOF'
-#!/usr/bin/env python3
-import json, sys, os
-from pathlib import Path
+WF_STATE="/tmp/ouija-test/wf-journey-state.json"
+rm -f "$WF_STATE"
 
-STATE_FILE = os.path.join(os.environ.get("WORKFLOW_DIR", "/tmp/ouija-test"), "wf-state.json")
+JOURNEY_SCRIPT="/tmp/ouija-test/journey-workflow.py"
+cat > "$JOURNEY_SCRIPT" << 'PYEOF'
+#!/usr/bin/env python3
+"""Comprehensive test workflow exercising all workflow actor features."""
+import json, sys, os
+
+STATE_FILE = os.environ.get("WF_STATE", "/tmp/ouija-test/wf-journey-state.json")
 
 def load_state():
-    try:
-        return json.load(open(STATE_FILE))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {"calls": 0, "sessions": {}}
+    try: return json.load(open(STATE_FILE))
+    except: return {"tasks": ["alpha", "beta", "gamma"], "done": {}, "sessions": {}, "call_count": 0, "crashed": False}
 
-def save_state(state):
-    json.dump(state, open(STATE_FILE, "w"))
+def save_state(s):
+    json.dump(s, open(STATE_FILE, "w"), indent=2)
 
 envelope = json.loads(sys.stdin.read())
 event = envelope.get("event")
 action = envelope.get("action")
-session_id = envelope.get("session_id", "unknown")
+sid = envelope.get("session_id", "?")
 params = envelope.get("params") or {}
 
+# ── Lifecycle events ──
 if event == "register":
     state = load_state()
-    state["sessions"][session_id] = {"status": "registered"}
-    save_state(state)
-    max_calls = params.get("max_calls", 0)
-    result = {
-        "instructions": "You are a test worker. Call workflow('init') to start.",
-        "inject_on_start": "Call workflow('init') to begin.",
-    }
-    if max_calls:
-        result["max_calls"] = max_calls
-    print(json.dumps(result))
-
-elif event in ("session_died", "session_restarted"):
-    state = load_state()
-    state["sessions"][session_id] = {"status": event}
-    save_state(state)
-    print(json.dumps({}))
-
-elif action == "init":
-    state = load_state()
-    state["calls"] = state.get("calls", 0) + 1
+    state["sessions"][sid] = "registered"
     save_state(state)
     print(json.dumps({
-        "message": f"Iteration {state['calls']}. Do some work, then call workflow('done').",
-        "verify": "echo 'test passes'"
+        "instructions": f"Worker {sid}. Call workflow('init') for tasks.",
+        "inject_on_start": "Call workflow('init').",
+        "max_calls": params.get("max_calls", 10)
     }))
+    sys.exit(0)
+
+if event == "session_died":
+    state = load_state()
+    state["sessions"][sid] = "died"
+    save_state(state)
+    print(json.dumps({}))
+    sys.exit(0)
+
+if event == "session_restarted":
+    state = load_state()
+    state["sessions"][sid] = "restarted"
+    save_state(state)
+    print(json.dumps({}))
+    sys.exit(0)
+
+# ── Runtime actions ──
+state = load_state()
+state["call_count"] += 1
+save_state(state)
+
+if action == "init":
+    remaining = [t for t in state["tasks"] if t not in state["done"]]
+    if not remaining:
+        print(json.dumps({"message": "All tasks complete."}))
+    else:
+        print(json.dumps({
+            "message": f"Task: {remaining[0]}. Call workflow('done', {{task: '{remaining[0]}'}})",
+            "verify": f"test '{remaining[0]}' = '{remaining[0]}'"
+        }))
 
 elif action == "done":
-    state = load_state()
-    state["calls"] = state.get("calls", 0) + 1
-    save_state(state)
-    print(json.dumps({"message": f"Done after {state['calls']} calls. Good work."}))
+    task = params.get("task")
+    if not task:
+        print(json.dumps({"error": "missing 'task' param. Call workflow('done', {task: 'name'})"}))
+    else:
+        state["done"][task] = sid
+        save_state(state)
+        remaining = [t for t in state["tasks"] if t not in state["done"]]
+        msg = f"Completed {task} by {sid}. {len(remaining)} remaining."
+        if remaining:
+            msg += f" Next: call workflow('init')."
+        else:
+            msg += " All done."
+        print(json.dumps({"message": msg}))
 
 elif action == "status":
-    state = load_state()
-    print(json.dumps({"message": f"calls={state.get('calls', 0)} sessions={list(state.get('sessions', {}).keys())}"}))
+    print(json.dumps({"message": json.dumps(state)}))
+
+elif action == "crash_test":
+    # Simulate a crash on demand
+    print("this is not json and also", file=sys.stderr)
+    sys.exit(1)
 
 elif action == "error_test":
     print(json.dumps({"error": "intentional error for testing"}))
@@ -1382,79 +1410,111 @@ elif action == "error_test":
 else:
     print(json.dumps({"error": f"unknown action: {action}"}))
 PYEOF
-chmod +x "$WORKFLOW_SCRIPT"
+chmod +x "$JOURNEY_SCRIPT"
 
-log "Test 32: Workflow — register via session_start with workflow param"
-# Register a session with workflow
-api "$BASE" POST /api/register -d "{\"id\":\"wf-sess\",\"pane\":\"$PANE_A\"}" >/dev/null
-# Call MCP session_start won't work in e2e (no real backend), so test the workflow tool directly.
-# First, manually set the workflow path on the session via the REST API register with metadata:
-api "$BASE" POST /api/register -d "{\"id\":\"wf-sess\",\"pane\":\"$PANE_A\",\"workflow\":\"$WORKFLOW_SCRIPT\"}" >/dev/null
-# Verify workflow field is set
+log "Test 32: Workflow journey — register session A with workflow"
+api "$BASE" POST /api/register \
+    -d "{\"id\":\"wf-a\",\"pane\":\"$PANE_A\",\"workflow\":\"$JOURNEY_SCRIPT\",\"workflow_max_calls\":10}" >/dev/null
 status=$(api "$BASE" GET /api/status)
-wf=$(echo "$status" | jq -r '.sessions[] | select(.id == "wf-sess") | .workflow // ""')
-assert_eq "32: workflow path stored in metadata" "$wf" "$WORKFLOW_SCRIPT"
+wf=$(echo "$status" | jq -r '.sessions[] | select(.id == "wf-a") | .workflow // ""')
+assert_eq "32: workflow path stored" "$wf" "$JOURNEY_SCRIPT"
+wf_max=$(echo "$status" | jq -r '.sessions[] | select(.id == "wf-a") | .workflow_max_calls')
+assert_eq "32: max_calls stored" "$wf_max" "10"
 
-log "Test 33: Workflow — call workflow('init') via MCP"
-result=$(mcp_call_tool "$BASE" "workflow" "{\"from\":\"wf-sess\",\"action\":\"init\"}")
+log "Test 33: Workflow journey — session A calls init, gets first task + verify"
+result=$(mcp_call_tool "$BASE" "workflow" '{"from":"wf-a","action":"init"}')
 result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
-assert_contains "33: init returns iteration message" "$result_text" "Iteration"
-assert_contains "33: init includes verify criteria" "$result_text" "Verify before proceeding"
+assert_contains "33: init returns task alpha" "$result_text" "alpha"
+assert_contains "33: verify criteria included" "$result_text" "Verify before proceeding"
 
-log "Test 34: Workflow — call workflow('done') via MCP"
-result=$(mcp_call_tool "$BASE" "workflow" "{\"from\":\"wf-sess\",\"action\":\"done\"}")
+log "Test 34: Workflow journey — session A completes alpha"
+result=$(mcp_call_tool "$BASE" "workflow" '{"from":"wf-a","action":"done","params":{"task":"alpha"}}')
 result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
-assert_contains "34: done returns completion message" "$result_text" "Done after"
+assert_contains "34: alpha completed" "$result_text" "Completed alpha"
+assert_contains "34: 2 remaining" "$result_text" "2 remaining"
 
-log "Test 35: Workflow — call workflow('status') via MCP"
-result=$(mcp_call_tool "$BASE" "workflow" "{\"from\":\"wf-sess\",\"action\":\"status\"}")
+log "Test 35: Workflow journey — register session B on SAME workflow (shared state)"
+api "$BASE" POST /api/register \
+    -d "{\"id\":\"wf-b\",\"pane\":\"$PANE_B\",\"workflow\":\"$JOURNEY_SCRIPT\",\"workflow_max_calls\":4}" >/dev/null
+
+log "Test 36: Workflow journey — session B calls init, gets beta (not alpha)"
+result=$(mcp_call_tool "$BASE" "workflow" '{"from":"wf-b","action":"init"}')
 result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
-assert_contains "35: status returns call count" "$result_text" "calls="
+assert_contains "36: B gets beta (alpha already done by A)" "$result_text" "beta"
 
-log "Test 36: Workflow — workflow error propagation"
-result=$(mcp_call_tool "$BASE" "workflow" "{\"from\":\"wf-sess\",\"action\":\"error_test\"}")
+log "Test 37: Workflow journey — session B completes beta"
+result=$(mcp_call_tool "$BASE" "workflow" '{"from":"wf-b","action":"done","params":{"task":"beta"}}')
 result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
-assert_contains "36: error propagated to LLM" "$result_text" "intentional error"
+assert_contains "37: beta completed by wf-b" "$result_text" "Completed beta by wf-b"
 
-log "Test 37: Workflow — unknown action returns error"
-result=$(mcp_call_tool "$BASE" "workflow" "{\"from\":\"wf-sess\",\"action\":\"nonexistent\"}")
+log "Test 38: Workflow journey — session_died lifecycle event"
+# Remove session A (simulates kill) — daemon fires NotifyWorkflow
+api "$BASE" POST /api/remove -d '{"id":"wf-a"}' >/dev/null
+sleep 0.5
+# Verify the workflow recorded the death in its state file
+wf_state=$(cat "$WF_STATE")
+died_status=$(echo "$wf_state" | jq -r '.sessions["wf-a"]')
+assert_eq "38: session_died recorded in workflow state" "$died_status" "died"
+
+log "Test 39: Workflow journey — re-register A, state persists (gamma still pending)"
+api "$BASE" POST /api/register \
+    -d "{\"id\":\"wf-a\",\"pane\":\"$PANE_A\",\"workflow\":\"$JOURNEY_SCRIPT\",\"workflow_max_calls\":10}" >/dev/null
+result=$(mcp_call_tool "$BASE" "workflow" '{"from":"wf-a","action":"init"}')
 result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
-assert_contains "37: unknown action error" "$result_text" "unknown action"
+assert_contains "39: A gets gamma after restart (state survived)" "$result_text" "gamma"
 
-log "Test 38: Workflow — no workflow configured returns error"
-# sess-b has no workflow
-result=$(mcp_call_tool "$BASE" "workflow" "{\"from\":\"sess-b\",\"action\":\"init\"}")
+log "Test 40: Workflow journey — workflow crash returns actionable error"
+result=$(mcp_call_tool "$BASE" "workflow" '{"from":"wf-a","action":"crash_test"}')
 result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
-assert_contains "38: no workflow error" "$result_text" "no workflow configured"
+assert_contains "40: crash error is actionable" "$result_text" "crashed"
+assert_contains "40: recovery guidance included" "$result_text" "workflow(action='status')"
 
-log "Test 39: Workflow — effort budget enforcement"
-# Register a new session with a low max_calls budget
-BUDGET_SCRIPT="/tmp/ouija-test/budget-workflow.py"
-cat > "$BUDGET_SCRIPT" << 'PYEOF2'
-#!/usr/bin/env python3
-import json, sys
-envelope = json.loads(sys.stdin.read())
-if envelope.get("event") == "register":
-    print(json.dumps({"instructions": "Budget test.", "inject_on_start": "Go.", "max_calls": 3}))
-else:
-    print(json.dumps({"message": "ok"}))
-PYEOF2
-chmod +x "$BUDGET_SCRIPT"
-api "$BASE" POST /api/register -d "{\"id\":\"budget-sess\",\"pane\":\"$PANE_B\",\"workflow\":\"$BUDGET_SCRIPT\",\"workflow_max_calls\":3}" >/dev/null
-# Make 3 calls (should succeed)
-for i in 1 2 3; do
-    result=$(mcp_call_tool "$BASE" "workflow" "{\"from\":\"budget-sess\",\"action\":\"ping\"}")
-    result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
-done
-assert_contains "39a: third call succeeds" "$result_text" "ok"
-# 4th call should be refused
-result=$(mcp_call_tool "$BASE" "workflow" "{\"from\":\"budget-sess\",\"action\":\"ping\"}")
+log "Test 41: Workflow journey — workflow error field propagation"
+result=$(mcp_call_tool "$BASE" "workflow" '{"from":"wf-a","action":"error_test"}')
 result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
-assert_contains "39b: fourth call refused (budget exhausted)" "$result_text" "budget exhausted"
+assert_contains "41: error field propagated" "$result_text" "intentional error"
 
-# Clean up workflow sessions
-api "$BASE" POST /api/remove -d '{"id":"wf-sess"}' >/dev/null
-api "$BASE" POST /api/remove -d '{"id":"budget-sess"}' >/dev/null
+log "Test 42: Workflow journey — unknown action returns error"
+result=$(mcp_call_tool "$BASE" "workflow" '{"from":"wf-a","action":"nonexistent"}')
+result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
+assert_contains "42: unknown action error" "$result_text" "unknown action"
+
+log "Test 43: Workflow journey — effort budget exhaustion"
+# wf-b has max_calls=4, already used 2 (init + done). Use 2 more then hit limit.
+mcp_call_tool "$BASE" "workflow" '{"from":"wf-b","action":"status"}' >/dev/null
+mcp_call_tool "$BASE" "workflow" '{"from":"wf-b","action":"status"}' >/dev/null
+# 5th call should be refused
+result=$(mcp_call_tool "$BASE" "workflow" '{"from":"wf-b","action":"status"}')
+result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
+assert_contains "43: budget exhausted after max_calls" "$result_text" "budget exhausted"
+
+log "Test 44: Workflow journey — no workflow returns helpful error"
+# wf-b is now budget-exhausted. Re-register its pane without workflow.
+api "$BASE" POST /api/remove -d '{"id":"wf-b"}' >/dev/null
+api "$BASE" POST /api/register -d "{\"id\":\"no-wf\",\"pane\":\"$PANE_B\"}" >/dev/null
+result=$(mcp_call_tool "$BASE" "workflow" '{"from":"no-wf","action":"init"}')
+result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
+assert_contains "44: no workflow error" "$result_text" "no workflow configured"
+
+log "Test 45: Workflow journey — complete gamma, verify shared state final"
+result=$(mcp_call_tool "$BASE" "workflow" '{"from":"wf-a","action":"done","params":{"task":"gamma"}}')
+result_text=$(echo "$result" | jq -r '.result.content[0].text // ""')
+assert_contains "45: gamma completed" "$result_text" "Completed gamma"
+assert_contains "45: all done" "$result_text" "All done"
+# Verify final state file
+wf_state=$(cat "$WF_STATE")
+done_count=$(echo "$wf_state" | jq '.done | length')
+assert_eq "45: all 3 tasks in done" "$done_count" "3"
+alpha_by=$(echo "$wf_state" | jq -r '.done.alpha')
+beta_by=$(echo "$wf_state" | jq -r '.done.beta')
+gamma_by=$(echo "$wf_state" | jq -r '.done.gamma')
+assert_eq "45: alpha done by wf-a" "$alpha_by" "wf-a"
+assert_eq "45: beta done by wf-b" "$beta_by" "wf-b"
+assert_eq "45: gamma done by wf-a" "$gamma_by" "wf-a"
+
+# Clean up
+api "$BASE" POST /api/remove -d '{"id":"wf-a"}' >/dev/null
+api "$BASE" POST /api/remove -d '{"id":"wf-b"}' >/dev/null
 api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/dev/null
 api "$BASE" POST /api/register -d "{\"id\":\"sess-b\",\"pane\":\"$PANE_B\"}" >/dev/null
 

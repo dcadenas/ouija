@@ -239,7 +239,6 @@ pub fn notify_workflow(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     fn make_input(session_id: &str) -> WorkflowInput {
         WorkflowInput {
@@ -250,21 +249,21 @@ mod tests {
         }
     }
 
-    fn make_script(content: &str) -> tempfile::TempPath {
-        let mut f = tempfile::Builder::new()
-            .suffix(".sh")
-            .tempfile()
-            .unwrap();
-        writeln!(f, "#!/usr/bin/env bash").unwrap();
-        writeln!(f, "{content}").unwrap();
-        f.flush().unwrap();
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-        let path = f.path().to_path_buf();
+    fn make_script(content: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        // Close the write fd so Linux allows exec (avoids ETXTBSY)
-        f.into_temp_path()
+        let n = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join("ouija-workflow-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("wf-{}-{n}.sh", std::process::id()));
+        // Write to a separate tmp file then rename — atomic, avoids ETXTBSY
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, format!("#!/usr/bin/env bash\n{content}\n")).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        path
     }
 
     #[tokio::test]
