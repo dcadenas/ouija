@@ -73,6 +73,50 @@ pub(crate) fn extract_project_description(project_dir: &str) -> Option<String> {
     None
 }
 
+/// Return status of a single session by name.
+pub async fn get_session(
+    State(state): State<SharedState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let proto = state.protocol.read().await;
+    match proto.sessions.get(&name) {
+        Some(s) => {
+            let stale = s.metadata.is_stale();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "id": s.id,
+                    "pane": s.pane,
+                    "origin": s.origin.label(),
+                    "vim_mode": s.metadata.vim_mode,
+                    "project_dir": s.metadata.project_dir,
+                    "role": s.metadata.role,
+                    "bulletin": s.metadata.bulletin,
+                    "networked": s.metadata.networked,
+                    "worktree": s.metadata.worktree,
+                    "model": s.metadata.model,
+                    "last_metadata_update": s.metadata.last_metadata_update,
+                    "stale": stale,
+                    "backend_session_id": s.metadata.backend_session_id,
+                    "backend": s.metadata.backend,
+                    "reminder": s.metadata.reminder,
+                    "prompt": s.metadata.prompt,
+                    "iteration": s.metadata.iteration,
+                    "iteration_log": s.metadata.iteration_log,
+                    "last_iteration_at": s.metadata.last_iteration_at,
+                    "workflow": s.metadata.workflow,
+                    "workflow_calls": s.metadata.workflow_calls,
+                    "workflow_max_calls": s.metadata.workflow_max_calls,
+                })),
+            )
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("session '{}' not found", name)})),
+        ),
+    }
+}
+
 /// Return daemon status, sessions, nodes, and transport info.
 pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let proto = state.protocol.read().await;
