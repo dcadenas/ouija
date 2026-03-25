@@ -37,12 +37,11 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 
 **Spawn sessions on the fly.** `session_start("gateway-debug")` creates a tmux window, launches a coding session, and registers it. Pass a `prompt` to seed the session with context, and `backend` to choose the assistant (`"claude-code"` or `"opencode"`). Works on `session_restart` too.
 
-**Long-running work.** Sessions persist through a `prompt` (what to do) and a `reminder` (how to continue). Two orthogonal triggers drive recurring work, and they compose:
+**Long-running work.** Three mechanisms for recurring work, from simple to structured:
 
-- **Loops** (`loop_next`) -- the session drives itself. Good for migrations, optimization, queue processing. Each call logs an iteration; `clean_context=true` restarts with a fresh conversation seeded by the same prompt.
-- **Tasks** (cron) -- the daemon drives the session. Good for periodic checks, daily reports, scheduled maintenance. If the target session is dead, the daemon revives it with the task's prompt + reminder. If alive, the reminder handles nudging.
-
-Both use the same underlying machinery: prompt defines the workflow, reminder keeps it on track, and the daemon compensates for LLM fragility (stall detection, reminder re-injection, force-restart).
+- **Loops** (`loop_next`) -- the session drives itself. Good for migrations, simple iteration. Each call logs an iteration; `clean_context=true` restarts with a fresh conversation seeded by the same prompt.
+- **Tasks** (cron) -- the daemon drives the session. Good for periodic checks, daily reports, scheduled maintenance. If the target session is dead, the daemon revives it with the task's prompt + reminder.
+- **Workflows** -- a deterministic program drives the session. Good for multi-phase processes, optimization loops, coordinated multi-session work. The LLM calls a `workflow()` tool; the program controls state, verification, and progression.
 
 Simple loops restart with clean context each iteration:
 
@@ -54,18 +53,30 @@ session_start(
 )
 ```
 
-For [autoresearch-style](https://github.com/karpathy/autoresearch) optimization, sessions accumulate knowledge across iterations. Put instructions in an external file (editable without restarting), track results in a TSV, and use `clean_context=false` to keep context between iterations:
+**Workflow actors** attach an external executable (Python, bash, anything) to a session. The program manages state, runs verification, and tells the LLM what to do — one step at a time. The LLM doesn't see the full process; each `workflow()` response reveals only the current step and what to call next, like [HATEOAS](https://en.wikipedia.org/wiki/HATEOAS) for an LLM:
 
 ```
 session_start(
-  prompt: "Read INSTRUCTIONS.md for your task. Read results.tsv for history. Read FINDINGS.md for what's been learned. Begin.",
-  reminder: "Call loop_next(clean_context=false) after each iteration. If context is heavy, call loop_next(clean_context=true) to restart fresh."
+  name: "optimizer",
+  workflow: "examples/autoresearch-workflow.py",
+  workflow_params: {"max_iterations": 30},
+  project_dir: "/code/my-project"
 )
 ```
 
-The session runs one change / measure / keep-or-revert per iteration, logging results to a TSV. `INSTRUCTIONS.md` defines the rules and scope. `FINDINGS.md` accumulates architecture knowledge that survives across restarts. The daemon detects stalls automatically and nudges or force-restarts the session.
+The workflow handles [autoresearch-style](https://github.com/karpathy/autoresearch) optimization: the LLM makes one change, measures, calls `workflow('result', {score, description})`, and the workflow commits improvements, reverts regressions, tracks history in a TSV, and accumulates findings that survive context restarts. The daemon enforces call budgets and detects stalls.
 
-**Context decay is the prompt's job.** Each `loop_next` call returns `<loop iteration="N" />` — the session sees its current iteration and can use it for any policy the prompt defines. A migration might restart every iteration. An optimization loop might accumulate context and restart every tenth iteration to shed drift. The daemon provides the counter and the `clean_context` lever; the prompt decides when to pull it.
+The prompt doesn't describe the process — the workflow discloses it incrementally:
+
+```
+LLM: workflow('init')
+  → "Iteration 3/30. Best: 0.89. Make one change, measure, call workflow('result', {score, description})."
+
+LLM: workflow('result', {score: 0.91, description: "batched queries"})
+  → "New best! Committed. 27 remaining. Call workflow('init') for next iteration."
+```
+
+Workflows can coordinate multiple sessions — spawning workers and reviewers via the REST API, gating progress on test results, replacing an entire coordinator LLM with deterministic code. See [`examples/`](examples/) for a reference implementation and authoring guide.
 
 **Peer-to-peer collaboration.** No hierarchy. Two long-running sessions can message each other directly — one optimizing a skill while the other evaluates results, or one migrating files while the other reviews the diffs. They coordinate through `session_send`, not through a central orchestrator.
 
