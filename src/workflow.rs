@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
 
-const WORKFLOW_TIMEOUT: Duration = Duration::from_secs(30);
+const WORKFLOW_TIMEOUT: Duration = Duration::from_secs(120);
 const NOTIFY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Returned by the workflow on registration.
