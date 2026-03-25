@@ -1359,56 +1359,55 @@ pub async fn kill_session(
 /// Start a new session in a tmux pane, optionally in a worktree.
 pub async fn start_session(
     State(state): State<SharedState>,
-    Json(mut body): Json<SessionNameBody>,
+    Json(body): Json<SessionNameBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Workflow registration: call the workflow to get instructions before starting
-    let workflow_for_meta = if let Some(ref wf) = body.workflow {
-        match crate::workflow::register_workflow(
-            &state,
-            wf,
-            &body.name,
-            body.workflow_params.as_ref(),
-            body.project_dir.as_deref(),
-        )
-        .await
-        {
-            Ok(reg) => {
-                let max_calls = reg.max_calls.unwrap_or(0);
-                body.prompt = Some(match body.prompt.take() {
-                    Some(user_prompt) => format!("{}\n\n{user_prompt}", reg.instructions),
-                    None => reg.instructions,
-                });
-                if body.reminder.is_none() {
-                    body.reminder = reg.inject_on_start;
-                }
-                Some((wf.clone(), max_calls))
-            }
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": format!("workflow registration failed: {e}") })),
-                );
-            }
-        }
-    } else {
-        None
-    };
-
-    // Spawn session creation in the background — don't block the caller.
+    // Return 202 immediately — all work (registration + boot) happens in background.
     let name = body.name.clone();
     let state2 = state.clone();
     tokio::spawn(async move {
+        // Workflow registration (if configured)
+        let mut prompt = body.prompt;
+        let mut reminder = body.reminder;
+        let mut workflow_for_meta = None;
+        if let Some(ref wf) = body.workflow {
+            match crate::workflow::register_workflow(
+                &state2,
+                wf,
+                &body.name,
+                body.workflow_params.as_ref(),
+                body.project_dir.as_deref(),
+            )
+            .await
+            {
+                Ok(reg) => {
+                    let max_calls = reg.max_calls.unwrap_or(0);
+                    prompt = Some(match prompt.take() {
+                        Some(user_prompt) => format!("{}\n\n{user_prompt}", reg.instructions),
+                        None => reg.instructions,
+                    });
+                    if reminder.is_none() {
+                        reminder = reg.inject_on_start;
+                    }
+                    workflow_for_meta = Some((wf.clone(), max_calls));
+                }
+                Err(e) => {
+                    tracing::warn!("async workflow registration failed for {}: {e}", body.name);
+                    return;
+                }
+            }
+        }
+
         let (result, _prompt_msg_id) = crate::nostr_transport::start_session(
             &state2,
             &body.name,
             body.worktree,
             body.project_dir.as_deref(),
-            body.prompt.as_deref(),
+            prompt.as_deref(),
             body.from.as_deref(),
             body.expects_reply,
             body.backend.as_deref(),
             body.model.as_deref(),
-            body.reminder.as_deref(),
+            reminder.as_deref(),
         )
         .await;
 
