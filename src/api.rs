@@ -1339,6 +1339,12 @@ pub struct SessionNameBody {
     model: Option<String>,
     #[serde(default)]
     reminder: Option<String>,
+    /// Path to a workflow executable.
+    #[serde(default)]
+    workflow: Option<String>,
+    /// JSON params passed to the workflow on registration. Consumed at start, not persisted.
+    #[serde(default)]
+    workflow_params: Option<serde_json::Value>,
 }
 
 /// Kill the coding assistant process in a session's tmux pane.
@@ -1353,8 +1359,41 @@ pub async fn kill_session(
 /// Start a new session in a tmux pane, optionally in a worktree.
 pub async fn start_session(
     State(state): State<SharedState>,
-    Json(body): Json<SessionNameBody>,
+    Json(mut body): Json<SessionNameBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Workflow registration: call the workflow to get instructions before starting
+    let workflow_for_meta = if let Some(ref wf) = body.workflow {
+        match crate::workflow::register_workflow(
+            &state,
+            wf,
+            &body.name,
+            body.workflow_params.as_ref(),
+            body.project_dir.as_deref(),
+        )
+        .await
+        {
+            Ok(reg) => {
+                let max_calls = reg.max_calls.unwrap_or(0);
+                body.prompt = Some(match body.prompt.take() {
+                    Some(user_prompt) => format!("{}\n\n{user_prompt}", reg.instructions),
+                    None => reg.instructions,
+                });
+                if body.reminder.is_none() {
+                    body.reminder = reg.inject_on_start;
+                }
+                Some((wf.clone(), max_calls))
+            }
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": format!("workflow registration failed: {e}") })),
+                );
+            }
+        }
+    } else {
+        None
+    };
+
     let (result, _prompt_msg_id) = crate::nostr_transport::start_session(
         &state,
         &body.name,
@@ -1368,6 +1407,17 @@ pub async fn start_session(
         body.reminder.as_deref(),
     )
     .await;
+
+    // Stamp workflow path and budget on the session metadata
+    if let Some((wf_path, max_calls)) = workflow_for_meta {
+        let mut proto = state.protocol.write().await;
+        if let Some(session) = proto.sessions.get_mut(&body.name) {
+            session.metadata.workflow = Some(wf_path);
+            session.metadata.workflow_max_calls = max_calls;
+        }
+        state.persist_protocol_state(&proto);
+    }
+
     (StatusCode::OK, Json(json!({ "result": result })))
 }
 
