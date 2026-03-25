@@ -8,3 +8,4 @@ firebase-debug.log
 *.png
 !screenshot.png
 .playwright-mcp/
+workflow-state.json

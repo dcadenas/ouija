@@ -1846,6 +1846,9 @@ pub async fn restart_session(
                     iteration_log: m.iteration_log.clone(),
                     last_iteration_at: m.last_iteration_at,
                     on_fire: m.on_fire.clone(),
+                    workflow: m.workflow.clone(),
+                    workflow_calls: m.workflow_calls,
+                    workflow_max_calls: m.workflow_max_calls,
                 },
                 None => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),

@@ -210,6 +210,24 @@ pub struct SessionNameParams {
     /// If true, preserve the git worktree after killing the session.
     #[serde(default)]
     pub keep_worktree: Option<bool>,
+    /// Path to a workflow executable. The workflow drives this session's behavior.
+    #[serde(default)]
+    pub workflow: Option<String>,
+    /// JSON params passed to the workflow on registration. Consumed at start, not persisted.
+    #[serde(default)]
+    pub workflow_params: Option<serde_json::Value>,
+}
+
+/// Parameters for the `workflow` MCP tool.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkflowParams {
+    /// Your session ID (the caller).
+    pub from: String,
+    /// Action name (e.g., "init", "done", "status").
+    pub action: String,
+    /// Action-specific parameters (JSON object).
+    #[serde(default)]
+    pub params: Option<serde_json::Value>,
 }
 
 /// Parameters for the `loop_next` MCP tool.
@@ -844,8 +862,42 @@ impl OuijaMcp {
     )]
     async fn session_start(
         &self,
-        Parameters(params): Parameters<SessionNameParams>,
+        Parameters(mut params): Parameters<SessionNameParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        // Workflow registration: call the workflow to get instructions before starting
+        let workflow_for_meta: Option<(String, u64)> = if let Some(ref wf) = params.workflow {
+            match crate::workflow::register_workflow(
+                &self.state,
+                wf,
+                &params.name,
+                params.workflow_params.as_ref(),
+                params.project_dir.as_deref(),
+            )
+            .await
+            {
+                Ok(reg) => {
+                    let max_calls = reg.max_calls.unwrap_or(0);
+                    // Merge workflow instructions into prompt
+                    params.prompt = Some(match params.prompt.take() {
+                        Some(user_prompt) => format!("{}\n\n{user_prompt}", reg.instructions),
+                        None => reg.instructions,
+                    });
+                    // Use inject_on_start as reminder if no explicit reminder
+                    if params.reminder.is_none() {
+                        params.reminder = reg.inject_on_start;
+                    }
+                    Some((wf.clone(), max_calls))
+                }
+                Err(e) => {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "workflow registration failed: {e}"
+                    ))]));
+                }
+            }
+        } else {
+            None
+        };
+
         let from = params.from.clone();
         let expects_reply = params.expects_reply;
         let (result, prompt_msg_id) = if params.name.contains('/') {
@@ -878,6 +930,17 @@ impl OuijaMcp {
             )
             .await
         };
+
+        // Stamp workflow path and budget on the session metadata
+        if let Some((wf_path, max_calls)) = workflow_for_meta {
+            let mut proto = self.state.protocol.write().await;
+            if let Some(session) = proto.sessions.get_mut(&params.name) {
+                session.metadata.workflow = Some(wf_path);
+                session.metadata.workflow_max_calls = max_calls;
+            }
+            self.state.persist_protocol_state(&proto);
+        }
+
         track_pending_reply(
             &self.state,
             &params.name,
@@ -1086,6 +1149,81 @@ impl OuijaMcp {
             Ok(CallToolResult::success(vec![Content::text(response)]))
         }
     }
+
+    #[tool(description = "Call this session's workflow actor — a deterministic program that controls \
+        your task progression. The workflow tells you what to do; you do the work and report back.\n\
+        \n\
+        Common rhythm:\n\
+        1. workflow(action='init') — get current state, next task, and success criteria\n\
+        2. Do the work the workflow described\n\
+        3. Verify your work meets the criteria the workflow gave you\n\
+        4. workflow(action='done', params={...}) — report completion, get next step\n\
+        \n\
+        Other patterns:\n\
+        - workflow(action='status') — check where you are without advancing\n\
+        - workflow(action='result', params={score: N, description: '...'}) — report a measured outcome\n\
+        \n\
+        Always follow the workflow's instructions. If an error occurs, retry or call workflow(action='status') \
+        to re-orient. The workflow manages state across context restarts — call 'init' after any restart.")]
+    async fn workflow(
+        &self,
+        Parameters(params): Parameters<WorkflowParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let session_id = params.from.clone();
+
+        let (workflow_path, project_dir) = {
+            let mut proto = self.state.protocol.write().await;
+            match proto.sessions.get_mut(&session_id) {
+                Some(s) => {
+                    // Enforce effort budget
+                    if s.metadata.workflow_max_calls > 0
+                        && s.metadata.workflow_calls >= s.metadata.workflow_max_calls
+                    {
+                        return Ok(CallToolResult::error(vec![Content::text(format!(
+                            "workflow call budget exhausted ({} of {} calls used). \
+                             The workflow set this limit at registration to prevent unbounded looping. \
+                             Use session_send(done=true) to signal completion.",
+                            s.metadata.workflow_calls, s.metadata.workflow_max_calls
+                        ))]));
+                    }
+                    s.metadata.workflow_calls += 1;
+                    let result = (
+                        s.metadata.workflow.clone(),
+                        s.metadata.project_dir.clone(),
+                    );
+                    self.state.persist_protocol_state(&proto);
+                    result
+                }
+                None => {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "session '{session_id}' not found"
+                    ))]));
+                }
+            }
+        };
+
+        let Some(workflow_path) = workflow_path else {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "this session has no workflow configured. Workflows are set via session_start(workflow='path/to/script'). Without a workflow, use loop_next for iteration or work autonomously.",
+            )]));
+        };
+
+        match crate::workflow::call_workflow(
+            &self.state,
+            &workflow_path,
+            &session_id,
+            &params.action,
+            params.params.as_ref(),
+            project_dir.as_deref(),
+        )
+        .await
+        {
+            Ok(message) => Ok(CallToolResult::success(vec![Content::text(message)])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "workflow error: {e}"
+            ))])),
+        }
+    }
 }
 
 #[tool_handler]
@@ -1280,6 +1418,20 @@ to restart cleanly, or start a separate worktree session alongside it.
 - Prefer messaging over spawning. If a session already exists for a project, send it a \
 message rather than starting a new one.
 </lifecycle_rules>
+
+<workflows>
+Sessions can be driven by an external workflow executable. Pass `workflow` (path to executable) \
+and optionally `workflow_params` (JSON) to `session_start`. The daemon calls the workflow at \
+startup to get instructions, which become the session's prompt.
+
+During the session, use `workflow(from, action, params)` to interact with the workflow actor. \
+The workflow controls task progression — follow its instructions for what actions to take.
+
+- Call `workflow(from, action='init')` at session start or after a restart to get current state
+- The workflow's response tells you what to do next and what actions are available
+- The workflow manages its own state and can push messages via the ouija REST API
+- If you stall, the daemon re-injects the reminder which tells you to call workflow('init')
+</workflows>
 ";
 
 /// Track a pending reply after a successful session start/restart.

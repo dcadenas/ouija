@@ -119,6 +119,15 @@ pub struct SessionMeta {
     /// What happens each time a scheduled task fires for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_fire: Option<crate::scheduler::OnFire>,
+    /// Path to a workflow executable. When set, this session is workflow-driven.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    /// Number of workflow() calls made by this session.
+    #[serde(default)]
+    pub workflow_calls: u64,
+    /// Maximum workflow calls allowed (set by workflow at registration). 0 = unlimited.
+    #[serde(default)]
+    pub workflow_max_calls: u64,
 }
 
 /// Metadata becomes stale after 30 minutes without an update.
@@ -155,6 +164,15 @@ impl SessionMeta {
         if self.on_fire.is_none() {
             self.on_fire = source.on_fire.clone();
         }
+        if self.workflow.is_none() {
+            self.workflow = source.workflow.clone();
+        }
+        if self.workflow_calls == 0 && source.workflow_calls > 0 {
+            self.workflow_calls = source.workflow_calls;
+        }
+        if self.workflow_max_calls == 0 && source.workflow_max_calls > 0 {
+            self.workflow_max_calls = source.workflow_max_calls;
+        }
     }
 }
 
@@ -178,6 +196,9 @@ impl Default for SessionMeta {
             iteration_log: Vec::new(),
             last_iteration_at: None,
             on_fire: None,
+            workflow: None,
+            workflow_calls: 0,
+            workflow_max_calls: 0,
         }
     }
 }
@@ -370,6 +391,14 @@ pub enum Effect {
     CleanupWorktree {
         project_dir: String,
     },
+
+    // Workflow lifecycle
+    NotifyWorkflow {
+        workflow_path: String,
+        event: String,
+        session_id: String,
+        project_dir: Option<String>,
+    },
 }
 
 /// Severity level for log effects emitted by the state machine.
@@ -447,6 +476,9 @@ fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>) -> Sessio
             iteration_log: m.iteration_log.clone(),
             last_iteration_at: m.last_iteration_at,
             on_fire: m.on_fire.clone(),
+            workflow: m.workflow.clone(),
+            workflow_calls: m.workflow_calls,
+            workflow_max_calls: m.workflow_max_calls,
         },
         None => SessionMeta::default(),
     }
@@ -837,6 +869,16 @@ impl DaemonState {
             },
         ));
         effects.push(Effect::BroadcastSessionList);
+
+        // Notify workflow if this session was workflow-driven
+        if let Some(ref wf) = session.metadata.workflow {
+            effects.push(Effect::NotifyWorkflow {
+                workflow_path: wf.clone(),
+                event: "session_died".into(),
+                session_id: id.to_string(),
+                project_dir: session.metadata.project_dir.clone(),
+            });
+        }
 
         effects.push(Effect::RemoveOk { id: id.to_string() });
 

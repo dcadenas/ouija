@@ -115,6 +115,9 @@ pub struct AppState {
     /// Queued prompts waiting for a readiness signal from HttpApi sessions.
     /// Maps session_id -> (pane_id, prompt_text).
     pub pending_prompts: std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
+    /// Per-workflow-path mutex. Serializes calls to the same workflow executable
+    /// to prevent concurrent state file corruption.
+    workflow_locks: std::sync::Mutex<HashMap<std::path::PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -193,6 +196,15 @@ pub struct SessionMetadata {
     /// What happens each time a scheduled task fires for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_fire: Option<crate::scheduler::OnFire>,
+    /// Path to a workflow executable. When set, this session is workflow-driven.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    /// Number of workflow() calls made by this session.
+    #[serde(default)]
+    pub workflow_calls: u64,
+    /// Maximum workflow calls allowed (set by workflow at registration). 0 = unlimited.
+    #[serde(default)]
+    pub workflow_max_calls: u64,
 }
 
 fn default_true() -> bool {
@@ -219,6 +231,9 @@ impl Default for SessionMetadata {
             iteration_log: Vec::new(),
             last_iteration_at: None,
             on_fire: None,
+            workflow: None,
+            workflow_calls: 0,
+            workflow_max_calls: 0,
         }
     }
 }
@@ -305,6 +320,7 @@ impl AppState {
             backends: crate::backend::BackendRegistry::default_registry(),
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            workflow_locks: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -337,7 +353,21 @@ impl AppState {
             backends: crate::backend::BackendRegistry::default_registry(),
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            workflow_locks: std::sync::Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Acquire a per-workflow-path lock. Creates the lock entry on first access.
+    /// Serializes all calls to the same workflow executable.
+    pub fn workflow_lock(
+        &self,
+        path: &std::path::Path,
+    ) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.workflow_locks.lock().unwrap();
+        locks
+            .entry(path.to_path_buf())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Resolve the backend for a given session by looking up its metadata.
@@ -612,6 +642,20 @@ impl AppState {
                 | Effect::RenameFailed { .. }
                 | Effect::RemoveOk { .. }
                 | Effect::RemoveFailed { .. } => {}
+                Effect::NotifyWorkflow {
+                    workflow_path,
+                    event,
+                    session_id,
+                    project_dir,
+                } => {
+                    crate::workflow::notify_workflow(
+                        self,
+                        workflow_path,
+                        event,
+                        session_id,
+                        project_dir.as_deref(),
+                    );
+                }
             }
         }
 
@@ -648,6 +692,9 @@ impl AppState {
                         prompt: entry.metadata.prompt.clone(),
                         iteration: entry.metadata.iteration,
                         iteration_log: entry.metadata.iteration_log.clone(),
+                        workflow: entry.metadata.workflow.clone(),
+                        workflow_calls: entry.metadata.workflow_calls,
+                        workflow_max_calls: entry.metadata.workflow_max_calls,
                         ..Default::default()
                     },
                 };
