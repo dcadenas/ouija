@@ -1011,6 +1011,22 @@ impl AppState {
                 continue;
             }
 
+            // Skip if the pane has an @ouija_id tmux variable — it was claimed
+            // by session_start or the registration hook and may be mid-restart.
+            let pane_id_check = pane.pane_id.clone();
+            let has_ouija_id = tokio::task::spawn_blocking(move || {
+                std::process::Command::new("tmux")
+                    .args(["show-options", "-pv", "-t", &pane_id_check, "@ouija_id"])
+                    .output()
+                    .map(|o| o.status.success() && !o.stdout.is_empty())
+                    .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false);
+            if has_ouija_id {
+                continue;
+            }
+
             let Some(ref path) = pane.pane_current_path else {
                 continue;
             };
