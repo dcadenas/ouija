@@ -969,6 +969,10 @@ impl DaemonState {
             effects.push(Effect::ClearPendingReplies {
                 removed_ids: dead_ids,
             });
+            // Increment wire_seq so the session list carries a fresh sequence
+            // number. Without this, the list shares the seq of the prior
+            // mutation and can be reordered with it, breaking convergence.
+            self.next_seq();
             effects.push(Effect::BroadcastSessionList);
         }
 
@@ -4333,3 +4337,17 @@ mod stateright_model {
         checker.assert_properties();
     }
 }
+
+// TODO: Stateright model gaps identified during workflow actor integration (2026-03-25):
+//
+// 1. Worktree cleanup invariant: model always uses keep_worktree=false and sessions
+//    don't share project_dir. Should add: ModelMsg::RemoveKeep { id, keep_worktree },
+//    sessions with shared project_dir, and property verifying CleanupWorktree is never
+//    emitted while another session references the same directory.
+//
+// 2. Workflow field persistence: model doesn't include workflow metadata. Should verify
+//    that inherit_recurrence_from preserves workflow, workflow_calls, workflow_max_calls
+//    across re-registration (the async registration race we fixed).
+//
+// 3. Reap vs Remove interaction: model exercises both but doesn't verify that reap
+//    never emits CleanupWorktree (current code is correct, invariant not checked).
