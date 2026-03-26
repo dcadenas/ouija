@@ -1409,7 +1409,8 @@ pub async fn start_session(
     let name = body.name.clone();
     let state2 = state.clone();
     tokio::spawn(async move {
-        // Workflow registration (if configured)
+        // Workflow registration (if configured) — must run before exists check
+        // because restart also needs the registered prompt/reminder.
         let mut prompt = body.prompt;
         let mut reminder = body.reminder;
         let mut workflow_for_meta = None;
@@ -1439,6 +1440,39 @@ pub async fn start_session(
                     return;
                 }
             }
+        }
+
+        // If session already exists, restart with fresh context instead of failing.
+        // Handles re-spawn: reviewer requests changes → workflow spawns worker with same name.
+        let exists = state2.protocol.read().await.sessions.contains_key(&body.name);
+        if exists {
+            tracing::info!("session '{}' exists, restarting with fresh context", body.name);
+            let (_result, _msg_id) = crate::nostr_transport::restart_session(
+                &state2,
+                &body.name,
+                true, // fresh
+                prompt.as_deref(),
+                body.from.as_deref(),
+                body.expects_reply,
+                body.backend.as_deref(),
+                body.model.as_deref(),
+                reminder.as_deref(),
+            )
+            .await;
+
+            // Stamp workflow metadata and reset call counter for new round
+            if let Some((wf_path, max_calls)) = workflow_for_meta {
+                let mut proto = state2.protocol.write().await;
+                if let Some(session) = proto.sessions.get_mut(&body.name) {
+                    session.metadata.workflow = Some(wf_path);
+                    session.metadata.workflow_max_calls = max_calls;
+                    session.metadata.workflow_calls = 0;
+                }
+                state2.persist_protocol_state(&proto);
+            }
+
+            tracing::info!("async session restart complete: {}", body.name);
+            return;
         }
 
         let (result, _prompt_msg_id) = crate::nostr_transport::start_session(
