@@ -825,6 +825,25 @@ impl DaemonState {
             }
         };
 
+        // Guard against stale unregister hooks racing with restart.
+        // When respawn-pane -k kills the old Claude, its SessionEnd hook fires
+        // an /api/remove. But by then the restart has already re-registered the
+        // session. Reject removes for sessions registered < 5s ago unless
+        // keep_worktree is set (which signals an intentional pre-restart removal).
+        if !keep_worktree {
+            if let Some(session) = self.sessions.get(id) {
+                let age = chrono::Utc::now().timestamp() - session.registered_at;
+                if session.registered_at > 0 && age < 5 {
+                    effects.push(Effect::RemoveFailed {
+                        reason: format!(
+                            "session '{id}' registered {age}s ago, rejecting stale remove"
+                        ),
+                    });
+                    return effects;
+                }
+            }
+        }
+
         let session = self
             .sessions
             .remove(id)
