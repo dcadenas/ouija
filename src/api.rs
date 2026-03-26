@@ -1441,29 +1441,6 @@ pub async fn start_session(
             }
         }
 
-        // Pre-stamp workflow metadata so it survives the startup hook's re-registration.
-        // start_session will register the session, then inherit_recurrence_from preserves
-        // any fields already set (including workflow).
-        if let Some((ref wf_path, max_calls)) = workflow_for_meta {
-            let mut proto = state2.protocol.write().await;
-            // Pre-register a placeholder so workflow fields are set before start_session
-            let meta = proto
-                .sessions
-                .entry(body.name.clone())
-                .or_insert_with(|| crate::daemon_protocol::SessionEntry {
-                    id: body.name.clone(),
-                    pane: None,
-                    origin: crate::daemon_protocol::Origin::Local,
-                    metadata: crate::daemon_protocol::SessionMeta::default(),
-                    registered_at: 0,
-                });
-            meta.metadata.workflow = Some(wf_path.clone());
-            meta.metadata.workflow_max_calls = max_calls;
-            meta.metadata.prompt = prompt.clone();
-            meta.metadata.reminder = reminder.clone();
-            state2.persist_protocol_state(&proto);
-        }
-
         let (result, _prompt_msg_id) = crate::nostr_transport::start_session(
             &state2,
             &body.name,
@@ -1477,6 +1454,45 @@ pub async fn start_session(
             reminder.as_deref(),
         )
         .await;
+
+        // Stamp workflow metadata after session is registered.
+        // Also re-stamp after a delay to handle the startup hook race
+        // (hook may re-register with blank metadata, wiping workflow).
+        if let Some((wf_path, max_calls)) = workflow_for_meta {
+            let stamp = |state: &std::sync::Arc<crate::state::AppState>,
+                         name: &str,
+                         wf: &str,
+                         mc: u64| {
+                let state = state.clone();
+                let name = name.to_string();
+                let wf = wf.to_string();
+                async move {
+                    let mut proto = state.protocol.write().await;
+                    if let Some(session) = proto.sessions.get_mut(&name) {
+                        session.metadata.workflow = Some(wf);
+                        session.metadata.workflow_max_calls = mc;
+                    }
+                    state.persist_protocol_state(&proto);
+                }
+            };
+            // Stamp now
+            stamp(&state2, &body.name, &wf_path, max_calls).await;
+            // Re-stamp after 5s to survive hook re-registration
+            let state3 = state2.clone();
+            let name3 = body.name.clone();
+            let wf3 = wf_path.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let mut proto = state3.protocol.write().await;
+                if let Some(session) = proto.sessions.get_mut(&name3) {
+                    if session.metadata.workflow.is_none() {
+                        tracing::info!("re-stamping workflow for {name3} (hook race recovery)");
+                        session.metadata.workflow = Some(wf3);
+                    }
+                }
+                state3.persist_protocol_state(&proto);
+            });
+        }
 
         tracing::info!("async session start complete: {}, result: {result}", body.name);
     });
