@@ -1653,6 +1653,80 @@ pub async fn backend_session_ready(
     Json(json!({"delivered": delivered, "session": name}))
 }
 
+/// Request body for the workflow REST endpoint.
+#[derive(Debug, Deserialize)]
+pub struct WorkflowCallBody {
+    action: String,
+    #[serde(default)]
+    params: Option<serde_json::Value>,
+}
+
+/// Call a session's workflow actor via REST.
+pub async fn call_session_workflow(
+    State(state): State<SharedState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    Json(body): Json<WorkflowCallBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (workflow_path, project_dir) = {
+        let mut proto = state.protocol.write().await;
+        match proto.sessions.get_mut(&session_id) {
+            Some(s) => {
+                // Enforce effort budget
+                if s.metadata.workflow_max_calls > 0
+                    && s.metadata.workflow_calls >= s.metadata.workflow_max_calls
+                {
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(json!({
+                            "error": format!(
+                                "workflow call budget exhausted ({} of {} calls used)",
+                                s.metadata.workflow_calls, s.metadata.workflow_max_calls
+                            )
+                        })),
+                    );
+                }
+                s.metadata.workflow_calls += 1;
+                let result = (
+                    s.metadata.workflow.clone(),
+                    s.metadata.project_dir.clone(),
+                );
+                state.persist_protocol_state(&proto);
+                result
+            }
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": format!("session '{}' not found", session_id)})),
+                );
+            }
+        }
+    };
+
+    let Some(workflow_path) = workflow_path else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "session has no workflow configured"})),
+        );
+    };
+
+    match crate::workflow::call_workflow(
+        &state,
+        &workflow_path,
+        &session_id,
+        &body.action,
+        body.params.as_ref(),
+        project_dir.as_deref(),
+    )
+    .await
+    {
+        Ok(message) => (StatusCode::OK, Json(json!({"message": message}))),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("workflow error: {e}")})),
+        ),
+    }
+}
+
 /// List indexed projects from the configured projects directory.
 pub async fn list_projects(
     State(state): State<SharedState>,
