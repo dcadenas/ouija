@@ -236,6 +236,41 @@ async fn prompt_submit_inner(
     })
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PreToolUseBody {
+    pub pane: String,
+    pub tool_name: String,
+}
+
+/// POST /api/hooks/pre-tool-use
+pub async fn pre_tool_use(
+    State(state): State<SharedState>,
+    Json(body): Json<PreToolUseBody>,
+) -> (StatusCode, Json<Value>) {
+    let result = pre_tool_use_inner(&state, body).await;
+    (StatusCode::OK, Json(result))
+}
+
+async fn pre_tool_use_inner(
+    state: &std::sync::Arc<crate::state::AppState>,
+    body: PreToolUseBody,
+) -> Value {
+    // block_interactive is currently always false (no-op).
+    // When wired up, this will check injection marker state on the session.
+    let _session_id = state.find_session_by_pane(&body.pane).await;
+    let blocked = false;
+
+    if !blocked {
+        return json!({ "block": false });
+    }
+    let message = match body.tool_name.as_str() {
+        "AskUserQuestion" => "Interactive prompts are disabled while handling ouija messages.\nDo NOT use AskUserQuestion. Instead, respond in prose with the available\noptions and let the user answer via message. If this question was triggered\nby a message from another session, forward the question to them via\nsession_send and continue when they reply.".to_string(),
+        "EnterPlanMode" => "Plan mode is disabled while handling ouija messages.\nDo NOT use EnterPlanMode. Instead, write your plan as a prose message to\nthe user or to the session that requested the task via session_send.\nDescribe your approach, list the steps, and ask for approval in the\nmessage. Proceed when they confirm.".to_string(),
+        other => format!("Interactive tool '{other}' is disabled while handling ouija messages.\nCommunicate in prose via session_send instead."),
+    };
+    json!({ "block": true, "message": message })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,5 +374,16 @@ mod tests {
         let output = result["output"].as_str().unwrap();
         assert!(output.contains("newcomer"), "output should mention newcomer: {output}");
         assert!(output.contains("joined"), "output should contain 'joined': {output}");
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_no_session_allows() {
+        let state = crate::state::AppState::new_for_test();
+        let body = PreToolUseBody {
+            pane: "%999".into(),
+            tool_name: "AskUserQuestion".into(),
+        };
+        let result = pre_tool_use_inner(&state, body).await;
+        assert_eq!(result["block"], false);
     }
 }
