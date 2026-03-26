@@ -1670,16 +1670,10 @@ pub async fn restart_session(
         }
     }
 
-    // Remove old session record (agent cleanup, tmux var, worktree).
-    // The subsequent Register re-creates it with the new pane.
-    if session.is_some() {
-        state
-            .apply_and_execute(crate::daemon_protocol::Event::Remove {
-                id: name.to_string(),
-                keep_worktree: true, // pre-restart removal — preserve worktree
-            })
-            .await;
-    }
+    // No Remove before restart: keep the session in state so that
+    // inherit_recurrence_from preserves metadata (workflow, prompt, reminder).
+    // The subsequent Register re-registers in place — apply_register handles
+    // old pane cleanup and agent restart when the pane changes.
 
     let projects_dir = state.settings.read().await.projects_dir.clone();
     let base = match projects_dir {
