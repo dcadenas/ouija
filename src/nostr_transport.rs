@@ -2160,6 +2160,9 @@ async fn setup_shared_serve_session(
 fn create_ouija_worktree(repo_dir: &str, name: &str) -> anyhow::Result<String> {
     let wt_dir = format!("{repo_dir}/.ouija/worktrees/{name}");
     if std::path::Path::new(&wt_dir).exists() {
+        // Ensure marker file exists (prevents cleanup_worktree_dir from cleaning
+        // a worktree that appears clean due to gitignored state files)
+        let _ = std::fs::write(format!("{wt_dir}/.ouija-active"), "");
         return Ok(wt_dir);
     }
     // Ensure parent dir exists
@@ -2182,6 +2185,9 @@ fn create_ouija_worktree(repo_dir: &str, name: &str) -> anyhow::Result<String> {
             );
         }
     }
+    // Write marker file to prevent cleanup_worktree_dir from cleaning a worktree
+    // that appears clean (state files may be gitignored).
+    let _ = std::fs::write(format!("{wt_dir}/.ouija-active"), "");
     Ok(wt_dir)
 }
 
