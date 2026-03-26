@@ -825,24 +825,9 @@ impl DaemonState {
             }
         };
 
-        // Guard against stale unregister hooks racing with restart.
-        // When respawn-pane -k kills the old Claude, its SessionEnd hook fires
-        // an /api/remove. But by then the restart has already re-registered the
-        // session. Reject removes for sessions registered < 5s ago unless
-        // keep_worktree is set (which signals an intentional pre-restart removal).
-        if !keep_worktree {
-            if let Some(session) = self.sessions.get(id) {
-                let age = chrono::Utc::now().timestamp() - session.registered_at;
-                if session.registered_at > 0 && age < 5 {
-                    effects.push(Effect::RemoveFailed {
-                        reason: format!(
-                            "session '{id}' registered {age}s ago, rejecting stale remove"
-                        ),
-                    });
-                    return effects;
-                }
-            }
-        }
+        // Note: stale-remove guard (registered_at < 5s) lives in the hooks
+        // handler (session_end_inner), not here. The protocol-level Remove must
+        // always succeed for direct API callers (admin, CLI, tests).
 
         let session = self
             .sessions
@@ -2471,10 +2456,6 @@ mod tests {
             pane: Some("%1".into()),
             metadata: Default::default(),
         });
-        // Set registered_at to old timestamp so the <5s guard doesn't block
-        if let Some(s) = state.sessions.get_mut("s1") {
-            s.registered_at = chrono::Utc::now().timestamp() - 10;
-        }
         let effects = state.apply(Event::Remove { id: "s1".into(), keep_worktree: false });
         assert!(!state.sessions.contains_key("s1"));
         assert!(
@@ -2524,9 +2505,6 @@ mod tests {
                 ..Default::default()
             },
         });
-        if let Some(s) = state.sessions.get_mut("wt") {
-            s.registered_at = chrono::Utc::now().timestamp() - 10;
-        }
         let effects = state.apply(Event::Remove { id: "wt".into(), keep_worktree: false });
         assert!(
             effects
