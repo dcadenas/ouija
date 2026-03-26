@@ -1,115 +1,163 @@
 # Workflow Examples
 
-## autoresearch-workflow.py
+## ouija_workflow.py — State Pattern building blocks
 
-An optimization/research loop workflow that drives an LLM session through iterative changes. Each iteration: read state, make one change, measure, keep or revert.
+The shared library that the examples below import. Three primitives:
 
-### Project setup
+- **State** — subclass, add `handle_*` methods, call `respond()` or `transition_to()`
+- **Context** — persistent data dict + ouija REST API client
+- **Workflow** — protocol handler, per-session state dispatch, registration
 
-Your project directory needs:
+Inspired by the Ruby [state_pattern](https://github.com/dcadenas/state_pattern) gem and its Python port [state-pattern-py](https://github.com/dcadenas/state-pattern-py). Same philosophy: states are plain classes, transitions are explicit, guards are plain conditionals. No DSL.
 
-- **INSTRUCTIONS.md** - What to optimize and how to measure (e.g., "minimize inference latency; run `python bench.py` and report the p99 value")
-- A git repo with a clean working tree (the workflow commits improvements and reverts regressions)
+## Examples
 
-The workflow creates these files automatically:
+### simple-loop-workflow.py
 
-- **results.tsv** - Tab-separated log of all iterations (score, description, outcome)
-- **FINDINGS.md** - Accumulated insights that survive context restarts
-- **workflow-state.json** - Internal state (iteration counter, best score)
+**Pattern:** Evaluator-optimizer (single session)
 
-### Starting a session
+An optimization loop. The LLM iterates: make one change, measure, report. The workflow commits improvements and reverts regressions.
 
 ```
 session_start(
-  name="optimizer",
-  workflow="examples/autoresearch-workflow.py",
-  workflow_params={"max_iterations": 30},
-  prompt="Read INSTRUCTIONS.md for your task.",
-  project_dir="/path/to/project"
+    name="optimizer",
+    workflow="examples/simple-loop-workflow.py",
+    workflow_params={"max_iterations": 10},
+    prompt="Read INSTRUCTIONS.md for your optimization target.",
+    project_dir="/path/to/project",
 )
 ```
 
-Parameters:
-- `workflow` - Path to the workflow script (relative to project_dir or absolute)
-- `workflow_params` - `max_iterations` (default: 50)
-- `prompt` - Additional prompt text (merged with workflow instructions)
-- `project_dir` - Working directory for the session
+States: `Running → Done`
 
-### How it works
+Your project directory needs an **INSTRUCTIONS.md** describing what to optimize and how to measure it, plus a git repo with a clean working tree.
 
-1. On `session_start`, the daemon calls `register` on the workflow. It returns instructions describing the `init`, `result`, `findings`, and `status` actions.
-2. The session starts and calls `workflow("init")` to get its first task.
-3. The LLM reads INSTRUCTIONS.md, makes one change, measures, and reports via `workflow("result", {score, description})`.
-4. The workflow commits improvements to git and reverts regressions, then prompts the next iteration.
-5. After `max_iterations`, the workflow tells the session to finish.
+### feature-workflow.py
 
-### Writing your own workflow
+**Pattern:** Prompt chaining (linear state sequence)
 
-A workflow is any executable that speaks the JSON-over-stdin/stdout protocol:
+A structured implementation workflow that guides the LLM through planning, chunked implementation with build verification, and final test verification.
 
-**Input** (one JSON object on stdin):
-```json
-{"event": "register", "session_id": "optimizer", "params": {"max_iterations": 30}}
-{"action": "init", "session_id": "optimizer", "params": null}
-{"action": "result", "session_id": "optimizer", "params": {"score": 0.95, "description": "..."}}
-{"event": "session_died", "session_id": "optimizer"}
+```
+session_start(
+    name="feat-1",
+    workflow="examples/feature-workflow.py",
+    workflow_params={"issue": "Add rate limiting to /api/upload"},
+    prompt="You are implementing a feature. Call workflow('init') to start.",
+    project_dir="/path/to/project",
+)
 ```
 
-**Output** (one JSON object on stdout):
+States: `Planning → Implementing → Verifying → Done`
+
+Demonstrates progressive disclosure — the LLM learns about each phase only when it arrives there. Planning never mentions chunks or verification.
+
+### review-workflow.py
+
+**Pattern:** Evaluator-optimizer (multi-session with back-transitions)
+
+Two sessions share one workflow: a worker implements, a reviewer approves or requests changes. Uses the async push channel (REST API inject) to notify sessions without polling.
+
+```
+# Worker
+session_start(
+    name="feat-worker",
+    workflow="examples/review-workflow.py",
+    workflow_params={"role": "worker", "issue": "Add caching layer"},
+    prompt="Implement the feature. Call workflow('init').",
+    project_dir="/path/to/project",
+)
+
+# Reviewer
+session_start(
+    name="feat-reviewer",
+    workflow="examples/review-workflow.py",
+    workflow_params={"role": "reviewer", "worker_session": "feat-worker"},
+    prompt="Review code changes. Call workflow('init').",
+    project_dir="/path/to/project",
+)
+```
+
+States (worker): `WorkerImpl → WorkerWaiting → (back to WorkerImpl on rejection)`
+States (reviewer): `Reviewing → ReviewerDone`
+
+Demonstrates role-based dispatch (`initial=lambda ctx: ...`), multi-session shared state, and back-transitions.
+
+### autoresearch-workflow.py
+
+The original procedural implementation of the optimization loop — same behavior as `simple-loop-workflow.py` but without the State Pattern library. Useful for comparison or as a template for workflows that don't need the state pattern abstraction.
+
+## Anthropic's five patterns mapped to building blocks
+
+| Pattern | Example | How it works |
+|---|---|---|
+| **Prompt chaining** | feature-workflow.py | Linear `transition_to(NextState)` sequence |
+| **Routing** | review-workflow.py | `pick_initial(ctx)` dispatches by role |
+| **Parallelization** | (compose with REST API) | State calls `ctx.api.session_start()` N times |
+| **Orchestrator-worker** | review-workflow.py | The workflow IS the orchestrator; sessions are workers |
+| **Evaluator-optimizer** | review-workflow.py | Back-transitions: `WorkerWaiting → WorkerImpl` |
+
+## Writing your own workflow
+
+### With ouija_workflow (State Pattern)
+
+```python
+#!/usr/bin/env python3
+from ouija_workflow import Workflow, State
+
+class MyState(State):
+    def handle_init(self, ctx, params):
+        return self.respond("Do the thing. Call workflow('done_it').")
+
+    def handle_done_it(self, ctx, params):
+        return self.transition_to(Finished, "Nice work.")
+
+class Finished(State):
+    terminal = True
+    def on_enter(self, ctx):
+        return "Call session_send(done=true)."
+
+Workflow(
+    initial=MyState,
+    states=[MyState, Finished],
+    instructions="You have a workflow. Follow its instructions.",
+).run()
+```
+
+### Without ouija_workflow (raw protocol)
+
+A workflow is any executable that reads one JSON object from stdin and writes one JSON object to stdout. See `autoresearch-workflow.py` for a full example. The protocol:
+
+**Registration** (daemon calls at session start):
 ```json
-{"instructions": "...", "inject_on_start": "Call workflow('init') to begin."}
-{"message": "Iteration 1/50. Make one change..."}
-{"error": "missing required param: score"}
+// stdin
+{"event": "register", "session_id": "worker-1", "params": {"issue_id": 123}}
+// stdout
+{"instructions": "You are a worker...", "inject_on_start": "Call workflow('init').", "max_calls": 200}
+```
+
+**Runtime** (LLM calls workflow tool):
+```json
+// stdin
+{"action": "chunk_done", "session_id": "worker-1", "params": {"chunk": "auth"}}
+// stdout
+{"message": "Tests pass. Next: implement logging.", "verify": "cargo test --lib logging passes"}
+```
+
+**Lifecycle** (daemon notifies on session death/restart):
+```json
+// stdin
+{"event": "session_died", "session_id": "worker-1"}
+// stdout
 {}
 ```
 
-The daemon spawns the workflow once per interaction. The process starts, reads stdin, writes stdout, and exits. State must be persisted to disk (the workflow's working directory is the session's `project_dir`).
-
-Environment variables available: `OUIJA_API` (daemon URL), `OUIJA_SESSION_ID`.
-
-Registration can also return:
-- `max_calls` (number) — daemon-enforced call budget. The daemon refuses further workflow calls after this limit, preventing unbounded looping.
-- `verify` field in runtime responses — machine-checkable success criteria appended to the message so the LLM knows how to verify its work before proceeding.
-
 ### Progressive disclosure: three levels of context
 
-Workflow information reaches the LLM at three levels. Be intentional about what goes where:
+| Level | What | When loaded | Purpose |
+|---|---|---|---|
+| 1. Tool description | The `workflow` MCP tool | Always in context | LLM knows the tool exists |
+| 2. Registration instructions | `instructions` from register | Session start | Orients — purpose, rhythm, constraints |
+| 3. Runtime responses | Each `workflow()` return | On demand | Directs — current state, next task, criteria |
 
-**Level 1 — Tool description** (always in context): The `workflow` MCP tool description tells the LLM *when* and *how* to call the workflow. This is built into ouija and always visible. The LLM uses it to decide whether to call the workflow at all.
-
-**Level 2 — Registration instructions** (loaded at session start): The `instructions` field from your workflow's `register` response. This is prepended to the session prompt. Write it like an **onboarding guide for a new team member**, not a technical specification:
-- Explain the purpose and rhythm ("you're optimizing X, one change at a time")
-- List the available actions and what they do, briefly
-- Describe what success looks like
-- Mention key constraints ("always measure before reporting, never skip verification")
-- Keep it compact — specific details belong in Level 3
-
-**Level 3 — Runtime responses** (loaded on demand): Each `workflow()` call returns step-specific instructions. This is where detailed context goes — current state, next task, verification criteria, recent history. The LLM gets this just-in-time, only when it needs it.
-
-The principle: Level 1 helps recognize, Level 2 orients, Level 3 directs. Don't bleed information between levels — if you find yourself putting step-specific detail in registration instructions, move it to a runtime response instead.
-
-### Writing good registration instructions
-
-Think of `instructions` as onboarding a junior developer to a process:
-
-**Good:**
-```
-You are running an optimization loop. Your job: make one change at a time,
-measure the result, and report it. The workflow handles git state — it commits
-improvements and reverts regressions.
-
-Actions: init (get next task), result (report outcome), findings (save insight), status (check state).
-
-Call workflow('init') after every restart. Always measure before calling 'result'.
-```
-
-**Too verbose** (front-loads detail that belongs in runtime responses):
-```
-You are running an optimization loop. On iteration 1, read INSTRUCTIONS.md and
-FINDINGS.md. The INSTRUCTIONS.md file contains... The FINDINGS.md file contains...
-results.tsv has columns: iteration, score, description, kept. When calling result,
-provide score as a float and description as a string. If score > best_score the
-workflow will run git add -A && git commit...
-```
-
-The second version wastes context window space with detail the LLM only needs when it's actually at that step — and which the `init` response already provides.
+Don't bleed between levels. If you're putting step-specific detail in registration instructions, move it to a runtime response.
