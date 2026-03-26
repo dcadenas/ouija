@@ -35,7 +35,7 @@ else
 fi
 
 # Version
-DAEMON_V=$(echo "$STATUS" | jq -r '.version // ""')
+DAEMON_V=$(echo "$STATUS" | jq -r '.version // ""' 2>/dev/null)
 PLUGIN_V=""
 for d in "$HOME"/.claude/plugins/cache/ouija/ouija/*/; do
   [ -f "${d}.version" ] && PLUGIN_V=$(cat "${d}.version" 2>/dev/null) && break
