@@ -1539,13 +1539,16 @@ pub async fn restart_session(
     State(state): State<SharedState>,
     Json(body): Json<SessionNameBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Snapshot workflow metadata before restart (may be wiped by hook re-registration)
-    let workflow_snapshot = {
+    // Snapshot metadata before restart (hook re-registration may wipe fields)
+    let meta_snapshot = {
         let proto = state.protocol.read().await;
-        proto.sessions.get(&body.name).and_then(|s| {
-            s.metadata.workflow.as_ref().map(|wf| {
-                (wf.clone(), s.metadata.workflow_max_calls)
-            })
+        proto.sessions.get(&body.name).map(|s| {
+            (
+                s.metadata.workflow.clone(),
+                s.metadata.workflow_max_calls,
+                s.metadata.prompt.clone(),
+                s.metadata.reminder.clone(),
+            )
         })
     };
 
@@ -1563,19 +1566,38 @@ pub async fn restart_session(
     )
     .await;
 
-    // Re-stamp workflow metadata after restart to survive hook race
-    if let Some((wf_path, max_calls)) = workflow_snapshot {
+    // Re-stamp metadata after restart to survive hook re-registration race.
+    // The hook may re-register with blank metadata, wiping workflow/prompt/reminder.
+    if let Some((wf, max_calls, prompt_snap, reminder_snap)) = meta_snapshot {
         let state2 = state.clone();
         let name = body.name.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             let mut proto = state2.protocol.write().await;
             if let Some(session) = proto.sessions.get_mut(&name) {
+                let mut changed = false;
                 if session.metadata.workflow.is_none() {
-                    tracing::info!("re-stamping workflow for {name} after restart");
-                    session.metadata.workflow = Some(wf_path);
-                    session.metadata.workflow_max_calls = max_calls;
-                    session.metadata.workflow_calls = 0;
+                    if let Some(ref wf) = wf {
+                        session.metadata.workflow = Some(wf.clone());
+                        session.metadata.workflow_max_calls = max_calls;
+                        session.metadata.workflow_calls = 0;
+                        changed = true;
+                    }
+                }
+                if session.metadata.prompt.is_none() {
+                    if let Some(ref p) = prompt_snap {
+                        session.metadata.prompt = Some(p.clone());
+                        changed = true;
+                    }
+                }
+                if session.metadata.reminder.is_none() {
+                    if let Some(ref r) = reminder_snap {
+                        session.metadata.reminder = Some(r.clone());
+                        changed = true;
+                    }
+                }
+                if changed {
+                    tracing::info!("re-stamped metadata for {name} after restart");
                     state2.persist_protocol_state(&proto);
                 }
             }
