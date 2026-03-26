@@ -586,10 +586,19 @@ pub fn enable_automatic_rename(pane_id: &str) {
 /// Uses the directory basename with dots replaced by underscores
 /// (matching tmux-sessionizer convention).
 pub fn tmux_session_name(project_dir: &str) -> String {
-    let basename = std::path::Path::new(project_dir)
+    // For ouija-managed worktrees, use the repo root's basename so
+    // worktree sessions join the same tmux session as the main project.
+    let effective_dir = if let Some(i) = project_dir.find("/.ouija/worktrees/") {
+        &project_dir[..i]
+    } else if let Some(i) = project_dir.find("/.claude/worktrees/") {
+        &project_dir[..i]
+    } else {
+        project_dir
+    };
+    let basename = std::path::Path::new(effective_dir)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| project_dir.to_string());
+        .unwrap_or_else(|| effective_dir.to_string());
     basename.replace('.', "_")
 }
 
