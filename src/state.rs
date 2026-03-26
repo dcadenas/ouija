@@ -71,6 +71,15 @@ impl std::fmt::Display for DuplicateNode {
 
 impl std::error::Error for DuplicateNode {}
 
+/// Lightweight session snapshot for diff computation.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct SessionSnapshot {
+    pub id: String,
+    pub origin: String,
+    pub role: Option<String>,
+    pub bulletin: Option<String>,
+}
+
 /// Thread-safe shared reference to the daemon's application state.
 pub type SharedState = Arc<AppState>;
 
@@ -115,6 +124,8 @@ pub struct AppState {
     /// Queued prompts waiting for a readiness signal from HttpApi sessions.
     /// Maps session_id -> (pane_id, prompt_text).
     pub pending_prompts: std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
+    /// Per-session baseline snapshots used to compute diffs in hook handlers.
+    pub session_diff_baselines: std::sync::Mutex<HashMap<String, Vec<SessionSnapshot>>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -317,6 +328,7 @@ impl AppState {
             backends: crate::backend::BackendRegistry::default_registry(),
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            session_diff_baselines: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -349,6 +361,7 @@ impl AppState {
             backends: crate::backend::BackendRegistry::default_registry(),
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            session_diff_baselines: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -372,6 +385,16 @@ impl AppState {
                 .unwrap_or_else(|| self.backends.default()),
             None => self.backends.default(),
         }
+    }
+
+    /// Find the session ID registered on a given pane (full `%NNN` format).
+    pub async fn find_session_by_pane(&self, pane: &str) -> Option<String> {
+        let proto = self.protocol.read().await;
+        proto
+            .sessions
+            .values()
+            .find(|s| s.pane.as_deref() == Some(pane))
+            .map(|s| s.id.clone())
     }
 
     /// Apply a protocol event and execute all resulting effects.
