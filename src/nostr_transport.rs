@@ -1928,6 +1928,10 @@ pub async fn restart_session(
                     ..Default::default()
                 },
             };
+            // Capture effective prompt/reminder before Register consumes proto_meta.
+            // These fall back to prev_metadata when the restart call doesn't pass them.
+            let effective_prompt = proto_meta.prompt.clone();
+            let effective_reminder = proto_meta.reminder.clone();
             state
                 .apply_and_execute(crate::daemon_protocol::Event::Register {
                     id: name.to_string(),
@@ -1936,10 +1940,10 @@ pub async fn restart_session(
                 })
                 .await;
             let mut prompt_msg_id = None;
-            if let Some(text) = prompt {
-                let full_text = match reminder {
+            if let Some(text) = effective_prompt {
+                let full_text = match effective_reminder {
                     Some(r) => format!("{text}\n\n{r}"),
-                    None => text.to_string(),
+                    None => text,
                 };
                 let injected = if let Some(sender) = from {
                     let er = expects_reply.unwrap_or(true);
