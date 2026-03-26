@@ -1539,6 +1539,16 @@ pub async fn restart_session(
     State(state): State<SharedState>,
     Json(body): Json<SessionNameBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Snapshot workflow metadata before restart (may be wiped by hook re-registration)
+    let workflow_snapshot = {
+        let proto = state.protocol.read().await;
+        proto.sessions.get(&body.name).and_then(|s| {
+            s.metadata.workflow.as_ref().map(|wf| {
+                (wf.clone(), s.metadata.workflow_max_calls)
+            })
+        })
+    };
+
     let fresh = body.fresh.unwrap_or(false);
     let (result, _prompt_msg_id) = crate::nostr_transport::restart_session(
         &state,
@@ -1552,6 +1562,26 @@ pub async fn restart_session(
         body.reminder.as_deref(),
     )
     .await;
+
+    // Re-stamp workflow metadata after restart to survive hook race
+    if let Some((wf_path, max_calls)) = workflow_snapshot {
+        let state2 = state.clone();
+        let name = body.name.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let mut proto = state2.protocol.write().await;
+            if let Some(session) = proto.sessions.get_mut(&name) {
+                if session.metadata.workflow.is_none() {
+                    tracing::info!("re-stamping workflow for {name} after restart");
+                    session.metadata.workflow = Some(wf_path);
+                    session.metadata.workflow_max_calls = max_calls;
+                    session.metadata.workflow_calls = 0;
+                    state2.persist_protocol_state(&proto);
+                }
+            }
+        });
+    }
+
     (StatusCode::OK, Json(json!({ "result": result })))
 }
 
