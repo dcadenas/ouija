@@ -318,7 +318,7 @@ async fn main() -> anyhow::Result<()> {
                             .filter(|s| {
                                 matches!(s.origin, crate::daemon_protocol::Origin::Local)
                                     && s.pane.is_some()
-                                    && (s.registered_at == 0 || now - s.registered_at > 15)
+                                    && (s.registered_at == 0 || now - s.registered_at > 60)
                             })
                             .filter_map(|s| Some((s.id.clone(), s.pane.clone()?)))
                             .collect()
