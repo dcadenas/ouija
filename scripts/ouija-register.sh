@@ -22,12 +22,19 @@ AUTO=$(curl -sf "${BASE}/api/settings" 2>/dev/null | jq -r 'if .auto_register ==
 # Skip if this pane already has a registration (avoids racing with daemon pre-registration)
 echo "$STATUS" | grep -q "\"pane\":\"${PANE}\"" && exit 0
 
-# Auto-name from directory basename, sanitized
-NAME=$(basename "$PWD" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/^-//;s/-$//')
-[ -z "$NAME" ] && NAME="unnamed"
+# If the daemon pre-set @ouija_id (e.g. via session_start), use that name.
+# This avoids re-deriving a different name from CWD in worktree directories.
+PRESET=$(tmux show-options -p -t "$PANE" -v @ouija_id 2>/dev/null)
 
-# Set tmux pane option early so statusline picks it up before API responds
-tmux set-option -p -t "$PANE" @ouija_id "$NAME" 2>/dev/null
+if [ -n "$PRESET" ]; then
+  NAME="$PRESET"
+else
+  # Auto-name from directory basename, sanitized
+  NAME=$(basename "$PWD" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/^-//;s/-$//')
+  [ -z "$NAME" ] && NAME="unnamed"
+  # Set tmux pane option early so statusline picks it up before API responds
+  tmux set-option -p -t "$PANE" @ouija_id "$NAME" 2>/dev/null
+fi
 
 ROLE="working on ${NAME}"
 
