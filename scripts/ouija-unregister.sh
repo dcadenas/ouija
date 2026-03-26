@@ -13,13 +13,17 @@ fi
 PORT="${OUIJA_PORT:-7880}"
 BASE="http://localhost:${PORT}"
 
-# Background the unregister so the hook returns immediately and isn't cancelled.
+# Capture SID synchronously BEFORE backgrounding. On restart, the old session
+# is already removed by restart_session's Remove event, so this returns empty
+# and we skip the remove — preventing the race where the backgrounded subshell
+# finds and removes the NEW session that was registered on the same pane.
+SID=$(curl -sf "${BASE}/api/status" 2>/dev/null \
+  | jq -r --arg pane "$PANE" '.sessions[] | select(.pane == $pane and .origin == "local") | .id' 2>/dev/null)
+
+[ -z "$SID" ] && exit 0
+
+# Background the actual remove so the hook returns immediately.
 (
-  SID=$(curl -sf "${BASE}/api/status" 2>/dev/null \
-    | jq -r --arg pane "$PANE" '.sessions[] | select(.pane == $pane and .origin == "local") | .id' 2>/dev/null)
-
-  [ -z "$SID" ] && exit 0
-
   curl -sf -X POST "${BASE}/api/remove" \
     -H "Content-Type: application/json" \
     -d "{\"id\":\"${SID}\"}" >/dev/null 2>&1
