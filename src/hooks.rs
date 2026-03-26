@@ -588,7 +588,7 @@ mod tests {
         let state = crate::state::AppState::new_for_test();
         let body = SessionStartBody {
             pane: "%50".into(),
-            cwd: "/home/user/code/ouija/.claude/worktrees/feature-x".into(),
+            cwd: "/home/user/code/ouija/.ouija/worktrees/feature-x".into(),
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "ouija");
