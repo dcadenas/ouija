@@ -1167,7 +1167,17 @@ async fn kill_session_inner(state: &std::sync::Arc<AppState>, name: &str, keep_w
         if !output.status.success() {
             anyhow::bail!("could not get pane PID");
         }
-        let pane_pid: u32 = String::from_utf8_lossy(&output.stdout).trim().parse()?;
+        let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let pane_pid: u32 = match pid_str.parse() {
+            Ok(pid) => pid,
+            Err(_) => {
+                // Pane exists but has no running process — skip process kill, just clean up
+                let _ = Command::new("tmux")
+                    .args(["kill-pane", "-t", &pane])
+                    .status();
+                return Ok("no running process in pane".to_string());
+            }
+        };
 
         // Find backend process in the tree
         let output = Command::new("ps").args(["-eo", "pid,ppid,comm"]).output()?;
