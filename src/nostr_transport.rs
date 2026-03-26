@@ -2187,7 +2187,7 @@ fn create_ouija_worktree(repo_dir: &str, name: &str) -> anyhow::Result<String> {
     let parent = format!("{repo_dir}/.ouija/worktrees");
     std::fs::create_dir_all(&parent)?;
     // Create worktree with a new branch
-    let branch = format!("ouija/{name}");
+    let branch = format!("wt/{name}");
     let output = std::process::Command::new("git")
         .args(["-C", repo_dir, "worktree", "add", "-b", &branch, &wt_dir])
         .output()?;
