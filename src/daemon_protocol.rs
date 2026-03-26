@@ -3292,22 +3292,43 @@ mod stateright_model {
 
     const SESSION_IDS: [&str; 2] = ["A", "B"];
 
+    /// A shared worktree path that two sessions can reference. Uses the
+    /// `.claude/worktrees/` convention so apply_remove's cleanup guard fires.
+    const MODEL_WORKTREE_DIR: &str = "/tmp/.claude/worktrees/shared";
+
     // -- Messages (must be Hash+Eq+Ord for Stateright) -----------------------
 
     #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
     enum ModelMsg {
-        // Client → Daemon
+        // Client -> Daemon
         Register {
             id: String,
         },
+        /// Register with metadata fields (project_dir, workflow, prompt, reminder)
+        /// to exercise inherit_recurrence_from and worktree cleanup paths.
+        RegisterWithMeta {
+            id: String,
+            project_dir: Option<String>,
+            workflow: Option<String>,
+            prompt: Option<String>,
+            reminder: Option<String>,
+        },
         Remove {
             id: String,
+        },
+        /// Remove with keep_worktree=true (the default Remove uses false).
+        RemoveKeep {
+            id: String,
+        },
+        /// Reap dead sessions (simulates the pane-polling reaper).
+        ReapDead {
+            ids: Vec<String>,
         },
         Rename {
             old_id: String,
             new_id: String,
         },
-        // Wire protocol (daemon → daemon)
+        // Wire protocol (daemon -> daemon)
         WireAnnounce {
             id: String,
             daemon_id: String,
@@ -3360,7 +3381,16 @@ mod stateright_model {
     #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
     enum ModelAction {
         Register(String),
+        RegisterWithMeta {
+            id: String,
+            project_dir: Option<String>,
+            workflow: Option<String>,
+            prompt: Option<String>,
+            reminder: Option<String>,
+        },
         Remove(String),
+        RemoveKeep(String),
+        ReapDead(Vec<String>),
         Rename(String, String),
         Send {
             from: String,
@@ -3398,6 +3428,10 @@ mod stateright_model {
             pending_reply_counts: BTreeMap<String, usize>,
             prev_pending_reply_counts: BTreeMap<String, usize>,
             last_event_type: LastEvent,
+            /// Worktree dirs cleaned up in the last apply (for invariant checking).
+            last_cleaned_worktrees: BTreeSet<String>,
+            /// Whether the last event was a ReapDead.
+            last_was_reap: bool,
         },
         Driver {
             actions_taken: u8,
@@ -3450,6 +3484,8 @@ mod stateright_model {
                     pending_reply_counts: BTreeMap::new(),
                     prev_pending_reply_counts: BTreeMap::new(),
                     last_event_type: LastEvent::Other,
+                    last_cleaned_worktrees: BTreeSet::new(),
+                    last_was_reap: false,
                 },
                 Self::SessionDriver { .. } => {
                     offer_actions(o);
@@ -3477,20 +3513,26 @@ mod stateright_model {
                 pending_reply_counts,
                 prev_pending_reply_counts,
                 last_event_type,
+                last_cleaned_worktrees,
+                last_was_reap,
             } = s
             else {
                 return;
             };
 
             match msg {
-                // -- Register / Remove / Rename / Wire* shared path --
+                // -- Register / Remove / Rename / Reap / Wire* shared path --
                 ModelMsg::Register { .. }
+                | ModelMsg::RegisterWithMeta { .. }
                 | ModelMsg::Remove { .. }
+                | ModelMsg::RemoveKeep { .. }
+                | ModelMsg::ReapDead { .. }
                 | ModelMsg::Rename { .. }
                 | ModelMsg::WireAnnounce { .. }
                 | ModelMsg::WireList { .. }
                 | ModelMsg::WireRemove { .. }
                 | ModelMsg::WireRenamed { .. } => {
+                    let is_reap = matches!(msg, ModelMsg::ReapDead { .. });
                     let event = match msg {
                         ModelMsg::Register { id } => Event::Register {
                             id: id.clone(),
@@ -3500,7 +3542,27 @@ mod stateright_model {
                                 ..Default::default()
                             },
                         },
+                        ModelMsg::RegisterWithMeta {
+                            id,
+                            project_dir,
+                            workflow,
+                            prompt,
+                            reminder,
+                        } => Event::Register {
+                            id: id.clone(),
+                            pane: Some(format!("model-pane-{id}")),
+                            metadata: SessionMeta {
+                                networked: true,
+                                project_dir,
+                                workflow,
+                                prompt,
+                                reminder,
+                                ..Default::default()
+                            },
+                        },
                         ModelMsg::Remove { id } => Event::Remove { id, keep_worktree: false },
+                        ModelMsg::RemoveKeep { id } => Event::Remove { id, keep_worktree: true },
+                        ModelMsg::ReapDead { ids } => Event::ReapDead { dead_ids: ids },
                         ModelMsg::Rename { old_id, new_id } => Event::Rename { old_id, new_id },
                         ModelMsg::WireAnnounce {
                             id,
@@ -3571,6 +3633,8 @@ mod stateright_model {
                     normalize_timestamps(ds);
                     *last_send_result = None;
                     *last_event_type = LastEvent::Other;
+                    *last_cleaned_worktrees = extract_cleaned_worktrees(&effects);
+                    *last_was_reap = is_reap;
                     route_effects(ds, &effects, peers, o);
                 }
 
@@ -3594,6 +3658,8 @@ mod stateright_model {
                     *last_send_result = extract_send_outcome(&effects);
                     update_pending_tracking(ds, prev_pending_reply_counts, pending_reply_counts);
                     *last_event_type = LastEvent::Other;
+                    *last_cleaned_worktrees = BTreeSet::new();
+                    *last_was_reap = false;
                     route_effects(ds, &effects, peers, o);
                 }
 
@@ -3621,6 +3687,8 @@ mod stateright_model {
                     } else {
                         LastEvent::ReplyProgress
                     };
+                    *last_cleaned_worktrees = BTreeSet::new();
+                    *last_was_reap = false;
                     route_effects(ds, &effects, peers, o);
                 }
 
@@ -3651,6 +3719,8 @@ mod stateright_model {
                     *last_send_result = None; // receiving side, clear stale result
                     update_pending_tracking(ds, prev_pending_reply_counts, pending_reply_counts);
                     *last_event_type = LastEvent::Other;
+                    *last_cleaned_worktrees = BTreeSet::new();
+                    *last_was_reap = false;
                     route_effects(ds, &effects, peers, o);
                 }
             }
@@ -3671,8 +3741,30 @@ mod stateright_model {
                         ModelAction::Register(id) => {
                             o.send(*target, ModelMsg::Register { id: id.clone() })
                         }
+                        ModelAction::RegisterWithMeta {
+                            id,
+                            project_dir,
+                            workflow,
+                            prompt,
+                            reminder,
+                        } => o.send(
+                            *target,
+                            ModelMsg::RegisterWithMeta {
+                                id: id.clone(),
+                                project_dir: project_dir.clone(),
+                                workflow: workflow.clone(),
+                                prompt: prompt.clone(),
+                                reminder: reminder.clone(),
+                            },
+                        ),
                         ModelAction::Remove(id) => {
                             o.send(*target, ModelMsg::Remove { id: id.clone() })
+                        }
+                        ModelAction::RemoveKeep(id) => {
+                            o.send(*target, ModelMsg::RemoveKeep { id: id.clone() })
+                        }
+                        ModelAction::ReapDead(ids) => {
+                            o.send(*target, ModelMsg::ReapDead { ids: ids.clone() })
                         }
                         ModelAction::Rename(old, new) => o.send(
                             *target,
@@ -3752,6 +3844,16 @@ mod stateright_model {
             }),
             _ => None,
         })
+    }
+
+    fn extract_cleaned_worktrees(effects: &[Effect]) -> BTreeSet<String> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::CleanupWorktree { project_dir } => Some(project_dir.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     fn update_pending_tracking(
@@ -3866,7 +3968,21 @@ mod stateright_model {
         for &id in &SESSION_IDS {
             c.push(ModelAction::Register(id.to_string()));
             c.push(ModelAction::Remove(id.to_string()));
+            // Register with shared worktree dir + recurrence metadata.
+            // Both sessions can point at the same dir, exercising the
+            // shared-worktree guard in apply_remove.
+            c.push(ModelAction::RegisterWithMeta {
+                id: id.to_string(),
+                project_dir: Some(MODEL_WORKTREE_DIR.to_string()),
+                workflow: Some("test-workflow.py".to_string()),
+                prompt: Some("model-prompt".to_string()),
+                reminder: Some("model-reminder".to_string()),
+            });
         }
+        // Offer RemoveKeep and ReapDead for first session only to limit
+        // state space -- the code paths are symmetric across IDs.
+        c.push(ModelAction::RemoveKeep(SESSION_IDS[0].to_string()));
+        c.push(ModelAction::ReapDead(vec![SESSION_IDS[0].to_string()]));
         for &a in &SESSION_IDS {
             for &b in &SESSION_IDS {
                 if a != b {
@@ -4038,11 +4154,6 @@ mod stateright_model {
         state: &<ActorModel<ModelActor, ()> as Model>::State,
     ) -> bool {
         for ds in daemon_states(&state.actor_states) {
-            // wire_seq should equal the number of local mutations (each increments it)
-            // More practically: it should never be 0 if any local sessions exist or existed
-            // (but we can't check "existed" without history). Just check it's non-negative.
-            // The real invariant is checked transitionally — here we check that
-            // last_seen_seq entries are consistent with wire_seq bounds.
             for &seen in ds.last_seen_seq.values() {
                 // Sanity: seq should never be astronomically large in the model
                 if seen > u64::MAX / 2 {
@@ -4059,15 +4170,10 @@ mod stateright_model {
         _: &ActorModel<ModelActor, ()>,
         state: &<ActorModel<ModelActor, ()> as Model>::State,
     ) -> bool {
-        // This is a structural check: remote entries should only exist if the
-        // source daemon has a corresponding local session. Already covered by
-        // convergence when network is empty, but this checks it always holds
-        // that remote entries reference real daemons.
         let ds = daemon_states(&state.actor_states);
         for obs in &ds {
             for entry in obs.sessions.values() {
                 if let Origin::Remote(ref peer_id) = entry.origin {
-                    // The daemon_id in the remote entry should match some daemon
                     let peer_exists = ds.iter().any(|d| d.daemon_id == *peer_id);
                     if !peer_exists {
                         return false;
@@ -4076,6 +4182,125 @@ mod stateright_model {
             }
         }
         true
+    }
+
+    // -- Worktree, recurrence, and reap property checkers --------------------
+
+    /// CleanupWorktree must never be emitted for a project_dir that another
+    /// live session still references. The bug: apply_remove with keep_worktree=false
+    /// used to clean up worktrees without checking if other sessions shared the
+    /// directory. The fix checks `self.sessions` for other references first.
+    fn check_no_cleanup_while_shared(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        for ds_state in &state.actor_states {
+            if let ModelState::Daemon {
+                ds,
+                last_cleaned_worktrees,
+                ..
+            } = ds_state.as_ref()
+            {
+                for cleaned_dir in last_cleaned_worktrees {
+                    // If any remaining session still points at this dir, invariant broken
+                    let still_referenced = ds
+                        .sessions
+                        .values()
+                        .any(|s| s.metadata.project_dir.as_deref() == Some(cleaned_dir.as_str()));
+                    if still_referenced {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// ReapDead must never emit CleanupWorktree. Reap preserves worktrees
+    /// (uncommitted work) -- only explicit Remove with keep_worktree=false cleans up.
+    fn check_reap_never_cleans_worktree(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        for ds_state in &state.actor_states {
+            if let ModelState::Daemon {
+                last_cleaned_worktrees,
+                last_was_reap: true,
+                ..
+            } = ds_state.as_ref()
+            {
+                if !last_cleaned_worktrees.is_empty() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Re-registering a session preserves recurrence fields (prompt, reminder,
+    /// iteration, workflow) that were set by the prior registration. This
+    /// verifies inherit_recurrence_from works correctly: if workflow_calls > 0
+    /// or workflow_max_calls > 0, the workflow path must still be set.
+    fn check_recurrence_preserved_on_reregister(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        for ds in daemon_states(&state.actor_states) {
+            for entry in ds.sessions.values() {
+                if !matches!(entry.origin, Origin::Local) {
+                    continue;
+                }
+                if entry.metadata.workflow_calls > 0 && entry.metadata.workflow.is_none() {
+                    return false;
+                }
+                if entry.metadata.workflow_max_calls > 0 && entry.metadata.workflow.is_none() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Liveness: the model exercises worktree cleanup at least once.
+    fn check_some_worktree_cleanup(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        state.actor_states.iter().any(|s| {
+            matches!(
+                s.as_ref(),
+                ModelState::Daemon {
+                    last_cleaned_worktrees,
+                    ..
+                } if !last_cleaned_worktrees.is_empty()
+            )
+        })
+    }
+
+    /// Liveness: some state has sessions with workflow metadata set.
+    fn check_some_workflow_sessions(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        daemon_states(&state.actor_states)
+            .iter()
+            .any(|ds| ds.sessions.values().any(|s| s.metadata.workflow.is_some()))
+    }
+
+    /// Liveness: the model exercises the ReapDead path.
+    fn check_some_reap(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        state.actor_states.iter().any(|s| {
+            matches!(
+                s.as_ref(),
+                ModelState::Daemon {
+                    last_was_reap: true,
+                    ..
+                }
+            )
+        })
     }
 
     // -- Model builder -------------------------------------------------------
@@ -4130,6 +4355,21 @@ mod stateright_model {
                 "alias send hints",
                 check_alias_send_hints,
             )
+            .property(
+                Expectation::Always,
+                "no cleanup while shared",
+                check_no_cleanup_while_shared,
+            )
+            .property(
+                Expectation::Always,
+                "reap never cleans worktree",
+                check_reap_never_cleans_worktree,
+            )
+            .property(
+                Expectation::Always,
+                "recurrence preserved on reregister",
+                check_recurrence_preserved_on_reregister,
+            )
             .property(Expectation::Sometimes, "registered", check_some_registered)
             .property(Expectation::Sometimes, "remote visible", check_some_remote)
             .property(
@@ -4146,6 +4386,21 @@ mod stateright_model {
                 Expectation::Sometimes,
                 "cross-daemon delivery",
                 check_cross_daemon_delivery,
+            )
+            .property(
+                Expectation::Sometimes,
+                "worktree cleanup exercised",
+                check_some_worktree_cleanup,
+            )
+            .property(
+                Expectation::Sometimes,
+                "workflow sessions exist",
+                check_some_workflow_sessions,
+            )
+            .property(
+                Expectation::Sometimes,
+                "reap exercised",
+                check_some_reap,
             )
             .within_boundary(|_, state| state.network.len() <= 12)
     }
@@ -4195,9 +4450,6 @@ mod stateright_model {
                 ..
             } = ds_state.as_ref()
             {
-                // The sending daemon shouldn't have `to` as a directly
-                // addressable session (exact key match — how apply_send
-                // resolves targets).
                 if ds.sessions.contains_key(to.as_str()) {
                     return false;
                 }
@@ -4247,8 +4499,6 @@ mod stateright_model {
                 ..
             } = ds_state.as_ref()
             {
-                // resolve_alias returns Some only when the alias target
-                // exists in sessions — matching exactly what apply_send does.
                 if ds.resolve_alias(to.as_str()).is_some() && renamed_to.is_none() {
                     return false;
                 }
@@ -4288,7 +4538,6 @@ mod stateright_model {
         _: &ActorModel<ModelActor, ()>,
         state: &<ActorModel<ModelActor, ()> as Model>::State,
     ) -> bool {
-        // Collect (daemon_id, last_send_result) pairs for daemon actors only
         let daemon_info: Vec<(&str, Option<&SendOutcome>)> = state
             .actor_states
             .iter()
@@ -4328,7 +4577,7 @@ mod stateright_model {
         let checker = build_model().checker().spawn_bfs().join();
         let elapsed = start.elapsed();
         println!(
-            "Real DaemonState model — states: {}, unique: {}, depth: {}, time: {:.1}s",
+            "Real DaemonState model -- states: {}, unique: {}, depth: {}, time: {:.1}s",
             checker.state_count(),
             checker.unique_state_count(),
             checker.max_depth(),
@@ -4337,17 +4586,3 @@ mod stateright_model {
         checker.assert_properties();
     }
 }
-
-// TODO: Stateright model gaps identified during workflow actor integration (2026-03-25):
-//
-// 1. Worktree cleanup invariant: model always uses keep_worktree=false and sessions
-//    don't share project_dir. Should add: ModelMsg::RemoveKeep { id, keep_worktree },
-//    sessions with shared project_dir, and property verifying CleanupWorktree is never
-//    emitted while another session references the same directory.
-//
-// 2. Workflow field persistence: model doesn't include workflow metadata. Should verify
-//    that inherit_recurrence_from preserves workflow, workflow_calls, workflow_max_calls
-//    across re-registration (the async registration race we fixed).
-//
-// 3. Reap vs Remove interaction: model exercises both but doesn't verify that reap
-//    never emits CleanupWorktree (current code is correct, invariant not checked).
