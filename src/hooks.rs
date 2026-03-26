@@ -19,11 +19,11 @@ pub struct PaneBody {
 
 impl PaneBody {
     /// Stable key for per-caller state (e.g. session diff baselines).
-    fn baseline_key(&self) -> String {
+    fn baseline_key(&self) -> &str {
         self.pane
-            .clone()
-            .or_else(|| self.backend_session_id.clone())
-            .unwrap_or_default()
+            .as_deref()
+            .or_else(|| self.backend_session_id.as_deref())
+            .unwrap_or("")
     }
 }
 
@@ -40,18 +40,18 @@ async fn session_end_inner(
     state: &std::sync::Arc<crate::state::AppState>,
     body: PaneBody,
 ) -> Value {
+    let Some(session_id) = state
+        .find_session_by_pane_or_backend_sid(
+            body.pane.as_deref(),
+            body.backend_session_id.as_deref(),
+        )
+        .await
+    else {
+        return json!({ "skipped": "no session" });
+    };
     let session = {
         let proto = state.protocol.read().await;
-        proto
-            .sessions
-            .values()
-            .find(|s| {
-                body.pane.as_deref().is_some_and(|p| s.pane.as_deref() == Some(p))
-                    || body.backend_session_id.as_deref().is_some_and(|b| {
-                        s.metadata.backend_session_id.as_deref() == Some(b)
-                    })
-            })
-            .cloned()
+        proto.sessions.get(&session_id).cloned()
     };
     let Some(session) = session else {
         return json!({ "skipped": "no session" });
@@ -118,22 +118,9 @@ async fn prompt_submit_inner(
     state: &std::sync::Arc<crate::state::AppState>,
     body: PaneBody,
 ) -> Value {
-    // Notify agent active
-    if let Some(id) = state
-        .find_session_by_pane_or_backend_sid(
-            body.pane.as_deref(),
-            body.backend_session_id.as_deref(),
-        )
-        .await
-    {
-        state
-            .notify_agent(&id, crate::session_agent::SessionMsg::Active)
-            .await;
-    }
-
-    // Build current snapshot
-    let baseline_key = body.baseline_key();
-    let (current_snapshots, my_session) = {
+    // Single lock acquisition: build snapshots, find our session, get ID for Active notify
+    let baseline_key = body.baseline_key().to_string();
+    let (current_snapshots, my_session, my_id) = {
         let proto = state.protocol.read().await;
         let snaps: Vec<crate::state::SessionSnapshot> = proto
             .sessions
@@ -159,13 +146,21 @@ async fn prompt_submit_inner(
                     })
             })
             .cloned();
-        (snaps, me)
+        let id = me.as_ref().map(|s| s.id.clone());
+        (snaps, me, id)
     };
+
+    // Notify agent active (outside lock)
+    if let Some(ref id) = my_id {
+        state
+            .notify_agent(id, crate::session_agent::SessionMsg::Active)
+            .await;
+    }
 
     // Compute diff against per-caller baseline
     let previous = {
         let mut baselines = state.session_diff_baselines.lock().unwrap();
-        let prev = baselines.get(&baseline_key).cloned().unwrap_or_default();
+        let prev = baselines.get(baseline_key.as_str()).cloned().unwrap_or_default();
         baselines.insert(baseline_key, current_snapshots.clone());
         prev
     };
@@ -293,9 +288,8 @@ async fn pre_tool_use_inner(
     state: &std::sync::Arc<crate::state::AppState>,
     body: PreToolUseBody,
 ) -> Value {
-    // block_interactive is currently always false (no-op).
-    // When wired up, this will check injection marker state on the session.
-    let _session_id = state.find_session_by_pane(&body.pane).await;
+    // TODO: check injection marker state on the session to decide blocking.
+    // Currently a no-op — always allows interactive tools.
     let blocked = false;
 
     if !blocked {

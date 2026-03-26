@@ -95,6 +95,9 @@ If \`session_send\` fails with "session not found", the sender disconnected. Cal
       }
     },
 
+    // TODO: chat.message fires on every message (including assistant turns).
+    // Ideally filter to user-initiated messages only, but opencode doesn't
+    // expose message source yet. The daemon handles redundant calls gracefully.
     "chat.message": async (input, output) => {
       try {
         const resp = await fetch(`${base}/api/hooks/prompt-submit`, {
