@@ -3,6 +3,7 @@ mod api;
 mod backend;
 mod config;
 pub mod daemon_protocol;
+mod hooks;
 mod mcp;
 mod nostr_transport;
 mod persistence;

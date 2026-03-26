@@ -7,7 +7,7 @@ use tokio::net::TcpListener;
 
 use crate::mcp::OuijaMcp;
 use crate::state::SharedState;
-use crate::{admin, api};
+use crate::{admin, api, hooks};
 
 /// Start the HTTP/MCP server on the configured port.
 pub async fn run(state: SharedState) -> anyhow::Result<()> {
@@ -87,6 +87,7 @@ pub async fn run(state: SharedState) -> anyhow::Result<()> {
             post(api::backend_session_ready),
         )
         .route("/api/projects", get(api::list_projects))
+        .route("/api/hooks/session-end", post(hooks::session_end))
         .with_state(state);
 
     let addr = format!("127.0.0.1:{port}");
