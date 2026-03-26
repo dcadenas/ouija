@@ -1674,6 +1674,16 @@ pub async fn restart_session(
     // inherit_recurrence_from preserves metadata (workflow, prompt, reminder).
     // The subsequent Register re-registers in place — apply_register handles
     // old pane cleanup and agent restart when the pane changes.
+    //
+    // Refresh registered_at so the reaper's 60s grace period protects the
+    // session during the brief window when pane_alive returns false (old
+    // process dead, new one not yet started).
+    {
+        let mut proto = state.protocol.write().await;
+        if let Some(s) = proto.sessions.get_mut(name) {
+            s.registered_at = chrono::Utc::now().timestamp();
+        }
+    }
 
     let projects_dir = state.settings.read().await.projects_dir.clone();
     let base = match projects_dir {
