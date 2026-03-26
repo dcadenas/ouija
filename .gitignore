@@ -10,3 +10,4 @@ firebase-debug.log
 !screenshot.png
 .playwright-mcp/
 workflow-state.json
+stress-state.json
