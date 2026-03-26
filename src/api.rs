@@ -1511,21 +1511,9 @@ pub async fn start_session(
             };
             // Stamp now
             stamp(&state2, &body.name, &wf_path, max_calls).await;
-            // Re-stamp after 5s to survive hook re-registration
-            let state3 = state2.clone();
-            let name3 = body.name.clone();
-            let wf3 = wf_path.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                let mut proto = state3.protocol.write().await;
-                if let Some(session) = proto.sessions.get_mut(&name3) {
-                    if session.metadata.workflow.is_none() {
-                        tracing::info!("re-stamping workflow for {name3} (hook race recovery)");
-                        session.metadata.workflow = Some(wf3);
-                    }
-                }
-                state3.persist_protocol_state(&proto);
-            });
+            // No re-stamp needed: apply_register's inherit_recurrence_from
+            // preserves workflow/prompt/reminder even if the hook re-registers
+            // with blank metadata.
         }
 
         tracing::info!("async session start complete: {}, result: {result}", body.name);
@@ -1566,43 +1554,9 @@ pub async fn restart_session(
     )
     .await;
 
-    // Re-stamp metadata after restart to survive hook re-registration race.
-    // The hook may re-register with blank metadata, wiping workflow/prompt/reminder.
-    if let Some((wf, max_calls, prompt_snap, reminder_snap)) = meta_snapshot {
-        let state2 = state.clone();
-        let name = body.name.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            let mut proto = state2.protocol.write().await;
-            if let Some(session) = proto.sessions.get_mut(&name) {
-                let mut changed = false;
-                if session.metadata.workflow.is_none() {
-                    if let Some(ref wf) = wf {
-                        session.metadata.workflow = Some(wf.clone());
-                        session.metadata.workflow_max_calls = max_calls;
-                        session.metadata.workflow_calls = 0;
-                        changed = true;
-                    }
-                }
-                if session.metadata.prompt.is_none() {
-                    if let Some(ref p) = prompt_snap {
-                        session.metadata.prompt = Some(p.clone());
-                        changed = true;
-                    }
-                }
-                if session.metadata.reminder.is_none() {
-                    if let Some(ref r) = reminder_snap {
-                        session.metadata.reminder = Some(r.clone());
-                        changed = true;
-                    }
-                }
-                if changed {
-                    tracing::info!("re-stamped metadata for {name} after restart");
-                    state2.persist_protocol_state(&proto);
-                }
-            }
-        });
-    }
+    // No re-stamp needed: apply_register's inherit_recurrence_from preserves
+    // workflow/prompt/reminder even if the hook re-registers with blank metadata.
+    let _ = meta_snapshot;
 
     (StatusCode::OK, Json(json!({ "result": result })))
 }
