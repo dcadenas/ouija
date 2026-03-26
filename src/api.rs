@@ -1441,6 +1441,29 @@ pub async fn start_session(
             }
         }
 
+        // Pre-stamp workflow metadata so it survives the startup hook's re-registration.
+        // start_session will register the session, then inherit_recurrence_from preserves
+        // any fields already set (including workflow).
+        if let Some((ref wf_path, max_calls)) = workflow_for_meta {
+            let mut proto = state2.protocol.write().await;
+            // Pre-register a placeholder so workflow fields are set before start_session
+            let meta = proto
+                .sessions
+                .entry(body.name.clone())
+                .or_insert_with(|| crate::daemon_protocol::SessionEntry {
+                    id: body.name.clone(),
+                    pane: None,
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta::default(),
+                    registered_at: 0,
+                });
+            meta.metadata.workflow = Some(wf_path.clone());
+            meta.metadata.workflow_max_calls = max_calls;
+            meta.metadata.prompt = prompt.clone();
+            meta.metadata.reminder = reminder.clone();
+            state2.persist_protocol_state(&proto);
+        }
+
         let (result, _prompt_msg_id) = crate::nostr_transport::start_session(
             &state2,
             &body.name,
@@ -1454,16 +1477,6 @@ pub async fn start_session(
             reminder.as_deref(),
         )
         .await;
-
-        // Stamp workflow path and budget on the session metadata
-        if let Some((wf_path, max_calls)) = workflow_for_meta {
-            let mut proto = state2.protocol.write().await;
-            if let Some(session) = proto.sessions.get_mut(&body.name) {
-                session.metadata.workflow = Some(wf_path);
-                session.metadata.workflow_max_calls = max_calls;
-            }
-            state2.persist_protocol_state(&proto);
-        }
 
         tracing::info!("async session start complete: {}, result: {result}", body.name);
     });
