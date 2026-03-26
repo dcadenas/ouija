@@ -58,6 +58,27 @@ async fn session_end_inner(
     json!({ "removed": id })
 }
 
+/// POST /api/hooks/stop
+pub async fn hook_stop(
+    State(state): State<SharedState>,
+    Json(body): Json<PaneBody>,
+) -> (StatusCode, Json<Value>) {
+    let result = hook_stop_inner(&state, body).await;
+    (StatusCode::OK, Json(result))
+}
+
+async fn hook_stop_inner(
+    state: &std::sync::Arc<crate::state::AppState>,
+    body: PaneBody,
+) -> Value {
+    if let Some(id) = state.find_session_by_pane(&body.pane).await {
+        state
+            .notify_agent(&id, crate::session_agent::SessionMsg::Stopped)
+            .await;
+    }
+    json!({ "ok": true })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +135,13 @@ mod tests {
         };
         let result = session_end_inner(&state, body).await;
         assert!(result.get("skipped").is_some());
+    }
+
+    #[tokio::test]
+    async fn hook_stop_no_session_returns_ok() {
+        let state = crate::state::AppState::new_for_test();
+        let body = PaneBody { pane: "%999".into() };
+        let result = hook_stop_inner(&state, body).await;
+        assert_eq!(result, json!({ "ok": true }));
     }
 }
