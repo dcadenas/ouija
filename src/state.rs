@@ -687,14 +687,16 @@ impl AppState {
     }
 
     /// Clean up a git worktree directory if it has no uncommitted changes.
-    ///
-    /// Phase 1: hardcoded to the Claude Code worktree path pattern (`/.claude/worktrees/`).
-    /// Phase 2: delegate to `backend.cleanup_worktree_dir(dir)` when per-session backends are supported.
+    /// Supports both ouija-managed (`.ouija/worktrees/`) and legacy Claude Code
+    /// (`.claude/worktrees/`) paths.
     async fn cleanup_worktree_dir(dir: &str) {
         let dir_owned = dir.to_string();
-        let repo = match dir.find("/.claude/worktrees/") {
-            Some(i) => dir[..i].to_string(),
-            None => return,
+        let repo = if let Some(i) = dir.find("/.ouija/worktrees/") {
+            dir[..i].to_string()
+        } else if let Some(i) = dir.find("/.claude/worktrees/") {
+            dir[..i].to_string()
+        } else {
+            return;
         };
         let dir_clone = dir_owned.clone();
         let has_changes = tokio::task::spawn_blocking(move || {

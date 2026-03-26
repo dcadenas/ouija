@@ -852,7 +852,7 @@ impl DaemonState {
         // or another session is still using the same worktree directory.
         if !keep_worktree {
             if let Some(ref dir) = session.metadata.project_dir {
-                if dir.contains("/.claude/worktrees/") {
+                if dir.contains("/.ouija/worktrees/") || dir.contains("/.claude/worktrees/") {
                     let shared = self
                         .sessions
                         .values()

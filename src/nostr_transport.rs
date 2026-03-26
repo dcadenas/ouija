@@ -1309,7 +1309,7 @@ pub async fn start_session(
         return (format!("session '{name}' already exists"), None);
     }
 
-    let dir = if let Some(pd) = project_dir {
+    let mut dir = if let Some(pd) = project_dir {
         pd.to_string()
     } else {
         let projects_dir = state.settings.read().await.projects_dir.clone();
@@ -1349,13 +1349,21 @@ pub async fn start_session(
         return (format!("failed to create {dir}: {e}"), None);
     }
 
+    // If worktree requested, ouija creates it in .ouija/worktrees/<name>.
+    // The backend never sees --worktree — it just gets a directory.
+    if worktree {
+        match create_ouija_worktree(&dir, name) {
+            Ok(wt_dir) => {
+                dir = wt_dir;
+            }
+            Err(e) => {
+                return (format!("failed to create worktree: {e}"), None);
+            }
+        }
+    }
+
     let tmux_session = crate::tmux::tmux_session_name(&dir);
     let window_name = name.to_string();
-    let worktree_mode = if worktree {
-        Some(crate::backend::WorktreeMode::Named(window_name.clone()))
-    } else {
-        None
-    };
     let backend = match backend {
         Some(b) => state
             .backends
@@ -1366,7 +1374,7 @@ pub async fn start_session(
     let backend_name = backend.name().to_string();
     let backend_cmd = backend.build_start_command(&crate::backend::StartOpts {
         project_dir: dir.clone(),
-        worktree: worktree_mode,
+        worktree: None, // ouija manages worktrees, not the backend
     });
     let start_result = tokio::task::spawn_blocking({
         let tmux_session = tmux_session.clone();
@@ -1697,24 +1705,20 @@ pub async fn restart_session(
         tracing::info!("restart '{name}': using --resume {sid}");
     }
 
-    let worktree_flag = prev_metadata.as_ref().is_some_and(|m| m.worktree);
-    let worktree_mode = if worktree_flag {
-        Some(crate::backend::WorktreeMode::Named(name.to_string()))
-    } else {
-        None
-    };
+    // Ouija manages worktrees in .ouija/worktrees/ — the backend just gets a dir.
+    // On restart, the worktree already exists (project_dir points to it).
 
     let claude_cmd = if fresh {
         backend.build_start_command(&crate::backend::StartOpts {
             project_dir: dir.clone(),
-            worktree: worktree_mode,
+            worktree: None, // ouija manages worktrees, not the backend
         })
     } else {
         backend
             .build_resume_command(&crate::backend::ResumeOpts {
                 project_dir: dir.clone(),
                 session_id: resume_id,
-                worktree: worktree_mode,
+                worktree: None, // ouija manages worktrees
             })
             .unwrap_or_else(|| {
                 backend.build_start_command(&crate::backend::StartOpts {
@@ -2151,6 +2155,36 @@ async fn setup_shared_serve_session(
 
 /// Inject a prompt into a pane after a short delay, giving the backend time to start.
 /// For HttpApi backends, queue the prompt and wait for a readiness signal from the plugin.
+/// Create an ouija-managed git worktree at `<repo>/.ouija/worktrees/<name>`.
+/// If it already exists (e.g. restart), returns the existing path.
+fn create_ouija_worktree(repo_dir: &str, name: &str) -> anyhow::Result<String> {
+    let wt_dir = format!("{repo_dir}/.ouija/worktrees/{name}");
+    if std::path::Path::new(&wt_dir).exists() {
+        return Ok(wt_dir);
+    }
+    // Ensure parent dir exists
+    let parent = format!("{repo_dir}/.ouija/worktrees");
+    std::fs::create_dir_all(&parent)?;
+    // Create worktree with a new branch
+    let branch = format!("ouija/{name}");
+    let output = std::process::Command::new("git")
+        .args(["-C", repo_dir, "worktree", "add", "-b", &branch, &wt_dir])
+        .output()?;
+    if !output.status.success() {
+        // Branch might already exist — try without -b
+        let output2 = std::process::Command::new("git")
+            .args(["-C", repo_dir, "worktree", "add", &wt_dir, &branch])
+            .output()?;
+        if !output2.status.success() {
+            anyhow::bail!(
+                "git worktree add failed: {}",
+                String::from_utf8_lossy(&output2.stderr).trim()
+            );
+        }
+    }
+    Ok(wt_dir)
+}
+
 pub(crate) fn schedule_prompt_injection(
     state: &std::sync::Arc<AppState>,
     session_name: &str,
