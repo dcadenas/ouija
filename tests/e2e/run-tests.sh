@@ -509,10 +509,10 @@ api "$BASE" POST /api/settings -d '{"projects_dir":"/tmp/projects"}' >/dev/null
 
 log "Test L1: Start session via REST API"
 L1=$(api "$BASE" POST /api/sessions/start -d '{"name":"lifecycle-test"}')
-assert_contains "L1: start returns pane" "$L1" "pane"
-assert_contains "L1: start creates dir" "$L1" "/tmp/projects/lifecycle-test"
-# Verify session registered
-wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'lifecycle-test'"
+assert_contains "L1: start returns 202 session name" "$L1" "lifecycle-test"
+assert_contains "L1: start returns starting status" "$L1" "starting"
+# Wait for async session to register
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'lifecycle-test'"
 L1_IDS=$(session_ids "$BASE")
 assert_contains "L1: session registered" "$L1_IDS" "lifecycle-test"
 # Verify directory was created
@@ -528,8 +528,8 @@ log "Test L1b: Start session when tmux session name already taken"
 # Create a bare tmux session with a name that will collide
 tmux new-session -d -s "tmux-collide"
 L1B=$(api "$BASE" POST /api/sessions/start -d '{"name":"tmux-collide","project_dir":"/tmp/projects/tmux-collide"}')
-assert_contains "L1b: start succeeds despite tmux name collision" "$L1B" "started"
-wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'tmux-collide'"
+assert_contains "L1b: start returns 202" "$L1B" "tmux-collide"
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'tmux-collide'"
 # Verify the new pane lives as a window inside the existing tmux session
 L1B_PANE=$(session_field "$BASE" "tmux-collide" "pane")
 L1B_TMUX_SESS=$(tmux display-message -t "$L1B_PANE" -p '#{session_name}' 2>/dev/null)
@@ -541,11 +541,13 @@ assert_eq "L1b: window named after ouija session" "$L1B_WIN_NAME" "tmux-collide"
 api "$BASE" POST /api/sessions/kill -d '{"name":"tmux-collide"}' >/dev/null 2>&1 || true
 tmux kill-session -t tmux-collide 2>/dev/null || true
 
-log "Test L2: Start duplicate session fails"
+log "Test L2: Start duplicate session restarts existing"
 L2=$(api "$BASE" POST /api/sessions/start -d '{"name":"lifecycle-test"}')
-assert_contains "L2: duplicate rejected" "$L2" "already exists"
+assert_contains "L2: duplicate returns 202 (restart)" "$L2" "lifecycle-test"
 
 log "Test L3: Kill session via REST API"
+# Wait for session to have a pane (async start may still be in progress)
+wait_for 10 bash -c "session_field '$BASE' 'lifecycle-test' 'pane' | grep -q '%'"
 L3=$(api "$BASE" POST /api/sessions/kill -d '{"name":"lifecycle-test"}')
 assert_contains "L3: kill response" "$L3" "removed"
 wait_for 5 bash -c "! session_ids '$BASE' | grep -qF 'lifecycle-test'"
