@@ -399,6 +399,30 @@ impl AppState {
             .map(|s| s.id.clone())
     }
 
+    /// Find session by pane OR backend session ID (opencode UUID).
+    pub async fn find_session_by_pane_or_backend_sid(
+        &self,
+        pane: Option<&str>,
+        backend_sid: Option<&str>,
+    ) -> Option<String> {
+        let proto = self.protocol.read().await;
+        if let Some(pane) = pane {
+            return proto
+                .sessions
+                .values()
+                .find(|s| s.pane.as_deref() == Some(pane))
+                .map(|s| s.id.clone());
+        }
+        if let Some(bsid) = backend_sid {
+            return proto
+                .sessions
+                .values()
+                .find(|s| s.metadata.backend_session_id.as_deref() == Some(bsid))
+                .map(|s| s.id.clone());
+        }
+        None
+    }
+
     /// Apply a protocol event and execute all resulting effects.
     ///
     /// The pure state transition happens under the protocol lock.

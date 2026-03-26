@@ -17,27 +17,26 @@ export const OuijaPlugin: Plugin = async (ctx) => {
 
   console.log(`ouija plugin v${OUIJA_VERSION}: connected to daemon at ${base}`)
 
-  let lastSessionState: string = ""
-  const nameCache = new Map<string, string>()
-
-  function resolveOuijaSessionName(opencodeSid: string, sessions: any[]): string {
-    const cached = nameCache.get(opencodeSid)
-    if (cached) return cached
-    const match = sessions.find((s: any) => s.backend_session_id === opencodeSid)
-    const name = match?.id || "(unknown)"
-    if (name !== "(unknown)") nameCache.set(opencodeSid, name)
-    return name
-  }
-
   async function fetchStatus(): Promise<any> {
     return fetch(`${base}/api/status`).then(r => r.json())
+  }
+
+  /** Build hook body with pane or backend_session_id. */
+  function hookBody(sessionID?: string): Record<string, string> {
+    const body: Record<string, string> = {}
+    const pane = process.env.TMUX_PANE
+    if (pane) body.pane = pane
+    else if (sessionID) body.backend_session_id = sessionID
+    return body
   }
 
   return {
     "experimental.chat.system.transform": async (input, output) => {
       try {
         const status = await fetchStatus()
-        const sid = resolveOuijaSessionName(input.sessionID, status.sessions || [])
+        const sessions = status.sessions || []
+        const match = sessions.find((s: any) => s.backend_session_id === input.sessionID)
+        const sid = match?.id || "(unknown)"
         output.system.push(`
 # Ouija Mesh Protocol
 
@@ -85,11 +84,12 @@ If \`session_send\` fails with "session not found", the sender disconnected. Cal
       if (event.type === "session.idle") {
         setTimeout(async () => {
           try {
-            const pane = process.env.TMUX_PANE
-            if (pane) {
-              const paneNum = pane.replace("%", "")
-              await fetch(`${base}/api/pane/${paneNum}/stopped`, { method: "POST" })
-            }
+            const sid = event.properties?.sessionID
+            await fetch(`${base}/api/hooks/stop`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(hookBody(sid)),
+            })
           } catch {}
         }, 0)
       }
@@ -97,56 +97,23 @@ If \`session_send\` fails with "session not found", the sender disconnected. Cal
 
     "chat.message": async (input, output) => {
       try {
-        const status = await fetchStatus()
-        const sessions = status.sessions || []
-        const sid = resolveOuijaSessionName(input.sessionID, sessions)
-        const messageID = output.message.id
-        const sessionID = input.sessionID
+        const resp = await fetch(`${base}/api/hooks/prompt-submit`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(hookBody(input.sessionID)),
+        })
+        if (!resp.ok) return
 
-        const current = JSON.stringify(
-          sessions
-            .map((s: any) => ({ id: s.id, role: s.role, bulletin: s.bulletin }))
-            .sort((a: any, b: any) => a.id.localeCompare(b.id))
-        )
-
-        if (lastSessionState && current !== lastSessionState) {
-          const prev = JSON.parse(lastSessionState)
-          const curr = JSON.parse(current)
-          const prevIds = new Set(prev.map((s: any) => s.id))
-          const currIds = new Set(curr.map((s: any) => s.id))
-
-          const joined = curr.filter((s: any) => !prevIds.has(s.id))
-          const left = prev.filter((s: any) => !currIds.has(s.id))
-
-          const lines: string[] = []
-          if (joined.length) {
-            lines.push(`<ouija-status type="mesh-update">joined:`)
-            joined.forEach((s: any) => lines.push(`  - ${s.id}${s.role ? " | " + s.role : ""}`))
-            lines.push(`</ouija-status>`)
-          }
-          if (left.length) {
-            lines.push(`<ouija-status type="mesh-update">left: ${left.map((s: any) => s.id).join(", ")}</ouija-status>`)
-          }
-
-          if (lines.length) {
-            output.parts.push({ type: "text", text: lines.join("\n"), id: crypto.randomUUID(), messageID, sessionID, synthetic: true })
-          }
-        }
-
-        lastSessionState = current
-
-        if (sid !== "(unknown)") {
-          const me = sessions.find((s: any) => s.id === sid)
-          if (me?.stale) {
-            output.parts.push({
-              type: "text",
-              text: `<ouija-status type="stale">Your metadata is stale. Call session_update(id="${sid}", role="<what you're doing>") to stay discoverable.</ouija-status>`,
-              id: crypto.randomUUID(),
-              messageID,
-              sessionID,
-              synthetic: true,
-            })
-          }
+        const result = await resp.json()
+        if (result.output) {
+          output.parts.push({
+            type: "text",
+            text: result.output,
+            id: crypto.randomUUID(),
+            messageID: output.message.id,
+            sessionID: input.sessionID,
+            synthetic: true,
+          })
         }
       } catch {
         // Daemon unreachable — skip silently

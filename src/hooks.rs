@@ -7,9 +7,24 @@ use serde_json::{json, Value};
 use crate::state::SharedState;
 
 /// Common request body for pane-identified hooks.
+/// Accepts either `pane` (tmux pane ID like "%689") or `backend_session_id`
+/// (opencode session UUID). At least one must be provided.
 #[derive(Debug, Deserialize)]
 pub struct PaneBody {
-    pub pane: String,
+    #[serde(default)]
+    pub pane: Option<String>,
+    #[serde(default)]
+    pub backend_session_id: Option<String>,
+}
+
+impl PaneBody {
+    /// Stable key for per-caller state (e.g. session diff baselines).
+    fn baseline_key(&self) -> String {
+        self.pane
+            .clone()
+            .or_else(|| self.backend_session_id.clone())
+            .unwrap_or_default()
+    }
 }
 
 /// POST /api/hooks/session-end
@@ -30,7 +45,12 @@ async fn session_end_inner(
         proto
             .sessions
             .values()
-            .find(|s| s.pane.as_deref() == Some(&body.pane))
+            .find(|s| {
+                body.pane.as_deref().is_some_and(|p| s.pane.as_deref() == Some(p))
+                    || body.backend_session_id.as_deref().is_some_and(|b| {
+                        s.metadata.backend_session_id.as_deref() == Some(b)
+                    })
+            })
             .cloned()
     };
     let Some(session) = session else {
@@ -49,7 +69,7 @@ async fn session_end_inner(
         })
         .await;
     // Clear tmux @ouija_id
-    let pane = body.pane;
+    let pane = session.pane.unwrap_or_default();
     tokio::task::spawn_blocking(move || {
         let _ = std::process::Command::new("tmux")
             .args(["set-option", "-pu", "-t", &pane, "@ouija_id"])
@@ -71,7 +91,13 @@ async fn hook_stop_inner(
     state: &std::sync::Arc<crate::state::AppState>,
     body: PaneBody,
 ) -> Value {
-    if let Some(id) = state.find_session_by_pane(&body.pane).await {
+    if let Some(id) = state
+        .find_session_by_pane_or_backend_sid(
+            body.pane.as_deref(),
+            body.backend_session_id.as_deref(),
+        )
+        .await
+    {
         state
             .notify_agent(&id, crate::session_agent::SessionMsg::Stopped)
             .await;
@@ -93,13 +119,20 @@ async fn prompt_submit_inner(
     body: PaneBody,
 ) -> Value {
     // Notify agent active
-    if let Some(id) = state.find_session_by_pane(&body.pane).await {
+    if let Some(id) = state
+        .find_session_by_pane_or_backend_sid(
+            body.pane.as_deref(),
+            body.backend_session_id.as_deref(),
+        )
+        .await
+    {
         state
             .notify_agent(&id, crate::session_agent::SessionMsg::Active)
             .await;
     }
 
     // Build current snapshot
+    let baseline_key = body.baseline_key();
     let (current_snapshots, my_session) = {
         let proto = state.protocol.read().await;
         let snaps: Vec<crate::state::SessionSnapshot> = proto
@@ -119,16 +152,21 @@ async fn prompt_submit_inner(
         let me = proto
             .sessions
             .values()
-            .find(|s| s.pane.as_deref() == Some(&body.pane))
+            .find(|s| {
+                body.pane.as_deref().is_some_and(|p| s.pane.as_deref() == Some(p))
+                    || body.backend_session_id.as_deref().is_some_and(|b| {
+                        s.metadata.backend_session_id.as_deref() == Some(b)
+                    })
+            })
             .cloned();
         (snaps, me)
     };
 
-    // Compute diff against per-pane baseline
+    // Compute diff against per-caller baseline
     let previous = {
         let mut baselines = state.session_diff_baselines.lock().unwrap();
-        let prev = baselines.get(&body.pane).cloned().unwrap_or_default();
-        baselines.insert(body.pane.clone(), current_snapshots.clone());
+        let prev = baselines.get(&baseline_key).cloned().unwrap_or_default();
+        baselines.insert(baseline_key, current_snapshots.clone());
         prev
     };
 
@@ -456,7 +494,7 @@ mod tests {
             }
         }
 
-        let body = PaneBody { pane: "%99".into() };
+        let body = PaneBody { pane: Some("%99".into()), backend_session_id: None };
         let result = session_end_inner(&state, body).await;
         assert!(result.get("removed").is_some());
         assert!(state.find_session_by_pane("%99").await.is_none());
@@ -473,7 +511,7 @@ mod tests {
             })
             .await;
         // registered_at is now(), so age < 5s — should reject
-        let body = PaneBody { pane: "%99".into() };
+        let body = PaneBody { pane: Some("%99".into()), backend_session_id: None };
         let result = session_end_inner(&state, body).await;
         assert!(result.get("skipped").is_some());
         // Session still exists
@@ -483,9 +521,7 @@ mod tests {
     #[tokio::test]
     async fn session_end_no_session() {
         let state = crate::state::AppState::new_for_test();
-        let body = PaneBody {
-            pane: "%999".into(),
-        };
+        let body = PaneBody { pane: Some("%999".into()), backend_session_id: None };
         let result = session_end_inner(&state, body).await;
         assert!(result.get("skipped").is_some());
     }
@@ -493,7 +529,7 @@ mod tests {
     #[tokio::test]
     async fn hook_stop_no_session_returns_ok() {
         let state = crate::state::AppState::new_for_test();
-        let body = PaneBody { pane: "%999".into() };
+        let body = PaneBody { pane: Some("%999".into()), backend_session_id: None };
         let result = hook_stop_inner(&state, body).await;
         assert_eq!(result, json!({ "ok": true }));
     }
@@ -501,7 +537,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_submit_returns_empty_for_unknown_pane() {
         let state = crate::state::AppState::new_for_test();
-        let body = PaneBody { pane: "%999".into() };
+        let body = PaneBody { pane: Some("%999".into()), backend_session_id: None };
         let result = prompt_submit_inner(&state, body).await;
         assert_eq!(result["output"], "");
     }
@@ -518,7 +554,7 @@ mod tests {
             })
             .await;
         // First call: sets baseline
-        let _ = prompt_submit_inner(&state, PaneBody { pane: "%10".into() }).await;
+        let _ = prompt_submit_inner(&state, PaneBody { pane: Some("%10".into()), backend_session_id: None }).await;
         // Add newcomer
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -531,7 +567,7 @@ mod tests {
             })
             .await;
         // Second call: should detect newcomer
-        let result = prompt_submit_inner(&state, PaneBody { pane: "%10".into() }).await;
+        let result = prompt_submit_inner(&state, PaneBody { pane: Some("%10".into()), backend_session_id: None }).await;
         let output = result["output"].as_str().unwrap();
         assert!(output.contains("newcomer"), "output should mention newcomer: {output}");
         assert!(output.contains("joined"), "output should contain 'joined': {output}");
