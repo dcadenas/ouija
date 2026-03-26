@@ -89,6 +89,7 @@ pub async fn run(state: SharedState) -> anyhow::Result<()> {
         .route("/api/projects", get(api::list_projects))
         .route("/api/hooks/session-end", post(hooks::session_end))
         .route("/api/hooks/stop", post(hooks::hook_stop))
+        .route("/api/hooks/prompt-submit", post(hooks::prompt_submit))
         .with_state(state);
 
     let addr = format!("127.0.0.1:{port}");

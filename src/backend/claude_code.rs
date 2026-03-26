@@ -16,11 +16,10 @@ mod embedded {
     pub const SCRIPT_BLOCK_INTERACTIVE: &str =
         include_str!("../../scripts/block-interactive-prompts.sh");
     pub const SCRIPT_CHECK_PENDING: &str = include_str!("../../scripts/check-pending-replies.sh");
-    pub const SCRIPT_CLEAR_MARKER: &str = include_str!("../../scripts/clear-injection-marker.sh");
+    pub const SCRIPT_PROMPT_SUBMIT: &str = include_str!("../../scripts/ouija-prompt-submit.sh");
     pub const SCRIPT_REGISTER: &str = include_str!("../../scripts/ouija-register.sh");
     pub const SCRIPT_STATUSLINE: &str = include_str!("../../scripts/ouija-statusline.sh");
     pub const SCRIPT_UNREGISTER: &str = include_str!("../../scripts/ouija-unregister.sh");
-    pub const SCRIPT_SESSION_DIFF: &str = include_str!("../../scripts/session-diff.sh");
 
     pub const SKILLS_PEER_TRUST: &str = include_str!("../../skills/ouija/SKILL.md");
 }
@@ -39,13 +38,12 @@ fn write_embedded_plugin_files(cache_dir: &std::path::Path) {
             embedded::SCRIPT_CHECK_PENDING,
         ),
         (
-            "scripts/clear-injection-marker.sh",
-            embedded::SCRIPT_CLEAR_MARKER,
+            "scripts/ouija-prompt-submit.sh",
+            embedded::SCRIPT_PROMPT_SUBMIT,
         ),
         ("scripts/ouija-register.sh", embedded::SCRIPT_REGISTER),
         ("scripts/ouija-statusline.sh", embedded::SCRIPT_STATUSLINE),
         ("scripts/ouija-unregister.sh", embedded::SCRIPT_UNREGISTER),
-        ("scripts/session-diff.sh", embedded::SCRIPT_SESSION_DIFF),
         ("skills/ouija/SKILL.md", embedded::SKILLS_PEER_TRUST),
     ];
 
