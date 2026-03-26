@@ -11,3 +11,4 @@ firebase-debug.log
 .playwright-mcp/
 workflow-state.json
 stress-state.json
+.ouija/
