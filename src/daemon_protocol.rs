@@ -849,12 +849,26 @@ impl DaemonState {
         });
 
         // Worktree cleanup on explicit kill (not reap), unless keep_worktree is set
+        // or another session is still using the same worktree directory.
         if !keep_worktree {
             if let Some(ref dir) = session.metadata.project_dir {
                 if dir.contains("/.claude/worktrees/") {
-                    effects.push(Effect::CleanupWorktree {
-                        project_dir: dir.clone(),
-                    });
+                    let shared = self
+                        .sessions
+                        .values()
+                        .any(|s| s.metadata.project_dir.as_deref() == Some(dir.as_str()));
+                    if shared {
+                        effects.push(Effect::Log {
+                            level: LogLevel::Info,
+                            message: format!(
+                                "skipping worktree cleanup for {dir}: other sessions still using it"
+                            ),
+                        });
+                    } else {
+                        effects.push(Effect::CleanupWorktree {
+                            project_dir: dir.clone(),
+                        });
+                    }
                 }
             }
         }
