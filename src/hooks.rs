@@ -271,6 +271,167 @@ async fn pre_tool_use_inner(
     json!({ "block": true, "message": message })
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SessionStartBody {
+    pub pane: String,
+    pub cwd: String,
+}
+
+/// POST /api/hooks/session-start
+pub async fn session_start(
+    State(state): State<SharedState>,
+    Json(body): Json<SessionStartBody>,
+) -> (StatusCode, Json<Value>) {
+    let result = session_start_inner(&state, body).await;
+    (StatusCode::OK, Json(result))
+}
+
+async fn session_start_inner(
+    state: &std::sync::Arc<crate::state::AppState>,
+    body: SessionStartBody,
+) -> Value {
+    // Check auto_register
+    if !state.settings.read().await.auto_register {
+        return json!({ "skipped": "auto_register disabled", "output": "" });
+    }
+
+    // Skip if pane already registered
+    if let Some(existing_id) = state.find_session_by_pane(&body.pane).await {
+        return json!({ "registered": existing_id, "output": "" });
+    }
+
+    // Derive name from cwd
+    let project_root = crate::state::resolve_project_root(&body.cwd);
+    let basename = std::path::Path::new(project_root)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unnamed");
+    let base_id = crate::state::sanitize_session_id(basename);
+    if base_id.is_empty() {
+        return json!({ "error": "could not derive session name", "output": "" });
+    }
+
+    // Resolve name conflicts
+    let id = {
+        let proto = state.protocol.read().await;
+        let mut id = base_id.clone();
+        let mut suffix = 2u32;
+        while proto.sessions.contains_key(&id) {
+            if proto.sessions.get(&id).and_then(|s| s.pane.as_deref()) == Some(&body.pane) {
+                break;
+            }
+            id = format!("{base_id}-{suffix}");
+            suffix += 1;
+            if suffix > 100 {
+                break;
+            }
+        }
+        id
+    };
+
+    // Register
+    let role = format!("working on {basename}");
+    let proto_meta = crate::daemon_protocol::SessionMeta {
+        project_dir: Some(project_root.to_string()),
+        role: Some(role),
+        ..Default::default()
+    };
+    state
+        .apply_and_execute(crate::daemon_protocol::Event::Register {
+            id: id.clone(),
+            pane: Some(body.pane.clone()),
+            metadata: proto_meta,
+        })
+        .await;
+
+    // Set tmux @ouija_id (after registration so name reflects any suffix)
+    let pane_clone = body.pane.clone();
+    let tmux_id = id.clone();
+    tokio::task::spawn_blocking(move || {
+        let _ = std::process::Command::new("tmux")
+            .args(["set-option", "-p", "-t", &pane_clone, "@ouija_id", &tmux_id])
+            .status();
+    });
+
+    // Build peer list
+    let peers: Vec<Value> = {
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .values()
+            .filter(|s| s.id != id)
+            .map(|s| {
+                json!({
+                    "id": s.id,
+                    "role": s.metadata.role,
+                    "bulletin": s.metadata.bulletin,
+                })
+            })
+            .collect()
+    };
+
+    // Version check
+    let daemon_version = env!("CARGO_PKG_VERSION");
+    let plugin_version = std::env::var("HOME")
+        .ok()
+        .and_then(|home| {
+            std::fs::read_dir(format!("{home}/.claude/plugins/cache/ouija/ouija"))
+                .ok()
+        })
+        .and_then(|entries| {
+            entries.flatten().find_map(|e| {
+                let vf = e.path().join(".version");
+                std::fs::read_to_string(vf).ok()
+            })
+        })
+        .map(|v| v.trim().to_string());
+
+    let version_warning = plugin_version
+        .as_ref()
+        .filter(|pv| pv.as_str() != daemon_version)
+        .map(|pv| format!("daemon={daemon_version}, plugin={pv}"));
+
+    // Format output
+    let mut output_parts = vec![format!(
+        "<ouija-status type=\"registered\">Registered as {id} on the ouija mesh.</ouija-status>"
+    )];
+
+    if let Some(ref warn) = version_warning {
+        output_parts.push(format!(
+            "WARNING: ouija version mismatch — {warn}.\n  To fix: run 'ouija update', then start a new session."
+        ));
+    }
+
+    if !peers.is_empty() {
+        let mut peer_lines =
+            vec!["<ouija-status type=\"mesh-update\">Other sessions on the mesh:".to_string()];
+        for p in &peers {
+            let mut line = format!("  - {}", p["id"].as_str().unwrap_or("?"));
+            if let Some(r) = p["role"].as_str() {
+                line.push_str(&format!(" | {r}"));
+            }
+            if let Some(b) = p["bulletin"].as_str() {
+                line.push_str(&format!(" | bulletin: {b}"));
+            }
+            peer_lines.push(line);
+        }
+        peer_lines.push("</ouija-status>".into());
+        output_parts.push(peer_lines.join("\n"));
+    } else {
+        output_parts.push(
+            "<ouija-status type=\"mesh-update\">No other sessions on the mesh.</ouija-status>"
+                .into(),
+        );
+    }
+
+    json!({
+        "registered": id,
+        "output": output_parts.join("\n"),
+        "peers": peers,
+        "version_warning": version_warning,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,5 +546,51 @@ mod tests {
         };
         let result = pre_tool_use_inner(&state, body).await;
         assert_eq!(result["block"], false);
+    }
+
+    #[tokio::test]
+    async fn session_start_registers_new_session() {
+        let state = crate::state::AppState::new_for_test();
+        let body = SessionStartBody {
+            pane: "%50".into(),
+            cwd: "/home/user/code/myproject".into(),
+        };
+        let result = session_start_inner(&state, body).await;
+        assert_eq!(result["registered"], "myproject");
+        let output = result["output"].as_str().unwrap();
+        assert!(output.contains("ouija-status"), "output: {output}");
+    }
+
+    #[tokio::test]
+    async fn session_start_skips_already_registered() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "existing".into(),
+                pane: Some("%50".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        let body = SessionStartBody {
+            pane: "%50".into(),
+            cwd: "/home/user/code/existing".into(),
+        };
+        let result = session_start_inner(&state, body).await;
+        assert_eq!(result["registered"], "existing");
+        // Verify only one session exists
+        let proto = state.protocol.read().await;
+        let count = proto.sessions.len();
+        assert_eq!(count, 1, "should still have exactly 1 session, got {count}");
+    }
+
+    #[tokio::test]
+    async fn session_start_resolves_worktree_path() {
+        let state = crate::state::AppState::new_for_test();
+        let body = SessionStartBody {
+            pane: "%50".into(),
+            cwd: "/home/user/code/ouija/.claude/worktrees/feature-x".into(),
+        };
+        let result = session_start_inner(&state, body).await;
+        assert_eq!(result["registered"], "ouija");
     }
 }

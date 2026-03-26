@@ -87,6 +87,7 @@ pub async fn run(state: SharedState) -> anyhow::Result<()> {
             post(api::backend_session_ready),
         )
         .route("/api/projects", get(api::list_projects))
+        .route("/api/hooks/session-start", post(hooks::session_start))
         .route("/api/hooks/session-end", post(hooks::session_end))
         .route("/api/hooks/stop", post(hooks::hook_stop))
         .route("/api/hooks/prompt-submit", post(hooks::prompt_submit))
