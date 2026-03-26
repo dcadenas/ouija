@@ -698,8 +698,8 @@ mkdir -p /tmp/projects/auto-wt-test
 git init /tmp/projects/auto-wt-test >/dev/null 2>&1
 api "$BASE" POST /api/register -d "{\"id\":\"existing-sess\",\"pane\":\"$PANE_A\",\"project_dir\":\"/tmp/projects/auto-wt-test\"}" >/dev/null
 L15=$(api "$BASE" POST /api/sessions/start -d '{"name":"auto-wt-test"}')
-assert_contains "L15: start succeeds" "$L15" "started"
-assert_contains "L15: auto-worktree noted" "$L15" "auto-enabled"
+assert_contains "L15: start accepted" "$L15" "starting"
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'auto-wt-test'"
 L15_STATUS=$(api "$BASE" GET /api/status)
 L15_WT=$(echo "$L15_STATUS" | jq -r '.sessions[] | select(.id == "auto-wt-test") | .worktree')
 assert_eq "L15: auto-worktree session has worktree=true" "$L15_WT" "true"
@@ -710,7 +710,8 @@ log "Test L14: Start session with worktree=true"
 mkdir -p /tmp/projects/wt-sess
 git init /tmp/projects/wt-sess >/dev/null 2>&1
 L14=$(api "$BASE" POST /api/sessions/start -d '{"name":"wt-sess","worktree":true}')
-assert_contains "L14: start worktree session" "$L14" "started"
+assert_contains "L14: start worktree session" "$L14" "starting"
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'wt-sess'"
 L14_STATUS=$(api "$BASE" GET /api/status)
 L14_WT=$(echo "$L14_STATUS" | jq -r '.sessions[] | select(.id == "wt-sess") | .worktree')
 assert_eq "L14: session has worktree=true in metadata" "$L14_WT" "true"
@@ -727,7 +728,7 @@ chmod +x /usr/local/bin/claude
 
 log "Test L16: session_start with from param uses XML format with reply=true"
 L16=$(api "$BASE" POST /api/sessions/start -d '{"name":"from-test","prompt":"what is your status?","from":"orchestrator"}')
-assert_contains "L16: start succeeds" "$L16" "started"
+assert_contains "L16: start accepted" "$L16" "starting"
 wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'from-test'"
 L16_PANE=$(session_field "$BASE" "from-test" "pane")
 wait_for 12 bash -c "tmux capture-pane -t '$L16_PANE' -p -J -S -30 | grep -qF 'from=\"orchestrator\"'"
@@ -741,7 +742,7 @@ api "$BASE" POST /api/remove -d '{"id":"from-test"}' >/dev/null 2>&1 || true
 
 log "Test L17: session_start with from + expects_reply=false omits reply attr"
 L17=$(api "$BASE" POST /api/sessions/start -d '{"name":"from-noreply","prompt":"FYI deployed v2","from":"deployer","expects_reply":false}')
-assert_contains "L17: start succeeds" "$L17" "started"
+assert_contains "L17: start accepted" "$L17" "starting"
 wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'from-noreply'"
 L17_PANE=$(session_field "$BASE" "from-noreply" "pane")
 wait_for 12 bash -c "tmux capture-pane -t '$L17_PANE' -p -J -S -30 | grep -qF 'from=\"deployer\"'"
@@ -753,7 +754,7 @@ api "$BASE" POST /api/remove -d '{"id":"from-noreply"}' >/dev/null 2>&1 || true
 
 log "Test L18: session_start without from injects plain prompt"
 L18=$(api "$BASE" POST /api/sessions/start -d '{"name":"plain-prompt","prompt":"just a plain prompt"}')
-assert_contains "L18: start succeeds" "$L18" "started"
+assert_contains "L18: start accepted" "$L18" "starting"
 wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'plain-prompt'"
 L18_PANE=$(session_field "$BASE" "plain-prompt" "pane")
 wait_for 12 bash -c "tmux capture-pane -t '$L18_PANE' -p -J -S -30 | grep -qF 'just a plain prompt'"
@@ -766,14 +767,14 @@ api "$BASE" POST /api/remove -d '{"id":"plain-prompt"}' >/dev/null 2>&1 || true
 log "Test L19: Sessions sharing project_dir are grouped in same tmux session"
 mkdir -p /tmp/projects/grouped-repo
 L19A=$(api "$BASE" POST /api/sessions/start -d '{"name":"group-a","project_dir":"/tmp/projects/grouped-repo"}')
-assert_contains "L19a: first start succeeds" "$L19A" "started"
+assert_contains "L19a: first start accepted" "$L19A" "starting"
 wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'group-a'"
 L19A_PANE=$(session_field "$BASE" "group-a" "pane")
 # Get the tmux session name of the first pane
 L19A_TMUX_SESS=$(tmux display-message -t "$L19A_PANE" -p '#{session_name}')
 assert_eq "L19a: tmux session named after directory" "$L19A_TMUX_SESS" "grouped-repo"
 L19B=$(api "$BASE" POST /api/sessions/start -d '{"name":"group-b","project_dir":"/tmp/projects/grouped-repo","worktree":true}')
-assert_contains "L19b: second start succeeds" "$L19B" "started"
+assert_contains "L19b: second start accepted" "$L19B" "starting"
 wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'group-b'"
 L19B_PANE=$(session_field "$BASE" "group-b" "pane")
 L19B_TMUX_SESS=$(tmux display-message -t "$L19B_PANE" -p '#{session_name}')
@@ -857,6 +858,11 @@ api "$BASE" POST /api/settings -d '{"idle_timeout_secs":60}' >/dev/null
 log "Test 21: Max local sessions — auto-close most idle when over limit"
 # Set max to 2, then register 3 sessions. The most idle one should be closed.
 # Backdate one session so it's clearly the most idle.
+# Clean up any stale sessions from async starts in earlier tests
+for stale_id in $(session_ids "$BASE"); do
+    api "$BASE" POST /api/remove -d "{\"id\":\"$stale_id\"}" >/dev/null 2>&1 || true
+done
+wait_for 5 bash -c '[ "$(session_count "'"$BASE"'")" -eq 0 ]'
 PANE_C=$(create_claude_pane "$FAKE_BIN")
 sleep 0.5
 api "$BASE" POST /api/register -d "{\"id\":\"keep-a\",\"pane\":\"$PANE_A\"}" >/dev/null
@@ -980,15 +986,14 @@ sleep 1
 PANE_A_NUM="${PANE_A#%}"
 result=$(api "$BASE" GET "/api/pane/${PANE_A_NUM}/pending-replies")
 assert_contains "23b: pending reply from ghost exists" "$result" '"count":1'
-# Kill the ghost's tmux pane so the reaper removes it
+# Kill the ghost's tmux pane and remove session via API (reaper grace period is 60s)
 tmux kill-pane -t "$PANE_EPHEMERAL" 2>/dev/null || true
-# Wait for reaper to remove pr-ghost and clear the pending reply
-wait_for 15 bash -c "! session_ids '$BASE' | grep -qF 'pr-ghost'" || true
+api "$BASE" POST /api/remove -d '{"id":"pr-ghost"}' >/dev/null 2>&1
 sleep 1
 ids_after=$(session_ids "$BASE")
-assert_not_contains "23b: ghost session reaped" "$ids_after" "pr-ghost"
+assert_not_contains "23b: ghost session removed" "$ids_after" "pr-ghost"
 result=$(api "$BASE" GET "/api/pane/${PANE_A_NUM}/pending-replies")
-assert_contains "23b: pending reply cleared after reap" "$result" '"count":0'
+assert_contains "23b: pending reply cleared after remove" "$result" '"count":0'
 # Clean up
 api "$BASE" POST /api/remove -d '{"id":"pr-asker"}' >/dev/null 2>&1 || true
 
@@ -1177,9 +1182,9 @@ api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/
 log "Test 27: session_start via HTTP with reminder and prompt"
 # Start a session with prompt + reminder
 result=$(api "$BASE" POST /api/sessions/start -d "{\"name\":\"loop-test\",\"project_dir\":\"/tmp/loop-test-proj\",\"prompt\":\"do the work\",\"reminder\":\"if done call loop_next\"}")
-assert_contains "27: session started" "$result" "started"
-# Verify prompt and reminder are in metadata
-sleep 1
+assert_contains "27: session start accepted" "$result" "starting"
+# Wait for async registration to complete before checking metadata
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'loop-test'"
 status=$(api "$BASE" GET /api/status)
 orig_prompt=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-test") | .prompt // ""')
 sess_reminder=$(echo "$status" | jq -r '.sessions[] | select(.id == "loop-test") | .reminder // ""')
