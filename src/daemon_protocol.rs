@@ -2312,6 +2312,34 @@ mod tests {
     }
 
     #[test]
+    fn register_same_id_different_pane_overwrites() {
+        // Two panes in the same project dir both derive the same base name.
+        // If both register as "ouija" (stale conflict map), the second
+        // overwrites the first. This test documents the overwrite behavior;
+        // the actual fix is in scan_and_autoregister_panes which updates
+        // its conflict map after each registration to prevent this.
+        let mut state = DaemonState::new("npub1abc".into(), "myhost".into());
+        state.apply(Event::Register {
+            id: "ouija".into(),
+            pane: Some("%1".into()),
+            metadata: Default::default(),
+        });
+        // Second pane claims the same name
+        let effects = state.apply(Event::Register {
+            id: "ouija".into(),
+            pane: Some("%2".into()),
+            metadata: Default::default(),
+        });
+        // The second registration wins — pane %2 now owns "ouija"
+        let session = state.sessions.get("ouija").unwrap();
+        assert_eq!(session.pane.as_deref(), Some("%2"));
+        // Old pane's tmux var is cleared
+        assert!(effects.iter().any(
+            |e| matches!(e, Effect::ClearTmuxVar { pane, .. } if pane == "%1")
+        ));
+    }
+
+    #[test]
     fn register_idempotent_same_id_same_pane() {
         let mut state = DaemonState::new("npub1abc".into(), "myhost".into());
         state.apply(Event::Register {

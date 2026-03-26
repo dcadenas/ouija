@@ -961,8 +961,9 @@ impl AppState {
             return;
         }
 
-        // Build lookup tables from current sessions (single lock acquisition)
-        let (registered_panes, id_to_pane) = {
+        // Build lookup tables from current sessions (single lock acquisition).
+        // These are updated within the loop so subsequent panes see prior registrations.
+        let (mut registered_panes, mut id_to_pane) = {
             let proto = self.protocol.read().await;
             let registered: std::collections::HashSet<String> = proto
                 .sessions
@@ -1027,6 +1028,12 @@ impl AppState {
                 metadata: proto_meta,
             })
             .await;
+
+            // Update maps so the next pane in this loop sees this registration.
+            // Without this, two panes in the same directory both claim the base
+            // name and the second overwrites the first.
+            id_to_pane.insert(id.clone(), Some(pane.pane_id.clone()));
+            registered_panes.insert(pane.pane_id.clone());
         }
     }
 
