@@ -251,7 +251,7 @@ mod tests {
         let n = SCRIPT_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join("ouija-workflow-tests");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("wf-{}-{n}.sh", std::process::id()));
+        let path = dir.join(format!("wf-{}-{:?}-{n}.sh", std::process::id(), std::thread::current().id()));
         // Write to a separate tmp file then rename — atomic, avoids ETXTBSY
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, format!("#!/usr/bin/env bash\n{content}\n")).unwrap();
