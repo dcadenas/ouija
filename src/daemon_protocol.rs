@@ -2471,6 +2471,10 @@ mod tests {
             pane: Some("%1".into()),
             metadata: Default::default(),
         });
+        // Set registered_at to old timestamp so the <5s guard doesn't block
+        if let Some(s) = state.sessions.get_mut("s1") {
+            s.registered_at = chrono::Utc::now().timestamp() - 10;
+        }
         let effects = state.apply(Event::Remove { id: "s1".into(), keep_worktree: false });
         assert!(!state.sessions.contains_key("s1"));
         assert!(
@@ -2520,6 +2524,9 @@ mod tests {
                 ..Default::default()
             },
         });
+        if let Some(s) = state.sessions.get_mut("wt") {
+            s.registered_at = chrono::Utc::now().timestamp() - 10;
+        }
         let effects = state.apply(Event::Remove { id: "wt".into(), keep_worktree: false });
         assert!(
             effects

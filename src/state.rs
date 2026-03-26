@@ -1402,6 +1402,13 @@ pub(crate) mod tests {
     async fn remove_session_basic() {
         let state = AppState::new(test_config());
         proto_register(&state, "s1", Some("%1")).await;
+        // Age past the <5s registered_at guard
+        {
+            let mut proto = state.protocol.write().await;
+            if let Some(s) = proto.sessions.get_mut("s1") {
+                s.registered_at = chrono::Utc::now().timestamp() - 10;
+            }
+        }
         state
             .apply_and_execute(crate::daemon_protocol::Event::Remove { id: "s1".into(), keep_worktree: false })
             .await;
