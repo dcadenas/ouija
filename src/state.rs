@@ -406,21 +406,15 @@ impl AppState {
         backend_sid: Option<&str>,
     ) -> Option<String> {
         let proto = self.protocol.read().await;
-        if let Some(pane) = pane {
-            return proto
-                .sessions
-                .values()
-                .find(|s| s.pane.as_deref() == Some(pane))
-                .map(|s| s.id.clone());
-        }
-        if let Some(bsid) = backend_sid {
-            return proto
-                .sessions
-                .values()
-                .find(|s| s.metadata.backend_session_id.as_deref() == Some(bsid))
-                .map(|s| s.id.clone());
-        }
-        None
+        proto
+            .sessions
+            .values()
+            .find(|s| {
+                pane.is_some_and(|p| s.pane.as_deref() == Some(p))
+                    || backend_sid
+                        .is_some_and(|b| s.metadata.backend_session_id.as_deref() == Some(b))
+            })
+            .map(|s| s.id.clone())
     }
 
     /// Apply a protocol event and execute all resulting effects.

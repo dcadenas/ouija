@@ -22,7 +22,7 @@ impl PaneBody {
     fn baseline_key(&self) -> &str {
         self.pane
             .as_deref()
-            .or_else(|| self.backend_session_id.as_deref())
+            .or(self.backend_session_id.as_deref())
             .unwrap_or("")
     }
 }
@@ -40,21 +40,25 @@ async fn session_end_inner(
     state: &std::sync::Arc<crate::state::AppState>,
     body: PaneBody,
 ) -> Value {
-    let Some(session_id) = state
-        .find_session_by_pane_or_backend_sid(
-            body.pane.as_deref(),
-            body.backend_session_id.as_deref(),
-        )
-        .await
-    else {
-        return json!({ "skipped": "no session" });
-    };
     let session = {
         let proto = state.protocol.read().await;
-        proto.sessions.get(&session_id).cloned()
-    };
-    let Some(session) = session else {
-        return json!({ "skipped": "no session" });
+        let found = proto
+            .sessions
+            .values()
+            .find(|s| {
+                body.pane
+                    .as_deref()
+                    .is_some_and(|p| s.pane.as_deref() == Some(p))
+                    || body
+                        .backend_session_id
+                        .as_deref()
+                        .is_some_and(|b| s.metadata.backend_session_id.as_deref() == Some(b))
+            })
+            .cloned();
+        match found {
+            Some(s) => s,
+            None => return json!({ "skipped": "no session" }),
+        }
     };
     // Reject if recently registered (stale SessionEnd hook from pre-restart Claude)
     let age = chrono::Utc::now().timestamp() - session.registered_at;
@@ -270,6 +274,7 @@ async fn prompt_submit_inner(
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // Fields used by Deserialize; will be read when blocking logic is implemented
 pub struct PreToolUseBody {
     pub pane: String,
     pub tool_name: String,
@@ -285,22 +290,12 @@ pub async fn pre_tool_use(
 }
 
 async fn pre_tool_use_inner(
-    state: &std::sync::Arc<crate::state::AppState>,
-    body: PreToolUseBody,
+    _state: &std::sync::Arc<crate::state::AppState>,
+    _body: PreToolUseBody,
 ) -> Value {
     // TODO: check injection marker state on the session to decide blocking.
     // Currently a no-op — always allows interactive tools.
-    let blocked = false;
-
-    if !blocked {
-        return json!({ "block": false });
-    }
-    let message = match body.tool_name.as_str() {
-        "AskUserQuestion" => "Interactive prompts are disabled while handling ouija messages.\nDo NOT use AskUserQuestion. Instead, respond in prose with the available\noptions and let the user answer via message. If this question was triggered\nby a message from another session, forward the question to them via\nsession_send and continue when they reply.".to_string(),
-        "EnterPlanMode" => "Plan mode is disabled while handling ouija messages.\nDo NOT use EnterPlanMode. Instead, write your plan as a prose message to\nthe user or to the session that requested the task via session_send.\nDescribe your approach, list the steps, and ask for approval in the\nmessage. Proceed when they confirm.".to_string(),
-        other => format!("Interactive tool '{other}' is disabled while handling ouija messages.\nCommunicate in prose via session_send instead."),
-    };
-    json!({ "block": true, "message": message })
+    json!({ "block": false })
 }
 
 #[derive(Debug, Deserialize)]
