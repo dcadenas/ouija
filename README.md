@@ -21,7 +21,7 @@ ouija start
 
 Or with Rust: `cargo binstall ouija` / `cargo install ouija`.
 
-This launches the daemon and auto-configures your coding assistant (MCP endpoint, hooks, plugins). Open a session inside tmux:
+This launches the daemon and auto-configures your coding assistant (hooks, skills). Open a session inside tmux:
 
 ```bash
 tmux new-session && claude    # or: opencode
@@ -35,52 +35,37 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 
 **Message any session**, local or remote. Sessions discover each other automatically.
 
-**Spawn sessions on the fly.** `ouija.start("gateway-debug")` creates a tmux window, launches a coding session, and registers it. Pass a `prompt` to seed the session with context, and `backend` to choose the assistant (`"claude-code"` or `"opencode"`). Works on `ouija.restart` too.
+**Spawn sessions on the fly.** Ask the assistant to start a new session (e.g. "use ouija to start a gateway-debug session"). The daemon creates a tmux window, launches a coding session, and registers it. You can specify a prompt to seed the session with context and a backend (`claude-code` or `opencode`).
 
 **Long-running work.** Three mechanisms for recurring work, from simple to structured:
 
-- **Loops** (`ouija.loop-next`, legacy) -- the session drives itself. Simple but limited — no state management, verification, or coordination. Still works for quick one-off migrations; prefer **workflows** for new work.
+- **Loops** (legacy) -- the session drives itself. Simple but limited — no state management, verification, or coordination. Still works for quick one-off migrations; prefer **workflows** for new work.
 - **Tasks** (cron) -- the daemon drives the session. Good for periodic checks, daily reports, scheduled maintenance. If the target session is dead, the daemon revives it with the task's prompt + reminder.
-- **Workflows** -- a deterministic program drives the session. Good for multi-phase processes, optimization loops, coordinated multi-session work. The LLM calls an `ouija.workflow()` tool; the program controls state, verification, and progression.
+- **Workflows** -- a deterministic program drives the session. Good for multi-phase processes, optimization loops, coordinated multi-session work. The LLM calls the workflow endpoint via the ouija skill; the program controls state, verification, and progression.
 
-Simple loops restart with clean context each iteration:
-
-```
-ouija.start(
-  name: "migrator",
-  prompt: "Find the next .js file in src/ not yet converted to .ts. Convert it, run tests, commit.",
-  reminder: "Call ouija.loop-next('converted X.js'). If no .js files remain, ouija.send(done=true)."
-)
-```
+Simple loops restart with clean context each iteration — the session's prompt and reminder tell it what to do and how to signal completion. The daemon handles the restart cycle.
 
 > **Note:** Loops are the legacy approach. For new long-running work, use workflows — they provide state management, verification criteria, effort budgets, and multi-session coordination. See [migrating from loops](docs/workflows.md#migrating-from-loopnext) below.
 
-**Workflow actors** attach an external executable (Python, bash, anything) to a session. The program manages state, runs verification, and tells the LLM what to do — one step at a time. The LLM doesn't see the full process; each `ouija.workflow()` response reveals only the current step and what to call next, like [HATEOAS](https://en.wikipedia.org/wiki/HATEOAS) for an LLM:
+**Workflow actors** attach an external executable (Python, bash, anything) to a session. The program manages state, runs verification, and tells the LLM what to do — one step at a time. The LLM doesn't see the full process; each workflow response reveals only the current step and what to call next, like [HATEOAS](https://en.wikipedia.org/wiki/HATEOAS) for an LLM.
 
-```
-ouija.start(
-  name: "optimizer",
-  workflow: "examples/autoresearch-workflow.py",
-  workflow_params: {"max_iterations": 30},
-  project_dir: "/code/my-project"
-)
-```
+Start a workflow session via the REST API (`POST /api/sessions`) or ask the assistant to start one with a workflow path and parameters. The daemon spawns the session, registers the workflow, and the LLM begins calling the workflow endpoint.
 
-The workflow handles [autoresearch-style](https://github.com/karpathy/autoresearch) optimization: the LLM makes one change, measures, calls `ouija.workflow('result', {score, description})`, and the workflow commits improvements, reverts regressions, tracks history in a TSV, and accumulates findings that survive context restarts. The daemon enforces call budgets and detects stalls.
+The workflow handles [autoresearch-style](https://github.com/karpathy/autoresearch) optimization: the LLM makes one change, measures, reports the result via the workflow endpoint, and the workflow commits improvements, reverts regressions, tracks history in a TSV, and accumulates findings that survive context restarts. The daemon enforces call budgets and detects stalls.
 
 The prompt doesn't describe the process — the workflow discloses it incrementally:
 
 ```
-LLM: ouija.workflow('init')
-  → "Iteration 3/30. Best: 0.89. Make one change, measure, call ouija.workflow('result', {score, description})."
+LLM calls workflow('init')
+  -> "Iteration 3/30. Best: 0.89. Make one change, measure, report the result."
 
-LLM: ouija.workflow('result', {score: 0.91, description: "batched queries"})
-  → "New best! Committed. 27 remaining. Call ouija.workflow('init') for next iteration."
+LLM calls workflow('result', {score: 0.91, description: "batched queries"})
+  -> "New best! Committed. 27 remaining. Call workflow('init') for next iteration."
 ```
 
 Workflows can coordinate multiple sessions — spawning workers and reviewers via the REST API, gating progress on test results, replacing an entire coordinator LLM with deterministic code. See the [workflow docs](docs/workflows.md) for the full architecture and [`examples/`](examples/) for a reference implementation.
 
-**Peer-to-peer collaboration.** No hierarchy. Two long-running sessions can message each other directly — one optimizing a skill while the other evaluates results, or one migrating files while the other reviews the diffs. They coordinate through `ouija.send`, not through a central orchestrator.
+**Peer-to-peer collaboration.** No hierarchy. Two long-running sessions can message each other directly — one optimizing a skill while the other evaluates results, or one migrating files while the other reviews the diffs. They coordinate through the ouija skill's send capability, not through a central orchestrator.
 
 **Always interactive.** Every session runs in a tmux pane. You can jump into any session at any time — watch it work, type a correction, answer a question, or take over. The session doesn't know or care whether the next input comes from a peer session or from you at the keyboard.
 
@@ -118,12 +103,12 @@ Messages can reference earlier ones for conversation threading:
 - `re="47"` — progress update on task 47
 - `re="47" done="true"` — task 47 is complete
 
-The daemon assigns unique IDs to every message, tracks pending replies, and nudges sessions that haven't responded. Sessions interact with the protocol through MCP tools (`ouija.send`, `ouija.list`, etc.) -- the XML is handled automatically.
+The daemon assigns unique IDs to every message, tracks pending replies, and nudges sessions that haven't responded. Sessions interact via the REST API and ouija skill -- the XML is handled automatically.
 
 ## How it works
 
 1. Each machine runs an **ouija daemon** (small Rust binary)
-2. Sessions connect via **MCP** and auto-register on startup
+2. Sessions **auto-register via hooks** on startup
 3. Local messages: **tmux injection** (Claude Code) or **HTTP API** (opencode)
 4. Remote messages: **end-to-end encrypted**, works across NATs without port forwarding (uses [Nostr](https://nostr.com) relays as transport)
 5. Node auth: **connect secret** in the ticket, unknown senders rejected
@@ -136,7 +121,7 @@ All session state transitions go through a pure state machine (`DaemonProtocol`)
 - **Connect secret auth.** Unknown senders are rejected.
 - **Encrypted transport.** End-to-end encrypted via Nostr ([NIP-17](https://github.com/nostr-protocol/nips/blob/master/17.md) gift-wrapped DMs). Relays cannot read content.
 - **Localhost only.** The daemon binds to `127.0.0.1`.
-- **Assistants never see tickets.** MCP tools only expose session IDs and messages.
+- **Assistants never see tickets.** The API only exposes session IDs and messages.
 
 ## CLI
 
