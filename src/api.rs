@@ -1378,8 +1378,6 @@ pub struct SessionNameBody {
     prompt: Option<String>,
     #[serde(default)]
     from: Option<String>,
-    #[serde(default)]
-    expects_reply: Option<bool>,
     /// Which coding assistant backend to use (e.g. "claude-code", "codex").
     #[serde(default)]
     backend: Option<String>,
@@ -1458,7 +1456,7 @@ pub async fn start_session(
                 true, // fresh
                 prompt.as_deref(),
                 body.from.as_deref(),
-                body.expects_reply,
+                None, // expects_reply not used for session start
                 body.backend.as_deref(),
                 body.model.as_deref(),
                 reminder.as_deref(),
@@ -1487,7 +1485,7 @@ pub async fn start_session(
             body.project_dir.as_deref(),
             prompt.as_deref(),
             body.from.as_deref(),
-            body.expects_reply,
+            None, // expects_reply not used for session start
             body.backend.as_deref(),
             body.model.as_deref(),
             reminder.as_deref(),
@@ -1552,7 +1550,7 @@ pub async fn restart_session(
         fresh,
         body.prompt.as_deref(),
         body.from.as_deref(),
-        body.expects_reply,
+        None, // expects_reply not used for session restart
         body.backend.as_deref(),
         body.model.as_deref(),
         body.reminder.as_deref(),

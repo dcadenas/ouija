@@ -67,23 +67,21 @@ Set `expects_reply: true` when you need a response back.
 ## 4. Starting and managing sessions
 
 ```bash
-# Start a session and track its completion:
+# Start a session with a completion reminder:
 curl -sf -X POST localhost:$OUIJA_PORT/api/sessions/start \
   -H 'Content-Type: application/json' \
   -d '{
     "name": "worker",
     "project_dir": "/path/to/project",
     "prompt": "implement the feature",
-    "from": "YOUR_ID",
-    "expects_reply": true
+    "reminder": "When done, send results: curl -sf -X POST localhost:7880/api/send -H Content-Type:application/json -d {\"from\":\"worker\",\"to\":\"YOUR_ID\",\"message\":\"done: <summary>\"}"
   }'
 ```
 
 Key fields:
-- `from` + `expects_reply: true` — the spawned session will be reminded to reply to you when idle. Its prompt is wrapped as `<msg from="YOUR_ID" reply="true">` so it knows who to reply to.
+- `reminder` — text re-injected on idle. Use this to ensure the spawned session reports back to you when finished. The reminder persists across context restarts.
 - `workflow` — attach a workflow executable (see section 5)
 - `worktree: true` — isolate in a git worktree
-- `reminder` — text re-injected on idle
 
 ```bash
 # Restart with fresh context:
