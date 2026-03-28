@@ -67,24 +67,35 @@ Set `expects_reply: true` when you need a response back.
 ## 4. Starting and managing sessions
 
 ```bash
-# Start a new session:
+# Start a session and track its completion:
 curl -sf -X POST localhost:$OUIJA_PORT/api/sessions/start \
   -H 'Content-Type: application/json' \
-  -d '{"name":"new-session","project_dir":"/path/to/project","prompt":"initial task"}'
+  -d '{
+    "name": "worker",
+    "project_dir": "/path/to/project",
+    "prompt": "implement the feature",
+    "from": "YOUR_ID",
+    "expects_reply": true
+  }'
+```
 
-# Restart a session:
+Key fields:
+- `from` + `expects_reply: true` — the spawned session will be reminded to reply to you when idle. Its prompt is wrapped as `<msg from="YOUR_ID" reply="true">` so it knows who to reply to.
+- `workflow` — attach a workflow executable (see section 5)
+- `worktree: true` — isolate in a git worktree
+- `reminder` — text re-injected on idle
+
+```bash
+# Restart with fresh context:
 curl -sf -X POST localhost:$OUIJA_PORT/api/sessions/restart \
   -H 'Content-Type: application/json' \
   -d '{"name":"session-id","fresh":true}'
 
-# Kill a session:
+# Kill:
 curl -sf -X POST localhost:$OUIJA_PORT/api/sessions/kill \
   -H 'Content-Type: application/json' \
   -d '{"name":"session-id"}'
 ```
-
-When starting with `from`, the prompt is wrapped as `<msg>` so the new session
-knows who initiated it and can reply.
 
 ## 5. Workflows
 
