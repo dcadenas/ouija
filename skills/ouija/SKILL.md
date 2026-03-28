@@ -88,10 +88,11 @@ Key fields:
 - `worktree: true` — isolate in a git worktree
 
 ```bash
-# Restart with fresh context:
+# Restart with fresh context (same pane, same worktree, new conversation):
 curl -sf -X POST localhost:$OUIJA_PORT/api/sessions/restart \
   -H 'Content-Type: application/json' \
-  -d '{"name":"session-id","fresh":true}'
+  -d '{"name":"session-id","fresh":true,"prompt":"new task","reminder":"when done, report back"}'
+# prompt/reminder optional — if omitted, reuses previous values
 
 # Kill:
 curl -sf -X POST localhost:$OUIJA_PORT/api/sessions/kill \
