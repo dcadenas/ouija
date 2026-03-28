@@ -307,7 +307,8 @@ impl Actor for SessionAgent {
                     // Inject reminder text if present, otherwise a default nudge (once)
                     if let Some(ref reminder_text) = reminder {
                         let wrapped = format!(
-                            "<ouija-status type=\"reminder\" clearing_id=\"{clearing_id}\">{reminder_text}</ouija-status>"
+                            "<ouija-status type=\"reminder\" clearing_id=\"{clearing_id}\">{reminder_text}\n\nIf you have completed all pending work, call: curl -sf -X POST localhost:$OUIJA_PORT/api/clear-reminder -H Content-Type:application/json -d '{{\"from\":\"{}\",\"clearing_id\":{clearing_id}}}' to stop this reminder.</ouija-status>",
+                            state.session_id
                         );
                         let _ = crate::tmux::locked_inject(
                             &self.app_state,
