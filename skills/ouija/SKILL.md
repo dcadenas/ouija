@@ -79,7 +79,11 @@ curl -sf -X POST localhost:$OUIJA_PORT/api/sessions/start \
 ```
 
 Key fields:
-- `reminder` — text re-injected on idle. Use this to ensure the spawned session reports back to you when finished. The reminder persists across context restarts.
+- `reminder` — a spawner-controlled idle program. Re-injected every time the session goes idle. Persists across context restarts. Use it to:
+  - **Report back**: "When done, send results to hub via POST /api/send ..."
+  - **Self-terminate**: "When done, kill yourself: curl -X POST .../api/sessions/kill ..."
+  - **Periodic check**: "If idle, check deploy status and report if complete"
+  - **Escalate**: "If stuck, message the coordinator for help"
 - `workflow` — attach a workflow executable (see section 5)
 - `worktree: true` — isolate in a git worktree
 
