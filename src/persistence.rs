@@ -198,7 +198,7 @@ fn default_true() -> bool {
 }
 
 /// Default idle timeout before a session is considered stale (seconds).
-const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 180;
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900;
 /// Default interval between reaper sweeps (seconds).
 const DEFAULT_REAPER_INTERVAL_SECS: u64 = 5;
 
