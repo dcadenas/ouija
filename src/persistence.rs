@@ -547,7 +547,7 @@ mod tests {
     #[test]
     fn idle_timeout_default() {
         let settings: OuijaSettings = serde_json::from_str("{}").unwrap();
-        assert_eq!(settings.idle_timeout_secs, 180);
+        assert_eq!(settings.idle_timeout_secs, 900);
     }
 
     #[test]
