@@ -1106,7 +1106,7 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         kill_session(state, name).await
     } else if let Some(rest) = cmd.strip_prefix("/start ") {
         let name = rest.trim();
-        start_session(state, name, None, None, None, None, None, None, None, None, None)
+        start_session(state, name, None, None, None, None, None, None, None, None, None, None)
             .await
             .0
     } else if let Some(rest) = cmd.strip_prefix("/restart ") {
@@ -1314,6 +1314,7 @@ pub async fn start_session(
     model: Option<&str>,
     reminder: Option<&str>,
     branch: Option<&str>,
+    base_branch: Option<&str>,
 ) -> (String, Option<u64>) {
     // Check if already exists
     if state.protocol.read().await.sessions.contains_key(name) {
@@ -1363,7 +1364,7 @@ pub async fn start_session(
     // If worktree requested, ouija creates it in .ouija/worktrees/<name>.
     // The backend never sees --worktree — it just gets a directory.
     if worktree {
-        match create_ouija_worktree(&dir, name, branch) {
+        match create_ouija_worktree(&dir, name, branch, base_branch) {
             Ok(wt_dir) => {
                 dir = wt_dir;
             }
@@ -2176,7 +2177,12 @@ async fn setup_shared_serve_session(
 /// For HttpApi backends, queue the prompt and wait for a readiness signal from the plugin.
 /// Create an ouija-managed git worktree at `<repo>/.ouija/worktrees/<name>`.
 /// If it already exists (e.g. restart), returns the existing path.
-fn create_ouija_worktree(repo_dir: &str, name: &str, branch: Option<&str>) -> anyhow::Result<String> {
+fn create_ouija_worktree(
+    repo_dir: &str,
+    name: &str,
+    branch: Option<&str>,
+    base_branch: Option<&str>,
+) -> anyhow::Result<String> {
     let wt_dir = format!("{repo_dir}/.ouija/worktrees/{name}");
     if std::path::Path::new(&wt_dir).exists() {
         return Ok(wt_dir);
@@ -2186,11 +2192,13 @@ fn create_ouija_worktree(repo_dir: &str, name: &str, branch: Option<&str>) -> an
     std::fs::create_dir_all(&parent)?;
     // Create worktree with a new branch
     let branch = branch.map(String::from).unwrap_or_else(|| name.to_string());
-    let output = std::process::Command::new("git")
-        .args(["-C", repo_dir, "worktree", "add", "-b", &branch, &wt_dir])
-        .output()?;
+    let mut args = vec!["-C", repo_dir, "worktree", "add", "-b", &branch, &wt_dir];
+    if let Some(base) = base_branch {
+        args.push(base);
+    }
+    let output = std::process::Command::new("git").args(&args).output()?;
     if !output.status.success() {
-        // Branch might already exist — try without -b
+        // Branch might already exist — check it out in the worktree
         let output2 = std::process::Command::new("git")
             .args(["-C", repo_dir, "worktree", "add", &wt_dir, &branch])
             .output()?;
