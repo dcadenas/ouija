@@ -317,16 +317,7 @@ api "$BASE" POST /api/settings -d '{"auto_register":false}' >/dev/null
 api "$BASE" POST /api/remove -d '{"id":"sess-a2"}' >/dev/null 2>&1 || true
 api "$BASE" POST /api/remove -d '{"id":"sess-b"}' >/dev/null 2>&1 || true
 
-log "Test 13: MCP initialize — server info returned"
-mcp_init "$BASE" >/dev/null
-init_result=$(grep '^data: {' /tmp/mcp-body | sed 's/^data: //')
-assert_contains "init has server info" "$init_result" '"serverInfo"'
-# stateful_mode=false means no session ID header — that's expected
-if [ -n "$MCP_SESSION" ]; then
-    log "  MCP session: $MCP_SESSION"
-else
-    log "  (stateless mode — no session ID, expected)"
-fi
+# (Test 13: MCP initialize removed — MCP server no longer exists)
 
 log "Test 15: REST register with pane — succeeds"
 result=$(api "$BASE" POST /api/register -d "{\"id\":\"rest-ok\",\"pane\":\"$PANE_A\"}")
@@ -707,6 +698,58 @@ L14_STATUS=$(api "$BASE" GET /api/status)
 L14_WT=$(echo "$L14_STATUS" | jq -r '.sessions[] | select(.id == "wt-sess") | .worktree')
 assert_eq "L14: session has worktree=true in metadata" "$L14_WT" "true"
 api "$BASE" POST /api/sessions/kill -d '{"name":"wt-sess"}' >/dev/null 2>&1 || true
+
+log "Test L14b: Worktree default branch name matches session name"
+mkdir -p /tmp/projects/wt-branch-test
+git init /tmp/projects/wt-branch-test >/dev/null 2>&1
+# Create an initial commit so branches work
+git -C /tmp/projects/wt-branch-test commit --allow-empty -m "init" >/dev/null 2>&1
+api "$BASE" POST /api/sessions/start -d '{"name":"wt-branch-default","project_dir":"/tmp/projects/wt-branch-test","worktree":true}' >/dev/null
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'wt-branch-default'"
+# Verify branch name equals session name (no wt/ prefix)
+wt_branch=$(git -C /tmp/projects/wt-branch-test branch --list 'wt-branch-default' | tr -d ' *')
+assert_eq "L14b: default branch is session name" "$wt_branch" "wt-branch-default"
+# Verify worktree dir exists
+test -d /tmp/projects/wt-branch-test/.ouija/worktrees/wt-branch-default && pass "L14b: worktree dir exists" || fail "L14b: worktree dir" "exists" "missing"
+# Cleanup
+api "$BASE" POST /api/sessions/kill -d '{"name":"wt-branch-default"}' >/dev/null 2>&1 || true
+sleep 1
+api "$BASE" POST /api/remove -d '{"id":"wt-branch-default"}' >/dev/null 2>&1 || true
+git -C /tmp/projects/wt-branch-test worktree prune 2>/dev/null
+
+log "Test L14c: Worktree with custom branch name"
+api "$BASE" POST /api/sessions/start -d '{"name":"wt-custom-branch","project_dir":"/tmp/projects/wt-branch-test","worktree":true,"branch":"feature/my-feature"}' >/dev/null
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'wt-custom-branch'"
+# Verify branch name is the custom one
+custom_branch=$(git -C /tmp/projects/wt-branch-test branch --list 'feature/my-feature' | tr -d ' *')
+assert_eq "L14c: custom branch name used" "$custom_branch" "feature/my-feature"
+# Verify worktree dir uses session name (not branch name)
+test -d /tmp/projects/wt-branch-test/.ouija/worktrees/wt-custom-branch && pass "L14c: worktree dir uses session name" || fail "L14c: worktree dir" "exists" "missing"
+# Cleanup
+api "$BASE" POST /api/sessions/kill -d '{"name":"wt-custom-branch"}' >/dev/null 2>&1 || true
+sleep 1
+api "$BASE" POST /api/remove -d '{"id":"wt-custom-branch"}' >/dev/null 2>&1 || true
+git -C /tmp/projects/wt-branch-test worktree prune 2>/dev/null
+
+log "Test L14d: Worktree with custom base_branch"
+# Create a feature branch to use as base
+git -C /tmp/projects/wt-branch-test checkout -b base-feature >/dev/null 2>&1
+git -C /tmp/projects/wt-branch-test commit --allow-empty -m "base feature commit" >/dev/null 2>&1
+BASE_COMMIT=$(git -C /tmp/projects/wt-branch-test rev-parse HEAD)
+git -C /tmp/projects/wt-branch-test checkout master >/dev/null 2>&1 || git -C /tmp/projects/wt-branch-test checkout main >/dev/null 2>&1
+api "$BASE" POST /api/sessions/start -d '{"name":"wt-base-branch","project_dir":"/tmp/projects/wt-branch-test","worktree":true,"branch":"from-base","base_branch":"base-feature"}' >/dev/null
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'wt-base-branch'"
+# Verify the new branch exists and its parent is the base-feature commit
+wt_parent=$(git -C /tmp/projects/wt-branch-test/.ouija/worktrees/wt-base-branch rev-parse HEAD 2>/dev/null)
+assert_eq "L14d: branch created from base_branch" "$wt_parent" "$BASE_COMMIT"
+# Cleanup
+api "$BASE" POST /api/sessions/kill -d '{"name":"wt-base-branch"}' >/dev/null 2>&1 || true
+sleep 1
+api "$BASE" POST /api/remove -d '{"id":"wt-base-branch"}' >/dev/null 2>&1 || true
+git -C /tmp/projects/wt-branch-test worktree prune 2>/dev/null
+git -C /tmp/projects/wt-branch-test branch -D from-base 2>/dev/null
+git -C /tmp/projects/wt-branch-test branch -D base-feature 2>/dev/null
+rm -rf /tmp/projects/wt-branch-test
 
 # Install fake claude globally for prompt injection tests (L16-L18).
 # Needs to: (1) accept any args, (2) report as "claude" to pane_current_command.

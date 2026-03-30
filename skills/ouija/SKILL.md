@@ -85,7 +85,10 @@ Key fields:
   - **Periodic check**: "If idle, check deploy status and report if complete"
   - **Escalate**: "If stuck, message the coordinator for help"
 - `workflow` — attach a workflow executable (see section 5)
-- `worktree: true` — isolate in a git worktree. **Important**: Claude Code resolves the `.git` pointer back to the main repo, so your CWD may not be the worktree. Always use `git -C {project_dir}` for git commands, never rely on CWD.
+- `worktree: true` — isolate in a git worktree
+  - `branch` — git branch name. Defaults to session name if omitted
+  - `base_branch` — create branch from this ref (e.g. `"main"`). Defaults to HEAD if omitted
+  - **CWD warning**: Claude Code resolves `.git` back to the main repo. Always use `git -C {project_dir}`, never rely on CWD
 
 ```bash
 # Restart with fresh context (same pane, same worktree, new conversation):
