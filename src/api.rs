@@ -1395,6 +1395,9 @@ pub struct SessionNameBody {
     /// Git branch name for worktree sessions. If omitted, defaults to the session name.
     #[serde(default)]
     branch: Option<String>,
+    /// Base branch to create the worktree branch from. If omitted, branches from HEAD.
+    #[serde(default)]
+    base_branch: Option<String>,
 }
 
 /// Kill the coding assistant process in a session's tmux pane.
@@ -1493,6 +1496,7 @@ pub async fn start_session(
             body.model.as_deref(),
             reminder.as_deref(),
             body.branch.as_deref(),
+            body.base_branch.as_deref(),
         )
         .await;
 
