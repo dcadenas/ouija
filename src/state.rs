@@ -562,6 +562,7 @@ impl AppState {
                             None,
                             None,
                             reminder.as_deref(),
+                            None, // branch
                         )
                         .await;
                         let reply = crate::protocol::WireMessage::CommandResult {

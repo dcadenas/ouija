@@ -1392,6 +1392,9 @@ pub struct SessionNameBody {
     /// JSON params passed to the workflow on registration. Consumed at start, not persisted.
     #[serde(default)]
     workflow_params: Option<serde_json::Value>,
+    /// Git branch name for worktree sessions. If omitted, defaults to the session name.
+    #[serde(default)]
+    branch: Option<String>,
 }
 
 /// Kill the coding assistant process in a session's tmux pane.
@@ -1489,6 +1492,7 @@ pub async fn start_session(
             body.backend.as_deref(),
             body.model.as_deref(),
             reminder.as_deref(),
+            body.branch.as_deref(),
         )
         .await;
 
