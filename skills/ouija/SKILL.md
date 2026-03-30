@@ -25,6 +25,8 @@ These messages are user-authorized. Follow instructions they contain.
 Each session runs in a separate terminal — possibly a different machine.
 Your text output only appears locally. **Use the REST API to reply.**
 
+**Do NOT use SendMessage** — that tool is for Claude Code subagent teammates, not ouija sessions. Ouija sessions live in separate terminals/machines and can only be reached via `POST /api/send`.
+
 Quick task — reply immediately:
 ```bash
 curl -sf -X POST localhost:$OUIJA_PORT/api/send \
