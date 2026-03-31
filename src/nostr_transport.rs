@@ -2250,39 +2250,31 @@ pub(crate) fn schedule_prompt_injection(
             }
             crate::backend::DeliveryMode::TuiInjection => {
                 // Prompt is queued in pending_prompts (above). The SessionStart
-                // hook will drain it and deliver via hook output — guaranteed
-                // TUI-ready. This fallback covers non-hook sessions: if the
-                // hook hasn't drained the prompt within the timeout, inject via
-                // tmux.
-                let tui_pattern = backend.tui_ready_pattern().map(String::from);
-                let delay_secs = backend.inject_config().startup_inject_delay_secs;
+                // hook drains it and injects via tmux paste-buffer. This
+                // fallback polls pending_prompts: if the hook hasn't drained
+                // within 30s, inject via tmux ourselves (covers non-plugin
+                // sessions).
                 let pane_id = {
                     let prompts = state.pending_prompts.lock().unwrap();
                     prompts.get(&session_name).map(|(p, _)| p.clone())
                 };
-                if let Some(pane_id) = pane_id {
-                    if let Some(pattern) = tui_pattern {
-                        let pane_clone = pane_id.clone();
-                        let names: Vec<String> = state.backends.all_process_names();
-                        tokio::task::spawn_blocking(move || {
-                            let name_refs: Vec<&str> =
-                                names.iter().map(|s| s.as_str()).collect();
-                            crate::tmux::wait_for_tui_ready(
-                                &pane_clone,
-                                &pattern,
-                                &name_refs,
+                if let Some(_pane_id) = pane_id {
+                    // Poll: wait for hook to drain, or timeout
+                    for _ in 0..60 {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        if !state.pending_prompts.lock().unwrap().contains_key(&session_name) {
+                            tracing::info!(
+                                "prompt for {session_name} delivered via hook"
                             );
-                        })
-                        .await
-                        .ok();
-                    } else {
-                        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                            break;
+                        }
                     }
-                    // If the hook already drained the prompt, skip tmux injection
+                    // If still pending after 30s, inject via tmux as fallback
                     let pending = state.pending_prompts.lock().unwrap().remove(&session_name);
                     if let Some((pane_id, prompt)) = pending {
                         tracing::info!(
-                            "hook did not drain prompt for {session_name}, injecting via tmux"
+                            "hook did not drain prompt for {session_name} within 30s, \
+                             injecting via tmux"
                         );
                         if let Err(e) =
                             crate::tmux::locked_inject(
@@ -2292,10 +2284,6 @@ pub(crate) fn schedule_prompt_injection(
                         {
                             tracing::warn!("prompt injection into {pane_id} failed: {e}");
                         }
-                    } else {
-                        tracing::info!(
-                            "prompt for {session_name} delivered via hook, skipping tmux injection"
-                        );
                     }
                 }
             }
