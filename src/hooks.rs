@@ -322,9 +322,24 @@ async fn session_start_inner(
         return json!({ "skipped": "auto_register disabled", "output": "" });
     }
 
-    // Skip if pane already registered
+    // Skip if pane already registered (API-started sessions hit this path)
     if let Some(existing_id) = state.find_session_by_pane(&body.pane).await {
-        return json!({ "registered": existing_id, "output": "" });
+        // Drain pending prompt if queued by start_session API
+        let pending_prompt = {
+            let mut prompts = state.pending_prompts.lock().unwrap();
+            let key = prompts
+                .iter()
+                .find(|(_, (pane, _))| pane == &body.pane)
+                .map(|(k, _)| k.clone());
+            key.and_then(|k| prompts.remove(&k).map(|(_, text)| text))
+        };
+        let output = match pending_prompt {
+            Some(prompt) => format!(
+                "<ouija-status type=\"registered\">Registered as {existing_id} on the ouija mesh.</ouija-status>\n{prompt}"
+            ),
+            None => String::new(),
+        };
+        return json!({ "registered": existing_id, "output": output });
     }
 
     // Derive name from cwd
