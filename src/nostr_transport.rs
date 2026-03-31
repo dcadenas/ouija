@@ -2249,11 +2249,23 @@ pub(crate) fn schedule_prompt_injection(
                 });
             }
             crate::backend::DeliveryMode::TuiInjection => {
-                // Remove from queue (queued above for all backends) and deliver after delay
+                // Remove from queue (queued above for all backends) and deliver
+                // after the TUI is ready (poll for prompt pattern) or after a
+                // minimum delay if no pattern is configured.
                 let pending = state.pending_prompts.lock().unwrap().remove(&session_name);
                 if let Some((pane_id, prompt)) = pending {
+                    let tui_pattern = backend.tui_ready_pattern().map(String::from);
                     let delay_secs = backend.inject_config().startup_inject_delay_secs;
-                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                    let pane_clone = pane_id.clone();
+                    if let Some(pattern) = tui_pattern {
+                        tokio::task::spawn_blocking(move || {
+                            crate::tmux::wait_for_tui_ready(&pane_clone, &pattern);
+                        })
+                        .await
+                        .ok();
+                    } else {
+                        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                    }
                     if let Err(e) =
                         crate::tmux::locked_inject(&state, &session_name, &pane_id, &prompt, false)
                             .await
