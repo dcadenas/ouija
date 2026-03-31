@@ -10,5 +10,6 @@ PROMPT=$(echo "$RESP" | jq -r '.pending_prompt // empty' 2>/dev/null)
 if [ -n "$PROMPT" ]; then
   printf '%s' "$PROMPT" | tmux load-buffer -b ouija-prompt -
   tmux paste-buffer -b ouija-prompt -t "$PANE" -d 2>/dev/null
+  sleep 0.3
   tmux send-keys -t "$PANE" Enter 2>/dev/null
 fi
