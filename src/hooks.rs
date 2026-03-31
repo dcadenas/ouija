@@ -451,6 +451,23 @@ async fn session_start_inner(
         );
     }
 
+    // Drain pending prompt if this session was started via the API with a prompt.
+    // The prompt was queued by schedule_prompt_injection; delivering it here
+    // (inside the SessionStart hook) guarantees the TUI is ready.
+    let pending_prompt = {
+        let mut prompts = state.pending_prompts.lock().unwrap();
+        // Find by pane match (pending_prompts keyed by session name, value is (pane, text))
+        let key = prompts
+            .iter()
+            .find(|(_, (pane, _))| pane == &body.pane)
+            .map(|(k, _)| k.clone());
+        key.and_then(|k| prompts.remove(&k).map(|(_, text)| text))
+    };
+
+    if let Some(prompt) = &pending_prompt {
+        output_parts.push(prompt.clone());
+    }
+
     json!({
         "registered": id,
         "output": output_parts.join("\n"),
