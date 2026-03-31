@@ -306,13 +306,37 @@ fn capture_pane(pane: &str) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Poll the pane until `pattern` appears in its content or timeout expires.
+/// Poll the pane until the backend process is running AND `pattern` appears.
+///
+/// Phase 1: wait for `pane_alive` (backend process detected in process tree).
+/// Phase 2: wait for `pattern` in pane content (TUI has rendered its prompt).
+///
+/// Both phases share the same `TUI_READY_TIMEOUT_SECS` deadline.
 /// Returns `true` if the pattern was found, `false` on timeout.
-pub fn wait_for_tui_ready(pane: &str, pattern: &str) -> bool {
+pub fn wait_for_tui_ready(pane: &str, pattern: &str, process_names: &[&str]) -> bool {
     let deadline = Instant::now() + Duration::from_secs(TUI_READY_TIMEOUT_SECS);
+
+    // Phase 1: wait for the backend process to appear
+    loop {
+        if pane_alive(pane, process_names) {
+            tracing::info!(pane, "TUI readiness: backend process detected");
+            break;
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                pane,
+                "TUI readiness timeout waiting for backend process, injecting anyway"
+            );
+            return false;
+        }
+        thread::sleep(Duration::from_millis(TUI_READY_POLL_MS));
+    }
+
+    // Phase 2: wait for the TUI prompt pattern
     loop {
         if let Ok(content) = capture_pane(pane) {
             if content.contains(pattern) {
+                tracing::info!(pane, "TUI readiness: prompt pattern found");
                 return true;
             }
         }
@@ -320,7 +344,7 @@ pub fn wait_for_tui_ready(pane: &str, pattern: &str) -> bool {
             tracing::warn!(
                 pane,
                 pattern,
-                "TUI readiness timeout after {TUI_READY_TIMEOUT_SECS}s, injecting anyway"
+                "TUI readiness timeout waiting for prompt pattern after {TUI_READY_TIMEOUT_SECS}s, injecting anyway"
             );
             return false;
         }

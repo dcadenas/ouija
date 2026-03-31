@@ -2258,8 +2258,15 @@ pub(crate) fn schedule_prompt_injection(
                     let delay_secs = backend.inject_config().startup_inject_delay_secs;
                     let pane_clone = pane_id.clone();
                     if let Some(pattern) = tui_pattern {
+                        let names: Vec<String> = state.backends.all_process_names();
                         tokio::task::spawn_blocking(move || {
-                            crate::tmux::wait_for_tui_ready(&pane_clone, &pattern);
+                            let name_refs: Vec<&str> =
+                                names.iter().map(|s| s.as_str()).collect();
+                            crate::tmux::wait_for_tui_ready(
+                                &pane_clone,
+                                &pattern,
+                                &name_refs,
+                            );
                         })
                         .await
                         .ok();
