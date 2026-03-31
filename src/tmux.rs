@@ -636,19 +636,33 @@ pub fn enable_automatic_rename(pane_id: &str) {
 /// Uses the directory basename with dots replaced by underscores
 /// (matching tmux-sessionizer convention).
 pub fn tmux_session_name(project_dir: &str) -> String {
-    // For ouija-managed worktrees, use the repo root's basename so
-    // worktree sessions join the same tmux session as the main project.
-    let effective_dir = if let Some(i) = project_dir.find("/.ouija/worktrees/") {
-        &project_dir[..i]
+    // For ouija-managed worktrees, derive the tmux session from the repo name
+    // so worktree sessions join the same tmux session as the main project.
+    let basename = if let Some(i) = project_dir.find("/.ouija/worktrees/") {
+        let after = &project_dir[i + "/.ouija/worktrees/".len()..];
+        // New path: ~/.ouija/worktrees/<repo-slug>/<name> → use repo-slug
+        // Legacy path: <repo>/.ouija/worktrees/<name> → use repo basename
+        if let Some(slash) = after.find('/') {
+            // Has sub-path → repo-slug is the first component
+            after[..slash].to_string()
+        } else {
+            // Legacy: only session name after worktrees/ → use repo basename
+            std::path::Path::new(&project_dir[..i])
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| project_dir[..i].to_string())
+        }
     } else if let Some(i) = project_dir.find("/.claude/worktrees/") {
-        &project_dir[..i]
+        std::path::Path::new(&project_dir[..i])
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| project_dir[..i].to_string())
     } else {
-        project_dir
+        std::path::Path::new(project_dir)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| project_dir.to_string())
     };
-    let basename = std::path::Path::new(effective_dir)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| effective_dir.to_string());
     basename.replace('.', "_")
 }
 

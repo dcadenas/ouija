@@ -2175,20 +2175,36 @@ async fn setup_shared_serve_session(
 
 /// Inject a prompt into a pane after a short delay, giving the backend time to start.
 /// For HttpApi backends, queue the prompt and wait for a readiness signal from the plugin.
-/// Create an ouija-managed git worktree at `<repo>/.ouija/worktrees/<name>`.
-/// If it already exists (e.g. restart), returns the existing path.
+/// Create an ouija-managed git worktree at `~/.ouija/worktrees/<repo-slug>/<name>`.
+///
+/// Worktrees live outside the repo directory tree to prevent Claude Code from
+/// resolving the `.git` pointer back to the main repo and editing files there.
+///
+/// Falls back to legacy `<repo>/.ouija/worktrees/<name>` if that directory
+/// already exists (avoids breaking running sessions).
 fn create_ouija_worktree(
     repo_dir: &str,
     name: &str,
     branch: Option<&str>,
     base_branch: Option<&str>,
 ) -> anyhow::Result<String> {
-    let wt_dir = format!("{repo_dir}/.ouija/worktrees/{name}");
+    // Check legacy location first (running sessions may use it)
+    let legacy_dir = format!("{repo_dir}/.ouija/worktrees/{name}");
+    if std::path::Path::new(&legacy_dir).exists() {
+        return Ok(legacy_dir);
+    }
+    // New location: ~/.ouija/worktrees/<repo-slug>/<name>
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let repo_slug = std::path::Path::new(repo_dir)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("repo");
+    let wt_dir = format!("{home}/.ouija/worktrees/{repo_slug}/{name}");
     if std::path::Path::new(&wt_dir).exists() {
         return Ok(wt_dir);
     }
     // Ensure parent dir exists
-    let parent = format!("{repo_dir}/.ouija/worktrees");
+    let parent = format!("{home}/.ouija/worktrees/{repo_slug}");
     std::fs::create_dir_all(&parent)?;
     // Create worktree with a new branch
     let branch = branch.map(String::from).unwrap_or_else(|| name.to_string());

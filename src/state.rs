@@ -732,16 +732,31 @@ impl AppState {
     }
 
     /// Clean up a git worktree directory if it has no uncommitted changes.
-    /// Supports both ouija-managed (`.ouija/worktrees/`) and legacy Claude Code
-    /// (`.claude/worktrees/`) paths.
+    /// Supports ouija-managed worktrees (both `~/.ouija/worktrees/` and legacy
+    /// `<repo>/.ouija/worktrees/`) and Claude Code (`.claude/worktrees/`) paths.
     async fn cleanup_worktree_dir(dir: &str) {
         let dir_owned = dir.to_string();
         let repo = if let Some(i) = dir.find("/.ouija/worktrees/") {
+            // Legacy in-repo path: repo is the prefix
             dir[..i].to_string()
         } else if let Some(i) = dir.find("/.claude/worktrees/") {
             dir[..i].to_string()
         } else {
-            return;
+            // New ~/.ouija/worktrees/ path — resolve repo via git
+            let dir_clone = dir.to_string();
+            match tokio::task::spawn_blocking(move || {
+                std::process::Command::new("git")
+                    .args(["-C", &dir_clone, "rev-parse", "--show-toplevel"])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            })
+            .await
+            {
+                Ok(Some(r)) if !r.is_empty() => r,
+                _ => return,
+            }
         };
         let dir_clone = dir_owned.clone();
         let has_changes = tokio::task::spawn_blocking(move || {
