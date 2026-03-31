@@ -273,6 +273,23 @@ pub fn refresh_plugin_cache(version: &str) {
     // Stamp version so hooks can detect plugin/daemon mismatch
     let _ = std::fs::write(cache_dir.join(".version"), version);
 
+    // Remove stale hook files from ~/.claude/hooks/ that shadow the plugin versions
+    let stale_hooks = [
+        "ouija-register.sh",
+        "ouija-unregister.sh",
+        "ouija-prompt-submit.sh",
+        "block-interactive-prompts.sh",
+        "check-pending-replies.sh",
+    ];
+    let hooks_dir = home.join(".claude/hooks");
+    for hook in &stale_hooks {
+        let path = hooks_dir.join(hook);
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+            println!("removed stale hook: ~/.claude/hooks/{hook}");
+        }
+    }
+
     println!("plugin cache refreshed");
 }
 
