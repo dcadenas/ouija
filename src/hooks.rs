@@ -333,13 +333,11 @@ async fn session_start_inner(
                 .map(|(k, _)| k.clone());
             key.and_then(|k| prompts.remove(&k).map(|(_, text)| text))
         };
-        let output = match pending_prompt {
-            Some(prompt) => format!(
-                "<ouija-status type=\"registered\">Registered as {existing_id} on the ouija mesh.</ouija-status>\n{prompt}"
-            ),
-            None => String::new(),
-        };
-        return json!({ "registered": existing_id, "output": output });
+        return json!({
+            "registered": existing_id,
+            "output": "",
+            "pending_prompt": pending_prompt,
+        });
     }
 
     // Derive name from cwd
@@ -479,15 +477,12 @@ async fn session_start_inner(
         key.and_then(|k| prompts.remove(&k).map(|(_, text)| text))
     };
 
-    if let Some(prompt) = &pending_prompt {
-        output_parts.push(prompt.clone());
-    }
-
     json!({
         "registered": id,
         "output": output_parts.join("\n"),
         "peers": peers,
         "version_warning": version_warning,
+        "pending_prompt": pending_prompt,
     })
 }
 
