@@ -66,10 +66,12 @@ async fn session_end_inner(
         return json!({ "skipped": format!("recently registered ({}s ago)", age) });
     }
     let id = session.id.clone();
+    // SessionEnd hook: always preserve worktrees. Cleanup should only happen
+    // via explicit API call with keep_worktree=false.
     state
         .apply_and_execute(crate::daemon_protocol::Event::Remove {
             id: id.clone(),
-            keep_worktree: false,
+            keep_worktree: true,
         })
         .await;
     // Clear tmux @ouija_id

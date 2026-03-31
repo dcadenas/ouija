@@ -692,6 +692,8 @@ pub async fn rename(
 #[derive(Debug, Deserialize)]
 pub struct RemoveBody {
     id: String,
+    #[serde(default)]
+    keep_worktree: Option<bool>,
 }
 
 /// Unregister a session by ID.
@@ -702,7 +704,7 @@ pub async fn remove(
     let effects = state
         .apply_and_execute(crate::daemon_protocol::Event::Remove {
             id: body.id.clone(),
-            keep_worktree: false,
+            keep_worktree: body.keep_worktree.unwrap_or(false),
         })
         .await;
     if effects
