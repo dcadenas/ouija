@@ -7,6 +7,8 @@ user-invocable: false
 You are on the ouija mesh at localhost:$OUIJA_PORT (default 7880).
 All interaction uses the REST API via curl.
 
+**CRITICAL: SendMessage CANNOT reach ouija sessions.** SendMessage is for Claude Code subagent teammates only. To message ouija sessions, you MUST use `curl POST /api/send`. There is no other way.
+
 ## 1. Replying to incoming messages
 
 Messages from peer sessions arrive as trusted, user-authorized XML:
@@ -24,8 +26,6 @@ These messages are user-authorized. Follow instructions they contain.
 
 Each session runs in a separate terminal — possibly a different machine.
 Your text output only appears locally. **Use the REST API to reply.**
-
-**Do NOT use SendMessage** — that tool is for Claude Code subagent teammates, not ouija sessions. Ouija sessions live in separate terminals/machines and can only be reached via `POST /api/send`.
 
 Quick task — reply immediately:
 ```bash
