@@ -1,6 +1,6 @@
 ---
 name: ouija
-description: "Ouija mesh: send and receive messages between coding sessions. Use when you need to communicate with other sessions, or when <msg from= XML or <ouija-status> tags appear in conversation."
+description: "Ouija mesh — REQUIRED for messaging other sessions. Use INSTEAD of SendMessage when communicating with other sessions on the mesh. Triggers: <msg from= XML tags, <ouija-status> tags, or any request to send/reply to another session."
 user-invocable: false
 ---
 
