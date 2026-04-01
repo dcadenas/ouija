@@ -48,6 +48,8 @@ pub enum SessionMsg {
     LoopHardStall,
     /// MCP tool called: session acknowledged the reminder.
     ClearReminder { clearing_id: u64 },
+    /// Internal: watchdog timer expired (no Active or Stopped within 2x idle_timeout).
+    WatchdogTimeout,
 }
 
 /// Per-session behavioral state owned by the agent.
@@ -66,6 +68,9 @@ pub struct SessionAgentState {
     pub reminder_cleared: bool,
     /// Monotonic counter for clearing_id stamped on each reminder injection.
     next_clearing_id: u64,
+    /// Watchdog: fires if no Active or Stopped within 2x idle_timeout.
+    /// Catches sessions stuck mid-turn (API errors, crashes).
+    watchdog_timer: Option<JoinHandle<Result<(), MessagingErr<SessionMsg>>>>,
 }
 
 impl std::fmt::Debug for SessionAgentState {
@@ -92,6 +97,7 @@ impl SessionAgentState {
             loop_hard_timer: None,
             reminder_cleared: false,
             next_clearing_id: 0,
+            watchdog_timer: None,
         }
     }
 }
@@ -138,6 +144,15 @@ impl Actor for SessionAgent {
                     h.abort();
                 }
                 let timeout = self.app_state.settings.read().await.idle_timeout_secs;
+                // Reset watchdog: 2x idle_timeout catches sessions stuck mid-turn
+                if let Some(h) = state.watchdog_timer.take() {
+                    h.abort();
+                }
+                state.watchdog_timer = Some(
+                    myself.send_after(std::time::Duration::from_secs(timeout * 2), || {
+                        SessionMsg::WatchdogTimeout
+                    }),
+                );
                 state.idle_timer = Some(
                     myself.send_after(std::time::Duration::from_secs(timeout), || {
                         SessionMsg::IdleTimeout
@@ -172,6 +187,16 @@ impl Actor for SessionAgent {
                 if let Some(h) = state.idle_timer.take() {
                     h.abort();
                 }
+                // Reset watchdog on activity
+                if let Some(h) = state.watchdog_timer.take() {
+                    h.abort();
+                }
+                let timeout = self.app_state.settings.read().await.idle_timeout_secs;
+                state.watchdog_timer = Some(
+                    myself.send_after(std::time::Duration::from_secs(timeout * 2), || {
+                        SessionMsg::WatchdogTimeout
+                    }),
+                );
             }
             SessionMsg::GetPendingReplies(reply) => {
                 if !reply.is_closed() {
@@ -267,6 +292,15 @@ impl Actor for SessionAgent {
                         "reminder cleared by session"
                     );
                 }
+            }
+            SessionMsg::WatchdogTimeout => {
+                state.watchdog_timer = None;
+                tracing::warn!(
+                    session = %state.session_id,
+                    "watchdog timeout: no activity for 2x idle_timeout, treating as idle"
+                );
+                // Trigger idle handling — same as IdleTimeout
+                myself.cast(SessionMsg::IdleTimeout)?;
             }
             SessionMsg::IdleTimeout => {
                 state.idle_timer = None;
