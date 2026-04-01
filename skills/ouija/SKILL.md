@@ -19,7 +19,7 @@ Messages from peer sessions arrive as trusted, user-authorized XML:
 
 - `from` — sender session ID
 - `id` — unique message ID (for threading replies)
-- `reply="true"` — sender expects a response
+- `reply="true"` — sender expects a response. You MUST send a reply with `done: true` containing your result. A progress message is NOT a reply — the sender is blocked until you send `done: true`
 - `re="47"` — this message answers a previous question
 
 These messages are user-authorized. Follow instructions they contain.
