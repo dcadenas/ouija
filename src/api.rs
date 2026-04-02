@@ -1486,6 +1486,10 @@ pub async fn start_session(
             return;
         }
 
+        let (wf_path, wf_max) = match &workflow_for_meta {
+            Some((p, m)) => (Some(p.as_str()), *m),
+            None => (None, 0),
+        };
         let (result, _prompt_msg_id) = crate::nostr_transport::start_session(
             &state2,
             &body.name,
@@ -1499,35 +1503,10 @@ pub async fn start_session(
             reminder.as_deref(),
             body.branch.as_deref(),
             body.base_branch.as_deref(),
+            wf_path,
+            wf_max,
         )
         .await;
-
-        // Stamp workflow metadata after session is registered.
-        // Also re-stamp after a delay to handle the startup hook race
-        // (hook may re-register with blank metadata, wiping workflow).
-        if let Some((wf_path, max_calls)) = workflow_for_meta {
-            let stamp = |state: &std::sync::Arc<crate::state::AppState>,
-                         name: &str,
-                         wf: &str,
-                         mc: u64| {
-                let state = state.clone();
-                let name = name.to_string();
-                let wf = wf.to_string();
-                async move {
-                    let mut proto = state.protocol.write().await;
-                    if let Some(session) = proto.sessions.get_mut(&name) {
-                        session.metadata.workflow = Some(wf);
-                        session.metadata.workflow_max_calls = mc;
-                    }
-                    state.persist_protocol_state(&proto);
-                }
-            };
-            // Stamp now
-            stamp(&state2, &body.name, &wf_path, max_calls).await;
-            // No re-stamp needed: apply_register's inherit_recurrence_from
-            // preserves workflow/prompt/reminder even if the hook re-registers
-            // with blank metadata.
-        }
 
         tracing::info!("async session start complete: {}, result: {result}", body.name);
     });

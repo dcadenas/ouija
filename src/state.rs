@@ -564,6 +564,8 @@ impl AppState {
                             reminder.as_deref(),
                             None, // branch
                             None, // base_branch
+                            None, // workflow
+                            0,    // workflow_max_calls
                         )
                         .await;
                         let reply = crate::protocol::WireMessage::CommandResult {

@@ -1106,7 +1106,7 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         kill_session(state, name).await
     } else if let Some(rest) = cmd.strip_prefix("/start ") {
         let name = rest.trim();
-        start_session(state, name, None, None, None, None, None, None, None, None, None, None)
+        start_session(state, name, None, None, None, None, None, None, None, None, None, None, None, 0)
             .await
             .0
     } else if let Some(rest) = cmd.strip_prefix("/restart ") {
@@ -1315,6 +1315,8 @@ pub async fn start_session(
     reminder: Option<&str>,
     branch: Option<&str>,
     base_branch: Option<&str>,
+    workflow: Option<&str>,
+    workflow_max_calls: u64,
 ) -> (String, Option<u64>) {
     // Check if already exists
     if state.protocol.read().await.sessions.contains_key(name) {
@@ -1548,6 +1550,8 @@ pub async fn start_session(
                 model: model.map(String::from),
                 reminder: reminder.map(String::from),
                 prompt: prompt.map(String::from),
+                workflow: workflow.map(String::from),
+                workflow_max_calls,
                 ..Default::default()
             };
             state
