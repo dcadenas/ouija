@@ -326,15 +326,15 @@ async fn session_start_inner(
 
     // Skip if pane already registered (API-started sessions hit this path)
     if let Some(existing_id) = state.find_session_by_pane(&body.pane).await {
-        // Drain pending prompt if queued by start_session API
-        let pending_prompt = {
-            let mut prompts = state.pending_prompts.lock().unwrap();
-            let key = prompts
-                .iter()
-                .find(|(_, (pane, _))| pane == &body.pane)
-                .map(|(k, _)| k.clone());
-            key.and_then(|k| prompts.remove(&k).map(|(_, text)| text))
-        };
+        // Drain pending prompt if queued by start_session API.
+        // Match by session name (not pane) because the prompt may be pre-queued
+        // before the pane ID is known.
+        let pending_prompt = state
+            .pending_prompts
+            .lock()
+            .unwrap()
+            .remove(&existing_id)
+            .map(|(_, text)| text);
         return json!({
             "registered": existing_id,
             "output": "",
@@ -466,18 +466,13 @@ async fn session_start_inner(
         );
     }
 
-    // Drain pending prompt if this session was started via the API with a prompt.
-    // The prompt was queued by schedule_prompt_injection; delivering it here
-    // (inside the SessionStart hook) guarantees the TUI is ready.
-    let pending_prompt = {
-        let mut prompts = state.pending_prompts.lock().unwrap();
-        // Find by pane match (pending_prompts keyed by session name, value is (pane, text))
-        let key = prompts
-            .iter()
-            .find(|(_, (pane, _))| pane == &body.pane)
-            .map(|(k, _)| k.clone());
-        key.and_then(|k| prompts.remove(&k).map(|(_, text)| text))
-    };
+    // Drain pending prompt by session name
+    let pending_prompt = state
+        .pending_prompts
+        .lock()
+        .unwrap()
+        .remove(&id)
+        .map(|(_, text)| text);
 
     json!({
         "registered": id,

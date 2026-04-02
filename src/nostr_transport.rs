@@ -1388,6 +1388,42 @@ pub async fn start_session(
         project_dir: dir.clone(),
         worktree: None, // ouija manages worktrees, not the backend
     });
+
+    // Pre-compute and queue the prompt BEFORE launching Claude Code, so the
+    // SessionStart hook can drain it immediately. Without this, there's a race
+    // where the hook fires before schedule_prompt_injection queues the prompt.
+    let pre_queued_prompt = if let Some(text) = prompt {
+        let full_text = match reminder {
+            Some(r) => format!("{text}\n\n{r}"),
+            None => text.to_string(),
+        };
+        let injected = if let Some(sender) = from {
+            let er = expects_reply.unwrap_or(true);
+            let msg_id = {
+                let mut proto = state.protocol.write().await;
+                proto.next_seq()
+            };
+            let formatted = crate::daemon_protocol::format_session_message(
+                sender, &full_text, er, msg_id, None, false,
+            );
+            Some((formatted, Some(msg_id)))
+        } else {
+            Some((full_text, None))
+        };
+        injected
+    } else {
+        None
+    };
+
+    // Queue prompt with a placeholder pane (updated after pane creation)
+    if let Some((ref prompt_text, _)) = pre_queued_prompt {
+        state
+            .pending_prompts
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), ("pending".into(), prompt_text.clone()));
+    }
+
     let start_result = tokio::task::spawn_blocking({
         let tmux_session = tmux_session.clone();
         let window_name = window_name.clone();
@@ -1504,36 +1540,22 @@ pub async fn start_session(
                     metadata: proto_meta,
                 })
                 .await;
-            let mut prompt_msg_id = None;
-            if let Some(text) = prompt {
-                let full_text = match reminder {
-                    Some(r) => format!("{text}\n\n{r}"),
-                    None => text.to_string(),
-                };
-                let injected = if let Some(sender) = from {
-                    let er = expects_reply.unwrap_or(true);
-                    let msg_id = {
-                        let mut proto = state.protocol.write().await;
-                        proto.next_seq()
-                    };
-                    prompt_msg_id = Some(msg_id);
-                    crate::daemon_protocol::format_session_message(
-                        sender, &full_text, er, msg_id, None, false,
-                    )
-                } else {
-                    full_text
-                };
-                // For HttpApi backends with a backend_session_id, deliver via
-                // prompt_async directly — ensures MCP tools are available on the
-                // first prompt. Falls back to schedule_prompt_injection otherwise.
+            // Update pending_prompts with the real pane ID (was "pending")
+            // and start the fallback timer. The hook drains the prompt; if it
+            // doesn't within 30s, the fallback injects via tmux.
+            let prompt_msg_id = pre_queued_prompt.as_ref().and_then(|(_, id)| *id);
+            if let Some((ref prompt_text, _)) = pre_queued_prompt {
+                // For HttpApi backends, deliver via prompt_async instead
                 if let Some(ref oc_sid) = oc_session_id {
                     if matches!(
                         backend.delivery_mode(),
                         crate::backend::DeliveryMode::HttpApi { .. }
                     ) {
+                        // Remove from pending_prompts (hook path not used for HttpApi)
+                        state.pending_prompts.lock().unwrap().remove(name);
                         let port = state.opencode_serve_port();
                         let body = serde_json::json!({
-                            "parts": [{"type": "text", "text": injected}]
+                            "parts": [{"type": "text", "text": prompt_text}]
                         });
                         let url = format!(
                             "http://127.0.0.1:{port}/session/{oc_sid}/prompt_async"
@@ -1542,10 +1564,8 @@ pub async fn start_session(
                         let dir2 = dir.clone();
                         let name2 = name.to_string();
                         let pane2 = pane_id.clone();
+                        let injected = prompt_text.clone();
                         tokio::spawn(async move {
-                            // Wait for opencode serve to bootstrap MCP connections
-                            // before delivering the prompt (MCP tools must be available
-                            // for the LLM to call workflow()).
                             tokio::time::sleep(std::time::Duration::from_secs(8)).await;
                             let resp = state2
                                 .http_client
@@ -1578,10 +1598,20 @@ pub async fn start_session(
                             }
                         });
                     } else {
-                        schedule_prompt_injection(state, name, pane_id.clone(), injected);
+                        // Update pane ID and start fallback timer
+                        state.pending_prompts.lock().unwrap().insert(
+                            name.to_string(),
+                            (pane_id.clone(), prompt_text.clone()),
+                        );
+                        schedule_prompt_injection(state, name, pane_id.clone(), prompt_text.clone());
                     }
                 } else {
-                    schedule_prompt_injection(state, name, pane_id.clone(), injected);
+                    // Update pane ID and start fallback timer
+                    state.pending_prompts.lock().unwrap().insert(
+                        name.to_string(),
+                        (pane_id.clone(), prompt_text.clone()),
+                    );
+                    schedule_prompt_injection(state, name, pane_id.clone(), prompt_text.clone());
                 }
             }
             if auto_worktree {
