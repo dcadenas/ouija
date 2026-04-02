@@ -1720,6 +1720,9 @@ pub struct WorkflowCallBody {
     action: String,
     #[serde(default)]
     params: Option<serde_json::Value>,
+    /// Capture any extra fields (e.g. "description") so they aren't silently dropped.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Call a session's workflow actor via REST.
@@ -1770,12 +1773,24 @@ pub async fn call_session_workflow(
         );
     };
 
+    // Merge extra top-level fields into params so they reach the workflow
+    let params = if body.extra.is_empty() {
+        body.params
+    } else {
+        let mut merged = match body.params {
+            Some(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        merged.extend(body.extra);
+        Some(serde_json::Value::Object(merged))
+    };
+
     match crate::workflow::call_workflow(
         &state,
         &workflow_path,
         &session_id,
         &body.action,
-        body.params.as_ref(),
+        params.as_ref(),
         project_dir.as_deref(),
     )
     .await
