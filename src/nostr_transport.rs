@@ -1415,14 +1415,24 @@ pub async fn start_session(
         None
     };
 
-    // Queue prompt with a placeholder pane (updated after pane creation)
-    if let Some((ref prompt_text, _)) = pre_queued_prompt {
-        state
-            .pending_prompts
-            .lock()
-            .unwrap()
-            .insert(name.to_string(), ("pending".into(), prompt_text.clone()));
-    }
+    // If there's a prompt, write it to a temp file so we can pass it as a
+    // CLI argument. This ensures Claude Code loads CLAUDE.md and rules before
+    // processing the prompt (tmux injection can race with context loading).
+    let prompt_file = if let Some((ref prompt_text, _)) = pre_queued_prompt {
+        let prompt_path = format!("/tmp/ouija-prompt-{}.txt", name);
+        std::fs::write(&prompt_path, prompt_text).ok();
+        Some(prompt_path)
+    } else {
+        None
+    };
+
+    // Build the full command with prompt as CLI arg if available
+    let full_cmd = if let Some(ref pf) = prompt_file {
+        let escaped_pf = crate::scheduler::shell_escape(pf);
+        format!("{backend_cmd} \"$(cat {escaped_pf})\" ; rm -f {escaped_pf}")
+    } else {
+        backend_cmd.clone()
+    };
 
     let start_result = tokio::task::spawn_blocking({
         let tmux_session = tmux_session.clone();
@@ -1493,10 +1503,9 @@ pub async fn start_session(
                 ])
                 .status();
 
-            // Launch backend
-            let cmd = backend_cmd;
+            // Launch backend (with prompt as CLI arg if available)
             Command::new("tmux")
-                .args(["send-keys", "-t", &pane_id, &cmd, "Enter"])
+                .args(["send-keys", "-t", &pane_id, &full_cmd, "Enter"])
                 .status()?;
 
             Ok(pane_id)
@@ -1540,19 +1549,14 @@ pub async fn start_session(
                     metadata: proto_meta,
                 })
                 .await;
-            // Update pending_prompts with the real pane ID (was "pending")
-            // and start the fallback timer. The hook drains the prompt; if it
-            // doesn't within 30s, the fallback injects via tmux.
             let prompt_msg_id = pre_queued_prompt.as_ref().and_then(|(_, id)| *id);
             if let Some((ref prompt_text, _)) = pre_queued_prompt {
-                // For HttpApi backends, deliver via prompt_async instead
+                // For HttpApi backends, deliver via prompt_async
                 if let Some(ref oc_sid) = oc_session_id {
                     if matches!(
                         backend.delivery_mode(),
                         crate::backend::DeliveryMode::HttpApi { .. }
                     ) {
-                        // Remove from pending_prompts (hook path not used for HttpApi)
-                        state.pending_prompts.lock().unwrap().remove(name);
                         let port = state.opencode_serve_port();
                         let body = serde_json::json!({
                             "parts": [{"type": "text", "text": prompt_text}]
@@ -1597,22 +1601,10 @@ pub async fn start_session(
                                 }
                             }
                         });
-                    } else {
-                        // Update pane ID and start fallback timer
-                        state.pending_prompts.lock().unwrap().insert(
-                            name.to_string(),
-                            (pane_id.clone(), prompt_text.clone()),
-                        );
-                        schedule_prompt_injection(state, name, pane_id.clone(), prompt_text.clone());
                     }
-                } else {
-                    // Update pane ID and start fallback timer
-                    state.pending_prompts.lock().unwrap().insert(
-                        name.to_string(),
-                        (pane_id.clone(), prompt_text.clone()),
-                    );
-                    schedule_prompt_injection(state, name, pane_id.clone(), prompt_text.clone());
+                    // TuiInjection: prompt already passed as CLI arg — no injection needed
                 }
+                // TuiInjection: prompt already passed as CLI arg — no injection needed
             }
             if auto_worktree {
                 let conflict_name = {
