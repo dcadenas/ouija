@@ -290,6 +290,27 @@ pub fn refresh_plugin_cache(version: &str) {
         }
     }
 
+    // Remove stale plugin layout artifacts from old versions
+    let stale_dirs = ["skill", "tools"];
+    for dir in &stale_dirs {
+        let path = cache_dir.join(dir);
+        if path.exists() {
+            let _ = std::fs::remove_dir_all(&path);
+            println!("removed stale plugin dir: {dir}/");
+        }
+    }
+
+    // Remove stale user-level skills
+    let stale_skills = ["ouija-peer-trust", "ouija-session-trust", "ouija-peer"];
+    let skills_dir = home.join(".claude/skills");
+    for skill in &stale_skills {
+        let path = skills_dir.join(skill);
+        if path.exists() {
+            let _ = std::fs::remove_dir_all(&path);
+            println!("removed stale skill: ~/.claude/skills/{skill}");
+        }
+    }
+
     println!("plugin cache refreshed");
 }
 
