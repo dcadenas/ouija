@@ -710,7 +710,7 @@ wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'wt-branch-default'"
 wt_branch=$(git -C /tmp/projects/wt-branch-test branch --list 'wt-branch-default' | tr -d ' *')
 assert_eq "L14b: default branch is session name" "$wt_branch" "wt-branch-default"
 # Verify worktree dir exists
-test -d /tmp/projects/wt-branch-test/.ouija/worktrees/wt-branch-default && pass "L14b: worktree dir exists" || fail "L14b: worktree dir" "exists" "missing"
+test -d $HOME/.ouija/worktrees/wt-branch-test/wt-branch-default && pass "L14b: worktree dir exists" || fail "L14b: worktree dir" "exists" "missing"
 # Cleanup
 api "$BASE" POST /api/sessions/kill -d '{"name":"wt-branch-default"}' >/dev/null 2>&1 || true
 sleep 1
@@ -724,7 +724,7 @@ wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'wt-custom-branch'"
 custom_branch=$(git -C /tmp/projects/wt-branch-test branch --list 'feature/my-feature' | tr -d ' *')
 assert_eq "L14c: custom branch name used" "$custom_branch" "feature/my-feature"
 # Verify worktree dir uses session name (not branch name)
-test -d /tmp/projects/wt-branch-test/.ouija/worktrees/wt-custom-branch && pass "L14c: worktree dir uses session name" || fail "L14c: worktree dir" "exists" "missing"
+test -d $HOME/.ouija/worktrees/wt-branch-test/wt-custom-branch && pass "L14c: worktree dir uses session name" || fail "L14c: worktree dir" "exists" "missing"
 # Cleanup
 api "$BASE" POST /api/sessions/kill -d '{"name":"wt-custom-branch"}' >/dev/null 2>&1 || true
 sleep 1
@@ -740,7 +740,7 @@ git -C /tmp/projects/wt-branch-test checkout master >/dev/null 2>&1 || git -C /t
 api "$BASE" POST /api/sessions/start -d '{"name":"wt-base-branch","project_dir":"/tmp/projects/wt-branch-test","worktree":true,"branch":"from-base","base_branch":"base-feature"}' >/dev/null
 wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'wt-base-branch'"
 # Verify the new branch exists and its parent is the base-feature commit
-wt_parent=$(git -C /tmp/projects/wt-branch-test/.ouija/worktrees/wt-base-branch rev-parse HEAD 2>/dev/null)
+wt_parent=$(git -C $HOME/.ouija/worktrees/wt-branch-test/wt-base-branch rev-parse HEAD 2>/dev/null)
 assert_eq "L14d: branch created from base_branch" "$wt_parent" "$BASE_COMMIT"
 # Cleanup
 api "$BASE" POST /api/sessions/kill -d '{"name":"wt-base-branch"}' >/dev/null 2>&1 || true
