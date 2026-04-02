@@ -272,6 +272,63 @@ pub async fn call_workflow(
     }
 }
 
+/// Transparent workflow call — forwards raw JSON body to the workflow endpoint.
+/// The caller is responsible for injecting session_id into the body.
+pub async fn call_workflow_raw(
+    state: &Arc<AppState>,
+    workflow_path: &str,
+    body: &serde_json::Value,
+    working_dir: Option<&str>,
+) -> Result<String, String> {
+    let path = resolve_path(workflow_path, working_dir);
+
+    let path_str = path.to_string_lossy();
+    let value = if is_http_workflow(&path_str) {
+        let client = state.http_client.clone();
+        let resp = client
+            .post(path_str.as_ref())
+            .json(body)
+            .timeout(WORKFLOW_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP workflow call failed: {e}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("HTTP {status}: {text}"));
+        }
+        resp.json::<serde_json::Value>()
+            .await
+            .map_err(|e| format!("invalid JSON response: {e}"))?
+    } else {
+        // Binary workflow: forward raw JSON as WorkflowInput
+        let input = WorkflowInput {
+            event: None,
+            action: body.get("action").and_then(|v| v.as_str()).map(String::from),
+            session_id: body.get("session_id").and_then(|v| v.as_str()).unwrap_or("").into(),
+            params: body.get("params").cloned(),
+        };
+        execute_binary_workflow(&path, &input, WORKFLOW_TIMEOUT, working_dir, state.config.port)
+            .await?
+    };
+
+    let resp: WorkflowResponse =
+        serde_json::from_value(value).map_err(|e| format!("invalid workflow response: {e}"))?;
+
+    if let Some(err) = resp.error {
+        return Err(err);
+    }
+
+    let message = resp
+        .message
+        .ok_or_else(|| "workflow returned no message".to_string())?;
+
+    match resp.verify {
+        Some(criteria) => Ok(format!("{message}\n\nVerify before proceeding: {criteria}")),
+        None => Ok(message),
+    }
+}
+
 /// Fire-and-forget lifecycle event notification to the workflow.
 pub fn notify_workflow(
     state: &Arc<AppState>,

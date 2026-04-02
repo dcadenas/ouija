@@ -1714,23 +1714,28 @@ pub async fn backend_session_ready(
     Json(json!({"delivered": delivered, "session": name}))
 }
 
-/// Request body for the workflow REST endpoint.
-#[derive(Debug, Deserialize)]
-pub struct WorkflowCallBody {
-    action: String,
-    #[serde(default)]
-    params: Option<serde_json::Value>,
-    /// Capture any extra fields (e.g. "description") so they aren't silently dropped.
-    #[serde(flatten)]
-    extra: serde_json::Map<String, serde_json::Value>,
-}
-
 /// Call a session's workflow actor via REST.
+/// Transparent proxy: injects session_id, forwards raw JSON to the workflow endpoint.
 pub async fn call_session_workflow(
     State(state): State<SharedState>,
     axum::extract::Path(session_id): axum::extract::Path<String>,
-    Json(body): Json<WorkflowCallBody>,
+    Json(mut body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Extract action for the call budget counter
+    let action = body
+        .as_object()
+        .and_then(|o| o.get("action"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if action.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "missing 'action' field"})),
+        );
+    }
+
     let (workflow_path, project_dir) = {
         let mut proto = state.protocol.write().await;
         match proto.sessions.get_mut(&session_id) {
@@ -1773,24 +1778,15 @@ pub async fn call_session_workflow(
         );
     };
 
-    // Merge extra top-level fields into params so they reach the workflow
-    let params = if body.extra.is_empty() {
-        body.params
-    } else {
-        let mut merged = match body.params {
-            Some(serde_json::Value::Object(m)) => m,
-            _ => serde_json::Map::new(),
-        };
-        merged.extend(body.extra);
-        Some(serde_json::Value::Object(merged))
-    };
+    // Inject session_id into the body and forward as-is
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("session_id".into(), serde_json::Value::String(session_id.clone()));
+    }
 
-    match crate::workflow::call_workflow(
+    match crate::workflow::call_workflow_raw(
         &state,
         &workflow_path,
-        &session_id,
-        &body.action,
-        params.as_ref(),
+        &body,
         project_dir.as_deref(),
     )
     .await
