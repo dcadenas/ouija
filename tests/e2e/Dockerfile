@@ -6,6 +6,7 @@ COPY hooks/ hooks/
 COPY scripts/ scripts/
 COPY skills/ skills/
 COPY .mcp.json ./
+COPY .claude-plugin/ .claude-plugin/
 COPY opencode-plugin/ opencode-plugin/
 RUN cargo test -- --skip model_check 2>&1
 RUN cargo build --release 2>&1
