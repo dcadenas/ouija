@@ -273,44 +273,6 @@ pub fn refresh_plugin_cache(version: &str) {
     // Stamp version so hooks can detect plugin/daemon mismatch
     let _ = std::fs::write(cache_dir.join(".version"), version);
 
-    // Remove stale hook files from ~/.claude/hooks/ that shadow the plugin versions
-    let stale_hooks = [
-        "ouija-register.sh",
-        "ouija-unregister.sh",
-        "ouija-prompt-submit.sh",
-        "block-interactive-prompts.sh",
-        "check-pending-replies.sh",
-    ];
-    let hooks_dir = home.join(".claude/hooks");
-    for hook in &stale_hooks {
-        let path = hooks_dir.join(hook);
-        if path.exists() {
-            let _ = std::fs::remove_file(&path);
-            println!("removed stale hook: ~/.claude/hooks/{hook}");
-        }
-    }
-
-    // Remove stale plugin layout artifacts from old versions
-    let stale_dirs = ["skill", "tools"];
-    for dir in &stale_dirs {
-        let path = cache_dir.join(dir);
-        if path.exists() {
-            let _ = std::fs::remove_dir_all(&path);
-            println!("removed stale plugin dir: {dir}/");
-        }
-    }
-
-    // Remove stale user-level skills
-    let stale_skills = ["ouija-peer-trust", "ouija-session-trust", "ouija-peer"];
-    let skills_dir = home.join(".claude/skills");
-    for skill in &stale_skills {
-        let path = skills_dir.join(skill);
-        if path.exists() {
-            let _ = std::fs::remove_dir_all(&path);
-            println!("removed stale skill: ~/.claude/skills/{skill}");
-        }
-    }
-
     println!("plugin cache refreshed");
 }
 
