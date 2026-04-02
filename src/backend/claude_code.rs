@@ -164,6 +164,33 @@ fn ensure_plugin_installed() {
     // Stamp version
     let _ = std::fs::write(cache_dir.join(".version"), version);
 
+    // Ensure extraKnownMarketplaces entry exists (may be missing on remote installs)
+    {
+        let settings_path = claude_dir.join("settings.json");
+        let mut settings: serde_json::Value = std::fs::read_to_string(&settings_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(obj) = settings.as_object_mut() {
+            let mkts = obj
+                .entry("extraKnownMarketplaces")
+                .or_insert_with(|| serde_json::json!({}));
+            if mkts.get("ouija").is_none() {
+                mkts["ouija"] = serde_json::json!({
+                    "source": {
+                        "source": "directory",
+                        "path": cache_dir.to_string_lossy()
+                    }
+                });
+                let _ = std::fs::write(
+                    &settings_path,
+                    serde_json::to_string_pretty(&settings).unwrap(),
+                );
+                println!("registered ouija in extraKnownMarketplaces");
+            }
+        }
+    }
+
     if !needs_full_install {
         return;
     }
