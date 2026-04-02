@@ -22,6 +22,8 @@ mod embedded {
     pub const SCRIPT_UNREGISTER: &str = include_str!("../../scripts/ouija-unregister.sh");
 
     pub const SKILLS_PEER_TRUST: &str = include_str!("../../skills/ouija/SKILL.md");
+    pub const PLUGIN_JSON: &str = include_str!("../../.claude-plugin/plugin.json");
+    pub const MARKETPLACE_JSON: &str = include_str!("../../.claude-plugin/marketplace.json");
 }
 
 /// Write all embedded plugin files to the given cache directory.
@@ -45,6 +47,8 @@ fn write_embedded_plugin_files(cache_dir: &std::path::Path) {
         ("scripts/ouija-statusline.sh", embedded::SCRIPT_STATUSLINE),
         ("scripts/ouija-unregister.sh", embedded::SCRIPT_UNREGISTER),
         ("skills/ouija/SKILL.md", embedded::SKILLS_PEER_TRUST),
+        (".claude-plugin/plugin.json", embedded::PLUGIN_JSON),
+        (".claude-plugin/marketplace.json", embedded::MARKETPLACE_JSON),
     ];
 
     for (path, content) in files {
