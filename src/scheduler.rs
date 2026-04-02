@@ -454,11 +454,26 @@ async fn respawn_and_inject(
         },
     });
 
+    // Pass prompt as CLI arg (same as start_session) so Claude loads
+    // CLAUDE.md and rules before processing the prompt.
+    let full_cmd = if let Some(ref prompt) = task.prompt {
+        let full_text = match &task.reminder {
+            Some(r) => format!("{prompt}\n\n{r}"),
+            None => prompt.clone(),
+        };
+        let prompt_path = format!("/tmp/ouija-prompt-{}.txt", task_name);
+        let _ = std::fs::write(&prompt_path, &full_text);
+        let escaped_pf = shell_escape(&prompt_path);
+        format!("{claude_cmd} \"$(cat {escaped_pf})\" ; rm -f {escaped_pf}")
+    } else {
+        claude_cmd
+    };
+
     let respawn_result = tokio::task::spawn_blocking({
         let pane_id = pane_id.clone();
         move || -> anyhow::Result<()> {
             let output = std::process::Command::new("tmux")
-                .args(["respawn-pane", "-k", "-t", &pane_id, &claude_cmd])
+                .args(["respawn-pane", "-k", "-t", &pane_id, &full_cmd])
                 .output()?;
             if !output.status.success() {
                 anyhow::bail!(
@@ -587,6 +602,31 @@ async fn revive_and_inject(
             })
     };
 
+    // Pass prompt as CLI arg so Claude loads CLAUDE.md before processing it
+    let full_launch_cmd = if clears_context {
+        if let Some(ref prompt) = task.prompt {
+            let full_text = match &task.reminder {
+                Some(r) => format!("{prompt}\n\n{r}"),
+                None => prompt.clone(),
+            };
+            let prompt_path = format!("/tmp/ouija-prompt-{}.txt", task.name);
+            let _ = std::fs::write(&prompt_path, &full_text);
+            let escaped_pf = shell_escape(&prompt_path);
+            format!("{launch_cmd} \"$(cat {escaped_pf})\" ; rm -f {escaped_pf}")
+        } else {
+            launch_cmd.clone()
+        }
+    } else {
+        launch_cmd.clone()
+    };
+
+    // Pre-trust the directory so Claude Code skips the trust prompt
+    if let Ok(home) = std::env::var("HOME") {
+        let escaped = dir.replace('/', "-");
+        let trust_dir = format!("{home}/.claude/projects/{escaped}");
+        let _ = std::fs::create_dir_all(&trust_dir);
+    }
+
     // Create named tmux session/window for the revived session.
     // If a tmux session with the target name exists, add a window to it;
     // otherwise create a new tmux session. Both get the ouija session name.
@@ -649,9 +689,9 @@ async fn revive_and_inject(
                 ])
                 .status();
 
-            // Launch the backend in the project dir
+            // Launch the backend in the project dir (prompt as CLI arg if available)
             std::process::Command::new("tmux")
-                .args(["send-keys", "-t", &pane_id, &launch_cmd, "Enter"])
+                .args(["send-keys", "-t", &pane_id, &full_launch_cmd, "Enter"])
                 .status()?;
 
             Ok(pane_id)
