@@ -423,7 +423,7 @@ impl SessionAgent {
 
         for from in senders {
             let reminder = format!(
-                "<ouija-status type=\"reminder\">You have an unanswered question from {from} — reply using ouija.send</ouija-status>"
+                "<ouija-status type=\"reminder\">You have an unanswered question from {from} — reply using: curl -sf -X POST localhost:$OUIJA_PORT/api/send -H Content-Type:application/json -d '{{\"from\":\"SESSION_ID\",\"to\":\"{from}\",\"message\":\"your answer\",\"responds_to\":MSG_ID,\"done\":true}}'</ouija-status>"
             );
             let _ = crate::tmux::locked_inject(
                 &self.app_state,
