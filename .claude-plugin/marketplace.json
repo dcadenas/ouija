@@ -18,7 +18,7 @@
         "url": "https://github.com/dcadenas"
       },
       "homepage": "https://github.com/dcadenas/ouija",
-      "keywords": ["sessions", "communication", "nostr", "mcp", "tmux"],
+      "keywords": ["sessions", "communication", "nostr", "tmux"],
       "strict": true
     }
   ]

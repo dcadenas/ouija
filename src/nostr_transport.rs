@@ -1428,13 +1428,7 @@ pub async fn start_session(
         None
     };
 
-    // Pre-trust the worktree directory so Claude Code skips the trust prompt.
-    // Claude Code considers a directory trusted if ~/.claude/projects/<escaped-path>/ exists.
-    if let Ok(home) = std::env::var("HOME") {
-        let escaped = dir.replace('/', "-");
-        let trust_dir = format!("{home}/.claude/projects/{escaped}");
-        let _ = std::fs::create_dir_all(&trust_dir);
-    }
+    crate::backend::claude_code::pre_trust_workspace(&dir);
 
     // Build the full command with prompt as CLI arg if available
     let full_cmd = if let Some(ref pf) = prompt_file {
@@ -1757,6 +1751,8 @@ pub async fn restart_session(
 
     // Ouija manages worktrees in .ouija/worktrees/ — the backend just gets a dir.
     // On restart, the worktree already exists (project_dir points to it).
+
+    crate::backend::claude_code::pre_trust_workspace(&dir);
 
     let claude_cmd = if fresh {
         backend.build_start_command(&crate::backend::StartOpts {

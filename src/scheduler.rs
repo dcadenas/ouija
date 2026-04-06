@@ -620,12 +620,7 @@ async fn revive_and_inject(
         launch_cmd.clone()
     };
 
-    // Pre-trust the directory so Claude Code skips the trust prompt
-    if let Ok(home) = std::env::var("HOME") {
-        let escaped = dir.replace('/', "-");
-        let trust_dir = format!("{home}/.claude/projects/{escaped}");
-        let _ = std::fs::create_dir_all(&trust_dir);
-    }
+    crate::backend::claude_code::pre_trust_workspace(&dir);
 
     // Create named tmux session/window for the revived session.
     // If a tmux session with the target name exists, add a window to it;

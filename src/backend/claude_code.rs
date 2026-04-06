@@ -5,13 +5,58 @@ use super::{CodingAssistant, DeliveryMode, InjectConfig, ResumeOpts, StartOpts};
 #[derive(Debug)]
 pub struct ClaudeCode;
 
+/// Pre-trust a workspace directory so Claude Code skips the trust dialog.
+///
+/// Writes `hasTrustDialogAccepted: true` into `~/.claude.json` for the given
+/// directory, and also ensures the `~/.claude/projects/<escaped>/` session
+/// data directory exists.
+pub fn pre_trust_workspace(dir: &str) {
+    let Ok(home) = std::env::var("HOME") else {
+        return;
+    };
+
+    // Ensure session data directory exists
+    let escaped = dir.replace('/', "-");
+    let _ = std::fs::create_dir_all(format!("{home}/.claude/projects/{escaped}"));
+
+    // Write trust entry to ~/.claude.json
+    let claude_json_path = format!("{home}/.claude.json");
+    let mut data: serde_json::Value = std::fs::read_to_string(&claude_json_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let projects = data.as_object_mut().and_then(|obj| {
+        obj.entry("projects")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+    });
+
+    if let Some(projects) = projects {
+        let entry = projects
+            .entry(dir)
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(obj) = entry.as_object_mut() {
+            if obj.get("hasTrustDialogAccepted") == Some(&serde_json::Value::Bool(true)) {
+                return; // already trusted
+            }
+            obj.insert(
+                "hasTrustDialogAccepted".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&data) {
+            let _ = std::fs::write(&claude_json_path, json);
+        }
+    }
+}
+
 // --- Embedded plugin files ---
 // These are compiled into the binary so `ouija start` can bootstrap the Claude
 // Code plugin without needing the source repo on disk.
 
 mod embedded {
     pub const HOOKS_JSON: &str = include_str!("../../hooks/hooks.json");
-    pub const MCP_JSON: &str = include_str!("../../.mcp.json");
 
     pub const SCRIPT_BLOCK_INTERACTIVE: &str =
         include_str!("../../scripts/block-interactive-prompts.sh");
@@ -30,7 +75,6 @@ mod embedded {
 fn write_embedded_plugin_files(cache_dir: &std::path::Path) {
     let files: &[(&str, &str)] = &[
         ("hooks/hooks.json", embedded::HOOKS_JSON),
-        (".mcp.json", embedded::MCP_JSON),
         (
             "scripts/block-interactive-prompts.sh",
             embedded::SCRIPT_BLOCK_INTERACTIVE,
@@ -117,12 +161,6 @@ fn try_sync_from_source(home: &std::path::Path, cache_dir: &std::path::Path) -> 
                 eprintln!("warning: failed to sync plugin {dir}: {e}");
             }
         }
-    }
-
-    let src = source_dir.join(".mcp.json");
-    let dst = cache_dir.join(".mcp.json");
-    if src.is_file() {
-        let _ = std::fs::copy(&src, &dst);
     }
 
     let src = source_dir.join(".claude-plugin");
