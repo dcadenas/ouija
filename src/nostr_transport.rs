@@ -2231,6 +2231,19 @@ fn create_ouija_worktree(
         .unwrap_or("repo");
     let wt_dir = format!("{home}/.ouija/worktrees/{repo_slug}/{name}");
     if std::path::Path::new(&wt_dir).exists() {
+        // If base_branch is specified, force-update the worktree branch to match it.
+        // Stale branches from previous runs may point at wrong commits.
+        if let Some(base) = base_branch {
+            let _ = std::process::Command::new("git")
+                .args(["-C", &wt_dir, "checkout", "--detach"])
+                .output();
+            let _ = std::process::Command::new("git")
+                .args(["-C", &wt_dir, "reset", "--hard", base])
+                .output();
+            tracing::info!(
+                "worktree {name} exists, force-updated to {base}",
+            );
+        }
         return Ok(wt_dir);
     }
     // Ensure parent dir exists
