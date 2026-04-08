@@ -749,6 +749,42 @@ api "$BASE" POST /api/remove -d '{"id":"wt-base-branch"}' >/dev/null 2>&1 || tru
 git -C /tmp/projects/wt-branch-test worktree prune 2>/dev/null
 git -C /tmp/projects/wt-branch-test branch -D from-base 2>/dev/null
 git -C /tmp/projects/wt-branch-test branch -D base-feature 2>/dev/null
+
+log "Test L14e: Re-start existing worktree with new base_branch stays on named branch"
+# Create a base branch with a known commit
+git -C /tmp/projects/wt-branch-test checkout -b rebase-base >/dev/null 2>&1
+git -C /tmp/projects/wt-branch-test commit --allow-empty -m "rebase base" >/dev/null 2>&1
+REBASE_COMMIT=$(git -C /tmp/projects/wt-branch-test rev-parse HEAD)
+git -C /tmp/projects/wt-branch-test checkout master >/dev/null 2>&1 || git -C /tmp/projects/wt-branch-test checkout main >/dev/null 2>&1
+# First start: creates the worktree
+api "$BASE" POST /api/sessions/start -d '{"name":"wt-rebase","project_dir":"/tmp/projects/wt-branch-test","worktree":true,"branch":"rebase-branch","base_branch":"rebase-base"}' >/dev/null
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'wt-rebase'"
+api "$BASE" POST /api/sessions/kill -d '{"name":"wt-rebase"}' >/dev/null 2>&1 || true
+sleep 1
+api "$BASE" POST /api/remove -d '{"id":"wt-rebase"}' >/dev/null 2>&1 || true
+# Advance rebase-base so re-start must force-update
+git -C /tmp/projects/wt-branch-test checkout rebase-base >/dev/null 2>&1
+git -C /tmp/projects/wt-branch-test commit --allow-empty -m "advanced base" >/dev/null 2>&1
+NEW_COMMIT=$(git -C /tmp/projects/wt-branch-test rev-parse HEAD)
+git -C /tmp/projects/wt-branch-test checkout master >/dev/null 2>&1 || git -C /tmp/projects/wt-branch-test checkout main >/dev/null 2>&1
+# Second start: worktree dir exists, should force-update to new base
+api "$BASE" POST /api/sessions/start -d '{"name":"wt-rebase","project_dir":"/tmp/projects/wt-branch-test","worktree":true,"branch":"rebase-branch","base_branch":"rebase-base"}' >/dev/null
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'wt-rebase'"
+WT_DIR="$HOME/.ouija/worktrees/wt-branch-test/wt-rebase"
+# Verify HEAD matches the advanced commit
+wt_head=$(git -C "$WT_DIR" rev-parse HEAD 2>/dev/null)
+assert_eq "L14e: force-updated to new base_branch commit" "$wt_head" "$NEW_COMMIT"
+# Verify NOT in detached HEAD (branch name should appear in symbolic-ref)
+wt_ref=$(git -C "$WT_DIR" symbolic-ref --short HEAD 2>/dev/null || echo "DETACHED")
+assert_eq "L14e: on named branch, not detached" "$wt_ref" "rebase-branch"
+# Cleanup
+api "$BASE" POST /api/sessions/kill -d '{"name":"wt-rebase"}' >/dev/null 2>&1 || true
+sleep 1
+api "$BASE" POST /api/remove -d '{"id":"wt-rebase"}' >/dev/null 2>&1 || true
+git -C /tmp/projects/wt-branch-test worktree prune 2>/dev/null
+git -C /tmp/projects/wt-branch-test branch -D rebase-branch 2>/dev/null
+git -C /tmp/projects/wt-branch-test branch -D rebase-base 2>/dev/null
+
 rm -rf /tmp/projects/wt-branch-test
 
 # Install fake claude globally for prompt injection tests (L16-L18).
