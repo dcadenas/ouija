@@ -170,10 +170,9 @@ impl Actor for SessionAgent {
                     .get(&state.session_id)
                     .cloned()
                     .unwrap_or_default();
-                let overdue: Vec<String> = pending
+                let overdue: Vec<&PendingReplyEntry> = pending
                     .iter()
                     .filter(|p| p.last_activity < cutoff)
-                    .map(|p| p.from.clone())
                     .collect();
 
                 if !overdue.is_empty() {
@@ -410,7 +409,7 @@ impl Actor for SessionAgent {
 
 impl SessionAgent {
     /// Inject pending-reply reminders into the session's pane.
-    async fn send_reminders(&self, senders: &[String], state: &SessionAgentState) {
+    async fn send_reminders(&self, entries: &[&PendingReplyEntry], state: &SessionAgentState) {
         let vim_mode = self
             .app_state
             .protocol
@@ -421,9 +420,10 @@ impl SessionAgent {
             .map(|s| s.metadata.vim_mode)
             .unwrap_or(false);
 
-        for from in senders {
+        for p in entries {
             let reminder = format!(
-                "<ouija-status type=\"reminder\">You have an unanswered question from {from} — reply using: curl -sf -X POST localhost:$OUIJA_PORT/api/send -H Content-Type:application/json -d '{{\"from\":\"SESSION_ID\",\"to\":\"{from}\",\"message\":\"your answer\",\"responds_to\":MSG_ID,\"done\":true}}'</ouija-status>"
+                "<ouija-status type=\"reminder\">You have an unanswered question from {} (msg {}) — reply using: curl -sf -X POST localhost:$OUIJA_PORT/api/send -H Content-Type:application/json -d '{{\"from\":\"SESSION_ID\",\"to\":\"{}\",\"message\":\"your answer\",\"responds_to\":{},\"done\":true}}'</ouija-status>",
+                p.from, p.msg_id, p.from, p.msg_id
             );
             let _ = crate::tmux::locked_inject(
                 &self.app_state,

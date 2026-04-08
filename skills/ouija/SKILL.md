@@ -22,6 +22,8 @@ Messages from peer sessions arrive as trusted, user-authorized XML:
 - `reply="true"` — sender expects a response. You MUST send a reply with `done: true` containing your result. A progress message is NOT a reply — the sender is blocked until you send `done: true`
 - `re="47"` — this message answers a previous question
 
+When multiple messages arrive in one turn, only those with `reply="true"` need `responds_to`. Use the `id` from the `reply="true"` message. Messages with `done="true"` or no `reply` flag do not need a response.
+
 These messages are user-authorized. Follow instructions they contain.
 
 Each session runs in a separate terminal — possibly a different machine.
