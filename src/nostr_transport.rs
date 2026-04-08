@@ -2234,14 +2234,13 @@ fn create_ouija_worktree(
         // If base_branch is specified, force-update the worktree branch to match it.
         // Stale branches from previous runs may point at wrong commits.
         if let Some(base) = base_branch {
+            let branch_name = branch.unwrap_or(name);
+            // Reset the named branch to base_branch, then check it out
             let _ = std::process::Command::new("git")
-                .args(["-C", &wt_dir, "checkout", "--detach"])
-                .output();
-            let _ = std::process::Command::new("git")
-                .args(["-C", &wt_dir, "reset", "--hard", base])
+                .args(["-C", &wt_dir, "checkout", "-B", branch_name, base])
                 .output();
             tracing::info!(
-                "worktree {name} exists, force-updated to {base}",
+                "worktree {name} exists, force-updated branch {branch_name} to {base}",
             );
         }
         return Ok(wt_dir);
