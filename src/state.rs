@@ -945,15 +945,16 @@ impl AppState {
         proto.clear_orphaned_replies(removed_ids);
     }
 
-    /// If local session count exceeds `max_local_sessions`, return the most
-    /// idle sessions that should be closed to bring the count back to the limit.
+    /// If local session count exceeds `max_local_sessions`, return idle/stale
+    /// sessions that can be closed to bring the count back to the limit.
+    /// Only sessions with stale metadata are eligible — active sessions are never killed.
     pub async fn collect_excess_idle_sessions(&self) -> Vec<String> {
         let max = self.settings.read().await.max_local_sessions as usize;
         if max == 0 {
             return vec![];
         }
         let proto = self.protocol.read().await;
-        let mut local: Vec<_> = proto
+        let local: Vec<_> = proto
             .sessions
             .values()
             .filter(|s| matches!(s.origin, crate::daemon_protocol::Origin::Local))
@@ -961,11 +962,12 @@ impl AppState {
         if local.len() <= max {
             return vec![];
         }
-        // Sort by last activity (oldest activity first) so the most idle sessions are evicted.
-        // Use last_metadata_update as the activity signal, falling back to registered_at.
-        local.sort_by_key(|s| s.metadata.last_metadata_update.unwrap_or(s.registered_at));
         let excess = local.len() - max;
-        local[..excess].iter().map(|s| s.id.clone()).collect()
+        // Only consider stale sessions for eviction
+        let mut stale: Vec<_> = local.into_iter().filter(|s| s.metadata.is_stale()).collect();
+        // Sort by last activity (oldest first)
+        stale.sort_by_key(|s| s.metadata.last_metadata_update.unwrap_or(s.registered_at));
+        stale.iter().take(excess).map(|s| s.id.clone()).collect()
     }
 
     pub fn persist_sessions_from(&self, sessions: &HashMap<String, Session>) {
