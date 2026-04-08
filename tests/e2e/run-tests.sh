@@ -707,7 +707,7 @@ git -C /tmp/projects/wt-branch-test commit --allow-empty -m "init" >/dev/null 2>
 api "$BASE" POST /api/sessions/start -d '{"name":"wt-branch-default","project_dir":"/tmp/projects/wt-branch-test","worktree":true}' >/dev/null
 wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'wt-branch-default'"
 # Verify branch name equals session name (no wt/ prefix)
-wt_branch=$(git -C /tmp/projects/wt-branch-test branch --list 'wt-branch-default' | tr -d ' *')
+wt_branch=$(git -C /tmp/projects/wt-branch-test branch --list 'wt-branch-default' | tr -d ' *+')
 assert_eq "L14b: default branch is session name" "$wt_branch" "wt-branch-default"
 # Verify worktree dir exists
 test -d $HOME/.ouija/worktrees/wt-branch-test/wt-branch-default && pass "L14b: worktree dir exists" || fail "L14b: worktree dir" "exists" "missing"
@@ -721,7 +721,7 @@ log "Test L14c: Worktree with custom branch name"
 api "$BASE" POST /api/sessions/start -d '{"name":"wt-custom-branch","project_dir":"/tmp/projects/wt-branch-test","worktree":true,"branch":"feature/my-feature"}' >/dev/null
 wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'wt-custom-branch'"
 # Verify branch name is the custom one
-custom_branch=$(git -C /tmp/projects/wt-branch-test branch --list 'feature/my-feature' | tr -d ' *')
+custom_branch=$(git -C /tmp/projects/wt-branch-test branch --list 'feature/my-feature' | tr -d ' *+')
 assert_eq "L14c: custom branch name used" "$custom_branch" "feature/my-feature"
 # Verify worktree dir uses session name (not branch name)
 test -d $HOME/.ouija/worktrees/wt-branch-test/wt-custom-branch && pass "L14c: worktree dir uses session name" || fail "L14c: worktree dir" "exists" "missing"
@@ -746,9 +746,9 @@ assert_eq "L14d: branch created from base_branch" "$wt_parent" "$BASE_COMMIT"
 api "$BASE" POST /api/sessions/kill -d '{"name":"wt-base-branch"}' >/dev/null 2>&1 || true
 sleep 1
 api "$BASE" POST /api/remove -d '{"id":"wt-base-branch"}' >/dev/null 2>&1 || true
-git -C /tmp/projects/wt-branch-test worktree prune 2>/dev/null
-git -C /tmp/projects/wt-branch-test branch -D from-base 2>/dev/null
-git -C /tmp/projects/wt-branch-test branch -D base-feature 2>/dev/null
+git -C /tmp/projects/wt-branch-test worktree prune 2>/dev/null || true
+git -C /tmp/projects/wt-branch-test branch -D from-base 2>/dev/null || true
+git -C /tmp/projects/wt-branch-test branch -D base-feature 2>/dev/null || true
 
 log "Test L14e: Re-start existing worktree with new base_branch stays on named branch"
 # Create a base branch with a known commit
@@ -781,9 +781,9 @@ assert_eq "L14e: on named branch, not detached" "$wt_ref" "rebase-branch"
 api "$BASE" POST /api/sessions/kill -d '{"name":"wt-rebase"}' >/dev/null 2>&1 || true
 sleep 1
 api "$BASE" POST /api/remove -d '{"id":"wt-rebase"}' >/dev/null 2>&1 || true
-git -C /tmp/projects/wt-branch-test worktree prune 2>/dev/null
-git -C /tmp/projects/wt-branch-test branch -D rebase-branch 2>/dev/null
-git -C /tmp/projects/wt-branch-test branch -D rebase-base 2>/dev/null
+git -C /tmp/projects/wt-branch-test worktree prune 2>/dev/null || true
+git -C /tmp/projects/wt-branch-test branch -D rebase-branch 2>/dev/null || true
+git -C /tmp/projects/wt-branch-test branch -D rebase-base 2>/dev/null || true
 
 rm -rf /tmp/projects/wt-branch-test
 
