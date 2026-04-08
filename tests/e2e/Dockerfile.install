@@ -7,7 +7,6 @@ COPY hooks/ hooks/
 COPY scripts/ scripts/
 COPY skills/ skills/
 COPY opencode-plugin/ opencode-plugin/
-COPY .mcp.json ./
 RUN cargo build --release
 
 # Runtime stage — clean image with NO Rust, tmux, or claude.
