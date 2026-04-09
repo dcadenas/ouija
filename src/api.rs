@@ -104,9 +104,6 @@ pub async fn get_session(
                     "iteration": s.metadata.iteration,
                     "iteration_log": s.metadata.iteration_log,
                     "last_iteration_at": s.metadata.last_iteration_at,
-                    "workflow": s.metadata.workflow,
-                    "workflow_calls": s.metadata.workflow_calls,
-                    "workflow_max_calls": s.metadata.workflow_max_calls,
                 })),
             )
         }
@@ -148,9 +145,6 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
                 "iteration": s.metadata.iteration,
                 "iteration_log": s.metadata.iteration_log,
                 "last_iteration_at": s.metadata.last_iteration_at,
-                "workflow": s.metadata.workflow,
-                "workflow_calls": s.metadata.workflow_calls,
-                "workflow_max_calls": s.metadata.workflow_max_calls,
             })
         })
         .collect();
@@ -476,12 +470,6 @@ pub struct RegisterBody {
     /// Reminder text re-injected on idle.
     #[serde(default)]
     reminder: Option<String>,
-    /// Path to a workflow executable.
-    #[serde(default)]
-    workflow: Option<String>,
-    /// Maximum workflow calls allowed (daemon-enforced effort budget).
-    #[serde(default)]
-    workflow_max_calls: Option<u64>,
 }
 
 /// Register a new local session with optional metadata.
@@ -530,8 +518,6 @@ pub async fn register(
         vim_mode: metadata.vim_mode,
         backend: metadata.backend.clone(),
         reminder: metadata.reminder.clone(),
-        workflow: body.workflow,
-        workflow_max_calls: body.workflow_max_calls.unwrap_or(0),
         ..Default::default()
     };
     let effects = state
@@ -1459,12 +1445,6 @@ pub struct SessionNameBody {
     model: Option<String>,
     #[serde(default)]
     reminder: Option<String>,
-    /// Path to a workflow executable.
-    #[serde(default)]
-    workflow: Option<String>,
-    /// JSON params passed to the workflow on registration. Consumed at start, not persisted.
-    #[serde(default)]
-    workflow_params: Option<serde_json::Value>,
     /// Git branch name for worktree sessions. If omitted, defaults to the session name.
     #[serde(default)]
     branch: Option<String>,
@@ -1491,41 +1471,7 @@ pub async fn start_session(
     let name = body.name.clone();
     let state2 = state.clone();
     tokio::spawn(async move {
-        // Workflow registration (if configured) — must run before exists check
-        // because restart also needs the registered prompt/reminder.
-        let mut prompt = body.prompt;
-        let mut reminder = body.reminder;
-        let mut workflow_for_meta = None;
-        if let Some(ref wf) = body.workflow {
-            match crate::workflow::register_workflow(
-                &state2,
-                wf,
-                &body.name,
-                body.workflow_params.as_ref(),
-                body.project_dir.as_deref(),
-            )
-            .await
-            {
-                Ok(reg) => {
-                    let max_calls = reg.max_calls.unwrap_or(0);
-                    prompt = Some(match prompt.take() {
-                        Some(user_prompt) => format!("{}\n\n{user_prompt}", reg.instructions),
-                        None => reg.instructions,
-                    });
-                    if reminder.is_none() {
-                        reminder = reg.inject_on_start;
-                    }
-                    workflow_for_meta = Some((wf.clone(), max_calls));
-                }
-                Err(e) => {
-                    tracing::warn!("async workflow registration failed for {}: {e}", body.name);
-                    return;
-                }
-            }
-        }
-
         // If session already exists, restart with fresh context instead of failing.
-        // Handles re-spawn: reviewer requests changes → workflow spawns worker with same name.
         let exists = state2.protocol.read().await.sessions.contains_key(&body.name);
         if exists {
             tracing::info!("session '{}' exists, restarting with fresh context", body.name);
@@ -1533,49 +1479,32 @@ pub async fn start_session(
                 &state2,
                 &body.name,
                 true, // fresh
-                prompt.as_deref(),
+                body.prompt.as_deref(),
                 body.from.as_deref(),
                 None, // expects_reply not used for session start
                 body.backend.as_deref(),
                 body.model.as_deref(),
-                reminder.as_deref(),
+                body.reminder.as_deref(),
             )
             .await;
-
-            // Stamp workflow metadata and reset call counter for new round
-            if let Some((wf_path, max_calls)) = workflow_for_meta {
-                let mut proto = state2.protocol.write().await;
-                if let Some(session) = proto.sessions.get_mut(&body.name) {
-                    session.metadata.workflow = Some(wf_path);
-                    session.metadata.workflow_max_calls = max_calls;
-                    session.metadata.workflow_calls = 0;
-                }
-                state2.persist_protocol_state(&proto);
-            }
 
             tracing::info!("async session restart complete: {}", body.name);
             return;
         }
 
-        let (wf_path, wf_max) = match &workflow_for_meta {
-            Some((p, m)) => (Some(p.as_str()), *m),
-            None => (None, 0),
-        };
         let (result, _prompt_msg_id) = crate::nostr_transport::start_session(
             &state2,
             &body.name,
             body.worktree,
             body.project_dir.as_deref(),
-            prompt.as_deref(),
+            body.prompt.as_deref(),
             body.from.as_deref(),
             None, // expects_reply not used for session start
             body.backend.as_deref(),
             body.model.as_deref(),
-            reminder.as_deref(),
+            body.reminder.as_deref(),
             body.branch.as_deref(),
             body.base_branch.as_deref(),
-            wf_path,
-            wf_max,
         )
         .await;
 
@@ -1590,19 +1519,6 @@ pub async fn restart_session(
     State(state): State<SharedState>,
     Json(body): Json<SessionNameBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Snapshot metadata before restart (hook re-registration may wipe fields)
-    let meta_snapshot = {
-        let proto = state.protocol.read().await;
-        proto.sessions.get(&body.name).map(|s| {
-            (
-                s.metadata.workflow.clone(),
-                s.metadata.workflow_max_calls,
-                s.metadata.prompt.clone(),
-                s.metadata.reminder.clone(),
-            )
-        })
-    };
-
     let fresh = body.fresh.unwrap_or(false);
     let (result, _prompt_msg_id) = crate::nostr_transport::restart_session(
         &state,
@@ -1616,10 +1532,6 @@ pub async fn restart_session(
         body.reminder.as_deref(),
     )
     .await;
-
-    // No re-stamp needed: apply_register's inherit_recurrence_from preserves
-    // workflow/prompt/reminder even if the hook re-registers with blank metadata.
-    let _ = meta_snapshot;
 
     (StatusCode::OK, Json(json!({ "result": result })))
 }
@@ -1783,91 +1695,6 @@ pub async fn backend_session_ready(
     };
     let delivered = deliver_pending_prompt(&state, &name);
     Json(json!({"delivered": delivered, "session": name}))
-}
-
-/// Call a session's workflow actor via REST.
-/// Transparent proxy: injects session_id, forwards raw JSON to the workflow endpoint.
-pub async fn call_session_workflow(
-    State(state): State<SharedState>,
-    axum::extract::Path(session_id): axum::extract::Path<String>,
-    Json(mut body): Json<serde_json::Value>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    // Extract action for the call budget counter
-    let action = body
-        .as_object()
-        .and_then(|o| o.get("action"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    if action.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "missing 'action' field"})),
-        );
-    }
-
-    let (workflow_path, project_dir) = {
-        let mut proto = state.protocol.write().await;
-        match proto.sessions.get_mut(&session_id) {
-            Some(s) => {
-                // Enforce effort budget
-                if s.metadata.workflow_max_calls > 0
-                    && s.metadata.workflow_calls >= s.metadata.workflow_max_calls
-                {
-                    return (
-                        StatusCode::TOO_MANY_REQUESTS,
-                        Json(json!({
-                            "error": format!(
-                                "workflow call budget exhausted ({} of {} calls used)",
-                                s.metadata.workflow_calls, s.metadata.workflow_max_calls
-                            )
-                        })),
-                    );
-                }
-                s.metadata.workflow_calls += 1;
-                let result = (
-                    s.metadata.workflow.clone(),
-                    s.metadata.project_dir.clone(),
-                );
-                state.persist_protocol_state(&proto);
-                result
-            }
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({"error": format!("session '{}' not found", session_id)})),
-                );
-            }
-        }
-    };
-
-    let Some(workflow_path) = workflow_path else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "session has no workflow configured"})),
-        );
-    };
-
-    // Inject session_id into the body and forward as-is
-    if let Some(obj) = body.as_object_mut() {
-        obj.insert("session_id".into(), serde_json::Value::String(session_id.clone()));
-    }
-
-    match crate::workflow::call_workflow_raw(
-        &state,
-        &workflow_path,
-        &body,
-        project_dir.as_deref(),
-    )
-    .await
-    {
-        Ok(message) => (StatusCode::OK, Json(json!({"message": message}))),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("workflow error: {e}")})),
-        ),
-    }
 }
 
 /// List indexed projects from the configured projects directory.

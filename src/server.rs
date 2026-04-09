@@ -48,7 +48,7 @@ pub async fn run(state: SharedState) -> anyhow::Result<()> {
                 .delete(api::remove_human),
         )
         .route("/api/sessions/{name}", get(api::get_session))
-        .route("/api/sessions/{session_id}/workflow", post(api::call_session_workflow))
+
         .route("/api/sessions/kill", post(api::kill_session))
         .route("/api/sessions/start", post(api::start_session))
         .route("/api/sessions/restart", post(api::restart_session))

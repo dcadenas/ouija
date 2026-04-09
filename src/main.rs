@@ -16,7 +16,7 @@ mod state;
 mod tmux;
 mod tmux_var;
 mod transport;
-mod workflow;
+
 
 use anyhow::Context;
 use backend::CodingAssistant;

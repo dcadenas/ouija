@@ -119,15 +119,6 @@ pub struct SessionMeta {
     /// What happens each time a scheduled task fires for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_fire: Option<crate::scheduler::OnFire>,
-    /// Path to a workflow executable. When set, this session is workflow-driven.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workflow: Option<String>,
-    /// Number of workflow() calls made by this session.
-    #[serde(default)]
-    pub workflow_calls: u64,
-    /// Maximum workflow calls allowed (set by workflow at registration). 0 = unlimited.
-    #[serde(default)]
-    pub workflow_max_calls: u64,
 }
 
 /// Metadata becomes stale after 30 minutes without an update.
@@ -164,15 +155,6 @@ impl SessionMeta {
         if self.on_fire.is_none() {
             self.on_fire = source.on_fire.clone();
         }
-        if self.workflow.is_none() {
-            self.workflow = source.workflow.clone();
-        }
-        if self.workflow_calls == 0 && source.workflow_calls > 0 {
-            self.workflow_calls = source.workflow_calls;
-        }
-        if self.workflow_max_calls == 0 && source.workflow_max_calls > 0 {
-            self.workflow_max_calls = source.workflow_max_calls;
-        }
     }
 }
 
@@ -196,9 +178,6 @@ impl Default for SessionMeta {
             iteration_log: Vec::new(),
             last_iteration_at: None,
             on_fire: None,
-            workflow: None,
-            workflow_calls: 0,
-            workflow_max_calls: 0,
         }
     }
 }
@@ -391,14 +370,6 @@ pub enum Effect {
     CleanupWorktree {
         project_dir: String,
     },
-
-    // Workflow lifecycle
-    NotifyWorkflow {
-        workflow_path: String,
-        event: String,
-        session_id: String,
-        project_dir: Option<String>,
-    },
 }
 
 /// Severity level for log effects emitted by the state machine.
@@ -476,9 +447,6 @@ fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>) -> Sessio
             iteration_log: m.iteration_log.clone(),
             last_iteration_at: m.last_iteration_at,
             on_fire: m.on_fire.clone(),
-            workflow: m.workflow.clone(),
-            workflow_calls: m.workflow_calls,
-            workflow_max_calls: m.workflow_max_calls,
         },
         None => SessionMeta::default(),
     }
@@ -887,16 +855,6 @@ impl DaemonState {
             },
         ));
         effects.push(Effect::BroadcastSessionList);
-
-        // Notify workflow if this session was workflow-driven
-        if let Some(ref wf) = session.metadata.workflow {
-            effects.push(Effect::NotifyWorkflow {
-                workflow_path: wf.clone(),
-                event: "session_died".into(),
-                session_id: id.to_string(),
-                project_dir: session.metadata.project_dir.clone(),
-            });
-        }
 
         effects.push(Effect::RemoveOk { id: id.to_string() });
 
@@ -3336,12 +3294,11 @@ mod stateright_model {
         Register {
             id: String,
         },
-        /// Register with metadata fields (project_dir, workflow, prompt, reminder)
+        /// Register with metadata fields (project_dir, prompt, reminder)
         /// to exercise inherit_recurrence_from and worktree cleanup paths.
         RegisterWithMeta {
             id: String,
             project_dir: Option<String>,
-            workflow: Option<String>,
             prompt: Option<String>,
             reminder: Option<String>,
         },
@@ -3416,7 +3373,6 @@ mod stateright_model {
         RegisterWithMeta {
             id: String,
             project_dir: Option<String>,
-            workflow: Option<String>,
             prompt: Option<String>,
             reminder: Option<String>,
         },
@@ -3577,7 +3533,6 @@ mod stateright_model {
                         ModelMsg::RegisterWithMeta {
                             id,
                             project_dir,
-                            workflow,
                             prompt,
                             reminder,
                         } => Event::Register {
@@ -3586,7 +3541,6 @@ mod stateright_model {
                             metadata: SessionMeta {
                                 networked: true,
                                 project_dir,
-                                workflow,
                                 prompt,
                                 reminder,
                                 ..Default::default()
@@ -3776,7 +3730,6 @@ mod stateright_model {
                         ModelAction::RegisterWithMeta {
                             id,
                             project_dir,
-                            workflow,
                             prompt,
                             reminder,
                         } => o.send(
@@ -3784,7 +3737,6 @@ mod stateright_model {
                             ModelMsg::RegisterWithMeta {
                                 id: id.clone(),
                                 project_dir: project_dir.clone(),
-                                workflow: workflow.clone(),
                                 prompt: prompt.clone(),
                                 reminder: reminder.clone(),
                             },
@@ -4006,7 +3958,6 @@ mod stateright_model {
             c.push(ModelAction::RegisterWithMeta {
                 id: id.to_string(),
                 project_dir: Some(MODEL_WORKTREE_DIR.to_string()),
-                workflow: Some("test-workflow.py".to_string()),
                 prompt: Some("model-prompt".to_string()),
                 reminder: Some("model-reminder".to_string()),
             });
@@ -4269,30 +4220,6 @@ mod stateright_model {
         true
     }
 
-    /// Re-registering a session preserves recurrence fields (prompt, reminder,
-    /// iteration, workflow) that were set by the prior registration. This
-    /// verifies inherit_recurrence_from works correctly: if workflow_calls > 0
-    /// or workflow_max_calls > 0, the workflow path must still be set.
-    fn check_recurrence_preserved_on_reregister(
-        _: &ActorModel<ModelActor, ()>,
-        state: &<ActorModel<ModelActor, ()> as Model>::State,
-    ) -> bool {
-        for ds in daemon_states(&state.actor_states) {
-            for entry in ds.sessions.values() {
-                if !matches!(entry.origin, Origin::Local) {
-                    continue;
-                }
-                if entry.metadata.workflow_calls > 0 && entry.metadata.workflow.is_none() {
-                    return false;
-                }
-                if entry.metadata.workflow_max_calls > 0 && entry.metadata.workflow.is_none() {
-                    return false;
-                }
-            }
-        }
-        true
-    }
-
     /// Liveness: the model exercises worktree cleanup at least once.
     fn check_some_worktree_cleanup(
         _: &ActorModel<ModelActor, ()>,
@@ -4307,16 +4234,6 @@ mod stateright_model {
                 } if !last_cleaned_worktrees.is_empty()
             )
         })
-    }
-
-    /// Liveness: some state has sessions with workflow metadata set.
-    fn check_some_workflow_sessions(
-        _: &ActorModel<ModelActor, ()>,
-        state: &<ActorModel<ModelActor, ()> as Model>::State,
-    ) -> bool {
-        daemon_states(&state.actor_states)
-            .iter()
-            .any(|ds| ds.sessions.values().any(|s| s.metadata.workflow.is_some()))
     }
 
     /// Liveness: the model exercises the ReapDead path.
@@ -4397,11 +4314,6 @@ mod stateright_model {
                 "reap never cleans worktree",
                 check_reap_never_cleans_worktree,
             )
-            .property(
-                Expectation::Always,
-                "recurrence preserved on reregister",
-                check_recurrence_preserved_on_reregister,
-            )
             .property(Expectation::Sometimes, "registered", check_some_registered)
             .property(Expectation::Sometimes, "remote visible", check_some_remote)
             .property(
@@ -4423,11 +4335,6 @@ mod stateright_model {
                 Expectation::Sometimes,
                 "worktree cleanup exercised",
                 check_some_worktree_cleanup,
-            )
-            .property(
-                Expectation::Sometimes,
-                "workflow sessions exist",
-                check_some_workflow_sessions,
             )
             .property(
                 Expectation::Sometimes,
