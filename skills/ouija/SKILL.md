@@ -88,7 +88,6 @@ Key fields:
   - **Self-terminate**: "When done, kill yourself: curl -X POST .../api/sessions/kill ..."
   - **Periodic check**: "If idle, check deploy status and report if complete"
   - **Escalate**: "If stuck, message the coordinator for help"
-- `workflow` — attach a workflow executable (see section 5)
 - `worktree: true` — isolate in a git worktree (created at `~/.ouija/worktrees/<repo>/<session>`)
   - `branch` — git branch name. Defaults to session name if omitted
   - `base_branch` — create branch from this ref (e.g. `"main"`). Defaults to HEAD if omitted
@@ -106,22 +105,7 @@ curl -sf -X POST localhost:7880/api/sessions/kill \
   -d '{"name":"session-id"}'
 ```
 
-## 5. Workflows
-
-If your session was started with a workflow, interact with it:
-```bash
-curl -sf -X POST "localhost:7880/api/sessions/YOUR_ID/workflow" \
-  -H 'Content-Type: application/json' \
-  -d '{"action":"init"}'
-```
-
-Common rhythm:
-1. `action: "init"` — get current state and next task
-2. Do the work
-3. `action: "done"` or `action: "result"` — report back
-4. Follow the workflow's response for next step
-
-## 6. Task scheduling
+## 5. Task scheduling
 
 ```bash
 # Create a scheduled task (cron in UTC):

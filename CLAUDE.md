@@ -35,12 +35,11 @@ When adding features: update `DaemonState::apply()` first, then wire up effects.
 
 - **`daemon_protocol.rs`** — `DaemonState`, `Event` enum, `Effect` enum, all session logic. The heart of ouija.
 - **`state.rs`** — `AppState` wraps DaemonState in `Arc<RwLock>`, owns transports, executes effects.
-- **`api.rs`** — REST endpoints: `/api/send`, `/api/sessions/start`, `/api/sessions/restart`, tasks, workflows.
+- **`api.rs`** — REST endpoints: `/api/send`, `/api/sessions/start`, `/api/sessions/restart`, tasks.
 - **`hooks.rs`** — Endpoints called by Claude Code hooks: session-start, session-end, stop, prompt-submit, pre-tool-use.
 - **`nostr_transport.rs`** — Nostr P2P messaging (NIP-17 encrypted DMs), session start/restart/kill orchestration.
 - **`session_agent.rs`** — Per-pane Ractor actor: idle timers, loop stall detection, reminder injection.
 - **`scheduler.rs`** — Cron tasks with `OnFire` modes (ContinueSession, NewSession, PersistentWorktree, DisposableWorktree).
-- **`workflow.rs`** — External executables that guide LLM sessions via stdin/stdout JSON protocol.
 - **`backend/claude_code.rs`** — Claude Code integration: CLI command building, plugin bootstrap, workspace trust.
 - **`backend/opencode.rs`** — OpenCode integration: HTTP API delivery mode.
 - **`tmux.rs`** — Pane discovery, message injection with bracketed paste, vim-mode detection.

@@ -1106,7 +1106,7 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         kill_session(state, name).await
     } else if let Some(rest) = cmd.strip_prefix("/start ") {
         let name = rest.trim();
-        start_session(state, name, None, None, None, None, None, None, None, None, None, None, None, 0)
+        start_session(state, name, None, None, None, None, None, None, None, None, None, None)
             .await
             .0
     } else if let Some(rest) = cmd.strip_prefix("/restart ") {
@@ -1315,8 +1315,6 @@ pub async fn start_session(
     reminder: Option<&str>,
     branch: Option<&str>,
     base_branch: Option<&str>,
-    workflow: Option<&str>,
-    workflow_max_calls: u64,
 ) -> (String, Option<u64>) {
     // Check if already exists
     if state.protocol.read().await.sessions.contains_key(name) {
@@ -1543,8 +1541,6 @@ pub async fn start_session(
                 model: model.map(String::from),
                 reminder: reminder.map(String::from),
                 prompt: prompt.map(String::from),
-                workflow: workflow.map(String::from),
-                workflow_max_calls,
                 ..Default::default()
             };
             state
@@ -1710,7 +1706,7 @@ pub async fn restart_session(
     }
 
     // No Remove before restart: keep the session in state so that
-    // inherit_recurrence_from preserves metadata (workflow, prompt, reminder).
+    // inherit_recurrence_from preserves metadata (prompt, reminder).
     // The subsequent Register re-registers in place — apply_register handles
     // old pane cleanup and agent restart when the pane changes.
     //
@@ -2003,9 +1999,6 @@ pub async fn restart_session(
                     iteration_log: m.iteration_log.clone(),
                     last_iteration_at: m.last_iteration_at,
                     on_fire: m.on_fire.clone(),
-                    workflow: m.workflow.clone(),
-                    workflow_calls: m.workflow_calls,
-                    workflow_max_calls: m.workflow_max_calls,
                 },
                 None => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),
