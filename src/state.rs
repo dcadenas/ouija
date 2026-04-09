@@ -123,7 +123,8 @@ pub struct AppState {
     pub perfire_worktree_panes: RwLock<HashMap<String, String>>,
     pub backends: crate::backend::BackendRegistry,
     pub http_client: reqwest::Client,
-    /// Queued prompts waiting for a readiness signal from HttpApi sessions.
+    /// Queued prompts for HttpApi sessions awaiting a readiness signal.
+    /// TuiInjection sessions pass prompts as CLI args instead.
     /// Maps session_id -> (pane_id, prompt_text).
     pub pending_prompts: std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
     /// Per-session baseline snapshots used to compute diffs in hook handlers.
