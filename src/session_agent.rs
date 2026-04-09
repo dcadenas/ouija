@@ -338,9 +338,10 @@ impl Actor for SessionAgent {
                     );
 
                     // Inject reminder text if present, otherwise a default nudge (once)
+                    let port = self.app_state.config.port;
                     if let Some(ref reminder_text) = reminder {
                         let wrapped = format!(
-                            "<ouija-status type=\"reminder\" clearing_id=\"{clearing_id}\">{reminder_text}\n\nIf you have completed all pending work, call: curl -sf -X POST localhost:${{OUIJA_PORT:-7880}}/api/clear-reminder -H Content-Type:application/json -d '{{\"from\":\"{}\",\"clearing_id\":{clearing_id}}}' to stop this reminder.</ouija-status>",
+                            "<ouija-status type=\"reminder\" clearing_id=\"{clearing_id}\">{reminder_text}\n\nIf you have completed all pending work, call: curl -sf -X POST localhost:{port}/api/clear-reminder -H Content-Type:application/json -d '{{\"from\":\"{}\",\"clearing_id\":{clearing_id}}}' to stop this reminder.</ouija-status>",
                             state.session_id
                         );
                         let _ = crate::tmux::locked_inject(
@@ -420,9 +421,10 @@ impl SessionAgent {
             .map(|s| s.metadata.vim_mode)
             .unwrap_or(false);
 
+        let port = self.app_state.config.port;
         for p in entries {
             let reminder = format!(
-                "<ouija-status type=\"reminder\">You have an unanswered question from {} (msg {}) — reply using: curl -sf -X POST localhost:${{OUIJA_PORT:-7880}}/api/send -H Content-Type:application/json -d '{{\"from\":\"SESSION_ID\",\"to\":\"{}\",\"message\":\"your answer\",\"responds_to\":{},\"done\":true}}'</ouija-status>",
+                "<ouija-status type=\"reminder\">You have an unanswered question from {} (msg {}) — reply using: curl -sf -X POST localhost:{port}/api/send -H Content-Type:application/json -d '{{\"from\":\"SESSION_ID\",\"to\":\"{}\",\"message\":\"your answer\",\"responds_to\":{},\"done\":true}}'</ouija-status>",
                 p.from, p.msg_id, p.from, p.msg_id
             );
             let _ = crate::tmux::locked_inject(
