@@ -602,8 +602,13 @@ async fn revive_and_inject(
             })
     };
 
-    // Pass prompt as CLI arg so Claude loads CLAUDE.md before processing it
-    let full_launch_cmd = if clears_context {
+    // Pass prompt as CLI arg so Claude loads CLAUDE.md before processing it.
+    // TuiInjection always uses CLI arg; HttpApi only when starting fresh.
+    let is_tui = matches!(
+        backend.delivery_mode(),
+        crate::backend::DeliveryMode::TuiInjection
+    );
+    let full_launch_cmd = if clears_context || is_tui {
         if let Some(ref prompt) = task.prompt {
             let full_text = match &task.reminder {
                 Some(r) => format!("{prompt}\n\n{r}"),
@@ -759,13 +764,21 @@ async fn revive_and_inject(
         }
     }
 
-    // Inject prompt into the revived session
-    if let Some(ref prompt) = task.prompt {
-        let full_text = match &task.reminder {
-            Some(r) => format!("{prompt}\n\n{r}"),
-            None => prompt.clone(),
-        };
-        crate::nostr_transport::schedule_prompt_injection(state, task.session_name(), new_pane.clone(), full_text);
+    // HttpApi: deliver prompt via schedule_prompt_injection (readiness signal).
+    // TuiInjection prompt was already passed as CLI arg above.
+    if !is_tui {
+        if let Some(ref prompt) = task.prompt {
+            let full_text = match &task.reminder {
+                Some(r) => format!("{prompt}\n\n{r}"),
+                None => prompt.clone(),
+            };
+            crate::nostr_transport::schedule_prompt_injection(
+                state,
+                task.session_name(),
+                new_pane.clone(),
+                full_text,
+            );
+        }
     }
 
     Ok(new_pane)
