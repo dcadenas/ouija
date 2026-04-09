@@ -37,33 +37,10 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 
 **Spawn sessions on the fly.** Ask the assistant to start a new session (e.g. "use ouija to start a gateway-debug session"). The daemon creates a tmux window, launches a coding session, and registers it. You can specify a prompt to seed the session with context and a backend (`claude-code` or `opencode`).
 
-**Long-running work.** Three mechanisms for recurring work, from simple to structured:
+**Long-running work.** Two mechanisms for recurring work:
 
-- **Loops** (legacy) -- the session drives itself. Simple but limited — no state management, verification, or coordination. Still works for quick one-off migrations; prefer **workflows** for new work.
+- **Loops** -- the session drives itself. Simple — the session's prompt and reminder tell it what to do and how to signal completion. The daemon handles the restart cycle.
 - **Tasks** (cron) -- the daemon drives the session. Good for periodic checks, daily reports, scheduled maintenance. If the target session is dead, the daemon revives it with the task's prompt + reminder.
-- **Workflows** -- a deterministic program drives the session. Good for multi-phase processes, optimization loops, coordinated multi-session work. The LLM calls the workflow endpoint via the ouija skill; the program controls state, verification, and progression.
-
-Simple loops restart with clean context each iteration — the session's prompt and reminder tell it what to do and how to signal completion. The daemon handles the restart cycle.
-
-> **Note:** Loops are the legacy approach. For new long-running work, use workflows — they provide state management, verification criteria, effort budgets, and multi-session coordination. See [migrating from loops](docs/workflows.md#migrating-from-loopnext) below.
-
-**Workflow actors** attach an external executable (Python, bash, anything) to a session. The program manages state, runs verification, and tells the LLM what to do — one step at a time. The LLM doesn't see the full process; each workflow response reveals only the current step and what to call next, like [HATEOAS](https://en.wikipedia.org/wiki/HATEOAS) for an LLM.
-
-Start a workflow session via the REST API (`POST /api/sessions`) or ask the assistant to start one with a workflow path and parameters. The daemon spawns the session, registers the workflow, and the LLM begins calling the workflow endpoint.
-
-The workflow handles [autoresearch-style](https://github.com/karpathy/autoresearch) optimization: the LLM makes one change, measures, reports the result via the workflow endpoint, and the workflow commits improvements, reverts regressions, tracks history in a TSV, and accumulates findings that survive context restarts. The daemon enforces call budgets and detects stalls.
-
-The prompt doesn't describe the process — the workflow discloses it incrementally:
-
-```
-LLM calls workflow('init')
-  -> "Iteration 3/30. Best: 0.89. Make one change, measure, report the result."
-
-LLM calls workflow('result', {score: 0.91, description: "batched queries"})
-  -> "New best! Committed. 27 remaining. Call workflow('init') for next iteration."
-```
-
-Workflows can coordinate multiple sessions — spawning workers and reviewers via the REST API, gating progress on test results, replacing an entire coordinator LLM with deterministic code. See the [workflow docs](docs/workflows.md) for the full architecture and [`examples/`](examples/) for a reference implementation.
 
 **Peer-to-peer collaboration.** No hierarchy. Two long-running sessions can message each other directly — one optimizing a skill while the other evaluates results, or one migrating files while the other reviews the diffs. They coordinate through the ouija skill's send capability, not through a central orchestrator.
 
