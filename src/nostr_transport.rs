@@ -1504,9 +1504,11 @@ pub async fn start_session(
                 ])
                 .status();
 
-            // Launch backend (with prompt as CLI arg if available)
+            // Launch backend (with prompt as CLI arg if available).
+            // Leading space keeps the command out of shell history.
+            let hidden_cmd = format!(" {full_cmd}");
             Command::new("tmux")
-                .args(["send-keys", "-t", &pane_id, &full_cmd, "Enter"])
+                .args(["send-keys", "-t", &pane_id, &hidden_cmd, "Enter"])
                 .status()?;
 
             Ok(pane_id)
@@ -1851,8 +1853,9 @@ pub async fn restart_session(
                         if is_http_api {
                             // Give the fresh shell a moment to initialise
                             std::thread::sleep(std::time::Duration::from_millis(300));
+                            let hidden = format!(" {full_cmd}");
                             let _ = Command::new("tmux")
-                                .args(["send-keys", "-t", pane, &full_cmd, "Enter"])
+                                .args(["send-keys", "-t", pane, &hidden, "Enter"])
                                 .status();
                         }
                         tracing::info!("restart: respawn-pane {pane} succeeded");
@@ -1925,8 +1928,9 @@ pub async fn restart_session(
                 ])
                 .status();
 
+            let hidden_cmd = format!(" {full_cmd}");
             Command::new("tmux")
-                .args(["send-keys", "-t", &pane_id, &full_cmd, "Enter"])
+                .args(["send-keys", "-t", &pane_id, &hidden_cmd, "Enter"])
                 .status()?;
 
             Ok(pane_id)
@@ -2222,8 +2226,9 @@ async fn setup_shared_serve_session(
     tokio::task::spawn_blocking(move || {
         // Small delay so the pane shell is ready
         std::thread::sleep(std::time::Duration::from_millis(300));
+        let hidden = format!(" {attach_cmd}");
         let _ = std::process::Command::new("tmux")
-            .args(["send-keys", "-t", &pane, &attach_cmd, "Enter"])
+            .args(["send-keys", "-t", &pane, &hidden, "Enter"])
             .status();
     });
 
