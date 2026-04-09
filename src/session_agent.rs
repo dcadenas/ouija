@@ -48,6 +48,10 @@ pub enum SessionMsg {
     LoopHardStall,
     /// MCP tool called: session acknowledged the reminder.
     ClearReminder { clearing_id: u64 },
+    /// Store a pending continuation to inject after compact completes.
+    SetPendingCompactContinuation(String),
+    /// Drain (take + clear) the pending compact continuation (RPC).
+    DrainPendingCompactContinuation(ractor::RpcReplyPort<Option<String>>),
     /// Internal: watchdog timer expired (no Active or Stopped within 2x idle_timeout).
     WatchdogTimeout,
 }
@@ -71,6 +75,8 @@ pub struct SessionAgentState {
     /// Watchdog: fires if no Active or Stopped within 2x idle_timeout.
     /// Catches sessions stuck mid-turn (API errors, crashes).
     watchdog_timer: Option<JoinHandle<Result<(), MessagingErr<SessionMsg>>>>,
+    /// One-shot continuation text to inject after compact completes.
+    pub pending_compact_continuation: Option<String>,
 }
 
 impl std::fmt::Debug for SessionAgentState {
@@ -98,6 +104,7 @@ impl SessionAgentState {
             reminder_cleared: false,
             next_clearing_id: 0,
             watchdog_timer: None,
+            pending_compact_continuation: None,
         }
     }
 }
@@ -290,6 +297,14 @@ impl Actor for SessionAgent {
                         clearing_id,
                         "reminder cleared by session"
                     );
+                }
+            }
+            SessionMsg::SetPendingCompactContinuation(text) => {
+                state.pending_compact_continuation = Some(text);
+            }
+            SessionMsg::DrainPendingCompactContinuation(reply) => {
+                if !reply.is_closed() {
+                    let _ = reply.send(state.pending_compact_continuation.take());
                 }
             }
             SessionMsg::WatchdogTimeout => {

@@ -939,6 +939,24 @@ impl AppState {
         }
     }
 
+    /// Drain the pending compact continuation from a session agent (RPC).
+    /// Returns None if the agent has no pending continuation or the session has no agent.
+    pub async fn drain_agent_compact_continuation(
+        &self,
+        session_id: &str,
+    ) -> Option<String> {
+        let agents = self.session_agents.read().await;
+        if let Some(agent) = agents.get(session_id) {
+            ractor::call!(
+                agent,
+                crate::session_agent::SessionMsg::DrainPendingCompactContinuation
+            )
+            .unwrap_or(None)
+        } else {
+            None
+        }
+    }
+
     /// Clear pending replies targeting removed sessions from protocol state.
     pub(crate) async fn clear_orphaned_pending_replies(&self, removed_ids: &[String]) {
         let mut proto = self.protocol.write().await;

@@ -64,6 +64,7 @@ mod embedded {
     pub const SCRIPT_PROMPT_SUBMIT: &str = include_str!("../../scripts/ouija-prompt-submit.sh");
     pub const SCRIPT_REGISTER: &str = include_str!("../../scripts/ouija-register.sh");
     pub const SCRIPT_STATUSLINE: &str = include_str!("../../scripts/ouija-statusline.sh");
+    pub const SCRIPT_POST_COMPACT: &str = include_str!("../../scripts/post-compact.sh");
     pub const SCRIPT_UNREGISTER: &str = include_str!("../../scripts/ouija-unregister.sh");
 
     pub const SKILLS_PEER_TRUST: &str = include_str!("../../skills/ouija/SKILL.md");
@@ -90,6 +91,7 @@ fn write_embedded_plugin_files(cache_dir: &std::path::Path) {
         ("scripts/ouija-register.sh", embedded::SCRIPT_REGISTER),
         ("scripts/ouija-statusline.sh", embedded::SCRIPT_STATUSLINE),
         ("scripts/ouija-unregister.sh", embedded::SCRIPT_UNREGISTER),
+        ("scripts/post-compact.sh", embedded::SCRIPT_POST_COMPACT),
         ("skills/ouija/SKILL.md", embedded::SKILLS_PEER_TRUST),
         (".claude-plugin/plugin.json", embedded::PLUGIN_JSON),
         (".claude-plugin/marketplace.json", embedded::MARKETPLACE_JSON),
@@ -468,6 +470,10 @@ impl CodingAssistant for ClaudeCode {
 
     fn has_project_history(&self, dir: &Path) -> bool {
         dir.join(".claude").is_dir()
+    }
+
+    fn compact_command(&self) -> Option<&str> {
+        Some("/compact")
     }
 
     fn exit_command(&self) -> Option<&str> {

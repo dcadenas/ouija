@@ -300,6 +300,64 @@ async fn pre_tool_use_inner(
     json!({ "block": false })
 }
 
+/// POST /api/hooks/post-compact
+pub async fn post_compact(
+    State(state): State<SharedState>,
+    Json(body): Json<PaneBody>,
+) -> (StatusCode, Json<Value>) {
+    let result = post_compact_inner(&state, body).await;
+    (StatusCode::OK, Json(result))
+}
+
+async fn post_compact_inner(
+    state: &std::sync::Arc<crate::state::AppState>,
+    body: PaneBody,
+) -> Value {
+    let session_id = match state
+        .find_session_by_pane_or_backend_sid(
+            body.pane.as_deref(),
+            body.backend_session_id.as_deref(),
+        )
+        .await
+    {
+        Some(id) => id,
+        None => return json!({ "ok": true, "continuation_injected": false }),
+    };
+
+    // Drain the pending continuation from the agent (RPC — atomically take + clear)
+    let continuation = state
+        .drain_agent_compact_continuation(&session_id)
+        .await;
+
+    let Some(continuation) = continuation else {
+        return json!({ "ok": true, "continuation_injected": false });
+    };
+
+    // Look up pane for injection
+    let pane = {
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.pane.clone())
+    };
+    let Some(pane) = pane else {
+        return json!({ "ok": true, "continuation_injected": false, "error": "no pane" });
+    };
+
+    if let Err(e) =
+        crate::tmux::locked_inject(state, &session_id, &pane, &continuation, false).await
+    {
+        tracing::warn!(
+            session = %session_id,
+            "post-compact continuation injection failed: {e}"
+        );
+        return json!({ "ok": false, "error": e.to_string() });
+    }
+
+    json!({ "ok": true, "continuation_injected": true })
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SessionStartBody {
     pub pane: String,
@@ -641,5 +699,71 @@ mod tests {
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "ouija");
+    }
+
+    #[tokio::test]
+    async fn post_compact_no_session_returns_ok() {
+        let state = crate::state::AppState::new_for_test();
+        let body = PaneBody {
+            pane: Some("%999".into()),
+            backend_session_id: None,
+        };
+        let result = post_compact_inner(&state, body).await;
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["continuation_injected"], false);
+    }
+
+    #[tokio::test]
+    async fn post_compact_no_pending_continuation() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "compact-test".into(),
+                pane: Some("%88".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        let body = PaneBody {
+            pane: Some("%88".into()),
+            backend_session_id: None,
+        };
+        let result = post_compact_inner(&state, body).await;
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["continuation_injected"], false);
+    }
+
+    #[tokio::test]
+    async fn post_compact_drains_and_clears_continuation() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "drain-test".into(),
+                pane: Some("%77".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        // Set a pending continuation via the agent
+        state
+            .notify_agent(
+                "drain-test",
+                crate::session_agent::SessionMsg::SetPendingCompactContinuation(
+                    "Continue working.".into(),
+                ),
+            )
+            .await;
+        // Give the agent a moment to process the message
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Drain should return the continuation
+        let continuation = state
+            .drain_agent_compact_continuation("drain-test")
+            .await;
+        assert_eq!(continuation.as_deref(), Some("Continue working."));
+
+        // Second drain should return None (one-shot)
+        let continuation = state
+            .drain_agent_compact_continuation("drain-test")
+            .await;
+        assert_eq!(continuation, None);
     }
 }
