@@ -1418,7 +1418,7 @@ pub async fn start_session(
     // CLI argument. This ensures Claude Code loads CLAUDE.md and rules before
     // processing the prompt (tmux injection can race with context loading).
     let prompt_file = if let Some((ref prompt_text, _)) = pre_queued_prompt {
-        let prompt_path = format!("/tmp/ouija-prompt-{}.txt", name);
+        let prompt_path = format!("/tmp/ouija-prompt-{}.txt", name.replace('/', "-"));
         std::fs::write(&prompt_path, prompt_text).ok();
         Some(prompt_path)
     } else {

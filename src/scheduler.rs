@@ -461,7 +461,7 @@ async fn respawn_and_inject(
             Some(r) => format!("{prompt}\n\n{r}"),
             None => prompt.clone(),
         };
-        let prompt_path = format!("/tmp/ouija-prompt-{}.txt", task_name);
+        let prompt_path = format!("/tmp/ouija-prompt-{}.txt", task_name.replace('/', "-"));
         let _ = std::fs::write(&prompt_path, &full_text);
         let escaped_pf = shell_escape(&prompt_path);
         format!("{claude_cmd} \"$(cat {escaped_pf})\" ; rm -f {escaped_pf}")
@@ -614,7 +614,7 @@ async fn revive_and_inject(
                 Some(r) => format!("{prompt}\n\n{r}"),
                 None => prompt.clone(),
             };
-            let prompt_path = format!("/tmp/ouija-prompt-{}.txt", task.name);
+            let prompt_path = format!("/tmp/ouija-prompt-{}.txt", task.name.replace('/', "-"));
             let _ = std::fs::write(&prompt_path, &full_text);
             let escaped_pf = shell_escape(&prompt_path);
             format!("{launch_cmd} \"$(cat {escaped_pf})\" ; rm -f {escaped_pf}")
