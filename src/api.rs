@@ -828,6 +828,77 @@ pub async fn inject(
     }
 }
 
+// --- Compact ---
+
+#[derive(Debug, Deserialize)]
+pub struct CompactBody {
+    #[serde(default)]
+    pub continuation: Option<String>,
+}
+
+/// Trigger engine-aware compaction and queue a continuation for post-compact injection.
+pub async fn compact(
+    State(state): State<SharedState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    Json(body): Json<CompactBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Look up the session
+    let (pane, backend_name) = {
+        let proto = state.protocol.read().await;
+        match proto.sessions.get(&session_id) {
+            Some(s) => (s.pane.clone(), s.metadata.backend.clone()),
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": format!("session '{}' not found", session_id)})),
+                );
+            }
+        }
+    };
+
+    let pane = match pane {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "session has no pane (remote sessions cannot be compacted)"})),
+            );
+        }
+    };
+
+    // Check backend supports compact
+    let backend = state.backend_for_session(&session_id).await;
+    let compact_cmd = match backend.compact_command() {
+        Some(cmd) => cmd.to_string(),
+        None => {
+            let name = backend_name.as_deref().unwrap_or("unknown");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("backend '{}' does not support compact", name)})),
+            );
+        }
+    };
+
+    // Store continuation on the session agent (if provided)
+    if let Some(continuation) = body.continuation {
+        state
+            .notify_agent(
+                &session_id,
+                crate::session_agent::SessionMsg::SetPendingCompactContinuation(continuation),
+            )
+            .await;
+    }
+
+    // Inject the compact command (raw, no XML wrapping)
+    match tmux::locked_inject(&state, &session_id, &pane, &compact_cmd, false).await {
+        Ok(()) => (StatusCode::OK, Json(json!({"status": "compact_triggered"}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        ),
+    }
+}
+
 // --- Nodes ---
 
 /// List connected remote nodes with their sessions.
