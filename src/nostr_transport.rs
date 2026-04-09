@@ -1448,12 +1448,16 @@ pub async fn start_session(
                 .output()
                 .is_ok_and(|o| o.status.success());
 
+            // Disable shell history in spawned panes (bash/zsh via HISTFILE,
+            // fish via fish_history).
             let pane_id = if tmux_session_exists {
                 let target = format!("{tmux_session}:");
                 let output = Command::new("tmux")
                     .args([
                         "new-window",
                         "-d",
+                        "-e", "HISTFILE=/dev/null",
+                        "-e", "fish_history=",
                         "-t",
                         &target,
                         "-n",
@@ -1475,6 +1479,8 @@ pub async fn start_session(
                     .args([
                         "new-session",
                         "-d",
+                        "-e", "HISTFILE=/dev/null",
+                        "-e", "fish_history=",
                         "-s",
                         &tmux_session,
                         "-n",
@@ -1504,8 +1510,8 @@ pub async fn start_session(
                 ])
                 .status();
 
-            // Launch backend (with prompt as CLI arg if available).
-            // Leading space keeps the command out of shell history.
+            // Leading space keeps the command out of shell history (fallback
+            // for shells that ignore HISTFILE but honour HIST_IGNORE_SPACE).
             let hidden_cmd = format!(" {full_cmd}");
             Command::new("tmux")
                 .args(["send-keys", "-t", &pane_id, &hidden_cmd, "Enter"])
@@ -1843,9 +1849,13 @@ pub async fn restart_session(
             // respawn-pane run the command directly (which would exit immediately).
             if let Some(ref pane) = existing_pane {
                 let respawn_args: Vec<&str> = if is_http_api {
-                    vec!["respawn-pane", "-k", "-t", pane]
+                    vec!["respawn-pane", "-k",
+                         "-e", "HISTFILE=/dev/null", "-e", "fish_history=",
+                         "-t", pane]
                 } else {
-                    vec!["respawn-pane", "-k", "-t", pane, &full_cmd]
+                    vec!["respawn-pane", "-k",
+                         "-e", "HISTFILE=/dev/null", "-e", "fish_history=",
+                         "-t", pane, &full_cmd]
                 };
                 let output = Command::new("tmux").args(&respawn_args).output();
                 match output {
@@ -1885,6 +1895,8 @@ pub async fn restart_session(
                     .args([
                         "new-window",
                         "-d",
+                        "-e", "HISTFILE=/dev/null",
+                        "-e", "fish_history=",
                         "-t",
                         &target,
                         "-n",
@@ -1899,6 +1911,8 @@ pub async fn restart_session(
                     .args([
                         "new-session",
                         "-d",
+                        "-e", "HISTFILE=/dev/null",
+                        "-e", "fish_history=",
                         "-s",
                         &tmux_session,
                         "-n",

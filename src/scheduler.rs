@@ -641,11 +641,16 @@ async fn revive_and_inject(
                 .is_ok_and(|o| o.status.success());
 
             let target = format!("{tmux_session}:");
+            // Disable shell history in spawned panes so ouija commands don't
+            // pollute the user's history (bash/zsh via HISTFILE, fish via
+            // fish_history).
             let output = if tmux_session_exists {
                 std::process::Command::new("tmux")
                     .args([
                         "new-window",
                         "-d",
+                        "-e", "HISTFILE=/dev/null",
+                        "-e", "fish_history=",
                         "-t",
                         &target,
                         "-n",
@@ -660,6 +665,8 @@ async fn revive_and_inject(
                     .args([
                         "new-session",
                         "-d",
+                        "-e", "HISTFILE=/dev/null",
+                        "-e", "fish_history=",
                         "-s",
                         &tmux_session,
                         "-n",
