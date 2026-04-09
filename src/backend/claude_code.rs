@@ -470,6 +470,10 @@ impl CodingAssistant for ClaudeCode {
         dir.join(".claude").is_dir()
     }
 
+    fn compact_command(&self) -> Option<&str> {
+        Some("/compact")
+    }
+
     fn exit_command(&self) -> Option<&str> {
         Some("/exit")
     }
