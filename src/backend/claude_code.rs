@@ -204,13 +204,14 @@ fn ensure_plugin_installed() {
     // Stamp version
     let _ = std::fs::write(cache_dir.join(".version"), version);
 
-    // Ensure extraKnownMarketplaces entry exists (may be missing on remote installs)
+    // Ensure extraKnownMarketplaces and statusLine exist (may be missing on upgrades)
     {
         let settings_path = claude_dir.join("settings.json");
         let mut settings: serde_json::Value = std::fs::read_to_string(&settings_path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_else(|| serde_json::json!({}));
+        let mut changed = false;
         if let Some(obj) = settings.as_object_mut() {
             let mkts = obj
                 .entry("extraKnownMarketplaces")
@@ -222,12 +223,28 @@ fn ensure_plugin_installed() {
                         "path": cache_dir.to_string_lossy()
                     }
                 });
-                let _ = std::fs::write(
-                    &settings_path,
-                    serde_json::to_string_pretty(&settings).unwrap(),
-                );
+                changed = true;
                 println!("registered ouija in extraKnownMarketplaces");
             }
+
+            if obj.get("statusLine").is_none() {
+                let script = cache_dir.join("scripts/ouija-statusline.sh");
+                obj.insert(
+                    "statusLine".to_string(),
+                    serde_json::json!({
+                        "type": "command",
+                        "command": script.to_string_lossy()
+                    }),
+                );
+                changed = true;
+                println!("configured ouija status line");
+            }
+        }
+        if changed {
+            let _ = std::fs::write(
+                &settings_path,
+                serde_json::to_string_pretty(&settings).unwrap(),
+            );
         }
     }
 
@@ -282,19 +299,6 @@ fn ensure_plugin_installed() {
             .or_insert_with(|| serde_json::json!({}));
         if enabled.get("ouija@ouija").is_none() {
             enabled["ouija@ouija"] = serde_json::Value::Bool(true);
-            changed = true;
-        }
-
-        // Set statusLine if not already configured
-        if obj.get("statusLine").is_none() {
-            let script = cache_dir.join("scripts/ouija-statusline.sh");
-            obj.insert(
-                "statusLine".to_string(),
-                serde_json::json!({
-                    "type": "command",
-                    "command": script.to_string_lossy()
-                }),
-            );
             changed = true;
         }
     }
