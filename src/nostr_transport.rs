@@ -1774,12 +1774,63 @@ pub async fn restart_session(
             })
     };
 
+    // Pre-compute effective prompt/reminder from metadata and function args
+    let effective_prompt = match &prev_metadata {
+        Some(m) => m.prompt.clone().or_else(|| prompt.map(String::from)),
+        None => prompt.map(String::from),
+    };
+    let effective_reminder = match &prev_metadata {
+        Some(m) => reminder.map(String::from).or_else(|| m.reminder.clone()),
+        None => reminder.map(String::from),
+    };
+
+    // Format prompt text with sender envelope if needed
+    let (formatted_prompt, prompt_msg_id) = if let Some(ref text) = effective_prompt {
+        let full_text = match &effective_reminder {
+            Some(r) => format!("{text}\n\n{r}"),
+            None => text.clone(),
+        };
+        if let Some(sender) = from {
+            let er = expects_reply.unwrap_or(true);
+            let msg_id = {
+                let mut proto = state.protocol.write().await;
+                proto.next_seq()
+            };
+            (
+                Some(crate::daemon_protocol::format_session_message(
+                    sender, &full_text, er, msg_id, None, false,
+                )),
+                Some(msg_id),
+            )
+        } else {
+            (Some(full_text), None)
+        }
+    } else {
+        (None, None)
+    };
+
     let tmux_session = crate::tmux::tmux_session_name(&dir);
     let window_name = name.to_string();
     let is_http_api = matches!(
         backend.delivery_mode(),
         crate::backend::DeliveryMode::HttpApi { .. }
     );
+
+    // For TuiInjection: pass prompt as CLI arg (same as start_session).
+    // This ensures CLAUDE.md and rules load before the prompt is processed.
+    let full_cmd = if !is_http_api {
+        if let Some(ref prompt_text) = formatted_prompt {
+            let prompt_path = format!("/tmp/ouija-prompt-{}.txt", name);
+            std::fs::write(&prompt_path, prompt_text).ok();
+            let escaped_pf = crate::scheduler::shell_escape(&prompt_path);
+            format!("{claude_cmd} \"$(cat {escaped_pf})\" ; rm -f {escaped_pf}")
+        } else {
+            claude_cmd.clone()
+        }
+    } else {
+        claude_cmd.clone()
+    };
+
     let start_result = tokio::task::spawn_blocking({
         let window_name = window_name.clone();
         let tmux_session = tmux_session.clone();
@@ -1797,7 +1848,7 @@ pub async fn restart_session(
                 let respawn_args: Vec<&str> = if is_http_api {
                     vec!["respawn-pane", "-k", "-t", pane]
                 } else {
-                    vec!["respawn-pane", "-k", "-t", pane, &claude_cmd]
+                    vec!["respawn-pane", "-k", "-t", pane, &full_cmd]
                 };
                 let output = Command::new("tmux").args(&respawn_args).output();
                 match output {
@@ -1806,7 +1857,7 @@ pub async fn restart_session(
                             // Give the fresh shell a moment to initialise
                             std::thread::sleep(std::time::Duration::from_millis(300));
                             let _ = Command::new("tmux")
-                                .args(["send-keys", "-t", pane, &claude_cmd, "Enter"])
+                                .args(["send-keys", "-t", pane, &full_cmd, "Enter"])
                                 .status();
                         }
                         tracing::info!("restart: respawn-pane {pane} succeeded");
@@ -1880,7 +1931,7 @@ pub async fn restart_session(
                 .status();
 
             Command::new("tmux")
-                .args(["send-keys", "-t", &pane_id, &claude_cmd, "Enter"])
+                .args(["send-keys", "-t", &pane_id, &full_cmd, "Enter"])
                 .status()?;
 
             Ok(pane_id)
@@ -1947,11 +1998,8 @@ pub async fn restart_session(
                     project_description: m.project_description.clone(),
                     last_metadata_update: None,
                     model: model.map(String::from).or_else(|| m.model.clone()),
-                    reminder: reminder.map(String::from).or_else(|| m.reminder.clone()),
-                    prompt: m
-                        .prompt
-                        .clone()
-                        .or_else(|| prompt.map(String::from)),
+                    reminder: effective_reminder.clone(),
+                    prompt: effective_prompt.clone(),
                     iteration: m.iteration,
                     iteration_log: m.iteration_log.clone(),
                     last_iteration_at: m.last_iteration_at,
@@ -1965,15 +2013,11 @@ pub async fn restart_session(
                     backend: Some(backend_name.clone()),
                     backend_session_id,
                     model: model.map(String::from),
-                    reminder: reminder.map(String::from),
-                    prompt: prompt.map(String::from),
+                    reminder: effective_reminder.clone(),
+                    prompt: effective_prompt.clone(),
                     ..Default::default()
                 },
             };
-            // Capture effective prompt/reminder before Register consumes proto_meta.
-            // These fall back to prev_metadata when the restart call doesn't pass them.
-            let effective_prompt = proto_meta.prompt.clone();
-            let effective_reminder = proto_meta.reminder.clone();
             state
                 .apply_and_execute(crate::daemon_protocol::Event::Register {
                     id: name.to_string(),
@@ -1981,26 +2025,17 @@ pub async fn restart_session(
                     metadata: proto_meta,
                 })
                 .await;
-            let mut prompt_msg_id = None;
-            if let Some(text) = effective_prompt {
-                let full_text = match effective_reminder {
-                    Some(r) => format!("{text}\n\n{r}"),
-                    None => text,
-                };
-                let injected = if let Some(sender) = from {
-                    let er = expects_reply.unwrap_or(true);
-                    let msg_id = {
-                        let mut proto = state.protocol.write().await;
-                        proto.next_seq()
-                    };
-                    prompt_msg_id = Some(msg_id);
-                    crate::daemon_protocol::format_session_message(
-                        sender, &full_text, er, msg_id, None, false,
-                    )
-                } else {
-                    full_text
-                };
-                schedule_prompt_injection(state, name, pane_id.clone(), injected);
+            // HttpApi: deliver prompt via schedule_prompt_injection (readiness
+            // signal + fallback). TuiInjection prompt was passed as CLI arg.
+            if is_http_api {
+                if let Some(ref prompt_text) = formatted_prompt {
+                    schedule_prompt_injection(
+                        state,
+                        name,
+                        pane_id.clone(),
+                        prompt_text.clone(),
+                    );
+                }
             }
             (
                 format!("restarted '{name}' in {dir} (pane {pane_id})"),
