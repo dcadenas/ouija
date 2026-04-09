@@ -4,7 +4,7 @@ description: "Ouija mesh — REQUIRED for messaging other sessions. Use INSTEAD 
 user-invocable: false
 ---
 
-You are on the ouija mesh at localhost:$OUIJA_PORT (default 7880).
+You are on the ouija mesh at localhost:${OUIJA_PORT:-7880} (default 7880).
 All interaction uses the REST API via curl.
 
 **CRITICAL: SendMessage CANNOT reach ouija sessions.** SendMessage is for Claude Code subagent teammates only. To message ouija sessions, you MUST use `curl POST /api/send`. There is no other way.
@@ -31,7 +31,7 @@ Your text output only appears locally. **Use the REST API to reply.**
 
 Quick task — reply immediately:
 ```bash
-curl -sf -X POST localhost:$OUIJA_PORT/api/send \
+curl -sf -X POST localhost:${OUIJA_PORT:-7880}/api/send \
   -H 'Content-Type: application/json' \
   -d '{"from":"YOUR_ID","to":"X","message":"result","expects_reply":false,"responds_to":47,"done":true}'
 ```
@@ -39,12 +39,12 @@ curl -sf -X POST localhost:$OUIJA_PORT/api/send \
 Long task — send progress first, then final result:
 ```bash
 # Progress (resets nudge timer, doesn't clear pending reply):
-curl -sf -X POST localhost:$OUIJA_PORT/api/send \
+curl -sf -X POST localhost:${OUIJA_PORT:-7880}/api/send \
   -H 'Content-Type: application/json' \
   -d '{"from":"YOUR_ID","to":"X","message":"working on it","expects_reply":false,"responds_to":47}'
 
 # Final result (clears pending reply):
-curl -sf -X POST localhost:$OUIJA_PORT/api/send \
+curl -sf -X POST localhost:${OUIJA_PORT:-7880}/api/send \
   -H 'Content-Type: application/json' \
   -d '{"from":"YOUR_ID","to":"X","message":"done: here is the result","expects_reply":false,"responds_to":47,"done":true}'
 ```
@@ -52,7 +52,7 @@ curl -sf -X POST localhost:$OUIJA_PORT/api/send \
 ## 2. Discovering sessions
 
 ```bash
-curl -sf localhost:$OUIJA_PORT/api/status | jq '.sessions[] | {id, role, bulletin, stale}'
+curl -sf localhost:${OUIJA_PORT:-7880}/api/status | jq '.sessions[] | {id, role, bulletin, stale}'
 ```
 
 Shows each session's id, role, project_dir, bulletin, and whether its metadata is stale.
@@ -61,7 +61,7 @@ Shows each session's id, role, project_dir, bulletin, and whether its metadata i
 
 To message any session (not just replies):
 ```bash
-curl -sf -X POST localhost:$OUIJA_PORT/api/send \
+curl -sf -X POST localhost:${OUIJA_PORT:-7880}/api/send \
   -H 'Content-Type: application/json' \
   -d '{"from":"YOUR_ID","to":"target-id","message":"question","expects_reply":true}'
 ```
@@ -72,7 +72,7 @@ Set `expects_reply: true` when you need a response back.
 
 ```bash
 # Start a session with a completion reminder:
-curl -sf -X POST localhost:$OUIJA_PORT/api/sessions/start \
+curl -sf -X POST localhost:${OUIJA_PORT:-7880}/api/sessions/start \
   -H 'Content-Type: application/json' \
   -d '{
     "name": "worker",
@@ -95,13 +95,13 @@ Key fields:
 
 ```bash
 # Restart with fresh context (same pane, same worktree, new conversation):
-curl -sf -X POST localhost:$OUIJA_PORT/api/sessions/restart \
+curl -sf -X POST localhost:${OUIJA_PORT:-7880}/api/sessions/restart \
   -H 'Content-Type: application/json' \
   -d '{"name":"session-id","fresh":true,"prompt":"new task","reminder":"when done, report back"}'
 # prompt/reminder optional — if omitted, reuses previous values
 
 # Kill:
-curl -sf -X POST localhost:$OUIJA_PORT/api/sessions/kill \
+curl -sf -X POST localhost:${OUIJA_PORT:-7880}/api/sessions/kill \
   -H 'Content-Type: application/json' \
   -d '{"name":"session-id"}'
 ```
@@ -110,7 +110,7 @@ curl -sf -X POST localhost:$OUIJA_PORT/api/sessions/kill \
 
 If your session was started with a workflow, interact with it:
 ```bash
-curl -sf -X POST "localhost:$OUIJA_PORT/api/sessions/YOUR_ID/workflow" \
+curl -sf -X POST "localhost:${OUIJA_PORT:-7880}/api/sessions/YOUR_ID/workflow" \
   -H 'Content-Type: application/json' \
   -d '{"action":"init"}'
 ```
@@ -125,20 +125,20 @@ Common rhythm:
 
 ```bash
 # Create a scheduled task (cron in UTC):
-curl -sf -X POST localhost:$OUIJA_PORT/api/tasks \
+curl -sf -X POST localhost:${OUIJA_PORT:-7880}/api/tasks \
   -H 'Content-Type: application/json' \
   -d '{"name":"check-logs","cron":"0 9 * * *","prompt":"check error logs"}'
 
 # List tasks:
-curl -sf localhost:$OUIJA_PORT/api/tasks
+curl -sf localhost:${OUIJA_PORT:-7880}/api/tasks
 
 # Trigger immediately:
-curl -sf -X POST localhost:$OUIJA_PORT/api/tasks/trigger \
+curl -sf -X POST localhost:${OUIJA_PORT:-7880}/api/tasks/trigger \
   -H 'Content-Type: application/json' \
   -d '{"id":"TASK_ID"}'
 
 # Delete:
-curl -sf -X DELETE localhost:$OUIJA_PORT/api/tasks \
+curl -sf -X DELETE localhost:${OUIJA_PORT:-7880}/api/tasks \
   -H 'Content-Type: application/json' \
   -d '{"id":"TASK_ID"}'
 ```
@@ -147,19 +147,19 @@ curl -sf -X DELETE localhost:$OUIJA_PORT/api/tasks \
 
 **Update your metadata** when your focus changes:
 ```bash
-curl -sf -X POST localhost:$OUIJA_PORT/api/sessions/update \
+curl -sf -X POST localhost:${OUIJA_PORT:-7880}/api/sessions/update \
   -H 'Content-Type: application/json' \
   -d '{"id":"YOUR_ID","role":"what you are doing","bulletin":"what you need or offer"}'
 ```
 
 **Clear idle reminders** — the daemon injects `<ouija-status type="reminder" clearing_id="N">` when idle:
 ```bash
-curl -sf -X POST localhost:$OUIJA_PORT/api/clear-reminder \
+curl -sf -X POST localhost:${OUIJA_PORT:-7880}/api/clear-reminder \
   -H 'Content-Type: application/json' \
   -d '{"from":"YOUR_ID","clearing_id":N}'
 ```
 
 **Clear pending replies** when the sender disconnected:
 ```bash
-curl -sf -X DELETE "localhost:$OUIJA_PORT/api/pane/$TMUX_PANE/pending-replies/SENDER_ID"
+curl -sf -X DELETE "localhost:${OUIJA_PORT:-7880}/api/pane/$TMUX_PANE/pending-replies/SENDER_ID"
 ```
