@@ -684,9 +684,12 @@ async fn revive_and_inject(
                 ])
                 .status();
 
-            // Launch the backend in the project dir (prompt as CLI arg if available)
+            // Launch the backend in the project dir (prompt as CLI arg if available).
+            // Leading space prevents the command from being recorded in shell
+            // history (zsh HIST_IGNORE_SPACE / bash HISTCONTROL=ignorespace).
+            let hidden_cmd = format!(" {full_launch_cmd}");
             std::process::Command::new("tmux")
-                .args(["send-keys", "-t", &pane_id, &full_launch_cmd, "Enter"])
+                .args(["send-keys", "-t", &pane_id, &hidden_cmd, "Enter"])
                 .status()?;
 
             Ok(pane_id)
