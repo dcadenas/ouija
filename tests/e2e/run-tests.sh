@@ -691,6 +691,7 @@ api "$BASE" POST /api/remove -d '{"id":"existing-sess"}' >/dev/null 2>&1 || true
 log "Test L14: Start session with worktree=true"
 mkdir -p /tmp/projects/wt-sess
 git init /tmp/projects/wt-sess >/dev/null 2>&1
+git -C /tmp/projects/wt-sess commit --allow-empty -m "init" >/dev/null 2>&1
 L14=$(api "$BASE" POST /api/sessions/start -d '{"name":"wt-sess","worktree":true}')
 assert_contains "L14: start worktree session" "$L14" "starting"
 wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'wt-sess'"
@@ -698,6 +699,61 @@ L14_STATUS=$(api "$BASE" GET /api/status)
 L14_WT=$(echo "$L14_STATUS" | jq -r '.sessions[] | select(.id == "wt-sess") | .worktree')
 assert_eq "L14: session has worktree=true in metadata" "$L14_WT" "true"
 api "$BASE" POST /api/sessions/kill -d '{"name":"wt-sess"}' >/dev/null 2>&1 || true
+
+log "Test L14kw: kill with keep_worktree=true preserves the worktree directory"
+mkdir -p /tmp/projects/wt-keep
+git init /tmp/projects/wt-keep >/dev/null 2>&1
+git -C /tmp/projects/wt-keep commit --allow-empty -m "init" >/dev/null 2>&1
+api "$BASE" POST /api/sessions/start -d '{"name":"wt-keep","project_dir":"/tmp/projects/wt-keep","worktree":true}' >/dev/null
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'wt-keep'"
+WT_KEEP_DIR="$HOME/.ouija/worktrees/wt-keep/wt-keep"
+test -d "$WT_KEEP_DIR" && pass "L14kw: worktree dir created" || fail "L14kw: worktree dir" "exists" "missing"
+L14KW_RESULT=$(api "$BASE" POST /api/sessions/kill -d '{"name":"wt-keep","keep_worktree":true}')
+assert_contains "L14kw: kill returned result" "$L14KW_RESULT" "removed"
+wait_for 5 bash -c "! (session_ids '$BASE' | grep -qF 'wt-keep')"
+assert_not_contains "L14kw: session gone from registry" "$(session_ids "$BASE")" "wt-keep"
+test -d "$WT_KEEP_DIR" && pass "L14kw: worktree preserved on disk" || fail "L14kw: worktree" "preserved" "removed"
+# Cleanup
+git -C /tmp/projects/wt-keep worktree remove --force "$WT_KEEP_DIR" 2>/dev/null || rm -rf "$WT_KEEP_DIR"
+git -C /tmp/projects/wt-keep worktree prune 2>/dev/null
+rm -rf /tmp/projects/wt-keep
+
+log "Test L14kwf: kill with keep_worktree=false removes the worktree directory"
+mkdir -p /tmp/projects/wt-del
+git init /tmp/projects/wt-del >/dev/null 2>&1
+git -C /tmp/projects/wt-del commit --allow-empty -m "init" >/dev/null 2>&1
+api "$BASE" POST /api/sessions/start -d '{"name":"wt-del","project_dir":"/tmp/projects/wt-del","worktree":true}' >/dev/null
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'wt-del'"
+WT_DEL_DIR="$HOME/.ouija/worktrees/wt-del/wt-del"
+test -d "$WT_DEL_DIR" && pass "L14kwf: worktree dir created" || fail "L14kwf: worktree dir" "exists" "missing"
+# Ensure clean tree so cleanup isn't skipped by the has_changes guard
+git -C "$WT_DEL_DIR" clean -xdf >/dev/null 2>&1
+L14KWF_RESULT=$(api "$BASE" POST /api/sessions/kill -d '{"name":"wt-del","keep_worktree":false}')
+assert_contains "L14kwf: kill returned result" "$L14KWF_RESULT" "removed"
+wait_for 5 bash -c "! (session_ids '$BASE' | grep -qF 'wt-del')"
+assert_not_contains "L14kwf: session gone from registry" "$(session_ids "$BASE")" "wt-del"
+wait_for 5 bash -c "! test -d '$WT_DEL_DIR'"
+test ! -d "$WT_DEL_DIR" && pass "L14kwf: worktree removed on disk" || fail "L14kwf: worktree" "removed" "still exists"
+git -C /tmp/projects/wt-del worktree prune 2>/dev/null
+rm -rf /tmp/projects/wt-del
+
+log "Test L14kwd: dirty worktree preserved even with keep_worktree=false"
+mkdir -p /tmp/projects/wt-dirty
+git init /tmp/projects/wt-dirty >/dev/null 2>&1
+git -C /tmp/projects/wt-dirty commit --allow-empty -m "init" >/dev/null 2>&1
+api "$BASE" POST /api/sessions/start -d '{"name":"wt-dirty","project_dir":"/tmp/projects/wt-dirty","worktree":true}' >/dev/null
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'wt-dirty'"
+WT_DIRTY_DIR="$HOME/.ouija/worktrees/wt-dirty/wt-dirty"
+# Introduce an uncommitted file
+echo "WIP" > "$WT_DIRTY_DIR/uncommitted.txt"
+api "$BASE" POST /api/sessions/kill -d '{"name":"wt-dirty","keep_worktree":false}' >/dev/null
+wait_for 5 bash -c "! (session_ids '$BASE' | grep -qF 'wt-dirty')"
+test -d "$WT_DIRTY_DIR" && pass "L14kwd: dirty worktree preserved" || fail "L14kwd: dirty worktree" "preserved" "removed"
+# Cleanup
+rm -f "$WT_DIRTY_DIR/uncommitted.txt"
+git -C /tmp/projects/wt-dirty worktree remove --force "$WT_DIRTY_DIR" 2>/dev/null || rm -rf "$WT_DIRTY_DIR"
+git -C /tmp/projects/wt-dirty worktree prune 2>/dev/null
+rm -rf /tmp/projects/wt-dirty
 
 log "Test L14b: Worktree default branch name matches session name"
 mkdir -p /tmp/projects/wt-branch-test

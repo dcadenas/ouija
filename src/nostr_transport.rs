@@ -1147,8 +1147,8 @@ async fn kill_session_inner(state: &std::sync::Arc<AppState>, name: &str, keep_w
         return format!("'{name}' has no pane");
     };
 
-    // Get the pane's PID and find the backend process
     let pane = pane.clone();
+    let project_dir = session.metadata.project_dir.clone();
     let backend = state.backend_for_session(name).await;
     let process_names: Vec<String> = backend
         .process_names()
@@ -1157,6 +1157,21 @@ async fn kill_session_inner(state: &std::sync::Arc<AppState>, name: &str, keep_w
         .collect();
     let exit_cmd = backend.exit_command().map(String::from);
     let cli_name = backend.cli_name().to_string();
+
+    // Remove from the registry BEFORE killing the process. When Claude
+    // runs its SessionEnd hook during /exit, the hook will find no
+    // session and no-op — otherwise the hook races with this function's
+    // final Remove and usually wins, masking CleanupWorktree.
+    // We always pass keep_worktree: true here; worktree teardown (if
+    // requested) happens AFTER the process is confirmed dead so we don't
+    // race the still-running claude writing to its cwd.
+    state
+        .apply_and_execute(crate::daemon_protocol::Event::Remove {
+            id: name.to_string(),
+            keep_worktree: true,
+        })
+        .await;
+
     let kill_result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
         use std::process::Command;
 
@@ -1277,10 +1292,13 @@ async fn kill_session_inner(state: &std::sync::Arc<AppState>, name: &str, keep_w
     })
     .await;
 
+    // Session is already out of the registry (Remove above). Even on kill
+    // failure, keep the session unregistered — a bail here usually means
+    // the pane was already gone, so it was effectively dead anyway.
     let msg = match kill_result {
         Ok(Ok(msg)) => msg,
-        Ok(Err(e)) => return format!("kill failed: {e}"),
-        Err(e) => return format!("kill failed: {e}"),
+        Ok(Err(e)) => format!("kill failed: {e}"),
+        Err(e) => format!("kill failed: {e}"),
     };
 
     // Also kill any tmux session that matches the ouija session name
@@ -1292,12 +1310,33 @@ async fn kill_session_inner(state: &std::sync::Arc<AppState>, name: &str, keep_w
     })
     .await;
 
-    state
-        .apply_and_execute(crate::daemon_protocol::Event::Remove {
-            id: name.to_string(),
-            keep_worktree,
-        })
-        .await;
+    // Worktree cleanup AFTER the process is confirmed dead, so we don't
+    // race against claude writing to its cwd. Mirrors the shared-worktree
+    // guard in apply_remove: skip cleanup if another session still uses
+    // the same directory.
+    if !keep_worktree {
+        if let Some(dir) = project_dir {
+            let is_worktree_path = dir.contains("/.ouija/worktrees/")
+                || dir.contains("/.claude/worktrees/");
+            if is_worktree_path {
+                let shared = state
+                    .protocol
+                    .read()
+                    .await
+                    .sessions
+                    .values()
+                    .any(|s| s.metadata.project_dir.as_deref() == Some(dir.as_str()));
+                if shared {
+                    tracing::info!(
+                        "skipping worktree cleanup for {dir}: other sessions still using it"
+                    );
+                } else {
+                    crate::state::AppState::cleanup_worktree_dir(&dir).await;
+                }
+            }
+        }
+    }
+
     format!("{msg}, session '{name}' removed")
 }
 
@@ -2296,7 +2335,8 @@ fn create_ouija_worktree(
     std::fs::create_dir_all(&parent)?;
     // Create worktree with a new branch
     let branch = branch.map(String::from).unwrap_or_else(|| name.to_string());
-    let mut args = vec!["-C", repo_dir, "worktree", "add", "-b", &branch, &wt_dir];
+    let flag = if base_branch.is_some() { "-B" } else { "-b" };
+    let mut args = vec!["-C", repo_dir, "worktree", "add", flag, &branch, &wt_dir];
     if let Some(base) = base_branch {
         args.push(base);
     }

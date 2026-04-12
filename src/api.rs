@@ -1451,6 +1451,10 @@ pub struct SessionNameBody {
     /// Base branch to create the worktree branch from. If omitted, branches from HEAD.
     #[serde(default)]
     base_branch: Option<String>,
+    /// On kill, preserve the worktree directory instead of cleaning it up.
+    /// Defaults to false (cleanup) when omitted.
+    #[serde(default)]
+    keep_worktree: Option<bool>,
 }
 
 /// Kill the coding assistant process in a session's tmux pane.
@@ -1458,7 +1462,11 @@ pub async fn kill_session(
     State(state): State<SharedState>,
     Json(body): Json<SessionNameBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let result = crate::nostr_transport::kill_session(&state, &body.name).await;
+    let result = if body.keep_worktree.unwrap_or(false) {
+        crate::nostr_transport::kill_session_keep_worktree(&state, &body.name).await
+    } else {
+        crate::nostr_transport::kill_session(&state, &body.name).await
+    };
     (StatusCode::OK, Json(json!({ "result": result })))
 }
 

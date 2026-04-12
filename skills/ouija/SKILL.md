@@ -1,6 +1,6 @@
 ---
 name: ouija
-description: "Ouija mesh — REQUIRED for messaging other sessions. Use INSTEAD of SendMessage when communicating with other sessions on the mesh. Triggers: <msg from= XML tags, <ouija-status> tags, or any request to send/reply to another session."
+description: "Ouija mesh — REQUIRED for messaging other sessions. You MUST invoke this skill via the Skill tool when you see <msg from= XML tags, <ouija-status> tags, or any request to send/reply to another session. Use INSTEAD of SendMessage — SendMessage CANNOT reach ouija sessions."
 user-invocable: false
 ---
 

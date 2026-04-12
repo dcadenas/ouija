@@ -706,28 +706,31 @@ impl AppState {
     /// Clean up a git worktree directory if it has no uncommitted changes.
     /// Supports ouija-managed worktrees (both `~/.ouija/worktrees/` and legacy
     /// `<repo>/.ouija/worktrees/`) and Claude Code (`.claude/worktrees/`) paths.
-    async fn cleanup_worktree_dir(dir: &str) {
+    pub(crate) async fn cleanup_worktree_dir(dir: &str) {
         let dir_owned = dir.to_string();
-        let repo = if let Some(i) = dir.find("/.ouija/worktrees/") {
-            // Legacy in-repo path: repo is the prefix
-            dir[..i].to_string()
-        } else if let Some(i) = dir.find("/.claude/worktrees/") {
-            dir[..i].to_string()
-        } else {
-            // New ~/.ouija/worktrees/ path — resolve repo via git
-            let dir_clone = dir.to_string();
-            match tokio::task::spawn_blocking(move || {
-                std::process::Command::new("git")
-                    .args(["-C", &dir_clone, "rev-parse", "--show-toplevel"])
-                    .output()
-                    .ok()
-                    .filter(|o| o.status.success())
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            })
-            .await
-            {
-                Ok(Some(r)) if !r.is_empty() => r,
-                _ => return,
+        // Resolve the main repo via git. This handles every layout: the
+        // legacy `<repo>/.ouija/worktrees/<name>`, the newer
+        // `~/.ouija/worktrees/<repo>/<name>`, and Claude Code's
+        // `<repo>/.claude/worktrees/<branch>`. String-matching the prefix
+        // before `.ouija/worktrees/` incorrectly resolves the home-based
+        // layout to `~` (not a repo), so always ask git.
+        let dir_clone = dir.to_string();
+        let repo = match tokio::task::spawn_blocking(move || {
+            std::process::Command::new("git")
+                .args(["-C", &dir_clone, "rev-parse", "--show-toplevel"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        })
+        .await
+        {
+            Ok(Some(r)) if !r.is_empty() => r,
+            _ => {
+                tracing::info!(
+                    "worktree {dir_owned} not inside a git repo, skipping cleanup"
+                );
+                return;
             }
         };
         let dir_clone = dir_owned.clone();
