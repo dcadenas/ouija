@@ -109,6 +109,15 @@ enum Command {
         #[arg(long)]
         expect_reply: bool,
     },
+    /// List sessions
+    Ls,
+    /// Update session metadata
+    Announce {
+        #[arg(long)]
+        role: Option<String>,
+        #[arg(long)]
+        bulletin: Option<String>,
+    },
     /// Inject directly into a tmux pane
     Inject { pane: String, message: String },
     /// Rename current session
@@ -583,6 +592,21 @@ async fn main() -> anyhow::Result<()> {
                 "done": !no_done,
             });
             cli_post("/api/send", &body).await?;
+        }
+        Command::Ls => {
+            cli_get("/api/status").await?;
+        }
+        Command::Announce { role, bulletin } => {
+            if role.is_none() && bulletin.is_none() {
+                anyhow::bail!("at least one of --role or --bulletin is required");
+            }
+            let id = require_my_session_id().await?;
+            let body = serde_json::json!({
+                "id": id,
+                "role": role,
+                "bulletin": bulletin,
+            });
+            cli_post("/api/sessions/update", &body).await?;
         }
         Command::Inject { pane, message } => {
             let body = serde_json::json!({ "pane": pane, "message": message });
