@@ -80,7 +80,11 @@ fn extract_description(dir: &Path) -> Option<String> {
         let path = dir.join(filename);
         if let Ok(content) = std::fs::read_to_string(&path) {
             // Take first ~500 bytes to avoid reading huge files
-            let content = &content[..content.len().min(MAX_FILE_PREVIEW_BYTES)];
+            let mut end = content.len().min(MAX_FILE_PREVIEW_BYTES);
+            while end > 0 && !content.is_char_boundary(end) {
+                end -= 1;
+            }
+            let content = &content[..end];
             if let Some(line) = first_meaningful_line(content) {
                 return Some(line);
             }
