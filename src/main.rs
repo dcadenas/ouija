@@ -33,7 +33,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Start the daemon
-    Start {
+    #[command(name = "start-server")]
+    StartServer {
         #[arg(short, long, default_value = "7880")]
         port: u16,
         #[arg(short, long)]
@@ -86,23 +87,23 @@ enum Command {
         #[arg(long)]
         role: Option<String>,
     },
-    /// Send a message through the daemon
-    Send { to: String, message: String },
     /// Inject directly into a tmux pane
     Inject { pane: String, message: String },
-    /// Rename a session
-    Rename { old_id: String, new_id: String },
-    /// Remove a session
-    Remove { id: String },
+    /// Rename current session
+    Rename { new_id: String },
+    /// Unregister a session (without killing it)
+    Unregister { id: String },
     /// Stop the running daemon
-    Stop,
+    #[command(name = "stop-server")]
+    StopServer,
     /// Print the message log file path
     LogPath {
         #[arg(long)]
         data: Option<String>,
     },
     /// Update ouija from crates.io and restart daemon
-    Update,
+    #[command(name = "self-update")]
+    SelfUpdate,
     /// View or change daemon settings
     Config {
         #[command(subcommand)]
@@ -202,7 +203,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Daemon logs to a file in the data dir; CLI subcommands log to stderr.
-    if !matches!(cli.command, Command::Start { .. }) {
+    if !matches!(cli.command, Command::StartServer { .. }) {
         tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_default_env()
@@ -212,7 +213,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     match cli.command {
-        Command::Start {
+        Command::StartServer {
             port,
             name,
             data,
@@ -528,35 +529,20 @@ async fn main() -> anyhow::Result<()> {
             });
             cli_post("/api/register", &body).await?;
         }
-        Command::Send { to, message } => {
-            let from = resolve_my_session_id().await;
-            match from {
-                Some(id) => {
-                    let body = serde_json::json!({ "to": to, "message": message, "from": id });
-                    cli_post("/api/send", &body).await?;
-                }
-                None => {
-                    let pane = std::env::var("TMUX_PANE").unwrap_or_default();
-                    anyhow::bail!(
-                        "no session registered for this pane ({pane}).\n\
-                         Run `ouija register <name>` first."
-                    );
-                }
-            }
-        }
         Command::Inject { pane, message } => {
             let body = serde_json::json!({ "pane": pane, "message": message });
             cli_post("/api/inject", &body).await?;
         }
-        Command::Rename { old_id, new_id } => {
+        Command::Rename { new_id } => {
+            let old_id = require_my_session_id().await?;
             let body = serde_json::json!({ "old_id": old_id, "new_id": new_id });
             cli_post("/api/rename", &body).await?;
         }
-        Command::Remove { id } => {
+        Command::Unregister { id } => {
             let body = serde_json::json!({ "id": id });
             cli_post("/api/remove", &body).await?;
         }
-        Command::Stop => {
+        Command::StopServer => {
             stop_daemon()?;
         }
         Command::LogPath { data } => {
@@ -564,7 +550,7 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", config.data_dir.join("messages.jsonl").display());
             println!("{}", config.data_dir.join("daemon.log").display());
         }
-        Command::Update => {
+        Command::SelfUpdate => {
             update_and_restart()?;
         }
         Command::Config { action } => match action {
