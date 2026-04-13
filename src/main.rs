@@ -165,6 +165,12 @@ enum Command {
         #[arg(long)]
         reminder: Option<String>,
     },
+    /// Clear an idle reminder
+    #[command(name = "clear-reminder")]
+    ClearReminder { clearing_id: u64 },
+    /// Clear a pending reply from a disconnected sender
+    #[command(name = "clear-reply")]
+    ClearReply { sender_id: String },
     /// Stop the running daemon
     #[command(name = "stop-server")]
     StopServer,
@@ -703,6 +709,19 @@ async fn main() -> anyhow::Result<()> {
                 "reminder": reminder,
             });
             cli_post("/api/sessions/restart", &body).await?;
+        }
+        Command::ClearReminder { clearing_id } => {
+            let from = require_my_session_id().await?;
+            let body = serde_json::json!({
+                "from": from,
+                "clearing_id": clearing_id,
+            });
+            cli_post("/api/clear-reminder", &body).await?;
+        }
+        Command::ClearReply { sender_id } => {
+            let pane = std::env::var("TMUX_PANE")
+                .context("TMUX_PANE not set — must be run from a tmux pane")?;
+            cli_delete(&format!("/api/pane/{pane}/pending-replies/{sender_id}")).await?;
         }
         Command::StopServer => {
             stop_daemon()?;
