@@ -124,6 +124,47 @@ enum Command {
     Rename { new_id: String },
     /// Unregister a session (without killing it)
     Unregister { id: String },
+    /// Start a new session
+    #[command(name = "spawn-session")]
+    SpawnSession {
+        name: String,
+        #[arg(long)]
+        project_dir: Option<String>,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        reminder: Option<String>,
+        #[arg(long)]
+        worktree: bool,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        base_branch: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        backend: Option<String>,
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Kill a running session
+    #[command(name = "kill-session")]
+    KillSession {
+        name: String,
+        #[arg(long)]
+        keep_worktree: bool,
+    },
+    /// Restart a session
+    #[command(name = "restart-session")]
+    RestartSession {
+        name: String,
+        #[arg(long)]
+        fresh: bool,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long)]
+        reminder: Option<String>,
+    },
     /// Stop the running daemon
     #[command(name = "stop-server")]
     StopServer,
@@ -620,6 +661,48 @@ async fn main() -> anyhow::Result<()> {
         Command::Unregister { id } => {
             let body = serde_json::json!({ "id": id });
             cli_post("/api/remove", &body).await?;
+        }
+        Command::SpawnSession {
+            name,
+            project_dir,
+            prompt,
+            reminder,
+            worktree,
+            branch,
+            base_branch,
+            model,
+            backend,
+            from,
+        } => {
+            let body = serde_json::json!({
+                "name": name,
+                "project_dir": project_dir,
+                "prompt": prompt,
+                "reminder": reminder,
+                "worktree": worktree,
+                "branch": branch,
+                "base_branch": base_branch,
+                "model": model,
+                "backend": backend,
+                "from": from,
+            });
+            cli_post("/api/sessions/start", &body).await?;
+        }
+        Command::KillSession { name, keep_worktree } => {
+            let body = serde_json::json!({
+                "name": name,
+                "keep_worktree": keep_worktree,
+            });
+            cli_post("/api/sessions/kill", &body).await?;
+        }
+        Command::RestartSession { name, fresh, prompt, reminder } => {
+            let body = serde_json::json!({
+                "name": name,
+                "fresh": fresh,
+                "prompt": prompt,
+                "reminder": reminder,
+            });
+            cli_post("/api/sessions/restart", &body).await?;
         }
         Command::StopServer => {
             stop_daemon()?;
