@@ -1177,8 +1177,16 @@ fn fetch_latest_crate_version(name: &str) -> anyhow::Result<String> {
 }
 
 /// Look up the registered session ID for the current tmux pane.
+/// Fast path: read @ouija_session tmux var. Fallback: query API.
 async fn resolve_my_session_id() -> Option<String> {
     let pane = std::env::var("TMUX_PANE").ok()?;
+
+    // Fast path: tmux pane variable (no HTTP)
+    if let Some(id) = tmux_var::get(&pane) {
+        return Some(id);
+    }
+
+    // Fallback: query daemon API
     let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
     let url = format!("http://localhost:{port}/api/status");
     let resp = reqwest::get(&url).await.ok()?;
@@ -1188,6 +1196,17 @@ async fn resolve_my_session_id() -> Option<String> {
         .iter()
         .find(|s| s["pane"].as_str() == Some(&pane))
         .and_then(|s| s["id"].as_str().map(String::from))
+}
+
+/// Resolve session ID or bail with a helpful error.
+async fn require_my_session_id() -> anyhow::Result<String> {
+    resolve_my_session_id().await.ok_or_else(|| {
+        let pane = std::env::var("TMUX_PANE").unwrap_or_default();
+        anyhow::anyhow!(
+            "no session registered for this pane ({pane}).\n\
+             Run `ouija register <name>` first."
+        )
+    })
 }
 
 async fn cli_get(path: &str) -> anyhow::Result<()> {
@@ -1204,6 +1223,16 @@ async fn cli_post(path: &str, body: &serde_json::Value) -> anyhow::Result<()> {
     let url = format!("http://localhost:{port}{path}");
     let client = reqwest::Client::new();
     let resp = client.post(&url).json(body).send().await?;
+    let text = resp.text().await?;
+    println!("{text}");
+    Ok(())
+}
+
+async fn cli_delete(path: &str) -> anyhow::Result<()> {
+    let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
+    let url = format!("http://localhost:{port}{path}");
+    let client = reqwest::Client::new();
+    let resp = client.delete(&url).send().await?;
     let text = resp.text().await?;
     println!("{text}");
     Ok(())
