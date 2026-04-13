@@ -370,8 +370,7 @@ impl Actor for SessionAgent {
                         // Auto-clears so it fires exactly once per idle period.
                         // The nudge text teaches the LLM the clearing mechanism (HATEOAS).
                         let nudge = format!(
-                            "<ouija-status type=\"idle-check\" clearing_id=\"{clearing_id}\">You appear idle. If you are done, call: curl -sf -X POST localhost:{port}/api/clear-reminder -H Content-Type:application/json -d '{{\"from\":\"{}\",\"clearing_id\":{clearing_id}}}' to confirm completion. If you have pending work, continue — this nudge will not repeat until your next idle period.</ouija-status>",
-                            state.session_id
+                            "<ouija-status type=\"idle-check\" clearing_id=\"{clearing_id}\">You appear idle. If you are done, run: ouija clear-reminder {clearing_id} — to confirm completion. If you have pending work, continue — this nudge will not repeat until your next idle period.</ouija-status>"
                         );
                         let _ = crate::tmux::locked_inject(
                             &self.app_state,
