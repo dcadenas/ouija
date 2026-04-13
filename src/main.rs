@@ -87,6 +87,28 @@ enum Command {
         #[arg(long)]
         role: Option<String>,
     },
+    /// Send a message expecting a reply
+    Ask { to: String, message: String },
+    /// Send a message (fire-and-forget)
+    Tell {
+        to: String,
+        message: String,
+        /// Thread as progress update for a pending reply
+        #[arg(long)]
+        reply_to: Option<u64>,
+    },
+    /// Reply to a message (defaults to done=true)
+    Reply {
+        to: String,
+        msg_id: u64,
+        message: String,
+        /// Don't mark as done (progress update)
+        #[arg(long)]
+        no_done: bool,
+        /// Expect a reply back
+        #[arg(long)]
+        expect_reply: bool,
+    },
     /// Inject directly into a tmux pane
     Inject { pane: String, message: String },
     /// Rename current session
@@ -528,6 +550,39 @@ async fn main() -> anyhow::Result<()> {
                 "role": role,
             });
             cli_post("/api/register", &body).await?;
+        }
+        Command::Ask { to, message } => {
+            let from = require_my_session_id().await?;
+            let body = serde_json::json!({
+                "from": from,
+                "to": to,
+                "message": message,
+                "expects_reply": true,
+            });
+            cli_post("/api/send", &body).await?;
+        }
+        Command::Tell { to, message, reply_to } => {
+            let from = require_my_session_id().await?;
+            let body = serde_json::json!({
+                "from": from,
+                "to": to,
+                "message": message,
+                "expects_reply": false,
+                "responds_to": reply_to,
+            });
+            cli_post("/api/send", &body).await?;
+        }
+        Command::Reply { to, msg_id, message, no_done, expect_reply } => {
+            let from = require_my_session_id().await?;
+            let body = serde_json::json!({
+                "from": from,
+                "to": to,
+                "message": message,
+                "expects_reply": expect_reply,
+                "responds_to": msg_id,
+                "done": !no_done,
+            });
+            cli_post("/api/send", &body).await?;
         }
         Command::Inject { pane, message } => {
             let body = serde_json::json!({ "pane": pane, "message": message });
