@@ -16,7 +16,7 @@ Supports **Claude Code** and **[opencode](https://opencode.ai)**. Sessions on di
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dcadenas/ouija/releases/latest/download/ouija-installer.sh | sh
-ouija start
+ouija start-server
 ```
 
 Or with Rust: `cargo binstall ouija` / `cargo install ouija`.
@@ -80,7 +80,7 @@ Messages can reference earlier ones for conversation threading:
 - `re="47"` — progress update on task 47
 - `re="47" done="true"` — task 47 is complete
 
-The daemon assigns unique IDs to every message, tracks pending replies, and nudges sessions that haven't responded. Sessions interact via the REST API and ouija skill -- the XML is handled automatically.
+The daemon assigns unique IDs to every message, tracks pending replies, and nudges sessions that haven't responded. Sessions interact via the `ouija` CLI and the ouija skill -- the XML is handled automatically.
 
 ## How it works
 
@@ -103,10 +103,16 @@ All session state transitions go through a pure state machine (`DaemonProtocol`)
 ## CLI
 
 ```bash
-ouija start          # start the daemon
-ouija stop           # stop it
-ouija update         # install latest from crates.io, restart
-ouija nodes          # list self and connected nodes
+ouija start-server   # start the daemon
+ouija stop-server    # stop it
+ouija self-update    # install latest from crates.io, restart
+ouija ls             # list sessions on the mesh
+ouija ask <to> "msg" # send a message expecting a reply
+ouija tell <to> "msg" # fire-and-forget message
+ouija reply <to> <id> "msg" # reply to a message
+ouija announce --role "..." --bulletin "..." # update your metadata
+ouija spawn-session <name> --prompt "..." # start a new session
+ouija nodes          # list connected nodes
 ouija config ...     # manage settings, Nostr DM users, router
 ```
 

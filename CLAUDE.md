@@ -51,7 +51,7 @@ Remote: Same flow but wrapped in NIP-17 encrypted DMs via Nostr relays.
 
 ### Plugin system
 
-`ouija start` writes embedded files (hooks, scripts, skills) to `~/.claude/plugins/cache/ouija/`. The hook scripts are thin wrappers that POST to `localhost:7880/api/hooks/*`. The skill (`skills/ouija/SKILL.md`) teaches Claude Code how to use the ouija API.
+`ouija start-server` writes embedded files (hooks, scripts, skills) to `~/.claude/plugins/cache/ouija/`. The hook scripts are thin wrappers that POST to `localhost:7880/api/hooks/*`. The skill (`skills/ouija/SKILL.md`) teaches Claude Code how to use the ouija CLI.
 
 ### Session lifecycle
 
