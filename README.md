@@ -1,6 +1,6 @@
 # ouija
 
-_A transparent pipe between coding sessions._
+_A transparent pipe between coding sessions through tmux._
 
 You're deep in a coding session when you realize another session has the understanding you need. Maybe it started on something unrelated on your machine, maybe it's on your laptop at home. You say "ask deploy-infra what port the gateway uses." The other session receives it as natural input, draws on what it knows, and replies. Every session stays fully interactive for you.
 
