@@ -10,7 +10,7 @@ This opens weirder possibilities too. A session on your machine talking to a ses
 
 ![Two Claude Code sessions exchanging messages via ouija. The deploy-infra session asks auth-service what port to use and gets a reply, all without leaving either terminal.](screenshot.png)
 
-Supports **Claude Code** and **[opencode](https://opencode.ai)**. Sessions on different backends can talk to each other — the protocol is backend-agnostic.
+Supports **Claude Code** (primary). **[opencode](https://opencode.ai)** support is implemented and can talk to Claude Code sessions, but is less battle-tested.
 
 ## Prerequisites
 
