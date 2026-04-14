@@ -20,8 +20,8 @@ STARTED="no"
 curl -sf http://127.0.0.1:17880/api/status >/dev/null 2>&1 && STARTED="yes"
 assert_eq "daemon did not start without tmux" "$STARTED" "no"
 
-# ── T3: Preflight — tmux present, claude missing ─────────────────
-log "T3: tmux present, no claude"
+# ── T3: Preflight — tmux present, no backend (neither claude nor opencode) ─
+log "T3: tmux present, no backend"
 apt-get update -qq >/dev/null 2>&1
 apt-get install -y -qq --no-install-recommends tmux >/dev/null 2>&1
 
@@ -31,21 +31,15 @@ tmux new-session -d -s preflight
 
 ouija start-server --port 17881 --data "$DATA_T3" >"$DATA_T3/output.log" 2>&1 &
 PID_T3=$!
-
-if wait_for 15 curl -sf http://127.0.0.1:17881/api/status -o /dev/null; then
-    pass "daemon started without claude"
-else
-    echo "--- daemon output ---"
-    cat "$DATA_T3/output.log" || true
-    echo "---"
-    fail "daemon should start without claude" "running" "not responding"
-fi
+wait "$PID_T3" 2>/dev/null || true
 
 LOG_T3=$(cat "$DATA_T3/output.log")
 assert_contains "claude warning printed" "$LOG_T3" "claude not found"
+assert_contains "no-backend error printed" "$LOG_T3" "no coding backend found"
 
-kill "$PID_T3" 2>/dev/null || true
-wait "$PID_T3" 2>/dev/null || true
+STARTED_T3="no"
+curl -sf http://127.0.0.1:17881/api/status >/dev/null 2>&1 && STARTED_T3="yes"
+assert_eq "daemon refuses to start without a backend" "$STARTED_T3" "no"
 
 # ── T4: Preflight — both tmux and claude present ─────────────────
 log "T4: tmux + claude present"
