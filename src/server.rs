@@ -48,7 +48,6 @@ pub async fn run(state: SharedState) -> anyhow::Result<()> {
                 .delete(api::remove_human),
         )
         .route("/api/sessions/{name}", get(api::get_session))
-
         .route("/api/sessions/kill", post(api::kill_session))
         .route("/api/sessions/start", post(api::start_session))
         .route("/api/sessions/restart", post(api::restart_session))
@@ -79,10 +78,7 @@ pub async fn run(state: SharedState) -> anyhow::Result<()> {
         .route("/api/hooks/prompt-submit", post(hooks::prompt_submit))
         .route("/api/hooks/pre-tool-use", post(hooks::pre_tool_use))
         .route("/api/hooks/post-compact", post(hooks::post_compact))
-        .route(
-            "/api/sessions/{session_id}/compact",
-            post(api::compact),
-        )
+        .route("/api/sessions/{session_id}/compact", post(api::compact))
         .with_state(state);
 
     let addr = format!("127.0.0.1:{port}");

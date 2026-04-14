@@ -147,7 +147,7 @@ start_daemon() {
     if [ ! -f "${data_dir}/settings.json" ]; then
         echo '{"auto_register":false}' > "${data_dir}/settings.json"
     fi
-    RUST_LOG=ouija=debug ouija start --port "$port" --name "$name" --data "$data_dir" "$@" \
+    RUST_LOG=ouija=debug ouija start-server --port "$port" --name "$name" --data "$data_dir" "$@" \
         >"${data_dir}/daemon.log" 2>&1 &
     local pid=$!
     wait_for 10 curl -sf "http://127.0.0.1:${port}/api/status" -o /dev/null

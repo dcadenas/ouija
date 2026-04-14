@@ -33,9 +33,7 @@ pub fn pre_trust_workspace(dir: &str) {
     });
 
     if let Some(projects) = projects {
-        let entry = projects
-            .entry(dir)
-            .or_insert_with(|| serde_json::json!({}));
+        let entry = projects.entry(dir).or_insert_with(|| serde_json::json!({}));
         if let Some(obj) = entry.as_object_mut() {
             if obj.get("hasTrustDialogAccepted") == Some(&serde_json::Value::Bool(true)) {
                 return; // already trusted
@@ -52,7 +50,7 @@ pub fn pre_trust_workspace(dir: &str) {
 }
 
 // --- Embedded plugin files ---
-// These are compiled into the binary so `ouija start` can bootstrap the Claude
+// These are compiled into the binary so `ouija start-server` can bootstrap the Claude
 // Code plugin without needing the source repo on disk.
 
 mod embedded {
@@ -94,7 +92,10 @@ fn write_embedded_plugin_files(cache_dir: &std::path::Path) {
         ("scripts/post-compact.sh", embedded::SCRIPT_POST_COMPACT),
         ("skills/ouija/SKILL.md", embedded::SKILLS_PEER_TRUST),
         (".claude-plugin/plugin.json", embedded::PLUGIN_JSON),
-        (".claude-plugin/marketplace.json", embedded::MARKETPLACE_JSON),
+        (
+            ".claude-plugin/marketplace.json",
+            embedded::MARKETPLACE_JSON,
+        ),
     ];
 
     for (path, content) in files {
@@ -176,7 +177,7 @@ fn try_sync_from_source(home: &std::path::Path, cache_dir: &std::path::Path) -> 
     true
 }
 
-/// Ensure the Claude Code plugin is installed. Called on every `ouija start`.
+/// Ensure the Claude Code plugin is installed. Called on every `ouija start-server`.
 /// If the plugin cache already exists, just stamps the version. If not, writes
 /// all embedded files and registers in installed_plugins.json / settings.json.
 fn ensure_plugin_installed() {

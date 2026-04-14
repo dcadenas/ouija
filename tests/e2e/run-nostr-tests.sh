@@ -153,7 +153,7 @@ log "  Restarting daemon A..."
 kill $PID_A 2>/dev/null || true
 wait $PID_A 2>/dev/null || true
 sleep 1
-RUST_LOG=ouija=debug ouija start --port $PORT_A --name alpha --data /tmp/ouija-A \
+RUST_LOG=ouija=debug ouija start-server --port $PORT_A --name alpha --data /tmp/ouija-A \
     --relay "$RELAY_URL" >/tmp/ouija-A/daemon.log 2>&1 &
 PID_A=$!
 wait_for 10 curl -sf "$BASE_A/api/status" -o /dev/null

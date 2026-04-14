@@ -334,8 +334,7 @@ impl Actor for SessionAgent {
                         let proto = self.app_state.protocol.read().await;
                         let session = proto.sessions.get(&state.session_id);
                         let reminder = session.and_then(|s| s.metadata.reminder.clone());
-                        let vim_mode =
-                            session.map(|s| s.metadata.vim_mode).unwrap_or(false);
+                        let vim_mode = session.map(|s| s.metadata.vim_mode).unwrap_or(false);
                         let pending = proto
                             .pending_replies
                             .get(&state.session_id)

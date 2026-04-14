@@ -1106,9 +1106,11 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         kill_session(state, name).await
     } else if let Some(rest) = cmd.strip_prefix("/start ") {
         let name = rest.trim();
-        start_session(state, name, None, None, None, None, None, None, None, None, None, None)
-            .await
-            .0
+        start_session(
+            state, name, None, None, None, None, None, None, None, None, None, None,
+        )
+        .await
+        .0
     } else if let Some(rest) = cmd.strip_prefix("/restart ") {
         let rest = rest.trim();
         let (name, fresh) = if let Some(name) = rest.strip_suffix(" --fresh") {
@@ -1135,7 +1137,11 @@ pub async fn kill_session_keep_worktree(state: &std::sync::Arc<AppState>, name: 
     kill_session_inner(state, name, true).await
 }
 
-async fn kill_session_inner(state: &std::sync::Arc<AppState>, name: &str, keep_worktree: bool) -> String {
+async fn kill_session_inner(
+    state: &std::sync::Arc<AppState>,
+    name: &str,
+    keep_worktree: bool,
+) -> String {
     let session = state.protocol.read().await.sessions.get(name).cloned();
     let Some(session) = session else {
         return format!("session '{name}' not found");
@@ -1238,9 +1244,7 @@ async fn kill_session_inner(state: &std::sync::Arc<AppState>, name: &str, keep_w
                 // backend may clean up its own worktree during exit.
                 // Go straight to SIGKILL to prevent cleanup handlers.
                 if keep_worktree {
-                    let _ = Command::new("kill")
-                        .args(["-9", &pid.to_string()])
-                        .status();
+                    let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 } else {
                     // Graceful: send exit command if backend supports it
@@ -1316,8 +1320,8 @@ async fn kill_session_inner(state: &std::sync::Arc<AppState>, name: &str, keep_w
     // the same directory.
     if !keep_worktree {
         if let Some(dir) = project_dir {
-            let is_worktree_path = dir.contains("/.ouija/worktrees/")
-                || dir.contains("/.claude/worktrees/");
+            let is_worktree_path =
+                dir.contains("/.ouija/worktrees/") || dir.contains("/.claude/worktrees/");
             if is_worktree_path {
                 let shared = state
                     .protocol
@@ -1495,8 +1499,10 @@ pub async fn start_session(
                     .args([
                         "new-window",
                         "-d",
-                        "-e", "HISTFILE=/dev/null",
-                        "-e", "fish_history=",
+                        "-e",
+                        "HISTFILE=/dev/null",
+                        "-e",
+                        "fish_history=",
                         "-t",
                         &target,
                         "-n",
@@ -1518,8 +1524,10 @@ pub async fn start_session(
                     .args([
                         "new-session",
                         "-d",
-                        "-e", "HISTFILE=/dev/null",
-                        "-e", "fish_history=",
+                        "-e",
+                        "HISTFILE=/dev/null",
+                        "-e",
+                        "fish_history=",
                         "-s",
                         &tmux_session,
                         "-n",
@@ -1609,9 +1617,7 @@ pub async fn start_session(
                         let body = serde_json::json!({
                             "parts": [{"type": "text", "text": prompt_text}]
                         });
-                        let url = format!(
-                            "http://127.0.0.1:{port}/session/{oc_sid}/prompt_async"
-                        );
+                        let url = format!("http://127.0.0.1:{port}/session/{oc_sid}/prompt_async");
                         let state2 = state.clone();
                         let dir2 = dir.clone();
                         let name2 = name.to_string();
@@ -1635,13 +1641,12 @@ pub async fn start_session(
                                 }
                                 Ok(r) => {
                                     tracing::warn!(
-                                        "start_session: prompt_async returned {}", r.status()
+                                        "start_session: prompt_async returned {}",
+                                        r.status()
                                     );
                                 }
                                 Err(e) => {
-                                    tracing::warn!(
-                                        "start_session: prompt_async failed: {e}"
-                                    );
+                                    tracing::warn!("start_session: prompt_async failed: {e}");
                                     let _ = crate::tmux::locked_inject(
                                         &state2, &name2, &pane2, &injected, false,
                                     )
@@ -1888,13 +1893,28 @@ pub async fn restart_session(
             // respawn-pane run the command directly (which would exit immediately).
             if let Some(ref pane) = existing_pane {
                 let respawn_args: Vec<&str> = if is_http_api {
-                    vec!["respawn-pane", "-k",
-                         "-e", "HISTFILE=/dev/null", "-e", "fish_history=",
-                         "-t", pane]
+                    vec![
+                        "respawn-pane",
+                        "-k",
+                        "-e",
+                        "HISTFILE=/dev/null",
+                        "-e",
+                        "fish_history=",
+                        "-t",
+                        pane,
+                    ]
                 } else {
-                    vec!["respawn-pane", "-k",
-                         "-e", "HISTFILE=/dev/null", "-e", "fish_history=",
-                         "-t", pane, &full_cmd]
+                    vec![
+                        "respawn-pane",
+                        "-k",
+                        "-e",
+                        "HISTFILE=/dev/null",
+                        "-e",
+                        "fish_history=",
+                        "-t",
+                        pane,
+                        &full_cmd,
+                    ]
                 };
                 let output = Command::new("tmux").args(&respawn_args).output();
                 match output {
@@ -1934,8 +1954,10 @@ pub async fn restart_session(
                     .args([
                         "new-window",
                         "-d",
-                        "-e", "HISTFILE=/dev/null",
-                        "-e", "fish_history=",
+                        "-e",
+                        "HISTFILE=/dev/null",
+                        "-e",
+                        "fish_history=",
                         "-t",
                         &target,
                         "-n",
@@ -1950,8 +1972,10 @@ pub async fn restart_session(
                     .args([
                         "new-session",
                         "-d",
-                        "-e", "HISTFILE=/dev/null",
-                        "-e", "fish_history=",
+                        "-e",
+                        "HISTFILE=/dev/null",
+                        "-e",
+                        "fish_history=",
                         "-s",
                         &tmux_session,
                         "-n",
@@ -2078,12 +2102,7 @@ pub async fn restart_session(
             // signal + fallback). TuiInjection prompt was passed as CLI arg.
             if is_http_api {
                 if let Some(ref prompt_text) = formatted_prompt {
-                    schedule_prompt_injection(
-                        state,
-                        name,
-                        pane_id.clone(),
-                        prompt_text.clone(),
-                    );
+                    schedule_prompt_injection(state, name, pane_id.clone(), prompt_text.clone());
                 }
             }
             (
@@ -2324,9 +2343,7 @@ fn create_ouija_worktree(
             let _ = std::process::Command::new("git")
                 .args(["-C", &wt_dir, "checkout", "-B", branch_name, base])
                 .output();
-            tracing::info!(
-                "worktree {name} exists, force-updated branch {branch_name} to {base}",
-            );
+            tracing::info!("worktree {name} exists, force-updated branch {branch_name} to {base}",);
         }
         return Ok(wt_dir);
     }

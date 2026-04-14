@@ -105,7 +105,11 @@ pub struct SessionMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reminder: Option<String>,
     /// Original prompt from session_start, stored for re-injection on iteration.
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "original_prompt")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "original_prompt"
+    )]
     pub prompt: Option<String>,
     /// How many times loop_next has been called on this session.
     #[serde(default, alias = "loop_iteration")]
@@ -114,7 +118,11 @@ pub struct SessionMeta {
     #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "loop_log")]
     pub iteration_log: Vec<IterationLogEntry>,
     /// Unix timestamp of the most recent iteration. Used by stall detection.
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "last_loop_next")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "last_loop_next"
+    )]
     pub last_iteration_at: Option<i64>,
     /// What happens each time a scheduled task fires for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2314,9 +2322,11 @@ mod tests {
         let session = state.sessions.get("ouija").unwrap();
         assert_eq!(session.pane.as_deref(), Some("%2"));
         // Old pane's tmux var is cleared
-        assert!(effects.iter().any(
-            |e| matches!(e, Effect::ClearTmuxVar { pane, .. } if pane == "%1")
-        ));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::ClearTmuxVar { pane, .. } if pane == "%1"))
+        );
     }
 
     #[test]
@@ -2414,7 +2424,10 @@ mod tests {
             pane: Some("%1".into()),
             metadata: Default::default(),
         });
-        let effects = state.apply(Event::Remove { id: "s1".into(), keep_worktree: false });
+        let effects = state.apply(Event::Remove {
+            id: "s1".into(),
+            keep_worktree: false,
+        });
         assert!(!state.sessions.contains_key("s1"));
         assert!(
             effects
@@ -2463,7 +2476,10 @@ mod tests {
                 ..Default::default()
             },
         });
-        let effects = state.apply(Event::Remove { id: "wt".into(), keep_worktree: false });
+        let effects = state.apply(Event::Remove {
+            id: "wt".into(),
+            keep_worktree: false,
+        });
         assert!(
             effects
                 .iter()
@@ -3101,7 +3117,10 @@ mod tests {
         assert_eq!(d1.aliases.get("host0/web"), Some(&"host0/frontend".into()));
 
         // d0 removes a session
-        d0.apply(Event::Remove { id: "api".into(), keep_worktree: false });
+        d0.apply(Event::Remove {
+            id: "api".into(),
+            keep_worktree: false,
+        });
 
         // d1 receives the removal
         d1.apply(Event::IncomingWire {
@@ -3546,8 +3565,14 @@ mod stateright_model {
                                 ..Default::default()
                             },
                         },
-                        ModelMsg::Remove { id } => Event::Remove { id, keep_worktree: false },
-                        ModelMsg::RemoveKeep { id } => Event::Remove { id, keep_worktree: true },
+                        ModelMsg::Remove { id } => Event::Remove {
+                            id,
+                            keep_worktree: false,
+                        },
+                        ModelMsg::RemoveKeep { id } => Event::Remove {
+                            id,
+                            keep_worktree: true,
+                        },
                         ModelMsg::ReapDead { ids } => Event::ReapDead { dead_ids: ids },
                         ModelMsg::Rename { old_id, new_id } => Event::Rename { old_id, new_id },
                         ModelMsg::WireAnnounce {
@@ -4336,11 +4361,7 @@ mod stateright_model {
                 "worktree cleanup exercised",
                 check_some_worktree_cleanup,
             )
-            .property(
-                Expectation::Sometimes,
-                "reap exercised",
-                check_some_reap,
-            )
+            .property(Expectation::Sometimes, "reap exercised", check_some_reap)
             .within_boundary(|_, state| state.network.len() <= 12)
     }
 

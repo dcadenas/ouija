@@ -262,7 +262,7 @@ log "  Sessions before restart: $ids_before ($count_before)"
 kill $DAEMON_PID 2>/dev/null || true
 wait $DAEMON_PID 2>/dev/null || true
 sleep 0.5
-RUST_LOG=ouija=debug ouija start --port $PORT --data /tmp/ouija-test >/tmp/daemon-restart.log 2>&1 &
+RUST_LOG=ouija=debug ouija start-server --port $PORT --data /tmp/ouija-test >/tmp/daemon-restart.log 2>&1 &
 DAEMON_PID=$!
 # Wait for HTTP to be ready
 wait_for 10 curl -sf "$BASE/api/status" -o /dev/null
@@ -293,7 +293,7 @@ kill $DAEMON_PID 2>/dev/null || true
 wait $DAEMON_PID 2>/dev/null || true
 sleep 0.5
 echo '{"auto_register":true,"reaper_interval_secs":1}' > /tmp/ouija-test/settings.json
-RUST_LOG=ouija=debug ouija start --port $PORT --data /tmp/ouija-test >/tmp/daemon-restart2.log 2>&1 &
+RUST_LOG=ouija=debug ouija start-server --port $PORT --data /tmp/ouija-test >/tmp/daemon-restart2.log 2>&1 &
 DAEMON_PID=$!
 wait_for 10 curl -sf "$BASE/api/status" -o /dev/null
 # Wait for session restoration
@@ -1002,7 +1002,7 @@ jq 'map(if .id == "evict-me" then .last_activity_at = "2000-01-01T00:00:00Z" els
 kill $DAEMON_PID 2>/dev/null || true
 wait $DAEMON_PID 2>/dev/null || true
 sleep 0.5
-RUST_LOG=ouija=debug ouija start --port $PORT --data /tmp/ouija-test >/tmp/ouija-test/daemon.log 2>&1 &
+RUST_LOG=ouija=debug ouija start-server --port $PORT --data /tmp/ouija-test >/tmp/ouija-test/daemon.log 2>&1 &
 DAEMON_PID=$!
 wait_for 10 curl -sf "$BASE/api/status" -o /dev/null
 # Wait for session restoration

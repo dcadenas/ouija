@@ -193,7 +193,11 @@ pub struct SessionMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reminder: Option<String>,
     /// Original prompt from session_start, stored for re-injection on iteration.
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "original_prompt")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "original_prompt"
+    )]
     pub prompt: Option<String>,
     /// How many times loop_next has been called.
     #[serde(default, alias = "loop_iteration")]
@@ -202,7 +206,11 @@ pub struct SessionMetadata {
     #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "loop_log")]
     pub iteration_log: Vec<crate::daemon_protocol::IterationLogEntry>,
     /// Unix timestamp of the most recent iteration. Used by stall detection.
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "last_loop_next")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "last_loop_next"
+    )]
     pub last_iteration_at: Option<i64>,
     /// What happens each time a scheduled task fires for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -727,9 +735,7 @@ impl AppState {
         {
             Ok(Some(r)) if !r.is_empty() => r,
             _ => {
-                tracing::info!(
-                    "worktree {dir_owned} not inside a git repo, skipping cleanup"
-                );
+                tracing::info!("worktree {dir_owned} not inside a git repo, skipping cleanup");
                 return;
             }
         };
@@ -914,10 +920,7 @@ impl AppState {
 
     /// Drain the pending compact continuation from a session agent (RPC).
     /// Returns None if the agent has no pending continuation or the session has no agent.
-    pub async fn drain_agent_compact_continuation(
-        &self,
-        session_id: &str,
-    ) -> Option<String> {
+    pub async fn drain_agent_compact_continuation(&self, session_id: &str) -> Option<String> {
         let agents = self.session_agents.read().await;
         if let Some(agent) = agents.get(session_id) {
             ractor::call!(
@@ -955,7 +958,10 @@ impl AppState {
         }
         let excess = local.len() - max;
         // Only consider stale sessions for eviction
-        let mut stale: Vec<_> = local.into_iter().filter(|s| s.metadata.is_stale()).collect();
+        let mut stale: Vec<_> = local
+            .into_iter()
+            .filter(|s| s.metadata.is_stale())
+            .collect();
         // Sort by last activity (oldest first)
         stale.sort_by_key(|s| s.metadata.last_metadata_update.unwrap_or(s.registered_at));
         stale.iter().take(excess).map(|s| s.id.clone()).collect()
@@ -1449,7 +1455,10 @@ pub(crate) mod tests {
         let state = AppState::new(test_config());
         proto_register(&state, "s1", Some("%1")).await;
         state
-            .apply_and_execute(crate::daemon_protocol::Event::Remove { id: "s1".into(), keep_worktree: false })
+            .apply_and_execute(crate::daemon_protocol::Event::Remove {
+                id: "s1".into(),
+                keep_worktree: false,
+            })
             .await;
         assert!(state.protocol.read().await.sessions.is_empty());
     }
@@ -1458,7 +1467,10 @@ pub(crate) mod tests {
     async fn remove_nonexistent_is_noop() {
         let state = AppState::new(test_config());
         let effects = state
-            .apply_and_execute(crate::daemon_protocol::Event::Remove { id: "nope".into(), keep_worktree: false })
+            .apply_and_execute(crate::daemon_protocol::Event::Remove {
+                id: "nope".into(),
+                keep_worktree: false,
+            })
             .await;
         assert!(
             effects

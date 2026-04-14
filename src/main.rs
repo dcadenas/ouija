@@ -17,7 +17,6 @@ mod tmux;
 mod tmux_var;
 mod transport;
 
-
 use anyhow::Context;
 use backend::CodingAssistant;
 use clap::{Parser, Subcommand};
@@ -617,7 +616,11 @@ async fn main() -> anyhow::Result<()> {
             });
             cli_post("/api/send", &body).await?;
         }
-        Command::Tell { to, message, reply_to } => {
+        Command::Tell {
+            to,
+            message,
+            reply_to,
+        } => {
             let from = require_my_session_id().await?;
             let body = serde_json::json!({
                 "from": from,
@@ -628,7 +631,13 @@ async fn main() -> anyhow::Result<()> {
             });
             cli_post("/api/send", &body).await?;
         }
-        Command::Reply { to, msg_id, message, no_done, expect_reply } => {
+        Command::Reply {
+            to,
+            msg_id,
+            message,
+            no_done,
+            expect_reply,
+        } => {
             let from = require_my_session_id().await?;
             let body = serde_json::json!({
                 "from": from,
@@ -694,14 +703,22 @@ async fn main() -> anyhow::Result<()> {
             });
             cli_post("/api/sessions/start", &body).await?;
         }
-        Command::KillSession { name, keep_worktree } => {
+        Command::KillSession {
+            name,
+            keep_worktree,
+        } => {
             let body = serde_json::json!({
                 "name": name,
                 "keep_worktree": keep_worktree,
             });
             cli_post("/api/sessions/kill", &body).await?;
         }
-        Command::RestartSession { name, fresh, prompt, reminder } => {
+        Command::RestartSession {
+            name,
+            fresh,
+            prompt,
+            reminder,
+        } => {
             let body = serde_json::json!({
                 "name": name,
                 "fresh": fresh,
@@ -1184,9 +1201,9 @@ fn stop_daemon() -> anyhow::Result<()> {
         .map(|s| s.success())
         .unwrap_or(false);
 
-    // Also kill any "ouija start" processes
+    // Also kill any "ouija start-server" processes
     let pkill_killed = Cmd::new("pkill")
-        .args(["-f", "ouija start"])
+        .args(["-f", "ouija start-server"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
@@ -1219,12 +1236,12 @@ fn update_and_restart() -> anyhow::Result<()> {
         if !daemon_alive {
             println!("daemon is not running — starting it...");
             Cmd::new("ouija")
-                .arg("start")
+                .arg("start-server")
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
-                .context("failed to spawn ouija start")?;
+                .context("failed to spawn ouija start-server")?;
             for i in 0..20 {
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 if Cmd::new("curl")
@@ -1289,12 +1306,12 @@ fn update_and_restart() -> anyhow::Result<()> {
     }
 
     Cmd::new("ouija")
-        .arg("start")
+        .arg("start-server")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .context("failed to spawn ouija start")?;
+        .context("failed to spawn ouija start-server")?;
 
     let status_url = format!("http://localhost:{port}/api/status");
     for i in 0..20 {

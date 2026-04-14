@@ -16,11 +16,7 @@ pub fn get(pane: &str) -> Option<String> {
         .output()
         .ok()?;
     let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if val.is_empty() {
-        None
-    } else {
-        Some(val)
-    }
+    if val.is_empty() { None } else { Some(val) }
 }
 
 /// Clear the `@ouija_session` user variable from a tmux pane.

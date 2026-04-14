@@ -17,7 +17,9 @@ const TUI_READY_TIMEOUT_SECS: u64 = 30;
 const REVIVAL_POLL_SECS: u64 = 2;
 
 /// What happens each time the task fires.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq, Hash, schemars::JsonSchema)]
+#[derive(
+    Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq, Hash, schemars::JsonSchema,
+)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum OnFire {
     /// Inject into live session; revive with --continue if dead.
@@ -411,12 +413,16 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
         }
         // Verify session still exists — a concurrent kill may have removed it
         // while we were checking pane liveness. If gone, fall through to revival.
-        if state.protocol.read().await.sessions.contains_key(session_name) {
+        if state
+            .protocol
+            .read()
+            .await
+            .sessions
+            .contains_key(session_name)
+        {
             return TaskRun::ok(task, None);
         }
-        tracing::info!(
-            "session '{session_name}' disappeared during alive check, reviving"
-        );
+        tracing::info!("session '{session_name}' disappeared during alive check, reviving");
     }
 
     // Pane is dead — attempt revival, falling back to session's project_dir
@@ -649,8 +655,10 @@ async fn revive_and_inject(
                     .args([
                         "new-window",
                         "-d",
-                        "-e", "HISTFILE=/dev/null",
-                        "-e", "fish_history=",
+                        "-e",
+                        "HISTFILE=/dev/null",
+                        "-e",
+                        "fish_history=",
                         "-t",
                         &target,
                         "-n",
@@ -665,8 +673,10 @@ async fn revive_and_inject(
                     .args([
                         "new-session",
                         "-d",
-                        "-e", "HISTFILE=/dev/null",
-                        "-e", "fish_history=",
+                        "-e",
+                        "HISTFILE=/dev/null",
+                        "-e",
+                        "fish_history=",
                         "-s",
                         &tmux_session,
                         "-n",
@@ -1073,8 +1083,18 @@ mod tests {
     fn on_fire_kills_alive() {
         assert!(!OnFire::ContinueSession.kills_alive());
         assert!(!OnFire::NewSession.kills_alive());
-        assert!(!OnFire::PersistentWorktree { clear_context: false }.kills_alive());
-        assert!(OnFire::PersistentWorktree { clear_context: true }.kills_alive());
+        assert!(
+            !OnFire::PersistentWorktree {
+                clear_context: false
+            }
+            .kills_alive()
+        );
+        assert!(
+            OnFire::PersistentWorktree {
+                clear_context: true
+            }
+            .kills_alive()
+        );
         assert!(OnFire::DisposableWorktree.kills_alive());
     }
 

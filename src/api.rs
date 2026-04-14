@@ -1479,9 +1479,17 @@ pub async fn start_session(
     let state2 = state.clone();
     tokio::spawn(async move {
         // If session already exists, restart with fresh context instead of failing.
-        let exists = state2.protocol.read().await.sessions.contains_key(&body.name);
+        let exists = state2
+            .protocol
+            .read()
+            .await
+            .sessions
+            .contains_key(&body.name);
         if exists {
-            tracing::info!("session '{}' exists, restarting with fresh context", body.name);
+            tracing::info!(
+                "session '{}' exists, restarting with fresh context",
+                body.name
+            );
             let (_result, _msg_id) = crate::nostr_transport::restart_session(
                 &state2,
                 &body.name,
@@ -1515,10 +1523,16 @@ pub async fn start_session(
         )
         .await;
 
-        tracing::info!("async session start complete: {}, result: {result}", body.name);
+        tracing::info!(
+            "async session start complete: {}, result: {result}",
+            body.name
+        );
     });
 
-    (StatusCode::ACCEPTED, Json(json!({ "session": name, "status": "starting" })))
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "session": name, "status": "starting" })),
+    )
 }
 
 /// Kill and restart a session, optionally with a fresh conversation.

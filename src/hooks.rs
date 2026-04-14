@@ -2,7 +2,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Json;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::state::SharedState;
 
@@ -93,10 +93,7 @@ pub async fn hook_stop(
     (StatusCode::OK, Json(result))
 }
 
-async fn hook_stop_inner(
-    state: &std::sync::Arc<crate::state::AppState>,
-    body: PaneBody,
-) -> Value {
+async fn hook_stop_inner(state: &std::sync::Arc<crate::state::AppState>, body: PaneBody) -> Value {
     if let Some(id) = state
         .find_session_by_pane_or_backend_sid(
             body.pane.as_deref(),
@@ -146,10 +143,13 @@ async fn prompt_submit_inner(
             .sessions
             .values()
             .find(|s| {
-                body.pane.as_deref().is_some_and(|p| s.pane.as_deref() == Some(p))
-                    || body.backend_session_id.as_deref().is_some_and(|b| {
-                        s.metadata.backend_session_id.as_deref() == Some(b)
-                    })
+                body.pane
+                    .as_deref()
+                    .is_some_and(|p| s.pane.as_deref() == Some(p))
+                    || body
+                        .backend_session_id
+                        .as_deref()
+                        .is_some_and(|b| s.metadata.backend_session_id.as_deref() == Some(b))
             })
             .cloned();
         let id = me.as_ref().map(|s| s.id.clone());
@@ -166,7 +166,10 @@ async fn prompt_submit_inner(
     // Compute diff against per-caller baseline
     let previous = {
         let mut baselines = state.session_diff_baselines.lock().unwrap();
-        let prev = baselines.get(baseline_key.as_str()).cloned().unwrap_or_default();
+        let prev = baselines
+            .get(baseline_key.as_str())
+            .cloned()
+            .unwrap_or_default();
         baselines.insert(baseline_key, current_snapshots.clone());
         prev
     };
@@ -188,8 +191,7 @@ async fn prompt_submit_inner(
     let updated: Vec<&crate::state::SessionSnapshot> = current_snapshots
         .iter()
         .filter(|s| {
-            prev_ids.contains(s.id.as_str())
-                && previous.iter().find(|p| p.id == s.id) != Some(s)
+            prev_ids.contains(s.id.as_str()) && previous.iter().find(|p| p.id == s.id) != Some(s)
         })
         .collect();
 
@@ -250,7 +252,10 @@ async fn prompt_submit_inner(
             let prev_s = previous.iter().find(|p| p.id == s.id);
             let mut details = Vec::new();
             if s.role != prev_s.and_then(|p| p.role.as_ref()).cloned() {
-                details.push(format!("role: {}", s.role.as_deref().unwrap_or("<cleared>")));
+                details.push(format!(
+                    "role: {}",
+                    s.role.as_deref().unwrap_or("<cleared>")
+                ));
             }
             if s.bulletin != prev_s.and_then(|p| p.bulletin.as_ref()).cloned() {
                 details.push(format!(
@@ -325,9 +330,7 @@ async fn post_compact_inner(
     };
 
     // Drain the pending continuation from the agent (RPC — atomically take + clear)
-    let continuation = state
-        .drain_agent_compact_continuation(&session_id)
-        .await;
+    let continuation = state.drain_agent_compact_continuation(&session_id).await;
 
     let Some(continuation) = continuation else {
         return json!({ "ok": true, "continuation_injected": false });
@@ -336,10 +339,7 @@ async fn post_compact_inner(
     // Look up pane for injection
     let pane = {
         let proto = state.protocol.read().await;
-        proto
-            .sessions
-            .get(&session_id)
-            .and_then(|s| s.pane.clone())
+        proto.sessions.get(&session_id).and_then(|s| s.pane.clone())
     };
     let Some(pane) = pane else {
         return json!({ "ok": true, "continuation_injected": false, "error": "no pane" });
@@ -465,8 +465,7 @@ async fn session_start_inner(
     let plugin_version = std::env::var("HOME")
         .ok()
         .and_then(|home| {
-            std::fs::read_dir(format!("{home}/.claude/plugins/cache/ouija/ouija"))
-                .ok()
+            std::fs::read_dir(format!("{home}/.claude/plugins/cache/ouija/ouija")).ok()
         })
         .and_then(|entries| {
             entries.flatten().find_map(|e| {
@@ -546,7 +545,10 @@ mod tests {
             }
         }
 
-        let body = PaneBody { pane: Some("%99".into()), backend_session_id: None };
+        let body = PaneBody {
+            pane: Some("%99".into()),
+            backend_session_id: None,
+        };
         let result = session_end_inner(&state, body).await;
         assert!(result.get("removed").is_some());
         assert!(state.find_session_by_pane("%99").await.is_none());
@@ -563,7 +565,10 @@ mod tests {
             })
             .await;
         // registered_at is now(), so age < 5s — should reject
-        let body = PaneBody { pane: Some("%99".into()), backend_session_id: None };
+        let body = PaneBody {
+            pane: Some("%99".into()),
+            backend_session_id: None,
+        };
         let result = session_end_inner(&state, body).await;
         assert!(result.get("skipped").is_some());
         // Session still exists
@@ -573,7 +578,10 @@ mod tests {
     #[tokio::test]
     async fn session_end_no_session() {
         let state = crate::state::AppState::new_for_test();
-        let body = PaneBody { pane: Some("%999".into()), backend_session_id: None };
+        let body = PaneBody {
+            pane: Some("%999".into()),
+            backend_session_id: None,
+        };
         let result = session_end_inner(&state, body).await;
         assert!(result.get("skipped").is_some());
     }
@@ -581,7 +589,10 @@ mod tests {
     #[tokio::test]
     async fn hook_stop_no_session_returns_ok() {
         let state = crate::state::AppState::new_for_test();
-        let body = PaneBody { pane: Some("%999".into()), backend_session_id: None };
+        let body = PaneBody {
+            pane: Some("%999".into()),
+            backend_session_id: None,
+        };
         let result = hook_stop_inner(&state, body).await;
         assert_eq!(result, json!({ "ok": true }));
     }
@@ -589,7 +600,10 @@ mod tests {
     #[tokio::test]
     async fn prompt_submit_returns_empty_for_unknown_pane() {
         let state = crate::state::AppState::new_for_test();
-        let body = PaneBody { pane: Some("%999".into()), backend_session_id: None };
+        let body = PaneBody {
+            pane: Some("%999".into()),
+            backend_session_id: None,
+        };
         let result = prompt_submit_inner(&state, body).await;
         assert_eq!(result["output"], "");
     }
@@ -606,7 +620,14 @@ mod tests {
             })
             .await;
         // First call: sets baseline
-        let _ = prompt_submit_inner(&state, PaneBody { pane: Some("%10".into()), backend_session_id: None }).await;
+        let _ = prompt_submit_inner(
+            &state,
+            PaneBody {
+                pane: Some("%10".into()),
+                backend_session_id: None,
+            },
+        )
+        .await;
         // Add newcomer
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -619,10 +640,23 @@ mod tests {
             })
             .await;
         // Second call: should detect newcomer
-        let result = prompt_submit_inner(&state, PaneBody { pane: Some("%10".into()), backend_session_id: None }).await;
+        let result = prompt_submit_inner(
+            &state,
+            PaneBody {
+                pane: Some("%10".into()),
+                backend_session_id: None,
+            },
+        )
+        .await;
         let output = result["output"].as_str().unwrap();
-        assert!(output.contains("newcomer"), "output should mention newcomer: {output}");
-        assert!(output.contains("joined"), "output should contain 'joined': {output}");
+        assert!(
+            output.contains("newcomer"),
+            "output should mention newcomer: {output}"
+        );
+        assert!(
+            output.contains("joined"),
+            "output should contain 'joined': {output}"
+        );
     }
 
     #[tokio::test]
@@ -736,15 +770,11 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Drain should return the continuation
-        let continuation = state
-            .drain_agent_compact_continuation("drain-test")
-            .await;
+        let continuation = state.drain_agent_compact_continuation("drain-test").await;
         assert_eq!(continuation.as_deref(), Some("Continue working."));
 
         // Second drain should return None (one-shot)
-        let continuation = state
-            .drain_agent_compact_continuation("drain-test")
-            .await;
+        let continuation = state.drain_agent_compact_continuation("drain-test").await;
         assert_eq!(continuation, None);
     }
 }

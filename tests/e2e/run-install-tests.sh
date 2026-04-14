@@ -13,7 +13,7 @@ assert_contains "ouija --help outputs usage info" "$HELP_OUTPUT" "ouija"
 
 # ── T2: Preflight — tmux missing ──────────────────────────────────
 log "T2: tmux missing"
-PREFLIGHT_OUT=$(ouija start --port 17880 2>&1 || true)
+PREFLIGHT_OUT=$(ouija start-server --port 17880 2>&1 || true)
 assert_contains "error mentions tmux not found" "$PREFLIGHT_OUT" "tmux not found"
 assert_contains "shows apt install hint" "$PREFLIGHT_OUT" "apt install tmux"
 STARTED="no"
@@ -29,7 +29,7 @@ DATA_T3=$(mktemp -d)
 echo '{"auto_register":false}' > "$DATA_T3/settings.json"
 tmux new-session -d -s preflight
 
-ouija start --port 17881 --data "$DATA_T3" >"$DATA_T3/output.log" 2>&1 &
+ouija start-server --port 17881 --data "$DATA_T3" >"$DATA_T3/output.log" 2>&1 &
 PID_T3=$!
 
 if wait_for 15 curl -sf http://127.0.0.1:17881/api/status -o /dev/null; then
@@ -55,7 +55,7 @@ chmod +x /usr/local/bin/claude
 DATA_T4=$(mktemp -d)
 echo '{"auto_register":false}' > "$DATA_T4/settings.json"
 
-ouija start --port 17882 --data "$DATA_T4" >"$DATA_T4/output.log" 2>&1 &
+ouija start-server --port 17882 --data "$DATA_T4" >"$DATA_T4/output.log" 2>&1 &
 PID_T4=$!
 
 if wait_for 15 curl -sf http://127.0.0.1:17882/api/status -o /dev/null; then
