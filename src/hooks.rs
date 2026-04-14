@@ -438,15 +438,6 @@ async fn session_start_inner(
         })
         .await;
 
-    // Set tmux @ouija_id (after registration so name reflects any suffix)
-    let pane_clone = body.pane.clone();
-    let tmux_id = id.clone();
-    tokio::task::spawn_blocking(move || {
-        let _ = std::process::Command::new("tmux")
-            .args(["set-option", "-p", "-t", &pane_clone, "@ouija_id", &tmux_id])
-            .status();
-    });
-
     // Build peer list
     let peers: Vec<Value> = {
         let proto = state.protocol.read().await;
