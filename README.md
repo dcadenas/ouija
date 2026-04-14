@@ -62,6 +62,8 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 
 **Dashboard** at `localhost:7880`. Manage sessions, tasks, node connections, and settings.
 
+![Ouija admin dashboard showing local sessions, scheduled tasks, pairing, message log, and daemon settings.](admin-screenshot.png)
+
 ## Design philosophy
 
 **ouija is transport, not intelligence.** Sessions compose their own messages, interpret what they receive, and decide what to do. ouija delivers bytes. That is deliberate.
