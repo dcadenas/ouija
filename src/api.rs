@@ -616,7 +616,6 @@ pub async fn send_msg(
                 "status": "delivered",
                 "method": method,
                 "msg_id": msg_id,
-                "hint": format!("To reply to this message, use responds_to={msg_id}")
             })),
         )
     } else if let Some((reason, renamed_to)) = effects.iter().find_map(|e| match e {
