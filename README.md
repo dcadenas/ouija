@@ -1,8 +1,10 @@
 # ouija
 
+_A transparent pipe between coding sessions._
+
 You're deep in a coding session when you realize another session has exactly the context you need. Maybe it started on something unrelated on your machine, maybe it's on your laptop at home. You say "ask deploy-infra what port the gateway uses." The other session receives it as natural input, draws on everything it knows, and replies. No tab switching, no copy-paste. Every session stays fully interactive for you.
 
-Ad hoc by design. Sessions don't need to be started any special way — just run ouija, open coding sessions as you normally would, and they discover each other. For same-machine messaging that's all you need. For cross-machine, pair two ouija daemons once over Nostr and any session on either machine becomes reachable.
+Ad hoc by design. Sessions don't need to be started any special way. Just run ouija, open coding sessions as you normally would, and they discover each other. For same-machine messaging that's all you need. For cross-machine, pair two ouija daemons once over Nostr and any session on either machine becomes reachable.
 
 This opens weirder possibilities too. A session on your machine talking to a session on a colleague's laptop in another country. A chat room of humans and LLMs all seeing the same messages, each contributing what they know.
 
