@@ -1,11 +1,9 @@
 use std::process::Command;
 
-const VAR_NAME: &str = "@ouija_session";
-
-/// Set the `@ouija_session` user variable on a tmux pane.
-pub fn set(pane: &str, session_id: &str) {
+/// Set a user variable on a tmux pane (`tmux set -pt <pane> <name> <value>`).
+pub fn set(pane: &str, name: &str, value: &str) {
     let _ = Command::new("tmux")
-        .args(["set", "-t", pane, "-p", VAR_NAME, session_id])
+        .args(["set", "-t", pane, "-p", name, value])
         .status();
 }
 
@@ -19,9 +17,9 @@ pub fn get(pane: &str) -> Option<String> {
     if val.is_empty() { None } else { Some(val) }
 }
 
-/// Clear the `@ouija_session` user variable from a tmux pane.
-pub fn clear(pane: &str) {
+/// Clear a user variable from a tmux pane (`tmux set -pu -t <pane> <name>`).
+pub fn clear(pane: &str, name: &str) {
     let _ = Command::new("tmux")
-        .args(["set", "-t", pane, "-pu", VAR_NAME])
+        .args(["set", "-t", pane, "-pu", name])
         .status();
 }
