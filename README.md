@@ -2,11 +2,13 @@
 
 _A transparent pipe between coding sessions._
 
-You're deep in a coding session when you realize another session has exactly the context you need. Maybe it started on something unrelated on your machine, maybe it's on your laptop at home. You say "ask deploy-infra what port the gateway uses." The other session receives it as natural input, draws on everything it knows, and replies. No tab switching, no copy-paste. Every session stays fully interactive for you.
+You're deep in a coding session when you realize another session has already built the understanding you need. Maybe it started on something unrelated on your machine, maybe it's on your laptop at home. You say "ask deploy-infra what port the gateway uses." The other session receives it as natural input, draws on what it knows, and replies. No tab switching, no copy-paste. Every session stays fully interactive for you.
 
 Ad hoc by design. Sessions don't need to be started any special way. Just run ouija, open coding sessions as you normally would, and they discover each other. For same-machine messaging that's all you need. For cross-machine, pair two ouija daemons once over Nostr and any session on either machine becomes reachable.
 
-This opens weirder possibilities too. A session on your machine talking to a session on a colleague's laptop in another country. A chat room of humans and LLMs all seeing the same messages, each contributing what they know.
+Sessions stay sovereign. ouija is plumbing, not a harness. Your sessions keep their own memory, their own tools, their own context. The protocol is open and inspectable, the transport is end-to-end encrypted, and no part of the stack locks you into a particular model provider or agent framework. In a landscape where harnesses and memory are increasingly coupled behind closed APIs, ouija is deliberately the opposite: transport between whatever sessions you already run.
+
+This opens weirder possibilities too. A session on your machine talking to a session on a colleague's laptop in another country. Eventually, chat rooms where humans and LLMs coexist, each contributing what they know. Most of this is latent in the architecture rather than battle-tested, but the primitives are there.
 
 ![Two Claude Code sessions exchanging messages via ouija. The deploy-infra session asks auth-service what port to use and gets a reply, all without leaving either terminal.](screenshot.png)
 
@@ -37,7 +39,9 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 
 ## What you can do
 
-**Message any session**, local or remote. Sessions discover each other automatically.
+**Message any session**, local or remote. Sessions discover each other automatically. Messages travel through a thin CLI (`ouija ask target "question"`) that costs roughly 5 tokens per call instead of the ~40 a raw HTTP POST would cost.
+
+**Share state through the filesystem, not just the wire.** A message can be small and point to shared state: "see `docs/api.md`" or "check the worktree at `~/code/foo`". The receiver loads the full content from disk, bypassing the compression that any fixed-size message would impose. Messages as pointers to shared state scale better than messages as state.
 
 **Spawn sessions on the fly.** Ask the assistant to start a new session (e.g. "use ouija to start a gateway-debug session"). The daemon creates a tmux window, launches a coding session, and registers it. You can specify a prompt to seed the session with context and a backend (`claude-code` or `opencode`).
 
@@ -55,6 +59,16 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 **Nostr DMs.** If you use Nostr, configure your npub to control the daemon from any Nostr client. Send `/list`, `/start`, `@session message`, or bare text (routed by an LLM).
 
 **Dashboard** at `localhost:7880`. Manage sessions, tasks, node connections, and settings.
+
+## Design philosophy
+
+**ouija is transport, not intelligence.** Sessions compose their own messages, interpret what they receive, and decide what to do. ouija delivers bytes. That is deliberate.
+
+**Messages are compression.** When a session sends a message, it is compressing its current understanding into a few hundred tokens. The transport is lossless but the composition is lossy. For anything larger than a paragraph, prefer pointing at shared state (a file, a wiki page, a worktree) rather than dumping context into the message body.
+
+**Receiving sessions can drop information.** Even when a message arrives intact, the receiver may fail to integrate it with its existing context. This is a property of LLMs, not ouija. Treat inter-session messaging as persuasion, not injection: explicit, cited, and verifiable against shared artifacts.
+
+**Stale claims transfer invisibly.** If session A tells session B "the database is sharded by tenant," and A's mental model is actually outdated, B will treat the claim as fact. Prefer pointers to ground truth over assertions whenever it matters.
 
 ## Connecting machines
 
@@ -91,7 +105,7 @@ The daemon assigns unique IDs to every message, tracks pending replies, and nudg
 1. Each machine runs an **ouija daemon** (small Rust binary)
 2. Sessions **auto-register via hooks** on startup
 3. Local messages: **tmux injection** (Claude Code) or **HTTP API** (opencode)
-4. Remote messages: **end-to-end encrypted**, works across NATs without port forwarding (uses [Nostr](https://nostr.com) relays as transport)
+4. Remote messages: **end-to-end encrypted** over [Nostr](https://nostr.com) relays. No central server, no direct TCP connection required, works across NATs, and relays see only ciphertext. Unusual for agent communication, since most frameworks assume a reachable IP or a proprietary cloud.
 5. Node auth: **connect secret** in the ticket, unknown senders rejected
 
 All session state transitions go through a pure state machine (`DaemonProtocol`) that's [formally verified](tests/model/main.rs) using [Stateright](https://github.com/stateright/stateright) model checking.
