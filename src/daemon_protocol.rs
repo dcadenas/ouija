@@ -237,6 +237,7 @@ pub enum Event {
 /// Side effects returned by apply(). Values, not actions.
 /// The runtime executes them. The model inspects or ignores them.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Effect {
     // Wire
     Broadcast(crate::protocol::WireMessage),
@@ -1108,6 +1109,7 @@ impl DaemonState {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_incoming_send(
         &mut self,
         from: &str,

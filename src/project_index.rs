@@ -153,24 +153,6 @@ pub async fn refresh_index(state: &Arc<AppState>) {
     *state.project_index.write().await = index;
 }
 
-/// Find projects matching a query (exact, then substring).
-pub async fn suggest_projects(state: &Arc<AppState>, query: &str) -> Vec<ProjectInfo> {
-    let index = state.project_index.read().await;
-    let query_lower = query.to_lowercase();
-
-    // Exact match
-    if let Some(info) = index.get(query) {
-        return vec![info.clone()];
-    }
-
-    // Substring match
-    index
-        .values()
-        .filter(|p| p.name.to_lowercase().contains(&query_lower))
-        .cloned()
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

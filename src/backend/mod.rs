@@ -101,6 +101,7 @@ pub struct InjectConfig {
 }
 
 /// A terminal-based coding assistant that ouija can orchestrate.
+#[allow(dead_code)]
 pub trait CodingAssistant: Send + Sync + std::fmt::Debug + 'static {
     fn name(&self) -> &str;
     fn cli_name(&self) -> &str;

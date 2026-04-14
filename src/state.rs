@@ -1118,6 +1118,7 @@ impl AppState {
     }
 
     /// Register a oneshot sender for a pending remote command result.
+    #[allow(dead_code)]
     pub fn register_pending_command(
         &self,
         command: String,

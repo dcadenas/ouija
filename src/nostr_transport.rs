@@ -1345,6 +1345,7 @@ async fn kill_session_inner(
 }
 
 /// Start a new session in a tmux pane, optionally in a worktree.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_session(
     state: &std::sync::Arc<AppState>,
     name: &str,
@@ -1439,7 +1440,7 @@ pub async fn start_session(
             Some(r) => format!("{text}\n\n{r}"),
             None => text.to_string(),
         };
-        let injected = if let Some(sender) = from {
+        if let Some(sender) = from {
             let er = expects_reply.unwrap_or(true);
             let msg_id = {
                 let mut proto = state.protocol.write().await;
@@ -1451,8 +1452,7 @@ pub async fn start_session(
             Some((formatted, Some(msg_id)))
         } else {
             Some((full_text, None))
-        };
-        injected
+        }
     } else {
         None
     };
@@ -1690,6 +1690,7 @@ pub async fn start_session(
 }
 
 /// Kill and restart a session, preserving metadata unless `fresh`.
+#[allow(clippy::too_many_arguments)]
 pub async fn restart_session(
     state: &std::sync::Arc<AppState>,
     name: &str,
@@ -2121,6 +2122,7 @@ pub async fn restart_session(
 ///
 /// Returns `Ok((status_message, prompt_msg_id))` on success.
 /// Returns `Err(())` on failure — caller should fall back to hard restart.
+#[allow(clippy::too_many_arguments)]
 async fn soft_restart_session(
     state: &std::sync::Arc<AppState>,
     name: &str,

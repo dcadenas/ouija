@@ -41,6 +41,7 @@ pub enum SessionMsg {
     /// Internal: idle timer expired.
     IdleTimeout,
     /// loop_next was called — reset loop stall timer.
+    #[allow(dead_code)]
     LoopProgress,
     /// Internal: mild stall timer expired (3x average interval).
     LoopMildStall,
