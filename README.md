@@ -2,7 +2,9 @@
 
 _A transparent pipe between coding sessions._
 
-You're deep in a coding session when you realize another session has already built the understanding you need. Maybe it started on something unrelated on your machine, maybe it's on your laptop at home. You say "ask deploy-infra what port the gateway uses." The other session receives it as natural input, draws on what it knows, and replies. No tab switching, no copy-paste. Every session stays fully interactive for you.
+You're deep in a coding session when you realize another session has the understanding you need. Maybe it started on something unrelated on your machine, maybe it's on your laptop at home. You say "ask deploy-infra what port the gateway uses." The other session receives it as natural input, draws on what it knows, and replies. Every session stays fully interactive for you.
+
+![Two Claude Code sessions exchanging messages via ouija. The deploy-infra session asks auth-service what port to use and gets a reply, all without leaving either terminal.](screenshot.png)
 
 Ad hoc by design. Sessions don't need to be started any special way. Just run ouija, open coding sessions as you normally would, and they discover each other. For same-machine messaging that's all you need. For cross-machine, pair two ouija daemons once over Nostr and any session on either machine becomes reachable.
 
@@ -11,10 +13,6 @@ ouija is plumbing, not a harness. It delivers messages between sessions and mana
 The session lifecycle primitives (spawn, kill, health checks, worktree isolation) may also be useful as a substrate beneath a higher-level harness or orchestrator. This is exploratory territory rather than a shipped use case.
 
 This opens weirder possibilities too. A session on your machine talking to a session on a colleague's laptop in another country. Eventually, chat rooms where humans and LLMs coexist, each contributing what they know. Most of this is latent in the architecture rather than battle-tested, but the primitives are there.
-
-![Two Claude Code sessions exchanging messages via ouija. The deploy-infra session asks auth-service what port to use and gets a reply, all without leaving either terminal.](screenshot.png)
-
-Supports **Claude Code** (primary). **[opencode](https://opencode.ai)** support is implemented and can talk to Claude Code sessions, but is less battle-tested.
 
 ## Prerequisites
 
