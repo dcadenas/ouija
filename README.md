@@ -62,7 +62,7 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 
 **Dashboard** at `localhost:7880`. Manage sessions, tasks, node connections, and settings.
 
-![Ouija admin dashboard showing local sessions, scheduled tasks, pairing, message log, and daemon settings.](admin-screenshot.png)
+<a href="admin-screenshot.png"><img src="admin-screenshot.png" alt="Ouija admin dashboard showing local sessions, scheduled tasks, pairing, message log, and daemon settings." width="450"></a>
 
 ## Design philosophy
 
