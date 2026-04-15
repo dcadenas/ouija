@@ -517,14 +517,11 @@ pub async fn locked_inject(
     }
 }
 
-/// Deliver a message to an opencode session via its TUI HTTP API.
+/// Deliver a message to an opencode session via its HTTP API.
 ///
-/// Uses the `/tui/append-prompt` + `/tui/submit-prompt` endpoints to drive
-/// the TUI directly. This makes the message visible in the prompt input area
-/// before submission, matching the experience of a user typing the message.
-///
-/// Falls back to `prompt_async` if the TUI endpoints fail (e.g. no attached
-/// TUI client).
+/// Uses the `prompt_async` endpoint which returns immediately without waiting
+/// for the LLM to finish processing. The message appears as a user message
+/// in the session and triggers an assistant turn.
 async fn deliver_via_http(
     state: &crate::state::AppState,
     oc_session_id: Option<String>,
@@ -533,90 +530,9 @@ async fn deliver_via_http(
 ) -> anyhow::Result<()> {
     let port = state.opencode_serve_port();
 
-    let _oc_session_id =
+    let oc_session_id =
         oc_session_id.ok_or_else(|| anyhow::anyhow!("no backend_session_id for session"))?;
 
-    let client = state.http_client.clone();
-    let base = format!("http://127.0.0.1:{port}");
-    let timeout = std::time::Duration::from_secs(10);
-
-    let dir_header = |req: reqwest::RequestBuilder| -> reqwest::RequestBuilder {
-        match project_dir {
-            Some(dir) => req.header("x-opencode-directory", dir),
-            None => req,
-        }
-    };
-
-    // Clear any existing prompt text, then append our message and submit.
-    let clear_resp = dir_header(
-        client
-            .post(format!("{base}/tui/clear-prompt"))
-            .json(&serde_json::json!({}))
-            .timeout(timeout),
-    )
-    .send()
-    .await;
-
-    if let Err(e) = &clear_resp {
-        tracing::debug!("tui/clear-prompt failed (may have no TUI): {e}");
-    }
-
-    let append_resp = dir_header(
-        client
-            .post(format!("{base}/tui/append-prompt"))
-            .json(&serde_json::json!({ "text": message }))
-            .timeout(timeout),
-    )
-    .send()
-    .await;
-
-    match &append_resp {
-        Ok(r) if r.status().is_success() => {}
-        Ok(r) => {
-            let status = r.status();
-            tracing::warn!("tui/append-prompt returned {status}, falling back to prompt_async");
-            return deliver_via_prompt_async(state, &_oc_session_id, project_dir, message).await;
-        }
-        Err(e) => {
-            tracing::warn!("tui/append-prompt failed: {e}, falling back to prompt_async");
-            return deliver_via_prompt_async(state, &_oc_session_id, project_dir, message).await;
-        }
-    }
-
-    let submit_resp = dir_header(
-        client
-            .post(format!("{base}/tui/submit-prompt"))
-            .json(&serde_json::json!({}))
-            .timeout(timeout),
-    )
-    .send()
-    .await;
-
-    match submit_resp {
-        Ok(r) if r.status().is_success() => {
-            tracing::info!(port, "delivered message via TUI endpoints");
-        }
-        Ok(r) => {
-            let status = r.status();
-            let text = r.text().await.unwrap_or_default();
-            tracing::warn!("tui/submit-prompt returned {status}: {text}");
-        }
-        Err(e) => {
-            tracing::warn!("tui/submit-prompt failed: {e}");
-        }
-    }
-
-    Ok(())
-}
-
-/// Fallback: deliver via `prompt_async` when TUI endpoints are unavailable.
-async fn deliver_via_prompt_async(
-    state: &crate::state::AppState,
-    oc_session_id: &str,
-    project_dir: Option<&str>,
-    message: &str,
-) -> anyhow::Result<()> {
-    let port = state.opencode_serve_port();
     let client = state.http_client.clone();
     let body = serde_json::json!({
         "parts": [{"type": "text", "text": message}]
@@ -634,7 +550,7 @@ async fn deliver_via_prompt_async(
 
     match resp {
         Ok(r) if r.status().is_success() => {
-            tracing::info!(port, "delivered message via prompt_async (fallback)");
+            tracing::info!(port, "delivered message via prompt_async");
         }
         Ok(r) => {
             let status = r.status();
