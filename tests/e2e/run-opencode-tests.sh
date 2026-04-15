@@ -185,6 +185,10 @@ else
     fail "oc-e2e registration" "session exists" "not found in status"
 fi
 
+log "Test 8a: backend field set to opencode"
+oc_backend=$(echo "$oc_status" | jq -r '.sessions[] | select(.id == "oc-e2e") | .backend // empty')
+assert_eq "backend is opencode" "$oc_backend" "opencode"
+
 log "Test 8b: backend-session readiness endpoint resolves registered session"
 backend_sid=$(echo "$oc_status" | jq -r '.sessions[] | select(.id == "oc-e2e") | .backend_session_id // empty')
 if [ -n "$backend_sid" ]; then
@@ -212,6 +216,13 @@ else
     else
         fail "ouija.send to opencode" "delivery via HTTP" "$(echo "$send_result" | head -c 200)"
     fi
+fi
+# Verify method field reports "http" for opencode-backed sessions
+send_method=$(echo "$send_result" | jq -r '.method // empty' 2>/dev/null)
+if [ "$send_method" = "http" ]; then
+    pass "send response reports method=http for opencode session"
+else
+    fail "method field" "http" "$send_method"
 fi
 
 log "Test 10: opencode received and processed the message"
@@ -315,6 +326,18 @@ if [ -z "$remaining" ]; then
     pass "oc-e2e session removed from ouija"
 else
     fail "session cleanup" "session gone" "still exists"
+fi
+
+# Verify abort was called before kill (hub#254 fix)
+if grep -q "aborted opencode server session" /tmp/ouija-test/daemon.log 2>/dev/null; then
+    pass "server-side abort called before kill (hub#254)"
+else
+    # The abort may fail if the serve session already ended — check that it was attempted
+    if grep -q "opencode abort" /tmp/ouija-test/daemon.log 2>/dev/null; then
+        pass "server-side abort attempted before kill (hub#254, lenient)"
+    else
+        fail "kill abort" "abort log entry" "not found in daemon log"
+    fi
 fi
 
 log "Test 12: second session on same serve works"
@@ -428,6 +451,30 @@ api "$BASE" POST /api/sessions/kill -d '{"name":"oc-soft"}' >/dev/null 2>&1
 # ═══════════════════════════════════════════════════════════════════
 # AUTO-START TEST — send to non-existent session matching project name
 # ═══════════════════════════════════════════════════════════════════
+
+log "Test 14: ouija skill installed for opencode"
+if [ -f "$HOME/.config/opencode/skills/ouija/SKILL.md" ]; then
+    pass "SKILL.md installed at ~/.config/opencode/skills/ouija/"
+    # Verify it has CLI instructions
+    if grep -q "ouija ask\|ouija tell\|ouija reply" "$HOME/.config/opencode/skills/ouija/SKILL.md"; then
+        pass "SKILL.md contains CLI instructions"
+    else
+        fail "SKILL.md content" "CLI instructions" "not found"
+    fi
+else
+    fail "SKILL.md" "file exists" "not found at ~/.config/opencode/skills/ouija/SKILL.md"
+fi
+
+log "Test 15: opencode plugin system prompt uses CLI"
+if [ -f "$HOME/.config/opencode/plugins/ouija.ts" ]; then
+    if grep -q "ouija ask\|ouija tell\|ouija reply\|ouija ls" "$HOME/.config/opencode/plugins/ouija.ts"; then
+        pass "ouija.ts system prompt uses CLI commands"
+    else
+        fail "ouija.ts prompt" "CLI commands" "not found in plugin"
+    fi
+else
+    fail "ouija.ts" "file exists" "not found at ~/.config/opencode/plugins/ouija.ts"
+fi
 
 log "Test 16: REST send auto-starts session from project index (skip: auto-start not yet implemented)"
 

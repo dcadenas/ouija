@@ -2790,6 +2790,75 @@ mod tests {
     }
 
     #[test]
+    fn send_to_opencode_session_reports_http_method() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "sender".into(),
+            pane: Some("%1".into()),
+            metadata: Default::default(),
+        });
+        state.apply(Event::Register {
+            id: "oc-target".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                ..Default::default()
+            },
+        });
+        let effects = state.apply(Event::Send {
+            from: "sender".into(),
+            to: "oc-target".into(),
+            message: "hello".into(),
+            expects_reply: false,
+            responds_to: None,
+            done: false,
+        });
+        // SendDelivered should report method="http" for opencode backend
+        let delivered = effects.iter().find_map(|e| match e {
+            Effect::SendDelivered { method, .. } => Some(method.clone()),
+            _ => None,
+        });
+        assert_eq!(delivered, Some("http".into()));
+        // LogMessage should also report transport="http"
+        let log_transport = effects.iter().find_map(|e| match e {
+            Effect::LogMessage { transport, .. } => Some(transport.clone()),
+            _ => None,
+        });
+        assert_eq!(log_transport, Some("http".into()));
+    }
+
+    #[test]
+    fn send_to_claude_session_reports_tmux_method() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "sender".into(),
+            pane: Some("%1".into()),
+            metadata: Default::default(),
+        });
+        state.apply(Event::Register {
+            id: "cc-target".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                backend: Some("claude-code".into()),
+                ..Default::default()
+            },
+        });
+        let effects = state.apply(Event::Send {
+            from: "sender".into(),
+            to: "cc-target".into(),
+            message: "hello".into(),
+            expects_reply: false,
+            responds_to: None,
+            done: false,
+        });
+        let delivered = effects.iter().find_map(|e| match e {
+            Effect::SendDelivered { method, .. } => Some(method.clone()),
+            _ => None,
+        });
+        assert_eq!(delivered, Some("tmux".into()));
+    }
+
+    #[test]
     fn send_remote_broadcasts_wire() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
         state.apply(Event::Register {

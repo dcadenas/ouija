@@ -663,4 +663,53 @@ mod tests {
         // Should not panic on non-existent pane
         enable_automatic_rename("%99999");
     }
+
+    #[test]
+    fn has_descendant_named_exact_match() {
+        let tree = ProcessTree {
+            children: [(1, vec![2]), (2, vec![3])].into_iter().collect(),
+            names: [(1, "bash".into()), (2, "node".into()), (3, "opencode".into())]
+                .into_iter()
+                .collect(),
+        };
+        assert!(tree.has_descendant_named(1, &["opencode"]));
+    }
+
+    #[test]
+    fn has_descendant_named_dot_prefix_match() {
+        // opencode via npm shows up as ".opencode" in ps
+        let tree = ProcessTree {
+            children: [(1, vec![2]), (2, vec![3])].into_iter().collect(),
+            names: [
+                (1, "bash".into()),
+                (2, "node".into()),
+                (3, ".opencode".into()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        assert!(tree.has_descendant_named(1, &["opencode"]));
+    }
+
+    #[test]
+    fn has_descendant_named_no_match() {
+        let tree = ProcessTree {
+            children: [(1, vec![2])].into_iter().collect(),
+            names: [(1, "bash".into()), (2, "vim".into())]
+                .into_iter()
+                .collect(),
+        };
+        assert!(!tree.has_descendant_named(1, &["opencode", "claude"]));
+    }
+
+    #[test]
+    fn has_descendant_named_multiple_targets() {
+        let tree = ProcessTree {
+            children: [(1, vec![2])].into_iter().collect(),
+            names: [(1, "bash".into()), (2, "claude".into())]
+                .into_iter()
+                .collect(),
+        };
+        assert!(tree.has_descendant_named(1, &["opencode", "claude"]));
+    }
 }
