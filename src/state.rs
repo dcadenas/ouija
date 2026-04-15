@@ -386,6 +386,85 @@ impl AppState {
         }
     }
 
+    /// Detect which backend is running in a tmux pane by walking the process tree.
+    ///
+    /// Returns the backend name (e.g. `"opencode"`, `"claude-code"`) if a known
+    /// backend process is found, or `None` if detection fails.
+    pub async fn detect_backend_in_pane(&self, pane: &str) -> Option<String> {
+        // Collect process names for each backend
+        let mut backend_process_names: Vec<(String, Vec<String>)> = Vec::new();
+        for name in self.backends.available() {
+            if let Some(b) = self.backends.get(name) {
+                let pnames: Vec<String> = b.process_names().iter().map(|s| s.to_string()).collect();
+                backend_process_names.push((name.to_string(), pnames));
+            }
+        }
+
+        let pane = pane.to_string();
+        tokio::task::spawn_blocking(move || {
+            use std::process::Command;
+
+            let output = Command::new("tmux")
+                .args(["display-message", "-t", &pane, "-p", "#{pane_pid}"])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let pane_pid: u32 = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse()
+                .ok()?;
+
+            let output = Command::new("ps")
+                .args(["-eo", "pid,ppid,comm"])
+                .output()
+                .ok()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut children: std::collections::HashMap<u32, Vec<u32>> =
+                std::collections::HashMap::new();
+            let mut names: std::collections::HashMap<u32, String> =
+                std::collections::HashMap::new();
+
+            for line in stdout.lines().skip(1) {
+                let mut parts = line.split_whitespace();
+                let (Some(pid_s), Some(ppid_s), Some(comm)) =
+                    (parts.next(), parts.next(), parts.next())
+                else {
+                    continue;
+                };
+                let (Ok(pid), Ok(ppid)) = (pid_s.parse::<u32>(), ppid_s.parse::<u32>()) else {
+                    continue;
+                };
+                children.entry(ppid).or_default().push(pid);
+                names.insert(pid, comm.to_string());
+            }
+
+            // BFS from pane_pid, check each process against known backend names.
+            // Match both exact name and dot-prefixed name (e.g. ".opencode"
+            // which appears when run via npm/node wrapper).
+            let mut stack = vec![pane_pid];
+            while let Some(pid) = stack.pop() {
+                if let Some(comm) = names.get(&pid) {
+                    for (backend_name, pnames) in &backend_process_names {
+                        for pn in pnames {
+                            if comm == pn || comm.strip_prefix('.') == Some(pn.as_str()) {
+                                return Some(backend_name.clone());
+                            }
+                        }
+                    }
+                }
+                if let Some(kids) = children.get(&pid) {
+                    stack.extend(kids);
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// Find the session ID registered on a given pane (full `%NNN` format).
     pub async fn find_session_by_pane(&self, pane: &str) -> Option<String> {
         let proto = self.protocol.read().await;

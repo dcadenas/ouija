@@ -1155,7 +1155,9 @@ async fn kill_session_inner(
 
     let pane = pane.clone();
     let project_dir = session.metadata.project_dir.clone();
+    let backend_session_id = session.metadata.backend_session_id.clone();
     let backend = state.backend_for_session(name).await;
+    let is_http_api = matches!(backend.delivery_mode(), crate::backend::DeliveryMode::HttpApi { .. });
     let process_names: Vec<String> = backend
         .process_names()
         .iter()
@@ -1163,6 +1165,43 @@ async fn kill_session_inner(
         .collect();
     let exit_cmd = backend.exit_command().map(String::from);
     let cli_name = backend.cli_name().to_string();
+
+    // For HttpApi backends (opencode), abort the server-side session BEFORE
+    // killing the client process. The attach client is just a TUI — killing
+    // it does NOT stop the server from executing the current assistant turn.
+    if is_http_api {
+        if let Some(ref oc_sid) = backend_session_id {
+            let port = state.opencode_serve_port();
+            let url = format!("http://127.0.0.1:{port}/session/{oc_sid}/abort");
+            match state
+                .http_client
+                .post(&url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => {
+                    tracing::info!(session = %name, oc_sid, "aborted opencode server session");
+                }
+                Ok(r) => {
+                    let status = r.status();
+                    let text = r.text().await.unwrap_or_default();
+                    tracing::warn!(
+                        session = %name, oc_sid, %status,
+                        "opencode abort returned non-success: {text}"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(session = %name, oc_sid, "opencode abort failed: {e}");
+                }
+            }
+        } else {
+            tracing::warn!(
+                session = %name,
+                "HttpApi session has no backend_session_id, cannot abort server-side"
+            );
+        }
+    }
 
     // Remove from the registry BEFORE killing the process. When Claude
     // runs its SessionEnd hook during /exit, the hook will find no
@@ -1221,14 +1260,17 @@ async fn kill_session_inner(
             names.insert(pid, comm.to_string());
         }
 
-        // BFS to find backend PID
+        // BFS to find backend PID.
+        // Match both exact name and dot-prefixed name (e.g. ".opencode"
+        // which appears when run via npm/node wrapper).
         let mut stack = vec![pane_pid];
         let mut backend_pid = None;
         while let Some(pid) = stack.pop() {
-            if names
-                .get(&pid)
-                .is_some_and(|n| process_names.iter().any(|pn| pn == n))
-            {
+            if names.get(&pid).is_some_and(|n| {
+                process_names
+                    .iter()
+                    .any(|pn| pn == n || n.strip_prefix('.') == Some(pn.as_str()))
+            }) {
                 backend_pid = Some(pid);
                 break;
             }

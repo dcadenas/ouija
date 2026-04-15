@@ -419,11 +419,15 @@ async fn session_start_inner(
         id
     };
 
+    // Detect backend from the process running in the pane
+    let detected_backend = state.detect_backend_in_pane(&body.pane).await;
+
     // Register
     let role = format!("working on {basename}");
     let proto_meta = crate::daemon_protocol::SessionMeta {
         project_dir: Some(project_root.to_string()),
         role: Some(role),
+        backend: detected_backend,
         ..Default::default()
     };
     state

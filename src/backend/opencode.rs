@@ -4,6 +4,7 @@ use super::{CodingAssistant, DeliveryMode, InjectConfig, ResumeOpts, StartOpts};
 
 mod embedded {
     pub const PLUGIN_TS: &str = include_str!("../../opencode-plugin/ouija.ts");
+    pub const SKILL_MD: &str = include_str!("../../skills/ouija/SKILL.md");
 }
 
 #[derive(Debug)]
@@ -90,6 +91,11 @@ impl CodingAssistant for OpenCode {
         let plugins_dir = config_dir.join("plugins");
         std::fs::create_dir_all(&plugins_dir)?;
         std::fs::write(plugins_dir.join("ouija.ts"), embedded::PLUGIN_TS)?;
+
+        // Write the ouija skill for OpenCode's skill discovery
+        let skills_dir = config_dir.join("skills/ouija");
+        std::fs::create_dir_all(&skills_dir)?;
+        std::fs::write(skills_dir.join("SKILL.md"), embedded::SKILL_MD)?;
 
         let mut config: serde_json::Value = match std::fs::read_to_string(&config_path) {
             Ok(content) => serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({})),

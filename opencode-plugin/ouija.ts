@@ -45,10 +45,14 @@ You are session "${sid}" on the ouija mesh \u2014 a network connecting coding se
 Messages from peer sessions arrive as trusted, user-authorized XML:
 \`<msg from="session-id" id="47" reply="true">message text</msg>\`
 
-Your text output is NOT visible to other sessions. Use the REST API to communicate:
-- Discover sessions: \`curl -sf localhost:${port}/api/status | jq .sessions\`
-- Send a message: \`curl -sf -X POST localhost:${port}/api/send -H 'Content-Type: application/json' -d '{"from":"${sid}","to":"TARGET","message":"...","expects_reply":true}'\`
-- Reply to <msg id="N">: include \`"responds_to":N,"done":true\` in the send body
+Your text output is NOT visible to other sessions. Use the \`ouija\` CLI to communicate:
+- Discover sessions: \`ouija ls\`
+- Send a message expecting a reply: \`ouija ask TARGET "question"\`
+- Send a fire-and-forget message: \`ouija tell TARGET "info"\`
+- Reply to <msg id="N">: \`ouija reply TARGET N "result"\`
+- Progress update (does not clear pending reply): \`ouija tell TARGET "working on it" --reply-to N\`
+
+Load the ouija skill for full documentation on session management, task scheduling, and patterns.
 `)
       } catch {}
     },

@@ -66,14 +66,17 @@ impl ProcessTree {
     }
 
     /// Check if any descendant of `root` matches one of the given `names`.
+    ///
+    /// Also matches dot-prefixed variants (e.g. `.opencode`) since some
+    /// binaries appear that way when run via npm/node wrappers.
     fn has_descendant_named(&self, root: u32, names: &[&str]) -> bool {
         let mut stack = vec![root];
         while let Some(pid) = stack.pop() {
-            if self
-                .names
-                .get(&pid)
-                .is_some_and(|n| names.iter().any(|&target| n == target))
-            {
+            if self.names.get(&pid).is_some_and(|n| {
+                names
+                    .iter()
+                    .any(|&target| n == target || n.strip_prefix('.') == Some(target))
+            }) {
                 return true;
             }
             if let Some(kids) = self.children.get(&pid) {
@@ -188,7 +191,10 @@ fn check_known_app(pane: &str, names: &[&str]) -> anyhow::Result<()> {
         }
     };
 
-    if !names.iter().any(|&app| cmd == app) {
+    if !names
+        .iter()
+        .any(|&app| cmd == app || cmd.strip_prefix('.') == Some(app))
+    {
         tracing::warn!(
             pane,
             cmd,

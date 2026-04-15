@@ -114,3 +114,38 @@ ouija clear-reminder N
 ```bash
 ouija clear-reply SENDER_ID
 ```
+
+## 7. Patterns
+
+The reminder is re-injected every idle cycle and is the main knob for session control flow. Write it as code a fresh-context session can execute, not as a one-shot instruction.
+
+### Loop with termination
+
+Two nested loops: the reminder re-injection is the inner loop (same context); `ouija restart-session --fresh` is the outer loop (clean context, same `prompt + reminder`).
+
+```bash
+ouija spawn-session counter \
+  --prompt "read value.txt, add 1 to the number, write it back" \
+  --reminder "if the number is < 10, call 'ouija restart-session counter --fresh'. Otherwise: ouija tell hub 'done: counter reached 10' then ouija clear-reminder N."
+```
+
+The reminder is the control flow — a continue branch and a terminate branch. State lives in the world (files, git, APIs), not in the session's memory, so every iteration is re-enterable from scratch.
+
+### Report-back when done
+
+```bash
+ouija spawn-session worker --project-dir /path --prompt "implement feature X" \
+  --reminder "When finished: ouija tell hub \"done: <summary>\", then ouija clear-reminder N."
+```
+
+Without `clear-reminder N`, the worker keeps getting nudged forever after it signals done. The `N` comes from the `clearing_id` the daemon stamps on each re-injection.
+
+### State-check (not state-assume) reminders
+
+A static reminder like *"Run init to begin"* becomes noise on the second re-injection — the session already ran init. Reminders must make sense on the 5th re-injection, not just the first. Phrase them as state checks:
+
+```
+reminder: "Check state: if pending → init. If running → continue your open work. If complete → report done and ouija clear-reminder N."
+```
+
+This is the anti-pattern fix for workers that get stuck in post-success idle: the reminder reads the world on every re-injection and picks the right branch, instead of assuming it's still the start.

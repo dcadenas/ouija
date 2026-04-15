@@ -509,6 +509,14 @@ pub async fn register(
             );
         }
     }
+    // Auto-detect backend from pane process tree if not explicitly provided
+    let backend = match metadata.backend {
+        Some(ref b) => Some(b.clone()),
+        None => match body.pane {
+            Some(ref p) => state.detect_backend_in_pane(p).await,
+            None => None,
+        },
+    };
     let proto_meta = crate::daemon_protocol::SessionMeta {
         project_dir: metadata.project_dir.clone(),
         role: metadata.role.clone(),
@@ -516,7 +524,7 @@ pub async fn register(
         networked: metadata.networked,
         worktree: metadata.worktree,
         vim_mode: metadata.vim_mode,
-        backend: metadata.backend.clone(),
+        backend,
         reminder: metadata.reminder.clone(),
         ..Default::default()
     };
