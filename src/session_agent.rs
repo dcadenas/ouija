@@ -218,16 +218,11 @@ impl Actor for SessionAgent {
                 if let Some(h) = state.idle_timer.take() {
                     h.abort();
                 }
-                // Reset watchdog on activity
+                // Cancel watchdog — it will be re-armed in Stopped only if
+                // there is pending work (replies or configured reminder).
                 if let Some(h) = state.watchdog_timer.take() {
                     h.abort();
                 }
-                let timeout = self.app_state.settings.read().await.idle_timeout_secs;
-                state.watchdog_timer = Some(
-                    myself.send_after(std::time::Duration::from_secs(timeout * 2), || {
-                        SessionMsg::WatchdogTimeout
-                    }),
-                );
             }
             SessionMsg::GetPendingReplies(reply) => {
                 if !reply.is_closed() {
