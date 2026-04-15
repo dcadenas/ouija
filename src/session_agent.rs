@@ -152,15 +152,10 @@ impl Actor for SessionAgent {
                     h.abort();
                 }
                 let timeout = self.app_state.settings.read().await.idle_timeout_secs;
-                // Reset watchdog: 2x idle_timeout catches sessions stuck mid-turn
+                // Reset watchdog
                 if let Some(h) = state.watchdog_timer.take() {
                     h.abort();
                 }
-                state.watchdog_timer = Some(
-                    myself.send_after(std::time::Duration::from_secs(timeout * 2), || {
-                        SessionMsg::WatchdogTimeout
-                    }),
-                );
                 // Check if there's a reason to arm the idle timer:
                 // pending replies or a configured reminder. Without either,
                 // the idle-check would just create a nudge loop (the session
@@ -184,6 +179,12 @@ impl Actor for SessionAgent {
                     state.idle_timer = Some(
                         myself.send_after(std::time::Duration::from_secs(timeout), || {
                             SessionMsg::IdleTimeout
+                        }),
+                    );
+                    // Watchdog at 2x catches sessions stuck mid-turn
+                    state.watchdog_timer = Some(
+                        myself.send_after(std::time::Duration::from_secs(timeout * 2), || {
+                            SessionMsg::WatchdogTimeout
                         }),
                     );
                 }
