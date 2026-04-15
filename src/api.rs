@@ -525,6 +525,7 @@ pub async fn register(
         worktree: metadata.worktree,
         vim_mode: metadata.vim_mode,
         backend,
+        backend_session_id: metadata.backend_session_id.clone(),
         reminder: metadata.reminder.clone(),
         ..Default::default()
     };
