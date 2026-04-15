@@ -161,30 +161,53 @@ impl Actor for SessionAgent {
                         SessionMsg::WatchdogTimeout
                     }),
                 );
-                state.idle_timer = Some(
-                    myself.send_after(std::time::Duration::from_secs(timeout), || {
-                        SessionMsg::IdleTimeout
-                    }),
-                );
+                // Check if there's a reason to arm the idle timer:
+                // pending replies or a configured reminder. Without either,
+                // the idle-check would just create a nudge loop (the session
+                // responds to clear it, which triggers Active→Stopped→repeat).
+                let (has_pending, has_reminder) = {
+                    let proto = self.app_state.protocol.read().await;
+                    let pending = proto
+                        .pending_replies
+                        .get(&state.session_id)
+                        .map(|p| !p.is_empty())
+                        .unwrap_or(false);
+                    let reminder = proto
+                        .sessions
+                        .get(&state.session_id)
+                        .and_then(|s| s.metadata.reminder.as_ref())
+                        .is_some();
+                    (pending, reminder)
+                };
+
+                if has_pending || has_reminder {
+                    state.idle_timer = Some(
+                        myself.send_after(std::time::Duration::from_secs(timeout), || {
+                            SessionMsg::IdleTimeout
+                        }),
+                    );
+                }
 
                 // Nudge about pending replies older than idle_timeout
-                let cutoff = Utc::now().timestamp() - timeout as i64;
-                let pending = self
-                    .app_state
-                    .protocol
-                    .read()
-                    .await
-                    .pending_replies
-                    .get(&state.session_id)
-                    .cloned()
-                    .unwrap_or_default();
-                let overdue: Vec<&PendingReplyEntry> = pending
-                    .iter()
-                    .filter(|p| p.last_activity < cutoff)
-                    .collect();
+                if has_pending {
+                    let cutoff = Utc::now().timestamp() - timeout as i64;
+                    let pending = self
+                        .app_state
+                        .protocol
+                        .read()
+                        .await
+                        .pending_replies
+                        .get(&state.session_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let overdue: Vec<&PendingReplyEntry> = pending
+                        .iter()
+                        .filter(|p| p.last_activity < cutoff)
+                        .collect();
 
-                if !overdue.is_empty() {
-                    self.send_reminders(&overdue, state).await;
+                    if !overdue.is_empty() {
+                        self.send_reminders(&overdue, state).await;
+                    }
                 }
             }
             SessionMsg::Active => {
