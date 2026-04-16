@@ -628,6 +628,15 @@ impl DaemonState {
                 name: "@ouija_session".into(),
                 value: id.clone(),
             });
+            // `@ouija_id` is the autoregister-skip marker read by
+            // `scan_and_autoregister_panes`. It is intentionally NOT cleared
+            // on Remove so the reaper skips dead-but-not-yet-destroyed panes
+            // during kill-session's graceful-exit window.
+            effects.push(Effect::SetTmuxVar {
+                pane: pane_id.clone(),
+                name: "@ouija_id".into(),
+                value: id.clone(),
+            });
         }
 
         // Alias if replaced
@@ -2241,6 +2250,63 @@ mod tests {
         assert!(effects
             .iter()
             .any(|e| matches!(e, Effect::SpawnAgent { .. })));
+    }
+
+    #[test]
+    fn register_emits_ouija_id_marker_for_autoregister_skip() {
+        // The reaper's `scan_and_autoregister_panes` skips panes that have
+        // `@ouija_id` set. Without this effect, API-spawned panes never get
+        // the marker (the SessionStart hook early-returns without setting
+        // it for pre-registered panes), so the reaper can auto-register a
+        // ghost session during the window between `Event::Remove` (which
+        // clears `@ouija_session`) and `tmux kill-pane` (which destroys
+        // the pane).
+        let mut state = DaemonState::new("npub1abc".into(), "myhost".into());
+        let effects = state.apply(Event::Register {
+            id: "pat-paral".into(),
+            pane: Some("%1".into()),
+            metadata: Default::default(),
+        });
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::SetTmuxVar { name, value, pane }
+                    if name == "@ouija_id" && value == "pat-paral" && pane == "%1"
+            )),
+            "Register must emit SetTmuxVar for @ouija_id, got: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn remove_preserves_ouija_id_marker_past_session_removal() {
+        // @ouija_id must persist past `Event::Remove` so the reaper's scan
+        // skips the dead-but-not-yet-destroyed pane during kill-session's
+        // graceful-exit window (up to 10s between Remove and kill-pane).
+        let mut state = DaemonState::new("npub1abc".into(), "myhost".into());
+        state.apply(Event::Register {
+            id: "pat-paral".into(),
+            pane: Some("%1".into()),
+            metadata: Default::default(),
+        });
+        let effects = state.apply(Event::Remove {
+            id: "pat-paral".into(),
+            keep_worktree: true,
+        });
+        assert!(
+            !effects.iter().any(|e| matches!(
+                e,
+                Effect::ClearTmuxVar { name, .. } if name == "@ouija_id"
+            )),
+            "Remove must NOT clear @ouija_id, got: {effects:?}"
+        );
+        // @ouija_session is still cleared — that's the daemon-driven marker.
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::ClearTmuxVar { name, .. } if name == "@ouija_session"
+            )),
+            "Remove must still clear @ouija_session, got: {effects:?}"
+        );
     }
 
     #[test]

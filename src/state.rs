@@ -534,14 +534,16 @@ impl AppState {
                     let _ = crate::tmux::locked_inject(self, session_id, pane, message, *vim_mode)
                         .await;
                 }
-                Effect::SetTmuxVar { pane, value, .. } => {
+                Effect::SetTmuxVar { pane, name, value } => {
                     let p = pane.clone();
+                    let n = name.clone();
                     let v = value.clone();
-                    tokio::task::spawn_blocking(move || crate::tmux_var::set(&p, &v));
+                    tokio::task::spawn_blocking(move || crate::tmux_var::set(&p, &n, &v));
                 }
-                Effect::ClearTmuxVar { pane, .. } => {
+                Effect::ClearTmuxVar { pane, name } => {
                     let p = pane.clone();
-                    tokio::task::spawn_blocking(move || crate::tmux_var::clear(&p));
+                    let n = name.clone();
+                    tokio::task::spawn_blocking(move || crate::tmux_var::clear(&p, &n));
                 }
                 Effect::RenameWindow { pane, name } => {
                     let p = pane.clone();
