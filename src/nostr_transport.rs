@@ -1910,7 +1910,7 @@ pub async fn restart_session(
     // This ensures CLAUDE.md and rules load before the prompt is processed.
     let full_cmd = if !is_http_api {
         if let Some(ref prompt_text) = formatted_prompt {
-            let prompt_path = format!("/tmp/ouija-prompt-{}.txt", name);
+            let prompt_path = format!("/tmp/ouija-prompt-{}.txt", name.replace('/', "-"));
             std::fs::write(&prompt_path, prompt_text).ok();
             let escaped_pf = crate::scheduler::shell_escape(&prompt_path);
             format!("{claude_cmd} \"$(cat {escaped_pf})\" ; rm -f {escaped_pf}")
