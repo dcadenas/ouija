@@ -1499,23 +1499,29 @@ pub async fn start_session(
         None
     };
 
-    // If there's a prompt, write it to a temp file so we can pass it as a
-    // CLI argument. This ensures Claude Code loads CLAUDE.md and rules before
-    // processing the prompt (tmux injection can race with context loading).
-    let prompt_file = if let Some((ref prompt_text, _)) = pre_queued_prompt {
-        let prompt_path = format!("/tmp/ouija-prompt-{}.txt", name.replace('/', "-"));
-        std::fs::write(&prompt_path, prompt_text).ok();
-        Some(prompt_path)
-    } else {
-        None
-    };
+    let is_http_api = matches!(
+        backend.delivery_mode(),
+        crate::backend::DeliveryMode::HttpApi { .. }
+    );
 
     crate::backend::claude_code::pre_trust_workspace(&dir);
 
-    // Build the full command with prompt as CLI arg if available
-    let full_cmd = if let Some(ref pf) = prompt_file {
-        let escaped_pf = crate::scheduler::shell_escape(pf);
-        format!("{backend_cmd} \"$(cat {escaped_pf})\" ; rm -f {escaped_pf}")
+    // For TuiInjection: pass prompt as CLI arg via temp file.  This ensures
+    // CLAUDE.md and rules load before the prompt is processed (tmux injection
+    // can race with context loading).
+    //
+    // HttpApi backends receive prompts via HTTP (prompt_async), so we must NOT
+    // append the file to the command — otherwise the prompt text becomes an
+    // argument to `echo` and gets dumped to the terminal.
+    let full_cmd = if !is_http_api {
+        if let Some((ref prompt_text, _)) = pre_queued_prompt {
+            let prompt_path = format!("/tmp/ouija-prompt-{}.txt", name.replace('/', "-"));
+            std::fs::write(&prompt_path, prompt_text).ok();
+            let escaped_pf = crate::scheduler::shell_escape(&prompt_path);
+            format!("{backend_cmd} \"$(cat {escaped_pf})\" ; rm -f {escaped_pf}")
+        } else {
+            backend_cmd.clone()
+        }
     } else {
         backend_cmd.clone()
     };
