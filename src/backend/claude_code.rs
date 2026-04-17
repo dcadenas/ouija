@@ -63,6 +63,7 @@ mod embedded {
     pub const SCRIPT_REGISTER: &str = include_str!("../../scripts/ouija-register.sh");
     pub const SCRIPT_STATUSLINE: &str = include_str!("../../scripts/ouija-statusline.sh");
     pub const SCRIPT_POST_COMPACT: &str = include_str!("../../scripts/post-compact.sh");
+    pub const SCRIPT_TOOL_ACTIVITY: &str = include_str!("../../scripts/ouija-tool-activity.sh");
     pub const SCRIPT_UNREGISTER: &str = include_str!("../../scripts/ouija-unregister.sh");
 
     pub const SKILLS_PEER_TRUST: &str = include_str!("../../skills/ouija/SKILL.md");
@@ -88,6 +89,10 @@ fn write_embedded_plugin_files(cache_dir: &std::path::Path) {
         ),
         ("scripts/ouija-register.sh", embedded::SCRIPT_REGISTER),
         ("scripts/ouija-statusline.sh", embedded::SCRIPT_STATUSLINE),
+        (
+            "scripts/ouija-tool-activity.sh",
+            embedded::SCRIPT_TOOL_ACTIVITY,
+        ),
         ("scripts/ouija-unregister.sh", embedded::SCRIPT_UNREGISTER),
         ("scripts/post-compact.sh", embedded::SCRIPT_POST_COMPACT),
         ("skills/ouija/SKILL.md", embedded::SKILLS_PEER_TRUST),
