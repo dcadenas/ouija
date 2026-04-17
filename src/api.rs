@@ -1706,10 +1706,16 @@ pub async fn session_ready(
 
 /// Handle a readiness signal keyed by opencode backend session ID.
 /// Resolves the ouija session name internally, avoiding plugin-side race conditions.
+///
+/// If no session is found by `backend_session_id`, we query the opencode serve
+/// for the session's directory, then match against ouija sessions by directory.
+/// When a match is found we adopt the `backend_session_id` so future messages
+/// are delivered via HTTP instead of tmux injection.
 pub async fn backend_session_ready(
     State(state): State<SharedState>,
     axum::extract::Path(backend_sid): axum::extract::Path<String>,
 ) -> Json<serde_json::Value> {
+    // First try: direct lookup by backend_session_id
     let session_name = {
         let proto = state.protocol.read().await;
         proto
@@ -1718,13 +1724,75 @@ pub async fn backend_session_ready(
             .find(|s| s.metadata.backend_session_id.as_deref() == Some(&backend_sid))
             .map(|s| s.id.clone())
     };
-    let Some(name) = session_name else {
-        return Json(
-            json!({"delivered": false, "error": "no session with this backend_session_id"}),
-        );
+
+    let name = if let Some(n) = session_name {
+        n
+    } else {
+        // Fallback: query opencode serve for the session's directory, then
+        // find a local ouija session with that directory and adopt the backend_session_id.
+        let adopted = adopt_backend_session_id(&state, &backend_sid).await;
+        let Some(n) = adopted else {
+            return Json(
+                json!({"delivered": false, "error": "no session with this backend_session_id"}),
+            );
+        };
+        n
     };
+
     let delivered = deliver_pending_prompt(&state, &name);
     Json(json!({"delivered": delivered, "session": name}))
+}
+
+/// Query the opencode serve for a session's directory, find the matching ouija
+/// session, and set its `backend_session_id` + `backend`.
+async fn adopt_backend_session_id(
+    state: &std::sync::Arc<crate::state::AppState>,
+    backend_sid: &str,
+) -> Option<String> {
+    let port = state.opencode_serve_port();
+    let url = format!("http://127.0.0.1:{port}/session/{backend_sid}");
+    let resp = state
+        .http_client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    let dir = body["directory"].as_str()?;
+
+    // Find a local ouija session with this directory that lacks a backend_session_id
+    let session_id = {
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .values()
+            .find(|s| {
+                matches!(s.origin, crate::daemon_protocol::Origin::Local)
+                    && s.metadata.project_dir.as_deref() == Some(dir)
+                    && s.metadata.backend_session_id.is_none()
+            })
+            .map(|s| s.id.clone())
+    };
+
+    let session_id = session_id?;
+    tracing::info!(
+        "adopting backend_session_id {backend_sid} for session {session_id} (dir: {dir})"
+    );
+
+    // Update the session metadata with backend info
+    state
+        .apply_and_execute(crate::daemon_protocol::Event::AdoptBackend {
+            id: session_id.clone(),
+            backend: "opencode".into(),
+            backend_session_id: backend_sid.to_string(),
+        })
+        .await;
+
+    Some(session_id)
 }
 
 /// List indexed projects from the configured projects directory.
