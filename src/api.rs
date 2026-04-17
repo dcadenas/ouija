@@ -477,6 +477,19 @@ pub async fn register(
     State(state): State<SharedState>,
     Json(body): Json<RegisterBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Diagnostic (issue #14): log every /api/register call so the caller that
+    // POSTs with pane=None for existing sessions can be identified.
+    tracing::info!(
+        target: "ouija::api::register",
+        "/api/register: id={} pane={:?} project_dir={:?} backend={:?} backend_session_id={:?} role={:?} networked={:?}",
+        body.id,
+        body.pane,
+        body.project_dir,
+        body.backend,
+        body.backend_session_id,
+        body.role,
+        body.networked,
+    );
     if body.id.contains('/') {
         return (
             StatusCode::BAD_REQUEST,
@@ -1743,6 +1756,25 @@ pub async fn backend_session_ready(
     Json(json!({"delivered": delivered, "session": name}))
 }
 
+/// Choose at most one candidate session ID for adoption (issue #15).
+/// Returns None for zero or >1 candidates — ambiguity is fail-closed.
+fn disambiguate_adoption_candidates(
+    backend_sid: &str,
+    dir: &str,
+    candidates: Vec<String>,
+) -> Option<String> {
+    match candidates.len() {
+        0 => None,
+        1 => candidates.into_iter().next(),
+        n => {
+            tracing::warn!(
+                "refusing to adopt backend_session_id {backend_sid}: {n} ambiguous candidates in dir {dir}: {candidates:?}"
+            );
+            None
+        }
+    }
+}
+
 /// Query the opencode serve for a session's directory, find the matching ouija
 /// session, and set its `backend_session_id` + `backend`.
 async fn adopt_backend_session_id(
@@ -1764,21 +1796,28 @@ async fn adopt_backend_session_id(
     let body: serde_json::Value = resp.json().await.ok()?;
     let dir = body["directory"].as_str()?;
 
-    // Find a local ouija session with this directory that lacks a backend_session_id
-    let session_id = {
+    // Collect ALL local ouija sessions matching this directory that lack a
+    // backend_session_id (issue #15). Silently picking the first match — as
+    // the original implementation did — lets an adopt for session A clobber
+    // the metadata of unrelated session B when both live in the same dir
+    // (hashbrown iteration order is effectively random). Fail closed on
+    // ambiguity: adopt only when exactly one candidate exists.
+    let candidates: Vec<String> = {
         let proto = state.protocol.read().await;
         proto
             .sessions
             .values()
-            .find(|s| {
+            .filter(|s| {
                 matches!(s.origin, crate::daemon_protocol::Origin::Local)
                     && s.metadata.project_dir.as_deref() == Some(dir)
                     && s.metadata.backend_session_id.is_none()
             })
             .map(|s| s.id.clone())
+            .collect()
     };
 
-    let session_id = session_id?;
+    let session_id = disambiguate_adoption_candidates(backend_sid, dir, candidates)?;
+
     tracing::info!(
         "adopting backend_session_id {backend_sid} for session {session_id} (dir: {dir})"
     );
@@ -1838,6 +1877,31 @@ pub async fn clear_reminder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disambiguate_single_candidate_adopts() {
+        let got = disambiguate_adoption_candidates("ses_x", "/repo", vec!["only".into()]);
+        assert_eq!(got.as_deref(), Some("only"));
+    }
+
+    #[test]
+    fn disambiguate_zero_candidates_fails() {
+        let got = disambiguate_adoption_candidates("ses_x", "/repo", vec![]);
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn disambiguate_multiple_candidates_fails_closed() {
+        // Two or more sessions in the same project_dir with no backend_session_id
+        // must NOT be silently resolved — adopt_backend_session_id has no way
+        // to know which one the backend SID actually belongs to (issue #15).
+        let got = disambiguate_adoption_candidates(
+            "ses_x",
+            "/repo",
+            vec!["hub".into(), "hub-skill-probe".into()],
+        );
+        assert!(got.is_none());
+    }
 
     #[test]
     fn extract_from_cargo_toml() {

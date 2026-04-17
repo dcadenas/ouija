@@ -573,6 +573,25 @@ impl DaemonState {
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
 
+        // Invariant guard (issue #14): refuse to wipe the pane of an existing
+        // local session. An external caller POSTing /api/register without a
+        // pane must not clobber the link to the real tmux pane — that leaves
+        // the session unreachable via tmux delivery while the pane is still
+        // alive. Preserving the existing entry is the safe no-op.
+        if pane.is_none()
+            && let Some(existing) = self.sessions.get(&id)
+            && matches!(existing.origin, Origin::Local)
+            && existing.pane.is_some()
+        {
+            tracing::warn!(
+                target: "ouija::daemon_protocol",
+                "refusing to re-register local session '{}' with pane=None (existing pane: {:?})",
+                id,
+                existing.pane,
+            );
+            return effects;
+        }
+
         // If re-registering the same ID with a different pane (e.g. restart),
         // clean up the old pane's tmux state before proceeding.
         if let Some(ref new_pane) = pane {
@@ -3234,6 +3253,85 @@ mod tests {
             backend_session_id: "ses_abc".into(),
         });
         assert!(effects.is_empty());
+    }
+
+    // --- Register invariant: pane preservation (issue #14) ---
+
+    #[test]
+    fn register_refuses_pane_none_for_existing_local_with_pane() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        // First Register with a real pane + full metadata.
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%42".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/repo".into()),
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_xyz".into()),
+                role: Some("working".into()),
+                networked: true,
+                ..Default::default()
+            },
+        });
+
+        // Re-register with pane=None and blank metadata — the ghost bug
+        // fingerprint. Must be a no-op.
+        let effects = state.apply(Event::Register {
+            id: "worker".into(),
+            pane: None,
+            metadata: SessionMeta::default(),
+        });
+
+        assert!(
+            effects.is_empty(),
+            "re-register with pane=None should emit no effects, got: {effects:?}"
+        );
+        let session = &state.sessions["worker"];
+        assert_eq!(session.pane.as_deref(), Some("%42"));
+        assert_eq!(session.metadata.project_dir.as_deref(), Some("/repo"));
+        assert_eq!(session.metadata.backend.as_deref(), Some("opencode"));
+        assert_eq!(
+            session.metadata.backend_session_id.as_deref(),
+            Some("ses_xyz")
+        );
+        assert_eq!(session.metadata.role.as_deref(), Some("working"));
+    }
+
+    #[test]
+    fn register_allows_pane_none_for_new_session() {
+        // If the session does not yet exist, pane=None is still permitted —
+        // some call paths register placeholders before a pane is known.
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        let effects = state.apply(Event::Register {
+            id: "placeholder".into(),
+            pane: None,
+            metadata: SessionMeta::default(),
+        });
+        assert!(!effects.is_empty());
+        assert!(state.sessions.contains_key("placeholder"));
+        assert!(state.sessions["placeholder"].pane.is_none());
+    }
+
+    #[test]
+    fn register_allows_pane_none_when_existing_has_no_pane() {
+        // An existing pane=None session may be re-registered with pane=None
+        // (e.g. metadata-only update via /api/register). No invariant to protect.
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "p".into(),
+            pane: None,
+            metadata: SessionMeta::default(),
+        });
+        let effects = state.apply(Event::Register {
+            id: "p".into(),
+            pane: None,
+            metadata: SessionMeta {
+                role: Some("updated".into()),
+                ..Default::default()
+            },
+        });
+        assert!(!effects.is_empty());
+        assert_eq!(state.sessions["p"].metadata.role.as_deref(), Some("updated"));
     }
 
     // --- Convergence simulation: exercises every Event variant ---
