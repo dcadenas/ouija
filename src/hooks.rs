@@ -422,12 +422,21 @@ async fn session_start_inner(
     // Detect backend from the process running in the pane
     let detected_backend = state.detect_backend_in_pane(&body.pane).await;
 
+    // For opencode sessions, resolve the backend_session_id from the shared
+    // serve so we can deliver messages via HTTP instead of tmux injection.
+    let backend_session_id = if detected_backend.as_deref() == Some("opencode") {
+        resolve_opencode_session_id(state, project_root).await
+    } else {
+        None
+    };
+
     // Register
     let role = format!("working on {basename}");
     let proto_meta = crate::daemon_protocol::SessionMeta {
         project_dir: Some(project_root.to_string()),
         role: Some(role),
         backend: detected_backend,
+        backend_session_id,
         ..Default::default()
     };
     state
@@ -514,6 +523,38 @@ async fn session_start_inner(
         "peers": peers,
         "version_warning": version_warning,
     })
+}
+
+/// Query the opencode serve to find the most recently updated session for a
+/// given project directory.  Returns the session ID if found.
+async fn resolve_opencode_session_id(
+    state: &std::sync::Arc<crate::state::AppState>,
+    project_dir: &str,
+) -> Option<String> {
+    let port = state.opencode_serve_port();
+    let url = format!("http://127.0.0.1:{port}/session");
+    let resp = state
+        .http_client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let sessions: Vec<serde_json::Value> = resp.json().await.ok()?;
+    // Find the most recently updated session matching this directory.
+    sessions
+        .iter()
+        .filter(|s| s["directory"].as_str() == Some(project_dir))
+        .max_by_key(|s| {
+            s["time"]["updated"]
+                .as_i64()
+                .or_else(|| s["time"]["created"].as_i64())
+                .unwrap_or(0)
+        })
+        .and_then(|s| s["id"].as_str().map(String::from))
 }
 
 #[cfg(test)]

@@ -215,6 +215,17 @@ pub enum Event {
         project_dir: Option<String>,
         networked: Option<bool>,
     },
+    /// Set the backend + backend_session_id on an already-registered local session.
+    ///
+    /// Distinct from [`Event::UpdateMetadata`]: this is internal plumbing
+    /// triggered when the backend (e.g. opencode) first reports its session ID
+    /// for a pane. It never bumps `last_metadata_update` (which tracks
+    /// user-facing role/bulletin staleness). No-op for remote sessions.
+    AdoptBackend {
+        id: String,
+        backend: String,
+        backend_session_id: String,
+    },
     ReapDead {
         dead_ids: Vec<String>,
     },
@@ -536,6 +547,11 @@ impl DaemonState {
                 project_dir,
                 networked,
             } => self.apply_update_metadata(&id, role, bulletin, project_dir, networked),
+            Event::AdoptBackend {
+                id,
+                backend,
+                backend_session_id,
+            } => self.apply_adopt_backend(&id, backend, backend_session_id),
             Event::ReapDead { dead_ids } => self.apply_reap(dead_ids),
             Event::IncomingWire { msg, sender_npub } => self.apply_incoming_wire(msg, sender_npub),
             Event::Send {
@@ -903,6 +919,25 @@ impl DaemonState {
         if let Some(n) = networked {
             session.metadata.networked = n;
         }
+        let mut effects = vec![Effect::Persist];
+        if session.metadata.networked {
+            effects.push(Effect::BroadcastSessionList);
+        }
+        effects
+    }
+
+    fn apply_adopt_backend(
+        &mut self,
+        id: &str,
+        backend: String,
+        backend_session_id: String,
+    ) -> Vec<Effect> {
+        let session = match self.sessions.get_mut(id) {
+            Some(s) if matches!(s.origin, Origin::Local) => s,
+            _ => return vec![],
+        };
+        session.metadata.backend = Some(backend);
+        session.metadata.backend_session_id = Some(backend_session_id);
         let mut effects = vec![Effect::Persist];
         if session.metadata.networked {
             effects.push(Effect::BroadcastSessionList);
@@ -3100,6 +3135,103 @@ mod tests {
             bulletin: None,
             project_dir: None,
             networked: None,
+        });
+        assert!(effects.is_empty());
+    }
+
+    // --- AdoptBackend tests ---
+
+    #[test]
+    fn adopt_backend_sets_fields_and_persists() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "s1".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                role: Some("working on thing".into()),
+                project_dir: Some("/repo".into()),
+                networked: true,
+                ..Default::default()
+            },
+        });
+        let effects = state.apply(Event::AdoptBackend {
+            id: "s1".into(),
+            backend: "opencode".into(),
+            backend_session_id: "ses_abc123".into(),
+        });
+        let meta = &state.sessions["s1"].metadata;
+        assert_eq!(meta.backend.as_deref(), Some("opencode"));
+        assert_eq!(meta.backend_session_id.as_deref(), Some("ses_abc123"));
+        // Other metadata preserved.
+        assert_eq!(meta.role.as_deref(), Some("working on thing"));
+        assert_eq!(meta.project_dir.as_deref(), Some("/repo"));
+        // Networked: persist + broadcast.
+        assert!(effects.iter().any(|e| matches!(e, Effect::Persist)));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::BroadcastSessionList))
+        );
+        // Does not bump user-facing metadata staleness.
+        assert!(meta.last_metadata_update.is_none());
+    }
+
+    #[test]
+    fn adopt_backend_non_networked_no_broadcast() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "s1".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                networked: false,
+                ..Default::default()
+            },
+        });
+        let effects = state.apply(Event::AdoptBackend {
+            id: "s1".into(),
+            backend: "opencode".into(),
+            backend_session_id: "ses_abc".into(),
+        });
+        assert!(effects.iter().any(|e| matches!(e, Effect::Persist)));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::BroadcastSessionList))
+        );
+    }
+
+    #[test]
+    fn adopt_backend_remote_noop() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.sessions.insert(
+            "remote/s1".into(),
+            SessionEntry {
+                id: "remote/s1".into(),
+                origin: Origin::Remote("npub1xyz".into()),
+                ..Default::default()
+            },
+        );
+        let effects = state.apply(Event::AdoptBackend {
+            id: "remote/s1".into(),
+            backend: "opencode".into(),
+            backend_session_id: "ses_abc".into(),
+        });
+        assert!(effects.is_empty());
+        assert!(
+            state.sessions["remote/s1"]
+                .metadata
+                .backend_session_id
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn adopt_backend_missing_session_noop() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        let effects = state.apply(Event::AdoptBackend {
+            id: "nope".into(),
+            backend: "opencode".into(),
+            backend_session_id: "ses_abc".into(),
         });
         assert!(effects.is_empty());
     }
