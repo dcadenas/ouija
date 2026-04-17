@@ -70,3 +70,9 @@ Remote: Same flow but wrapped in NIP-17 encrypted DMs via Nostr relays.
 - **Unit tests**: inline `#[cfg(test)]` modules in each file
 - **Model checking**: Stateright BFS in `daemon_protocol.rs` verifies all state machine invariants
 - **E2E tests**: Docker Compose scenarios in `tests/e2e/` (single-daemon, Nostr P2P, OpenCode, install)
+
+### Tmux isolation in unit tests
+
+Unit tests exercise `apply_and_execute`, which dispatches `Effect::SetTmuxVar`, `Effect::RenameWindow`, etc. Those effects must NEVER reach the host tmux server, or tests will rewrite real pane vars (e.g. `@ouija_session`) and window names when `cargo test` runs inside a tmux session.
+
+The tmux-side primitives in `src/tmux_var.rs` and `src/tmux.rs` (`rename_window`, `enable_automatic_rename`) early-return under `cfg!(test)`. Any new function that shells out to `tmux` from an effect handler must follow the same pattern.

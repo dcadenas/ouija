@@ -567,6 +567,9 @@ async fn deliver_via_http(
 
 /// Rename the tmux window containing a pane and disable automatic-rename.
 pub fn rename_window(pane_id: &str, name: &str) {
+    if cfg!(test) {
+        return;
+    }
     let _ = Command::new("tmux")
         .args(["rename-window", "-t", pane_id, name])
         .status();
@@ -583,6 +586,9 @@ pub fn rename_window(pane_id: &str, name: &str) {
 
 /// Re-enable automatic-rename on the tmux window containing a pane.
 pub fn enable_automatic_rename(pane_id: &str) {
+    if cfg!(test) {
+        return;
+    }
     let _ = Command::new("tmux")
         .args(["set-window-option", "-t", pane_id, "automatic-rename", "on"])
         .status();
