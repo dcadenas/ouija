@@ -87,7 +87,13 @@ enum Command {
         role: Option<String>,
     },
     /// Send a message expecting a reply
-    Ask { to: String, message: String },
+    Ask {
+        to: String,
+        message: String,
+        /// Sender session ID. Required outside tmux when `$OUIJA_SESSION_ID` is unset.
+        #[arg(long)]
+        from: Option<String>,
+    },
     /// Send a message (fire-and-forget)
     Tell {
         to: String,
@@ -95,6 +101,9 @@ enum Command {
         /// Thread as progress update for a pending reply
         #[arg(long)]
         reply_to: Option<u64>,
+        /// Sender session ID. Required outside tmux when `$OUIJA_SESSION_ID` is unset.
+        #[arg(long)]
+        from: Option<String>,
     },
     /// Reply to a message (defaults to done=true)
     Reply {
@@ -107,6 +116,9 @@ enum Command {
         /// Expect a reply back
         #[arg(long)]
         expect_reply: bool,
+        /// Sender session ID. Required outside tmux when `$OUIJA_SESSION_ID` is unset.
+        #[arg(long)]
+        from: Option<String>,
     },
     /// List sessions
     Ls,
@@ -606,8 +618,11 @@ async fn main() -> anyhow::Result<()> {
             });
             cli_post("/api/register", &body).await?;
         }
-        Command::Ask { to, message } => {
-            let from = require_my_session_id().await?;
+        Command::Ask { to, message, from } => {
+            let from = match from {
+                Some(id) => id,
+                None => require_my_session_id().await?,
+            };
             let body = serde_json::json!({
                 "from": from,
                 "to": to,
@@ -620,8 +635,12 @@ async fn main() -> anyhow::Result<()> {
             to,
             message,
             reply_to,
+            from,
         } => {
-            let from = require_my_session_id().await?;
+            let from = match from {
+                Some(id) => id,
+                None => require_my_session_id().await?,
+            };
             let body = serde_json::json!({
                 "from": from,
                 "to": to,
@@ -637,8 +656,12 @@ async fn main() -> anyhow::Result<()> {
             message,
             no_done,
             expect_reply,
+            from,
         } => {
-            let from = require_my_session_id().await?;
+            let from = match from {
+                Some(id) => id,
+                None => require_my_session_id().await?,
+            };
             let body = serde_json::json!({
                 "from": from,
                 "to": to,
