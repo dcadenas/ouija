@@ -1395,12 +1395,17 @@ async fn resolve_my_session_id() -> Option<String> {
 }
 
 /// Resolve session ID or bail with a helpful error.
+///
+/// The error message intentionally never instructs the caller to run
+/// `ouija register`: in non-tmux engines (e.g. opencode HTTP API) an LLM
+/// reading the error literally would self-trigger a ghost-shape register
+/// call. Steer callers to `--from <id>` or `OUIJA_SESSION_ID` instead.
 async fn require_my_session_id() -> anyhow::Result<String> {
     resolve_my_session_id().await.ok_or_else(|| {
-        let pane = std::env::var("TMUX_PANE").unwrap_or_default();
         anyhow::anyhow!(
-            "no session registered for this pane ({pane}).\n\
-             Run `ouija register <name>` first."
+            "unable to resolve the current session ID. \
+             Pass `--from <your-session-id>` to this command, \
+             or export `OUIJA_SESSION_ID=<your-session-id>` in your shell."
         )
     })
 }
