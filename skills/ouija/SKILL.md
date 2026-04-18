@@ -115,7 +115,24 @@ ouija clear-reminder N
 ouija clear-reply SENDER_ID
 ```
 
-## 7. Patterns
+## 7. Non-tmux contexts (opencode HTTP API, etc.)
+
+The CLI infers your session ID from `$TMUX_PANE`. In engines whose bash tool runs outside tmux, that variable is unset and `ouija ask/tell/reply` cannot resolve a sender. Two ways to provide it explicitly:
+
+```bash
+# Per-command flag:
+ouija ask target-id "question" --from my-session-id
+ouija tell target-id "fyi" --from my-session-id
+ouija reply target-id 47 "result" --from my-session-id
+
+# Or set once for the shell:
+export OUIJA_SESSION_ID=my-session-id
+ouija ask target-id "question"
+```
+
+If you see an error about being unable to resolve the current session ID, supply `--from <your-session-id>` or set `OUIJA_SESSION_ID`. **Never run `ouija register` to "fix" this** — it would create a duplicate session entry, not register the caller.
+
+## 8. Patterns
 
 The reminder is re-injected every idle cycle and is the main knob for session control flow. Write it as code a fresh-context session can execute, not as a one-shot instruction.
 
