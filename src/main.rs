@@ -1360,9 +1360,21 @@ fn fetch_latest_crate_version(name: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("no versions found for {name} on crates.io"))
 }
 
-/// Look up the registered session ID for the current tmux pane.
-/// Fast path: read @ouija_session tmux var. Fallback: query API.
+/// Look up the registered session ID for the current execution context.
+///
+/// Resolution order:
+/// 1. `$OUIJA_SESSION_ID` env var — explicit override for non-tmux engines
+///    (e.g. opencode HTTP API) and plugin wrappers.
+/// 2. `@ouija_session` tmux pane variable — fast path for tmux callers.
+/// 3. `/api/status` lookup by `$TMUX_PANE` — fallback when the pane var was
+///    cleared but the daemon still tracks the pane.
 async fn resolve_my_session_id() -> Option<String> {
+    if let Ok(id) = std::env::var("OUIJA_SESSION_ID") {
+        if !id.is_empty() {
+            return Some(id);
+        }
+    }
+
     let pane = std::env::var("TMUX_PANE").ok()?;
 
     // Fast path: tmux pane variable (no HTTP)
