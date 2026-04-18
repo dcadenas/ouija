@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use axum::Router;
 use axum::routing::{delete, get, post};
 use tokio::net::TcpListener;
@@ -85,7 +87,10 @@ pub async fn run(state: SharedState) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     println!("ouija daemon '{name}' listening on http://localhost:{port}");
     tracing::info!("ouija daemon '{name}' listening on {addr}");
-    axum::serve(listener, app).await?;
+    // `into_make_service_with_connect_info::<SocketAddr>()` enables the
+    // `ConnectInfo<SocketAddr>` extractor — handlers can read the peer
+    // address and port of the TCP connection (issue #14 diagnostic).
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
 
     Ok(())
 }

@@ -1,7 +1,9 @@
+use std::net::SocketAddr;
 use std::path::Path;
 
-use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::body::Bytes;
+use axum::extract::{ConnectInfo, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Json;
 use serde::Deserialize;
 use serde_json::json;
@@ -475,21 +477,38 @@ pub struct RegisterBody {
 /// Register a new local session with optional metadata.
 pub async fn register(
     State(state): State<SharedState>,
-    Json(body): Json<RegisterBody>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body_bytes: Bytes,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Diagnostic (issue #14): log every /api/register call so the caller that
-    // POSTs with pane=None for existing sessions can be identified.
+    // Diagnostic (issue #14): log peer address, User-Agent, and the raw JSON
+    // body (including any unknown fields) so the still-unidentified caller
+    // POSTing with pane=None for existing sessions can be pinned down.
+    // Extracting Bytes instead of Json<RegisterBody> is what preserves the
+    // unknown-field fidelity — Json would silently drop them.
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    let raw_body = String::from_utf8_lossy(&body_bytes);
     tracing::info!(
         target: "ouija::api::register",
-        "/api/register: id={} pane={:?} project_dir={:?} backend={:?} backend_session_id={:?} role={:?} networked={:?}",
-        body.id,
-        body.pane,
-        body.project_dir,
-        body.backend,
-        body.backend_session_id,
-        body.role,
-        body.networked,
+        peer = %peer,
+        user_agent = %user_agent,
+        "/api/register: raw_body={}",
+        raw_body,
     );
+
+    let body: RegisterBody = match serde_json::from_slice(&body_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("invalid JSON: {e}") })),
+            );
+        }
+    };
+
     if body.id.contains('/') {
         return (
             StatusCode::BAD_REQUEST,
