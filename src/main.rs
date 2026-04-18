@@ -87,7 +87,13 @@ enum Command {
         role: Option<String>,
     },
     /// Send a message expecting a reply
-    Ask { to: String, message: String },
+    Ask {
+        to: String,
+        message: String,
+        /// Sender session ID. Required outside tmux when `$OUIJA_SESSION_ID` is unset.
+        #[arg(long)]
+        from: Option<String>,
+    },
     /// Send a message (fire-and-forget)
     Tell {
         to: String,
@@ -95,6 +101,9 @@ enum Command {
         /// Thread as progress update for a pending reply
         #[arg(long)]
         reply_to: Option<u64>,
+        /// Sender session ID. Required outside tmux when `$OUIJA_SESSION_ID` is unset.
+        #[arg(long)]
+        from: Option<String>,
     },
     /// Reply to a message (defaults to done=true)
     Reply {
@@ -107,6 +116,9 @@ enum Command {
         /// Expect a reply back
         #[arg(long)]
         expect_reply: bool,
+        /// Sender session ID. Required outside tmux when `$OUIJA_SESSION_ID` is unset.
+        #[arg(long)]
+        from: Option<String>,
     },
     /// List sessions
     Ls,
@@ -606,8 +618,11 @@ async fn main() -> anyhow::Result<()> {
             });
             cli_post("/api/register", &body).await?;
         }
-        Command::Ask { to, message } => {
-            let from = require_my_session_id().await?;
+        Command::Ask { to, message, from } => {
+            let from = match from {
+                Some(id) => id,
+                None => require_my_session_id().await?,
+            };
             let body = serde_json::json!({
                 "from": from,
                 "to": to,
@@ -620,8 +635,12 @@ async fn main() -> anyhow::Result<()> {
             to,
             message,
             reply_to,
+            from,
         } => {
-            let from = require_my_session_id().await?;
+            let from = match from {
+                Some(id) => id,
+                None => require_my_session_id().await?,
+            };
             let body = serde_json::json!({
                 "from": from,
                 "to": to,
@@ -637,8 +656,12 @@ async fn main() -> anyhow::Result<()> {
             message,
             no_done,
             expect_reply,
+            from,
         } => {
-            let from = require_my_session_id().await?;
+            let from = match from {
+                Some(id) => id,
+                None => require_my_session_id().await?,
+            };
             let body = serde_json::json!({
                 "from": from,
                 "to": to,
@@ -1360,9 +1383,21 @@ fn fetch_latest_crate_version(name: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("no versions found for {name} on crates.io"))
 }
 
-/// Look up the registered session ID for the current tmux pane.
-/// Fast path: read @ouija_session tmux var. Fallback: query API.
+/// Look up the registered session ID for the current execution context.
+///
+/// Resolution order:
+/// 1. `$OUIJA_SESSION_ID` env var — explicit override for non-tmux engines
+///    (e.g. opencode HTTP API) and plugin wrappers.
+/// 2. `@ouija_session` tmux pane variable — fast path for tmux callers.
+/// 3. `/api/status` lookup by `$TMUX_PANE` — fallback when the pane var was
+///    cleared but the daemon still tracks the pane.
 async fn resolve_my_session_id() -> Option<String> {
+    if let Ok(id) = std::env::var("OUIJA_SESSION_ID") {
+        if !id.is_empty() {
+            return Some(id);
+        }
+    }
+
     let pane = std::env::var("TMUX_PANE").ok()?;
 
     // Fast path: tmux pane variable (no HTTP)
@@ -1383,12 +1418,17 @@ async fn resolve_my_session_id() -> Option<String> {
 }
 
 /// Resolve session ID or bail with a helpful error.
+///
+/// The error message intentionally never instructs the caller to run
+/// `ouija register`: in non-tmux engines (e.g. opencode HTTP API) an LLM
+/// reading the error literally would self-trigger a ghost-shape register
+/// call. Steer callers to `--from <id>` or `OUIJA_SESSION_ID` instead.
 async fn require_my_session_id() -> anyhow::Result<String> {
     resolve_my_session_id().await.ok_or_else(|| {
-        let pane = std::env::var("TMUX_PANE").unwrap_or_default();
         anyhow::anyhow!(
-            "no session registered for this pane ({pane}).\n\
-             Run `ouija register <name>` first."
+            "unable to resolve the current session ID. \
+             Pass `--from <your-session-id>` to this command, \
+             or export `OUIJA_SESSION_ID=<your-session-id>` in your shell."
         )
     })
 }
