@@ -474,6 +474,78 @@ pub struct RegisterBody {
     reminder: Option<String>,
 }
 
+/// Parse `/proc/net/tcp` to find the socket inode whose *local* endpoint
+/// matches `needle` (an address string in the kernel's little-endian hex
+/// format, e.g. `0100007F:8012`). Pure function, unit-testable.
+fn parse_tcp_inode_for_local(tcp_table: &str, needle: &str) -> Option<u64> {
+    for line in tcp_table.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() >= 10 && cols[1] == needle {
+            return cols[9].parse().ok();
+        }
+    }
+    None
+}
+
+/// Format a `SocketAddr` into the `AABBCCDD:EEFF` encoding used by
+/// `/proc/net/tcp` (IPv4 only; IPv6 not supported because the daemon binds
+/// loopback). Returns None for IPv6 peers.
+fn needle_for_loopback_peer(peer: SocketAddr) -> Option<String> {
+    let std::net::IpAddr::V4(v4) = peer.ip() else {
+        return None;
+    };
+    let o = v4.octets();
+    Some(format!(
+        "{:02X}{:02X}{:02X}{:02X}:{:04X}",
+        o[3],
+        o[2],
+        o[1],
+        o[0],
+        peer.port()
+    ))
+}
+
+/// Resolve the PID + cmdline of a local TCP peer by walking `/proc`. Linux
+/// only; returns None on other platforms or when resolution fails (socket
+/// already closed, permission denied, peer is IPv6, etc.).
+#[cfg(target_os = "linux")]
+fn resolve_loopback_peer(peer: SocketAddr) -> Option<String> {
+    let needle = needle_for_loopback_peer(peer)?;
+    let tcp_table = std::fs::read_to_string("/proc/net/tcp").ok()?;
+    let inode = parse_tcp_inode_for_local(&tcp_table, &needle)?;
+    let socket_target = format!("socket:[{inode}]");
+
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let name = entry.file_name();
+        let pid = match name.to_str() {
+            Some(s) if s.chars().all(|c| c.is_ascii_digit()) => s,
+            _ => continue,
+        };
+        let fd_dir = entry.path().join("fd");
+        let Ok(fds) = std::fs::read_dir(&fd_dir) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            if let Ok(link) = std::fs::read_link(fd.path())
+                && link.to_str() == Some(socket_target.as_str())
+            {
+                let cmdline = std::fs::read_to_string(entry.path().join("cmdline"))
+                    .unwrap_or_default()
+                    .replace('\0', " ")
+                    .trim_end()
+                    .to_string();
+                return Some(format!("pid={pid} cmd={cmdline:?}"));
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resolve_loopback_peer(_peer: SocketAddr) -> Option<String> {
+    None
+}
+
 /// Register a new local session with optional metadata.
 pub async fn register(
     State(state): State<SharedState>,
@@ -481,20 +553,21 @@ pub async fn register(
     headers: HeaderMap,
     body_bytes: Bytes,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Diagnostic (issue #14): log peer address, User-Agent, and the raw JSON
-    // body (including any unknown fields) so the still-unidentified caller
-    // POSTing with pane=None for existing sessions can be pinned down.
-    // Extracting Bytes instead of Json<RegisterBody> is what preserves the
-    // unknown-field fidelity — Json would silently drop them.
+    // Diagnostic (issue #14): log peer address, User-Agent, the raw JSON body
+    // (preserves unknown fields), and — on Linux — the caller PID+cmdline
+    // resolved via /proc/net/tcp + /proc/<pid>/fd walk. Resolving inside the
+    // handler catches the caller before TIME_WAIT loses the socket→PID mapping.
     let user_agent = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-");
     let raw_body = String::from_utf8_lossy(&body_bytes);
+    let caller = resolve_loopback_peer(peer).unwrap_or_else(|| "pid=unknown".to_string());
     tracing::info!(
         target: "ouija::api::register",
         peer = %peer,
         user_agent = %user_agent,
+        caller = %caller,
         "/api/register: raw_body={}",
         raw_body,
     );
@@ -1920,6 +1993,30 @@ mod tests {
             vec!["hub".into(), "hub-skill-probe".into()],
         );
         assert!(got.is_none());
+    }
+
+    #[test]
+    fn needle_for_127_0_0_1_encodes_little_endian_hex() {
+        let peer: SocketAddr = "127.0.0.1:45084".parse().unwrap();
+        // 127.0.0.1 little-endian = 01 00 00 7F → "0100007F"; port 45084 = 0xB01C
+        assert_eq!(needle_for_loopback_peer(peer).as_deref(), Some("0100007F:B01C"));
+    }
+
+    #[test]
+    fn parse_tcp_inode_finds_matching_local() {
+        let table = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0100007F:B01C 0100007F:1EC8 01 00000000:00000000 00:00000000 00000000  1000        0 1234567 1 0000000000000000 20 4 20 10 -1\n\
+   1: 0100007F:1EC8 0100007F:B01C 01 00000000:00000000 00:00000000 00000000  1000        0 7654321 1 0000000000000000 20 4 20 10 -1\n";
+        assert_eq!(parse_tcp_inode_for_local(table, "0100007F:B01C"), Some(1234567));
+        assert_eq!(parse_tcp_inode_for_local(table, "0100007F:1EC8"), Some(7654321));
+        assert_eq!(parse_tcp_inode_for_local(table, "0100007F:FFFF"), None);
+    }
+
+    #[test]
+    fn parse_tcp_inode_skips_header_and_short_lines() {
+        let table = "sl  local_address rem_address   st\nshort line\n";
+        assert!(parse_tcp_inode_for_local(table, "0100007F:0001").is_none());
     }
 
     #[test]
