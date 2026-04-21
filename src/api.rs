@@ -935,66 +935,106 @@ pub struct CompactBody {
     pub continuation: Option<String>,
 }
 
-/// Trigger engine-aware compaction and queue a continuation for post-compact injection.
+/// Trigger backend-aware compaction. Callers pass the same `{continuation}` body
+/// for every backend; the endpoint routes by `delivery_mode()`:
+///
+/// - TUI backends (e.g. Claude Code) receive the compact slash command via tmux,
+///   and the continuation is parked on the session agent for the post-compact
+///   hook to drain.
+/// - HTTP backends (e.g. OpenCode) skip tmux entirely and deliver the
+///   continuation as a fresh user turn via the backend's HTTP API. Phase 1
+///   does not shrink OC context — only continuation delivery.
 pub async fn compact(
     State(state): State<SharedState>,
     axum::extract::Path(session_id): axum::extract::Path<String>,
     Json(body): Json<CompactBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Look up the session
-    let (pane, backend_name) = {
+    let (status, value) = compact_inner(&state, session_id, body).await;
+    (status, Json(value))
+}
+
+async fn compact_inner(
+    state: &std::sync::Arc<crate::state::AppState>,
+    session_id: String,
+    body: CompactBody,
+) -> (StatusCode, serde_json::Value) {
+    let (pane, backend_session_id) = {
         let proto = state.protocol.read().await;
         match proto.sessions.get(&session_id) {
-            Some(s) => (s.pane.clone(), s.metadata.backend.clone()),
+            Some(s) => (s.pane.clone(), s.metadata.backend_session_id.clone()),
             None => {
                 return (
                     StatusCode::NOT_FOUND,
-                    Json(json!({"error": format!("session '{}' not found", session_id)})),
+                    json!({"error": format!("session '{}' not found", session_id)}),
                 );
             }
         }
     };
 
-    let pane = match pane {
-        Some(p) => p,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "session has no pane (remote sessions cannot be compacted)"})),
-            );
-        }
-    };
-
-    // Check backend supports compact
     let backend = state.backend_for_session(&session_id).await;
-    let compact_cmd = match backend.compact_command() {
-        Some(cmd) => cmd.to_string(),
-        None => {
-            let name = backend_name.as_deref().unwrap_or("unknown");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("backend '{}' does not support compact", name)})),
-            );
+
+    match backend.delivery_mode() {
+        crate::backend::DeliveryMode::TuiInjection => {
+            let Some(pane) = pane else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    json!({"error": "session has no pane (remote sessions cannot be compacted)"}),
+                );
+            };
+            let Some(compact_cmd) = backend.compact_command().map(str::to_string) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    json!({"error": format!("backend '{}' does not support compact", backend.name())}),
+                );
+            };
+
+            if let Some(continuation) = body.continuation {
+                state
+                    .notify_agent(
+                        &session_id,
+                        crate::session_agent::SessionMsg::SetPendingCompactContinuation(
+                            continuation,
+                        ),
+                    )
+                    .await;
+            }
+
+            match tmux::locked_inject(state, &session_id, &pane, &compact_cmd, false).await {
+                Ok(()) => (StatusCode::OK, json!({"status": "ok", "compacted": true})),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": e.to_string()}),
+                ),
+            }
         }
-    };
+        crate::backend::DeliveryMode::HttpApi { .. } => {
+            if backend_session_id.is_none() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    json!({
+                        "error": format!(
+                            "session has no backend_session_id (backend '{}' not attached)",
+                            backend.name()
+                        )
+                    }),
+                );
+            }
 
-    // Store continuation on the session agent (if provided)
-    if let Some(continuation) = body.continuation {
-        state
-            .notify_agent(
-                &session_id,
-                crate::session_agent::SessionMsg::SetPendingCompactContinuation(continuation),
-            )
-            .await;
-    }
+            // Phase 1: deliver caller's continuation as a fresh user turn.
+            // No /summarize call — context shrink is deferred to a follow-up.
+            if let Some(continuation) = body.continuation {
+                if let Err(e) =
+                    tmux::locked_inject(state, &session_id, "", &continuation, false).await
+                {
+                    tracing::warn!(
+                        session = %session_id,
+                        "opencode compact continuation delivery failed: {e}"
+                    );
+                }
+            }
 
-    // Inject the compact command (raw, no XML wrapping)
-    match tmux::locked_inject(&state, &session_id, &pane, &compact_cmd, false).await {
-        Ok(()) => (StatusCode::OK, Json(json!({"status": "compact_triggered"}))),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        ),
+            (StatusCode::OK, json!({"status": "ok", "compacted": false}))
+        }
     }
 }
 
@@ -2081,5 +2121,138 @@ mod tests {
     fn extract_missing_files_returns_none() {
         let dir = tempfile::tempdir().unwrap();
         assert!(extract_project_description(dir.path().to_str().unwrap()).is_none());
+    }
+
+    // --- compact endpoint ---
+
+    #[tokio::test]
+    async fn compact_session_not_found_returns_404() {
+        let state = crate::state::AppState::new_for_test();
+        let (status, body) = compact_inner(
+            &state,
+            "ghost".into(),
+            CompactBody {
+                continuation: Some("go".into()),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body["error"].as_str().unwrap().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn compact_cc_without_pane_returns_400() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "cc-no-pane".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = compact_inner(
+            &state,
+            "cc-no-pane".into(),
+            CompactBody {
+                continuation: Some("go".into()),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("pane"));
+    }
+
+    #[tokio::test]
+    async fn compact_oc_without_backend_session_id_returns_400() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-no-sid".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: None,
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = compact_inner(
+            &state,
+            "oc-no-sid".into(),
+            CompactBody {
+                continuation: Some("go".into()),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("backend_session_id"),
+            "expected error to mention backend_session_id, got: {}",
+            body["error"]
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_oc_with_backend_session_id_returns_200_compacted_false() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-ok".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_probe".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = compact_inner(
+            &state,
+            "oc-ok".into(),
+            CompactBody {
+                continuation: Some("keep going".into()),
+            },
+        )
+        .await;
+        // deliver_via_http swallows network errors into Ok(()), so the endpoint
+        // returns 200 even without an opencode serve running in the test env.
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["compacted"], false);
+    }
+
+    #[tokio::test]
+    async fn compact_oc_without_continuation_returns_200_compacted_false() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-empty".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_probe".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = compact_inner(
+            &state,
+            "oc-empty".into(),
+            CompactBody { continuation: None },
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["compacted"], false);
     }
 }
