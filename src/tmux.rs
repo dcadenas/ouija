@@ -494,10 +494,20 @@ pub async fn locked_inject(
             // swallow upstream failures so those callers keep their existing
             // semantics. Callers that need to observe delivery outcomes must
             // call deliver_via_http directly.
-            if let Err(e) =
-                deliver_via_http(state, oc_session_id, project_dir.as_deref(), message).await
-            {
-                tracing::warn!(session = %session_id, "http delivery failed: {e}");
+            match oc_session_id {
+                Some(sid) => {
+                    if let Err(e) =
+                        deliver_via_http(state, &sid, project_dir.as_deref(), message).await
+                    {
+                        tracing::warn!(session = %session_id, "http delivery failed: {e}");
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        session = %session_id,
+                        "http delivery skipped: no backend_session_id on session"
+                    );
+                }
             }
             Ok(())
         }
@@ -528,19 +538,16 @@ pub async fn locked_inject(
 /// for the LLM to finish processing. The message appears as a user message
 /// in the session and triggers an assistant turn.
 ///
-/// Returns `Err` on missing backend_session_id, connection failure, or any
-/// non-2xx response so callers can distinguish delivered from swallowed.
-/// Best-effort callers (e.g. `locked_inject`) wrap this in a tracing::warn.
+/// Returns `Err` on connection failure or any non-2xx response so callers can
+/// distinguish delivered from swallowed. Best-effort callers (e.g. the HttpApi
+/// branch of `locked_inject`) wrap this in a tracing::warn.
 pub(crate) async fn deliver_via_http(
     state: &crate::state::AppState,
-    oc_session_id: Option<String>,
+    oc_session_id: &str,
     project_dir: Option<&str>,
     message: &str,
 ) -> anyhow::Result<()> {
     let port = state.opencode_serve_port();
-
-    let oc_session_id =
-        oc_session_id.ok_or_else(|| anyhow::anyhow!("no backend_session_id for session"))?;
 
     let client = state.http_client.clone();
     let body = serde_json::json!({

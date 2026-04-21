@@ -323,13 +323,20 @@ impl Actor for SessionAgent {
                 }
             }
             SessionMsg::TrySetPendingCompactContinuation(text, reply) => {
+                // If the caller's RPC was cancelled (timeout, task drop, axum
+                // disconnect) before we got here, bail out before mutating —
+                // otherwise we would reserve the slot without anyone owning it,
+                // and every subsequent compact would 409 until the agent is
+                // restarted and the next post-compact hook would drain the
+                // orphan into an unrelated turn.
+                if reply.is_closed() {
+                    return Ok(());
+                }
                 let acquired = state.pending_compact_continuation.is_none();
                 if acquired {
                     state.pending_compact_continuation = Some(text);
                 }
-                if !reply.is_closed() {
-                    let _ = reply.send(acquired);
-                }
+                let _ = reply.send(acquired);
             }
             SessionMsg::DrainPendingCompactContinuation(reply) => {
                 if !reply.is_closed() {

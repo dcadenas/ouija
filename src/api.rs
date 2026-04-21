@@ -949,9 +949,19 @@ pub struct CompactBody {
 ///   does not shrink OC context — only continuation delivery. `compacted:
 ///   false` reflects that no context shrink occurred on this path.
 ///
-/// Response envelope changed from the legacy `{status:"compact_triggered"}` to
-/// `{status:"ok", compacted: <bool>}`. Out-of-repo callers that asserted on
-/// the old literal must update.
+/// Breaking changes vs. the prior version of this endpoint:
+/// - Response envelope changed from `{status:"compact_triggered"}` to
+///   `{status:"ok", compacted: <bool>}`. Callers asserting on the old literal
+///   must update.
+/// - Request body is now strict: `CompactBody` rejects unknown fields (e.g. a
+///   typo like `{"continuatino": "..."}` now returns 400 instead of silently
+///   dropping the value).
+///
+/// Concurrency: when a `continuation` is supplied the TUI branch rejects
+/// concurrent compact attempts with 409 to prevent overwriting an in-flight
+/// caller's continuation. A bare `/compact` (no continuation) on the TUI
+/// branch and all HTTP-branch calls currently have no concurrency guard —
+/// see follow-up.
 pub async fn compact(
     State(state): State<SharedState>,
     axum::extract::Path(session_id): axum::extract::Path<String>,
@@ -966,18 +976,21 @@ async fn compact_inner(
     session_id: String,
     body: CompactBody,
 ) -> (StatusCode, serde_json::Value) {
-    // Normalize: treat whitespace-only or empty continuation as None so both
-    // branches handle "no continuation" uniformly.
+    // Normalize: trim surrounding whitespace so the same string reaches both
+    // tmux paste and prompt_async, and treat empty/whitespace-only as None so
+    // both branches apply the same "no continuation" rule.
     let continuation = body.continuation.and_then(|s| {
-        if s.trim().is_empty() {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
             None
         } else {
-            Some(s)
+            Some(trimmed.to_string())
         }
     });
 
     // Read everything we need under a single lock acquisition so a racing
-    // session mutation can't split backend_session_id from pane/project_dir.
+    // session mutation can't split backend_session_id from pane/project_dir
+    // or flip the backend type between the lookup and the dispatch decision.
     let lookup = {
         let proto = state.protocol.read().await;
         match proto.sessions.get(&session_id) {
@@ -985,6 +998,7 @@ async fn compact_inner(
                 pane: s.pane.clone(),
                 backend_session_id: s.metadata.backend_session_id.clone(),
                 project_dir: s.metadata.project_dir.clone(),
+                backend_name: s.metadata.backend.clone(),
             },
             None => {
                 return (
@@ -995,7 +1009,16 @@ async fn compact_inner(
         }
     };
 
-    let backend = state.backend_for_session(&session_id).await;
+    // Resolve the backend from the name captured above rather than re-reading
+    // the protocol lock — prevents the branch decision from diverging from the
+    // metadata it was taken on.
+    let backend = match lookup.backend_name.as_deref() {
+        Some(name) => state
+            .backends
+            .get(name)
+            .unwrap_or_else(|| state.backends.default()),
+        None => state.backends.default(),
+    };
 
     match backend.delivery_mode() {
         crate::backend::DeliveryMode::TuiInjection => {
@@ -1014,9 +1037,10 @@ async fn compact_inner(
 
             // Atomically acquire the compact slot. If another compact already parked a
             // continuation on this session, reject with 409 so the in-flight operation
-            // isn't silently overwritten. Parking before injection is required so we
-            // can reserve the slot; the rollback below handles the HIGH-1 case where
-            // injection fails after we reserved.
+            // isn't silently overwritten. Parking before injection is required so the
+            // slot is reserved by the time /compact reaches the pane; the rollback below
+            // releases the slot when injection fails synchronously so a later compact
+            // doesn't see a stale continuation.
             let parked = if let Some(ref text) = continuation {
                 let acquired = state
                     .try_set_pending_compact_continuation(&session_id, text.clone())
@@ -1037,8 +1061,20 @@ async fn compact_inner(
             {
                 if parked {
                     // Rollback: drain what we just parked so a later compact doesn't
-                    // splice this stale continuation into an unrelated turn.
-                    let _ = state.drain_agent_compact_continuation(&session_id).await;
+                    // splice this stale continuation into an unrelated turn. If the
+                    // drain RPC comes back with nothing unexpectedly, log it — the
+                    // slot may stay reserved and block future compacts until the
+                    // agent is restarted.
+                    if state
+                        .drain_agent_compact_continuation(&session_id)
+                        .await
+                        .is_none()
+                    {
+                        tracing::warn!(
+                            session = %session_id,
+                            "rollback drain returned None after successful try-set; slot may be orphaned",
+                        );
+                    }
                 }
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1075,7 +1111,7 @@ async fn compact_inner(
 
             match tmux::deliver_via_http(
                 state,
-                Some(backend_session_id),
+                &backend_session_id,
                 lookup.project_dir.as_deref(),
                 &continuation,
             )
@@ -1095,6 +1131,7 @@ struct SessionLookup {
     pane: Option<String>,
     backend_session_id: Option<String>,
     project_dir: Option<String>,
+    backend_name: Option<String>,
 }
 
 // --- Nodes ---
@@ -2360,6 +2397,50 @@ mod tests {
         assert!(
             err.to_string().contains("unknown field"),
             "expected unknown-field error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_cc_inject_failure_drains_parked_continuation() {
+        // When locked_inject fails AFTER the compact slot has been reserved, the
+        // rollback must drain what we parked so the next /compact on this session
+        // doesn't 409 forever and the post-compact hook doesn't splice a stale
+        // continuation into an unrelated turn. The inject path shells out to tmux,
+        // so in the test env it fails after the inject-queue's 3 retries — takes
+        // ~1.5s of real time but exercises the exact failure mode.
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "cc-inject-fail".into(),
+                pane: Some("%999999999".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, _body) = compact_inner(
+            &state,
+            "cc-inject-fail".into(),
+            CompactBody {
+                continuation: Some("rollback me".into()),
+            },
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "expected inject failure to surface as 500"
+        );
+
+        // Critical: the slot must be free so a follow-up compact can proceed.
+        let pending = state
+            .drain_agent_compact_continuation("cc-inject-fail")
+            .await;
+        assert_eq!(
+            pending, None,
+            "rollback must drain the parked continuation on inject failure — slot was not released"
         );
     }
 
