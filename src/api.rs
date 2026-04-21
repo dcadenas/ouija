@@ -1999,7 +1999,10 @@ mod tests {
     fn needle_for_127_0_0_1_encodes_little_endian_hex() {
         let peer: SocketAddr = "127.0.0.1:45084".parse().unwrap();
         // 127.0.0.1 little-endian = 01 00 00 7F → "0100007F"; port 45084 = 0xB01C
-        assert_eq!(needle_for_loopback_peer(peer).as_deref(), Some("0100007F:B01C"));
+        assert_eq!(
+            needle_for_loopback_peer(peer).as_deref(),
+            Some("0100007F:B01C")
+        );
     }
 
     #[test]
@@ -2008,8 +2011,14 @@ mod tests {
   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
    0: 0100007F:B01C 0100007F:1EC8 01 00000000:00000000 00:00000000 00000000  1000        0 1234567 1 0000000000000000 20 4 20 10 -1\n\
    1: 0100007F:1EC8 0100007F:B01C 01 00000000:00000000 00:00000000 00000000  1000        0 7654321 1 0000000000000000 20 4 20 10 -1\n";
-        assert_eq!(parse_tcp_inode_for_local(table, "0100007F:B01C"), Some(1234567));
-        assert_eq!(parse_tcp_inode_for_local(table, "0100007F:1EC8"), Some(7654321));
+        assert_eq!(
+            parse_tcp_inode_for_local(table, "0100007F:B01C"),
+            Some(1234567)
+        );
+        assert_eq!(
+            parse_tcp_inode_for_local(table, "0100007F:1EC8"),
+            Some(7654321)
+        );
         assert_eq!(parse_tcp_inode_for_local(table, "0100007F:FFFF"), None);
     }
 

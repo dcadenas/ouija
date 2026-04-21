@@ -748,10 +748,7 @@ mod tests {
 
         // Arm the idle timer.
         state
-            .notify_agent(
-                "tool-activity",
-                crate::session_agent::SessionMsg::Stopped,
-            )
+            .notify_agent("tool-activity", crate::session_agent::SessionMsg::Stopped)
             .await;
 
         // Halfway through the idle window, a tool fires — should reset timer.

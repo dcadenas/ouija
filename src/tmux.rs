@@ -674,9 +674,13 @@ mod tests {
     fn has_descendant_named_exact_match() {
         let tree = ProcessTree {
             children: [(1, vec![2]), (2, vec![3])].into_iter().collect(),
-            names: [(1, "bash".into()), (2, "node".into()), (3, "opencode".into())]
-                .into_iter()
-                .collect(),
+            names: [
+                (1, "bash".into()),
+                (2, "node".into()),
+                (3, "opencode".into()),
+            ]
+            .into_iter()
+            .collect(),
         };
         assert!(tree.has_descendant_named(1, &["opencode"]));
     }

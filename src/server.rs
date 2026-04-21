@@ -90,7 +90,11 @@ pub async fn run(state: SharedState) -> anyhow::Result<()> {
     // `into_make_service_with_connect_info::<SocketAddr>()` enables the
     // `ConnectInfo<SocketAddr>` extractor — handlers can read the peer
     // address and port of the TCP connection (issue #14 diagnostic).
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }

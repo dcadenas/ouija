@@ -1157,7 +1157,10 @@ async fn kill_session_inner(
     let project_dir = session.metadata.project_dir.clone();
     let backend_session_id = session.metadata.backend_session_id.clone();
     let backend = state.backend_for_session(name).await;
-    let is_http_api = matches!(backend.delivery_mode(), crate::backend::DeliveryMode::HttpApi { .. });
+    let is_http_api = matches!(
+        backend.delivery_mode(),
+        crate::backend::DeliveryMode::HttpApi { .. }
+    );
     let process_names: Vec<String> = backend
         .process_names()
         .iter()

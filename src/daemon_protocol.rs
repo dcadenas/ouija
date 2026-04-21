@@ -1904,9 +1904,11 @@ mod tests {
 
         // target has a pending reply for msg_id
         assert!(state.pending_replies.contains_key("target"));
-        assert!(state.pending_replies["target"]
-            .iter()
-            .any(|p| p.msg_id == msg_id));
+        assert!(
+            state.pending_replies["target"]
+                .iter()
+                .any(|p| p.msg_id == msg_id)
+        );
     }
 
     #[test]
@@ -1954,9 +1956,11 @@ mod tests {
             done: false,
         });
         // Pending reply still exists
-        assert!(state.pending_replies["target"]
-            .iter()
-            .any(|p| p.msg_id == msg_id));
+        assert!(
+            state.pending_replies["target"]
+                .iter()
+                .any(|p| p.msg_id == msg_id)
+        );
     }
 
     #[test]
@@ -2004,11 +2008,13 @@ mod tests {
             done: true,
         });
         // Pending reply cleared
-        assert!(state
-            .pending_replies
-            .get("target")
-            .map(|v| v.is_empty())
-            .unwrap_or(true));
+        assert!(
+            state
+                .pending_replies
+                .get("target")
+                .map(|v| v.is_empty())
+                .unwrap_or(true)
+        );
     }
 
     #[test]
@@ -2085,9 +2091,11 @@ mod tests {
         });
         // msg_id1 cleared, msg_id2 remains
         assert_eq!(state.pending_replies["target"].len(), 1);
-        assert!(state.pending_replies["target"]
-            .iter()
-            .any(|p| p.msg_id == msg_id2));
+        assert!(
+            state.pending_replies["target"]
+                .iter()
+                .any(|p| p.msg_id == msg_id2)
+        );
     }
 
     #[test]
@@ -2297,13 +2305,17 @@ mod tests {
         });
         assert!(state.sessions.contains_key("web"));
         assert_eq!(state.sessions["web"].pane, Some("%1".into()));
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::SetTmuxVar { .. })));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetTmuxVar { .. }))
+        );
         assert!(effects.iter().any(|e| matches!(e, Effect::Persist)));
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::SpawnAgent { .. })));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SpawnAgent { .. }))
+        );
     }
 
     #[test]
@@ -2377,14 +2389,18 @@ mod tests {
             metadata: Default::default(),
         });
         // Re-registering same ID with different pane updates the pane (e.g. restart)
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::RegisterOk { .. })));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::RegisterOk { .. }))
+        );
         assert_eq!(state.sessions["web"].pane, Some("%2".into()));
         // Old pane should be cleaned up
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::ClearTmuxVar { pane, .. } if pane == "%1")));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::ClearTmuxVar { pane, .. } if pane == "%1"))
+        );
     }
 
     #[test]
@@ -2403,9 +2419,11 @@ mod tests {
         assert!(!state.sessions.contains_key("old-name"));
         assert!(state.sessions.contains_key("new-name"));
         assert_eq!(state.aliases.get("old-name"), Some(&"new-name".into()));
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::StopAgent { session_id } if session_id == "old-name")));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::StopAgent { session_id } if session_id == "old-name"))
+        );
     }
 
     #[test]
@@ -2431,9 +2449,11 @@ mod tests {
         let session = state.sessions.get("ouija").unwrap();
         assert_eq!(session.pane.as_deref(), Some("%2"));
         // Old pane's tmux var is cleared
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::ClearTmuxVar { pane, .. } if pane == "%1")));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::ClearTmuxVar { pane, .. } if pane == "%1"))
+        );
     }
 
     #[test]
@@ -2477,12 +2497,16 @@ mod tests {
         assert!(state.sessions.contains_key("new"));
         assert_eq!(state.aliases.get("old"), Some(&"new".into()));
         assert!(effects.iter().any(|e| matches!(e, Effect::Broadcast(..))));
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::BroadcastSessionList)));
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::RenameAgent { .. })));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::BroadcastSessionList))
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::RenameAgent { .. }))
+        );
     }
 
     #[test]
@@ -2498,9 +2522,11 @@ mod tests {
             new_id: "has/slash".into(),
         });
         assert!(state.sessions.contains_key("s1"));
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::RenameFailed { .. })));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::RenameFailed { .. }))
+        );
     }
 
     #[test]
@@ -2510,9 +2536,11 @@ mod tests {
             old_id: "nope".into(),
             new_id: "new".into(),
         });
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::RenameFailed { .. })));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::RenameFailed { .. }))
+        );
     }
 
     #[test]
@@ -2528,12 +2556,16 @@ mod tests {
             keep_worktree: false,
         });
         assert!(!state.sessions.contains_key("s1"));
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::StopAgent { session_id } if session_id == "s1")));
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::ClearPendingReplies { .. })));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::StopAgent { session_id } if session_id == "s1"))
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::ClearPendingReplies { .. }))
+        );
         assert!(effects.iter().any(|e| matches!(e, Effect::Persist)));
     }
 
@@ -2553,9 +2585,11 @@ mod tests {
             keep_worktree: false,
         });
         assert!(state.sessions.contains_key("remote/s1"));
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::RemoveFailed { .. })));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::RemoveFailed { .. }))
+        );
     }
 
     #[test]
@@ -2573,9 +2607,11 @@ mod tests {
             id: "wt".into(),
             keep_worktree: false,
         });
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::CleanupWorktree { .. })));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::CleanupWorktree { .. }))
+        );
     }
 
     #[test]
@@ -2596,9 +2632,11 @@ mod tests {
         });
         assert!(!state.sessions.contains_key("dead"));
         assert!(state.sessions.contains_key("alive"));
-        assert!(!effects
-            .iter()
-            .any(|e| matches!(e, Effect::CleanupWorktree { .. })));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::CleanupWorktree { .. }))
+        );
     }
 
     // --- IncomingWire tests ---
@@ -2626,9 +2664,11 @@ mod tests {
         });
         assert!(state.sessions.contains_key("remote-host/s1"));
         assert!(state.sessions.contains_key("remote-host/s2"));
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::RecordNode { .. })));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::RecordNode { .. }))
+        );
     }
 
     #[test]
@@ -2839,9 +2879,11 @@ mod tests {
             },
             sender_npub: None,
         });
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::InjectMessage { pane, .. } if pane == "%1")));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::InjectMessage { pane, .. } if pane == "%1"))
+        );
         assert!(effects.iter().any(|e| matches!(
             e,
             Effect::Broadcast(crate::protocol::WireMessage::SessionSendAck {
@@ -2866,9 +2908,11 @@ mod tests {
             },
             sender_npub: None,
         });
-        assert!(!effects
-            .iter()
-            .any(|e| matches!(e, Effect::InjectMessage { .. })));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::InjectMessage { .. }))
+        );
         assert!(effects.iter().any(|e| matches!(
             e,
             Effect::Log {
@@ -2901,12 +2945,16 @@ mod tests {
             responds_to: None,
             done: false,
         });
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::InjectMessage { pane, .. } if pane == "%2")));
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::SendDelivered { .. })));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::InjectMessage { pane, .. } if pane == "%2"))
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendDelivered { .. }))
+        );
     }
 
     #[test]
@@ -3006,9 +3054,11 @@ mod tests {
             e,
             Effect::Broadcast(crate::protocol::WireMessage::SessionSend { .. })
         )));
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::SendDelivered { .. })));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendDelivered { .. }))
+        );
     }
 
     #[test]
@@ -3035,9 +3085,11 @@ mod tests {
             responds_to: None,
             done: false,
         });
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::SendToHuman { npub, .. } if npub == "npub1human")));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendToHuman { npub, .. } if npub == "npub1human"))
+        );
     }
 
     #[test]
@@ -3051,9 +3103,11 @@ mod tests {
             responds_to: None,
             done: false,
         });
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::SendFailed { .. })));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendFailed { .. }))
+        );
     }
 
     #[test]
@@ -3331,7 +3385,10 @@ mod tests {
             },
         });
         assert!(!effects.is_empty());
-        assert_eq!(state.sessions["p"].metadata.role.as_deref(), Some("updated"));
+        assert_eq!(
+            state.sessions["p"].metadata.role.as_deref(),
+            Some("updated")
+        );
     }
 
     // --- Convergence simulation: exercises every Event variant ---
@@ -3470,10 +3527,11 @@ mod tests {
             sender_npub: Some("npub0".into()),
         });
         // d1 should have no d0 sessions
-        assert!(!d1
-            .sessions
-            .iter()
-            .any(|(_, s)| matches!(&s.origin, Origin::Remote(d) if d == "npub0")));
+        assert!(
+            !d1.sessions
+                .iter()
+                .any(|(_, s)| matches!(&s.origin, Origin::Remote(d) if d == "npub0"))
+        );
 
         // Verify seq filtering: stale message dropped (use seq=2, not seq<=1 which triggers restart reset)
         let final_seq = d1.last_seen_seq.get("npub0").copied().unwrap_or(0);
@@ -3534,9 +3592,11 @@ mod tests {
             responds_to: None,
             done: false,
         });
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::InjectMessage { .. })));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::InjectMessage { .. }))
+        );
 
         // Send to remote → Broadcast(SessionSend)
         let effects = state.apply(Event::Send {
@@ -3561,9 +3621,11 @@ mod tests {
             responds_to: None,
             done: false,
         });
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::SendToHuman { .. })));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendToHuman { .. }))
+        );
 
         // Send to nonexistent → SendFailed
         let effects = state.apply(Event::Send {
@@ -3574,9 +3636,11 @@ mod tests {
             responds_to: None,
             done: false,
         });
-        assert!(effects
-            .iter()
-            .any(|e| matches!(e, Effect::SendFailed { .. })));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::SendFailed { .. }))
+        );
     }
 
     /// Verify accept_seq filtering logic.
