@@ -1014,6 +1014,28 @@ impl AppState {
         }
     }
 
+    /// Atomically set a pending compact continuation only if the slot is empty (RPC).
+    /// Returns true if acquired, false if a continuation is already pending or the
+    /// session has no agent. Used to reject concurrent compact requests that would
+    /// otherwise silently overwrite each other's continuation.
+    pub async fn try_set_pending_compact_continuation(
+        &self,
+        session_id: &str,
+        text: String,
+    ) -> bool {
+        let agents = self.session_agents.read().await;
+        if let Some(agent) = agents.get(session_id) {
+            ractor::call!(
+                agent,
+                crate::session_agent::SessionMsg::TrySetPendingCompactContinuation,
+                text
+            )
+            .unwrap_or(false)
+        } else {
+            false
+        }
+    }
+
     /// Clear pending replies targeting removed sessions from protocol state.
     pub(crate) async fn clear_orphaned_pending_replies(&self, removed_ids: &[String]) {
         let mut proto = self.protocol.write().await;

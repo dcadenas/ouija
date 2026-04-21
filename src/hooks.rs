@@ -879,17 +879,11 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta::default(),
             })
             .await;
-        // Set a pending continuation via the agent
-        state
-            .notify_agent(
-                "drain-test",
-                crate::session_agent::SessionMsg::SetPendingCompactContinuation(
-                    "Continue working.".into(),
-                ),
-            )
+        // Set a pending continuation via the agent's atomic try-set
+        let acquired = state
+            .try_set_pending_compact_continuation("drain-test", "Continue working.".into())
             .await;
-        // Give the agent a moment to process the message
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(acquired, "slot should be empty for a fresh session");
 
         // Drain should return the continuation
         let continuation = state.drain_agent_compact_continuation("drain-test").await;

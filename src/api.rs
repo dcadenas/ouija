@@ -1012,28 +1012,38 @@ async fn compact_inner(
                 );
             };
 
-            // Inject the compact slash command first. If the injection fails
-            // we never park the continuation — otherwise a failed compact
-            // attempt would leave stale state that a later (unrelated) compact
-            // would drain and splice into the wrong turn.
+            // Atomically acquire the compact slot. If another compact already parked a
+            // continuation on this session, reject with 409 so the in-flight operation
+            // isn't silently overwritten. Parking before injection is required so we
+            // can reserve the slot; the rollback below handles the HIGH-1 case where
+            // injection fails after we reserved.
+            let parked = if let Some(ref text) = continuation {
+                let acquired = state
+                    .try_set_pending_compact_continuation(&session_id, text.clone())
+                    .await;
+                if !acquired {
+                    return (
+                        StatusCode::CONFLICT,
+                        json!({"error": "another compact continuation is already pending for this session"}),
+                    );
+                }
+                true
+            } else {
+                false
+            };
+
             if let Err(e) =
                 tmux::locked_inject(state, &session_id, &pane, &compact_cmd, false).await
             {
+                if parked {
+                    // Rollback: drain what we just parked so a later compact doesn't
+                    // splice this stale continuation into an unrelated turn.
+                    let _ = state.drain_agent_compact_continuation(&session_id).await;
+                }
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     json!({"error": e.to_string()}),
                 );
-            }
-
-            if let Some(continuation) = continuation {
-                state
-                    .notify_agent(
-                        &session_id,
-                        crate::session_agent::SessionMsg::SetPendingCompactContinuation(
-                            continuation,
-                        ),
-                    )
-                    .await;
             }
 
             (StatusCode::OK, json!({"status": "ok", "compacted": true}))
@@ -2350,6 +2360,53 @@ mod tests {
         assert!(
             err.to_string().contains("unknown field"),
             "expected unknown-field error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_cc_with_pending_continuation_returns_409() {
+        // Simulates a second compact arriving while the first is still in flight.
+        // The second caller must NOT overwrite the first caller's continuation;
+        // the endpoint returns 409 Conflict instead.
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "cc-busy".into(),
+                pane: Some("%1".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        // Pre-park a continuation to simulate an in-flight compact
+        let acquired = state
+            .try_set_pending_compact_continuation("cc-busy", "first".into())
+            .await;
+        assert!(acquired, "slot should be empty for a fresh session");
+
+        let (status, body) = compact_inner(
+            &state,
+            "cc-busy".into(),
+            CompactBody {
+                continuation: Some("second".into()),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let err = body["error"].as_str().unwrap();
+        assert!(
+            err.contains("pending") || err.contains("in progress"),
+            "expected error to mention pending/in-progress, got: {err}"
+        );
+
+        // Critically: the first continuation must still be parked, not overwritten
+        let pending = state.drain_agent_compact_continuation("cc-busy").await;
+        assert_eq!(
+            pending.as_deref(),
+            Some("first"),
+            "first caller's continuation must not be overwritten by the rejected second attempt"
         );
     }
 }
