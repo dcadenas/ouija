@@ -4,6 +4,42 @@ pub mod opencode;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Pre-trust mise config files in `dir` so spawned shells don't block on an
+/// interactive "Trust them? [Yes/No/All]" prompt.
+///
+/// When a shell with `mise activate` sees an untrusted mise config, it prompts
+/// for trust before loading shims. In HttpApi-backed sessions that prompt
+/// blocks `opencode attach` forever — no `.opencode` descendant ever appears
+/// in the pane tree, and the reaper's `pane_alive` check reaps the session
+/// at the 60s grace boundary. Trusting the config non-interactively at spawn
+/// time eliminates the stall.
+///
+/// Best-effort: no-op when mise isn't installed, when the dir has no mise
+/// config, or when `mise trust` fails for any reason.
+pub fn pre_trust_mise(dir: &str) {
+    if cfg!(test) {
+        return;
+    }
+    const CONFIGS: &[&str] = &[
+        "mise.toml",
+        ".mise.toml",
+        "mise/config.toml",
+        ".tool-versions",
+    ];
+    for name in CONFIGS {
+        let path = format!("{dir}/{name}");
+        if !std::path::Path::new(&path).exists() {
+            continue;
+        }
+        let _ = std::process::Command::new("mise")
+            .args(["trust", &path])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
 /// Registry of available coding assistant backends.
 ///
 /// Holds all known backends and provides lookup by name plus a configurable

@@ -632,6 +632,7 @@ async fn revive_and_inject(
     };
 
     crate::backend::claude_code::pre_trust_workspace(&dir);
+    crate::backend::pre_trust_mise(&dir);
 
     // Create named tmux session/window for the revived session.
     // If a tmux session with the target name exists, add a window to it;

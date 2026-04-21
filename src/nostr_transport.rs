@@ -1508,6 +1508,7 @@ pub async fn start_session(
     );
 
     crate::backend::claude_code::pre_trust_workspace(&dir);
+    crate::backend::pre_trust_mise(&dir);
 
     // For TuiInjection: pass prompt as CLI arg via temp file.  This ensures
     // CLAUDE.md and rules load before the prompt is processed (tmux injection
@@ -1852,6 +1853,7 @@ pub async fn restart_session(
     // On restart, the worktree already exists (project_dir points to it).
 
     crate::backend::claude_code::pre_trust_workspace(&dir);
+    crate::backend::pre_trust_mise(&dir);
 
     let claude_cmd = if fresh {
         backend.build_start_command(&crate::backend::StartOpts {
