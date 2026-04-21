@@ -930,72 +930,208 @@ pub async fn inject(
 // --- Compact ---
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompactBody {
     #[serde(default)]
     pub continuation: Option<String>,
 }
 
-/// Trigger engine-aware compaction and queue a continuation for post-compact injection.
+/// Trigger backend-aware compaction. Callers pass the same `{continuation}` body
+/// for every backend; the endpoint routes by `delivery_mode()`:
+///
+/// - TUI backends (e.g. Claude Code) receive the compact slash command via tmux,
+///   and the continuation is parked on the session agent for the post-compact
+///   hook to drain. `compacted: true` on the response means the compact command
+///   was successfully queued; the backend performs the actual compaction
+///   asynchronously.
+/// - HTTP backends (e.g. OpenCode) skip tmux entirely and deliver the
+///   continuation as a fresh user turn via the backend's HTTP API. Phase 1
+///   does not shrink OC context — only continuation delivery. `compacted:
+///   false` reflects that no context shrink occurred on this path.
+///
+/// Breaking changes vs. the prior version of this endpoint:
+/// - Response envelope changed from `{status:"compact_triggered"}` to
+///   `{status:"ok", compacted: <bool>}`. Callers asserting on the old literal
+///   must update.
+/// - Request body is now strict: `CompactBody` rejects unknown fields (e.g. a
+///   typo like `{"continuatino": "..."}` now returns 400 instead of silently
+///   dropping the value).
+///
+/// Concurrency: when a `continuation` is supplied the TUI branch rejects
+/// concurrent compact attempts with 409 to prevent overwriting an in-flight
+/// caller's continuation. A bare `/compact` (no continuation) on the TUI
+/// branch and all HTTP-branch calls currently have no concurrency guard —
+/// see follow-up.
 pub async fn compact(
     State(state): State<SharedState>,
     axum::extract::Path(session_id): axum::extract::Path<String>,
     Json(body): Json<CompactBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Look up the session
-    let (pane, backend_name) = {
+    let (status, value) = compact_inner(&state, session_id, body).await;
+    (status, Json(value))
+}
+
+async fn compact_inner(
+    state: &std::sync::Arc<crate::state::AppState>,
+    session_id: String,
+    body: CompactBody,
+) -> (StatusCode, serde_json::Value) {
+    // Normalize: trim surrounding whitespace so the same string reaches both
+    // tmux paste and prompt_async, and treat empty/whitespace-only as None so
+    // both branches apply the same "no continuation" rule.
+    let continuation = body.continuation.and_then(|s| {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+
+    // Read everything we need under a single lock acquisition so a racing
+    // session mutation can't split backend_session_id from pane/project_dir
+    // or flip the backend type between the lookup and the dispatch decision.
+    let lookup = {
         let proto = state.protocol.read().await;
         match proto.sessions.get(&session_id) {
-            Some(s) => (s.pane.clone(), s.metadata.backend.clone()),
+            Some(s) => SessionLookup {
+                pane: s.pane.clone(),
+                backend_session_id: s.metadata.backend_session_id.clone(),
+                project_dir: s.metadata.project_dir.clone(),
+                backend_name: s.metadata.backend.clone(),
+            },
             None => {
                 return (
                     StatusCode::NOT_FOUND,
-                    Json(json!({"error": format!("session '{}' not found", session_id)})),
+                    json!({"error": format!("session '{}' not found", session_id)}),
                 );
             }
         }
     };
 
-    let pane = match pane {
-        Some(p) => p,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "session has no pane (remote sessions cannot be compacted)"})),
-            );
-        }
+    // Resolve the backend from the name captured above rather than re-reading
+    // the protocol lock — prevents the branch decision from diverging from the
+    // metadata it was taken on.
+    let backend = match lookup.backend_name.as_deref() {
+        Some(name) => state
+            .backends
+            .get(name)
+            .unwrap_or_else(|| state.backends.default()),
+        None => state.backends.default(),
     };
 
-    // Check backend supports compact
-    let backend = state.backend_for_session(&session_id).await;
-    let compact_cmd = match backend.compact_command() {
-        Some(cmd) => cmd.to_string(),
-        None => {
-            let name = backend_name.as_deref().unwrap_or("unknown");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("backend '{}' does not support compact", name)})),
-            );
-        }
-    };
+    match backend.delivery_mode() {
+        crate::backend::DeliveryMode::TuiInjection => {
+            let Some(pane) = lookup.pane else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    json!({"error": "session has no pane (remote sessions cannot be compacted)"}),
+                );
+            };
+            let Some(compact_cmd) = backend.compact_command().map(str::to_string) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    json!({"error": format!("backend '{}' does not support compact", backend.name())}),
+                );
+            };
 
-    // Store continuation on the session agent (if provided)
-    if let Some(continuation) = body.continuation {
-        state
-            .notify_agent(
-                &session_id,
-                crate::session_agent::SessionMsg::SetPendingCompactContinuation(continuation),
+            // Atomically acquire the compact slot. If another compact already parked a
+            // continuation on this session, reject with 409 so the in-flight operation
+            // isn't silently overwritten. Parking before injection is required so the
+            // slot is reserved by the time /compact reaches the pane; the rollback below
+            // releases the slot when injection fails synchronously so a later compact
+            // doesn't see a stale continuation.
+            let parked = if let Some(ref text) = continuation {
+                let acquired = state
+                    .try_set_pending_compact_continuation(&session_id, text.clone())
+                    .await;
+                if !acquired {
+                    return (
+                        StatusCode::CONFLICT,
+                        json!({"error": "another compact continuation is already pending for this session"}),
+                    );
+                }
+                true
+            } else {
+                false
+            };
+
+            if let Err(e) =
+                tmux::locked_inject(state, &session_id, &pane, &compact_cmd, false).await
+            {
+                if parked {
+                    // Rollback: drain what we just parked so a later compact doesn't
+                    // splice this stale continuation into an unrelated turn. If the
+                    // drain RPC comes back with nothing unexpectedly, log it — the
+                    // slot may stay reserved and block future compacts until the
+                    // agent is restarted.
+                    if state
+                        .drain_agent_compact_continuation(&session_id)
+                        .await
+                        .is_none()
+                    {
+                        tracing::warn!(
+                            session = %session_id,
+                            "rollback drain returned None after successful try-set; slot may be orphaned",
+                        );
+                    }
+                }
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": e.to_string()}),
+                );
+            }
+
+            (StatusCode::OK, json!({"status": "ok", "compacted": true}))
+        }
+        crate::backend::DeliveryMode::HttpApi { .. } => {
+            let Some(backend_session_id) = lookup.backend_session_id else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    json!({
+                        "error": format!(
+                            "session has no backend_session_id (backend '{}' not attached)",
+                            backend.name()
+                        )
+                    }),
+                );
+            };
+
+            // Phase 1 only supports continuation delivery on HTTP backends;
+            // a no-op request would silently succeed without the caller
+            // knowing nothing happened.
+            let Some(continuation) = continuation else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    json!({
+                        "error": "continuation is required for HTTP backends (phase 1 has no context-shrink path)"
+                    }),
+                );
+            };
+
+            match tmux::deliver_via_http(
+                state,
+                &backend_session_id,
+                lookup.project_dir.as_deref(),
+                &continuation,
             )
-            .await;
+            .await
+            {
+                Ok(()) => (StatusCode::OK, json!({"status": "ok", "compacted": false})),
+                Err(e) => (
+                    StatusCode::BAD_GATEWAY,
+                    json!({"error": format!("opencode delivery failed: {e}")}),
+                ),
+            }
+        }
     }
+}
 
-    // Inject the compact command (raw, no XML wrapping)
-    match tmux::locked_inject(&state, &session_id, &pane, &compact_cmd, false).await {
-        Ok(()) => (StatusCode::OK, Json(json!({"status": "compact_triggered"}))),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
-        ),
-    }
+struct SessionLookup {
+    pane: Option<String>,
+    backend_session_id: Option<String>,
+    project_dir: Option<String>,
+    backend_name: Option<String>,
 }
 
 // --- Nodes ---
@@ -2081,5 +2217,277 @@ mod tests {
     fn extract_missing_files_returns_none() {
         let dir = tempfile::tempdir().unwrap();
         assert!(extract_project_description(dir.path().to_str().unwrap()).is_none());
+    }
+
+    // --- compact endpoint ---
+
+    #[tokio::test]
+    async fn compact_session_not_found_returns_404() {
+        let state = crate::state::AppState::new_for_test();
+        let (status, body) = compact_inner(
+            &state,
+            "ghost".into(),
+            CompactBody {
+                continuation: Some("go".into()),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body["error"].as_str().unwrap().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn compact_cc_without_pane_returns_400() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "cc-no-pane".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = compact_inner(
+            &state,
+            "cc-no-pane".into(),
+            CompactBody {
+                continuation: Some("go".into()),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("pane"));
+    }
+
+    #[tokio::test]
+    async fn compact_oc_without_backend_session_id_returns_400() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-no-sid".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: None,
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = compact_inner(
+            &state,
+            "oc-no-sid".into(),
+            CompactBody {
+                continuation: Some("go".into()),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("backend_session_id"),
+            "expected error to mention backend_session_id, got: {}",
+            body["error"]
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_oc_delivery_failure_returns_502() {
+        // In the test env, opencode_serve_port() == 320 (privileged, unbound)
+        // so the POST connection is refused. The endpoint must surface this
+        // as an upstream failure rather than masquerading it as success.
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-fail".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_probe".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = compact_inner(
+            &state,
+            "oc-fail".into(),
+            CompactBody {
+                continuation: Some("keep going".into()),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            body["error"].as_str().is_some(),
+            "expected error body on delivery failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_oc_without_continuation_returns_400() {
+        // HTTP backends only do continuation delivery in phase 1. A request
+        // without a continuation is meaningless and must not be silently OK.
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-no-cont".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_probe".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = compact_inner(
+            &state,
+            "oc-no-cont".into(),
+            CompactBody { continuation: None },
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"].as_str().unwrap().contains("continuation"),
+            "expected error to mention continuation, got: {}",
+            body["error"]
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_oc_empty_continuation_returns_400() {
+        // An empty / whitespace-only continuation is normalized to None and
+        // rejected on the HTTP branch for the same reason as None.
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-empty-cont".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_probe".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = compact_inner(
+            &state,
+            "oc-empty-cont".into(),
+            CompactBody {
+                continuation: Some("   ".into()),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("continuation"));
+    }
+
+    #[test]
+    fn compact_body_rejects_unknown_fields() {
+        // Guard against silently-swallowed typos like {"continuatino": "..."}.
+        let bad = serde_json::json!({"continuatino": "oops"});
+        let err = serde_json::from_value::<CompactBody>(bad).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "expected unknown-field error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_cc_inject_failure_drains_parked_continuation() {
+        // When locked_inject fails AFTER the compact slot has been reserved, the
+        // rollback must drain what we parked so the next /compact on this session
+        // doesn't 409 forever and the post-compact hook doesn't splice a stale
+        // continuation into an unrelated turn. The inject path shells out to tmux,
+        // so in the test env it fails after the inject-queue's 3 retries — takes
+        // ~1.5s of real time but exercises the exact failure mode.
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "cc-inject-fail".into(),
+                pane: Some("%999999999".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, _body) = compact_inner(
+            &state,
+            "cc-inject-fail".into(),
+            CompactBody {
+                continuation: Some("rollback me".into()),
+            },
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "expected inject failure to surface as 500"
+        );
+
+        // Critical: the slot must be free so a follow-up compact can proceed.
+        let pending = state
+            .drain_agent_compact_continuation("cc-inject-fail")
+            .await;
+        assert_eq!(
+            pending, None,
+            "rollback must drain the parked continuation on inject failure — slot was not released"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_cc_with_pending_continuation_returns_409() {
+        // Simulates a second compact arriving while the first is still in flight.
+        // The second caller must NOT overwrite the first caller's continuation;
+        // the endpoint returns 409 Conflict instead.
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "cc-busy".into(),
+                pane: Some("%1".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        // Pre-park a continuation to simulate an in-flight compact
+        let acquired = state
+            .try_set_pending_compact_continuation("cc-busy", "first".into())
+            .await;
+        assert!(acquired, "slot should be empty for a fresh session");
+
+        let (status, body) = compact_inner(
+            &state,
+            "cc-busy".into(),
+            CompactBody {
+                continuation: Some("second".into()),
+            },
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let err = body["error"].as_str().unwrap();
+        assert!(
+            err.contains("pending") || err.contains("in progress"),
+            "expected error to mention pending/in-progress, got: {err}"
+        );
+
+        // Critically: the first continuation must still be parked, not overwritten
+        let pending = state.drain_agent_compact_continuation("cc-busy").await;
+        assert_eq!(
+            pending.as_deref(),
+            Some("first"),
+            "first caller's continuation must not be overwritten by the rejected second attempt"
+        );
     }
 }

@@ -49,8 +49,11 @@ pub enum SessionMsg {
     LoopHardStall,
     /// MCP tool called: session acknowledged the reminder.
     ClearReminder { clearing_id: u64 },
-    /// Store a pending continuation to inject after compact completes.
-    SetPendingCompactContinuation(String),
+    /// Atomically set a pending continuation to inject after compact completes (RPC).
+    /// Replies `true` if the slot was acquired, `false` if a continuation is already pending.
+    /// Used by the compact endpoint to reject concurrent compact attempts on the same session
+    /// so a second caller cannot overwrite the first caller's continuation.
+    TrySetPendingCompactContinuation(String, ractor::RpcReplyPort<bool>),
     /// Drain (take + clear) the pending compact continuation (RPC).
     DrainPendingCompactContinuation(ractor::RpcReplyPort<Option<String>>),
     /// Internal: watchdog timer expired (no Active or Stopped within 2x idle_timeout).
@@ -319,8 +322,21 @@ impl Actor for SessionAgent {
                     );
                 }
             }
-            SessionMsg::SetPendingCompactContinuation(text) => {
-                state.pending_compact_continuation = Some(text);
+            SessionMsg::TrySetPendingCompactContinuation(text, reply) => {
+                // If the caller's RPC was cancelled (timeout, task drop, axum
+                // disconnect) before we got here, bail out before mutating —
+                // otherwise we would reserve the slot without anyone owning it,
+                // and every subsequent compact would 409 until the agent is
+                // restarted and the next post-compact hook would drain the
+                // orphan into an unrelated turn.
+                if reply.is_closed() {
+                    return Ok(());
+                }
+                let acquired = state.pending_compact_continuation.is_none();
+                if acquired {
+                    state.pending_compact_continuation = Some(text);
+                }
+                let _ = reply.send(acquired);
             }
             SessionMsg::DrainPendingCompactContinuation(reply) => {
                 if !reply.is_closed() {

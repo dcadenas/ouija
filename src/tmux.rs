@@ -477,24 +477,39 @@ pub async fn locked_inject(
 
     match backend.delivery_mode() {
         crate::backend::DeliveryMode::HttpApi { .. } => {
-            // Read backend_session_id here so deliver_via_http doesn't
-            // re-acquire the protocol lock (backend_for_session already
-            // dropped its lock).
-            let oc_session_id = {
+            // Read both fields under one lock acquisition so a concurrent
+            // session mutation can't split them.
+            let (oc_session_id, project_dir) = {
                 let proto = state.protocol.read().await;
-                proto
-                    .sessions
-                    .get(session_id)
-                    .and_then(|s| s.metadata.backend_session_id.clone())
+                match proto.sessions.get(session_id) {
+                    Some(s) => (
+                        s.metadata.backend_session_id.clone(),
+                        s.metadata.project_dir.clone(),
+                    ),
+                    None => (None, None),
+                }
             };
-            let project_dir = {
-                let proto = state.protocol.read().await;
-                proto
-                    .sessions
-                    .get(session_id)
-                    .and_then(|s| s.metadata.project_dir.clone())
-            };
-            deliver_via_http(state, oc_session_id, project_dir.as_deref(), message).await
+            // locked_inject is the fire-and-forget path used by reminders,
+            // session-agent nudges, and similar best-effort senders; log and
+            // swallow upstream failures so those callers keep their existing
+            // semantics. Callers that need to observe delivery outcomes must
+            // call deliver_via_http directly.
+            match oc_session_id {
+                Some(sid) => {
+                    if let Err(e) =
+                        deliver_via_http(state, &sid, project_dir.as_deref(), message).await
+                    {
+                        tracing::warn!(session = %session_id, "http delivery failed: {e}");
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        session = %session_id,
+                        "http delivery skipped: no backend_session_id on session"
+                    );
+                }
+            }
+            Ok(())
         }
         crate::backend::DeliveryMode::TuiInjection => {
             let config = backend.inject_config();
@@ -522,16 +537,17 @@ pub async fn locked_inject(
 /// Uses the `prompt_async` endpoint which returns immediately without waiting
 /// for the LLM to finish processing. The message appears as a user message
 /// in the session and triggers an assistant turn.
-async fn deliver_via_http(
+///
+/// Returns `Err` on connection failure or any non-2xx response so callers can
+/// distinguish delivered from swallowed. Best-effort callers (e.g. the HttpApi
+/// branch of `locked_inject`) wrap this in a tracing::warn.
+pub(crate) async fn deliver_via_http(
     state: &crate::state::AppState,
-    oc_session_id: Option<String>,
+    oc_session_id: &str,
     project_dir: Option<&str>,
     message: &str,
 ) -> anyhow::Result<()> {
     let port = state.opencode_serve_port();
-
-    let oc_session_id =
-        oc_session_id.ok_or_else(|| anyhow::anyhow!("no backend_session_id for session"))?;
 
     let client = state.http_client.clone();
     let body = serde_json::json!({
@@ -546,23 +562,19 @@ async fn deliver_via_http(
     if let Some(dir) = project_dir {
         req = req.header("x-opencode-directory", dir);
     }
-    let resp = req.send().await;
+    let resp = req
+        .send()
+        .await
+        .context("prompt_async request failed")?;
 
-    match resp {
-        Ok(r) if r.status().is_success() => {
-            tracing::info!(port, "delivered message via prompt_async");
-        }
-        Ok(r) => {
-            let status = r.status();
-            let text = r.text().await.unwrap_or_default();
-            tracing::warn!("prompt_async returned {status}: {text}");
-        }
-        Err(e) => {
-            tracing::warn!("prompt_async request failed: {e}");
-        }
+    let status = resp.status();
+    if status.is_success() {
+        tracing::info!(port, "delivered message via prompt_async");
+        Ok(())
+    } else {
+        let text = resp.text().await.unwrap_or_default();
+        bail!("prompt_async returned {status}: {text}");
     }
-
-    Ok(())
 }
 
 /// Rename the tmux window containing a pane and disable automatic-rename.
