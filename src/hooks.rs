@@ -17,16 +17,6 @@ pub struct PaneBody {
     pub backend_session_id: Option<String>,
 }
 
-impl PaneBody {
-    /// Stable key for per-caller state (e.g. session diff baselines).
-    fn baseline_key(&self) -> &str {
-        self.pane
-            .as_deref()
-            .or(self.backend_session_id.as_deref())
-            .unwrap_or("")
-    }
-}
-
 /// POST /api/hooks/session-end
 pub async fn session_end(
     State(state): State<SharedState>,
@@ -121,163 +111,21 @@ async fn prompt_submit_inner(
     state: &std::sync::Arc<crate::state::AppState>,
     body: PaneBody,
 ) -> Value {
-    // Single lock acquisition: build snapshots, find our session, get ID for Active notify
-    let baseline_key = body.baseline_key().to_string();
-    let (current_snapshots, my_session, my_id) = {
-        let proto = state.protocol.read().await;
-        let snaps: Vec<crate::state::SessionSnapshot> = proto
-            .sessions
-            .values()
-            .map(|s| crate::state::SessionSnapshot {
-                id: s.id.clone(),
-                origin: match &s.origin {
-                    crate::daemon_protocol::Origin::Local => "local".into(),
-                    crate::daemon_protocol::Origin::Remote(_) => "remote".into(),
-                    crate::daemon_protocol::Origin::Human(_) => "human".into(),
-                },
-                role: s.metadata.role.clone(),
-                bulletin: s.metadata.bulletin.clone(),
-            })
-            .collect();
-        let me = proto
-            .sessions
-            .values()
-            .find(|s| {
-                body.pane
-                    .as_deref()
-                    .is_some_and(|p| s.pane.as_deref() == Some(p))
-                    || body
-                        .backend_session_id
-                        .as_deref()
-                        .is_some_and(|b| s.metadata.backend_session_id.as_deref() == Some(b))
-            })
-            .cloned();
-        let id = me.as_ref().map(|s| s.id.clone());
-        (snaps, me, id)
-    };
-
-    // Notify agent active (outside lock)
-    if let Some(ref id) = my_id {
+    // The prompt-submit hook no longer injects mesh state into the LLM
+    // context window. We still notify the session agent that the session
+    // is active (to reset idle / watchdog timers).
+    if let Some(id) = state
+        .find_session_by_pane_or_backend_sid(
+            body.pane.as_deref(),
+            body.backend_session_id.as_deref(),
+        )
+        .await
+    {
         state
-            .notify_agent(id, crate::session_agent::SessionMsg::Active)
+            .notify_agent(&id, crate::session_agent::SessionMsg::Active)
             .await;
     }
-
-    // Compute diff against per-caller baseline
-    let previous = {
-        let mut baselines = state.session_diff_baselines.lock().unwrap();
-        let prev = baselines
-            .get(baseline_key.as_str())
-            .cloned()
-            .unwrap_or_default();
-        baselines.insert(baseline_key, current_snapshots.clone());
-        prev
-    };
-
-    let prev_ids: std::collections::HashSet<&str> =
-        previous.iter().map(|s| s.id.as_str()).collect();
-    let curr_ids: std::collections::HashSet<&str> =
-        current_snapshots.iter().map(|s| s.id.as_str()).collect();
-
-    let joined: Vec<&crate::state::SessionSnapshot> = current_snapshots
-        .iter()
-        .filter(|s| !prev_ids.contains(s.id.as_str()))
-        .collect();
-    let left: Vec<&str> = previous
-        .iter()
-        .filter(|s| !curr_ids.contains(s.id.as_str()))
-        .map(|s| s.id.as_str())
-        .collect();
-    let updated: Vec<&crate::state::SessionSnapshot> = current_snapshots
-        .iter()
-        .filter(|s| {
-            prev_ids.contains(s.id.as_str()) && previous.iter().find(|p| p.id == s.id) != Some(s)
-        })
-        .collect();
-
-    // Stale check — is_stale() is on SessionMeta in daemon_protocol.rs
-    let stale = my_session.as_ref().and_then(|s| {
-        if s.metadata.is_stale() {
-            Some(json!({
-                "id": s.id,
-                "role": s.metadata.role,
-                "bulletin": s.metadata.bulletin,
-            }))
-        } else {
-            None
-        }
-    });
-
-    // Format output
-    let mut output_parts: Vec<String> = Vec::new();
-
-    if let Some(ref stale_info) = stale {
-        let id = stale_info["id"].as_str().unwrap_or("");
-        let role = stale_info["role"].as_str().unwrap_or("none");
-        let bulletin = stale_info["bulletin"].as_str().unwrap_or("");
-        if !bulletin.is_empty() {
-            output_parts.push(format!(
-                "<ouija-status type=\"stale\">Your metadata is stale. Current: role=\"{role}\" | bulletin=\"{bulletin}\". Update via POST /api/sessions/update with {{\"id\":\"{id}\", \"role\":\"...\", \"bulletin\":\"...\"}} if these are outdated.</ouija-status>"
-            ));
-        } else {
-            output_parts.push(format!(
-                "<ouija-status type=\"stale\">Your metadata is stale (role: \"{role}\", no bulletin). Update via POST /api/sessions/update with {{\"id\":\"{id}\", \"role\":\"...\", \"bulletin\":\"...\"}} to stay discoverable.</ouija-status>"
-            ));
-        }
-    }
-
-    if !joined.is_empty() {
-        let mut lines = vec!["<ouija-status type=\"mesh-update\">joined:".to_string()];
-        for s in &joined {
-            let mut line = format!("  - {} ({})", s.id, s.origin);
-            if let Some(ref r) = s.role {
-                line.push_str(&format!(" — {r}"));
-            }
-            lines.push(line);
-        }
-        lines.push("</ouija-status>".into());
-        output_parts.push(lines.join("\n"));
-    }
-
-    if !left.is_empty() {
-        output_parts.push(format!(
-            "<ouija-status type=\"mesh-update\">left: {}</ouija-status>",
-            left.join(",")
-        ));
-    }
-
-    if !updated.is_empty() {
-        let mut lines = vec!["<ouija-status type=\"mesh-update\">updated:".to_string()];
-        for s in &updated {
-            let prev_s = previous.iter().find(|p| p.id == s.id);
-            let mut details = Vec::new();
-            if s.role != prev_s.and_then(|p| p.role.as_ref()).cloned() {
-                details.push(format!(
-                    "role: {}",
-                    s.role.as_deref().unwrap_or("<cleared>")
-                ));
-            }
-            if s.bulletin != prev_s.and_then(|p| p.bulletin.as_ref()).cloned() {
-                details.push(format!(
-                    "bulletin: {}",
-                    s.bulletin.as_deref().unwrap_or("<cleared>")
-                ));
-            }
-            lines.push(format!("  - {}: {}", s.id, details.join(", ")));
-        }
-        lines.push("</ouija-status>".into());
-        output_parts.push(lines.join("\n"));
-    }
-
-    json!({
-        "output": output_parts.join("\n"),
-        "diff": {
-            "joined": joined,
-            "left": left,
-            "updated": updated,
-        },
-        "stale": stale,
-    })
+    json!({ "output": "" })
 }
 
 #[derive(Debug, Deserialize)]
@@ -588,57 +436,6 @@ mod tests {
         };
         let result = prompt_submit_inner(&state, body).await;
         assert_eq!(result["output"], "");
-    }
-
-    #[tokio::test]
-    async fn prompt_submit_detects_joined_sessions() {
-        let state = crate::state::AppState::new_for_test();
-        // Register observer pane
-        state
-            .apply_and_execute(crate::daemon_protocol::Event::Register {
-                id: "observer".into(),
-                pane: Some("%10".into()),
-                metadata: crate::daemon_protocol::SessionMeta::default(),
-            })
-            .await;
-        // First call: sets baseline
-        let _ = prompt_submit_inner(
-            &state,
-            PaneBody {
-                pane: Some("%10".into()),
-                backend_session_id: None,
-            },
-        )
-        .await;
-        // Add newcomer
-        state
-            .apply_and_execute(crate::daemon_protocol::Event::Register {
-                id: "newcomer".into(),
-                pane: Some("%11".into()),
-                metadata: crate::daemon_protocol::SessionMeta {
-                    role: Some("working on newcomer".into()),
-                    ..Default::default()
-                },
-            })
-            .await;
-        // Second call: should detect newcomer
-        let result = prompt_submit_inner(
-            &state,
-            PaneBody {
-                pane: Some("%10".into()),
-                backend_session_id: None,
-            },
-        )
-        .await;
-        let output = result["output"].as_str().unwrap();
-        assert!(
-            output.contains("newcomer"),
-            "output should mention newcomer: {output}"
-        );
-        assert!(
-            output.contains("joined"),
-            "output should contain 'joined': {output}"
-        );
     }
 
     #[tokio::test]
