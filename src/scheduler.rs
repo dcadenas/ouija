@@ -426,15 +426,8 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
                 .as_deref()
                 .or(session.metadata.project_dir.as_deref())
                 .unwrap_or("/tmp");
-            return respawn_and_inject(
-                state,
-                task,
-                pane,
-                dir,
-                snapshot_model,
-                snapshot_effort,
-            )
-            .await;
+            return respawn_and_inject(state, task, pane, dir, snapshot_model, snapshot_effort)
+                .await;
         }
         // Verify session still exists — a concurrent kill may have removed it
         // while we were checking pane liveness. If gone, fall through to revival.

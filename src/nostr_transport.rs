@@ -2296,15 +2296,47 @@ async fn soft_restart_session(
             None => {
                 // Session was removed between the pre-flight snapshot and
                 // this write (concurrent Unregister, racing restart, etc.).
-                // The opencode serve session we just created is now orphaned
-                // — bail so the caller can fall through to the hard-restart
+                // Bail so the caller can fall through to the hard-restart
                 // path. Without this we would silently POST prompt_async
                 // against a dangling backend_session_id that no SessionMeta
                 // references.
                 drop(proto);
                 tracing::warn!(
-                    "soft restart: session '{name}' disappeared between pre-flight and atomic write; orphaning opencode session {new_session_id}"
+                    "soft restart: session '{name}' disappeared between pre-flight and atomic write; deleting orphaned opencode session {new_session_id}"
                 );
+                // Fire-and-forget DELETE to clean up the orphaned opencode
+                // serve session. If the DELETE fails, the serve will still
+                // reclaim the session on its own restart; the Err return
+                // below is the important signal to the caller.
+                let port = state.opencode_serve_port();
+                let client = state.http_client.clone();
+                let orphan_id = new_session_id.clone();
+                tokio::spawn(async move {
+                    let url = format!("http://127.0.0.1:{port}/session/{orphan_id}");
+                    match client
+                        .delete(&url)
+                        .timeout(std::time::Duration::from_secs(5))
+                        .send()
+                        .await
+                    {
+                        Ok(r) if r.status().is_success() => {
+                            tracing::debug!(
+                                "soft restart cleanup: deleted orphan opencode session {orphan_id}"
+                            );
+                        }
+                        Ok(r) => {
+                            tracing::warn!(
+                                "soft restart cleanup: DELETE /session/{orphan_id} returned {}",
+                                r.status()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "soft restart cleanup: DELETE /session/{orphan_id} failed: {e}"
+                            );
+                        }
+                    }
+                });
                 return Err(());
             }
         }
