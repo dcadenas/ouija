@@ -97,6 +97,7 @@ pub async fn get_session(
                     "networked": s.metadata.networked,
                     "worktree": s.metadata.worktree,
                     "model": s.metadata.model,
+                    "effort": s.metadata.effort,
                     "last_metadata_update": s.metadata.last_metadata_update,
                     "stale": stale,
                     "backend_session_id": s.metadata.backend_session_id,
@@ -138,6 +139,7 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
                 "networked": s.metadata.networked,
                 "worktree": s.metadata.worktree,
                 "model": s.metadata.model,
+                "effort": s.metadata.effort,
                 "last_metadata_update": s.metadata.last_metadata_update,
                 "stale": stale,
                 "backend_session_id": s.metadata.backend_session_id,
@@ -1689,9 +1691,20 @@ pub struct SessionNameBody {
     /// Which coding assistant backend to use (e.g. "claude-code", "codex").
     #[serde(default)]
     backend: Option<String>,
-    /// Which LLM model to use (informational metadata only).
+    /// Which LLM model to use.
+    ///
+    /// Passed through to the backend: for claude-code this becomes
+    /// `claude --model <X>`; for opencode it is split on the first `/` into
+    /// `providerID/modelID` and sent on each `prompt_async` body.
     #[serde(default)]
     model: Option<String>,
+    /// Reasoning effort / variant for the model.
+    ///
+    /// For claude-code: passed as `claude --effort <X>`.
+    /// For opencode: sent as `variant` on each `prompt_async` body.
+    #[serde(default)]
+    #[allow(dead_code)] // wired into transport fns in a follow-up chunk
+    effort: Option<String>,
     #[serde(default)]
     reminder: Option<String>,
     /// Git branch name for worktree sessions. If omitted, defaults to the session name.
