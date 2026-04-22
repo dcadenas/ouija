@@ -2770,18 +2770,30 @@ pub(crate) fn opencode_prompt_body(
     if let Some(m) = model {
         let trimmed = m.trim();
         match trimmed.split_once('/') {
-            Some((provider, model_id))
-                if !provider.trim().is_empty() && !model_id.trim().is_empty() =>
-            {
-                obj.insert(
-                    "model".into(),
-                    serde_json::json!({
-                        "providerID": provider,
-                        "modelID": model_id,
-                    }),
-                );
+            Some((provider, model_id)) => {
+                // Trim each segment independently: `"openrouter / gpt-5"`
+                // would otherwise send `providerID: " openrouter "` which
+                // opencode's provider lookup does not match. The non-empty
+                // guard is then applied to the already-trimmed segments so
+                // inputs like `" / "` or `"openrouter / "` are rejected.
+                let provider = provider.trim();
+                let model_id = model_id.trim();
+                if !provider.is_empty() && !model_id.is_empty() {
+                    obj.insert(
+                        "model".into(),
+                        serde_json::json!({
+                            "providerID": provider,
+                            "modelID": model_id,
+                        }),
+                    );
+                } else {
+                    tracing::warn!(
+                        model = m,
+                        "opencode_prompt_body: model string has empty segment after trim; falling back to agent/session default"
+                    );
+                }
             }
-            _ => {
+            None => {
                 tracing::warn!(
                     model = m,
                     "opencode_prompt_body: model string is not in 'providerID/modelID' form; falling back to agent/session default"
@@ -3114,6 +3126,39 @@ mod tests {
         assert!(
             body.get("variant").is_none(),
             "empty effort must be omitted, got: {body}"
+        );
+    }
+
+    #[test]
+    fn opencode_prompt_body_trims_padded_segments() {
+        // `"openrouter / gpt-5"` splits into `"openrouter "` and `" gpt-5"`.
+        // Before the fix, both trimmed-non-empty-guarded segments were
+        // inserted UN-trimmed, yielding providerID=" openrouter " — which
+        // opencode's provider lookup would not match.
+        let body = opencode_prompt_body("hi", Some("openrouter / gpt-5"), None);
+        assert_eq!(
+            body["model"],
+            serde_json::json!({
+                "providerID": "openrouter",
+                "modelID": "gpt-5",
+            }),
+            "segments must be trimmed before insertion, got: {body}"
+        );
+    }
+
+    #[test]
+    fn opencode_prompt_body_rejects_whitespace_only_segment() {
+        // `"openrouter / "` trims the model_id segment to empty and must be
+        // omitted, not inserted as providerID="openrouter", modelID="".
+        let body = opencode_prompt_body("hi", Some("openrouter / "), None);
+        assert!(
+            body.get("model").is_none(),
+            "whitespace-only modelID must be rejected, got: {body}"
+        );
+        let body = opencode_prompt_body("hi", Some(" / gpt-5"), None);
+        assert!(
+            body.get("model").is_none(),
+            "whitespace-only providerID must be rejected, got: {body}"
         );
     }
 
