@@ -267,22 +267,16 @@ async fn session_start_inner(
         return json!({ "error": "could not derive session name", "output": "" });
     }
 
-    // Resolve name conflicts
+    // Resolve name conflicts via the shared helper (same suffix-bumping and
+    // same-pane-idempotency rules as scan_and_autoregister_panes).
     let id = {
         let proto = state.protocol.read().await;
-        let mut id = base_id.clone();
-        let mut suffix = 2u32;
-        while proto.sessions.contains_key(&id) {
-            if proto.sessions.get(&id).and_then(|s| s.pane.as_deref()) == Some(&body.pane) {
-                break;
-            }
-            id = format!("{base_id}-{suffix}");
-            suffix += 1;
-            if suffix > 100 {
-                break;
-            }
-        }
-        id
+        let id_to_pane: std::collections::HashMap<String, Option<String>> = proto
+            .sessions
+            .iter()
+            .map(|(id, s)| (id.clone(), s.pane.clone()))
+            .collect();
+        crate::state::resolve_unique_session_id(&id_to_pane, &base_id, Some(&body.pane))
     };
 
     // Detect backend from the process running in the pane
