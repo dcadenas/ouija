@@ -2681,6 +2681,49 @@ fn save_peer_pubkeys(data_dir: &Path, pubkeys: &HashSet<PublicKey>) {
     }
 }
 
+/// Build an opencode `prompt_async` request body from the session's text,
+/// model, and effort.
+///
+/// The returned JSON has `parts: [{type: "text", text}]` always present, plus
+/// optional top-level `model` and `variant` fields that opencode merges into
+/// its per-prompt overrides (see opencode's `prompt.ts` precedence:
+/// `input.model ?? ag.model ?? lastModel(sessionID)`).
+///
+/// `model` is split on the **first** `/` into `providerID` / `modelID`,
+/// mirroring opencode's parser at `packages/opencode/src/provider/provider.ts`.
+/// `"openrouter/openai/gpt-5.4"` -> `providerID="openrouter"`, `modelID="openai/gpt-5.4"`.
+/// A model string with no `/` is treated as ambiguous and the `model` field is
+/// omitted entirely — opencode will fall back to the agent / session default.
+/// `effort` is passed through unchanged as `variant`.
+#[allow(dead_code)] // wired into start_session/soft_restart_session in a follow-up chunk
+pub(crate) fn opencode_prompt_body(
+    text: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "parts": [{"type": "text", "text": text}],
+    });
+    let obj = body
+        .as_object_mut()
+        .expect("json! macro returns an object");
+    if let Some(m) = model
+        && let Some((provider, model_id)) = m.split_once('/')
+    {
+        obj.insert(
+            "model".into(),
+            serde_json::json!({
+                "providerID": provider,
+                "modelID": model_id,
+            }),
+        );
+    }
+    if let Some(e) = effort {
+        obj.insert("variant".into(), serde_json::Value::String(e.to_string()));
+    }
+    body
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2892,5 +2935,85 @@ mod tests {
         // nprofile part still parses correctly
         let parsed = Nip19Profile::from_bech32(nprofile_part).unwrap();
         assert_eq!(parsed.public_key, keys.public_key());
+    }
+
+    // --- opencode_prompt_body ---
+
+    #[test]
+    fn opencode_prompt_body_text_only() {
+        let body = opencode_prompt_body("hello", None, None);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "parts": [{"type": "text", "text": "hello"}]
+            })
+        );
+    }
+
+    #[test]
+    fn opencode_prompt_body_with_model_two_segments() {
+        let body = opencode_prompt_body("hi", Some("openrouter/gpt-5"), None);
+        assert_eq!(
+            body["model"],
+            serde_json::json!({
+                "providerID": "openrouter",
+                "modelID": "gpt-5",
+            })
+        );
+        assert!(body.get("variant").is_none());
+    }
+
+    #[test]
+    fn opencode_prompt_body_with_model_three_segments_splits_on_first_slash() {
+        // opencode's parser splits on the FIRST `/` only.
+        // `openrouter/openai/gpt-5.4` -> provider=openrouter, model=openai/gpt-5.4
+        let body = opencode_prompt_body("hi", Some("openrouter/openai/gpt-5.4"), None);
+        assert_eq!(
+            body["model"],
+            serde_json::json!({
+                "providerID": "openrouter",
+                "modelID": "openai/gpt-5.4",
+            })
+        );
+    }
+
+    #[test]
+    fn opencode_prompt_body_with_effort_only() {
+        let body = opencode_prompt_body("hi", None, Some("xhigh"));
+        assert!(body.get("model").is_none());
+        assert_eq!(body["variant"], serde_json::Value::String("xhigh".into()));
+    }
+
+    #[test]
+    fn opencode_prompt_body_with_model_and_effort() {
+        let body = opencode_prompt_body(
+            "do the thing",
+            Some("openrouter/google/gemini-3.1-pro-preview"),
+            Some("xhigh"),
+        );
+        assert_eq!(
+            body["model"],
+            serde_json::json!({
+                "providerID": "openrouter",
+                "modelID": "google/gemini-3.1-pro-preview",
+            })
+        );
+        assert_eq!(body["variant"], serde_json::Value::String("xhigh".into()));
+        assert_eq!(
+            body["parts"],
+            serde_json::json!([{"type": "text", "text": "do the thing"}])
+        );
+    }
+
+    #[test]
+    fn opencode_prompt_body_with_model_no_slash_omits_model() {
+        // No `/` is ambiguous (no providerID). Omit the model field and let
+        // opencode fall back to the agent / session default.
+        let body = opencode_prompt_body("hi", Some("sonnet"), Some("max"));
+        assert!(
+            body.get("model").is_none(),
+            "no-slash model must be omitted, got: {body}"
+        );
+        assert_eq!(body["variant"], serde_json::Value::String("max".into()));
     }
 }
