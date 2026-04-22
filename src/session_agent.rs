@@ -157,6 +157,8 @@ impl Actor for SessionAgent {
                 // pending replies or a configured reminder. Without either,
                 // the idle-check would just create a nudge loop (the session
                 // responds to clear it, which triggers Active→Stopped→repeat).
+                // "Configured reminder" means a non-empty reminder body —
+                // see SessionMeta::has_active_reminder.
                 let (has_pending, has_reminder) = {
                     let proto = self.app_state.protocol.read().await;
                     let pending = proto
@@ -167,8 +169,7 @@ impl Actor for SessionAgent {
                     let reminder = proto
                         .sessions
                         .get(&state.session_id)
-                        .and_then(|s| s.metadata.reminder.as_ref())
-                        .is_some();
+                        .is_some_and(|s| s.metadata.has_active_reminder());
                     (pending, reminder)
                 };
 
@@ -339,11 +340,18 @@ impl Actor for SessionAgent {
                     state.next_clearing_id += 1;
                     let clearing_id = state.next_clearing_id;
 
-                    // Read session metadata in one lock
+                    // Read session metadata in one lock. Gate the reminder
+                    // read through has_active_reminder so empty-string /
+                    // whitespace-only reminder bodies are treated as absent
+                    // here too — a defensive echo of the Stopped-handler gate
+                    // above, so this site is safe even if the Stopped check
+                    // is ever bypassed (watchdog, future caller).
                     let (reminder, vim_mode, pending) = {
                         let proto = self.app_state.protocol.read().await;
                         let session = proto.sessions.get(&state.session_id);
-                        let reminder = session.and_then(|s| s.metadata.reminder.clone());
+                        let reminder = session
+                            .filter(|s| s.metadata.has_active_reminder())
+                            .and_then(|s| s.metadata.reminder.clone());
                         let vim_mode = session.map(|s| s.metadata.vim_mode).unwrap_or(false);
                         let pending = proto
                             .pending_replies
