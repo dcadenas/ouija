@@ -865,6 +865,22 @@ assert_not_contains "L18: no XML msg tag" "$L18_CONTENT" "<msg "
 tmux kill-pane -t "$L18_PANE" 2>/dev/null || true
 api "$BASE" POST /api/remove -d '{"id":"plain-prompt"}' >/dev/null 2>&1 || true
 
+log "Test L18b: ouija.start persists --model and --effort on session metadata"
+L18B=$(api "$BASE" POST /api/sessions/start -d '{"name":"model-effort","model":"sonnet","effort":"max"}')
+assert_contains "L18b: start succeeds" "$L18B" "starting"
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'model-effort'"
+L18B_MODEL=$(session_field "$BASE" "model-effort" "model")
+L18B_EFFORT=$(session_field "$BASE" "model-effort" "effort")
+assert_eq "L18b: model persisted on session" "$L18B_MODEL" "sonnet"
+assert_eq "L18b: effort persisted on session" "$L18B_EFFORT" "max"
+# Also verify GET /api/sessions/{name} exposes both fields
+L18B_DETAIL=$(api "$BASE" GET /api/sessions/model-effort)
+assert_contains "L18b: detail endpoint includes model" "$L18B_DETAIL" '"model":"sonnet"'
+assert_contains "L18b: detail endpoint includes effort" "$L18B_DETAIL" '"effort":"max"'
+L18B_PANE=$(session_field "$BASE" "model-effort" "pane")
+tmux kill-pane -t "$L18B_PANE" 2>/dev/null || true
+api "$BASE" POST /api/remove -d '{"id":"model-effort"}' >/dev/null 2>&1 || true
+
 log "Test L19: Sessions sharing project_dir are grouped in same tmux session"
 mkdir -p /tmp/projects/grouped-repo
 L19A=$(api "$BASE" POST /api/sessions/start -d '{"name":"group-a","project_dir":"/tmp/projects/grouped-repo"}')
