@@ -2011,6 +2011,13 @@ pub async fn backend_session_ready(
     State(state): State<SharedState>,
     axum::extract::Path(backend_sid): axum::extract::Path<String>,
 ) -> Json<serde_json::Value> {
+    Json(backend_session_ready_inner(&state, backend_sid).await)
+}
+
+async fn backend_session_ready_inner(
+    state: &std::sync::Arc<crate::state::AppState>,
+    backend_sid: String,
+) -> serde_json::Value {
     // Step 1: direct lookup.
     let session_name = {
         let proto = state.protocol.read().await;
@@ -2029,7 +2036,7 @@ pub async fn backend_session_ready(
         // needs the dir too. The double call is intentionally kept to preserve
         // adoption's existing call signature (and fail-mode coverage) for this
         // surgical change — dir lookup is a cheap loopback GET.
-        let adopted = adopt_backend_session_id(&state, &backend_sid).await;
+        let adopted = adopt_backend_session_id(state, &backend_sid).await;
 
         if let Some(n) = adopted {
             n
@@ -2040,29 +2047,23 @@ pub async fn backend_session_ready(
                 tracing::debug!(
                     "auto_register disabled; declining to auto-provision for backend_session_id {backend_sid}"
                 );
-                return Json(
-                    json!({"delivered": false, "error": "no session with this backend_session_id"}),
-                );
+                return json!({"delivered": false, "error": "no session with this backend_session_id"});
             }
 
-            let Some(dir) = lookup_opencode_session_dir(&state, &backend_sid).await else {
-                return Json(
-                    json!({"delivered": false, "error": "no session with this backend_session_id"}),
-                );
+            let Some(dir) = lookup_opencode_session_dir(state, &backend_sid).await else {
+                return json!({"delivered": false, "error": "no session with this backend_session_id"});
             };
 
-            let Some(n) = auto_provision_from_backend_session(&state, &backend_sid, &dir).await
+            let Some(n) = auto_provision_from_backend_session(state, &backend_sid, &dir).await
             else {
-                return Json(
-                    json!({"delivered": false, "error": "no session with this backend_session_id"}),
-                );
+                return json!({"delivered": false, "error": "no session with this backend_session_id"});
             };
             n
         }
     };
 
-    let delivered = deliver_pending_prompt(&state, &name);
-    Json(json!({"delivered": delivered, "session": name}))
+    let delivered = deliver_pending_prompt(state, &name);
+    json!({"delivered": delivered, "session": name})
 }
 
 /// Auto-provision a fresh session record for an opencode backend session that
@@ -2082,6 +2083,24 @@ async fn auto_provision_from_backend_session(
     backend_sid: &str,
     dir: &str,
 ) -> Option<String> {
+    // Race guard 1: another concurrent ready callback may have already
+    // bound this backend_session_id while we were doing the dir lookup.
+    // Short-circuit here so we surface the concurrent winner's id (which
+    // the caller returns to the plugin as `session`) instead of either
+    // inventing a new id or failing closed because the pane is now filtered
+    // out of the "unregistered panes" set. Must run BEFORE the pane filter:
+    // the winner's session binds the pane, so the filter would drop it.
+    {
+        let proto = state.protocol.read().await;
+        if let Some(existing) = proto
+            .sessions
+            .values()
+            .find(|s| s.metadata.backend_session_id.as_deref() == Some(backend_sid))
+        {
+            return Some(existing.id.clone());
+        }
+    }
+
     // Snapshot the current pane layout and the registered pane → session map.
     let panes = state.list_assistant_panes().await;
     let registered_panes: std::collections::HashSet<String> = {
@@ -2140,12 +2159,13 @@ async fn auto_provision_from_backend_session(
         return None;
     }
 
-    // Belt-and-suspenders recheck: another concurrent ready callback may have
-    // just auto-provisioned this backend_session_id while we were scanning
-    // tmux. If so, return the id it created instead of racing a second
-    // Register. apply_register's write-lock + same-pane idempotent path would
-    // otherwise absorb the conflict harmlessly, but short-circuiting here
-    // saves a pointless round-trip and keeps the log cleaner.
+    // Race guard 2: re-check the backend_session_id under the same lock we
+    // use to build id_to_pane, so the winning concurrent writer is visible
+    // to every subsequent branch. Without this, a writer that landed between
+    // the top-of-function guard and this point would cause us to pick a
+    // suffix-bumped id and run a redundant Register. apply_register's
+    // pane-dedup would then evict the winner's session by pane (different
+    // id, same pane) — stomping their atomic bind.
     let id = {
         let proto = state.protocol.read().await;
         if let Some(existing) = proto
@@ -2795,6 +2815,264 @@ mod tests {
             session.metadata.project_dir.as_deref(),
             Some("/tmp/freshproject"),
             "project_dir must be set"
+        );
+        drop(proto);
+
+        // The pane must now resolve back to the new session, which is the
+        // end-state that unblocks the ouija CLI's `@ouija_session` / pane
+        // lookup inside the user's terminal.
+        let resolved = state.find_session_by_pane("%17").await;
+        assert_eq!(
+            resolved.as_deref(),
+            Some("freshproject"),
+            "find_session_by_pane must resolve the auto-provisioned pane"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_provision_declines_when_no_pane_matches_dir() {
+        // Zero tmux panes running opencode in the target directory. The daemon
+        // cannot invent a pane, so it must fail closed and leave state empty.
+        // The user's workaround (explicit `ouija register ...`) still applies.
+        let state = crate::state::AppState::new_for_test();
+        // Seed a pane in a DIFFERENT dir so list_assistant_panes is non-empty
+        // but no candidate matches the target. Catches regressions where an
+        // empty vs. non-empty cache path diverges.
+        *state.cached_assistant_panes.write().await =
+            vec![pane_in("/tmp/someother", "%11")];
+
+        let result = auto_provision_from_backend_session(
+            &state,
+            "ses_unmatched",
+            "/tmp/freshproject",
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "auto-provision must decline with zero matching panes, got Some({result:?})"
+        );
+        let proto = state.protocol.read().await;
+        assert!(
+            proto.sessions.is_empty(),
+            "no session must be created on zero-match decline, got: {:?}",
+            proto.sessions.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_provision_declines_on_ambiguous_multiple_panes() {
+        // Two opencode panes in the same project dir — very common when a
+        // user iterates on a feature in split panes. The daemon has no way
+        // to know which pane this backend_session_id belongs to, so it must
+        // fail closed for the same reason disambiguate_adoption_candidates
+        // does (issue #15). User disambiguates via `ouija register ...`.
+        let state = crate::state::AppState::new_for_test();
+        *state.cached_assistant_panes.write().await = vec![
+            pane_in("/tmp/freshproject", "%17"),
+            pane_in("/tmp/freshproject", "%23"),
+        ];
+
+        let result = auto_provision_from_backend_session(
+            &state,
+            "ses_ambiguous",
+            "/tmp/freshproject",
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "auto-provision must decline on >=2 matching panes, got Some({result:?})"
+        );
+        let proto = state.protocol.read().await;
+        assert!(
+            proto.sessions.is_empty(),
+            "no session must be created on ambiguity decline"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_provision_skips_panes_already_registered() {
+        // A pane that already owns a session (different backend_session_id,
+        // or none at all) must not be re-registered by auto-provision. This
+        // protects sessions created via the claude-code SessionStart hook or
+        // the periodic scan_and_autoregister_panes loop from being stomped
+        // when an unrelated opencode readiness signal arrives.
+        let state = crate::state::AppState::new_for_test();
+        *state.cached_assistant_panes.write().await =
+            vec![pane_in("/tmp/freshproject", "%17")];
+        // Pre-register the pane to a different session.
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "preexisting".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/freshproject".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let result = auto_provision_from_backend_session(
+            &state,
+            "ses_intruder",
+            "/tmp/freshproject",
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "auto-provision must skip already-registered panes, got Some({result:?})"
+        );
+        let proto = state.protocol.read().await;
+        assert_eq!(
+            proto.sessions.len(),
+            1,
+            "no additional session must be created, got: {:?}",
+            proto.sessions.keys().collect::<Vec<_>>()
+        );
+        let preexisting = proto.sessions.get("preexisting").unwrap();
+        assert!(
+            preexisting.metadata.backend_session_id.is_none(),
+            "pre-existing session must NOT be clobbered with the intruder's backend_session_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_provision_short_circuits_when_concurrent_call_won_the_race() {
+        // Simulate the case where a concurrent backend-session/ready callback
+        // has just completed auto-provision by the time this one reaches the
+        // recheck point. The recheck must return the concurrent result instead
+        // of racing a second Register (which would churn @ouija_session under
+        // the user's feet with a different suffix).
+        let state = crate::state::AppState::new_for_test();
+        *state.cached_assistant_panes.write().await =
+            vec![pane_in("/tmp/freshproject", "%17")];
+        // Seed a session that already owns the backend_session_id — the
+        // state the "winning" concurrent call would have left behind.
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "already-bound".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/freshproject".into()),
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_raced".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let result = auto_provision_from_backend_session(
+            &state,
+            "ses_raced",
+            "/tmp/freshproject",
+        )
+        .await;
+
+        assert_eq!(
+            result.as_deref(),
+            Some("already-bound"),
+            "recheck must surface the concurrent winner's id, not invent a new one"
+        );
+        let proto = state.protocol.read().await;
+        assert_eq!(
+            proto.sessions.len(),
+            1,
+            "no extra session must be created on the lost race"
+        );
+    }
+
+    // --- backend_session_ready_inner (end-to-end through the outer handler) ---
+
+    #[tokio::test]
+    async fn backend_session_ready_respects_auto_register_disabled() {
+        // auto_register=false is the operator opt-out. Even with a matching
+        // tmux pane in the target dir, the daemon must not invent a session
+        // record behind the operator's back. The request carries the strict
+        // error the pre-#35 daemon returned.
+        let state = crate::state::AppState::new_for_test();
+        state.settings.write().await.auto_register = false;
+        *state.cached_assistant_panes.write().await =
+            vec![pane_in("/tmp/freshproject", "%17")];
+
+        let response =
+            backend_session_ready_inner(&state, "ses_gated".into()).await;
+
+        assert_eq!(response["delivered"], false);
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no session with this backend_session_id"),
+            "expected strict error, got: {response}"
+        );
+        assert!(response.get("session").is_none());
+
+        let proto = state.protocol.read().await;
+        assert!(
+            proto.sessions.is_empty(),
+            "no session must be created when auto_register is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_session_ready_returns_strict_error_when_serve_unreachable() {
+        // opencode serve binds at config.port + 320 = 320 in new_for_test(),
+        // so the GET connection is refused. lookup_opencode_session_dir
+        // surfaces this as None, the outer handler must keep the historical
+        // strict error rather than creating a session with an invented dir.
+        let state = crate::state::AppState::new_for_test();
+        // Even with a pane cached, serve unreachable -> no dir -> no
+        // auto-provision. This guards against a future refactor that tries
+        // to synthesize a dir from the pane's pane_current_path.
+        *state.cached_assistant_panes.write().await =
+            vec![pane_in("/tmp/freshproject", "%17")];
+
+        let response =
+            backend_session_ready_inner(&state, "ses_no_serve".into()).await;
+
+        assert_eq!(response["delivered"], false);
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no session with this backend_session_id"),
+            "expected strict error, got: {response}"
+        );
+        let proto = state.protocol.read().await;
+        assert!(
+            proto.sessions.is_empty(),
+            "no session must be created when opencode serve is unreachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_session_ready_direct_lookup_hits_when_session_already_bound() {
+        // Fast path: the backend_session_id is already attached to a session
+        // (hub-spawned, or a prior auto-provision). The handler returns the
+        // session name without touching the opencode serve or the pane scan.
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "prebound".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/freshproject".into()),
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_known".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let response =
+            backend_session_ready_inner(&state, "ses_known".into()).await;
+
+        assert_eq!(
+            response["session"].as_str(),
+            Some("prebound"),
+            "direct lookup must surface the session id, got: {response}"
         );
     }
 }
