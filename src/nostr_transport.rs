@@ -2283,13 +2283,29 @@ async fn soft_restart_session(
     //    writer between the snapshot and this atomic block.
     {
         let mut proto = state.protocol.write().await;
-        if let Some(session) = proto.sessions.get_mut(name) {
-            session.metadata.backend_session_id = Some(new_session_id.clone());
-            if let Some(m) = model {
-                session.metadata.model = Some(m.to_string());
+        match proto.sessions.get_mut(name) {
+            Some(session) => {
+                session.metadata.backend_session_id = Some(new_session_id.clone());
+                if let Some(m) = model {
+                    session.metadata.model = Some(m.to_string());
+                }
+                if let Some(e) = effort {
+                    session.metadata.effort = Some(e.to_string());
+                }
             }
-            if let Some(e) = effort {
-                session.metadata.effort = Some(e.to_string());
+            None => {
+                // Session was removed between the pre-flight snapshot and
+                // this write (concurrent Unregister, racing restart, etc.).
+                // The opencode serve session we just created is now orphaned
+                // — bail so the caller can fall through to the hard-restart
+                // path. Without this we would silently POST prompt_async
+                // against a dangling backend_session_id that no SessionMeta
+                // references.
+                drop(proto);
+                tracing::warn!(
+                    "soft restart: session '{name}' disappeared between pre-flight and atomic write; orphaning opencode session {new_session_id}"
+                );
+                return Err(());
             }
         }
         state.persist_protocol_state(&proto);
