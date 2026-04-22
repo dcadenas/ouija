@@ -1831,16 +1831,9 @@ pub async fn restart_session(
             )
             .await
             {
-                // Persist the effective model/effort on the session so a future
-                // restart without --model/--effort keeps the override.
-                {
-                    let mut proto = state.protocol.write().await;
-                    if let Some(s) = proto.sessions.get_mut(name) {
-                        s.metadata.model = effective_model.clone();
-                        s.metadata.effort = effective_effort.clone();
-                    }
-                    state.persist_protocol_state(&proto);
-                }
+                // soft_restart_session writes backend_session_id + model +
+                // effort atomically under one lock before delivering, so the
+                // caller does not need a second write here.
                 return result;
             }
             tracing::info!("soft restart failed for '{name}', falling back to hard restart");
@@ -2272,11 +2265,17 @@ async fn soft_restart_session(
         "soft restart: created new opencode session {new_session_id} for '{name}' (port {port})"
     );
 
-    // 2. Update backend_session_id immediately
+    // 2. Update backend_session_id, model, and effort atomically under one
+    //    write lock before delivering the prompt. A concurrent reader (e.g.
+    //    deliver_via_http from locked_inject) running between these writes
+    //    would otherwise observe the new session id with stale model/effort
+    //    metadata and route the next message through the previous model.
     {
         let mut proto = state.protocol.write().await;
         if let Some(session) = proto.sessions.get_mut(name) {
             session.metadata.backend_session_id = Some(new_session_id.clone());
+            session.metadata.model = model.map(String::from);
+            session.metadata.effort = effort.map(String::from);
         }
         state.persist_protocol_state(&proto);
     }
