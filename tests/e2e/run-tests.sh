@@ -865,6 +865,47 @@ assert_not_contains "L18: no XML msg tag" "$L18_CONTENT" "<msg "
 tmux kill-pane -t "$L18_PANE" 2>/dev/null || true
 api "$BASE" POST /api/remove -d '{"id":"plain-prompt"}' >/dev/null 2>&1 || true
 
+log "Test L18b: ouija.start persists --model and --effort on session metadata"
+L18B=$(api "$BASE" POST /api/sessions/start -d '{"name":"model-effort","model":"sonnet","effort":"max"}')
+assert_contains "L18b: start succeeds" "$L18B" "starting"
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'model-effort'"
+L18B_MODEL=$(session_field "$BASE" "model-effort" "model")
+L18B_EFFORT=$(session_field "$BASE" "model-effort" "effort")
+assert_eq "L18b: model persisted on session" "$L18B_MODEL" "sonnet"
+assert_eq "L18b: effort persisted on session" "$L18B_EFFORT" "max"
+# Also verify GET /api/sessions/{name} exposes both fields
+L18B_DETAIL=$(api "$BASE" GET /api/sessions/model-effort)
+assert_contains "L18b: detail endpoint includes model" "$L18B_DETAIL" '"model":"sonnet"'
+assert_contains "L18b: detail endpoint includes effort" "$L18B_DETAIL" '"effort":"max"'
+L18B_PANE=$(session_field "$BASE" "model-effort" "pane")
+
+# Directly POST to the SessionStart hook endpoint with this pane/cwd.
+# The hook early-returns when find_session_by_pane hits, but POST still
+# exercises the code path; we assert model/effort survive regardless.
+# The real regression would be a future change that removes the early-return
+# and re-Registers with blank metadata — inherit_recurrence_from must then
+# carry model/effort forward (covered by unit tests in daemon_protocol.rs,
+# also verified end-to-end here).
+api "$BASE" POST /api/hooks/session-start \
+    -d "{\"pane\":\"$L18B_PANE\",\"cwd\":\"/tmp/projects/model-effort\"}" >/dev/null 2>&1 || true
+L18B_MODEL_AFTER_HOOK=$(session_field "$BASE" "model-effort" "model")
+L18B_EFFORT_AFTER_HOOK=$(session_field "$BASE" "model-effort" "effort")
+assert_eq "L18b: model survives SessionStart hook" "$L18B_MODEL_AFTER_HOOK" "sonnet"
+assert_eq "L18b: effort survives SessionStart hook" "$L18B_EFFORT_AFTER_HOOK" "max"
+
+# Restart without --model/--effort: the session's persisted values must
+# be preserved via the prev_metadata fallback in restart_session.
+api "$BASE" POST /api/sessions/restart -d '{"name":"model-effort","fresh":false}' >/dev/null 2>&1 || true
+wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'model-effort'"
+L18B_MODEL_AFTER_RESTART=$(session_field "$BASE" "model-effort" "model")
+L18B_EFFORT_AFTER_RESTART=$(session_field "$BASE" "model-effort" "effort")
+assert_eq "L18b: model preserved on restart without --model" "$L18B_MODEL_AFTER_RESTART" "sonnet"
+assert_eq "L18b: effort preserved on restart without --effort" "$L18B_EFFORT_AFTER_RESTART" "max"
+
+L18B_PANE=$(session_field "$BASE" "model-effort" "pane")
+tmux kill-pane -t "$L18B_PANE" 2>/dev/null || true
+api "$BASE" POST /api/remove -d '{"id":"model-effort"}' >/dev/null 2>&1 || true
+
 log "Test L19: Sessions sharing project_dir are grouped in same tmux session"
 mkdir -p /tmp/projects/grouped-repo
 L19A=$(api "$BASE" POST /api/sessions/start -d '{"name":"group-a","project_dir":"/tmp/projects/grouped-repo"}')

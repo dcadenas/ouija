@@ -487,7 +487,8 @@ impl SessionAgent {
                 None,
                 None,
                 None,
-                None,
+                None, // model (fallback to prev_metadata.model inside restart)
+                None, // effort (fallback to prev_metadata.effort inside restart)
                 reminder.as_deref(),
             )
             .await;

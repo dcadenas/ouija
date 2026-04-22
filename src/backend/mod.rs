@@ -114,6 +114,10 @@ pub enum DeliveryMode {
 pub struct StartOpts {
     pub project_dir: String,
     pub worktree: Option<WorktreeMode>,
+    /// LLM model override (passed through to backend CLI / API).
+    pub model: Option<String>,
+    /// Reasoning effort / variant (passed through to backend CLI / API).
+    pub effort: Option<String>,
 }
 
 #[derive(Debug)]
@@ -121,6 +125,10 @@ pub struct ResumeOpts {
     pub project_dir: String,
     pub session_id: Option<String>,
     pub worktree: Option<WorktreeMode>,
+    /// LLM model override (passed through to backend CLI / API).
+    pub model: Option<String>,
+    /// Reasoning effort / variant (passed through to backend CLI / API).
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone)]

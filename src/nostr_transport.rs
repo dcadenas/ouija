@@ -1107,7 +1107,7 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
     } else if let Some(rest) = cmd.strip_prefix("/start ") {
         let name = rest.trim();
         start_session(
-            state, name, None, None, None, None, None, None, None, None, None, None,
+            state, name, None, None, None, None, None, None, None, None, None, None, None,
         )
         .await
         .0
@@ -1120,7 +1120,7 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         } else {
             (rest, false)
         };
-        restart_session(state, name, fresh, None, None, None, None, None, None)
+        restart_session(state, name, fresh, None, None, None, None, None, None, None)
             .await
             .0
     } else {
@@ -1401,6 +1401,7 @@ pub async fn start_session(
     expects_reply: Option<bool>,
     backend: Option<&str>,
     model: Option<&str>,
+    effort: Option<&str>,
     reminder: Option<&str>,
     branch: Option<&str>,
     base_branch: Option<&str>,
@@ -1476,6 +1477,8 @@ pub async fn start_session(
     let backend_cmd = backend.build_start_command(&crate::backend::StartOpts {
         project_dir: dir.clone(),
         worktree: None, // ouija manages worktrees, not the backend
+        model: model.map(String::from),
+        effort: effort.map(String::from),
     });
 
     // Pre-compute the prompt text and sender envelope before launching, so we
@@ -1646,6 +1649,7 @@ pub async fn start_session(
                 backend: Some(backend_name.clone()),
                 backend_session_id,
                 model: model.map(String::from),
+                effort: effort.map(String::from),
                 reminder: reminder.map(String::from),
                 prompt: prompt.map(String::from),
                 ..Default::default()
@@ -1666,9 +1670,7 @@ pub async fn start_session(
                         crate::backend::DeliveryMode::HttpApi { .. }
                     ) {
                         let port = state.opencode_serve_port();
-                        let body = serde_json::json!({
-                            "parts": [{"type": "text", "text": prompt_text}]
-                        });
+                        let body = opencode_prompt_body(prompt_text, model, effort);
                         let url = format!("http://127.0.0.1:{port}/session/{oc_sid}/prompt_async");
                         let state2 = state.clone();
                         let dir2 = dir.clone();
@@ -1752,6 +1754,7 @@ pub async fn restart_session(
     expects_reply: Option<bool>,
     backend: Option<&str>,
     model: Option<&str>,
+    effort: Option<&str>,
     reminder: Option<&str>,
 ) -> (String, Option<u64>) {
     // Snapshot full metadata before killing so we can carry it forward
@@ -1779,6 +1782,32 @@ pub async fn restart_session(
         }
     };
 
+    // Preserve previous model/effort when caller omits them, matching the
+    // backend fallback logic above. This ensures `ouija restart-session` does
+    // not silently downgrade a session to the backend's default model.
+    //
+    // Treat empty/whitespace-only strings (whether from the caller or from
+    // persisted SessionMeta written by an older build) as absent. The API
+    // boundary normalizes; this is a belt-and-braces guard so an empty string
+    // here never reaches the backend as `claude --model ''` or
+    // `variant: ""`.
+    // Reuse the API-boundary normalizer so "  sonnet  " trims to "sonnet"
+    // instead of flowing through to `claude --model '  sonnet  '`. Covers
+    // both caller-supplied values and persisted SessionMeta.model/effort
+    // from older builds that predate the boundary normalization.
+    let effective_model =
+        crate::api::normalize_optional_string(model.map(String::from)).or_else(|| {
+            crate::api::normalize_optional_string(
+                prev_metadata.as_ref().and_then(|m| m.model.clone()),
+            )
+        });
+    let effective_effort =
+        crate::api::normalize_optional_string(effort.map(String::from)).or_else(|| {
+            crate::api::normalize_optional_string(
+                prev_metadata.as_ref().and_then(|m| m.effort.clone()),
+            )
+        });
+
     // --- Soft restart for HttpApi backends ---
     // Create a new session on the serve via HTTP API and deliver the prompt directly.
     // No tmux interaction needed — the LLM works in the serve, not the TUI.
@@ -1801,9 +1830,14 @@ pub async fn restart_session(
                 from,
                 expects_reply,
                 reminder,
+                effective_model.as_deref(),
+                effective_effort.as_deref(),
             )
             .await
             {
+                // soft_restart_session writes backend_session_id + model +
+                // effort atomically under one lock before delivering, so the
+                // caller does not need a second write here.
                 return result;
             }
             tracing::info!("soft restart failed for '{name}', falling back to hard restart");
@@ -1859,6 +1893,8 @@ pub async fn restart_session(
         backend.build_start_command(&crate::backend::StartOpts {
             project_dir: dir.clone(),
             worktree: None, // ouija manages worktrees, not the backend
+            model: effective_model.clone(),
+            effort: effective_effort.clone(),
         })
     } else {
         backend
@@ -1866,11 +1902,15 @@ pub async fn restart_session(
                 project_dir: dir.clone(),
                 session_id: resume_id,
                 worktree: None, // ouija manages worktrees
+                model: effective_model.clone(),
+                effort: effective_effort.clone(),
             })
             .unwrap_or_else(|| {
                 backend.build_start_command(&crate::backend::StartOpts {
                     project_dir: dir.clone(),
                     worktree: None,
+                    model: effective_model.clone(),
+                    effort: effective_effort.clone(),
                 })
             })
     };
@@ -2127,7 +2167,8 @@ pub async fn restart_session(
                     backend: Some(backend_name.clone()),
                     project_description: m.project_description.clone(),
                     last_metadata_update: None,
-                    model: model.map(String::from).or_else(|| m.model.clone()),
+                    model: effective_model.clone(),
+                    effort: effective_effort.clone(),
                     reminder: effective_reminder.clone(),
                     prompt: effective_prompt.clone(),
                     iteration: m.iteration,
@@ -2139,7 +2180,8 @@ pub async fn restart_session(
                     project_dir: Some(dir.clone()),
                     backend: Some(backend_name.clone()),
                     backend_session_id,
-                    model: model.map(String::from),
+                    model: effective_model.clone(),
+                    effort: effective_effort.clone(),
                     reminder: effective_reminder.clone(),
                     prompt: effective_prompt.clone(),
                     ..Default::default()
@@ -2173,6 +2215,10 @@ pub async fn restart_session(
 /// via HTTP API and deliver the prompt directly. Then respawn the TUI attach to
 /// point at the new session so the human can interact.
 ///
+/// `model` and `effort` are applied to the delivered prompt_async body via
+/// [`opencode_prompt_body`] so the new session runs with the right model /
+/// variant from the first request.
+///
 /// Returns `Ok((status_message, prompt_msg_id))` on success.
 /// Returns `Err(())` on failure — caller should fall back to hard restart.
 #[allow(clippy::too_many_arguments)]
@@ -2185,6 +2231,8 @@ async fn soft_restart_session(
     from: Option<&str>,
     expects_reply: Option<bool>,
     reminder: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
 ) -> Result<(String, Option<u64>), ()> {
     let port = state.opencode_serve_port();
 
@@ -2221,11 +2269,76 @@ async fn soft_restart_session(
         "soft restart: created new opencode session {new_session_id} for '{name}' (port {port})"
     );
 
-    // 2. Update backend_session_id immediately
+    // 2. Update backend_session_id, model, and effort atomically under one
+    //    write lock before delivering the prompt. A concurrent reader (e.g.
+    //    deliver_via_http from locked_inject) running between these writes
+    //    would otherwise observe the new session id with stale model/effort
+    //    metadata and route the next message through the previous model.
+    //
+    //    When `model` / `effort` are None we preserve the session's current
+    //    metadata rather than clearing it: callers are expected to pre-compute
+    //    the effective values (restart_session does this via prev_metadata
+    //    fallback), but a stale snapshot or a future caller that forgets the
+    //    fallback must not silently wipe fields that were set by another
+    //    writer between the snapshot and this atomic block.
     {
         let mut proto = state.protocol.write().await;
-        if let Some(session) = proto.sessions.get_mut(name) {
-            session.metadata.backend_session_id = Some(new_session_id.clone());
+        match proto.sessions.get_mut(name) {
+            Some(session) => {
+                session.metadata.backend_session_id = Some(new_session_id.clone());
+                if let Some(m) = model {
+                    session.metadata.model = Some(m.to_string());
+                }
+                if let Some(e) = effort {
+                    session.metadata.effort = Some(e.to_string());
+                }
+            }
+            None => {
+                // Session was removed between the pre-flight snapshot and
+                // this write (concurrent Unregister, racing restart, etc.).
+                // Bail so the caller can fall through to the hard-restart
+                // path. Without this we would silently POST prompt_async
+                // against a dangling backend_session_id that no SessionMeta
+                // references.
+                drop(proto);
+                tracing::warn!(
+                    "soft restart: session '{name}' disappeared between pre-flight and atomic write; deleting orphaned opencode session {new_session_id}"
+                );
+                // Fire-and-forget DELETE to clean up the orphaned opencode
+                // serve session. If the DELETE fails, the serve will still
+                // reclaim the session on its own restart; the Err return
+                // below is the important signal to the caller.
+                let port = state.opencode_serve_port();
+                let client = state.http_client.clone();
+                let orphan_id = new_session_id.clone();
+                tokio::spawn(async move {
+                    let url = format!("http://127.0.0.1:{port}/session/{orphan_id}");
+                    match client
+                        .delete(&url)
+                        .timeout(std::time::Duration::from_secs(5))
+                        .send()
+                        .await
+                    {
+                        Ok(r) if r.status().is_success() => {
+                            tracing::debug!(
+                                "soft restart cleanup: deleted orphan opencode session {orphan_id}"
+                            );
+                        }
+                        Ok(r) => {
+                            tracing::warn!(
+                                "soft restart cleanup: DELETE /session/{orphan_id} returned {}",
+                                r.status()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "soft restart cleanup: DELETE /session/{orphan_id} failed: {e}"
+                            );
+                        }
+                    }
+                });
+                return Err(());
+            }
         }
         state.persist_protocol_state(&proto);
     }
@@ -2251,9 +2364,7 @@ async fn soft_restart_session(
             full_text
         };
 
-        let body = serde_json::json!({
-            "parts": [{"type": "text", "text": message}]
-        });
+        let body = opencode_prompt_body(&message, model, effort);
         let async_url = format!("http://127.0.0.1:{port}/session/{new_session_id}/prompt_async");
         let resp = state
             .http_client
@@ -2660,6 +2771,80 @@ fn save_peer_pubkeys(data_dir: &Path, pubkeys: &HashSet<PublicKey>) {
     }
 }
 
+/// Build an opencode `prompt_async` request body from the session's text,
+/// model, and effort.
+///
+/// The returned JSON has `parts: [{type: "text", text}]` always present, plus
+/// optional top-level `model` and `variant` fields that opencode merges into
+/// its per-prompt overrides (see opencode's `prompt.ts` precedence:
+/// `input.model ?? ag.model ?? lastModel(sessionID)`).
+///
+/// `model` is split on the **first** `/` into `providerID` / `modelID`,
+/// mirroring opencode's parser at `packages/opencode/src/provider/provider.ts`.
+/// `"openrouter/openai/gpt-5.4"` -> `providerID="openrouter"`, `modelID="openai/gpt-5.4"`.
+///
+/// A model string with no `/`, or one with an empty segment on either side
+/// of the first `/` (`"/"`, `"openrouter/"`, `"/gpt-5"`, or
+/// whitespace-only input), is treated as ambiguous: the `model` field is
+/// omitted entirely and a `tracing::warn!` is emitted. Opencode then falls
+/// back to the agent / session default. Effort is passed through unchanged
+/// as `variant` — callers should normalize empty strings to `None` upstream
+/// (the API boundary does this).
+pub(crate) fn opencode_prompt_body(
+    text: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "parts": [{"type": "text", "text": text}],
+    });
+    let obj = body.as_object_mut().expect("json! macro returns an object");
+    if let Some(m) = model {
+        let trimmed = m.trim();
+        match trimmed.split_once('/') {
+            Some((provider, model_id)) => {
+                // Trim each segment independently: `"openrouter / gpt-5"`
+                // would otherwise send `providerID: " openrouter "` which
+                // opencode's provider lookup does not match. The non-empty
+                // guard is then applied to the already-trimmed segments so
+                // inputs like `" / "` or `"openrouter / "` are rejected.
+                let provider = provider.trim();
+                let model_id = model_id.trim();
+                if !provider.is_empty() && !model_id.is_empty() {
+                    obj.insert(
+                        "model".into(),
+                        serde_json::json!({
+                            "providerID": provider,
+                            "modelID": model_id,
+                        }),
+                    );
+                } else {
+                    tracing::warn!(
+                        model = m,
+                        "opencode_prompt_body: model string has empty segment after trim; falling back to agent/session default"
+                    );
+                }
+            }
+            None => {
+                tracing::warn!(
+                    model = m,
+                    "opencode_prompt_body: model string is not in 'providerID/modelID' form; falling back to agent/session default"
+                );
+            }
+        }
+    }
+    if let Some(e) = effort {
+        let trimmed = e.trim();
+        if !trimmed.is_empty() {
+            obj.insert(
+                "variant".into(),
+                serde_json::Value::String(trimmed.to_string()),
+            );
+        }
+    }
+    body
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2871,5 +3056,152 @@ mod tests {
         // nprofile part still parses correctly
         let parsed = Nip19Profile::from_bech32(nprofile_part).unwrap();
         assert_eq!(parsed.public_key, keys.public_key());
+    }
+
+    // --- opencode_prompt_body ---
+
+    #[test]
+    fn opencode_prompt_body_text_only() {
+        let body = opencode_prompt_body("hello", None, None);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "parts": [{"type": "text", "text": "hello"}]
+            })
+        );
+    }
+
+    #[test]
+    fn opencode_prompt_body_with_model_two_segments() {
+        let body = opencode_prompt_body("hi", Some("openrouter/gpt-5"), None);
+        assert_eq!(
+            body["model"],
+            serde_json::json!({
+                "providerID": "openrouter",
+                "modelID": "gpt-5",
+            })
+        );
+        assert!(body.get("variant").is_none());
+    }
+
+    #[test]
+    fn opencode_prompt_body_with_model_three_segments_splits_on_first_slash() {
+        // opencode's parser splits on the FIRST `/` only.
+        // `openrouter/openai/gpt-5.4` -> provider=openrouter, model=openai/gpt-5.4
+        let body = opencode_prompt_body("hi", Some("openrouter/openai/gpt-5.4"), None);
+        assert_eq!(
+            body["model"],
+            serde_json::json!({
+                "providerID": "openrouter",
+                "modelID": "openai/gpt-5.4",
+            })
+        );
+    }
+
+    #[test]
+    fn opencode_prompt_body_with_effort_only() {
+        let body = opencode_prompt_body("hi", None, Some("xhigh"));
+        assert!(body.get("model").is_none());
+        assert_eq!(body["variant"], serde_json::Value::String("xhigh".into()));
+    }
+
+    #[test]
+    fn opencode_prompt_body_with_model_and_effort() {
+        let body = opencode_prompt_body(
+            "do the thing",
+            Some("openrouter/google/gemini-3.1-pro-preview"),
+            Some("xhigh"),
+        );
+        assert_eq!(
+            body["model"],
+            serde_json::json!({
+                "providerID": "openrouter",
+                "modelID": "google/gemini-3.1-pro-preview",
+            })
+        );
+        assert_eq!(body["variant"], serde_json::Value::String("xhigh".into()));
+        assert_eq!(
+            body["parts"],
+            serde_json::json!([{"type": "text", "text": "do the thing"}])
+        );
+    }
+
+    #[test]
+    fn opencode_prompt_body_with_model_no_slash_omits_model() {
+        // No `/` is ambiguous (no providerID). Omit the model field and let
+        // opencode fall back to the agent / session default.
+        let body = opencode_prompt_body("hi", Some("sonnet"), Some("max"));
+        assert!(
+            body.get("model").is_none(),
+            "no-slash model must be omitted, got: {body}"
+        );
+        assert_eq!(body["variant"], serde_json::Value::String("max".into()));
+    }
+
+    #[test]
+    fn opencode_prompt_body_omits_malformed_slash_values() {
+        // `/`, `openrouter/`, `/gpt-5` all have an empty segment and must be
+        // treated as ambiguous.
+        for bad in ["/", "openrouter/", "/gpt-5", " / ", "   "] {
+            let body = opencode_prompt_body("hi", Some(bad), None);
+            assert!(
+                body.get("model").is_none(),
+                "malformed model {bad:?} must be omitted, got: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_prompt_body_omits_empty_variant() {
+        // An empty effort string must not be sent as variant = "".
+        let body = opencode_prompt_body("hi", None, Some(""));
+        assert!(
+            body.get("variant").is_none(),
+            "empty effort must be omitted, got: {body}"
+        );
+    }
+
+    #[test]
+    fn opencode_prompt_body_trims_padded_segments() {
+        // `"openrouter / gpt-5"` splits into `"openrouter "` and `" gpt-5"`.
+        // Before the fix, both trimmed-non-empty-guarded segments were
+        // inserted UN-trimmed, yielding providerID=" openrouter " — which
+        // opencode's provider lookup would not match.
+        let body = opencode_prompt_body("hi", Some("openrouter / gpt-5"), None);
+        assert_eq!(
+            body["model"],
+            serde_json::json!({
+                "providerID": "openrouter",
+                "modelID": "gpt-5",
+            }),
+            "segments must be trimmed before insertion, got: {body}"
+        );
+    }
+
+    #[test]
+    fn opencode_prompt_body_rejects_whitespace_only_segment() {
+        // `"openrouter / "` trims the model_id segment to empty and must be
+        // omitted, not inserted as providerID="openrouter", modelID="".
+        let body = opencode_prompt_body("hi", Some("openrouter / "), None);
+        assert!(
+            body.get("model").is_none(),
+            "whitespace-only modelID must be rejected, got: {body}"
+        );
+        let body = opencode_prompt_body("hi", Some(" / gpt-5"), None);
+        assert!(
+            body.get("model").is_none(),
+            "whitespace-only providerID must be rejected, got: {body}"
+        );
+    }
+
+    #[test]
+    fn opencode_prompt_body_trims_padded_effort() {
+        // Whitespace padding on effort must not flow through as variant.
+        let body = opencode_prompt_body("hi", None, Some("  max  "));
+        assert_eq!(
+            body["variant"],
+            serde_json::Value::String("max".into()),
+            "effort must be trimmed before insertion, got: {body}"
+        );
     }
 }

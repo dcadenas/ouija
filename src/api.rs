@@ -22,6 +22,19 @@ const CONNECT_TIMEOUT_SECS: u64 = 10;
 /// Max task runs to return in the list endpoint.
 const MAX_TASK_RUNS_RETURNED: usize = 50;
 
+/// Normalize a user-supplied optional string: trim whitespace and treat
+/// empty/whitespace-only strings as absent.
+///
+/// Applied at the API boundary on fields like `model` and `effort` where
+/// `Some("")` is always a mistake (serialized form of a CLI flag without a
+/// value, or a JSON client passing an empty placeholder) and must not flow
+/// through as if it were an explicit override.
+pub(crate) fn normalize_optional_string(input: Option<String>) -> Option<String> {
+    input
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Extract a short project description from a project directory.
 ///
 /// Tries in order: `Cargo.toml` description field, `package.json` description,
@@ -97,6 +110,7 @@ pub async fn get_session(
                     "networked": s.metadata.networked,
                     "worktree": s.metadata.worktree,
                     "model": s.metadata.model,
+                    "effort": s.metadata.effort,
                     "last_metadata_update": s.metadata.last_metadata_update,
                     "stale": stale,
                     "backend_session_id": s.metadata.backend_session_id,
@@ -138,6 +152,7 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
                 "networked": s.metadata.networked,
                 "worktree": s.metadata.worktree,
                 "model": s.metadata.model,
+                "effort": s.metadata.effort,
                 "last_metadata_update": s.metadata.last_metadata_update,
                 "stale": stale,
                 "backend_session_id": s.metadata.backend_session_id,
@@ -999,6 +1014,8 @@ async fn compact_inner(
                 backend_session_id: s.metadata.backend_session_id.clone(),
                 project_dir: s.metadata.project_dir.clone(),
                 backend_name: s.metadata.backend.clone(),
+                model: s.metadata.model.clone(),
+                effort: s.metadata.effort.clone(),
             },
             None => {
                 return (
@@ -1114,6 +1131,8 @@ async fn compact_inner(
                 &backend_session_id,
                 lookup.project_dir.as_deref(),
                 &continuation,
+                lookup.model.as_deref(),
+                lookup.effort.as_deref(),
             )
             .await
             {
@@ -1132,6 +1151,8 @@ struct SessionLookup {
     backend_session_id: Option<String>,
     project_dir: Option<String>,
     backend_name: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
 }
 
 // --- Nodes ---
@@ -1689,9 +1710,19 @@ pub struct SessionNameBody {
     /// Which coding assistant backend to use (e.g. "claude-code", "codex").
     #[serde(default)]
     backend: Option<String>,
-    /// Which LLM model to use (informational metadata only).
+    /// Which LLM model to use.
+    ///
+    /// Passed through to the backend: for claude-code this becomes
+    /// `claude --model <X>`; for opencode it is split on the first `/` into
+    /// `providerID/modelID` and sent on each `prompt_async` body.
     #[serde(default)]
     model: Option<String>,
+    /// Reasoning effort / variant for the model.
+    ///
+    /// For claude-code: passed as `claude --effort <X>`.
+    /// For opencode: sent as `variant` on each `prompt_async` body.
+    #[serde(default)]
+    effort: Option<String>,
     #[serde(default)]
     reminder: Option<String>,
     /// Git branch name for worktree sessions. If omitted, defaults to the session name.
@@ -1724,6 +1755,13 @@ pub async fn start_session(
     State(state): State<SharedState>,
     Json(body): Json<SessionNameBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Normalize at the boundary: `Some("")` or `Some("   ")` must not flow
+    // through as an explicit override — it would clobber prev_metadata on
+    // restart with an empty string and produce malformed CLI invocations.
+    let mut body = body;
+    body.model = normalize_optional_string(body.model);
+    body.effort = normalize_optional_string(body.effort);
+
     // Return 202 immediately — all work (registration + boot) happens in background.
     let name = body.name.clone();
     let state2 = state.clone();
@@ -1749,6 +1787,7 @@ pub async fn start_session(
                 None, // expects_reply not used for session start
                 body.backend.as_deref(),
                 body.model.as_deref(),
+                body.effort.as_deref(),
                 body.reminder.as_deref(),
             )
             .await;
@@ -1767,6 +1806,7 @@ pub async fn start_session(
             None, // expects_reply not used for session start
             body.backend.as_deref(),
             body.model.as_deref(),
+            body.effort.as_deref(),
             body.reminder.as_deref(),
             body.branch.as_deref(),
             body.base_branch.as_deref(),
@@ -1790,6 +1830,11 @@ pub async fn restart_session(
     State(state): State<SharedState>,
     Json(body): Json<SessionNameBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Normalize at the boundary; see start_session for rationale.
+    let mut body = body;
+    body.model = normalize_optional_string(body.model);
+    body.effort = normalize_optional_string(body.effort);
+
     let fresh = body.fresh.unwrap_or(false);
     let (result, _prompt_msg_id) = crate::nostr_transport::restart_session(
         &state,
@@ -1800,6 +1845,7 @@ pub async fn restart_session(
         None, // expects_reply not used for session restart
         body.backend.as_deref(),
         body.model.as_deref(),
+        body.effort.as_deref(),
         body.reminder.as_deref(),
     )
     .await;
@@ -2105,6 +2151,26 @@ pub async fn clear_reminder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_optional_string_passthrough() {
+        assert_eq!(
+            normalize_optional_string(Some("sonnet".into())),
+            Some("sonnet".into())
+        );
+        assert_eq!(normalize_optional_string(None), None);
+    }
+
+    #[test]
+    fn normalize_optional_string_trims_and_drops_empty() {
+        assert_eq!(normalize_optional_string(Some("".into())), None);
+        assert_eq!(normalize_optional_string(Some("   ".into())), None);
+        assert_eq!(normalize_optional_string(Some("\t\n ".into())), None);
+        assert_eq!(
+            normalize_optional_string(Some("  opus  ".into())),
+            Some("opus".into())
+        );
+    }
 
     #[test]
     fn disambiguate_single_candidate_adopts() {

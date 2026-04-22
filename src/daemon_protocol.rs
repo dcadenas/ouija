@@ -98,9 +98,20 @@ pub struct SessionMeta {
     /// Unix timestamp; 0 in model tests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_metadata_update: Option<i64>,
-    /// Which LLM model this session is configured to use (informational only).
+    /// Which LLM model this session is configured to use.
+    ///
+    /// For claude-code: passed as `--model <X>` on the CLI (alias or full id).
+    /// For opencode: parsed on first `/` as `providerID/modelID` and sent on each
+    /// `prompt_async` body as `{"model":{"providerID":..,"modelID":..}}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Reasoning effort / variant for the model.
+    ///
+    /// For claude-code: passed as `--effort <X>` on the CLI (`low|medium|high|xhigh|max`).
+    /// For opencode: sent as `variant` on each `prompt_async` body. Opaque passthrough
+    /// string — opencode's variant ladder per provider is not interpreted here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// Reminder text re-injected on idle. Also appended to prompt at session start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reminder: Option<String>,
@@ -156,6 +167,13 @@ impl SessionMeta {
     /// Fill recurrence fields from `source` for any field still at its default value.
     /// Used during re-registration so the startup hook doesn't wipe recurrence state
     /// that was set by session_start or carried forward by restart_session.
+    ///
+    /// This also carries `model` and `effort` forward — the claude-code
+    /// SessionStart hook Registers with `SessionMeta::default()` right after
+    /// `start_session` writes the metadata, and without this inheritance the
+    /// hook silently wipes the operator-configured values. A subsequent
+    /// `restart-session` would then read `prev_metadata.model = None` and
+    /// drop to the backend default.
     pub fn inherit_recurrence_from(&mut self, source: &SessionMeta) {
         if self.prompt.is_none() {
             self.prompt = source.prompt.clone();
@@ -175,6 +193,12 @@ impl SessionMeta {
         if self.on_fire.is_none() {
             self.on_fire = source.on_fire.clone();
         }
+        if self.model.is_none() {
+            self.model = source.model.clone();
+        }
+        if self.effort.is_none() {
+            self.effort = source.effort.clone();
+        }
     }
 }
 
@@ -192,6 +216,7 @@ impl Default for SessionMeta {
             project_description: None,
             last_metadata_update: None,
             model: None,
+            effort: None,
             reminder: None,
             prompt: None,
             iteration: 0,
@@ -459,6 +484,11 @@ pub fn format_session_message(
     format!("<msg {attrs}>{message}</msg>")
 }
 
+#[cfg(test)]
+pub(crate) fn metadata_to_session_meta_for_test(m: &crate::state::SessionMetadata) -> SessionMeta {
+    metadata_to_session_meta(Some(m))
+}
+
 fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>) -> SessionMeta {
     match m {
         Some(m) => SessionMeta {
@@ -473,6 +503,7 @@ fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>) -> Sessio
             project_description: m.project_description.clone(),
             last_metadata_update: m.last_metadata_update.map(|ts| ts.timestamp()),
             model: m.model.clone(),
+            effort: m.effort.clone(),
             reminder: m.reminder.clone(),
             prompt: m.prompt.clone(),
             iteration: m.iteration,
@@ -1709,6 +1740,42 @@ mod tests {
         assert_eq!(meta.iteration, 0);
         assert!(meta.iteration_log.is_empty());
         assert!(meta.last_iteration_at.is_none());
+        assert!(meta.model.is_none());
+        assert!(meta.effort.is_none());
+    }
+
+    #[test]
+    fn register_roundtrips_model_and_effort() {
+        let mut state = DaemonState::new_for_model("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "s".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                model: Some("sonnet".into()),
+                effort: Some("max".into()),
+                ..Default::default()
+            },
+        });
+        let meta = &state
+            .sessions
+            .get("s")
+            .expect("session registered")
+            .metadata;
+        assert_eq!(meta.model.as_deref(), Some("sonnet"));
+        assert_eq!(meta.effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn session_meta_serde_effort_round_trip() {
+        let meta = SessionMeta {
+            model: Some("openrouter/openai/gpt-5.4".into()),
+            effort: Some("xhigh".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let decoded: SessionMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.model.as_deref(), Some("openrouter/openai/gpt-5.4"));
+        assert_eq!(decoded.effort.as_deref(), Some("xhigh"));
     }
 
     #[test]
@@ -1806,6 +1873,82 @@ mod tests {
         }
         assert_eq!(meta.iteration_log.len(), 100);
         assert_eq!(meta.iteration_log[0].iteration, 10);
+    }
+
+    #[test]
+    fn inherit_recurrence_carries_model_and_effort() {
+        // Regression: the claude-code SessionStart hook re-Registers each
+        // spawned session with SessionMeta::default() (model=None,
+        // effort=None). apply_register merges via inherit_recurrence_from.
+        // Without this inheritance, the re-register wipes the model and
+        // effort that start_session had just persisted.
+        let source = SessionMeta {
+            model: Some("sonnet".into()),
+            effort: Some("max".into()),
+            ..Default::default()
+        };
+        let mut target = SessionMeta::default();
+        target.inherit_recurrence_from(&source);
+        assert_eq!(target.model.as_deref(), Some("sonnet"));
+        assert_eq!(target.effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn inherit_recurrence_does_not_overwrite_explicit_model_and_effort() {
+        // When the new metadata already has model/effort (e.g. a
+        // restart_session Register that intentionally changes the model),
+        // inherit must not silently revert to the previous value.
+        let source = SessionMeta {
+            model: Some("sonnet".into()),
+            effort: Some("max".into()),
+            ..Default::default()
+        };
+        let mut target = SessionMeta {
+            model: Some("opus".into()),
+            effort: Some("high".into()),
+            ..Default::default()
+        };
+        target.inherit_recurrence_from(&source);
+        assert_eq!(target.model.as_deref(), Some("opus"));
+        assert_eq!(target.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn register_re_register_preserves_model_and_effort() {
+        // End-to-end: a first Register with model/effort, then a blank
+        // re-Register (as the SessionStart hook does) must preserve both
+        // fields on the session.
+        let mut state = DaemonState::new_for_model("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "s".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                model: Some("sonnet".into()),
+                effort: Some("max".into()),
+                ..Default::default()
+            },
+        });
+        // Simulate the SessionStart hook re-registering with blank metadata.
+        state.apply(Event::Register {
+            id: "s".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta::default(),
+        });
+        let meta = &state
+            .sessions
+            .get("s")
+            .expect("session registered")
+            .metadata;
+        assert_eq!(
+            meta.model.as_deref(),
+            Some("sonnet"),
+            "model wiped by hook re-register"
+        );
+        assert_eq!(
+            meta.effort.as_deref(),
+            Some("max"),
+            "effort wiped by hook re-register"
+        );
     }
 
     #[test]

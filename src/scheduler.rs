@@ -370,11 +370,12 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
         proto.sessions.get(session_name).cloned()
     };
 
-    // Session not found — create from scratch if task has enough info
+    // Session not found — create from scratch if task has enough info.
+    // No prior metadata to honour; backend default applies.
     let Some(session) = session else {
         if task.project_dir.is_some() || task.prompt.is_some() {
             tracing::info!("session '{session_name}' not found, creating from task project_dir",);
-            return revive_from_task(state, task, None).await;
+            return revive_from_task(state, task, None, None, None).await;
         }
         return TaskRun::failed(
             task,
@@ -388,8 +389,16 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
     }
 
     let Some(pane) = &session.pane else {
-        // Session exists but has no pane — revive it
-        return revive_from_task(state, task, None).await;
+        // Session exists but has no pane — revive it, carrying model/effort
+        // from the snapshot we already have in scope.
+        return revive_from_task(
+            state,
+            task,
+            None,
+            session.metadata.model.clone(),
+            session.metadata.effort.clone(),
+        )
+        .await;
     };
 
     // Check if pane is alive
@@ -402,6 +411,14 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
     .await
     .unwrap_or(false);
 
+    // Capture model/effort from the session snapshot we already have, so a
+    // subsequent Unregister race cannot silently downgrade the respawn to
+    // backend defaults. This is the same snapshot used for `session.pane`
+    // and `session.metadata.project_dir` below — all three fields come from
+    // the same atomic read above at line 368-371.
+    let snapshot_model = session.metadata.model.clone();
+    let snapshot_effort = session.metadata.effort.clone();
+
     if alive {
         if task.on_fire.kills_alive() {
             let dir = task
@@ -409,7 +426,8 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
                 .as_deref()
                 .or(session.metadata.project_dir.as_deref())
                 .unwrap_or("/tmp");
-            return respawn_and_inject(state, task, pane, dir).await;
+            return respawn_and_inject(state, task, pane, dir, snapshot_model, snapshot_effort)
+                .await;
         }
         // Verify session still exists — a concurrent kill may have removed it
         // while we were checking pane liveness. If gone, fall through to revival.
@@ -430,15 +448,22 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
         .project_dir
         .as_deref()
         .or(session.metadata.project_dir.as_deref());
-    revive_from_task(state, task, project_dir).await
+    revive_from_task(state, task, project_dir, snapshot_model, snapshot_effort).await
 }
 
 /// Respawn the backend in an existing pane (for clears_context on a live session).
+///
+/// `model` and `effort` are passed from the caller's atomic snapshot of the
+/// session (taken under the same lock acquisition as `dir` / `pane`) so a
+/// concurrent Unregister between the caller's read and this function cannot
+/// silently downgrade the respawn to backend defaults.
 async fn respawn_and_inject(
     state: &SharedState,
     task: &ScheduledTask,
     pane: &str,
     dir: &str,
+    model: Option<String>,
+    effort: Option<String>,
 ) -> TaskRun {
     let pane_id = pane.to_string();
     let dir = dir.to_string();
@@ -458,6 +483,8 @@ async fn respawn_and_inject(
         } else {
             None
         },
+        model,
+        effort,
     });
 
     // Pass prompt as CLI arg (same as start_session) so Claude loads
@@ -539,13 +566,18 @@ async fn respawn_and_inject(
 /// Create or revive a session and inject a message.
 ///
 /// `project_dir_override` falls back to `task.project_dir` if `None`.
+/// `model`/`effort` are passed through from the caller's session snapshot;
+/// for the 'session not found' path the caller passes `None` (there is no
+/// prior metadata to honour).
 async fn revive_from_task(
     state: &SharedState,
     task: &ScheduledTask,
     project_dir_override: Option<&str>,
+    model: Option<String>,
+    effort: Option<String>,
 ) -> TaskRun {
     let project_dir = project_dir_override.or(task.project_dir.as_deref());
-    match revive_and_inject(state, task, project_dir).await {
+    match revive_and_inject(state, task, project_dir, model, effort).await {
         Ok(new_pane) => {
             if task.on_fire.clears_context() {
                 let mut proto = state.protocol.write().await;
@@ -560,10 +592,19 @@ async fn revive_from_task(
 }
 
 /// Revive a dead session: create new tmux window, launch the backend, re-register, inject.
+///
+/// `model` / `effort` are threaded through from the caller's session snapshot
+/// — `execute_injection` captures them under the same atomic read that
+/// sourced `project_dir`, so a concurrent Unregister between the caller's
+/// read and this function cannot silently downgrade the revive to backend
+/// defaults. When the caller is the 'session not found' branch, both are
+/// `None` (no prior metadata to honour).
 async fn revive_and_inject(
     state: &SharedState,
     task: &ScheduledTask,
     project_dir: Option<&str>,
+    model: Option<String>,
+    effort: Option<String>,
 ) -> anyhow::Result<String> {
     let dir = project_dir
         .map(String::from)
@@ -588,6 +629,8 @@ async fn revive_and_inject(
         backend.build_start_command(&crate::backend::StartOpts {
             project_dir: dir.clone(),
             worktree,
+            model: model.clone(),
+            effort: effort.clone(),
         })
     } else {
         let session_id = task
@@ -599,11 +642,15 @@ async fn revive_and_inject(
                 project_dir: dir.clone(),
                 session_id,
                 worktree,
+                model: model.clone(),
+                effort: effort.clone(),
             })
             .unwrap_or_else(|| {
                 backend.build_start_command(&crate::backend::StartOpts {
                     project_dir: dir.clone(),
                     worktree: None,
+                    model: model.clone(),
+                    effort: effort.clone(),
                 })
             })
     };

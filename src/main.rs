@@ -151,8 +151,12 @@ enum Command {
         branch: Option<String>,
         #[arg(long)]
         base_branch: Option<String>,
+        /// LLM model (claude: alias/full id; opencode: providerID/modelID).
         #[arg(long)]
         model: Option<String>,
+        /// Reasoning effort / variant (claude: --effort; opencode: prompt variant).
+        #[arg(long)]
+        effort: Option<String>,
         #[arg(long)]
         backend: Option<String>,
         #[arg(long)]
@@ -175,6 +179,12 @@ enum Command {
         prompt: Option<String>,
         #[arg(long)]
         reminder: Option<String>,
+        /// Override the LLM model on restart (defaults to the previous model).
+        #[arg(long)]
+        model: Option<String>,
+        /// Override the reasoning effort on restart (defaults to the previous effort).
+        #[arg(long)]
+        effort: Option<String>,
     },
     /// Clear an idle reminder
     #[command(name = "clear-reminder")]
@@ -709,6 +719,7 @@ async fn main() -> anyhow::Result<()> {
             branch,
             base_branch,
             model,
+            effort,
             backend,
             from,
         } => {
@@ -721,6 +732,7 @@ async fn main() -> anyhow::Result<()> {
                 "branch": branch,
                 "base_branch": base_branch,
                 "model": model,
+                "effort": effort,
                 "backend": backend,
                 "from": from,
             });
@@ -741,12 +753,16 @@ async fn main() -> anyhow::Result<()> {
             fresh,
             prompt,
             reminder,
+            model,
+            effort,
         } => {
             let body = serde_json::json!({
                 "name": name,
                 "fresh": fresh,
                 "prompt": prompt,
                 "reminder": reminder,
+                "model": model,
+                "effort": effort,
             });
             cli_post("/api/sessions/restart", &body).await?;
         }

@@ -175,9 +175,19 @@ pub struct SessionMetadata {
     /// Whether this session runs in an isolated git worktree (backend worktree mode).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub worktree: bool,
-    /// Which LLM model this session is configured to use (informational only).
+    /// Which LLM model this session is configured to use.
+    ///
+    /// For claude-code: passed as `--model <X>` on the CLI.
+    /// For opencode: split on first `/` and sent as `{providerID,modelID}` on
+    /// each `prompt_async` body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Reasoning effort / variant for the model.
+    ///
+    /// For claude-code: passed as `--effort <X>` on the CLI.
+    /// For opencode: sent as `variant` on each `prompt_async` body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// Reminder text re-injected on idle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reminder: Option<String>,
@@ -224,6 +234,7 @@ impl Default for SessionMetadata {
             bulletin: None,
             worktree: false,
             model: None,
+            effort: None,
             reminder: None,
             prompt: None,
             iteration: 0,
@@ -625,7 +636,8 @@ impl AppState {
                             from.as_deref(),
                             expects_reply,
                             None,
-                            None,
+                            None, // model
+                            None, // effort
                             reminder.as_deref(),
                             None, // branch
                             None, // base_branch
@@ -665,7 +677,8 @@ impl AppState {
                             from.as_deref(),
                             expects_reply,
                             None,
-                            None,
+                            None, // model
+                            None, // effort
                             reminder.as_deref(),
                         )
                         .await;
@@ -742,11 +755,25 @@ impl AppState {
 
     /// Persist protocol state sessions to disk.
     pub(crate) fn persist_protocol_state(&self, proto: &crate::daemon_protocol::DaemonState) {
-        // Convert DaemonState sessions to the persisted Session format
+        // Convert DaemonState sessions to the persisted Session format.
+        //
+        // IMPORTANT: every field on SessionMetadata must be explicitly copied
+        // from SessionMeta here. A `..Default::default()` tail silently drops
+        // any field not enumerated, so Effect::Persist writes nulls for those
+        // fields, and a daemon restart loses them — which was the root cause
+        // of the round-4 regression that zeroed model, effort, backend,
+        // backend_session_id, project_description, last_metadata_update,
+        // on_fire, and last_iteration_at on every persist.
+        //
+        // If you add a new field to SessionMetadata, add it here too. The
+        // persist_protocol_state_round_trips_all_metadata_fields test in
+        // state::tests exercises the full round-trip so a drop will surface
+        // as a test failure, not a silent behaviour change.
         let sessions: HashMap<String, Session> = proto
             .sessions
             .iter()
             .map(|(k, entry)| {
+                let m = &entry.metadata;
                 let session = Session {
                     id: entry.id.clone(),
                     pane: entry.pane.clone(),
@@ -760,17 +787,26 @@ impl AppState {
                     registered_at: Utc::now(),
                     last_activity_at: Utc::now(),
                     metadata: SessionMetadata {
-                        vim_mode: entry.metadata.vim_mode,
-                        project_dir: entry.metadata.project_dir.clone(),
-                        role: entry.metadata.role.clone(),
-                        networked: entry.metadata.networked,
-                        bulletin: entry.metadata.bulletin.clone(),
-                        worktree: entry.metadata.worktree,
-                        reminder: entry.metadata.reminder.clone(),
-                        prompt: entry.metadata.prompt.clone(),
-                        iteration: entry.metadata.iteration,
-                        iteration_log: entry.metadata.iteration_log.clone(),
-                        ..Default::default()
+                        vim_mode: m.vim_mode,
+                        project_dir: m.project_dir.clone(),
+                        role: m.role.clone(),
+                        networked: m.networked,
+                        last_metadata_update: m
+                            .last_metadata_update
+                            .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0)),
+                        backend_session_id: m.backend_session_id.clone(),
+                        backend: m.backend.clone(),
+                        project_description: m.project_description.clone(),
+                        bulletin: m.bulletin.clone(),
+                        worktree: m.worktree,
+                        model: m.model.clone(),
+                        effort: m.effort.clone(),
+                        reminder: m.reminder.clone(),
+                        prompt: m.prompt.clone(),
+                        iteration: m.iteration,
+                        iteration_log: m.iteration_log.clone(),
+                        last_iteration_at: m.last_iteration_at,
+                        on_fire: m.on_fire.clone(),
                     },
                 };
                 (k.clone(), session)
@@ -1468,6 +1504,145 @@ pub(crate) mod tests {
         let sessions = &proto.sessions;
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions.get("s1").unwrap().pane.as_deref(), Some("%2"));
+    }
+
+    #[tokio::test]
+    async fn persist_protocol_state_round_trips_all_metadata_fields() {
+        // Regression (review round 4): persist_protocol_state built
+        // SessionMetadata by hand with ..Default::default() tail, silently
+        // dropping model, effort, backend, backend_session_id,
+        // project_description, last_metadata_update, on_fire,
+        // last_iteration_at. Every Effect::Persist wrote null for those
+        // fields, so a daemon restart would load them back as None and
+        // silently downgrade sessions (claude: drop --model on restart;
+        // scheduler: drop flags on revive; opencode deliver_via_http: drop
+        // model/variant on every message). Exercise the full
+        // persist → load → deserialise round-trip.
+        let config = test_config();
+        let state = AppState::new(config.clone());
+
+        // Register a session with every metadata field set so we can detect
+        // any field that persist_protocol_state drops.
+        let meta = crate::daemon_protocol::SessionMeta {
+            project_dir: Some("/tmp/proj".into()),
+            role: Some("worker".into()),
+            networked: false,
+            bulletin: Some("available".into()),
+            last_metadata_update: Some(1_700_000_100),
+            backend_session_id: Some("oc_abc123".into()),
+            backend: Some("opencode".into()),
+            project_description: Some("test project".into()),
+            vim_mode: true,
+            worktree: true,
+            model: Some("openrouter/sonnet".into()),
+            effort: Some("max".into()),
+            reminder: Some("remember to...".into()),
+            prompt: Some("do the thing".into()),
+            iteration: 3,
+            iteration_log: vec![],
+            last_iteration_at: Some(1_700_000_000),
+            on_fire: Some(crate::scheduler::OnFire::NewSession),
+        };
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "s1".into(),
+                pane: Some("%1".into()),
+                metadata: meta,
+            })
+            .await;
+
+        // Trigger the real persist path (same code Effect::Persist dispatches to).
+        {
+            let proto = state.protocol.read().await;
+            state.persist_protocol_state(&proto);
+        }
+
+        // Read sessions.json back from disk.
+        let loaded = crate::persistence::load_sessions(&config.data_dir)
+            .expect("load_sessions after persist");
+        let s = loaded
+            .iter()
+            .find(|p| p.id == "s1")
+            .expect("session s1 not persisted");
+
+        // Every field that was set on the SessionMeta must round-trip.
+        assert_eq!(
+            s.metadata.model.as_deref(),
+            Some("openrouter/sonnet"),
+            "model dropped by persist"
+        );
+        assert_eq!(
+            s.metadata.effort.as_deref(),
+            Some("max"),
+            "effort dropped by persist"
+        );
+        assert_eq!(
+            s.metadata.backend.as_deref(),
+            Some("opencode"),
+            "backend dropped by persist"
+        );
+        assert_eq!(
+            s.metadata.backend_session_id.as_deref(),
+            Some("oc_abc123"),
+            "backend_session_id dropped by persist"
+        );
+        assert_eq!(
+            s.metadata.project_description.as_deref(),
+            Some("test project"),
+            "project_description dropped by persist"
+        );
+        assert!(
+            s.metadata.last_metadata_update.is_some(),
+            "last_metadata_update dropped by persist"
+        );
+        assert_eq!(
+            s.metadata.last_iteration_at,
+            Some(1_700_000_000),
+            "last_iteration_at dropped by persist"
+        );
+        assert!(s.metadata.on_fire.is_some(), "on_fire dropped by persist");
+        assert_eq!(
+            s.metadata.role.as_deref(),
+            Some("worker"),
+            "role dropped by persist"
+        );
+        assert_eq!(
+            s.metadata.bulletin.as_deref(),
+            Some("available"),
+            "bulletin dropped by persist"
+        );
+        assert_eq!(
+            s.metadata.reminder.as_deref(),
+            Some("remember to..."),
+            "reminder preserved"
+        );
+        assert_eq!(
+            s.metadata.prompt.as_deref(),
+            Some("do the thing"),
+            "prompt preserved"
+        );
+        assert!(s.metadata.vim_mode, "vim_mode preserved");
+        assert!(s.metadata.worktree, "worktree preserved");
+        assert!(!s.metadata.networked, "networked=false preserved");
+        assert_eq!(s.metadata.iteration, 3, "iteration preserved");
+
+        // Full restart simulation: feed the persisted SessionMetadata back
+        // through metadata_to_session_meta (the function apply_persisted
+        // uses on startup) and assert the re-hydrated SessionMeta matches
+        // what we registered. This closes the round-trip for the paths the
+        // reviewer called out:
+        //   (a) restart_session prev_metadata fallback — reads from
+        //       proto.sessions, which is populated by metadata_to_session_meta.
+        //   (b) scheduler respawn/revive — reads from the same place.
+        //   (c) locked_inject HttpApi — reads from the same place.
+        let hydrated = crate::daemon_protocol::metadata_to_session_meta_for_test(&s.metadata);
+        assert_eq!(hydrated.model.as_deref(), Some("openrouter/sonnet"));
+        assert_eq!(hydrated.effort.as_deref(), Some("max"));
+        assert_eq!(hydrated.backend.as_deref(), Some("opencode"));
+        assert_eq!(hydrated.backend_session_id.as_deref(), Some("oc_abc123"));
+        assert!(hydrated.on_fire.is_some());
+        assert_eq!(hydrated.last_iteration_at, Some(1_700_000_000));
+        assert_eq!(hydrated.last_metadata_update, Some(1_700_000_100));
     }
 
     #[tokio::test]
