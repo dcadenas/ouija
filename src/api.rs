@@ -1703,7 +1703,6 @@ pub struct SessionNameBody {
     /// For claude-code: passed as `claude --effort <X>`.
     /// For opencode: sent as `variant` on each `prompt_async` body.
     #[serde(default)]
-    #[allow(dead_code)] // wired into transport fns in a follow-up chunk
     effort: Option<String>,
     #[serde(default)]
     reminder: Option<String>,
@@ -1762,6 +1761,7 @@ pub async fn start_session(
                 None, // expects_reply not used for session start
                 body.backend.as_deref(),
                 body.model.as_deref(),
+                body.effort.as_deref(),
                 body.reminder.as_deref(),
             )
             .await;
@@ -1780,6 +1780,7 @@ pub async fn start_session(
             None, // expects_reply not used for session start
             body.backend.as_deref(),
             body.model.as_deref(),
+            body.effort.as_deref(),
             body.reminder.as_deref(),
             body.branch.as_deref(),
             body.base_branch.as_deref(),
@@ -1813,6 +1814,7 @@ pub async fn restart_session(
         None, // expects_reply not used for session restart
         body.backend.as_deref(),
         body.model.as_deref(),
+        body.effort.as_deref(),
         body.reminder.as_deref(),
     )
     .await;

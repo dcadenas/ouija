@@ -636,7 +636,8 @@ impl AppState {
                             from.as_deref(),
                             expects_reply,
                             None,
-                            None,
+                            None, // model
+                            None, // effort
                             reminder.as_deref(),
                             None, // branch
                             None, // base_branch
@@ -676,7 +677,8 @@ impl AppState {
                             from.as_deref(),
                             expects_reply,
                             None,
-                            None,
+                            None, // model
+                            None, // effort
                             reminder.as_deref(),
                         )
                         .await;

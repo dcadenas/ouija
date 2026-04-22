@@ -1107,7 +1107,7 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
     } else if let Some(rest) = cmd.strip_prefix("/start ") {
         let name = rest.trim();
         start_session(
-            state, name, None, None, None, None, None, None, None, None, None, None,
+            state, name, None, None, None, None, None, None, None, None, None, None, None,
         )
         .await
         .0
@@ -1120,7 +1120,7 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         } else {
             (rest, false)
         };
-        restart_session(state, name, fresh, None, None, None, None, None, None)
+        restart_session(state, name, fresh, None, None, None, None, None, None, None)
             .await
             .0
     } else {
@@ -1401,6 +1401,7 @@ pub async fn start_session(
     expects_reply: Option<bool>,
     backend: Option<&str>,
     model: Option<&str>,
+    effort: Option<&str>,
     reminder: Option<&str>,
     branch: Option<&str>,
     base_branch: Option<&str>,
@@ -1477,7 +1478,7 @@ pub async fn start_session(
         project_dir: dir.clone(),
         worktree: None, // ouija manages worktrees, not the backend
         model: model.map(String::from),
-        effort: None, // wired through in a later chunk
+        effort: effort.map(String::from),
     });
 
     // Pre-compute the prompt text and sender envelope before launching, so we
@@ -1648,6 +1649,7 @@ pub async fn start_session(
                 backend: Some(backend_name.clone()),
                 backend_session_id,
                 model: model.map(String::from),
+                effort: effort.map(String::from),
                 reminder: reminder.map(String::from),
                 prompt: prompt.map(String::from),
                 ..Default::default()
@@ -1668,9 +1670,7 @@ pub async fn start_session(
                         crate::backend::DeliveryMode::HttpApi { .. }
                     ) {
                         let port = state.opencode_serve_port();
-                        let body = serde_json::json!({
-                            "parts": [{"type": "text", "text": prompt_text}]
-                        });
+                        let body = opencode_prompt_body(prompt_text, model, effort);
                         let url = format!("http://127.0.0.1:{port}/session/{oc_sid}/prompt_async");
                         let state2 = state.clone();
                         let dir2 = dir.clone();
@@ -1754,6 +1754,7 @@ pub async fn restart_session(
     expects_reply: Option<bool>,
     backend: Option<&str>,
     model: Option<&str>,
+    effort: Option<&str>,
     reminder: Option<&str>,
 ) -> (String, Option<u64>) {
     // Snapshot full metadata before killing so we can carry it forward
@@ -1781,6 +1782,16 @@ pub async fn restart_session(
         }
     };
 
+    // Preserve previous model/effort when caller omits them, matching the
+    // backend fallback logic above. This ensures `ouija restart-session` does
+    // not silently downgrade a session to the backend's default model.
+    let effective_model = model
+        .map(String::from)
+        .or_else(|| prev_metadata.as_ref().and_then(|m| m.model.clone()));
+    let effective_effort = effort
+        .map(String::from)
+        .or_else(|| prev_metadata.as_ref().and_then(|m| m.effort.clone()));
+
     // --- Soft restart for HttpApi backends ---
     // Create a new session on the serve via HTTP API and deliver the prompt directly.
     // No tmux interaction needed — the LLM works in the serve, not the TUI.
@@ -1803,9 +1814,21 @@ pub async fn restart_session(
                 from,
                 expects_reply,
                 reminder,
+                effective_model.as_deref(),
+                effective_effort.as_deref(),
             )
             .await
             {
+                // Persist the effective model/effort on the session so a future
+                // restart without --model/--effort keeps the override.
+                {
+                    let mut proto = state.protocol.write().await;
+                    if let Some(s) = proto.sessions.get_mut(name) {
+                        s.metadata.model = effective_model.clone();
+                        s.metadata.effort = effective_effort.clone();
+                    }
+                    state.persist_protocol_state(&proto);
+                }
                 return result;
             }
             tracing::info!("soft restart failed for '{name}', falling back to hard restart");
@@ -1856,18 +1879,6 @@ pub async fn restart_session(
 
     crate::backend::claude_code::pre_trust_workspace(&dir);
     crate::backend::pre_trust_mise(&dir);
-
-    // Preserve previous model/effort when caller omits them, matching the
-    // backend fallback logic above. This ensures `ouija restart-session` does
-    // not silently downgrade a session to the backend's default model.
-    let effective_model = model.map(String::from).or_else(|| {
-        prev_metadata
-            .as_ref()
-            .and_then(|m| m.model.clone())
-    });
-    let effective_effort = prev_metadata
-        .as_ref()
-        .and_then(|m| m.effort.clone());
 
     let claude_cmd = if fresh {
         backend.build_start_command(&crate::backend::StartOpts {
@@ -2147,8 +2158,8 @@ pub async fn restart_session(
                     backend: Some(backend_name.clone()),
                     project_description: m.project_description.clone(),
                     last_metadata_update: None,
-                    model: model.map(String::from).or_else(|| m.model.clone()),
-                    effort: m.effort.clone(),
+                    model: effective_model.clone(),
+                    effort: effective_effort.clone(),
                     reminder: effective_reminder.clone(),
                     prompt: effective_prompt.clone(),
                     iteration: m.iteration,
@@ -2160,7 +2171,8 @@ pub async fn restart_session(
                     project_dir: Some(dir.clone()),
                     backend: Some(backend_name.clone()),
                     backend_session_id,
-                    model: model.map(String::from),
+                    model: effective_model.clone(),
+                    effort: effective_effort.clone(),
                     reminder: effective_reminder.clone(),
                     prompt: effective_prompt.clone(),
                     ..Default::default()
@@ -2194,6 +2206,10 @@ pub async fn restart_session(
 /// via HTTP API and deliver the prompt directly. Then respawn the TUI attach to
 /// point at the new session so the human can interact.
 ///
+/// `model` and `effort` are applied to the delivered prompt_async body via
+/// [`opencode_prompt_body`] so the new session runs with the right model /
+/// variant from the first request.
+///
 /// Returns `Ok((status_message, prompt_msg_id))` on success.
 /// Returns `Err(())` on failure — caller should fall back to hard restart.
 #[allow(clippy::too_many_arguments)]
@@ -2206,6 +2222,8 @@ async fn soft_restart_session(
     from: Option<&str>,
     expects_reply: Option<bool>,
     reminder: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
 ) -> Result<(String, Option<u64>), ()> {
     let port = state.opencode_serve_port();
 
@@ -2272,9 +2290,7 @@ async fn soft_restart_session(
             full_text
         };
 
-        let body = serde_json::json!({
-            "parts": [{"type": "text", "text": message}]
-        });
+        let body = opencode_prompt_body(&message, model, effort);
         let async_url = format!("http://127.0.0.1:{port}/session/{new_session_id}/prompt_async");
         let resp = state
             .http_client
@@ -2695,7 +2711,6 @@ fn save_peer_pubkeys(data_dir: &Path, pubkeys: &HashSet<PublicKey>) {
 /// A model string with no `/` is treated as ambiguous and the `model` field is
 /// omitted entirely — opencode will fall back to the agent / session default.
 /// `effort` is passed through unchanged as `variant`.
-#[allow(dead_code)] // wired into start_session/soft_restart_session in a follow-up chunk
 pub(crate) fn opencode_prompt_body(
     text: &str,
     model: Option<&str>,
