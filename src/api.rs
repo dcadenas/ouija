@@ -30,7 +30,9 @@ const MAX_TASK_RUNS_RETURNED: usize = 50;
 /// value, or a JSON client passing an empty placeholder) and must not flow
 /// through as if it were an explicit override.
 pub(crate) fn normalize_optional_string(input: Option<String>) -> Option<String> {
-    input.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    input
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Extract a short project description from a project directory.

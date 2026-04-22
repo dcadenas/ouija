@@ -1795,14 +1795,18 @@ pub async fn restart_session(
         let t = s.trim();
         if t.is_empty() { None } else { Some(s) }
     };
-    let effective_model = model
-        .map(String::from)
-        .and_then(normalize)
-        .or_else(|| prev_metadata.as_ref().and_then(|m| m.model.clone()).and_then(normalize));
-    let effective_effort = effort
-        .map(String::from)
-        .and_then(normalize)
-        .or_else(|| prev_metadata.as_ref().and_then(|m| m.effort.clone()).and_then(normalize));
+    let effective_model = model.map(String::from).and_then(normalize).or_else(|| {
+        prev_metadata
+            .as_ref()
+            .and_then(|m| m.model.clone())
+            .and_then(normalize)
+    });
+    let effective_effort = effort.map(String::from).and_then(normalize).or_else(|| {
+        prev_metadata
+            .as_ref()
+            .and_then(|m| m.effort.clone())
+            .and_then(normalize)
+    });
 
     // --- Soft restart for HttpApi backends ---
     // Create a new session on the serve via HTTP API and deliver the prompt directly.
