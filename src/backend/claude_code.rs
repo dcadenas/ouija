@@ -71,6 +71,38 @@ mod embedded {
     pub const MARKETPLACE_JSON: &str = include_str!("../../.claude-plugin/marketplace.json");
 }
 
+/// Compare the previously-stamped plugin version against the current daemon
+/// version. Returns `Some(previous)` when a mismatch warning should be
+/// printed, `None` when the versions match or the previous stamp is absent
+/// (fresh install). An unreadable or empty stamp is treated as absent.
+///
+/// This is the operator-facing replacement for the old session-start LLM
+/// context injection: if a long-running coding session was spawned before a
+/// daemon upgrade, its cached hook scripts may still predate the running
+/// daemon until the session is restarted.
+fn version_mismatch_to_report(previous: Option<&str>, current: &str) -> Option<String> {
+    let prev = previous?.trim();
+    if prev.is_empty() || prev == current {
+        None
+    } else {
+        Some(prev.to_string())
+    }
+}
+
+/// Print a stderr warning when the plugin cache's old `.version` differs
+/// from the daemon binary's version. Silent otherwise. Called from
+/// `ensure_plugin_installed` and `refresh_plugin_cache` right before they
+/// overwrite the stamp.
+fn warn_if_plugin_version_skew(cache_dir: &std::path::Path, current: &str) {
+    let prev = std::fs::read_to_string(cache_dir.join(".version")).ok();
+    if let Some(old) = version_mismatch_to_report(prev.as_deref(), current) {
+        eprintln!(
+            "warning: ouija plugin cache was previously stamped {old}, daemon is {current} — \
+             restart any running coding sessions so they pick up the new hook scripts."
+        );
+    }
+}
+
 /// Write all embedded plugin files to the given cache directory.
 fn write_embedded_plugin_files(cache_dir: &std::path::Path) {
     let files: &[(&str, &str)] = &[
@@ -206,6 +238,10 @@ fn ensure_plugin_installed() {
     }
 
     write_embedded_plugin_files(&cache_dir);
+
+    // Warn the operator if the previously-stamped plugin version differs
+    // from the running daemon, BEFORE we overwrite .version.
+    warn_if_plugin_version_skew(&cache_dir, version);
 
     // Stamp version
     let _ = std::fs::write(cache_dir.join(".version"), version);
@@ -351,7 +387,10 @@ pub fn refresh_plugin_cache(version: &str) {
         write_embedded_plugin_files(&cache_dir);
     }
 
-    // Stamp version so hooks can detect plugin/daemon mismatch
+    // Warn the operator before overwriting if the previous stamp differs.
+    warn_if_plugin_version_skew(&cache_dir, version);
+
+    // Stamp version so the next daemon start can detect plugin/daemon mismatch.
     let _ = std::fs::write(cache_dir.join(".version"), version);
 
     println!("plugin cache refreshed");
@@ -616,6 +655,33 @@ mod tests {
         assert_eq!(
             b.resolve_project_root("/home/user/myproject"),
             "/home/user/myproject"
+        );
+    }
+
+    #[test]
+    fn version_mismatch_none_when_previous_missing() {
+        assert_eq!(version_mismatch_to_report(None, "1.2.3"), None);
+    }
+
+    #[test]
+    fn version_mismatch_none_when_previous_empty() {
+        assert_eq!(version_mismatch_to_report(Some(""), "1.2.3"), None);
+        assert_eq!(version_mismatch_to_report(Some("   \n"), "1.2.3"), None);
+    }
+
+    #[test]
+    fn version_mismatch_none_when_match() {
+        assert_eq!(version_mismatch_to_report(Some("1.2.3"), "1.2.3"), None);
+        // Trailing newline (how `std::fs::write` of the version would behave
+        // if we ever started appending one) should not count as a mismatch.
+        assert_eq!(version_mismatch_to_report(Some("1.2.3\n"), "1.2.3"), None);
+    }
+
+    #[test]
+    fn version_mismatch_reports_trimmed_previous() {
+        assert_eq!(
+            version_mismatch_to_report(Some("1.2.2\n"), "1.2.3"),
+            Some("1.2.2".to_string())
         );
     }
 }
