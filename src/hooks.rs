@@ -465,81 +465,9 @@ async fn session_start_inner(
         })
         .await;
 
-    // Build peer list
-    let peers: Vec<Value> = {
-        let proto = state.protocol.read().await;
-        proto
-            .sessions
-            .values()
-            .filter(|s| s.id != id)
-            .map(|s| {
-                json!({
-                    "id": s.id,
-                    "role": s.metadata.role,
-                    "bulletin": s.metadata.bulletin,
-                })
-            })
-            .collect()
-    };
-
-    // Version check
-    let daemon_version = env!("CARGO_PKG_VERSION");
-    let plugin_version = std::env::var("HOME")
-        .ok()
-        .and_then(|home| {
-            std::fs::read_dir(format!("{home}/.claude/plugins/cache/ouija/ouija")).ok()
-        })
-        .and_then(|entries| {
-            entries.flatten().find_map(|e| {
-                let vf = e.path().join(".version");
-                std::fs::read_to_string(vf).ok()
-            })
-        })
-        .map(|v| v.trim().to_string());
-
-    let version_warning = plugin_version
-        .as_ref()
-        .filter(|pv| pv.as_str() != daemon_version)
-        .map(|pv| format!("daemon={daemon_version}, plugin={pv}"));
-
-    // Format output
-    let mut output_parts = vec![format!(
-        "<ouija-status type=\"registered\">Registered as {id} on the ouija mesh.</ouija-status>"
-    )];
-
-    if let Some(ref warn) = version_warning {
-        output_parts.push(format!(
-            "WARNING: ouija version mismatch — {warn}.\n  To fix: run 'ouija update', then start a new session."
-        ));
-    }
-
-    if !peers.is_empty() {
-        let mut peer_lines =
-            vec!["<ouija-status type=\"mesh-update\">Other sessions on the mesh:".to_string()];
-        for p in &peers {
-            let mut line = format!("  - {}", p["id"].as_str().unwrap_or("?"));
-            if let Some(r) = p["role"].as_str() {
-                line.push_str(&format!(" | {r}"));
-            }
-            if let Some(b) = p["bulletin"].as_str() {
-                line.push_str(&format!(" | bulletin: {b}"));
-            }
-            peer_lines.push(line);
-        }
-        peer_lines.push("</ouija-status>".into());
-        output_parts.push(peer_lines.join("\n"));
-    } else {
-        output_parts.push(
-            "<ouija-status type=\"mesh-update\">No other sessions on the mesh.</ouija-status>"
-                .into(),
-        );
-    }
-
     json!({
         "registered": id,
-        "output": output_parts.join("\n"),
-        "peers": peers,
-        "version_warning": version_warning,
+        "output": "",
     })
 }
 
@@ -801,8 +729,9 @@ mod tests {
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "myproject");
-        let output = result["output"].as_str().unwrap();
-        assert!(output.contains("ouija-status"), "output: {output}");
+        // output is intentionally empty — session-start no longer injects mesh
+        // state into the LLM context window.
+        assert_eq!(result["output"], "");
     }
 
     #[tokio::test]
