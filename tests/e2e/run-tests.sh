@@ -119,10 +119,12 @@ REGISTER_SCRIPT=$(find_script "ouija-register.sh")
 api "$BASE" POST /api/settings -d '{"auto_register":true}' >/dev/null
 # Remove existing registration on PANE_A so the hook can register fresh
 api "$BASE" POST /api/remove -d '{"id":"sess-a2"}' >/dev/null 2>&1 || true
-# Run the hook — it should register a session named "my-project"
-# (hook output is intentionally empty; verify registration via session list)
-HOOK_OUT=$(echo '{"source":"startup"}' | TMUX_PANE="$PANE_A" OUIJA_PORT=$PORT bash -c "cd /tmp/my-project && bash '$REGISTER_SCRIPT'" 2>&1)
-assert_eq "hook output is empty" "$HOOK_OUT" ""
+# Run the hook — it should register a session named "my-project".
+# The hook intentionally produces no stdout (see PR #534), and
+# ouija-register.sh swallows curl errors with `|| exit 0`, so asserting
+# on empty stdout would pass even if the daemon were unreachable.
+# Verify registration via the daemon's session list instead.
+echo '{"source":"startup"}' | TMUX_PANE="$PANE_A" OUIJA_PORT=$PORT bash -c "cd /tmp/my-project && bash '$REGISTER_SCRIPT'" >/dev/null 2>&1
 ids=$(session_ids "$BASE")
 assert_contains "hook-registered session in list" "$ids" "my-project"
 # Clean up
