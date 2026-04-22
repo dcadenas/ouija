@@ -1738,7 +1738,11 @@ mod tests {
                 ..Default::default()
             },
         });
-        let meta = &state.sessions.get("s").expect("session registered").metadata;
+        let meta = &state
+            .sessions
+            .get("s")
+            .expect("session registered")
+            .metadata;
         assert_eq!(meta.model.as_deref(), Some("sonnet"));
         assert_eq!(meta.effort.as_deref(), Some("max"));
     }

@@ -2719,9 +2719,7 @@ pub(crate) fn opencode_prompt_body(
     let mut body = serde_json::json!({
         "parts": [{"type": "text", "text": text}],
     });
-    let obj = body
-        .as_object_mut()
-        .expect("json! macro returns an object");
+    let obj = body.as_object_mut().expect("json! macro returns an object");
     if let Some(m) = model
         && let Some((provider, model_id)) = m.split_once('/')
     {

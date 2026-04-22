@@ -562,10 +562,7 @@ pub(crate) async fn deliver_via_http(
     if let Some(dir) = project_dir {
         req = req.header("x-opencode-directory", dir);
     }
-    let resp = req
-        .send()
-        .await
-        .context("prompt_async request failed")?;
+    let resp = req.send().await.context("prompt_async request failed")?;
 
     let status = resp.status();
     if status.is_success() {
