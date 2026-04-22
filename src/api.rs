@@ -2049,9 +2049,13 @@ fn disambiguate_adoption_candidates(
     }
 }
 
-/// Query the opencode serve for a session's directory, find the matching ouija
-/// session, and set its `backend_session_id` + `backend`.
-async fn adopt_backend_session_id(
+/// Query the opencode serve for the project directory associated with a
+/// `backend_session_id`. Returns `None` if the serve is unreachable, the
+/// session is unknown to the serve, or the response lacks a `directory` field.
+///
+/// Extracted so the auto-provision path (issue #35) can reuse the resolved
+/// directory without a second HTTP round-trip after adoption misses.
+async fn lookup_opencode_session_dir(
     state: &std::sync::Arc<crate::state::AppState>,
     backend_sid: &str,
 ) -> Option<String> {
@@ -2068,7 +2072,16 @@ async fn adopt_backend_session_id(
         return None;
     }
     let body: serde_json::Value = resp.json().await.ok()?;
-    let dir = body["directory"].as_str()?;
+    body["directory"].as_str().map(str::to_string)
+}
+
+/// Query the opencode serve for a session's directory, find the matching ouija
+/// session, and set its `backend_session_id` + `backend`.
+async fn adopt_backend_session_id(
+    state: &std::sync::Arc<crate::state::AppState>,
+    backend_sid: &str,
+) -> Option<String> {
+    let dir = lookup_opencode_session_dir(state, backend_sid).await?;
 
     // Collect ALL local ouija sessions matching this directory that lack a
     // backend_session_id (issue #15). Silently picking the first match — as
@@ -2083,14 +2096,14 @@ async fn adopt_backend_session_id(
             .values()
             .filter(|s| {
                 matches!(s.origin, crate::daemon_protocol::Origin::Local)
-                    && s.metadata.project_dir.as_deref() == Some(dir)
+                    && s.metadata.project_dir.as_deref() == Some(dir.as_str())
                     && s.metadata.backend_session_id.is_none()
             })
             .map(|s| s.id.clone())
             .collect()
     };
 
-    let session_id = disambiguate_adoption_candidates(backend_sid, dir, candidates)?;
+    let session_id = disambiguate_adoption_candidates(backend_sid, &dir, candidates)?;
 
     tracing::info!(
         "adopting backend_session_id {backend_sid} for session {session_id} (dir: {dir})"
@@ -2554,6 +2567,23 @@ mod tests {
             pending.as_deref(),
             Some("first"),
             "first caller's continuation must not be overwritten by the rejected second attempt"
+        );
+    }
+
+    // --- lookup_opencode_session_dir ---
+
+    #[tokio::test]
+    async fn lookup_opencode_session_dir_returns_none_when_serve_unreachable() {
+        // The test env binds opencode_serve_port() to config.port + 320.
+        // For new_for_test(), config.port = 0 → port 320 (privileged, unbound),
+        // so the GET will fail with connection refused. The helper must not
+        // panic and must surface the failure as None so callers can fall back
+        // gracefully (e.g. to the auto-provision path or the strict error).
+        let state = crate::state::AppState::new_for_test();
+        let dir = lookup_opencode_session_dir(&state, "ses_does_not_exist").await;
+        assert!(
+            dir.is_none(),
+            "unreachable opencode serve must produce None, got Some({dir:?})"
         );
     }
 }
