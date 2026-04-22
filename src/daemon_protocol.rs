@@ -484,6 +484,11 @@ pub fn format_session_message(
     format!("<msg {attrs}>{message}</msg>")
 }
 
+#[cfg(test)]
+pub(crate) fn metadata_to_session_meta_for_test(m: &crate::state::SessionMetadata) -> SessionMeta {
+    metadata_to_session_meta(Some(m))
+}
+
 fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>) -> SessionMeta {
     match m {
         Some(m) => SessionMeta {

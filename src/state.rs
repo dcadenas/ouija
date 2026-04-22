@@ -1625,6 +1625,24 @@ pub(crate) mod tests {
         assert!(s.metadata.worktree, "worktree preserved");
         assert!(!s.metadata.networked, "networked=false preserved");
         assert_eq!(s.metadata.iteration, 3, "iteration preserved");
+
+        // Full restart simulation: feed the persisted SessionMetadata back
+        // through metadata_to_session_meta (the function apply_persisted
+        // uses on startup) and assert the re-hydrated SessionMeta matches
+        // what we registered. This closes the round-trip for the paths the
+        // reviewer called out:
+        //   (a) restart_session prev_metadata fallback — reads from
+        //       proto.sessions, which is populated by metadata_to_session_meta.
+        //   (b) scheduler respawn/revive — reads from the same place.
+        //   (c) locked_inject HttpApi — reads from the same place.
+        let hydrated = crate::daemon_protocol::metadata_to_session_meta_for_test(&s.metadata);
+        assert_eq!(hydrated.model.as_deref(), Some("openrouter/sonnet"));
+        assert_eq!(hydrated.effort.as_deref(), Some("max"));
+        assert_eq!(hydrated.backend.as_deref(), Some("opencode"));
+        assert_eq!(hydrated.backend_session_id.as_deref(), Some("oc_abc123"));
+        assert!(hydrated.on_fire.is_some());
+        assert_eq!(hydrated.last_iteration_at, Some(1_700_000_000));
+        assert_eq!(hydrated.last_metadata_update, Some(1_700_000_100));
     }
 
     #[tokio::test]
