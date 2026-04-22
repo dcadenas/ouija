@@ -477,16 +477,21 @@ pub async fn locked_inject(
 
     match backend.delivery_mode() {
         crate::backend::DeliveryMode::HttpApi { .. } => {
-            // Read both fields under one lock acquisition so a concurrent
-            // session mutation can't split them.
-            let (oc_session_id, project_dir) = {
+            // Read backend_session_id, project_dir, model, and effort under
+            // one lock acquisition so a concurrent session mutation can't
+            // split them. model/effort are applied on every prompt_async
+            // body so messages after the initial prompt continue to route
+            // through the session's configured model and variant.
+            let (oc_session_id, project_dir, model, effort) = {
                 let proto = state.protocol.read().await;
                 match proto.sessions.get(session_id) {
                     Some(s) => (
                         s.metadata.backend_session_id.clone(),
                         s.metadata.project_dir.clone(),
+                        s.metadata.model.clone(),
+                        s.metadata.effort.clone(),
                     ),
-                    None => (None, None),
+                    None => (None, None, None, None),
                 }
             };
             // locked_inject is the fire-and-forget path used by reminders,
@@ -496,8 +501,15 @@ pub async fn locked_inject(
             // call deliver_via_http directly.
             match oc_session_id {
                 Some(sid) => {
-                    if let Err(e) =
-                        deliver_via_http(state, &sid, project_dir.as_deref(), message).await
+                    if let Err(e) = deliver_via_http(
+                        state,
+                        &sid,
+                        project_dir.as_deref(),
+                        message,
+                        model.as_deref(),
+                        effort.as_deref(),
+                    )
+                    .await
                     {
                         tracing::warn!(session = %session_id, "http delivery failed: {e}");
                     }
@@ -538,6 +550,12 @@ pub async fn locked_inject(
 /// for the LLM to finish processing. The message appears as a user message
 /// in the session and triggers an assistant turn.
 ///
+/// `model` and `effort` are applied to every request via
+/// [`crate::nostr_transport::opencode_prompt_body`]. Opencode's server remembers
+/// the last model per session, but the `variant` (effort) is not remembered —
+/// so re-sending both on each delivery keeps the session anchored to the
+/// operator-requested configuration.
+///
 /// Returns `Err` on connection failure or any non-2xx response so callers can
 /// distinguish delivered from swallowed. Best-effort callers (e.g. the HttpApi
 /// branch of `locked_inject`) wrap this in a tracing::warn.
@@ -546,13 +564,13 @@ pub(crate) async fn deliver_via_http(
     oc_session_id: &str,
     project_dir: Option<&str>,
     message: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
 ) -> anyhow::Result<()> {
     let port = state.opencode_serve_port();
 
     let client = state.http_client.clone();
-    let body = serde_json::json!({
-        "parts": [{"type": "text", "text": message}]
-    });
+    let body = crate::nostr_transport::opencode_prompt_body(message, model, effort);
 
     let async_url = format!("http://127.0.0.1:{port}/session/{oc_session_id}/prompt_async");
     let mut req = client

@@ -1001,6 +1001,8 @@ async fn compact_inner(
                 backend_session_id: s.metadata.backend_session_id.clone(),
                 project_dir: s.metadata.project_dir.clone(),
                 backend_name: s.metadata.backend.clone(),
+                model: s.metadata.model.clone(),
+                effort: s.metadata.effort.clone(),
             },
             None => {
                 return (
@@ -1116,6 +1118,8 @@ async fn compact_inner(
                 &backend_session_id,
                 lookup.project_dir.as_deref(),
                 &continuation,
+                lookup.model.as_deref(),
+                lookup.effort.as_deref(),
             )
             .await
             {
@@ -1134,6 +1138,8 @@ struct SessionLookup {
     backend_session_id: Option<String>,
     project_dir: Option<String>,
     backend_name: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
 }
 
 // --- Nodes ---
