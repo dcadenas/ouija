@@ -98,9 +98,20 @@ pub struct SessionMeta {
     /// Unix timestamp; 0 in model tests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_metadata_update: Option<i64>,
-    /// Which LLM model this session is configured to use (informational only).
+    /// Which LLM model this session is configured to use.
+    ///
+    /// For claude-code: passed as `--model <X>` on the CLI (alias or full id).
+    /// For opencode: parsed on first `/` as `providerID/modelID` and sent on each
+    /// `prompt_async` body as `{"model":{"providerID":..,"modelID":..}}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Reasoning effort / variant for the model.
+    ///
+    /// For claude-code: passed as `--effort <X>` on the CLI (`low|medium|high|xhigh|max`).
+    /// For opencode: sent as `variant` on each `prompt_async` body. Opaque passthrough
+    /// string — opencode's variant ladder per provider is not interpreted here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// Reminder text re-injected on idle. Also appended to prompt at session start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reminder: Option<String>,
@@ -192,6 +203,7 @@ impl Default for SessionMeta {
             project_description: None,
             last_metadata_update: None,
             model: None,
+            effort: None,
             reminder: None,
             prompt: None,
             iteration: 0,
@@ -473,6 +485,7 @@ fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>) -> Sessio
             project_description: m.project_description.clone(),
             last_metadata_update: m.last_metadata_update.map(|ts| ts.timestamp()),
             model: m.model.clone(),
+            effort: m.effort.clone(),
             reminder: m.reminder.clone(),
             prompt: m.prompt.clone(),
             iteration: m.iteration,
@@ -1709,6 +1722,38 @@ mod tests {
         assert_eq!(meta.iteration, 0);
         assert!(meta.iteration_log.is_empty());
         assert!(meta.last_iteration_at.is_none());
+        assert!(meta.model.is_none());
+        assert!(meta.effort.is_none());
+    }
+
+    #[test]
+    fn register_roundtrips_model_and_effort() {
+        let mut state = DaemonState::new_for_model("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "s".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                model: Some("sonnet".into()),
+                effort: Some("max".into()),
+                ..Default::default()
+            },
+        });
+        let meta = &state.sessions.get("s").expect("session registered").metadata;
+        assert_eq!(meta.model.as_deref(), Some("sonnet"));
+        assert_eq!(meta.effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn session_meta_serde_effort_round_trip() {
+        let meta = SessionMeta {
+            model: Some("openrouter/openai/gpt-5.4".into()),
+            effort: Some("xhigh".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let decoded: SessionMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.model.as_deref(), Some("openrouter/openai/gpt-5.4"));
+        assert_eq!(decoded.effort.as_deref(), Some("xhigh"));
     }
 
     #[test]

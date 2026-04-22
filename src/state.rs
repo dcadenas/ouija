@@ -175,9 +175,19 @@ pub struct SessionMetadata {
     /// Whether this session runs in an isolated git worktree (backend worktree mode).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub worktree: bool,
-    /// Which LLM model this session is configured to use (informational only).
+    /// Which LLM model this session is configured to use.
+    ///
+    /// For claude-code: passed as `--model <X>` on the CLI.
+    /// For opencode: split on first `/` and sent as `{providerID,modelID}` on
+    /// each `prompt_async` body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Reasoning effort / variant for the model.
+    ///
+    /// For claude-code: passed as `--effort <X>` on the CLI.
+    /// For opencode: sent as `variant` on each `prompt_async` body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// Reminder text re-injected on idle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reminder: Option<String>,
@@ -224,6 +234,7 @@ impl Default for SessionMetadata {
             bulletin: None,
             worktree: false,
             model: None,
+            effort: None,
             reminder: None,
             prompt: None,
             iteration: 0,

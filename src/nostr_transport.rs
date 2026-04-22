@@ -2128,6 +2128,7 @@ pub async fn restart_session(
                     project_description: m.project_description.clone(),
                     last_metadata_update: None,
                     model: model.map(String::from).or_else(|| m.model.clone()),
+                    effort: m.effort.clone(),
                     reminder: effective_reminder.clone(),
                     prompt: effective_prompt.clone(),
                     iteration: m.iteration,
