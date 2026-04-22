@@ -536,6 +536,14 @@ impl AppState {
                     let p = pane.clone();
                     let n = name.clone();
                     let v = value.clone();
+                    // FIXME: fire-and-forget — this spawn_blocking is NOT
+                    // awaited, so a fast caller (e.g. `ouija clear-reminder`
+                    // from the newly spawned session) can race against the
+                    // `@ouija_session` pane-var write and fall through to the
+                    // slower API lookup. The OUIJA_SESSION_ID env var set by
+                    // `tmux::pane_env_args` at spawn time is the primary
+                    // signal and masks this race in practice; do not rely on
+                    // the tmux pane var as the sole session-id source.
                     tokio::task::spawn_blocking(move || crate::tmux_var::set(&p, &n, &v));
                 }
                 Effect::ClearTmuxVar { pane, name } => {

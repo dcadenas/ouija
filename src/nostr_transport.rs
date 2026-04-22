@@ -1546,27 +1546,24 @@ pub async fn start_session(
                 .output()
                 .is_ok_and(|o| o.status.success());
 
-            // Disable shell history in spawned panes (bash/zsh via HISTFILE,
-            // fish via fish_history).
+            // `pane_env_args` sets OUIJA_SESSION_ID (primary session-id
+            // signal for the ouija CLI) plus HISTFILE/fish_history to
+            // suppress shell history writes.
+            let env_args = crate::tmux::pane_env_args(&window_name);
             let pane_id = if tmux_session_exists {
                 let target = format!("{tmux_session}:");
-                let output = Command::new("tmux")
-                    .args([
-                        "new-window",
-                        "-d",
-                        "-e",
-                        "HISTFILE=/dev/null",
-                        "-e",
-                        "fish_history=",
-                        "-t",
-                        &target,
-                        "-n",
-                        &window_name,
-                        "-P",
-                        "-F",
-                        "#{pane_id}",
-                    ])
-                    .output()?;
+                let mut args: Vec<&str> = vec!["new-window", "-d"];
+                args.extend(env_args.iter().map(String::as_str));
+                args.extend_from_slice(&[
+                    "-t",
+                    &target,
+                    "-n",
+                    &window_name,
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                ]);
+                let output = Command::new("tmux").args(&args).output()?;
                 if !output.status.success() {
                     anyhow::bail!(
                         "tmux new-window failed: {}",
@@ -1575,23 +1572,18 @@ pub async fn start_session(
                 }
                 String::from_utf8_lossy(&output.stdout).trim().to_string()
             } else {
-                let output = Command::new("tmux")
-                    .args([
-                        "new-session",
-                        "-d",
-                        "-e",
-                        "HISTFILE=/dev/null",
-                        "-e",
-                        "fish_history=",
-                        "-s",
-                        &tmux_session,
-                        "-n",
-                        &window_name,
-                        "-P",
-                        "-F",
-                        "#{pane_id}",
-                    ])
-                    .output()?;
+                let mut args: Vec<&str> = vec!["new-session", "-d"];
+                args.extend(env_args.iter().map(String::as_str));
+                args.extend_from_slice(&[
+                    "-s",
+                    &tmux_session,
+                    "-n",
+                    &window_name,
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                ]);
+                let output = Command::new("tmux").args(&args).output()?;
                 if !output.status.success() {
                     anyhow::bail!(
                         "tmux new-session failed: {}",
@@ -1986,30 +1978,15 @@ pub async fn restart_session(
             // we respawn with a bare shell and then send-keys instead of letting
             // respawn-pane run the command directly (which would exit immediately).
             if let Some(ref pane) = existing_pane {
-                let respawn_args: Vec<&str> = if is_http_api {
-                    vec![
-                        "respawn-pane",
-                        "-k",
-                        "-e",
-                        "HISTFILE=/dev/null",
-                        "-e",
-                        "fish_history=",
-                        "-t",
-                        pane,
-                    ]
-                } else {
-                    vec![
-                        "respawn-pane",
-                        "-k",
-                        "-e",
-                        "HISTFILE=/dev/null",
-                        "-e",
-                        "fish_history=",
-                        "-t",
-                        pane,
-                        &full_cmd,
-                    ]
-                };
+                // See `pane_env_args` docs for why OUIJA_SESSION_ID must
+                // be set on every pane spawn (including respawn-pane).
+                let env_args = crate::tmux::pane_env_args(&window_name);
+                let mut respawn_args: Vec<&str> = vec!["respawn-pane", "-k"];
+                respawn_args.extend(env_args.iter().map(String::as_str));
+                respawn_args.extend_from_slice(&["-t", pane]);
+                if !is_http_api {
+                    respawn_args.push(&full_cmd);
+                }
                 let output = Command::new("tmux").args(&respawn_args).output();
                 match output {
                     Ok(o) if o.status.success() => {
@@ -2043,42 +2020,33 @@ pub async fn restart_session(
                 .is_ok_and(|o| o.status.success());
 
             let target = format!("{tmux_session}:");
+            let env_args = crate::tmux::pane_env_args(&window_name);
             let output = if tmux_session_exists {
-                Command::new("tmux")
-                    .args([
-                        "new-window",
-                        "-d",
-                        "-e",
-                        "HISTFILE=/dev/null",
-                        "-e",
-                        "fish_history=",
-                        "-t",
-                        &target,
-                        "-n",
-                        &window_name,
-                        "-P",
-                        "-F",
-                        "#{pane_id}",
-                    ])
-                    .output()?
+                let mut args: Vec<&str> = vec!["new-window", "-d"];
+                args.extend(env_args.iter().map(String::as_str));
+                args.extend_from_slice(&[
+                    "-t",
+                    &target,
+                    "-n",
+                    &window_name,
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                ]);
+                Command::new("tmux").args(&args).output()?
             } else {
-                Command::new("tmux")
-                    .args([
-                        "new-session",
-                        "-d",
-                        "-e",
-                        "HISTFILE=/dev/null",
-                        "-e",
-                        "fish_history=",
-                        "-s",
-                        &tmux_session,
-                        "-n",
-                        &window_name,
-                        "-P",
-                        "-F",
-                        "#{pane_id}",
-                    ])
-                    .output()?
+                let mut args: Vec<&str> = vec!["new-session", "-d"];
+                args.extend(env_args.iter().map(String::as_str));
+                args.extend_from_slice(&[
+                    "-s",
+                    &tmux_session,
+                    "-n",
+                    &window_name,
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                ]);
+                Command::new("tmux").args(&args).output()?
             };
             if !output.status.success() {
                 anyhow::bail!(
@@ -2397,10 +2365,12 @@ async fn soft_restart_session(
             "opencode attach http://127.0.0.1:{port} --session {new_session_id} --dir {escaped_dir}"
         );
         let pane = pane.to_string();
+        let env_args = crate::tmux::pane_env_args(name);
         tokio::task::spawn_blocking(move || {
-            let _ = std::process::Command::new("tmux")
-                .args(["respawn-pane", "-k", "-t", &pane, &attach_cmd])
-                .status();
+            let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
+            args.extend(env_args.iter().map(String::as_str));
+            args.extend_from_slice(&["-t", &pane, &attach_cmd]);
+            let _ = std::process::Command::new("tmux").args(&args).status();
         });
     }
 
