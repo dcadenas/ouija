@@ -1795,15 +1795,14 @@ pub async fn restart_session(
     // instead of flowing through to `claude --model '  sonnet  '`. Covers
     // both caller-supplied values and persisted SessionMeta.model/effort
     // from older builds that predate the boundary normalization.
-    let effective_model = crate::api::normalize_optional_string(model.map(String::from)).or_else(
-        || {
+    let effective_model =
+        crate::api::normalize_optional_string(model.map(String::from)).or_else(|| {
             crate::api::normalize_optional_string(
                 prev_metadata.as_ref().and_then(|m| m.model.clone()),
             )
-        },
-    );
-    let effective_effort = crate::api::normalize_optional_string(effort.map(String::from))
-        .or_else(|| {
+        });
+    let effective_effort =
+        crate::api::normalize_optional_string(effort.map(String::from)).or_else(|| {
             crate::api::normalize_optional_string(
                 prev_metadata.as_ref().and_then(|m| m.effort.clone()),
             )
