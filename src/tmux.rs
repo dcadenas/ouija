@@ -621,6 +621,36 @@ pub fn enable_automatic_rename(pane_id: &str) {
         .status();
 }
 
+/// Build the `-e KEY=VALUE` argument list handed to `tmux new-window`,
+/// `tmux new-session`, and `tmux respawn-pane` when ouija spawns a pane.
+///
+/// The returned vector is flat and ready to splat into `Command::args(...)`:
+/// `["-e", "OUIJA_SESSION_ID=<id>", "-e", "HISTFILE=/dev/null", ...]`.
+///
+/// `OUIJA_SESSION_ID` is the primary signal the `ouija` CLI uses to resolve
+/// the caller's session identity. Exporting it into the spawned shell closes
+/// three failure modes seen in the wild:
+///   1. The `@ouija_session` tmux pane var is set by a fire-and-forget
+///      `spawn_blocking` effect (see `state.rs` `Effect::SetTmuxVar`) that
+///      is not awaited; a fast `ouija clear-reminder` call from the newly
+///      spawned session can lose this race.
+///   2. Opencode bash subshells occasionally do not inherit `TMUX_PANE`.
+///   3. Sessions launched outside tmux (future non-tmux backends) have no
+///      pane var to read at all.
+///
+/// `HISTFILE=/dev/null` and `fish_history=` suppress history writes so
+/// ouija commands don't pollute the user's shell history.
+pub fn pane_env_args(session_id: &str) -> Vec<String> {
+    vec![
+        "-e".into(),
+        format!("OUIJA_SESSION_ID={session_id}"),
+        "-e".into(),
+        "HISTFILE=/dev/null".into(),
+        "-e".into(),
+        "fish_history=".into(),
+    ]
+}
+
 /// Derive a tmux session name from a project directory path.
 /// Uses the directory basename with dots replaced by underscores
 /// (matching tmux-sessionizer convention).
@@ -658,6 +688,51 @@ pub fn tmux_session_name(project_dir: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_env_args_includes_ouija_session_id() {
+        let args = pane_env_args("feat/442-chunk-4");
+        // Flat -e KEY=VALUE pairs, in order, suitable for splatting into tmux argv
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "OUIJA_SESSION_ID=feat/442-chunk-4"),
+            "expected OUIJA_SESSION_ID=<id> in args, got {args:?}"
+        );
+    }
+
+    #[test]
+    fn pane_env_args_preserves_history_suppression() {
+        let args = pane_env_args("x");
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "HISTFILE=/dev/null"),
+            "expected HISTFILE=/dev/null preserved, got {args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "fish_history="),
+            "expected fish_history= preserved, got {args:?}"
+        );
+    }
+
+    #[test]
+    fn pane_env_args_each_key_prefixed_by_dash_e() {
+        // Every VALUE must be immediately preceded by a "-e" flag — no
+        // bare values sneaking in that would otherwise be interpreted as
+        // the shell-command positional arg to new-window/new-session.
+        let args = pane_env_args("abc");
+        let mut i = 0;
+        while i < args.len() {
+            assert_eq!(args[i], "-e", "arg {i} should be -e, got {args:?}");
+            assert!(i + 1 < args.len(), "-e at end with no value: {args:?}");
+            assert!(
+                args[i + 1].contains('='),
+                "value without '=': {:?}",
+                args[i + 1]
+            );
+            i += 2;
+        }
+    }
 
     #[test]
     fn tmux_session_name_basename() {

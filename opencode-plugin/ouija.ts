@@ -11,11 +11,11 @@ export const OuijaPlugin: Plugin = async (ctx) => {
     .catch(() => false)
 
   if (!daemonAlive) {
-    console.log(`ouija plugin v${OUIJA_VERSION}: daemon not reachable at ${base}, hooks disabled`)
+    console.error(`ouija plugin v${OUIJA_VERSION}: daemon not reachable at ${base}, hooks disabled`)
     return {}
   }
 
-  console.log(`ouija plugin v${OUIJA_VERSION}: connected to daemon at ${base}`)
+  console.error(`ouija plugin v${OUIJA_VERSION}: connected to daemon at ${base}`)
 
   async function fetchStatus(): Promise<any> {
     return fetch(`${base}/api/status`).then(r => r.json())
