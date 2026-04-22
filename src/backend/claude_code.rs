@@ -402,13 +402,22 @@ pub fn refresh_plugin_cache(version: &str) {
 /// special characters embed safely inside the surrounding `format!`-built
 /// shell command. Each returned flag is prefixed with a leading space so the
 /// fragment can be concatenated directly onto the command string.
+///
+/// Empty / whitespace-only values are treated as absent as a defensive guard
+/// against an empty string slipping past the API boundary. Producing
+/// `claude --model ''` would fail at runtime on the CLI anyway; omitting the
+/// flag is the safer default.
 fn format_model_effort_flags(model: Option<&str>, effort: Option<&str>) -> String {
     let mut out = String::new();
-    if let Some(m) = model {
+    if let Some(m) = model
+        && !m.trim().is_empty()
+    {
         out.push_str(" --model ");
         out.push_str(&crate::scheduler::shell_escape(m));
     }
-    if let Some(e) = effort {
+    if let Some(e) = effort
+        && !e.trim().is_empty()
+    {
         out.push_str(" --effort ");
         out.push_str(&crate::scheduler::shell_escape(e));
     }
@@ -773,6 +782,21 @@ mod tests {
         assert_eq!(
             format_model_effort_flags(Some("opus"), Some("high")),
             " --model 'opus' --effort 'high'"
+        );
+    }
+
+    #[test]
+    fn format_model_effort_flags_drops_empty_strings() {
+        // Defensive guard against empty/whitespace values that slipped past
+        // the API boundary: omit the flag rather than emitting claude --model ''.
+        assert_eq!(format_model_effort_flags(Some(""), Some("   ")), "");
+        assert_eq!(
+            format_model_effort_flags(Some("   "), Some("max")),
+            " --effort 'max'"
+        );
+        assert_eq!(
+            format_model_effort_flags(Some("sonnet"), Some("")),
+            " --model 'sonnet'"
         );
     }
 

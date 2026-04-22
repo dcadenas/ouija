@@ -22,6 +22,17 @@ const CONNECT_TIMEOUT_SECS: u64 = 10;
 /// Max task runs to return in the list endpoint.
 const MAX_TASK_RUNS_RETURNED: usize = 50;
 
+/// Normalize a user-supplied optional string: trim whitespace and treat
+/// empty/whitespace-only strings as absent.
+///
+/// Applied at the API boundary on fields like `model` and `effort` where
+/// `Some("")` is always a mistake (serialized form of a CLI flag without a
+/// value, or a JSON client passing an empty placeholder) and must not flow
+/// through as if it were an explicit override.
+pub(crate) fn normalize_optional_string(input: Option<String>) -> Option<String> {
+    input.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 /// Extract a short project description from a project directory.
 ///
 /// Tries in order: `Cargo.toml` description field, `package.json` description,
@@ -1742,6 +1753,13 @@ pub async fn start_session(
     State(state): State<SharedState>,
     Json(body): Json<SessionNameBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Normalize at the boundary: `Some("")` or `Some("   ")` must not flow
+    // through as an explicit override — it would clobber prev_metadata on
+    // restart with an empty string and produce malformed CLI invocations.
+    let mut body = body;
+    body.model = normalize_optional_string(body.model);
+    body.effort = normalize_optional_string(body.effort);
+
     // Return 202 immediately — all work (registration + boot) happens in background.
     let name = body.name.clone();
     let state2 = state.clone();
@@ -1810,6 +1828,11 @@ pub async fn restart_session(
     State(state): State<SharedState>,
     Json(body): Json<SessionNameBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Normalize at the boundary; see start_session for rationale.
+    let mut body = body;
+    body.model = normalize_optional_string(body.model);
+    body.effort = normalize_optional_string(body.effort);
+
     let fresh = body.fresh.unwrap_or(false);
     let (result, _prompt_msg_id) = crate::nostr_transport::restart_session(
         &state,
@@ -2126,6 +2149,26 @@ pub async fn clear_reminder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_optional_string_passthrough() {
+        assert_eq!(
+            normalize_optional_string(Some("sonnet".into())),
+            Some("sonnet".into())
+        );
+        assert_eq!(normalize_optional_string(None), None);
+    }
+
+    #[test]
+    fn normalize_optional_string_trims_and_drops_empty() {
+        assert_eq!(normalize_optional_string(Some("".into())), None);
+        assert_eq!(normalize_optional_string(Some("   ".into())), None);
+        assert_eq!(normalize_optional_string(Some("\t\n ".into())), None);
+        assert_eq!(
+            normalize_optional_string(Some("  opus  ".into())),
+            Some("opus".into())
+        );
+    }
 
     #[test]
     fn disambiguate_single_candidate_adopts() {

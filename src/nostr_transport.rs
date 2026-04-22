@@ -1785,12 +1785,24 @@ pub async fn restart_session(
     // Preserve previous model/effort when caller omits them, matching the
     // backend fallback logic above. This ensures `ouija restart-session` does
     // not silently downgrade a session to the backend's default model.
+    //
+    // Treat empty/whitespace-only strings (whether from the caller or from
+    // persisted SessionMeta written by an older build) as absent. The API
+    // boundary normalizes; this is a belt-and-braces guard so an empty string
+    // here never reaches the backend as `claude --model ''` or
+    // `variant: ""`.
+    let normalize = |s: String| -> Option<String> {
+        let t = s.trim();
+        if t.is_empty() { None } else { Some(s) }
+    };
     let effective_model = model
         .map(String::from)
-        .or_else(|| prev_metadata.as_ref().and_then(|m| m.model.clone()));
+        .and_then(normalize)
+        .or_else(|| prev_metadata.as_ref().and_then(|m| m.model.clone()).and_then(normalize));
     let effective_effort = effort
         .map(String::from)
-        .or_else(|| prev_metadata.as_ref().and_then(|m| m.effort.clone()));
+        .and_then(normalize)
+        .or_else(|| prev_metadata.as_ref().and_then(|m| m.effort.clone()).and_then(normalize));
 
     // --- Soft restart for HttpApi backends ---
     // Create a new session on the serve via HTTP API and deliver the prompt directly.
@@ -2708,9 +2720,14 @@ fn save_peer_pubkeys(data_dir: &Path, pubkeys: &HashSet<PublicKey>) {
 /// `model` is split on the **first** `/` into `providerID` / `modelID`,
 /// mirroring opencode's parser at `packages/opencode/src/provider/provider.ts`.
 /// `"openrouter/openai/gpt-5.4"` -> `providerID="openrouter"`, `modelID="openai/gpt-5.4"`.
-/// A model string with no `/` is treated as ambiguous and the `model` field is
-/// omitted entirely — opencode will fall back to the agent / session default.
-/// `effort` is passed through unchanged as `variant`.
+///
+/// A model string with no `/`, or one with an empty segment on either side
+/// of the first `/` (`"/"`, `"openrouter/"`, `"/gpt-5"`, or
+/// whitespace-only input), is treated as ambiguous: the `model` field is
+/// omitted entirely and a `tracing::warn!` is emitted. Opencode then falls
+/// back to the agent / session default. Effort is passed through unchanged
+/// as `variant` — callers should normalize empty strings to `None` upstream
+/// (the API boundary does this).
 pub(crate) fn opencode_prompt_body(
     text: &str,
     model: Option<&str>,
@@ -2720,18 +2737,31 @@ pub(crate) fn opencode_prompt_body(
         "parts": [{"type": "text", "text": text}],
     });
     let obj = body.as_object_mut().expect("json! macro returns an object");
-    if let Some(m) = model
-        && let Some((provider, model_id)) = m.split_once('/')
-    {
-        obj.insert(
-            "model".into(),
-            serde_json::json!({
-                "providerID": provider,
-                "modelID": model_id,
-            }),
-        );
+    if let Some(m) = model {
+        let trimmed = m.trim();
+        match trimmed.split_once('/') {
+            Some((provider, model_id))
+                if !provider.trim().is_empty() && !model_id.trim().is_empty() =>
+            {
+                obj.insert(
+                    "model".into(),
+                    serde_json::json!({
+                        "providerID": provider,
+                        "modelID": model_id,
+                    }),
+                );
+            }
+            _ => {
+                tracing::warn!(
+                    model = m,
+                    "opencode_prompt_body: model string is not in 'providerID/modelID' form; falling back to agent/session default"
+                );
+            }
+        }
     }
-    if let Some(e) = effort {
+    if let Some(e) = effort
+        && !e.trim().is_empty()
+    {
         obj.insert("variant".into(), serde_json::Value::String(e.to_string()));
     }
     body
@@ -3028,5 +3058,28 @@ mod tests {
             "no-slash model must be omitted, got: {body}"
         );
         assert_eq!(body["variant"], serde_json::Value::String("max".into()));
+    }
+
+    #[test]
+    fn opencode_prompt_body_omits_malformed_slash_values() {
+        // `/`, `openrouter/`, `/gpt-5` all have an empty segment and must be
+        // treated as ambiguous.
+        for bad in ["/", "openrouter/", "/gpt-5", " / ", "   "] {
+            let body = opencode_prompt_body("hi", Some(bad), None);
+            assert!(
+                body.get("model").is_none(),
+                "malformed model {bad:?} must be omitted, got: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_prompt_body_omits_empty_variant() {
+        // An empty effort string must not be sent as variant = "".
+        let body = opencode_prompt_body("hi", None, Some(""));
+        assert!(
+            body.get("variant").is_none(),
+            "empty effort must be omitted, got: {body}"
+        );
     }
 }
