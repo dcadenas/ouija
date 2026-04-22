@@ -155,7 +155,7 @@ pub struct AppState {
     /// Pending remote command results: command string → oneshot senders.
     pending_commands: std::sync::Mutex<Vec<(String, tokio::sync::oneshot::Sender<String>)>>,
     /// Cached tmux panes running the coding assistant, refreshed by the reaper loop.
-    cached_assistant_panes: RwLock<Vec<crate::tmux::TmuxPane>>,
+    pub(crate) cached_assistant_panes: RwLock<Vec<crate::tmux::TmuxPane>>,
     /// Per-fire worktree panes: pane_id → project_dir.
     /// Reaper runs `git worktree prune` when these panes die.
     pub perfire_worktree_panes: RwLock<HashMap<String, String>>,
@@ -1160,6 +1160,33 @@ impl AppState {
 
     pub async fn cached_assistant_panes(&self) -> Vec<crate::tmux::TmuxPane> {
         self.cached_assistant_panes.read().await.clone()
+    }
+
+    /// Return a current snapshot of tmux panes running a known assistant.
+    ///
+    /// Production path: runs a fresh `find_assistant_panes` so the caller sees
+    /// panes that appeared since the last periodic scan. This is what the
+    /// auto-provision branch in `backend_session_ready` needs — the very
+    /// first readiness callback for a brand-new pane fires in the
+    /// milliseconds after opencode startup, well before the periodic
+    /// scanner's next tick.
+    ///
+    /// Test path: short-circuits to `cached_assistant_panes`, which
+    /// `new_for_test()` initialises empty but tests can seed with
+    /// `*state.cached_assistant_panes.write().await = vec![...]`. This keeps
+    /// unit tests off the real tmux server, matching the `cfg!(test)` pattern
+    /// documented in CLAUDE.md for tmux-side primitives.
+    pub async fn list_assistant_panes(&self) -> Vec<crate::tmux::TmuxPane> {
+        if cfg!(test) {
+            return self.cached_assistant_panes().await;
+        }
+        let names: Vec<String> = self.backends.all_process_names();
+        tokio::task::spawn_blocking(move || {
+            let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+            crate::tmux::find_assistant_panes(&refs).unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// Scan tmux for assistant panes, update cache, and auto-register unregistered ones.

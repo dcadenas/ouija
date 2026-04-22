@@ -1994,15 +1994,24 @@ pub async fn session_ready(
 /// Handle a readiness signal keyed by opencode backend session ID.
 /// Resolves the ouija session name internally, avoiding plugin-side race conditions.
 ///
-/// If no session is found by `backend_session_id`, we query the opencode serve
-/// for the session's directory, then match against ouija sessions by directory.
-/// When a match is found we adopt the `backend_session_id` so future messages
-/// are delivered via HTTP instead of tmux injection.
+/// Resolution order:
+/// 1. Direct lookup by `backend_session_id` — hub-spawned sessions and any
+///    previously-adopted session already have this bound.
+/// 2. Adoption — query opencode serve for the session's directory, then
+///    look for a pre-existing local ouija session in that directory whose
+///    `backend_session_id` is still unset. This handles the case where the
+///    daemon knew about the session before opencode attached a backend ID.
+/// 3. Auto-provision (issue #35) — when the caller is a human/agent starting
+///    opencode themselves in a fresh directory, there is no pre-existing
+///    record to adopt. Scan tmux for the opencode pane in that directory and
+///    create a fresh session record with the backend_session_id bound.
+///    Gated by the `auto_register` setting so operators who opted out of
+///    implicit registration keep the strict behaviour.
 pub async fn backend_session_ready(
     State(state): State<SharedState>,
     axum::extract::Path(backend_sid): axum::extract::Path<String>,
 ) -> Json<serde_json::Value> {
-    // First try: direct lookup by backend_session_id
+    // Step 1: direct lookup.
     let session_name = {
         let proto = state.protocol.read().await;
         proto
@@ -2015,19 +2024,165 @@ pub async fn backend_session_ready(
     let name = if let Some(n) = session_name {
         n
     } else {
-        // Fallback: query opencode serve for the session's directory, then
-        // find a local ouija session with that directory and adopt the backend_session_id.
+        // Step 2: adoption. Consumes one opencode-serve round-trip internally;
+        // we redo it here in step 3 if adoption misses, since auto-provision
+        // needs the dir too. The double call is intentionally kept to preserve
+        // adoption's existing call signature (and fail-mode coverage) for this
+        // surgical change — dir lookup is a cheap loopback GET.
         let adopted = adopt_backend_session_id(&state, &backend_sid).await;
-        let Some(n) = adopted else {
-            return Json(
-                json!({"delivered": false, "error": "no session with this backend_session_id"}),
-            );
-        };
-        n
+
+        if let Some(n) = adopted {
+            n
+        } else {
+            // Step 3: auto-provision for ad-hoc opencode sessions (issue #35).
+            let auto_register = state.settings.read().await.auto_register;
+            if !auto_register {
+                tracing::debug!(
+                    "auto_register disabled; declining to auto-provision for backend_session_id {backend_sid}"
+                );
+                return Json(
+                    json!({"delivered": false, "error": "no session with this backend_session_id"}),
+                );
+            }
+
+            let Some(dir) = lookup_opencode_session_dir(&state, &backend_sid).await else {
+                return Json(
+                    json!({"delivered": false, "error": "no session with this backend_session_id"}),
+                );
+            };
+
+            let Some(n) = auto_provision_from_backend_session(&state, &backend_sid, &dir).await
+            else {
+                return Json(
+                    json!({"delivered": false, "error": "no session with this backend_session_id"}),
+                );
+            };
+            n
+        }
     };
 
     let delivered = deliver_pending_prompt(&state, &name);
     Json(json!({"delivered": delivered, "session": name}))
+}
+
+/// Auto-provision a fresh session record for an opencode backend session that
+/// has no pre-existing ouija entry (issue #35).
+///
+/// Finds the tmux pane currently running opencode in `dir`. On exactly one
+/// match, registers a new session with the backend_session_id bound atomically.
+/// Fails closed (returns `None`) on zero or multiple matching panes — we
+/// cannot map a backend_session_id to a pane in that case, same principle as
+/// `disambiguate_adoption_candidates`.
+///
+/// The tmux pane scan is indirected through `AppState::list_assistant_panes`
+/// so unit tests can seed `cached_assistant_panes` rather than shelling out
+/// to a real tmux server.
+async fn auto_provision_from_backend_session(
+    state: &std::sync::Arc<crate::state::AppState>,
+    backend_sid: &str,
+    dir: &str,
+) -> Option<String> {
+    // Snapshot the current pane layout and the registered pane → session map.
+    let panes = state.list_assistant_panes().await;
+    let registered_panes: std::collections::HashSet<String> = {
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .values()
+            .filter(|s| matches!(s.origin, crate::daemon_protocol::Origin::Local))
+            .filter_map(|s| s.pane.clone())
+            .collect()
+    };
+
+    // Filter to panes in the target dir that are not already registered.
+    let candidates: Vec<String> = panes
+        .into_iter()
+        .filter(|p| {
+            !registered_panes.contains(&p.pane_id)
+                && p.pane_current_path
+                    .as_deref()
+                    .map(|path| crate::state::resolve_project_root(path) == dir)
+                    .unwrap_or(false)
+        })
+        .map(|p| p.pane_id)
+        .collect();
+
+    let pane_id = match candidates.len() {
+        1 => candidates.into_iter().next().unwrap(),
+        0 => {
+            tracing::warn!(
+                "auto-provision declined: no tmux pane running opencode in dir {dir} for backend_session_id {backend_sid}"
+            );
+            return None;
+        }
+        n => {
+            // Same fail-closed principle as disambiguate_adoption_candidates:
+            // with multiple opencode panes in the same dir, the daemon has
+            // no way to tell which one this backend_session_id belongs to.
+            // Let the user disambiguate via `ouija register ...`.
+            tracing::warn!(
+                "auto-provision declined: {n} opencode panes in dir {dir}; cannot map backend_session_id {backend_sid} unambiguously"
+            );
+            return None;
+        }
+    };
+
+    // Derive a unique session id from the dir basename.
+    let basename = std::path::Path::new(dir)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unnamed");
+    let base_id = crate::state::sanitize_session_id(basename);
+    if base_id.is_empty() {
+        tracing::warn!(
+            "auto-provision declined: could not derive a session id from dir {dir} (basename='{basename}')"
+        );
+        return None;
+    }
+
+    // Belt-and-suspenders recheck: another concurrent ready callback may have
+    // just auto-provisioned this backend_session_id while we were scanning
+    // tmux. If so, return the id it created instead of racing a second
+    // Register. apply_register's write-lock + same-pane idempotent path would
+    // otherwise absorb the conflict harmlessly, but short-circuiting here
+    // saves a pointless round-trip and keeps the log cleaner.
+    let id = {
+        let proto = state.protocol.read().await;
+        if let Some(existing) = proto
+            .sessions
+            .values()
+            .find(|s| s.metadata.backend_session_id.as_deref() == Some(backend_sid))
+        {
+            return Some(existing.id.clone());
+        }
+        let id_to_pane: std::collections::HashMap<String, Option<String>> = proto
+            .sessions
+            .iter()
+            .map(|(id, s)| (id.clone(), s.pane.clone()))
+            .collect();
+        crate::state::resolve_unique_session_id(&id_to_pane, &base_id, Some(&pane_id))
+    };
+
+    tracing::info!(
+        "auto-provisioned session '{id}' for pane {pane_id} / backend_session_id {backend_sid} (dir: {dir})"
+    );
+
+    let metadata = crate::daemon_protocol::SessionMeta {
+        project_dir: Some(dir.to_string()),
+        role: Some(format!("working on {basename}")),
+        backend: Some("opencode".into()),
+        backend_session_id: Some(backend_sid.to_string()),
+        ..Default::default()
+    };
+    state
+        .apply_and_execute(crate::daemon_protocol::Event::Register {
+            id: id.clone(),
+            pane: Some(pane_id),
+            metadata,
+        })
+        .await;
+
+    Some(id)
 }
 
 /// Choose at most one candidate session ID for adoption (issue #15).
@@ -2584,6 +2739,62 @@ mod tests {
         assert!(
             dir.is_none(),
             "unreachable opencode serve must produce None, got Some({dir:?})"
+        );
+    }
+
+    // --- auto_provision_from_backend_session (issue #35) ---
+
+    fn pane_in(dir: &str, pane_id: &str) -> crate::tmux::TmuxPane {
+        crate::tmux::TmuxPane {
+            pane_id: pane_id.into(),
+            session_name: "test".into(),
+            pane_current_path: Some(dir.into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_provision_creates_session_for_single_matching_pane() {
+        // Issue #35: opencode TUI started in a fresh dir with no pre-existing
+        // ouija record. After direct lookup and adoption both miss, the
+        // daemon must auto-provision a session record so the user's first
+        // `ouija` CLI call resolves the pane.
+        let state = crate::state::AppState::new_for_test();
+        // Seed the cached pane snapshot — in tests, list_assistant_panes
+        // reads from this rather than shelling out to tmux.
+        *state.cached_assistant_panes.write().await =
+            vec![pane_in("/tmp/freshproject", "%17")];
+
+        let result = auto_provision_from_backend_session(
+            &state,
+            "ses_brand_new",
+            "/tmp/freshproject",
+        )
+        .await;
+
+        let session_id = result.expect("auto-provision must succeed for exactly one matching pane");
+        assert_eq!(session_id, "freshproject");
+
+        // Verify state mutations end-to-end.
+        let proto = state.protocol.read().await;
+        let session = proto
+            .sessions
+            .get(&session_id)
+            .expect("session must exist in protocol state");
+        assert_eq!(session.pane.as_deref(), Some("%17"), "pane must be bound");
+        assert_eq!(
+            session.metadata.backend.as_deref(),
+            Some("opencode"),
+            "backend must be opencode"
+        );
+        assert_eq!(
+            session.metadata.backend_session_id.as_deref(),
+            Some("ses_brand_new"),
+            "backend_session_id must be bound atomically with the Register"
+        );
+        assert_eq!(
+            session.metadata.project_dir.as_deref(),
+            Some("/tmp/freshproject"),
+            "project_dir must be set"
         );
     }
 }
