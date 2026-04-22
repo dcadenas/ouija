@@ -396,6 +396,25 @@ pub fn refresh_plugin_cache(version: &str) {
     println!("plugin cache refreshed");
 }
 
+/// Render ` --model <X> --effort <Y>` fragments for the claude CLI.
+///
+/// Returns an empty string when both are `None`. Values are shell-escaped so
+/// special characters embed safely inside the surrounding `format!`-built
+/// shell command. Each returned flag is prefixed with a leading space so the
+/// fragment can be concatenated directly onto the command string.
+fn format_model_effort_flags(model: Option<&str>, effort: Option<&str>) -> String {
+    let mut out = String::new();
+    if let Some(m) = model {
+        out.push_str(" --model ");
+        out.push_str(&crate::scheduler::shell_escape(m));
+    }
+    if let Some(e) = effort {
+        out.push_str(" --effort ");
+        out.push_str(&crate::scheduler::shell_escape(e));
+    }
+    out
+}
+
 impl CodingAssistant for ClaudeCode {
     fn name(&self) -> &str {
         "claude-code"
@@ -415,17 +434,20 @@ impl CodingAssistant for ClaudeCode {
 
     fn build_start_command(&self, opts: &StartOpts) -> String {
         let escaped_dir = crate::scheduler::shell_escape(&opts.project_dir);
+        let model_effort = format_model_effort_flags(opts.model.as_deref(), opts.effort.as_deref());
         match &opts.worktree {
             None => {
-                format!("cd {escaped_dir} && claude --dangerously-skip-permissions")
+                format!("cd {escaped_dir} && claude --dangerously-skip-permissions{model_effort}")
             }
             Some(super::WorktreeMode::Disposable) => {
-                format!("cd {escaped_dir} && claude --dangerously-skip-permissions --worktree")
+                format!(
+                    "cd {escaped_dir} && claude --dangerously-skip-permissions{model_effort} --worktree"
+                )
             }
             Some(super::WorktreeMode::Named(name)) => {
                 let escaped_name = crate::scheduler::shell_escape(name);
                 format!(
-                    "cd {escaped_dir} && claude --dangerously-skip-permissions --worktree {escaped_name}"
+                    "cd {escaped_dir} && claude --dangerously-skip-permissions{model_effort} --worktree {escaped_name}"
                 )
             }
         }
@@ -437,19 +459,22 @@ impl CodingAssistant for ClaudeCode {
             Some(sid) => format!("--resume {}", crate::scheduler::shell_escape(sid)),
             None => "--continue".to_string(),
         };
+        let model_effort = format_model_effort_flags(opts.model.as_deref(), opts.effort.as_deref());
         let cmd = match &opts.worktree {
             None => {
-                format!("cd {escaped_dir} && claude --dangerously-skip-permissions {resume_flag}")
+                format!(
+                    "cd {escaped_dir} && claude --dangerously-skip-permissions {resume_flag}{model_effort}"
+                )
             }
             Some(super::WorktreeMode::Disposable) => {
                 format!(
-                    "cd {escaped_dir} && claude --dangerously-skip-permissions {resume_flag} --worktree"
+                    "cd {escaped_dir} && claude --dangerously-skip-permissions {resume_flag}{model_effort} --worktree"
                 )
             }
             Some(super::WorktreeMode::Named(name)) => {
                 let escaped_name = crate::scheduler::shell_escape(name);
                 format!(
-                    "cd {escaped_dir} && claude --dangerously-skip-permissions {resume_flag} --worktree {escaped_name}"
+                    "cd {escaped_dir} && claude --dangerously-skip-permissions {resume_flag}{model_effort} --worktree {escaped_name}"
                 )
             }
         };
@@ -550,12 +575,28 @@ mod tests {
         ClaudeCode
     }
 
+    fn start_opts(dir: &str) -> StartOpts {
+        StartOpts {
+            project_dir: dir.to_string(),
+            worktree: None,
+            model: None,
+            effort: None,
+        }
+    }
+
+    fn resume_opts(dir: &str, session_id: Option<&str>) -> ResumeOpts {
+        ResumeOpts {
+            project_dir: dir.to_string(),
+            session_id: session_id.map(String::from),
+            worktree: None,
+            model: None,
+            effort: None,
+        }
+    }
+
     #[test]
     fn start_command_no_worktree() {
-        let cmd = backend().build_start_command(&StartOpts {
-            project_dir: "/home/user/myproject".to_string(),
-            worktree: None,
-        });
+        let cmd = backend().build_start_command(&start_opts("/home/user/myproject"));
         assert_eq!(
             cmd,
             "cd '/home/user/myproject' && claude --dangerously-skip-permissions"
@@ -565,8 +606,8 @@ mod tests {
     #[test]
     fn start_command_named_worktree() {
         let cmd = backend().build_start_command(&StartOpts {
-            project_dir: "/home/user/myproject".to_string(),
             worktree: Some(WorktreeMode::Named("feature-x".to_string())),
+            ..start_opts("/home/user/myproject")
         });
         assert_eq!(
             cmd,
@@ -577,8 +618,8 @@ mod tests {
     #[test]
     fn start_command_disposable_worktree() {
         let cmd = backend().build_start_command(&StartOpts {
-            project_dir: "/home/user/myproject".to_string(),
             worktree: Some(WorktreeMode::Disposable),
+            ..start_opts("/home/user/myproject")
         });
         assert_eq!(
             cmd,
@@ -587,12 +628,72 @@ mod tests {
     }
 
     #[test]
-    fn resume_command_no_session_id() {
-        let cmd = backend().build_resume_command(&ResumeOpts {
-            project_dir: "/home/user/myproject".to_string(),
-            session_id: None,
-            worktree: None,
+    fn start_command_with_model() {
+        let cmd = backend().build_start_command(&StartOpts {
+            model: Some("sonnet".into()),
+            ..start_opts("/home/user/myproject")
         });
+        assert_eq!(
+            cmd,
+            "cd '/home/user/myproject' && claude --dangerously-skip-permissions --model 'sonnet'"
+        );
+    }
+
+    #[test]
+    fn start_command_with_effort_only() {
+        let cmd = backend().build_start_command(&StartOpts {
+            effort: Some("max".into()),
+            ..start_opts("/home/user/myproject")
+        });
+        assert_eq!(
+            cmd,
+            "cd '/home/user/myproject' && claude --dangerously-skip-permissions --effort 'max'"
+        );
+    }
+
+    #[test]
+    fn start_command_with_model_and_effort() {
+        let cmd = backend().build_start_command(&StartOpts {
+            model: Some("opus".into()),
+            effort: Some("high".into()),
+            ..start_opts("/home/user/myproject")
+        });
+        assert_eq!(
+            cmd,
+            "cd '/home/user/myproject' && claude --dangerously-skip-permissions --model 'opus' --effort 'high'"
+        );
+    }
+
+    #[test]
+    fn start_command_with_model_effort_and_named_worktree() {
+        let cmd = backend().build_start_command(&StartOpts {
+            worktree: Some(WorktreeMode::Named("feature-x".to_string())),
+            model: Some("sonnet".into()),
+            effort: Some("max".into()),
+            ..start_opts("/home/user/myproject")
+        });
+        assert_eq!(
+            cmd,
+            "cd '/home/user/myproject' && claude --dangerously-skip-permissions --model 'sonnet' --effort 'max' --worktree 'feature-x'"
+        );
+    }
+
+    #[test]
+    fn start_command_shell_escapes_model_with_special_chars() {
+        // Unlikely in practice but proves the passthrough survives quoting.
+        let cmd = backend().build_start_command(&StartOpts {
+            model: Some("weird model".into()),
+            ..start_opts("/home/user/myproject")
+        });
+        assert!(
+            cmd.contains("--model 'weird model'"),
+            "expected shell-quoted model, got: {cmd}"
+        );
+    }
+
+    #[test]
+    fn resume_command_no_session_id() {
+        let cmd = backend().build_resume_command(&resume_opts("/home/user/myproject", None));
         assert_eq!(
             cmd,
             Some(
@@ -604,11 +705,8 @@ mod tests {
 
     #[test]
     fn resume_command_with_session_id() {
-        let cmd = backend().build_resume_command(&ResumeOpts {
-            project_dir: "/home/user/myproject".to_string(),
-            session_id: Some("abc123".to_string()),
-            worktree: None,
-        });
+        let cmd =
+            backend().build_resume_command(&resume_opts("/home/user/myproject", Some("abc123")));
         assert_eq!(
             cmd,
             Some(
@@ -621,9 +719,8 @@ mod tests {
     #[test]
     fn resume_command_with_session_id_and_named_worktree() {
         let cmd = backend().build_resume_command(&ResumeOpts {
-            project_dir: "/home/user/myproject".to_string(),
-            session_id: Some("abc123".to_string()),
             worktree: Some(WorktreeMode::Named("feature-x".to_string())),
+            ..resume_opts("/home/user/myproject", Some("abc123"))
         });
         assert_eq!(
             cmd,
@@ -631,6 +728,51 @@ mod tests {
                 "cd '/home/user/myproject' && claude --dangerously-skip-permissions --resume 'abc123' --worktree 'feature-x'"
                     .to_string()
             )
+        );
+    }
+
+    #[test]
+    fn resume_command_with_model_and_effort() {
+        let cmd = backend().build_resume_command(&ResumeOpts {
+            model: Some("sonnet".into()),
+            effort: Some("max".into()),
+            ..resume_opts("/home/user/myproject", Some("abc123"))
+        });
+        assert_eq!(
+            cmd,
+            Some(
+                "cd '/home/user/myproject' && claude --dangerously-skip-permissions --resume 'abc123' --model 'sonnet' --effort 'max'"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn format_model_effort_flags_empty_when_none() {
+        assert_eq!(format_model_effort_flags(None, None), "");
+    }
+
+    #[test]
+    fn format_model_effort_flags_model_only() {
+        assert_eq!(
+            format_model_effort_flags(Some("sonnet"), None),
+            " --model 'sonnet'"
+        );
+    }
+
+    #[test]
+    fn format_model_effort_flags_effort_only() {
+        assert_eq!(
+            format_model_effort_flags(None, Some("max")),
+            " --effort 'max'"
+        );
+    }
+
+    #[test]
+    fn format_model_effort_flags_both() {
+        assert_eq!(
+            format_model_effort_flags(Some("opus"), Some("high")),
+            " --model 'opus' --effort 'high'"
         );
     }
 

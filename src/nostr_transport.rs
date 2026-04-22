@@ -1476,6 +1476,8 @@ pub async fn start_session(
     let backend_cmd = backend.build_start_command(&crate::backend::StartOpts {
         project_dir: dir.clone(),
         worktree: None, // ouija manages worktrees, not the backend
+        model: model.map(String::from),
+        effort: None, // wired through in a later chunk
     });
 
     // Pre-compute the prompt text and sender envelope before launching, so we
@@ -1855,10 +1857,24 @@ pub async fn restart_session(
     crate::backend::claude_code::pre_trust_workspace(&dir);
     crate::backend::pre_trust_mise(&dir);
 
+    // Preserve previous model/effort when caller omits them, matching the
+    // backend fallback logic above. This ensures `ouija restart-session` does
+    // not silently downgrade a session to the backend's default model.
+    let effective_model = model.map(String::from).or_else(|| {
+        prev_metadata
+            .as_ref()
+            .and_then(|m| m.model.clone())
+    });
+    let effective_effort = prev_metadata
+        .as_ref()
+        .and_then(|m| m.effort.clone());
+
     let claude_cmd = if fresh {
         backend.build_start_command(&crate::backend::StartOpts {
             project_dir: dir.clone(),
             worktree: None, // ouija manages worktrees, not the backend
+            model: effective_model.clone(),
+            effort: effective_effort.clone(),
         })
     } else {
         backend
@@ -1866,11 +1882,15 @@ pub async fn restart_session(
                 project_dir: dir.clone(),
                 session_id: resume_id,
                 worktree: None, // ouija manages worktrees
+                model: effective_model.clone(),
+                effort: effective_effort.clone(),
             })
             .unwrap_or_else(|| {
                 backend.build_start_command(&crate::backend::StartOpts {
                     project_dir: dir.clone(),
                     worktree: None,
+                    model: effective_model.clone(),
+                    effort: effective_effort.clone(),
                 })
             })
     };

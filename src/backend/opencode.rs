@@ -152,6 +152,8 @@ mod tests {
         let cmd = backend().build_start_command(&StartOpts {
             project_dir: "/home/user/myproject".to_string(),
             worktree: None,
+            model: None,
+            effort: None,
         });
         // HttpApi backends use shared serve; start command is a placeholder
         assert!(cmd.contains("/home/user/myproject"));
@@ -163,6 +165,8 @@ mod tests {
             project_dir: "/home/user/myproject".to_string(),
             session_id: None,
             worktree: None,
+            model: None,
+            effort: None,
         });
         assert!(cmd.is_some());
         assert!(cmd.unwrap().contains("/home/user/myproject"));

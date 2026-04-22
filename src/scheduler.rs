@@ -458,6 +458,8 @@ async fn respawn_and_inject(
         } else {
             None
         },
+        model: None,
+        effort: None,
     });
 
     // Pass prompt as CLI arg (same as start_session) so Claude loads
@@ -588,6 +590,8 @@ async fn revive_and_inject(
         backend.build_start_command(&crate::backend::StartOpts {
             project_dir: dir.clone(),
             worktree,
+            model: None,
+            effort: None,
         })
     } else {
         let session_id = task
@@ -599,11 +603,15 @@ async fn revive_and_inject(
                 project_dir: dir.clone(),
                 session_id,
                 worktree,
+                model: None,
+                effort: None,
             })
             .unwrap_or_else(|| {
                 backend.build_start_command(&crate::backend::StartOpts {
                     project_dir: dir.clone(),
                     worktree: None,
+                    model: None,
+                    effort: None,
                 })
             })
     };
