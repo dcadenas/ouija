@@ -1791,22 +1791,23 @@ pub async fn restart_session(
     // boundary normalizes; this is a belt-and-braces guard so an empty string
     // here never reaches the backend as `claude --model ''` or
     // `variant: ""`.
-    let normalize = |s: String| -> Option<String> {
-        let t = s.trim();
-        if t.is_empty() { None } else { Some(s) }
-    };
-    let effective_model = model.map(String::from).and_then(normalize).or_else(|| {
-        prev_metadata
-            .as_ref()
-            .and_then(|m| m.model.clone())
-            .and_then(normalize)
-    });
-    let effective_effort = effort.map(String::from).and_then(normalize).or_else(|| {
-        prev_metadata
-            .as_ref()
-            .and_then(|m| m.effort.clone())
-            .and_then(normalize)
-    });
+    // Reuse the API-boundary normalizer so "  sonnet  " trims to "sonnet"
+    // instead of flowing through to `claude --model '  sonnet  '`. Covers
+    // both caller-supplied values and persisted SessionMeta.model/effort
+    // from older builds that predate the boundary normalization.
+    let effective_model = crate::api::normalize_optional_string(model.map(String::from)).or_else(
+        || {
+            crate::api::normalize_optional_string(
+                prev_metadata.as_ref().and_then(|m| m.model.clone()),
+            )
+        },
+    );
+    let effective_effort = crate::api::normalize_optional_string(effort.map(String::from))
+        .or_else(|| {
+            crate::api::normalize_optional_string(
+                prev_metadata.as_ref().and_then(|m| m.effort.clone()),
+            )
+        });
 
     // --- Soft restart for HttpApi backends ---
     // Create a new session on the serve via HTTP API and deliver the prompt directly.
@@ -2274,12 +2275,23 @@ async fn soft_restart_session(
     //    deliver_via_http from locked_inject) running between these writes
     //    would otherwise observe the new session id with stale model/effort
     //    metadata and route the next message through the previous model.
+    //
+    //    When `model` / `effort` are None we preserve the session's current
+    //    metadata rather than clearing it: callers are expected to pre-compute
+    //    the effective values (restart_session does this via prev_metadata
+    //    fallback), but a stale snapshot or a future caller that forgets the
+    //    fallback must not silently wipe fields that were set by another
+    //    writer between the snapshot and this atomic block.
     {
         let mut proto = state.protocol.write().await;
         if let Some(session) = proto.sessions.get_mut(name) {
             session.metadata.backend_session_id = Some(new_session_id.clone());
-            session.metadata.model = model.map(String::from);
-            session.metadata.effort = effort.map(String::from);
+            if let Some(m) = model {
+                session.metadata.model = Some(m.to_string());
+            }
+            if let Some(e) = effort {
+                session.metadata.effort = Some(e.to_string());
+            }
         }
         state.persist_protocol_state(&proto);
     }
@@ -2762,10 +2774,14 @@ pub(crate) fn opencode_prompt_body(
             }
         }
     }
-    if let Some(e) = effort
-        && !e.trim().is_empty()
-    {
-        obj.insert("variant".into(), serde_json::Value::String(e.to_string()));
+    if let Some(e) = effort {
+        let trimmed = e.trim();
+        if !trimmed.is_empty() {
+            obj.insert(
+                "variant".into(),
+                serde_json::Value::String(trimmed.to_string()),
+            );
+        }
     }
     body
 }
@@ -3083,6 +3099,17 @@ mod tests {
         assert!(
             body.get("variant").is_none(),
             "empty effort must be omitted, got: {body}"
+        );
+    }
+
+    #[test]
+    fn opencode_prompt_body_trims_padded_effort() {
+        // Whitespace padding on effort must not flow through as variant.
+        let body = opencode_prompt_body("hi", None, Some("  max  "));
+        assert_eq!(
+            body["variant"],
+            serde_json::Value::String("max".into()),
+            "effort must be trimmed before insertion, got: {body}"
         );
     }
 }
