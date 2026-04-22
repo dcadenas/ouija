@@ -387,7 +387,9 @@ impl Actor for SessionAgent {
                         "idle timeout fired"
                     );
 
-                    // Inject reminder text if present, otherwise a default nudge (once)
+                    // Inject configured reminder text if present. Sessions
+                    // without a configured reminder get no default nudge —
+                    // the transport is not a nag service.
                     if let Some(ref reminder_text) = reminder {
                         let wrapped = format!(
                             "<ouija-status type=\"reminder\" clearing_id=\"{clearing_id}\">{reminder_text}\n\nIf you have completed all pending work, run: ouija clear-reminder {clearing_id}</ouija-status>"
@@ -400,22 +402,6 @@ impl Actor for SessionAgent {
                             vim_mode,
                         )
                         .await;
-                    } else {
-                        // Default nudge for sessions with no configured reminder.
-                        // Auto-clears so it fires exactly once per idle period.
-                        // The nudge text teaches the LLM the clearing mechanism (HATEOAS).
-                        let nudge = format!(
-                            "<ouija-status type=\"idle-check\" clearing_id=\"{clearing_id}\">You appear idle. If you are done, run: ouija clear-reminder {clearing_id} — to confirm completion. If you have pending work, continue — this nudge will not repeat until your next idle period.</ouija-status>"
-                        );
-                        let _ = crate::tmux::locked_inject(
-                            &self.app_state,
-                            &state.session_id,
-                            &state.pane,
-                            &nudge,
-                            vim_mode,
-                        )
-                        .await;
-                        state.reminder_cleared = true;
                     }
 
                     // Append pending reply info with per-message format
