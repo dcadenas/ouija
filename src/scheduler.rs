@@ -447,6 +447,16 @@ async fn respawn_and_inject(
     let task_name = task.name.clone();
 
     let backend = state.backend_for_session(task.session_name()).await;
+    // Carry the session's configured model/effort into the respawn so a
+    // scheduled clears_context fire does not silently downgrade to the
+    // backend's default model.
+    let (model, effort) = {
+        let proto = state.protocol.read().await;
+        match proto.sessions.get(task.session_name()) {
+            Some(s) => (s.metadata.model.clone(), s.metadata.effort.clone()),
+            None => (None, None),
+        }
+    };
     let claude_cmd = backend.build_start_command(&crate::backend::StartOpts {
         project_dir: dir.to_string(),
         worktree: if uses_worktree {
@@ -458,8 +468,8 @@ async fn respawn_and_inject(
         } else {
             None
         },
-        model: None,
-        effort: None,
+        model,
+        effort,
     });
 
     // Pass prompt as CLI arg (same as start_session) so Claude loads
@@ -586,12 +596,22 @@ async fn revive_and_inject(
         None
     };
     let backend = state.backend_for_session(task.session_name()).await;
+    // Carry the session's configured model/effort into the revive so a
+    // cron-driven respawn does not silently downgrade to the backend's
+    // default model.
+    let (model, effort) = {
+        let proto = state.protocol.read().await;
+        match proto.sessions.get(task.session_name()) {
+            Some(s) => (s.metadata.model.clone(), s.metadata.effort.clone()),
+            None => (None, None),
+        }
+    };
     let launch_cmd = if clears_context {
         backend.build_start_command(&crate::backend::StartOpts {
             project_dir: dir.clone(),
             worktree,
-            model: None,
-            effort: None,
+            model: model.clone(),
+            effort: effort.clone(),
         })
     } else {
         let session_id = task
@@ -603,15 +623,15 @@ async fn revive_and_inject(
                 project_dir: dir.clone(),
                 session_id,
                 worktree,
-                model: None,
-                effort: None,
+                model: model.clone(),
+                effort: effort.clone(),
             })
             .unwrap_or_else(|| {
                 backend.build_start_command(&crate::backend::StartOpts {
                     project_dir: dir.clone(),
                     worktree: None,
-                    model: None,
-                    effort: None,
+                    model: model.clone(),
+                    effort: effort.clone(),
                 })
             })
     };
