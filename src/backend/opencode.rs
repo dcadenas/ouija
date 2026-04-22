@@ -7,6 +7,39 @@ mod embedded {
     pub const SKILL_MD: &str = include_str!("../../skills/ouija/SKILL.md");
 }
 
+/// The legacy MCP URL that older ouija installs wrote into opencode's
+/// `mcp.ouija` config. The `/mcp` route was removed from the daemon in
+/// commit 2878926 "drop MCP tools, skill-only HATEOAS interface", and
+/// any session that still has this entry keeps seeing SSE 404s from
+/// opencode. We recognize it so we can clean it up.
+const STALE_MCP_URL_PREFIX: &str = "http://localhost:7880/mcp";
+
+/// Remove the dead `mcp.ouija` entry from an opencode config.
+///
+/// Only prunes if the entry's `url` points at `localhost:7880/mcp` (the
+/// daemon's removed endpoint). User-provided custom URLs are left alone.
+/// If pruning empties the surrounding `mcp` block entirely, the block
+/// is removed too so configs don't accumulate empty objects.
+fn prune_stale_mcp_ouija(config: &mut serde_json::Value) {
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    let Some(mcp) = obj.get_mut("mcp").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+    let stale = mcp
+        .get("ouija")
+        .and_then(|v| v.get("url"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|u| u.starts_with(STALE_MCP_URL_PREFIX));
+    if stale {
+        mcp.remove("ouija");
+    }
+    if mcp.is_empty() {
+        obj.remove("mcp");
+    }
+}
+
 #[derive(Debug)]
 pub struct OpenCode;
 
@@ -106,20 +139,16 @@ impl CodingAssistant for OpenCode {
             Err(e) => return Err(e.into()),
         };
 
+        // The `/mcp` route was removed from the daemon in commit 2878926.
+        // Older installs wrote `mcp.ouija → http://localhost:7880/mcp`
+        // into opencode.json, which causes persistent SSE 404 errors in
+        // opencode's MCP sidebar. Prune the stale entry if present and
+        // do NOT write a new one — ouija is skill+REST only now.
+        prune_stale_mcp_ouija(&mut config);
+
         let obj = config
             .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("opencode config is not a JSON object"))?;
-
-        // Add MCP config
-        let mcp = obj.entry("mcp").or_insert_with(|| serde_json::json!({}));
-
-        if mcp.get("ouija").is_none() {
-            mcp["ouija"] = serde_json::json!({
-                "type": "remote",
-                "url": "http://localhost:7880/mcp",
-                "oauth": false
-            });
-        }
 
         // Add plugin to the plugin array (merge, don't overwrite)
         let plugin_file = plugins_dir.join("ouija.ts");
@@ -189,6 +218,82 @@ mod tests {
     fn has_project_history_without_opencode_dir() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(!backend().has_project_history(tmp.path()));
+    }
+
+    #[test]
+    fn prune_stale_mcp_ouija_removes_legacy_url() {
+        // Commit 2878926 dropped the /mcp route from the daemon, but the
+        // install logic kept writing mcp.ouija. Anyone who ran an older
+        // ouija still has this dead entry in their opencode.json.
+        let mut config = serde_json::json!({
+            "mcp": {
+                "ouija": {
+                    "type": "remote",
+                    "url": "http://localhost:7880/mcp",
+                    "oauth": false,
+                },
+                "other": { "type": "local", "command": ["echo"] },
+            }
+        });
+        prune_stale_mcp_ouija(&mut config);
+        assert!(
+            config["mcp"].get("ouija").is_none(),
+            "stale mcp.ouija should be removed, got {config:#}"
+        );
+        assert!(
+            config["mcp"].get("other").is_some(),
+            "unrelated mcp entries must be preserved, got {config:#}"
+        );
+    }
+
+    #[test]
+    fn prune_stale_mcp_ouija_leaves_non_default_url_alone() {
+        // If a user has manually pointed mcp.ouija at some other URL
+        // (e.g. a hand-rolled MCP bridge), don't clobber their config.
+        let mut config = serde_json::json!({
+            "mcp": {
+                "ouija": {
+                    "type": "remote",
+                    "url": "https://example.internal/ouija-mcp",
+                    "oauth": false,
+                }
+            }
+        });
+        prune_stale_mcp_ouija(&mut config);
+        assert!(
+            config["mcp"]["ouija"].is_object(),
+            "custom mcp.ouija URL must be preserved, got {config:#}"
+        );
+    }
+
+    #[test]
+    fn prune_stale_mcp_ouija_tolerates_missing_mcp_block() {
+        let mut config = serde_json::json!({ "plugin": [] });
+        // Must not panic, must not inject an `mcp` block.
+        prune_stale_mcp_ouija(&mut config);
+        assert!(
+            config.get("mcp").is_none(),
+            "should not add an mcp block when none exists, got {config:#}"
+        );
+    }
+
+    #[test]
+    fn prune_stale_mcp_ouija_removes_empty_mcp_after_pruning() {
+        // If mcp.ouija was the only entry, the whole mcp block becomes
+        // empty — clean it up so the user's config doesn't accrue noise.
+        let mut config = serde_json::json!({
+            "mcp": {
+                "ouija": {
+                    "type": "remote",
+                    "url": "http://localhost:7880/mcp",
+                }
+            }
+        });
+        prune_stale_mcp_ouija(&mut config);
+        assert!(
+            config.get("mcp").is_none() || config["mcp"].as_object().is_some_and(|m| m.is_empty()),
+            "mcp block should be removed or empty after prune, got {config:#}"
+        );
     }
 
     #[test]
