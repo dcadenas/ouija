@@ -8,7 +8,6 @@ use crate::daemon_protocol::{IterationLogEntry, PendingReplyEntry};
 use crate::state::AppState;
 
 /// Hardcoded stall thresholds.
-const MILD_STALL_MULTIPLIER: i64 = 3;
 const HARD_STALL_MULTIPLIER: i64 = 10;
 /// Absolute cap for hard stall: 30 minutes.
 const HARD_STALL_CAP_SECS: u64 = 1800;
@@ -43,8 +42,6 @@ pub enum SessionMsg {
     /// loop_next was called — reset loop stall timer.
     #[allow(dead_code)]
     LoopProgress,
-    /// Internal: mild stall timer expired (3x average interval).
-    LoopMildStall,
     /// Internal: hard stall timer expired (10x average interval or 30min cap).
     LoopHardStall,
     /// MCP tool called: session acknowledged the reminder.
@@ -68,8 +65,6 @@ pub struct SessionAgentState {
     pub last_stopped_at: Option<DateTime<Utc>>,
     pub last_active_at: Option<DateTime<Utc>>,
     idle_timer: Option<JoinHandle<Result<(), MessagingErr<SessionMsg>>>>,
-    /// Timer for mild loop stall (3x average interval).
-    loop_mild_timer: Option<JoinHandle<Result<(), MessagingErr<SessionMsg>>>>,
     /// Timer for hard loop stall (10x average interval or 30min cap).
     loop_hard_timer: Option<JoinHandle<Result<(), MessagingErr<SessionMsg>>>>,
     /// True when the session has acknowledged the current reminder via ouija.clear-reminder.
@@ -103,7 +98,6 @@ impl SessionAgentState {
             last_stopped_at: None,
             last_active_at: None,
             idle_timer: None,
-            loop_mild_timer: None,
             loop_hard_timer: None,
             reminder_cleared: false,
             next_clearing_id: 0,
@@ -163,6 +157,8 @@ impl Actor for SessionAgent {
                 // pending replies or a configured reminder. Without either,
                 // the idle-check would just create a nudge loop (the session
                 // responds to clear it, which triggers Active→Stopped→repeat).
+                // "Configured reminder" means a non-empty reminder body —
+                // see SessionMeta::has_active_reminder.
                 let (has_pending, has_reminder) = {
                     let proto = self.app_state.protocol.read().await;
                     let pending = proto
@@ -173,8 +169,7 @@ impl Actor for SessionAgent {
                     let reminder = proto
                         .sessions
                         .get(&state.session_id)
-                        .and_then(|s| s.metadata.reminder.as_ref())
-                        .is_some();
+                        .is_some_and(|s| s.metadata.has_active_reminder());
                     (pending, reminder)
                 };
 
@@ -250,10 +245,7 @@ impl Actor for SessionAgent {
                 state.session_id = new_id;
             }
             SessionMsg::LoopProgress => {
-                // Cancel existing stall timers
-                if let Some(h) = state.loop_mild_timer.take() {
-                    h.abort();
-                }
+                // Cancel existing stall timer
                 if let Some(h) = state.loop_hard_timer.take() {
                     h.abort();
                 }
@@ -270,14 +262,8 @@ impl Actor for SessionAgent {
 
                 // Only activate stall detection with 3+ entries
                 if let Some(avg) = avg {
-                    let mild_secs = (avg * MILD_STALL_MULTIPLIER) as u64;
                     let hard_secs = ((avg * HARD_STALL_MULTIPLIER) as u64).min(HARD_STALL_CAP_SECS);
 
-                    state.loop_mild_timer = Some(
-                        myself.send_after(std::time::Duration::from_secs(mild_secs), || {
-                            SessionMsg::LoopMildStall
-                        }),
-                    );
                     state.loop_hard_timer = Some(
                         myself.send_after(std::time::Duration::from_secs(hard_secs), || {
                             SessionMsg::LoopHardStall
@@ -287,24 +273,13 @@ impl Actor for SessionAgent {
                     tracing::debug!(
                         session = %state.session_id,
                         avg_interval = avg,
-                        mild_timeout = mild_secs,
                         hard_timeout = hard_secs,
-                        "loop stall timers set"
+                        "loop stall timer set"
                     );
                 }
             }
-            SessionMsg::LoopMildStall => {
-                state.loop_mild_timer = None;
-                tracing::warn!(
-                    session = %state.session_id,
-                    "mild loop stall detected (3x average interval)"
-                );
-
-                self.handle_mild_stall(state).await;
-            }
             SessionMsg::LoopHardStall => {
                 state.loop_hard_timer = None;
-                state.loop_mild_timer = None; // clear mild too
                 tracing::warn!(
                     session = %state.session_id,
                     "hard loop stall detected — forcing clean context restart"
@@ -365,11 +340,18 @@ impl Actor for SessionAgent {
                     state.next_clearing_id += 1;
                     let clearing_id = state.next_clearing_id;
 
-                    // Read session metadata in one lock
+                    // Read session metadata in one lock. Gate the reminder
+                    // read through has_active_reminder so empty-string /
+                    // whitespace-only reminder bodies are treated as absent
+                    // here too — a defensive echo of the Stopped-handler gate
+                    // above, so this site is safe even if the Stopped check
+                    // is ever bypassed (watchdog, future caller).
                     let (reminder, vim_mode, pending) = {
                         let proto = self.app_state.protocol.read().await;
                         let session = proto.sessions.get(&state.session_id);
-                        let reminder = session.and_then(|s| s.metadata.reminder.clone());
+                        let reminder = session
+                            .filter(|s| s.metadata.has_active_reminder())
+                            .and_then(|s| s.metadata.reminder.clone());
                         let vim_mode = session.map(|s| s.metadata.vim_mode).unwrap_or(false);
                         let pending = proto
                             .pending_replies
@@ -387,7 +369,9 @@ impl Actor for SessionAgent {
                         "idle timeout fired"
                     );
 
-                    // Inject reminder text if present, otherwise a default nudge (once)
+                    // Inject configured reminder text if present. Sessions
+                    // without a configured reminder get no default nudge —
+                    // the transport is not a nag service.
                     if let Some(ref reminder_text) = reminder {
                         let wrapped = format!(
                             "<ouija-status type=\"reminder\" clearing_id=\"{clearing_id}\">{reminder_text}\n\nIf you have completed all pending work, run: ouija clear-reminder {clearing_id}</ouija-status>"
@@ -400,22 +384,6 @@ impl Actor for SessionAgent {
                             vim_mode,
                         )
                         .await;
-                    } else {
-                        // Default nudge for sessions with no configured reminder.
-                        // Auto-clears so it fires exactly once per idle period.
-                        // The nudge text teaches the LLM the clearing mechanism (HATEOAS).
-                        let nudge = format!(
-                            "<ouija-status type=\"idle-check\" clearing_id=\"{clearing_id}\">You appear idle. If you are done, run: ouija clear-reminder {clearing_id} — to confirm completion. If you have pending work, continue — this nudge will not repeat until your next idle period.</ouija-status>"
-                        );
-                        let _ = crate::tmux::locked_inject(
-                            &self.app_state,
-                            &state.session_id,
-                            &state.pane,
-                            &nudge,
-                            vim_mode,
-                        )
-                        .await;
-                        state.reminder_cleared = true;
                     }
 
                     // Append pending reply info with per-message format
@@ -482,62 +450,6 @@ impl SessionAgent {
                 vim_mode,
             )
             .await;
-        }
-    }
-
-    /// Mild stall: inject reminder + notify pending reply originators.
-    async fn handle_mild_stall(&self, state: &SessionAgentState) {
-        let (reminder, vim_mode, pending) = {
-            let proto = self.app_state.protocol.read().await;
-            let session = proto.sessions.get(&state.session_id);
-            let reminder = session.and_then(|s| s.metadata.reminder.clone());
-            let vim_mode = session.map(|s| s.metadata.vim_mode).unwrap_or(false);
-            let pending = proto
-                .pending_replies
-                .get(&state.session_id)
-                .cloned()
-                .unwrap_or_default();
-            (reminder, vim_mode, pending)
-        };
-
-        // Inject reminder into the stalled session
-        if let Some(ref reminder_text) = reminder {
-            let msg = format!(
-                "<ouija-status type=\"loop-stall\">Loop stall detected (3x average interval). Reminder: {reminder_text}</ouija-status>"
-            );
-            let _ = crate::tmux::locked_inject(
-                &self.app_state,
-                &state.session_id,
-                &state.pane,
-                &msg,
-                vim_mode,
-            )
-            .await;
-        }
-
-        // Notify originators of pending replies about the stall
-        for p in &pending {
-            let origin_info = {
-                let proto = self.app_state.protocol.read().await;
-                proto
-                    .sessions
-                    .get(&p.from)
-                    .and_then(|s| s.pane.clone().map(|pane| (pane, s.metadata.vim_mode)))
-            };
-            if let Some((origin_pane, origin_vim)) = origin_info {
-                let notify_msg = format!(
-                    "<ouija-status type=\"loop-stall\">session '{}' appears stalled (no progress for 3x its average interval)</ouija-status>",
-                    state.session_id
-                );
-                let _ = crate::tmux::locked_inject(
-                    &self.app_state,
-                    &p.from,
-                    &origin_pane,
-                    &notify_msg,
-                    origin_vim,
-                )
-                .await;
-            }
         }
     }
 

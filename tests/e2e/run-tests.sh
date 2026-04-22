@@ -119,9 +119,12 @@ REGISTER_SCRIPT=$(find_script "ouija-register.sh")
 api "$BASE" POST /api/settings -d '{"auto_register":true}' >/dev/null
 # Remove existing registration on PANE_A so the hook can register fresh
 api "$BASE" POST /api/remove -d '{"id":"sess-a2"}' >/dev/null 2>&1 || true
-# Run the hook — it should register a session named "my-project"
-HOOK_OUT=$(echo '{"source":"startup"}' | TMUX_PANE="$PANE_A" OUIJA_PORT=$PORT bash -c "cd /tmp/my-project && bash '$REGISTER_SCRIPT'" 2>&1)
-assert_contains "hook registers session" "$HOOK_OUT" "Registered as my-project on the ouija mesh"
+# Run the hook — it should register a session named "my-project".
+# The hook intentionally produces no stdout (see PR #534), and
+# ouija-register.sh swallows curl errors with `|| exit 0`, so asserting
+# on empty stdout would pass even if the daemon were unreachable.
+# Verify registration via the daemon's session list instead.
+echo '{"source":"startup"}' | TMUX_PANE="$PANE_A" OUIJA_PORT=$PORT bash -c "cd /tmp/my-project && bash '$REGISTER_SCRIPT'" >/dev/null 2>&1
 ids=$(session_ids "$BASE")
 assert_contains "hook-registered session in list" "$ids" "my-project"
 # Clean up
@@ -140,24 +143,6 @@ assert_not_contains "session not registered when disabled" "$ids" "my-project"
 # Restore
 api "$BASE" POST /api/settings -d '{"auto_register":true}' >/dev/null
 api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/dev/null
-
-log "Test 10b2: Register hook outputs mesh state"
-# Set up: register a session with role and bulletin so the hook has peers to show
-api "$BASE" POST /api/register -d "{\"id\":\"hook-peer\",\"pane\":\"$PANE_B\",\"role\":\"testing\",\"bulletin\":\"can help with tests\"}" >/dev/null
-# Remove existing registration on PANE_A so the hook can register fresh
-api "$BASE" POST /api/remove -d '{"id":"sess-a2"}' >/dev/null 2>&1 || true
-# Run the register hook script directly, simulating a SessionStart
-SCRIPT_PATH=$(find_script "ouija-register.sh")
-HOOK_OUTPUT=$(echo '{"source":"startup"}' | TMUX_PANE="$PANE_A" OUIJA_PORT=$PORT bash -c "cd /tmp/my-project && bash '$SCRIPT_PATH'" 2>&1)
-assert_contains "hook output has registered message" "$HOOK_OUTPUT" "Registered as my-project on the ouija mesh"
-assert_contains "hook output shows peer" "$HOOK_OUTPUT" "hook-peer"
-assert_contains "hook output shows role" "$HOOK_OUTPUT" "testing"
-assert_contains "hook output shows bulletin" "$HOOK_OUTPUT" "can help with tests"
-# Clean up
-api "$BASE" POST /api/remove -d '{"id":"my-project"}' >/dev/null 2>&1 || true
-api "$BASE" POST /api/remove -d '{"id":"hook-peer"}' >/dev/null 2>&1 || true
-api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/dev/null
-api "$BASE" POST /api/register -d "{\"id\":\"sess-b\",\"pane\":\"$PANE_B\"}" >/dev/null
 
 log "Test 10c: Register without pane"
 result=$(api "$BASE" POST /api/register -d '{"id":"no-pane"}')
@@ -608,7 +593,8 @@ L6F_IDS=$(session_ids "$BASE")
 assert_contains "L6f: session survived fresh restart" "$L6F_IDS" "meta-restart"
 
 # ═══════════════════════════════════════════════════════════════════
-# (Mesh context embedded resources were removed in favor of the session-diff hook)
+# (Mesh context embedded resources were removed — the hooks now return
+# empty output. Sessions discover peers via `ouija ls` from the skill.)
 
 # Clean up lifecycle sessions
 api "$BASE" POST /api/sessions/kill -d '{"name":"meta-restart"}' >/dev/null 2>&1 || true

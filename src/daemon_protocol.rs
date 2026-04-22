@@ -141,6 +141,18 @@ impl SessionMeta {
         }
     }
 
+    /// Returns `true` if this session has a reminder whose body is more than
+    /// just whitespace. An empty-string or whitespace-only reminder is treated
+    /// as if no reminder were set: injecting it would produce a `<ouija-status
+    /// type="reminder">` with only the `ouija clear-reminder N` tail, which
+    /// is the exact "non-signal injection" this daemon's session_agent is
+    /// meant to avoid.
+    pub fn has_active_reminder(&self) -> bool {
+        self.reminder
+            .as_deref()
+            .is_some_and(|r| !r.trim().is_empty())
+    }
+
     /// Fill recurrence fields from `source` for any field still at its default value.
     /// Used during re-registration so the startup hook doesn't wipe recurrence state
     /// that was set by session_start or carried forward by restart_session.
@@ -1697,6 +1709,41 @@ mod tests {
         assert_eq!(meta.iteration, 0);
         assert!(meta.iteration_log.is_empty());
         assert!(meta.last_iteration_at.is_none());
+    }
+
+    #[test]
+    fn has_active_reminder_rejects_none_and_blank() {
+        let mut meta = SessionMeta::default();
+        assert!(!meta.has_active_reminder(), "None is not active");
+
+        meta.reminder = Some(String::new());
+        assert!(!meta.has_active_reminder(), "empty string is not active");
+
+        meta.reminder = Some("   \t\n".into());
+        assert!(
+            !meta.has_active_reminder(),
+            "whitespace-only is not active"
+        );
+    }
+
+    #[test]
+    fn has_active_reminder_accepts_real_text() {
+        let meta = SessionMeta {
+            reminder: Some("keep working".into()),
+            ..Default::default()
+        };
+        assert!(meta.has_active_reminder());
+    }
+
+    #[test]
+    fn has_active_reminder_accepts_text_with_surrounding_whitespace() {
+        // The reminder body is still meaningful; we just don't want to
+        // reject valid content because the user typed a trailing newline.
+        let meta = SessionMeta {
+            reminder: Some("  keep working  \n".into()),
+            ..Default::default()
+        };
+        assert!(meta.has_active_reminder());
     }
 
     #[test]

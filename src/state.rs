@@ -73,15 +73,6 @@ impl std::fmt::Display for DuplicateNode {
 
 impl std::error::Error for DuplicateNode {}
 
-/// Lightweight session snapshot for diff computation.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct SessionSnapshot {
-    pub id: String,
-    pub origin: String,
-    pub role: Option<String>,
-    pub bulletin: Option<String>,
-}
-
 /// Thread-safe shared reference to the daemon's application state.
 pub type SharedState = Arc<AppState>;
 
@@ -127,8 +118,6 @@ pub struct AppState {
     /// TuiInjection sessions pass prompts as CLI args instead.
     /// Maps session_id -> (pane_id, prompt_text).
     pub pending_prompts: std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
-    /// Per-session baseline snapshots used to compute diffs in hook handlers.
-    pub session_diff_baselines: std::sync::Mutex<HashMap<String, Vec<SessionSnapshot>>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -327,7 +316,6 @@ impl AppState {
             backends: crate::backend::BackendRegistry::default_registry(),
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
-            session_diff_baselines: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -360,7 +348,6 @@ impl AppState {
             backends: crate::backend::BackendRegistry::default_registry(),
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
-            session_diff_baselines: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
