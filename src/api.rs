@@ -1735,6 +1735,54 @@ pub struct SessionNameBody {
     /// Defaults to false (cleanup) when omitted.
     #[serde(default)]
     keep_worktree: Option<bool>,
+    /// Opt-in to the data-destructive worktree reset on respawn.
+    ///
+    /// When the worktree dir already exists and `base_branch` is supplied,
+    /// ouija used to unconditionally `git checkout -B <branch> <base>`,
+    /// silently discarding every commit the branch was ahead of base
+    /// (hub#528). The default is now `false`: ouija skips the reset and
+    /// WARNs if the branch is ahead. Callers that *want* the reset (e.g. a
+    /// legitimate "redraft from scratch" flow) must pass `force_reset=true`
+    /// so the intent is explicit and auditable.
+    #[serde(default)]
+    force_reset: Option<bool>,
+}
+
+/// Return a warning message when the caller's request carries
+/// destructive intent (`force_reset=true` or a `base_branch` override)
+/// that the restart path cannot honor.
+///
+/// `/api/sessions/start` routes to `restart_session` when the named
+/// session is already registered. `restart_session` reuses the existing
+/// worktree dir from `SessionMeta.project_dir` as-is and does not call
+/// `create_ouija_worktree`, so `base_branch` and `force_reset` have no
+/// downstream hook to act on. This predicate centralizes the "dropped
+/// intent" check so the API handler can `tracing::warn!` before routing
+/// — making the drop auditable from daemon logs even when hub cannot
+/// act on the return envelope (202 Accepted is sent before the work
+/// runs, per the ExistingOrOtherDesignDecision recorded on hub#528).
+///
+/// Returns `None` when the body does not assert any restart-incompatible
+/// intent. Returns `Some(msg)` with a single diagnostic line when it
+/// does. Caller emits the warn; predicate stays pure for unit testing.
+fn restart_drops_destructive_intent(body: &SessionNameBody) -> Option<String> {
+    let mut dropped: Vec<&str> = Vec::new();
+    if body.force_reset == Some(true) {
+        dropped.push("force_reset=true");
+    }
+    if body.base_branch.is_some() {
+        dropped.push("base_branch");
+    }
+    if dropped.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "session '{}' is already registered, routing to restart_session \
+         which cannot act on {}; destructive intent silently dropped. \
+         File a ticket for a sync reset endpoint if this is load-bearing.",
+        body.name,
+        dropped.join(", ")
+    ))
 }
 
 /// Kill the coding assistant process in a session's tmux pane.
@@ -1778,6 +1826,9 @@ pub async fn start_session(
                 "session '{}' exists, restarting with fresh context",
                 body.name
             );
+            if let Some(msg) = restart_drops_destructive_intent(&body) {
+                tracing::warn!("{msg}");
+            }
             let (_result, _msg_id) = crate::nostr_transport::restart_session(
                 &state2,
                 &body.name,
@@ -1810,6 +1861,7 @@ pub async fn start_session(
             body.reminder.as_deref(),
             body.branch.as_deref(),
             body.base_branch.as_deref(),
+            body.force_reset.unwrap_or(false),
         )
         .await;
 
@@ -1834,6 +1886,18 @@ pub async fn restart_session(
     let mut body = body;
     body.model = normalize_optional_string(body.model);
     body.effort = normalize_optional_string(body.effort);
+
+    // restart_session shares SessionNameBody with start_session, so
+    // `force_reset` and `base_branch` deserialize here too — but the
+    // underlying `nostr_transport::restart_session` does not accept or
+    // act on them (no create_ouija_worktree call; the worktree is
+    // reused as-is from prev_metadata.project_dir). Warn-log the drop
+    // so the caller's opt-in is visible in daemon logs. Same predicate
+    // and same rationale as the /api/sessions/start exists branch
+    // (hub#528 review).
+    if let Some(msg) = restart_drops_destructive_intent(&body) {
+        tracing::warn!("{msg}");
+    }
 
     let fresh = body.fresh.unwrap_or(false);
     let (result, _prompt_msg_id) = crate::nostr_transport::restart_session(
@@ -3585,6 +3649,107 @@ mod tests {
         assert!(
             survivor.metadata.backend_session_id.is_none(),
             "victim's metadata must not be rewritten with the hijacker's backend_session_id"
+        );
+    }
+
+    // --- force_reset plumbing (hub#528 guard) ---
+
+    #[test]
+    fn session_name_body_parses_force_reset_when_present() {
+        // Hub opts in to the data-destructive reset by passing force_reset=true.
+        let body: SessionNameBody = serde_json::from_str(
+            r#"{"name":"s","worktree":true,"base_branch":"main","force_reset":true}"#,
+        )
+        .expect("body parses");
+        assert_eq!(
+            body.force_reset,
+            Some(true),
+            "force_reset=true must deserialize to Some(true)"
+        );
+    }
+
+    #[test]
+    fn session_name_body_force_reset_defaults_to_none() {
+        // When the caller omits the field, it must default to None —
+        // which start_session treats as force_reset=false (the safe default).
+        let body: SessionNameBody =
+            serde_json::from_str(r#"{"name":"s"}"#).expect("body parses");
+        assert_eq!(
+            body.force_reset, None,
+            "omitted force_reset must deserialize to None (safe default)"
+        );
+    }
+
+    // --- Dropped-intent predicate on the restart path (hub#528 review) ---
+    //
+    // `/api/sessions/start` routes to `restart_session` when the named
+    // session is already registered. `restart_session` does not plumb
+    // `base_branch` or `force_reset` into `create_ouija_worktree` — it
+    // reuses the existing worktree dir as-is. Without a warning, a
+    // caller that explicitly opted in with `force_reset=true` on a
+    // registered session would see a 202 Accepted indistinguishable from
+    // the reset being honored.
+    //
+    // The `restart_drops_destructive_intent` predicate is the single
+    // source of truth for when that warning should fire. The API handler
+    // calls it inside the `exists` branch; tests lock in the predicate's
+    // behavior so the warning never silently regresses.
+
+    #[test]
+    fn restart_drops_destructive_intent_fires_for_force_reset_true() {
+        let body: SessionNameBody = serde_json::from_str(
+            r#"{"name":"s","force_reset":true}"#,
+        )
+        .unwrap();
+        let warn = restart_drops_destructive_intent(&body);
+        assert!(
+            warn.is_some(),
+            "force_reset=true on the restart path must produce a warn message"
+        );
+        let msg = warn.unwrap();
+        assert!(
+            msg.contains("force_reset"),
+            "warn message must mention force_reset, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn restart_drops_destructive_intent_fires_for_base_branch() {
+        let body: SessionNameBody = serde_json::from_str(
+            r#"{"name":"s","base_branch":"main"}"#,
+        )
+        .unwrap();
+        let warn = restart_drops_destructive_intent(&body);
+        assert!(
+            warn.is_some(),
+            "base_branch on the restart path must produce a warn message — \
+             restart_session cannot act on it"
+        );
+        assert!(
+            warn.unwrap().contains("base_branch"),
+            "warn message must mention base_branch"
+        );
+    }
+
+    #[test]
+    fn restart_drops_destructive_intent_silent_when_no_opt_in() {
+        let body: SessionNameBody = serde_json::from_str(r#"{"name":"s"}"#).unwrap();
+        assert!(
+            restart_drops_destructive_intent(&body).is_none(),
+            "no opt-in supplied, no warn"
+        );
+    }
+
+    #[test]
+    fn restart_drops_destructive_intent_silent_when_force_reset_false() {
+        // Explicit force_reset=false is not an opt-in; nothing is dropped.
+        let body: SessionNameBody = serde_json::from_str(
+            r#"{"name":"s","force_reset":false}"#,
+        )
+        .unwrap();
+        assert!(
+            restart_drops_destructive_intent(&body).is_none(),
+            "force_reset=false is not an opt-in; no warn"
         );
     }
 }

@@ -1106,8 +1106,9 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         kill_session(state, name).await
     } else if let Some(rest) = cmd.strip_prefix("/start ") {
         let name = rest.trim();
+        // /start chat-command never resets — no base_branch supplied anyway.
         start_session(
-            state, name, None, None, None, None, None, None, None, None, None, None, None,
+            state, name, None, None, None, None, None, None, None, None, None, None, None, false,
         )
         .await
         .0
@@ -1405,6 +1406,7 @@ pub async fn start_session(
     reminder: Option<&str>,
     branch: Option<&str>,
     base_branch: Option<&str>,
+    force_reset: bool,
 ) -> (String, Option<u64>) {
     // Check if already exists
     if state.protocol.read().await.sessions.contains_key(name) {
@@ -1454,7 +1456,18 @@ pub async fn start_session(
     // If worktree requested, ouija creates it in .ouija/worktrees/<name>.
     // The backend never sees --worktree — it just gets a directory.
     if worktree {
-        match create_ouija_worktree(&dir, name, branch, base_branch) {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        // `force_reset` is the explicit caller opt-in that guards against
+        // silent branch wipes on respawn (hub#528). Threaded from the API
+        // boundary; defaults to false.
+        match create_ouija_worktree(
+            &dir,
+            name,
+            branch,
+            base_branch,
+            force_reset,
+            std::path::Path::new(&home),
+        ) {
             Ok(wt_dir) => {
                 dir = wt_dir;
             }
@@ -2445,46 +2458,245 @@ async fn setup_shared_serve_session(
 
 /// Inject a prompt into a pane after a short delay, giving the backend time to start.
 /// For HttpApi backends, queue the prompt and wait for a readiness signal from the plugin.
-/// Create an ouija-managed git worktree at `~/.ouija/worktrees/<repo-slug>/<name>`.
+/// Count commits `branch` is ahead of `base` inside `wt_dir`, via
+/// `git rev-list --count <base>..<branch>`. Returns `None` when the subprocess
+/// fails (e.g. either ref is missing), `Some(n)` on success.
+fn git_rev_count(wt_dir: &str, base: &str, branch: &str) -> Option<u32> {
+    let range = format!("{base}..{branch}");
+    let out = std::process::Command::new("git")
+        .args(["-C", wt_dir, "rev-list", "--count", &range])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        tracing::debug!(
+            "git rev-list --count {range} in {wt_dir} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Resolve `ref_name` to a SHA inside `wt_dir` via `git rev-parse`. Returns
+/// `None` on failure.
+fn git_rev_parse(wt_dir: &str, ref_name: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["-C", wt_dir, "rev-parse", ref_name])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Reset `branch_name` to `base` inside the worktree at `wt_dir`. On
+/// success, logs an info line and returns `Ok(())`. On failure, logs
+/// the stderr at WARN and returns an `Err` describing the failure so
+/// callers that opted in with `force_reset=true` can propagate the
+/// failure rather than returning a misleading `Ok(wt_dir)` (hub#528
+/// followup: `Ok(wt_dir)` after a failed reset is indistinguishable
+/// from a successful reset).
+fn run_reset(wt_dir: &str, branch_name: &str, base: &str) -> anyhow::Result<()> {
+    let out = std::process::Command::new("git")
+        .args(["-C", wt_dir, "checkout", "-B", branch_name, base])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            tracing::info!(
+                "worktree {wt_dir}: reset branch {branch_name} to {base}"
+            );
+            Ok(())
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            tracing::warn!(
+                "worktree {wt_dir}: git checkout -B {branch_name} {base} failed: {stderr}"
+            );
+            Err(anyhow::anyhow!(
+                "git checkout -B {branch_name} {base} in {wt_dir} failed: {stderr}"
+            ))
+        }
+        Err(e) => {
+            tracing::warn!(
+                "worktree {wt_dir}: failed to spawn git checkout -B {branch_name} {base}: {e}"
+            );
+            Err(anyhow::anyhow!(
+                "failed to spawn git checkout -B {branch_name} {base} in {wt_dir}: {e}"
+            ))
+        }
+    }
+}
+
+/// Return a warning message when a legacy-layout worktree short-circuit
+/// will silently drop a caller's destructive intent.
+///
+/// The legacy path (`<repo>/.ouija/worktrees/<name>`) is returned
+/// as-is for running-session compatibility — no `git checkout -B` is
+/// run, even when the caller passed `force_reset=true` with a
+/// `base_branch`. This matches the explicit design of the legacy
+/// short-circuit, but it makes `force_reset=true` unobservably dropped.
+///
+/// Returns `None` when nothing was dropped (no `base_branch`, or
+/// `force_reset=false` where the new path would also skip). Returns
+/// `Some(msg)` to be logged at WARN when the opt-in is silenced.
+/// Caller emits the log; predicate is pure for unit testing.
+fn legacy_drops_destructive_intent(
+    base_branch: Option<&str>,
+    force_reset: bool,
+) -> Option<String> {
+    if !force_reset || base_branch.is_none() {
+        return None;
+    }
+    let base = base_branch.unwrap();
+    Some(format!(
+        "legacy-layout worktree short-circuit: force_reset=true + base_branch={base} \
+         silently dropped (legacy path returns the dir as-is for running-session \
+         compatibility). If destructive intent was load-bearing here, migrate the \
+         worktree to the new <home>/.ouija/worktrees/ layout."
+    ))
+}
+
+/// Create an ouija-managed git worktree at `<home>/.ouija/worktrees/<repo-slug>/<name>`.
 ///
 /// Worktrees live outside the repo directory tree to prevent Claude Code from
 /// resolving the `.git` pointer back to the main repo and editing files there.
 ///
 /// Falls back to legacy `<repo>/.ouija/worktrees/<name>` if that directory
 /// already exists (avoids breaking running sessions).
+///
+/// When the worktree dir already exists and `base_branch` is `Some`, the
+/// function will reset the branch to base only when safe:
+/// - the branch is not ahead of base, or
+/// - `force_reset` is `true` (explicit caller opt-in).
+///
+/// When the branch is ahead and `force_reset` is `false`, the reset is
+/// skipped and a structured warning is logged so the caller can recover via
+/// `git reflog`. This guards against silent data loss (hub#528).
 fn create_ouija_worktree(
     repo_dir: &str,
     name: &str,
     branch: Option<&str>,
     base_branch: Option<&str>,
+    force_reset: bool,
+    home: &std::path::Path,
 ) -> anyhow::Result<String> {
     // Check legacy location first (running sessions may use it)
     let legacy_dir = format!("{repo_dir}/.ouija/worktrees/{name}");
     if std::path::Path::new(&legacy_dir).exists() {
+        if let Some(msg) = legacy_drops_destructive_intent(base_branch, force_reset) {
+            // Mirror the non-legacy arms (Some(0)/Some(n)/None at
+            // :2612/:2626/:2640): when force_reset=true is asserted but
+            // cannot be honored here, return Err so Ok(wt_dir) never
+            // conflates "reset happened" with "reset was silently
+            // dropped". Warn-log too so the reason is in daemon logs.
+            tracing::warn!("worktree {name}: {msg}");
+            return Err(anyhow::anyhow!(msg));
+        }
         return Ok(legacy_dir);
     }
-    // New location: ~/.ouija/worktrees/<repo-slug>/<name>
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    // New location: <home>/.ouija/worktrees/<repo-slug>/<name>
     let repo_slug = std::path::Path::new(repo_dir)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("repo");
-    let wt_dir = format!("{home}/.ouija/worktrees/{repo_slug}/{name}");
+    let home_str = home.to_string_lossy();
+    let wt_dir = format!("{home_str}/.ouija/worktrees/{repo_slug}/{name}");
     if std::path::Path::new(&wt_dir).exists() {
-        // If base_branch is specified, force-update the worktree branch to match it.
-        // Stale branches from previous runs may point at wrong commits.
+        // If base_branch is specified, the caller may want the branch reset
+        // to base. This is data-destructive: if the branch is ahead of base
+        // (has real commits), an unconditional reset silently discards those
+        // commits (hub#528 regression). Guard against that: only reset when
+        // the branch is not ahead of base, OR the caller explicitly opts in
+        // with `force_reset`.
         if let Some(base) = base_branch {
             let branch_name = branch.unwrap_or(name);
-            // Reset the named branch to base_branch, then check it out
-            let _ = std::process::Command::new("git")
-                .args(["-C", &wt_dir, "checkout", "-B", branch_name, base])
-                .output();
-            tracing::info!("worktree {name} exists, force-updated branch {branch_name} to {base}",);
+            let ahead = git_rev_count(&wt_dir, base, branch_name);
+            match ahead {
+                Some(0) => {
+                    // Zero ahead: nothing to lose. Still run the reset so
+                    // the working tree and HEAD are aligned (handles cases
+                    // where the branch existed but was pointed elsewhere).
+                    //
+                    // When `force_reset=true`, the caller explicitly
+                    // asserted they want the reset; propagate failures
+                    // so they see when their request was not honored
+                    // (matches the Some(n>0) and None force_reset=true
+                    // arms below).
+                    //
+                    // When `force_reset=false`, the reset is a best-effort
+                    // alignment convenience that must not block session
+                    // start on a transient git failure. Log the outcome
+                    // honestly: on failure, warn; only emit the
+                    // "no-op" info line when the reset actually ran.
+                    match run_reset(&wt_dir, branch_name, base) {
+                        Ok(()) => {
+                            tracing::info!(
+                                "worktree {name}: branch {branch_name} is 0 commits ahead of {base}, reset is a no-op"
+                            );
+                        }
+                        Err(e) if force_reset => {
+                            return Err(e);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "worktree {name}: branch {branch_name} is 0 commits ahead of {base} \
+                                 but alignment reset failed: {e}. Continuing without force_reset."
+                            );
+                        }
+                    }
+                }
+                Some(n) if n > 0 && !force_reset => {
+                    let tip = git_rev_parse(&wt_dir, branch_name).unwrap_or_else(|| "?".into());
+                    tracing::warn!(
+                        "worktree {name}: SKIPPING reset of branch {branch_name} to {base} \
+                         because it is {n} commits ahead (tip {tip}); \
+                         pass force_reset=true to override. \
+                         Recover via `git -C {wt_dir} reflog` if the branch was lost."
+                    );
+                    // Do NOT reset. Return the worktree as-is.
+                }
+                Some(n) => {
+                    // force_reset is true and n > 0: record what we are
+                    // about to discard so reflog recovery is discoverable,
+                    // then propagate any reset failure so the caller sees
+                    // their explicit destructive request was not honored.
+                    let tip = git_rev_parse(&wt_dir, branch_name).unwrap_or_else(|| "?".into());
+                    tracing::warn!(
+                        "worktree {name}: force_reset=true, DISCARDING {n} commits on branch {branch_name} (tip {tip}) to reset to {base}"
+                    );
+                    run_reset(&wt_dir, branch_name, base)?;
+                }
+                None if force_reset => {
+                    // `git rev-list` failed — the base ref might not exist
+                    // in this worktree, or the branch does not yet exist.
+                    // Since the caller explicitly opted in with
+                    // `force_reset=true`, honor the intent rather than
+                    // silently dropping it. Propagate a reset failure so
+                    // the caller does not receive a misleading Ok(wt_dir)
+                    // while their destructive request was dropped.
+                    tracing::warn!(
+                        "worktree {name}: cannot compute {base}..{branch_name} commit count \
+                         (base or branch ref missing), but force_reset=true — attempting reset anyway"
+                    );
+                    run_reset(&wt_dir, branch_name, base)?;
+                }
+                None => {
+                    // `git rev-list` failed and force_reset is false —
+                    // fail safe: skip the reset, warn so operators can
+                    // see why the reset did not happen.
+                    tracing::warn!(
+                        "worktree {name}: cannot compute {base}..{branch_name} commit count \
+                         (base or branch ref missing); skipping reset to avoid data loss. \
+                         Pass force_reset=true to override."
+                    );
+                }
+            }
         }
         return Ok(wt_dir);
     }
     // Ensure parent dir exists
-    let parent = format!("{home}/.ouija/worktrees/{repo_slug}");
+    let parent = format!("{home_str}/.ouija/worktrees/{repo_slug}");
     std::fs::create_dir_all(&parent)?;
     // Create worktree with a new branch
     let branch = branch.map(String::from).unwrap_or_else(|| name.to_string());
@@ -3172,6 +3384,677 @@ mod tests {
             body["variant"],
             serde_json::Value::String("max".into()),
             "effort must be trimmed before insertion, got: {body}"
+        );
+    }
+
+    // --- create_ouija_worktree: branch-wipe guard tests ---
+    //
+    // Regression coverage for hub#528 (2026-04-21): `create_ouija_worktree`
+    // used to unconditionally `git checkout -B <branch> <base>` on any
+    // existing worktree dir when the caller passed `base_branch`, silently
+    // discarding every commit the branch was ahead of base.
+
+    /// Build a throwaway git repo with one commit on its default branch,
+    /// and add a worktree on a new branch named `branch` (starting from
+    /// base). Returns `(repo_dir_keep_alive, worktree_dir, base_branch)`.
+    ///
+    /// Subsequent commits inside the worktree will put `branch` ahead of
+    /// `base` so the guard can be exercised.
+    fn setup_repo_with_worktree(
+        home: &std::path::Path,
+        name: &str,
+        branch: &str,
+    ) -> (tempfile::TempDir, String, String) {
+        use std::process::Command;
+        let repo = tempfile::tempdir().expect("tempdir for repo");
+        let repo_dir = repo.path().to_str().unwrap().to_string();
+
+        // Isolate from any user git config / hooks so tests are
+        // reproducible regardless of host environment.
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("HOME", home)
+                // Disable GPG signing regardless of host config.
+                .env("GIT_CONFIG_COUNT", "2")
+                .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+                .env("GIT_CONFIG_VALUE_0", "false")
+                .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
+                .env("GIT_CONFIG_VALUE_1", "false")
+                // Skip global/system config so host-level hooks/templates
+                // cannot fail the commit.
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("git ran");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+
+        run(&["-C", &repo_dir, "init", "-q", "--initial-branch=main"]);
+        std::fs::write(format!("{repo_dir}/README"), "r").unwrap();
+        run(&["-C", &repo_dir, "add", "README"]);
+        run(&["-C", &repo_dir, "commit", "-q", "-m", "init"]);
+
+        // Create the worktree dir at the new-location path the function
+        // uses, so the "existing worktree" branch of the code fires.
+        let repo_slug = std::path::Path::new(&repo_dir)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let wt_parent = home.join(".ouija/worktrees").join(repo_slug);
+        std::fs::create_dir_all(&wt_parent).unwrap();
+        let wt_dir = wt_parent.join(name).to_str().unwrap().to_string();
+
+        run(&[
+            "-C", &repo_dir, "worktree", "add", "-b", branch, &wt_dir, "main",
+        ]);
+
+        (repo, wt_dir, "main".to_string())
+    }
+
+    fn commit_in(wt_dir: &str, filename: &str, msg: &str) -> String {
+        use std::process::Command;
+        std::fs::write(format!("{wt_dir}/{filename}"), "data").unwrap();
+        // Match `setup_repo_with_worktree`: clear env hooks that might
+        // interact with the host's git config (GPG signing, commit
+        // template, hook path) to prevent test flakes.
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                // Disable GPG signing regardless of host config.
+                .env("GIT_CONFIG_COUNT", "2")
+                .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+                .env("GIT_CONFIG_VALUE_0", "false")
+                .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
+                .env("GIT_CONFIG_VALUE_1", "false")
+                // Skip global/system config so host-level hooks/templates
+                // cannot fail the commit.
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("git ran")
+        };
+        let o = run(&["-C", wt_dir, "add", filename]);
+        assert!(
+            o.status.success(),
+            "git add {filename} in {wt_dir}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let o = run(&["-C", wt_dir, "commit", "-q", "-m", msg]);
+        assert!(
+            o.status.success(),
+            "git commit in {wt_dir}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let sha = run(&["-C", wt_dir, "rev-parse", "HEAD"]);
+        String::from_utf8_lossy(&sha.stdout).trim().to_string()
+    }
+
+    fn branch_tip(wt_dir: &str, branch: &str) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-C", wt_dir, "rev-parse", branch])
+            .output()
+            .expect("git ran");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Helper: set up repo+worktree and return (repo_keepalive, repo_dir,
+    /// wt_dir, base_branch). `home` will be passed explicitly into
+    /// `create_ouija_worktree` (no HOME env mutation — tests run in
+    /// parallel and must not share global state).
+    fn repo_and_worktree(
+        home: &std::path::Path,
+        name: &str,
+        branch: &str,
+    ) -> (tempfile::TempDir, String, String, String) {
+        let (repo, wt_dir, base) = setup_repo_with_worktree(home, name, branch);
+        let repo_dir = repo.path().to_str().unwrap().to_string();
+        (repo, repo_dir, wt_dir, base)
+    }
+
+    #[test]
+    fn existing_worktree_with_ahead_commits_not_reset_by_default() {
+        let home = tempfile::tempdir().unwrap();
+        let (_repo, repo_dir, wt_dir, base) =
+            repo_and_worktree(home.path(), "s1", "feat-x");
+
+        // Put the branch 2 commits ahead of base.
+        commit_in(&wt_dir, "a", "a");
+        let tip_before = commit_in(&wt_dir, "b", "b");
+
+        let out = create_ouija_worktree(
+            &repo_dir,
+            "s1",
+            Some("feat-x"),
+            Some(&base),
+            /* force_reset = */ false,
+            home.path(),
+        )
+        .unwrap();
+        assert_eq!(out, wt_dir);
+
+        let tip_after = branch_tip(&wt_dir, "feat-x");
+        assert_eq!(
+            tip_before, tip_after,
+            "branch must not be silently reset when force_reset=false \
+             and branch is ahead of base"
+        );
+    }
+
+    #[test]
+    fn existing_worktree_with_ahead_commits_reset_when_forced() {
+        let home = tempfile::tempdir().unwrap();
+        let (_repo, repo_dir, wt_dir, base) =
+            repo_and_worktree(home.path(), "s2", "feat-y");
+        let base_tip = branch_tip(&wt_dir, &base);
+        commit_in(&wt_dir, "a", "a");
+        commit_in(&wt_dir, "b", "b");
+
+        let _ = create_ouija_worktree(
+            &repo_dir,
+            "s2",
+            Some("feat-y"),
+            Some(&base),
+            /* force_reset = */ true,
+            home.path(),
+        )
+        .unwrap();
+
+        let tip_after = branch_tip(&wt_dir, "feat-y");
+        assert_eq!(
+            base_tip, tip_after,
+            "force_reset=true must reset branch to base (current behavior)"
+        );
+    }
+
+    #[test]
+    fn existing_worktree_with_no_ahead_commits_is_safe_noop() {
+        let home = tempfile::tempdir().unwrap();
+        let (_repo, repo_dir, wt_dir, base) =
+            repo_and_worktree(home.path(), "s3", "feat-z");
+        // No commits beyond base. Branch is at base already.
+        let base_tip = branch_tip(&wt_dir, &base);
+
+        let _ = create_ouija_worktree(
+            &repo_dir,
+            "s3",
+            Some("feat-z"),
+            Some(&base),
+            /* force_reset = */ false,
+            home.path(),
+        )
+        .unwrap();
+
+        let tip_after = branch_tip(&wt_dir, "feat-z");
+        assert_eq!(
+            base_tip, tip_after,
+            "not-ahead branch must remain at base (no-op, not an error)"
+        );
+    }
+
+    #[test]
+    fn missing_base_branch_ref_does_not_silently_reset() {
+        let home = tempfile::tempdir().unwrap();
+        let (_repo, repo_dir, wt_dir, _base) =
+            repo_and_worktree(home.path(), "s4", "feat-q");
+        let tip_before = commit_in(&wt_dir, "a", "a");
+
+        let _ = create_ouija_worktree(
+            &repo_dir,
+            "s4",
+            Some("feat-q"),
+            Some("does-not-exist-branch"),
+            /* force_reset = */ false,
+            home.path(),
+        )
+        .unwrap();
+
+        let tip_after = branch_tip(&wt_dir, "feat-q");
+        assert_eq!(
+            tip_before, tip_after,
+            "missing base ref must fail safe: skip the reset, preserve work"
+        );
+    }
+
+    /// When `force_reset=true`, the caller has explicitly asked for the
+    /// destructive reset. If the ahead-of-base check cannot be computed
+    /// (e.g. the branch ref does not exist yet in this worktree), ouija
+    /// must still honor the request rather than silently dropping it.
+    /// Construct a case where the ref check fails but the checkout would
+    /// succeed: the worktree dir exists but the requested branch does
+    /// not yet exist inside it — `git rev-list --count base..newbranch`
+    /// returns non-zero (unknown revision), but `git checkout -B
+    /// newbranch base` succeeds and creates the branch at base.
+    ///
+    /// Old behavior (reviewed): return Ok without attempting the reset,
+    /// dropping the caller's explicit intent. New behavior: honor
+    /// force_reset=true and attempt the reset anyway.
+    #[test]
+    fn force_reset_true_honored_even_when_rev_list_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let (_repo, repo_dir, wt_dir, base) =
+            repo_and_worktree(home.path(), "s5", "feat-initial");
+
+        // Delete the initial branch ref so rev-list cannot compute
+        // `base..feat-initial`. The worktree dir still exists on disk,
+        // which is the scenario the function is guarding.
+        //
+        // `git branch -D` refuses to delete the branch currently checked
+        // out in a worktree, so first detach HEAD.
+        let run_in_wt = |args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .args(["-C", &wt_dir])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "git -C {wt_dir} {args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        run_in_wt(&["checkout", "--detach", "-q"]);
+        run_in_wt(&["branch", "-D", "feat-initial"]);
+
+        // Sanity: branch really is gone, so rev-list will fail.
+        assert!(
+            git_rev_count(&wt_dir, &base, "feat-initial").is_none(),
+            "test setup: rev-list must fail when branch is absent"
+        );
+
+        let _ = create_ouija_worktree(
+            &repo_dir,
+            "s5",
+            Some("feat-initial"),
+            Some(&base),
+            /* force_reset = */ true,
+            home.path(),
+        )
+        .unwrap();
+
+        // If force_reset is honored, checkout -B creates feat-initial
+        // at base. If it is silently dropped, feat-initial remains absent.
+        let tip = git_rev_parse(&wt_dir, "feat-initial");
+        assert_eq!(
+            tip,
+            Some(branch_tip(&wt_dir, &base)),
+            "force_reset=true must be honored when rev-list fails: \
+             checkout -B should create feat-initial at base"
+        );
+    }
+
+    /// When `force_reset=true` and the subsequent `git checkout -B` also
+    /// fails, the failure must be surfaced to the caller as an `Err`.
+    /// Returning `Ok(wt_dir)` conflates a successful destructive reset
+    /// with a failed one — the caller (hub) has no way to know its
+    /// explicit opt-in was dropped, and start_session will proceed on
+    /// whatever HEAD the worktree happens to have.
+    ///
+    /// Construct the worst case: delete both the branch ref and the base
+    /// ref in the worktree. rev-list fails (→ None arm with
+    /// force_reset=true), then `checkout -B branch base` also fails with
+    /// "base is not a commit". Previously this returned Ok silently; now
+    /// it must return Err.
+    #[test]
+    fn force_reset_true_propagates_when_reset_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let (_repo, repo_dir, wt_dir, base) =
+            repo_and_worktree(home.path(), "s6", "feat-lost");
+
+        // Detach HEAD in both the main worktree (to free `main`) and the
+        // added worktree (to free `feat-lost`), then delete both refs so
+        // rev-list AND checkout -B will fail.
+        let run_in = |dir: &str, args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .args(["-C", dir])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "git -C {dir} {args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        run_in(&repo_dir, &["checkout", "--detach", "-q"]);
+        run_in(&repo_dir, &["branch", "-D", &base]);
+        run_in(&wt_dir, &["checkout", "--detach", "-q"]);
+        run_in(&wt_dir, &["branch", "-D", "feat-lost"]);
+
+        // Sanity: both refs are gone, so checkout -B feat-lost main will fail.
+        assert!(
+            git_rev_count(&wt_dir, &base, "feat-lost").is_none(),
+            "test setup: rev-list must fail with both refs missing"
+        );
+
+        let result = create_ouija_worktree(
+            &repo_dir,
+            "s6",
+            Some("feat-lost"),
+            Some(&base),
+            /* force_reset = */ true,
+            home.path(),
+        );
+
+        assert!(
+            result.is_err(),
+            "create_ouija_worktree must return Err when force_reset=true \
+             is asserted but the reset fails; got Ok({:?})",
+            result.ok()
+        );
+    }
+
+    /// Same invariant as `force_reset_true_propagates_when_reset_fails`,
+    /// but on the Some(0) / zero-ahead arm. A caller that opts in with
+    /// `force_reset=true` on a branch that is content-equivalent to base
+    /// still wants to know if the alignment reset actually ran — the
+    /// arm was previously `let _ = run_reset(...)`, swallowing the
+    /// failure and returning Ok(wt_dir) indistinguishable from success.
+    ///
+    /// Construct a zero-ahead scenario where `git checkout -B` fails:
+    /// create two worktrees sharing the same repo, both on branch
+    /// `shared`. Pass `branch=shared, base=shared` to
+    /// `create_ouija_worktree` so rev-list returns 0 and the Some(0)
+    /// arm fires; the subsequent `git checkout -B shared shared` in
+    /// the second worktree fails because `shared` is held elsewhere.
+    #[test]
+    fn force_reset_true_propagates_when_zero_ahead_reset_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let (_repo, repo_dir, wt_dir, base) =
+            repo_and_worktree(home.path(), "s7", "held-elsewhere");
+
+        // Make a second worktree that claims the branch we are going to
+        // try to checkout inside wt_dir. After this, `git checkout -B
+        // held-elsewhere <base>` inside wt_dir will fail because
+        // `held-elsewhere` is already used by the other worktree.
+        //
+        // But first we need to not be on that branch in wt_dir
+        // ourselves — detach HEAD so the branch is free to be held by
+        // the second worktree.
+        let run_in = |dir: &str, args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .args(["-C", dir])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "git -C {dir} {args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        run_in(&wt_dir, &["checkout", "--detach", "-q"]);
+        // Put the second worktree on held-elsewhere next to the first.
+        let other_wt = home.path().join("other-wt");
+        run_in(
+            &repo_dir,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                other_wt.to_str().unwrap(),
+                "held-elsewhere",
+            ],
+        );
+
+        // Sanity: rev-list succeeds (branch and base both resolve), and
+        // the branch is 0 ahead of itself.
+        assert_eq!(
+            git_rev_count(&wt_dir, "held-elsewhere", "held-elsewhere"),
+            Some(0),
+            "test setup: rev-list must report 0 ahead for Some(0) arm to fire"
+        );
+
+        // Call with branch=held-elsewhere, base=held-elsewhere so the
+        // Some(0) arm fires inside create_ouija_worktree. The checkout
+        // -B should then fail because held-elsewhere is claimed by
+        // other_wt.
+        let _ = base; // base_branch is "main" in the helper; use held-elsewhere explicitly
+        let result = create_ouija_worktree(
+            &repo_dir,
+            "s7",
+            Some("held-elsewhere"),
+            Some("held-elsewhere"),
+            /* force_reset = */ true,
+            home.path(),
+        );
+
+        assert!(
+            result.is_err(),
+            "create_ouija_worktree must return Err when force_reset=true \
+             is asserted on a zero-ahead branch but the alignment reset \
+             fails; got Ok({:?})",
+            result.ok()
+        );
+    }
+
+    /// When `force_reset=false` and the branch is already 0 ahead of
+    /// base, a transient alignment failure must NOT block session start.
+    /// The caller did not opt in to destructive behavior; run_reset is
+    /// a best-effort HEAD/working-tree alignment. A failure here should
+    /// be warn-logged (see follow-on log) but returned as Ok(wt_dir).
+    #[test]
+    fn zero_ahead_without_force_reset_tolerates_alignment_failure() {
+        let home = tempfile::tempdir().unwrap();
+        let (_repo, repo_dir, wt_dir, _base) =
+            repo_and_worktree(home.path(), "s8", "held-elsewhere2");
+
+        let run_in = |dir: &str, args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .args(["-C", dir])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "git -C {dir} {args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        run_in(&wt_dir, &["checkout", "--detach", "-q"]);
+        let other_wt = home.path().join("other-wt-2");
+        run_in(
+            &repo_dir,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                other_wt.to_str().unwrap(),
+                "held-elsewhere2",
+            ],
+        );
+
+        // Force the Some(0) arm to fire with force_reset=false. Even
+        // though the alignment checkout will fail (branch held
+        // elsewhere), the function must still return Ok(wt_dir).
+        let result = create_ouija_worktree(
+            &repo_dir,
+            "s8",
+            Some("held-elsewhere2"),
+            Some("held-elsewhere2"),
+            /* force_reset = */ false,
+            home.path(),
+        );
+        assert!(
+            result.is_ok(),
+            "force_reset=false + alignment failure must return Ok(wt_dir); got Err({:?})",
+            result.err()
+        );
+    }
+
+    /// Regression: the guard must not break the happy path that creates a
+    /// brand-new worktree. A fresh repo + no pre-existing worktree dir
+    /// should produce a working checkout on the requested branch.
+    #[test]
+    fn fresh_worktree_creation_still_works() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_dir = repo.path().to_str().unwrap().to_string();
+        let run = |args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("HOME", home.path())
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        run(&["-C", &repo_dir, "init", "-q", "--initial-branch=main"]);
+        std::fs::write(format!("{repo_dir}/README"), "r").unwrap();
+        run(&["-C", &repo_dir, "add", "README"]);
+        run(&["-C", &repo_dir, "commit", "-q", "-m", "init"]);
+
+        let out = create_ouija_worktree(
+            &repo_dir,
+            "fresh",
+            Some("feat-new"),
+            Some("main"),
+            /* force_reset = */ false,
+            home.path(),
+        )
+        .expect("fresh worktree creates cleanly");
+
+        // Directory should exist and contain the file from main.
+        assert!(std::path::Path::new(&out).exists());
+        assert!(std::path::Path::new(&format!("{out}/README")).exists());
+        assert_eq!(branch_tip(&out, "feat-new"), branch_tip(&out, "main"));
+    }
+
+    // --- Legacy-path dropped-intent predicate (hub#528 review) ---
+    //
+    // The legacy short-circuit returns `Ok(legacy_dir)` without running
+    // any reset logic or honoring force_reset. That is correct for
+    // running-session compatibility, but silently drops an explicit
+    // `force_reset=true` opt-in. `legacy_drops_destructive_intent` is
+    // the single-source predicate the caller consults before emitting a
+    // WARN log; tests cover it so a future refactor cannot accidentally
+    // silence the drop.
+
+    #[test]
+    fn legacy_drops_destructive_intent_fires_for_force_reset_true() {
+        assert!(
+            legacy_drops_destructive_intent(Some("main"), true).is_some(),
+            "force_reset=true + base_branch must produce a warn"
+        );
+    }
+
+    #[test]
+    fn legacy_drops_destructive_intent_silent_when_no_force_reset() {
+        // base_branch alone (without force_reset) is a safe default —
+        // the guard on the non-legacy path would also skip when the
+        // branch is ahead. Don't warn for that.
+        assert!(
+            legacy_drops_destructive_intent(Some("main"), false).is_none(),
+            "force_reset=false on legacy path is not a dropped intent"
+        );
+    }
+
+    #[test]
+    fn legacy_drops_destructive_intent_silent_when_no_base_branch() {
+        // Without base_branch, even the new-path code takes no reset
+        // action. Nothing would have been dropped regardless of path.
+        assert!(
+            legacy_drops_destructive_intent(None, true).is_none(),
+            "no base_branch means no reset target; nothing dropped"
+        );
+    }
+
+    /// Legacy-location worktrees predate the guard. When the caller did
+    /// NOT opt in with force_reset=true, the function must return the
+    /// legacy dir as-is without running any reset logic — even when
+    /// base_branch is supplied. Protects running sessions still under
+    /// `<repo>/.ouija/worktrees/<name>`.
+    #[test]
+    fn legacy_location_short_circuits_when_force_reset_is_false() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_dir = repo.path().to_str().unwrap().to_string();
+        let legacy = format!("{repo_dir}/.ouija/worktrees/legacy");
+        std::fs::create_dir_all(&legacy).unwrap();
+        // Drop a sentinel file so we can confirm nothing inside was touched.
+        std::fs::write(format!("{legacy}/SENTINEL"), "untouched").unwrap();
+
+        let out = create_ouija_worktree(
+            &repo_dir,
+            "legacy",
+            Some("any-branch"),
+            Some("any-base"),
+            /* force_reset = */ false,
+            home.path(),
+        )
+        .expect("legacy path with force_reset=false returns Ok");
+
+        assert_eq!(
+            out, legacy,
+            "legacy path must be returned verbatim without running any git command"
+        );
+        assert_eq!(
+            std::fs::read_to_string(format!("{legacy}/SENTINEL")).unwrap(),
+            "untouched",
+            "legacy worktree contents must not be altered"
+        );
+    }
+
+    /// Mirror of the new-path force_reset=true invariant: when the
+    /// caller explicitly opts in with `force_reset=true + base_branch`
+    /// but lands on a legacy worktree that cannot honor the reset, the
+    /// function must return Err. Otherwise Ok(legacy_dir) is
+    /// indistinguishable from a honored reset — the same dropped-intent
+    /// shape the non-legacy arms (Some(0)/Some(n)/None) now propagate
+    /// via `?`. Blast radius is narrow today, but the first redraft
+    /// call site that lands on a legacy worktree would otherwise
+    /// silently proceed on unexpected branch state.
+    #[test]
+    fn legacy_location_returns_err_when_force_reset_true() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_dir = repo.path().to_str().unwrap().to_string();
+        let legacy = format!("{repo_dir}/.ouija/worktrees/legacy-err");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(format!("{legacy}/SENTINEL"), "untouched").unwrap();
+
+        let result = create_ouija_worktree(
+            &repo_dir,
+            "legacy-err",
+            Some("any-branch"),
+            Some("any-base"),
+            /* force_reset = */ true,
+            home.path(),
+        );
+
+        assert!(
+            result.is_err(),
+            "legacy path must return Err when force_reset=true cannot \
+             be honored; got Ok({:?})",
+            result.ok()
+        );
+        // Contents must still be untouched — the legacy dir is read-only
+        // on this path regardless of the return shape.
+        assert_eq!(
+            std::fs::read_to_string(format!("{legacy}/SENTINEL")).unwrap(),
+            "untouched",
+            "legacy worktree contents must not be altered"
         );
     }
 }
