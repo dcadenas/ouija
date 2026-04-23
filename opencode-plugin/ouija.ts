@@ -62,12 +62,22 @@ Load the ouija skill for full documentation on session management, task scheduli
       if (event.type === "session.status" || event.type === "session.created") {
         const sid = event.properties?.sessionID || event.properties?.info?.id
         if (!sid) return
+        // Enrich the readiness body with pane + cwd so the daemon can
+        // auto-provision (ouija#35) without a round-trip to opencode serve
+        // or a tmux pane scan. The daemon treats both as optional and
+        // falls back to the serve+scan path when either is absent.
+        const readyBody: Record<string, string> = {}
+        const pane = process.env.TMUX_PANE
+        if (pane) readyBody.pane = pane
+        try {
+          readyBody.cwd = process.cwd()
+        } catch {}
         setTimeout(async () => {
           try {
             await fetch(`${base}/api/backend-session/${encodeURIComponent(sid)}/ready`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({})
+              body: JSON.stringify(readyBody)
             })
           } catch {}
         }, 0)

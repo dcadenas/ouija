@@ -2010,15 +2010,50 @@ pub async fn session_ready(
 pub async fn backend_session_ready(
     State(state): State<SharedState>,
     axum::extract::Path(backend_sid): axum::extract::Path<String>,
+    body_bytes: Bytes,
 ) -> Json<serde_json::Value> {
-    Json(backend_session_ready_inner(&state, backend_sid).await)
+    // Parse the body as optional hints. An empty body, `{}`, or malformed
+    // JSON all degrade cleanly to "no hints" — older plugin builds POST an
+    // empty body, and we must not 400 them.
+    let hints = if body_bytes.is_empty() {
+        BackendSessionReadyHints::default()
+    } else {
+        serde_json::from_slice::<BackendSessionReadyHints>(&body_bytes).unwrap_or_default()
+    };
+    Json(backend_session_ready_inner_with_hints(&state, backend_sid, hints).await)
 }
 
+/// Optional hints the opencode plugin may send in the readiness POST body.
+/// Both fields present: skip the opencode-serve dir lookup AND the tmux
+/// pane scan, using the explicit values directly. Otherwise fall back to
+/// the existing resolve-by-scan path (see the decision recorded on this
+/// task — partial hints are an out-of-scope refactor).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackendSessionReadyHints {
+    #[serde(default)]
+    pane: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+#[cfg(test)]
 async fn backend_session_ready_inner(
     state: &std::sync::Arc<crate::state::AppState>,
     backend_sid: String,
 ) -> serde_json::Value {
-    // Step 1: direct lookup.
+    backend_session_ready_inner_with_hints(state, backend_sid, BackendSessionReadyHints::default())
+        .await
+}
+
+async fn backend_session_ready_inner_with_hints(
+    state: &std::sync::Arc<crate::state::AppState>,
+    backend_sid: String,
+    hints: BackendSessionReadyHints,
+) -> serde_json::Value {
+    // Step 1: direct lookup. This runs FIRST regardless of hints — hub-
+    // spawned and previously-adopted sessions must win over any hint-derived
+    // id, or a stale plugin cwd could shadow the real session.
     let session_name = {
         let proto = state.protocol.read().await;
         proto
@@ -2050,15 +2085,28 @@ async fn backend_session_ready_inner(
                 return json!({"delivered": false, "error": "no session with this backend_session_id"});
             }
 
-            let Some(dir) = lookup_opencode_session_dir(state, &backend_sid).await else {
-                return json!({"delivered": false, "error": "no session with this backend_session_id"});
-            };
+            // Fast path: plugin sent both pane + cwd. Skip the opencode-serve
+            // round-trip AND the tmux pane scan and use the hints directly.
+            if let (Some(pane), Some(cwd)) = (hints.pane.as_deref(), hints.cwd.as_deref()) {
+                if let Some(n) =
+                    auto_provision_with_explicit_pane(state, &backend_sid, pane, cwd).await
+                {
+                    n
+                } else {
+                    return json!({"delivered": false, "error": "no session with this backend_session_id"});
+                }
+            } else {
+                // Fallback: resolve dir from opencode serve, then scan tmux.
+                let Some(dir) = lookup_opencode_session_dir(state, &backend_sid).await else {
+                    return json!({"delivered": false, "error": "no session with this backend_session_id"});
+                };
 
-            let Some(n) = auto_provision_from_backend_session(state, &backend_sid, &dir).await
-            else {
-                return json!({"delivered": false, "error": "no session with this backend_session_id"});
-            };
-            n
+                let Some(n) = auto_provision_from_backend_session(state, &backend_sid, &dir).await
+                else {
+                    return json!({"delivered": false, "error": "no session with this backend_session_id"});
+                };
+                n
+            }
         }
     };
 
@@ -2146,6 +2194,50 @@ async fn auto_provision_from_backend_session(
         }
     };
 
+    register_auto_provisioned_session(state, backend_sid, &pane_id, dir).await
+}
+
+/// Auto-provision using an explicit `(pane, dir)` pair supplied by the
+/// opencode plugin in the readiness POST body. Skips the opencode-serve
+/// dir lookup and the tmux pane scan entirely. Race guards and apply_register
+/// dedup still protect against concurrent writers.
+async fn auto_provision_with_explicit_pane(
+    state: &std::sync::Arc<crate::state::AppState>,
+    backend_sid: &str,
+    pane: &str,
+    cwd: &str,
+) -> Option<String> {
+    // Resolve worktree paths up to the repo root, matching the
+    // scan-path's behaviour so the session id we derive is stable
+    // across /repo and /repo/.claude/worktrees/<branch>.
+    let dir = crate::state::resolve_project_root(cwd);
+
+    // Race guard: the backend_session_id may already be bound. Surface
+    // the concurrent winner rather than racing a second Register that
+    // apply_register's pane-dedup would resolve by evicting them.
+    {
+        let proto = state.protocol.read().await;
+        if let Some(existing) = proto
+            .sessions
+            .values()
+            .find(|s| s.metadata.backend_session_id.as_deref() == Some(backend_sid))
+        {
+            return Some(existing.id.clone());
+        }
+    }
+
+    register_auto_provisioned_session(state, backend_sid, pane, dir).await
+}
+
+/// Inner helper: derive the session id, re-check the race, and apply the
+/// Register. Shared by both the scan-path and the explicit-hint path so
+/// the id-derivation + race-guard + metadata layout stay in one place.
+async fn register_auto_provisioned_session(
+    state: &std::sync::Arc<crate::state::AppState>,
+    backend_sid: &str,
+    pane_id: &str,
+    dir: &str,
+) -> Option<String> {
     // Derive a unique session id from the dir basename.
     let basename = std::path::Path::new(dir)
         .file_name()
@@ -2159,7 +2251,7 @@ async fn auto_provision_from_backend_session(
         return None;
     }
 
-    // Race guard 2: re-check the backend_session_id under the same lock we
+    // Race guard: re-check the backend_session_id under the same lock we
     // use to build id_to_pane, so the winning concurrent writer is visible
     // to every subsequent branch. Without this, a writer that landed between
     // the top-of-function guard and this point would cause us to pick a
@@ -2180,7 +2272,7 @@ async fn auto_provision_from_backend_session(
             .iter()
             .map(|(id, s)| (id.clone(), s.pane.clone()))
             .collect();
-        crate::state::resolve_unique_session_id(&id_to_pane, &base_id, Some(&pane_id))
+        crate::state::resolve_unique_session_id(&id_to_pane, &base_id, Some(pane_id))
     };
 
     tracing::info!(
@@ -2197,7 +2289,7 @@ async fn auto_provision_from_backend_session(
     state
         .apply_and_execute(crate::daemon_protocol::Event::Register {
             id: id.clone(),
-            pane: Some(pane_id),
+            pane: Some(pane_id.to_string()),
             metadata,
         })
         .await;
@@ -3073,6 +3165,166 @@ mod tests {
             response["session"].as_str(),
             Some("prebound"),
             "direct lookup must surface the session id, got: {response}"
+        );
+    }
+
+    // --- Plugin-sent pane + cwd hints (fast-path) ---
+
+    #[tokio::test]
+    async fn backend_session_ready_uses_explicit_pane_and_cwd_hints() {
+        // Happy path for the enriched opencode plugin: when both pane and
+        // cwd arrive in the body, skip the opencode-serve round-trip AND the
+        // tmux pane scan. Seeding cached_assistant_panes empty proves the
+        // scan was not consulted — the only way the session can be created
+        // is via the explicit hint path.
+        let state = crate::state::AppState::new_for_test();
+        // Leave cached_assistant_panes empty — the hint path must not depend
+        // on the cache.
+        assert!(state.cached_assistant_panes().await.is_empty());
+
+        let hints = BackendSessionReadyHints {
+            pane: Some("%31".into()),
+            cwd: Some("/tmp/explicit-project".into()),
+        };
+
+        let response = backend_session_ready_inner_with_hints(
+            &state,
+            "ses_explicit".into(),
+            hints,
+        )
+        .await;
+
+        assert_eq!(
+            response["session"].as_str(),
+            Some("explicit-project"),
+            "hint path must auto-provision with id derived from cwd basename, got: {response}"
+        );
+
+        // State mutations end-to-end.
+        let proto = state.protocol.read().await;
+        let session = proto.sessions.get("explicit-project").expect("session exists");
+        assert_eq!(session.pane.as_deref(), Some("%31"));
+        assert_eq!(
+            session.metadata.backend_session_id.as_deref(),
+            Some("ses_explicit"),
+        );
+        assert_eq!(
+            session.metadata.project_dir.as_deref(),
+            Some("/tmp/explicit-project"),
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_session_ready_explicit_hints_respect_auto_register_disabled() {
+        // auto_register=false opts out of implicit session creation
+        // regardless of whether the plugin sent explicit hints. The hint
+        // shortcut must not bypass the operator guardrail.
+        let state = crate::state::AppState::new_for_test();
+        state.settings.write().await.auto_register = false;
+
+        let hints = BackendSessionReadyHints {
+            pane: Some("%31".into()),
+            cwd: Some("/tmp/explicit-project".into()),
+        };
+
+        let response = backend_session_ready_inner_with_hints(
+            &state,
+            "ses_gated_with_hints".into(),
+            hints,
+        )
+        .await;
+
+        assert_eq!(response["delivered"], false);
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no session with this backend_session_id"),
+            "expected strict error, got: {response}"
+        );
+        let proto = state.protocol.read().await;
+        assert!(
+            proto.sessions.is_empty(),
+            "hints must not bypass the auto_register opt-out"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_session_ready_partial_hints_fall_back_to_scan_path() {
+        // Only pane, no cwd: do NOT take the fast-path. Fall through to the
+        // existing opencode-serve dir lookup. In the test env the serve is
+        // unreachable, so the expected end-state is the strict error — this
+        // test pins the fallback behaviour rather than relying on a
+        // future half-hint shortcut that is explicitly out of scope
+        // (see the "partial hints fall back entirely" decision on this task).
+        let state = crate::state::AppState::new_for_test();
+        // Seed a matching pane anyway. Hint path must NOT fire (cwd missing),
+        // so the scan path will run and miss because opencode serve is down.
+        *state.cached_assistant_panes.write().await =
+            vec![pane_in("/tmp/half-hinted", "%31")];
+
+        let hints = BackendSessionReadyHints {
+            pane: Some("%31".into()),
+            cwd: None,
+        };
+
+        let response = backend_session_ready_inner_with_hints(
+            &state,
+            "ses_half".into(),
+            hints,
+        )
+        .await;
+
+        // Fallback path: no dir -> strict error, no session.
+        assert_eq!(response["delivered"], false);
+        assert!(response.get("session").is_none());
+        let proto = state.protocol.read().await;
+        assert!(proto.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn backend_session_ready_explicit_hints_direct_lookup_still_wins() {
+        // When the backend_session_id is already bound to a session, the
+        // direct-lookup fast path in step 1 must short-circuit BEFORE the
+        // hint path runs. Otherwise an existing session with a different
+        // id could be shadowed by a newly-invented one derived from the
+        // hint cwd.
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "prebound".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/some-real-project".into()),
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_known".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let hints = BackendSessionReadyHints {
+            pane: Some("%99".into()),
+            cwd: Some("/tmp/unrelated".into()),
+        };
+
+        let response = backend_session_ready_inner_with_hints(
+            &state,
+            "ses_known".into(),
+            hints,
+        )
+        .await;
+
+        assert_eq!(
+            response["session"].as_str(),
+            Some("prebound"),
+            "direct lookup must win even when hints point elsewhere, got: {response}"
+        );
+        let proto = state.protocol.read().await;
+        assert_eq!(
+            proto.sessions.len(),
+            1,
+            "no session must be created from the hints when direct lookup hits"
         );
     }
 }
