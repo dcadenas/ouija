@@ -2585,7 +2585,13 @@ fn create_ouija_worktree(
     let legacy_dir = format!("{repo_dir}/.ouija/worktrees/{name}");
     if std::path::Path::new(&legacy_dir).exists() {
         if let Some(msg) = legacy_drops_destructive_intent(base_branch, force_reset) {
+            // Mirror the non-legacy arms (Some(0)/Some(n)/None at
+            // :2612/:2626/:2640): when force_reset=true is asserted but
+            // cannot be honored here, return Err so Ok(wt_dir) never
+            // conflates "reset happened" with "reset was silently
+            // dropped". Warn-log too so the reason is in daemon logs.
             tracing::warn!("worktree {name}: {msg}");
+            return Err(anyhow::anyhow!(msg));
         }
         return Ok(legacy_dir);
     }
@@ -3974,12 +3980,13 @@ mod tests {
         );
     }
 
-    /// Legacy-location worktrees predate the guard. If the legacy path
-    /// exists, the function must return it as-is without running any reset
-    /// logic — even when base_branch is supplied. Protects running sessions
-    /// that still live under `<repo>/.ouija/worktrees/<name>`.
+    /// Legacy-location worktrees predate the guard. When the caller did
+    /// NOT opt in with force_reset=true, the function must return the
+    /// legacy dir as-is without running any reset logic — even when
+    /// base_branch is supplied. Protects running sessions still under
+    /// `<repo>/.ouija/worktrees/<name>`.
     #[test]
-    fn legacy_location_short_circuits_with_no_reset() {
+    fn legacy_location_short_circuits_when_force_reset_is_false() {
         let home = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         let repo_dir = repo.path().to_str().unwrap().to_string();
@@ -3993,15 +4000,57 @@ mod tests {
             "legacy",
             Some("any-branch"),
             Some("any-base"),
-            /* force_reset = */ true, // even with force_reset=true
+            /* force_reset = */ false,
             home.path(),
         )
-        .expect("legacy path returns Ok");
+        .expect("legacy path with force_reset=false returns Ok");
 
         assert_eq!(
             out, legacy,
             "legacy path must be returned verbatim without running any git command"
         );
+        assert_eq!(
+            std::fs::read_to_string(format!("{legacy}/SENTINEL")).unwrap(),
+            "untouched",
+            "legacy worktree contents must not be altered"
+        );
+    }
+
+    /// Mirror of the new-path force_reset=true invariant: when the
+    /// caller explicitly opts in with `force_reset=true + base_branch`
+    /// but lands on a legacy worktree that cannot honor the reset, the
+    /// function must return Err. Otherwise Ok(legacy_dir) is
+    /// indistinguishable from a honored reset — the same dropped-intent
+    /// shape the non-legacy arms (Some(0)/Some(n)/None) now propagate
+    /// via `?`. Blast radius is narrow today, but the first redraft
+    /// call site that lands on a legacy worktree would otherwise
+    /// silently proceed on unexpected branch state.
+    #[test]
+    fn legacy_location_returns_err_when_force_reset_true() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_dir = repo.path().to_str().unwrap().to_string();
+        let legacy = format!("{repo_dir}/.ouija/worktrees/legacy-err");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(format!("{legacy}/SENTINEL"), "untouched").unwrap();
+
+        let result = create_ouija_worktree(
+            &repo_dir,
+            "legacy-err",
+            Some("any-branch"),
+            Some("any-base"),
+            /* force_reset = */ true,
+            home.path(),
+        );
+
+        assert!(
+            result.is_err(),
+            "legacy path must return Err when force_reset=true cannot \
+             be honored; got Ok({:?})",
+            result.ok()
+        );
+        // Contents must still be untouched — the legacy dir is read-only
+        // on this path regardless of the return shape.
         assert_eq!(
             std::fs::read_to_string(format!("{legacy}/SENTINEL")).unwrap(),
             "untouched",
