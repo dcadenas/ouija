@@ -2199,8 +2199,22 @@ async fn auto_provision_from_backend_session(
 
 /// Auto-provision using an explicit `(pane, dir)` pair supplied by the
 /// opencode plugin in the readiness POST body. Skips the opencode-serve
-/// dir lookup and the tmux pane scan entirely. Race guards and apply_register
-/// dedup still protect against concurrent writers.
+/// dir lookup and the tmux pane scan lookup-by-dir, but still verifies the
+/// pane against the same two invariants the scan path enforces:
+///
+/// 1. The pane must appear in `list_assistant_panes`. This rejects stale
+///    `TMUX_PANE` values (pane died between capture and POST), inherited
+///    env vars from non-opencode callers, and any other caller who hands
+///    us a pane id that isn't actually running an assistant process.
+/// 2. The pane must not already be bound to another Local session. Without
+///    this filter, `apply_register`'s pane-dedup silently evicts whoever
+///    currently owns the pane — a concurrent claude-code SessionStart, a
+///    prior auto-provision, or a manual `ouija register` would all be
+///    vulnerable. Fail closed instead; the operator can disambiguate via
+///    `ouija register` if they really want to reassign the pane.
+///
+/// Race guards and apply_register dedup still protect against concurrent
+/// writers as before.
 async fn auto_provision_with_explicit_pane(
     state: &std::sync::Arc<crate::state::AppState>,
     backend_sid: &str,
@@ -2223,6 +2237,38 @@ async fn auto_provision_with_explicit_pane(
             .find(|s| s.metadata.backend_session_id.as_deref() == Some(backend_sid))
         {
             return Some(existing.id.clone());
+        }
+    }
+
+    // Defense 1: the supplied pane must be in list_assistant_panes. This is
+    // the same liveness + is-an-assistant-pane check the scan path applies
+    // implicitly when it iterates find_assistant_panes results.
+    let panes = state.list_assistant_panes().await;
+    if !panes.iter().any(|p| p.pane_id == pane) {
+        tracing::warn!(
+            "auto-provision declined: hint pane {pane} is not among current assistant panes (backend_session_id {backend_sid})"
+        );
+        return None;
+    }
+
+    // Defense 2: the supplied pane must not already belong to another
+    // Local session. Matches the `registered_panes` filter in the scan path
+    // (auto_provision_from_backend_session). Without this, apply_register's
+    // pane-dedup would silently evict the current owner.
+    {
+        let proto = state.protocol.read().await;
+        let already_bound = proto
+            .sessions
+            .values()
+            .any(|s| {
+                matches!(s.origin, crate::daemon_protocol::Origin::Local)
+                    && s.pane.as_deref() == Some(pane)
+            });
+        if already_bound {
+            tracing::warn!(
+                "auto-provision declined: hint pane {pane} is already bound to another local session (backend_session_id {backend_sid})"
+            );
+            return None;
         }
     }
 
@@ -3174,13 +3220,14 @@ mod tests {
     async fn backend_session_ready_uses_explicit_pane_and_cwd_hints() {
         // Happy path for the enriched opencode plugin: when both pane and
         // cwd arrive in the body, skip the opencode-serve round-trip AND the
-        // tmux pane scan. Seeding cached_assistant_panes empty proves the
-        // scan was not consulted — the only way the session can be created
-        // is via the explicit hint path.
+        // scan-path's list-panes-by-dir filter. The pane still has to appear
+        // in list_assistant_panes (defense 1 of the hint-path validation),
+        // so seed it under a DIFFERENT directory than the hint cwd — that
+        // proves the hint cwd is used for dir derivation, not the pane's
+        // pane_current_path that the scan path would have consulted.
         let state = crate::state::AppState::new_for_test();
-        // Leave cached_assistant_panes empty — the hint path must not depend
-        // on the cache.
-        assert!(state.cached_assistant_panes().await.is_empty());
+        *state.cached_assistant_panes.write().await =
+            vec![pane_in("/tmp/different-dir", "%31")];
 
         let hints = BackendSessionReadyHints {
             pane: Some("%31".into()),
@@ -3200,7 +3247,9 @@ mod tests {
             "hint path must auto-provision with id derived from cwd basename, got: {response}"
         );
 
-        // State mutations end-to-end.
+        // State mutations end-to-end: note that project_dir follows the
+        // explicit cwd hint, NOT the pane's cached pane_current_path —
+        // the scan path would have resolved /tmp/different-dir here.
         let proto = state.protocol.read().await;
         let session = proto.sessions.get("explicit-project").expect("session exists");
         assert_eq!(session.pane.as_deref(), Some("%31"));
@@ -3325,6 +3374,88 @@ mod tests {
             proto.sessions.len(),
             1,
             "no session must be created from the hints when direct lookup hits"
+        );
+    }
+
+    // --- Hint-path pane validation (review item: defense parity with scan path) ---
+
+    #[tokio::test]
+    async fn hint_path_rejects_pane_not_in_assistant_panes() {
+        // Defense parity with scan path: a caller that POSTs an arbitrary
+        // pane id that isn't actually running opencode must NOT be able to
+        // create a ghost session bound to a dead pane. The scan path enforces
+        // this implicitly by only considering panes from list_assistant_panes;
+        // the hint path must match that contract explicitly.
+        let state = crate::state::AppState::new_for_test();
+        // Seed panes that do NOT include %99.
+        *state.cached_assistant_panes.write().await =
+            vec![pane_in("/tmp/unrelated", "%11")];
+
+        let result = auto_provision_with_explicit_pane(
+            &state,
+            "ses_ghost",
+            "%99", // not in list_assistant_panes
+            "/tmp/freshproject",
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "hint path must reject a pane that is not in list_assistant_panes, got Some({result:?})"
+        );
+        let proto = state.protocol.read().await;
+        assert!(
+            proto.sessions.is_empty(),
+            "no session must be created for an unverified pane"
+        );
+    }
+
+    #[tokio::test]
+    async fn hint_path_rejects_pane_already_registered_to_another_session() {
+        // Silent-hijack guard: the scan path filters out panes already owned
+        // by another Local session (api.rs:2154-2175). Without the same filter
+        // on the hint path, apply_register's pane-dedup silently evicts
+        // whoever currently owns the pane. A concurrent claude-code
+        // SessionStart, a prior auto-provision, or a manual `ouija register`
+        // would all be vulnerable. The hint path must fail closed instead.
+        let state = crate::state::AppState::new_for_test();
+        *state.cached_assistant_panes.write().await =
+            vec![pane_in("/tmp/freshproject", "%17")];
+        // Pre-bind the pane to another session (e.g. the claude-code hook
+        // got there first).
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "prebound".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/freshproject".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let result = auto_provision_with_explicit_pane(
+            &state,
+            "ses_hijacker",
+            "%17", // already owned by `prebound`
+            "/tmp/freshproject",
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "hint path must refuse to hijack an already-registered pane, got Some({result:?})"
+        );
+        let proto = state.protocol.read().await;
+        assert_eq!(
+            proto.sessions.len(),
+            1,
+            "the victim session must survive intact"
+        );
+        let survivor = proto.sessions.get("prebound").unwrap();
+        assert!(
+            survivor.metadata.backend_session_id.is_none(),
+            "victim's metadata must not be rewritten with the hijacker's backend_session_id"
         );
     }
 }
