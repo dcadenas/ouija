@@ -2221,6 +2221,26 @@ async fn auto_provision_with_explicit_pane(
     pane: &str,
     cwd: &str,
 ) -> Option<String> {
+    // Validate cwd BEFORE resolving / deriving anything from it. Every
+    // other ouija code path treats project_dir as an absolute path with
+    // at least one non-root segment, so reject degenerate input at the
+    // boundary rather than letting it corrupt the session record.
+    //
+    // - Empty string: Path::file_name() returns None → basename falls
+    //   through to "unnamed" in register_auto_provisioned_session; also
+    //   project_dir would be persisted as "".
+    // - Bare "/": same file_name() = None pathology; and no realistic
+    //   caller has / as their project root.
+    // - Relative (no leading "/"): would poison downstream comparisons
+    //   (adoption, scan-by-dir, bulletin dedup) that string-compare
+    //   project_dir against absolute paths.
+    if cwd.is_empty() || cwd == "/" || !cwd.starts_with('/') {
+        tracing::warn!(
+            "auto-provision declined: invalid hint cwd {cwd:?} (must be absolute, non-empty, non-root) for backend_session_id {backend_sid}"
+        );
+        return None;
+    }
+
     // Resolve worktree paths up to the repo root, matching the
     // scan-path's behaviour so the session id we derive is stable
     // across /repo and /repo/.claude/worktrees/<branch>.
@@ -3408,6 +3428,80 @@ mod tests {
             proto.sessions.is_empty(),
             "no session must be created for an unverified pane"
         );
+    }
+
+    #[tokio::test]
+    async fn hint_path_rejects_empty_cwd() {
+        // Degenerate cwd = "" makes Path::file_name() return None, which
+        // register_auto_provisioned_session turns into the literal "unnamed".
+        // And project_dir would be persisted as the empty string. Reject
+        // this at the hint-path entry rather than letting it corrupt state.
+        let state = crate::state::AppState::new_for_test();
+        *state.cached_assistant_panes.write().await =
+            vec![pane_in("/tmp/ignored", "%17")];
+
+        let result = auto_provision_with_explicit_pane(
+            &state,
+            "ses_bad_cwd",
+            "%17",
+            "", // degenerate cwd
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "empty cwd must be rejected, got Some({result:?})"
+        );
+        assert!(state.protocol.read().await.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hint_path_rejects_bare_root_cwd() {
+        // cwd = "/" has the same file_name() = None pathology: basename
+        // falls through to "unnamed" and project_dir is persisted as "/".
+        // No realistic caller has / as their project root.
+        let state = crate::state::AppState::new_for_test();
+        *state.cached_assistant_panes.write().await =
+            vec![pane_in("/tmp/ignored", "%17")];
+
+        let result = auto_provision_with_explicit_pane(
+            &state,
+            "ses_root_cwd",
+            "%17",
+            "/",
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "bare `/` cwd must be rejected, got Some({result:?})"
+        );
+        assert!(state.protocol.read().await.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hint_path_rejects_relative_cwd() {
+        // Every other ouija code path treats project_dir as absolute.
+        // Accepting relative paths here would poison downstream comparisons
+        // (adoption, scan-by-dir, bulletin dedup, etc.) that string-compare
+        // project_dir. Reject at the boundary instead.
+        let state = crate::state::AppState::new_for_test();
+        *state.cached_assistant_panes.write().await =
+            vec![pane_in("/tmp/ignored", "%17")];
+
+        let result = auto_provision_with_explicit_pane(
+            &state,
+            "ses_rel_cwd",
+            "%17",
+            "relative/path",
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "relative cwd must be rejected, got Some({result:?})"
+        );
+        assert!(state.protocol.read().await.sessions.is_empty());
     }
 
     #[tokio::test]
