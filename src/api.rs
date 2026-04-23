@@ -1735,6 +1735,17 @@ pub struct SessionNameBody {
     /// Defaults to false (cleanup) when omitted.
     #[serde(default)]
     keep_worktree: Option<bool>,
+    /// Opt-in to the data-destructive worktree reset on respawn.
+    ///
+    /// When the worktree dir already exists and `base_branch` is supplied,
+    /// ouija used to unconditionally `git checkout -B <branch> <base>`,
+    /// silently discarding every commit the branch was ahead of base
+    /// (hub#528). The default is now `false`: ouija skips the reset and
+    /// WARNs if the branch is ahead. Callers that *want* the reset (e.g. a
+    /// legitimate "redraft from scratch" flow) must pass `force_reset=true`
+    /// so the intent is explicit and auditable.
+    #[serde(default)]
+    force_reset: Option<bool>,
 }
 
 /// Kill the coding assistant process in a session's tmux pane.
@@ -1810,6 +1821,7 @@ pub async fn start_session(
             body.reminder.as_deref(),
             body.branch.as_deref(),
             body.base_branch.as_deref(),
+            body.force_reset.unwrap_or(false),
         )
         .await;
 
@@ -3585,6 +3597,34 @@ mod tests {
         assert!(
             survivor.metadata.backend_session_id.is_none(),
             "victim's metadata must not be rewritten with the hijacker's backend_session_id"
+        );
+    }
+
+    // --- force_reset plumbing (hub#528 guard) ---
+
+    #[test]
+    fn session_name_body_parses_force_reset_when_present() {
+        // Hub opts in to the data-destructive reset by passing force_reset=true.
+        let body: SessionNameBody = serde_json::from_str(
+            r#"{"name":"s","worktree":true,"base_branch":"main","force_reset":true}"#,
+        )
+        .expect("body parses");
+        assert_eq!(
+            body.force_reset,
+            Some(true),
+            "force_reset=true must deserialize to Some(true)"
+        );
+    }
+
+    #[test]
+    fn session_name_body_force_reset_defaults_to_none() {
+        // When the caller omits the field, it must default to None —
+        // which start_session treats as force_reset=false (the safe default).
+        let body: SessionNameBody =
+            serde_json::from_str(r#"{"name":"s"}"#).expect("body parses");
+        assert_eq!(
+            body.force_reset, None,
+            "omitted force_reset must deserialize to None (safe default)"
         );
     }
 }

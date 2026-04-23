@@ -1106,8 +1106,9 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         kill_session(state, name).await
     } else if let Some(rest) = cmd.strip_prefix("/start ") {
         let name = rest.trim();
+        // /start chat-command never resets — no base_branch supplied anyway.
         start_session(
-            state, name, None, None, None, None, None, None, None, None, None, None, None,
+            state, name, None, None, None, None, None, None, None, None, None, None, None, false,
         )
         .await
         .0
@@ -1405,6 +1406,7 @@ pub async fn start_session(
     reminder: Option<&str>,
     branch: Option<&str>,
     base_branch: Option<&str>,
+    force_reset: bool,
 ) -> (String, Option<u64>) {
     // Check if already exists
     if state.protocol.read().await.sessions.contains_key(name) {
@@ -1455,15 +1457,15 @@ pub async fn start_session(
     // The backend never sees --worktree — it just gets a directory.
     if worktree {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        // force_reset stays false by default to prevent silent branch
-        // wipes on respawn (hub#528). Chunk 2 will thread an explicit
-        // opt-in from the API boundary down to here.
+        // `force_reset` is the explicit caller opt-in that guards against
+        // silent branch wipes on respawn (hub#528). Threaded from the API
+        // boundary; defaults to false.
         match create_ouija_worktree(
             &dir,
             name,
             branch,
             base_branch,
-            /* force_reset = */ false,
+            force_reset,
             std::path::Path::new(&home),
         ) {
             Ok(wt_dir) => {
