@@ -30,6 +30,53 @@ pub fn sanitize_session_id(name: &str) -> String {
         .to_string()
 }
 
+/// Resolve a unique session ID for a new registration.
+///
+/// Walks `base_id`, `base_id-2`, `base_id-3`, ... until either an unused id is
+/// found or the existing entry's pane matches `target_pane` (idempotent
+/// re-registration of the same pane). Caps at `MAX_NAME_SUFFIX` attempts; on
+/// overflow returns the last id tried with a `tracing::warn!` so the caller's
+/// `Event::Register` either replaces the holder via apply_register's pane-dedup
+/// or fails loudly rather than spinning forever.
+///
+/// `id_to_pane` is a snapshot of `proto.sessions` keyed by id with the value
+/// being the pane currently bound to that id. Callers that already hold a
+/// `proto.sessions` read lock can build this in one pass; callers without a
+/// lock can pass a lazily-constructed map. Either way, the helper itself is
+/// pure — no I/O, no awaits, no locks — so it composes cleanly with both
+/// the lock-held (`hooks::session_start_inner`) and lock-free
+/// (`AppState::scan_and_autoregister_panes`) call sites.
+///
+/// `target_pane = None` means the caller has no pane to dedupe against (e.g.
+/// API-driven registration without a `pane` field). In that case every
+/// existing entry counts as a conflict; we never collapse to the base id just
+/// because some other holder also happens to have a None pane.
+pub fn resolve_unique_session_id(
+    id_to_pane: &HashMap<String, Option<String>>,
+    base_id: &str,
+    target_pane: Option<&str>,
+) -> String {
+    let mut id = base_id.to_string();
+    let mut suffix = 2u32;
+    while let Some(existing_pane) = id_to_pane.get(&id) {
+        // Same-pane idempotency: if the existing entry is bound to the
+        // same pane the caller is registering, return the current id so
+        // apply_register's idempotent path runs instead of inventing a new id.
+        if target_pane.is_some() && existing_pane.as_deref() == target_pane {
+            return id;
+        }
+        id = format!("{base_id}-{suffix}");
+        if suffix > MAX_NAME_SUFFIX {
+            tracing::warn!(
+                "resolve_unique_session_id: exhausted suffixes 2..={MAX_NAME_SUFFIX} for base '{base_id}', returning '{id}'"
+            );
+            return id;
+        }
+        suffix += 1;
+    }
+    id
+}
+
 /// Expand `~/` to `$HOME/` in a path string.
 pub fn expand_tilde(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
@@ -108,7 +155,7 @@ pub struct AppState {
     /// Pending remote command results: command string → oneshot senders.
     pending_commands: std::sync::Mutex<Vec<(String, tokio::sync::oneshot::Sender<String>)>>,
     /// Cached tmux panes running the coding assistant, refreshed by the reaper loop.
-    cached_assistant_panes: RwLock<Vec<crate::tmux::TmuxPane>>,
+    pub(crate) cached_assistant_panes: RwLock<Vec<crate::tmux::TmuxPane>>,
     /// Per-fire worktree panes: pane_id → project_dir.
     /// Reaper runs `git worktree prune` when these panes die.
     pub perfire_worktree_panes: RwLock<HashMap<String, String>>,
@@ -1115,6 +1162,33 @@ impl AppState {
         self.cached_assistant_panes.read().await.clone()
     }
 
+    /// Return a current snapshot of tmux panes running a known assistant.
+    ///
+    /// Production path: runs a fresh `find_assistant_panes` so the caller sees
+    /// panes that appeared since the last periodic scan. This is what the
+    /// auto-provision branch in `backend_session_ready` needs — the very
+    /// first readiness callback for a brand-new pane fires in the
+    /// milliseconds after opencode startup, well before the periodic
+    /// scanner's next tick.
+    ///
+    /// Test path: short-circuits to `cached_assistant_panes`, which
+    /// `new_for_test()` initialises empty but tests can seed with
+    /// `*state.cached_assistant_panes.write().await = vec![...]`. This keeps
+    /// unit tests off the real tmux server, matching the `cfg!(test)` pattern
+    /// documented in CLAUDE.md for tmux-side primitives.
+    pub async fn list_assistant_panes(&self) -> Vec<crate::tmux::TmuxPane> {
+        if cfg!(test) {
+            return self.cached_assistant_panes().await;
+        }
+        let names: Vec<String> = self.backends.all_process_names();
+        tokio::task::spawn_blocking(move || {
+            let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+            crate::tmux::find_assistant_panes(&refs).unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
     /// Scan tmux for assistant panes, update cache, and auto-register unregistered ones.
     pub async fn scan_and_autoregister_panes(self: &Arc<Self>) {
         let names: Vec<String> = self.backends.all_process_names();
@@ -1195,20 +1269,9 @@ impl AppState {
                 continue;
             }
 
-            // Resolve name conflicts using pre-computed map (no lock re-acquisition)
-            let mut id = base_id.clone();
-            let mut suffix = 2u32;
-            while let Some(existing_pane) = id_to_pane.get(&id) {
-                if existing_pane.as_deref() == Some(pane.pane_id.as_str()) {
-                    break; // Same pane, protocol handles idempotent update
-                }
-                id = format!("{base_id}-{suffix}");
-                suffix += 1;
-                if suffix > MAX_NAME_SUFFIX {
-                    tracing::warn!("could not find available name for pane {}", pane.pane_id);
-                    break;
-                }
-            }
+            // Resolve name conflicts using pre-computed map (no lock re-acquisition).
+            // Shared with hooks::session_start_inner via resolve_unique_session_id.
+            let id = resolve_unique_session_id(&id_to_pane, &base_id, Some(pane.pane_id.as_str()));
 
             let proto_meta = crate::daemon_protocol::SessionMeta {
                 project_dir: Some(project_root.to_string()),
@@ -1437,6 +1500,90 @@ pub(crate) mod tests {
         assert_eq!(
             resolve_project_root("/home/daniel/code/ouija/.ouija/worktrees/feature-x"),
             "/home/daniel/code/ouija"
+        );
+    }
+
+    // --- resolve_unique_session_id ---
+
+    #[test]
+    fn resolve_unique_session_id_no_conflicts_returns_base() {
+        let map: HashMap<String, Option<String>> = HashMap::new();
+        assert_eq!(
+            resolve_unique_session_id(&map, "ouija", Some("%17")),
+            "ouija"
+        );
+    }
+
+    #[test]
+    fn resolve_unique_session_id_same_pane_returns_base_idempotent() {
+        // Re-resolving a name that already maps to the same pane must NOT
+        // bump to a new suffix. The protocol handles idempotent re-register
+        // (same id, same pane) without side effects; if the helper invented
+        // a new id here we'd lose that idempotency and silently rename
+        // sessions on every hook fire.
+        let mut map = HashMap::new();
+        map.insert("ouija".into(), Some("%17".into()));
+        assert_eq!(
+            resolve_unique_session_id(&map, "ouija", Some("%17")),
+            "ouija"
+        );
+    }
+
+    #[test]
+    fn resolve_unique_session_id_distinct_pane_bumps_suffix() {
+        // Same base_id, different pane: must allocate -2.
+        let mut map = HashMap::new();
+        map.insert("ouija".into(), Some("%17".into()));
+        assert_eq!(
+            resolve_unique_session_id(&map, "ouija", Some("%18")),
+            "ouija-2"
+        );
+    }
+
+    #[test]
+    fn resolve_unique_session_id_walks_through_taken_suffixes() {
+        // ouija and ouija-2 are taken (different panes); helper must skip to ouija-3.
+        let mut map = HashMap::new();
+        map.insert("ouija".into(), Some("%17".into()));
+        map.insert("ouija-2".into(), Some("%18".into()));
+        assert_eq!(
+            resolve_unique_session_id(&map, "ouija", Some("%19")),
+            "ouija-3"
+        );
+    }
+
+    #[test]
+    fn resolve_unique_session_id_no_target_pane_treats_existing_as_conflict() {
+        // When target_pane is None (caller has no pane to dedupe against), every
+        // existing entry counts as a conflict — never collapse to base just
+        // because some other id_to_pane entry happens to also be None.
+        let mut map = HashMap::new();
+        map.insert("ouija".into(), None);
+        assert_eq!(
+            resolve_unique_session_id(&map, "ouija", None),
+            "ouija-2"
+        );
+    }
+
+    #[test]
+    fn resolve_unique_session_id_overflow_returns_last_attempted_id() {
+        // Saturate the namespace from base..=base-MAX_NAME_SUFFIX with foreign
+        // panes. The helper must not loop forever and must not panic; it
+        // returns the last id it tried so the caller's apply_register can
+        // reject it (Register dedup will replace whatever currently owns
+        // that id rather than silently corrupt state).
+        let mut map = HashMap::new();
+        map.insert("ouija".into(), Some("%1".into()));
+        for n in 2..=MAX_NAME_SUFFIX {
+            map.insert(format!("ouija-{n}"), Some(format!("%{n}")));
+        }
+        let resolved = resolve_unique_session_id(&map, "ouija", Some("%9999"));
+        // The overflow stop happens after format!("{base}-{suffix}") with
+        // suffix == MAX_NAME_SUFFIX + 1. We don't pin the exact id; what
+        // matters is that the call returns and is finite.
+        assert!(
+            resolved.starts_with("ouija"),
+            "expected resolved id to start with the base, got: {resolved}"
         );
     }
 

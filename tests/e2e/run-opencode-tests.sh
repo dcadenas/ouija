@@ -203,6 +203,58 @@ else
     fail "backend_session_id" "non-empty value" "empty in status"
 fi
 
+log "Test 8c: ad-hoc opencode session auto-provisions via explicit pane+cwd hints (#35)"
+# Simulates the enriched opencode plugin POSTing an unknown backend_session_id
+# with TMUX_PANE and cwd in the body. The daemon should auto-provision a
+# fresh session record so the CLI inside the pane can resolve itself.
+# Gated on auto_register=true (the default in /tmp/ouija-test/settings.json
+# is false for the rest of this suite's isolation).
+tmux new-window -t test
+ADHOC_PANE=$(tmux display-message -t test -p '#{pane_id}')
+mkdir -p /tmp/adhoc-project
+# Enable auto_register for the duration of this test. Install an EXIT trap
+# BEFORE the POST so the restore fires even if `set -e` (or any later test)
+# aborts the script — otherwise Tests 9+ would silently run with
+# auto_register=true and exhibit subtle test-isolation flakiness.
+trap 'api "$BASE" POST /api/settings -d "{\"auto_register\":false}" >/dev/null 2>&1 || true' EXIT
+api "$BASE" POST /api/settings -d '{"auto_register":true}' >/dev/null
+# Use a backend_session_id that opencode serve does NOT know about, so the
+# dir-lookup fallback cannot satisfy the request — the only way to succeed
+# is via the explicit pane+cwd hint path.
+ADHOC_BSID="ses_adhoc_$$"
+adhoc_resp=$(curl -sf -X POST "$BASE/api/backend-session/${ADHOC_BSID}/ready" \
+    -H "Content-Type: application/json" \
+    -d "{\"pane\":\"${ADHOC_PANE}\",\"cwd\":\"/tmp/adhoc-project\"}" \
+    2>/dev/null || echo '{"error":"failed"}')
+adhoc_session=$(echo "$adhoc_resp" | jq -r '.session // empty')
+if [ "$adhoc_session" = "adhoc-project" ]; then
+    pass "auto-provisioned session 'adhoc-project' from explicit pane+cwd"
+else
+    fail "auto-provision via hints" "session=adhoc-project" "$(echo "$adhoc_resp" | head -c 200)"
+fi
+# The new session must resolve by pane (the end-state the CLI relies on).
+adhoc_by_pane=$(api "$BASE" GET /api/status | jq -r \
+    --arg pane "$ADHOC_PANE" \
+    '.sessions[] | select(.pane == $pane) | .id // empty')
+if [ "$adhoc_by_pane" = "adhoc-project" ]; then
+    pass "auto-provisioned session resolves by pane"
+else
+    fail "resolve by pane" "adhoc-project" "$adhoc_by_pane"
+fi
+# And the backend_session_id must be bound atomically.
+adhoc_bsid_bound=$(api "$BASE" GET /api/status | jq -r \
+    --arg bsid "$ADHOC_BSID" \
+    '.sessions[] | select(.backend_session_id == $bsid) | .id // empty')
+if [ "$adhoc_bsid_bound" = "adhoc-project" ]; then
+    pass "backend_session_id bound atomically with the auto-provisioned Register"
+else
+    fail "bsid bound" "adhoc-project" "$adhoc_bsid_bound"
+fi
+# Clean up: restore auto_register=false for the rest of the suite, then
+# clear the trap now that the state is known-good.
+api "$BASE" POST /api/settings -d '{"auto_register":false}' >/dev/null
+trap - EXIT
+
 log "Test 9: ouija send delivers to opencode via HTTP API"
 send_result=$(api "$BASE" POST /api/send \
     -d '{"from":"test-sender","to":"oc-e2e","message":"Reply with only the word hello","expects_reply":false}')
