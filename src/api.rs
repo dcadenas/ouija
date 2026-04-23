@@ -1887,6 +1887,18 @@ pub async fn restart_session(
     body.model = normalize_optional_string(body.model);
     body.effort = normalize_optional_string(body.effort);
 
+    // restart_session shares SessionNameBody with start_session, so
+    // `force_reset` and `base_branch` deserialize here too — but the
+    // underlying `nostr_transport::restart_session` does not accept or
+    // act on them (no create_ouija_worktree call; the worktree is
+    // reused as-is from prev_metadata.project_dir). Warn-log the drop
+    // so the caller's opt-in is visible in daemon logs. Same predicate
+    // and same rationale as the /api/sessions/start exists branch
+    // (hub#528 review).
+    if let Some(msg) = restart_drops_destructive_intent(&body) {
+        tracing::warn!("{msg}");
+    }
+
     let fresh = body.fresh.unwrap_or(false);
     let (result, _prompt_msg_id) = crate::nostr_transport::restart_session(
         &state,
