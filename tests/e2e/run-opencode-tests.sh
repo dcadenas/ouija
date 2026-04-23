@@ -212,7 +212,11 @@ log "Test 8c: ad-hoc opencode session auto-provisions via explicit pane+cwd hint
 tmux new-window -t test
 ADHOC_PANE=$(tmux display-message -t test -p '#{pane_id}')
 mkdir -p /tmp/adhoc-project
-# Enable auto_register for the duration of this test.
+# Enable auto_register for the duration of this test. Install an EXIT trap
+# BEFORE the POST so the restore fires even if `set -e` (or any later test)
+# aborts the script — otherwise Tests 9+ would silently run with
+# auto_register=true and exhibit subtle test-isolation flakiness.
+trap 'api "$BASE" POST /api/settings -d "{\"auto_register\":false}" >/dev/null 2>&1 || true' EXIT
 api "$BASE" POST /api/settings -d '{"auto_register":true}' >/dev/null
 # Use a backend_session_id that opencode serve does NOT know about, so the
 # dir-lookup fallback cannot satisfy the request — the only way to succeed
@@ -246,8 +250,10 @@ if [ "$adhoc_bsid_bound" = "adhoc-project" ]; then
 else
     fail "bsid bound" "adhoc-project" "$adhoc_bsid_bound"
 fi
-# Clean up: restore auto_register=false for the rest of the suite.
+# Clean up: restore auto_register=false for the rest of the suite, then
+# clear the trap now that the state is known-good.
 api "$BASE" POST /api/settings -d '{"auto_register":false}' >/dev/null
+trap - EXIT
 
 log "Test 9: ouija send delivers to opencode via HTTP API"
 send_result=$(api "$BASE" POST /api/send \
