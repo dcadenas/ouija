@@ -2018,18 +2018,35 @@ pub async fn backend_session_ready(
     let hints = if body_bytes.is_empty() {
         BackendSessionReadyHints::default()
     } else {
-        serde_json::from_slice::<BackendSessionReadyHints>(&body_bytes).unwrap_or_default()
+        match serde_json::from_slice::<BackendSessionReadyHints>(&body_bytes) {
+            Ok(h) => h,
+            Err(e) => {
+                // Log so operators can see the fallback — without this, a
+                // plugin bug or a wire-format drift would silently route
+                // every request through the slow scan path with no clue.
+                tracing::debug!(
+                    target: "ouija::api::backend_session_ready",
+                    "failed to parse readiness hints ({e}); falling back to scan path"
+                );
+                BackendSessionReadyHints::default()
+            }
+        }
     };
     Json(backend_session_ready_inner_with_hints(&state, backend_sid, hints).await)
 }
 
 /// Optional hints the opencode plugin may send in the readiness POST body.
 /// Both fields present: skip the opencode-serve dir lookup AND the tmux
-/// pane scan, using the explicit values directly. Otherwise fall back to
+/// scan-by-dir, using the explicit values directly. Otherwise fall back to
 /// the existing resolve-by-scan path (see the decision recorded on this
 /// task — partial hints are an out-of-scope refactor).
+///
+/// The plugin-side body is a forward-compatible contract: future plugin
+/// releases will add fields (plugin_version, tty_path, etc.) that older
+/// daemons MUST be able to ignore without discarding the fields they do
+/// know. That is why there is no `deny_unknown_fields` — Postel's law
+/// applies at the plugin-to-daemon boundary.
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct BackendSessionReadyHints {
     #[serde(default)]
     pane: Option<String>,
@@ -3502,6 +3519,24 @@ mod tests {
             "relative cwd must be rejected, got Some({result:?})"
         );
         assert!(state.protocol.read().await.sessions.is_empty());
+    }
+
+    // --- Hint body forward-compat (review item: drop deny_unknown_fields) ---
+
+    #[test]
+    fn hints_tolerate_unknown_fields_for_forward_compat() {
+        // The readiness body is a plugin-side contract that will grow over
+        // time (plugin_version, tty_path, etc.). With deny_unknown_fields,
+        // a newer plugin talking to an older daemon would fail parsing; the
+        // unwrap_or_default() at the handler entry then silently discards
+        // BOTH pane and cwd, triggering a slow scan-path fallback with no
+        // diagnostic. Postel's law: accept unknown fields, use the known
+        // ones. This test pins that contract.
+        let body = br#"{"pane":"%17","cwd":"/tmp/foo","tty_path":"/dev/pts/3","plugin_version":"2.0"}"#;
+        let hints: BackendSessionReadyHints =
+            serde_json::from_slice(body).expect("unknown fields must not fail parsing");
+        assert_eq!(hints.pane.as_deref(), Some("%17"));
+        assert_eq!(hints.cwd.as_deref(), Some("/tmp/foo"));
     }
 
     #[tokio::test]
