@@ -3508,4 +3508,84 @@ mod tests {
             "missing base ref must fail safe: skip the reset, preserve work"
         );
     }
+
+    /// Regression: the guard must not break the happy path that creates a
+    /// brand-new worktree. A fresh repo + no pre-existing worktree dir
+    /// should produce a working checkout on the requested branch.
+    #[test]
+    fn fresh_worktree_creation_still_works() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_dir = repo.path().to_str().unwrap().to_string();
+        let run = |args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("HOME", home.path())
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        run(&["-C", &repo_dir, "init", "-q", "--initial-branch=main"]);
+        std::fs::write(format!("{repo_dir}/README"), "r").unwrap();
+        run(&["-C", &repo_dir, "add", "README"]);
+        run(&["-C", &repo_dir, "commit", "-q", "-m", "init"]);
+
+        let out = create_ouija_worktree(
+            &repo_dir,
+            "fresh",
+            Some("feat-new"),
+            Some("main"),
+            /* force_reset = */ false,
+            home.path(),
+        )
+        .expect("fresh worktree creates cleanly");
+
+        // Directory should exist and contain the file from main.
+        assert!(std::path::Path::new(&out).exists());
+        assert!(std::path::Path::new(&format!("{out}/README")).exists());
+        assert_eq!(branch_tip(&out, "feat-new"), branch_tip(&out, "main"));
+    }
+
+    /// Legacy-location worktrees predate the guard. If the legacy path
+    /// exists, the function must return it as-is without running any reset
+    /// logic — even when base_branch is supplied. Protects running sessions
+    /// that still live under `<repo>/.ouija/worktrees/<name>`.
+    #[test]
+    fn legacy_location_short_circuits_with_no_reset() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_dir = repo.path().to_str().unwrap().to_string();
+        let legacy = format!("{repo_dir}/.ouija/worktrees/legacy");
+        std::fs::create_dir_all(&legacy).unwrap();
+        // Drop a sentinel file so we can confirm nothing inside was touched.
+        std::fs::write(format!("{legacy}/SENTINEL"), "untouched").unwrap();
+
+        let out = create_ouija_worktree(
+            &repo_dir,
+            "legacy",
+            Some("any-branch"),
+            Some("any-base"),
+            /* force_reset = */ true, // even with force_reset=true
+            home.path(),
+        )
+        .expect("legacy path returns Ok");
+
+        assert_eq!(
+            out, legacy,
+            "legacy path must be returned verbatim without running any git command"
+        );
+        assert_eq!(
+            std::fs::read_to_string(format!("{legacy}/SENTINEL")).unwrap(),
+            "untouched",
+            "legacy worktree contents must not be altered"
+        );
+    }
 }
