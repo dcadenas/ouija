@@ -2490,10 +2490,14 @@ fn git_rev_parse(wt_dir: &str, ref_name: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Reset `branch_name` to `base` inside the worktree at `wt_dir`. Logs
-/// stderr on failure so operators can diagnose it (previously this call's
-/// output was silently discarded — hub#528).
-fn run_reset(wt_dir: &str, branch_name: &str, base: &str) {
+/// Reset `branch_name` to `base` inside the worktree at `wt_dir`. On
+/// success, logs an info line and returns `Ok(())`. On failure, logs
+/// the stderr at WARN and returns an `Err` describing the failure so
+/// callers that opted in with `force_reset=true` can propagate the
+/// failure rather than returning a misleading `Ok(wt_dir)` (hub#528
+/// followup: `Ok(wt_dir)` after a failed reset is indistinguishable
+/// from a successful reset).
+fn run_reset(wt_dir: &str, branch_name: &str, base: &str) -> anyhow::Result<()> {
     let out = std::process::Command::new("git")
         .args(["-C", wt_dir, "checkout", "-B", branch_name, base])
         .output();
@@ -2502,17 +2506,24 @@ fn run_reset(wt_dir: &str, branch_name: &str, base: &str) {
             tracing::info!(
                 "worktree {wt_dir}: reset branch {branch_name} to {base}"
             );
+            Ok(())
         }
         Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
             tracing::warn!(
-                "worktree {wt_dir}: git checkout -B {branch_name} {base} failed: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
+                "worktree {wt_dir}: git checkout -B {branch_name} {base} failed: {stderr}"
             );
+            Err(anyhow::anyhow!(
+                "git checkout -B {branch_name} {base} in {wt_dir} failed: {stderr}"
+            ))
         }
         Err(e) => {
             tracing::warn!(
                 "worktree {wt_dir}: failed to spawn git checkout -B {branch_name} {base}: {e}"
             );
+            Err(anyhow::anyhow!(
+                "failed to spawn git checkout -B {branch_name} {base} in {wt_dir}: {e}"
+            ))
         }
     }
 }
@@ -2568,7 +2579,11 @@ fn create_ouija_worktree(
                     // Safe no-op: nothing to lose. Still run the reset so
                     // the working tree and HEAD are aligned (handles cases
                     // where the branch existed but was pointed elsewhere).
-                    run_reset(&wt_dir, branch_name, base);
+                    // We deliberately do NOT propagate a run_reset failure
+                    // here: the caller did not assert force_reset, so a
+                    // transient git failure during alignment should not
+                    // block session start. run_reset already logs stderr.
+                    let _ = run_reset(&wt_dir, branch_name, base);
                     tracing::info!(
                         "worktree {name}: branch {branch_name} is 0 commits ahead of {base}, reset is a no-op"
                     );
@@ -2585,27 +2600,28 @@ fn create_ouija_worktree(
                 }
                 Some(n) => {
                     // force_reset is true and n > 0: record what we are
-                    // about to discard so reflog recovery is discoverable.
+                    // about to discard so reflog recovery is discoverable,
+                    // then propagate any reset failure so the caller sees
+                    // their explicit destructive request was not honored.
                     let tip = git_rev_parse(&wt_dir, branch_name).unwrap_or_else(|| "?".into());
                     tracing::warn!(
                         "worktree {name}: force_reset=true, DISCARDING {n} commits on branch {branch_name} (tip {tip}) to reset to {base}"
                     );
-                    run_reset(&wt_dir, branch_name, base);
+                    run_reset(&wt_dir, branch_name, base)?;
                 }
                 None if force_reset => {
                     // `git rev-list` failed — the base ref might not exist
                     // in this worktree, or the branch does not yet exist.
                     // Since the caller explicitly opted in with
                     // `force_reset=true`, honor the intent rather than
-                    // silently dropping it. The reset may succeed (e.g.
-                    // the branch is missing but the base is present) or
-                    // fail loudly via `run_reset`'s stderr capture; either
-                    // way the caller sees the attempt was made.
+                    // silently dropping it. Propagate a reset failure so
+                    // the caller does not receive a misleading Ok(wt_dir)
+                    // while their destructive request was dropped.
                     tracing::warn!(
                         "worktree {name}: cannot compute {base}..{branch_name} commit count \
                          (base or branch ref missing), but force_reset=true — attempting reset anyway"
                     );
-                    run_reset(&wt_dir, branch_name, base);
+                    run_reset(&wt_dir, branch_name, base)?;
                 }
                 None => {
                     // `git rev-list` failed and force_reset is false —
@@ -3588,6 +3604,67 @@ mod tests {
             Some(branch_tip(&wt_dir, &base)),
             "force_reset=true must be honored when rev-list fails: \
              checkout -B should create feat-initial at base"
+        );
+    }
+
+    /// When `force_reset=true` and the subsequent `git checkout -B` also
+    /// fails, the failure must be surfaced to the caller as an `Err`.
+    /// Returning `Ok(wt_dir)` conflates a successful destructive reset
+    /// with a failed one — the caller (hub) has no way to know its
+    /// explicit opt-in was dropped, and start_session will proceed on
+    /// whatever HEAD the worktree happens to have.
+    ///
+    /// Construct the worst case: delete both the branch ref and the base
+    /// ref in the worktree. rev-list fails (→ None arm with
+    /// force_reset=true), then `checkout -B branch base` also fails with
+    /// "base is not a commit". Previously this returned Ok silently; now
+    /// it must return Err.
+    #[test]
+    fn force_reset_true_propagates_when_reset_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let (_repo, repo_dir, wt_dir, base) =
+            repo_and_worktree(home.path(), "s6", "feat-lost");
+
+        // Detach HEAD in both the main worktree (to free `main`) and the
+        // added worktree (to free `feat-lost`), then delete both refs so
+        // rev-list AND checkout -B will fail.
+        let run_in = |dir: &str, args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .args(["-C", dir])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "git -C {dir} {args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        run_in(&repo_dir, &["checkout", "--detach", "-q"]);
+        run_in(&repo_dir, &["branch", "-D", &base]);
+        run_in(&wt_dir, &["checkout", "--detach", "-q"]);
+        run_in(&wt_dir, &["branch", "-D", "feat-lost"]);
+
+        // Sanity: both refs are gone, so checkout -B feat-lost main will fail.
+        assert!(
+            git_rev_count(&wt_dir, &base, "feat-lost").is_none(),
+            "test setup: rev-list must fail with both refs missing"
+        );
+
+        let result = create_ouija_worktree(
+            &repo_dir,
+            "s6",
+            Some("feat-lost"),
+            Some(&base),
+            /* force_reset = */ true,
+            home.path(),
+        );
+
+        assert!(
+            result.is_err(),
+            "create_ouija_worktree must return Err when force_reset=true \
+             is asserted but the reset fails; got Ok({:?})",
+            result.ok()
         );
     }
 
