@@ -2576,17 +2576,37 @@ fn create_ouija_worktree(
             let ahead = git_rev_count(&wt_dir, base, branch_name);
             match ahead {
                 Some(0) => {
-                    // Safe no-op: nothing to lose. Still run the reset so
+                    // Zero ahead: nothing to lose. Still run the reset so
                     // the working tree and HEAD are aligned (handles cases
                     // where the branch existed but was pointed elsewhere).
-                    // We deliberately do NOT propagate a run_reset failure
-                    // here: the caller did not assert force_reset, so a
-                    // transient git failure during alignment should not
-                    // block session start. run_reset already logs stderr.
-                    let _ = run_reset(&wt_dir, branch_name, base);
-                    tracing::info!(
-                        "worktree {name}: branch {branch_name} is 0 commits ahead of {base}, reset is a no-op"
-                    );
+                    //
+                    // When `force_reset=true`, the caller explicitly
+                    // asserted they want the reset; propagate failures
+                    // so they see when their request was not honored
+                    // (matches the Some(n>0) and None force_reset=true
+                    // arms below).
+                    //
+                    // When `force_reset=false`, the reset is a best-effort
+                    // alignment convenience that must not block session
+                    // start on a transient git failure. Log the outcome
+                    // honestly: on failure, warn; only emit the
+                    // "no-op" info line when the reset actually ran.
+                    match run_reset(&wt_dir, branch_name, base) {
+                        Ok(()) => {
+                            tracing::info!(
+                                "worktree {name}: branch {branch_name} is 0 commits ahead of {base}, reset is a no-op"
+                            );
+                        }
+                        Err(e) if force_reset => {
+                            return Err(e);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "worktree {name}: branch {branch_name} is 0 commits ahead of {base} \
+                                 but alignment reset failed: {e}. Continuing without force_reset."
+                            );
+                        }
+                    }
                 }
                 Some(n) if n > 0 && !force_reset => {
                     let tip = git_rev_parse(&wt_dir, branch_name).unwrap_or_else(|| "?".into());
@@ -3351,7 +3371,8 @@ mod tests {
         let repo = tempfile::tempdir().expect("tempdir for repo");
         let repo_dir = repo.path().to_str().unwrap().to_string();
 
-        // Isolate from any user git config / hooks.
+        // Isolate from any user git config / hooks so tests are
+        // reproducible regardless of host environment.
         let run = |args: &[&str]| {
             let out = Command::new("git")
                 .args(args)
@@ -3360,6 +3381,16 @@ mod tests {
                 .env("GIT_COMMITTER_NAME", "t")
                 .env("GIT_COMMITTER_EMAIL", "t@t")
                 .env("HOME", home)
+                // Disable GPG signing regardless of host config.
+                .env("GIT_CONFIG_COUNT", "2")
+                .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+                .env("GIT_CONFIG_VALUE_0", "false")
+                .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
+                .env("GIT_CONFIG_VALUE_1", "false")
+                // Skip global/system config so host-level hooks/templates
+                // cannot fail the commit.
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
                 .output()
                 .expect("git ran");
             assert!(
@@ -3396,6 +3427,9 @@ mod tests {
     fn commit_in(wt_dir: &str, filename: &str, msg: &str) -> String {
         use std::process::Command;
         std::fs::write(format!("{wt_dir}/{filename}"), "data").unwrap();
+        // Match `setup_repo_with_worktree`: clear env hooks that might
+        // interact with the host's git config (GPG signing, commit
+        // template, hook path) to prevent test flakes.
         let run = |args: &[&str]| {
             Command::new("git")
                 .args(args)
@@ -3403,13 +3437,31 @@ mod tests {
                 .env("GIT_AUTHOR_EMAIL", "t@t")
                 .env("GIT_COMMITTER_NAME", "t")
                 .env("GIT_COMMITTER_EMAIL", "t@t")
+                // Disable GPG signing regardless of host config.
+                .env("GIT_CONFIG_COUNT", "2")
+                .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+                .env("GIT_CONFIG_VALUE_0", "false")
+                .env("GIT_CONFIG_KEY_1", "tag.gpgsign")
+                .env("GIT_CONFIG_VALUE_1", "false")
+                // Skip global/system config so host-level hooks/templates
+                // cannot fail the commit.
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
                 .output()
                 .expect("git ran")
         };
         let o = run(&["-C", wt_dir, "add", filename]);
-        assert!(o.status.success());
+        assert!(
+            o.status.success(),
+            "git add {filename} in {wt_dir}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
         let o = run(&["-C", wt_dir, "commit", "-q", "-m", msg]);
-        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert!(
+            o.status.success(),
+            "git commit in {wt_dir}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
         let sha = run(&["-C", wt_dir, "rev-parse", "HEAD"]);
         String::from_utf8_lossy(&sha.stdout).trim().to_string()
     }
@@ -3665,6 +3717,144 @@ mod tests {
             "create_ouija_worktree must return Err when force_reset=true \
              is asserted but the reset fails; got Ok({:?})",
             result.ok()
+        );
+    }
+
+    /// Same invariant as `force_reset_true_propagates_when_reset_fails`,
+    /// but on the Some(0) / zero-ahead arm. A caller that opts in with
+    /// `force_reset=true` on a branch that is content-equivalent to base
+    /// still wants to know if the alignment reset actually ran — the
+    /// arm was previously `let _ = run_reset(...)`, swallowing the
+    /// failure and returning Ok(wt_dir) indistinguishable from success.
+    ///
+    /// Construct a zero-ahead scenario where `git checkout -B` fails:
+    /// create two worktrees sharing the same repo, both on branch
+    /// `shared`. Pass `branch=shared, base=shared` to
+    /// `create_ouija_worktree` so rev-list returns 0 and the Some(0)
+    /// arm fires; the subsequent `git checkout -B shared shared` in
+    /// the second worktree fails because `shared` is held elsewhere.
+    #[test]
+    fn force_reset_true_propagates_when_zero_ahead_reset_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let (_repo, repo_dir, wt_dir, base) =
+            repo_and_worktree(home.path(), "s7", "held-elsewhere");
+
+        // Make a second worktree that claims the branch we are going to
+        // try to checkout inside wt_dir. After this, `git checkout -B
+        // held-elsewhere <base>` inside wt_dir will fail because
+        // `held-elsewhere` is already used by the other worktree.
+        //
+        // But first we need to not be on that branch in wt_dir
+        // ourselves — detach HEAD so the branch is free to be held by
+        // the second worktree.
+        let run_in = |dir: &str, args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .args(["-C", dir])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "git -C {dir} {args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        run_in(&wt_dir, &["checkout", "--detach", "-q"]);
+        // Put the second worktree on held-elsewhere next to the first.
+        let other_wt = home.path().join("other-wt");
+        run_in(
+            &repo_dir,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                other_wt.to_str().unwrap(),
+                "held-elsewhere",
+            ],
+        );
+
+        // Sanity: rev-list succeeds (branch and base both resolve), and
+        // the branch is 0 ahead of itself.
+        assert_eq!(
+            git_rev_count(&wt_dir, "held-elsewhere", "held-elsewhere"),
+            Some(0),
+            "test setup: rev-list must report 0 ahead for Some(0) arm to fire"
+        );
+
+        // Call with branch=held-elsewhere, base=held-elsewhere so the
+        // Some(0) arm fires inside create_ouija_worktree. The checkout
+        // -B should then fail because held-elsewhere is claimed by
+        // other_wt.
+        let _ = base; // base_branch is "main" in the helper; use held-elsewhere explicitly
+        let result = create_ouija_worktree(
+            &repo_dir,
+            "s7",
+            Some("held-elsewhere"),
+            Some("held-elsewhere"),
+            /* force_reset = */ true,
+            home.path(),
+        );
+
+        assert!(
+            result.is_err(),
+            "create_ouija_worktree must return Err when force_reset=true \
+             is asserted on a zero-ahead branch but the alignment reset \
+             fails; got Ok({:?})",
+            result.ok()
+        );
+    }
+
+    /// When `force_reset=false` and the branch is already 0 ahead of
+    /// base, a transient alignment failure must NOT block session start.
+    /// The caller did not opt in to destructive behavior; run_reset is
+    /// a best-effort HEAD/working-tree alignment. A failure here should
+    /// be warn-logged (see follow-on log) but returned as Ok(wt_dir).
+    #[test]
+    fn zero_ahead_without_force_reset_tolerates_alignment_failure() {
+        let home = tempfile::tempdir().unwrap();
+        let (_repo, repo_dir, wt_dir, _base) =
+            repo_and_worktree(home.path(), "s8", "held-elsewhere2");
+
+        let run_in = |dir: &str, args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .args(["-C", dir])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "git -C {dir} {args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        run_in(&wt_dir, &["checkout", "--detach", "-q"]);
+        let other_wt = home.path().join("other-wt-2");
+        run_in(
+            &repo_dir,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                other_wt.to_str().unwrap(),
+                "held-elsewhere2",
+            ],
+        );
+
+        // Force the Some(0) arm to fire with force_reset=false. Even
+        // though the alignment checkout will fail (branch held
+        // elsewhere), the function must still return Ok(wt_dir).
+        let result = create_ouija_worktree(
+            &repo_dir,
+            "s8",
+            Some("held-elsewhere2"),
+            Some("held-elsewhere2"),
+            /* force_reset = */ false,
+            home.path(),
+        );
+        assert!(
+            result.is_ok(),
+            "force_reset=false + alignment failure must return Ok(wt_dir); got Err({:?})",
+            result.err()
         );
     }
 
