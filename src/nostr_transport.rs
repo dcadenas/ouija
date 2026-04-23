@@ -2592,14 +2592,29 @@ fn create_ouija_worktree(
                     );
                     run_reset(&wt_dir, branch_name, base);
                 }
-                None => {
+                None if force_reset => {
                     // `git rev-list` failed — the base ref might not exist
                     // in this worktree, or the branch does not yet exist.
-                    // Fail safe: skip the reset, warn so operators can see
-                    // why the reset did not happen.
+                    // Since the caller explicitly opted in with
+                    // `force_reset=true`, honor the intent rather than
+                    // silently dropping it. The reset may succeed (e.g.
+                    // the branch is missing but the base is present) or
+                    // fail loudly via `run_reset`'s stderr capture; either
+                    // way the caller sees the attempt was made.
                     tracing::warn!(
                         "worktree {name}: cannot compute {base}..{branch_name} commit count \
-                         (base or branch ref missing); skipping reset to avoid data loss"
+                         (base or branch ref missing), but force_reset=true — attempting reset anyway"
+                    );
+                    run_reset(&wt_dir, branch_name, base);
+                }
+                None => {
+                    // `git rev-list` failed and force_reset is false —
+                    // fail safe: skip the reset, warn so operators can
+                    // see why the reset did not happen.
+                    tracing::warn!(
+                        "worktree {name}: cannot compute {base}..{branch_name} commit count \
+                         (base or branch ref missing); skipping reset to avoid data loss. \
+                         Pass force_reset=true to override."
                     );
                 }
             }
@@ -3506,6 +3521,73 @@ mod tests {
         assert_eq!(
             tip_before, tip_after,
             "missing base ref must fail safe: skip the reset, preserve work"
+        );
+    }
+
+    /// When `force_reset=true`, the caller has explicitly asked for the
+    /// destructive reset. If the ahead-of-base check cannot be computed
+    /// (e.g. the branch ref does not exist yet in this worktree), ouija
+    /// must still honor the request rather than silently dropping it.
+    /// Construct a case where the ref check fails but the checkout would
+    /// succeed: the worktree dir exists but the requested branch does
+    /// not yet exist inside it — `git rev-list --count base..newbranch`
+    /// returns non-zero (unknown revision), but `git checkout -B
+    /// newbranch base` succeeds and creates the branch at base.
+    ///
+    /// Old behavior (reviewed): return Ok without attempting the reset,
+    /// dropping the caller's explicit intent. New behavior: honor
+    /// force_reset=true and attempt the reset anyway.
+    #[test]
+    fn force_reset_true_honored_even_when_rev_list_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let (_repo, repo_dir, wt_dir, base) =
+            repo_and_worktree(home.path(), "s5", "feat-initial");
+
+        // Delete the initial branch ref so rev-list cannot compute
+        // `base..feat-initial`. The worktree dir still exists on disk,
+        // which is the scenario the function is guarding.
+        //
+        // `git branch -D` refuses to delete the branch currently checked
+        // out in a worktree, so first detach HEAD.
+        let run_in_wt = |args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .args(["-C", &wt_dir])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "git -C {wt_dir} {args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        run_in_wt(&["checkout", "--detach", "-q"]);
+        run_in_wt(&["branch", "-D", "feat-initial"]);
+
+        // Sanity: branch really is gone, so rev-list will fail.
+        assert!(
+            git_rev_count(&wt_dir, &base, "feat-initial").is_none(),
+            "test setup: rev-list must fail when branch is absent"
+        );
+
+        let _ = create_ouija_worktree(
+            &repo_dir,
+            "s5",
+            Some("feat-initial"),
+            Some(&base),
+            /* force_reset = */ true,
+            home.path(),
+        )
+        .unwrap();
+
+        // If force_reset is honored, checkout -B creates feat-initial
+        // at base. If it is silently dropped, feat-initial remains absent.
+        let tip = git_rev_parse(&wt_dir, "feat-initial");
+        assert_eq!(
+            tip,
+            Some(branch_tip(&wt_dir, &base)),
+            "force_reset=true must be honored when rev-list fails: \
+             checkout -B should create feat-initial at base"
         );
     }
 
