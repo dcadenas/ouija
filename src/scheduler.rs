@@ -511,9 +511,7 @@ async fn respawn_and_inject(
             let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
             args.extend(env_args.iter().map(String::as_str));
             args.extend_from_slice(&["-t", &pane_id, &full_cmd]);
-            let output = std::process::Command::new("tmux")
-                .args(&args)
-                .output()?;
+            let output = std::process::Command::new("tmux").args(&args).output()?;
             if !output.status.success() {
                 anyhow::bail!(
                     "respawn-pane failed: {}",

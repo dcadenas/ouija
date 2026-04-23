@@ -2503,9 +2503,7 @@ fn run_reset(wt_dir: &str, branch_name: &str, base: &str) -> anyhow::Result<()> 
         .output();
     match out {
         Ok(o) if o.status.success() => {
-            tracing::info!(
-                "worktree {wt_dir}: reset branch {branch_name} to {base}"
-            );
+            tracing::info!("worktree {wt_dir}: reset branch {branch_name} to {base}");
             Ok(())
         }
         Ok(o) => {
@@ -2541,10 +2539,7 @@ fn run_reset(wt_dir: &str, branch_name: &str, base: &str) -> anyhow::Result<()> 
 /// `force_reset=false` where the new path would also skip). Returns
 /// `Some(msg)` to be logged at WARN when the opt-in is silenced.
 /// Caller emits the log; predicate is pure for unit testing.
-fn legacy_drops_destructive_intent(
-    base_branch: Option<&str>,
-    force_reset: bool,
-) -> Option<String> {
+fn legacy_drops_destructive_intent(base_branch: Option<&str>, force_reset: bool) -> Option<String> {
     if !force_reset || base_branch.is_none() {
         return None;
     }
@@ -3529,8 +3524,7 @@ mod tests {
     #[test]
     fn existing_worktree_with_ahead_commits_not_reset_by_default() {
         let home = tempfile::tempdir().unwrap();
-        let (_repo, repo_dir, wt_dir, base) =
-            repo_and_worktree(home.path(), "s1", "feat-x");
+        let (_repo, repo_dir, wt_dir, base) = repo_and_worktree(home.path(), "s1", "feat-x");
 
         // Put the branch 2 commits ahead of base.
         commit_in(&wt_dir, "a", "a");
@@ -3558,8 +3552,7 @@ mod tests {
     #[test]
     fn existing_worktree_with_ahead_commits_reset_when_forced() {
         let home = tempfile::tempdir().unwrap();
-        let (_repo, repo_dir, wt_dir, base) =
-            repo_and_worktree(home.path(), "s2", "feat-y");
+        let (_repo, repo_dir, wt_dir, base) = repo_and_worktree(home.path(), "s2", "feat-y");
         let base_tip = branch_tip(&wt_dir, &base);
         commit_in(&wt_dir, "a", "a");
         commit_in(&wt_dir, "b", "b");
@@ -3584,8 +3577,7 @@ mod tests {
     #[test]
     fn existing_worktree_with_no_ahead_commits_is_safe_noop() {
         let home = tempfile::tempdir().unwrap();
-        let (_repo, repo_dir, wt_dir, base) =
-            repo_and_worktree(home.path(), "s3", "feat-z");
+        let (_repo, repo_dir, wt_dir, base) = repo_and_worktree(home.path(), "s3", "feat-z");
         // No commits beyond base. Branch is at base already.
         let base_tip = branch_tip(&wt_dir, &base);
 
@@ -3609,8 +3601,7 @@ mod tests {
     #[test]
     fn missing_base_branch_ref_does_not_silently_reset() {
         let home = tempfile::tempdir().unwrap();
-        let (_repo, repo_dir, wt_dir, _base) =
-            repo_and_worktree(home.path(), "s4", "feat-q");
+        let (_repo, repo_dir, wt_dir, _base) = repo_and_worktree(home.path(), "s4", "feat-q");
         let tip_before = commit_in(&wt_dir, "a", "a");
 
         let _ = create_ouija_worktree(
@@ -3646,8 +3637,7 @@ mod tests {
     #[test]
     fn force_reset_true_honored_even_when_rev_list_fails() {
         let home = tempfile::tempdir().unwrap();
-        let (_repo, repo_dir, wt_dir, base) =
-            repo_and_worktree(home.path(), "s5", "feat-initial");
+        let (_repo, repo_dir, wt_dir, base) = repo_and_worktree(home.path(), "s5", "feat-initial");
 
         // Delete the initial branch ref so rev-list cannot compute
         // `base..feat-initial`. The worktree dir still exists on disk,
@@ -3712,8 +3702,7 @@ mod tests {
     #[test]
     fn force_reset_true_propagates_when_reset_fails() {
         let home = tempfile::tempdir().unwrap();
-        let (_repo, repo_dir, wt_dir, base) =
-            repo_and_worktree(home.path(), "s6", "feat-lost");
+        let (_repo, repo_dir, wt_dir, base) = repo_and_worktree(home.path(), "s6", "feat-lost");
 
         // Detach HEAD in both the main worktree (to free `main`) and the
         // added worktree (to free `feat-lost`), then delete both refs so

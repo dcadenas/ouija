@@ -2358,13 +2358,10 @@ async fn auto_provision_with_explicit_pane(
     // pane-dedup would silently evict the current owner.
     {
         let proto = state.protocol.read().await;
-        let already_bound = proto
-            .sessions
-            .values()
-            .any(|s| {
-                matches!(s.origin, crate::daemon_protocol::Origin::Local)
-                    && s.pane.as_deref() == Some(pane)
-            });
+        let already_bound = proto.sessions.values().any(|s| {
+            matches!(s.origin, crate::daemon_protocol::Origin::Local)
+                && s.pane.as_deref() == Some(pane)
+        });
         if already_bound {
             tracing::warn!(
                 "auto-provision declined: hint pane {pane} is already bound to another local session (backend_session_id {backend_sid})"
@@ -3020,15 +3017,10 @@ mod tests {
         let state = crate::state::AppState::new_for_test();
         // Seed the cached pane snapshot — in tests, list_assistant_panes
         // reads from this rather than shelling out to tmux.
-        *state.cached_assistant_panes.write().await =
-            vec![pane_in("/tmp/freshproject", "%17")];
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/freshproject", "%17")];
 
-        let result = auto_provision_from_backend_session(
-            &state,
-            "ses_brand_new",
-            "/tmp/freshproject",
-        )
-        .await;
+        let result =
+            auto_provision_from_backend_session(&state, "ses_brand_new", "/tmp/freshproject").await;
 
         let session_id = result.expect("auto-provision must succeed for exactly one matching pane");
         assert_eq!(session_id, "freshproject");
@@ -3077,15 +3069,10 @@ mod tests {
         // Seed a pane in a DIFFERENT dir so list_assistant_panes is non-empty
         // but no candidate matches the target. Catches regressions where an
         // empty vs. non-empty cache path diverges.
-        *state.cached_assistant_panes.write().await =
-            vec![pane_in("/tmp/someother", "%11")];
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/someother", "%11")];
 
-        let result = auto_provision_from_backend_session(
-            &state,
-            "ses_unmatched",
-            "/tmp/freshproject",
-        )
-        .await;
+        let result =
+            auto_provision_from_backend_session(&state, "ses_unmatched", "/tmp/freshproject").await;
 
         assert!(
             result.is_none(),
@@ -3112,12 +3099,8 @@ mod tests {
             pane_in("/tmp/freshproject", "%23"),
         ];
 
-        let result = auto_provision_from_backend_session(
-            &state,
-            "ses_ambiguous",
-            "/tmp/freshproject",
-        )
-        .await;
+        let result =
+            auto_provision_from_backend_session(&state, "ses_ambiguous", "/tmp/freshproject").await;
 
         assert!(
             result.is_none(),
@@ -3138,8 +3121,7 @@ mod tests {
         // the periodic scan_and_autoregister_panes loop from being stomped
         // when an unrelated opencode readiness signal arrives.
         let state = crate::state::AppState::new_for_test();
-        *state.cached_assistant_panes.write().await =
-            vec![pane_in("/tmp/freshproject", "%17")];
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/freshproject", "%17")];
         // Pre-register the pane to a different session.
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -3152,12 +3134,8 @@ mod tests {
             })
             .await;
 
-        let result = auto_provision_from_backend_session(
-            &state,
-            "ses_intruder",
-            "/tmp/freshproject",
-        )
-        .await;
+        let result =
+            auto_provision_from_backend_session(&state, "ses_intruder", "/tmp/freshproject").await;
 
         assert!(
             result.is_none(),
@@ -3185,8 +3163,7 @@ mod tests {
         // of racing a second Register (which would churn @ouija_session under
         // the user's feet with a different suffix).
         let state = crate::state::AppState::new_for_test();
-        *state.cached_assistant_panes.write().await =
-            vec![pane_in("/tmp/freshproject", "%17")];
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/freshproject", "%17")];
         // Seed a session that already owns the backend_session_id — the
         // state the "winning" concurrent call would have left behind.
         state
@@ -3202,12 +3179,8 @@ mod tests {
             })
             .await;
 
-        let result = auto_provision_from_backend_session(
-            &state,
-            "ses_raced",
-            "/tmp/freshproject",
-        )
-        .await;
+        let result =
+            auto_provision_from_backend_session(&state, "ses_raced", "/tmp/freshproject").await;
 
         assert_eq!(
             result.as_deref(),
@@ -3232,11 +3205,9 @@ mod tests {
         // error the pre-#35 daemon returned.
         let state = crate::state::AppState::new_for_test();
         state.settings.write().await.auto_register = false;
-        *state.cached_assistant_panes.write().await =
-            vec![pane_in("/tmp/freshproject", "%17")];
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/freshproject", "%17")];
 
-        let response =
-            backend_session_ready_inner(&state, "ses_gated".into()).await;
+        let response = backend_session_ready_inner(&state, "ses_gated".into()).await;
 
         assert_eq!(response["delivered"], false);
         assert!(
@@ -3265,11 +3236,9 @@ mod tests {
         // Even with a pane cached, serve unreachable -> no dir -> no
         // auto-provision. This guards against a future refactor that tries
         // to synthesize a dir from the pane's pane_current_path.
-        *state.cached_assistant_panes.write().await =
-            vec![pane_in("/tmp/freshproject", "%17")];
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/freshproject", "%17")];
 
-        let response =
-            backend_session_ready_inner(&state, "ses_no_serve".into()).await;
+        let response = backend_session_ready_inner(&state, "ses_no_serve".into()).await;
 
         assert_eq!(response["delivered"], false);
         assert!(
@@ -3305,8 +3274,7 @@ mod tests {
             })
             .await;
 
-        let response =
-            backend_session_ready_inner(&state, "ses_known".into()).await;
+        let response = backend_session_ready_inner(&state, "ses_known".into()).await;
 
         assert_eq!(
             response["session"].as_str(),
@@ -3327,20 +3295,15 @@ mod tests {
         // proves the hint cwd is used for dir derivation, not the pane's
         // pane_current_path that the scan path would have consulted.
         let state = crate::state::AppState::new_for_test();
-        *state.cached_assistant_panes.write().await =
-            vec![pane_in("/tmp/different-dir", "%31")];
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/different-dir", "%31")];
 
         let hints = BackendSessionReadyHints {
             pane: Some("%31".into()),
             cwd: Some("/tmp/explicit-project".into()),
         };
 
-        let response = backend_session_ready_inner_with_hints(
-            &state,
-            "ses_explicit".into(),
-            hints,
-        )
-        .await;
+        let response =
+            backend_session_ready_inner_with_hints(&state, "ses_explicit".into(), hints).await;
 
         assert_eq!(
             response["session"].as_str(),
@@ -3352,7 +3315,10 @@ mod tests {
         // explicit cwd hint, NOT the pane's cached pane_current_path —
         // the scan path would have resolved /tmp/different-dir here.
         let proto = state.protocol.read().await;
-        let session = proto.sessions.get("explicit-project").expect("session exists");
+        let session = proto
+            .sessions
+            .get("explicit-project")
+            .expect("session exists");
         assert_eq!(session.pane.as_deref(), Some("%31"));
         assert_eq!(
             session.metadata.backend_session_id.as_deref(),
@@ -3377,12 +3343,9 @@ mod tests {
             cwd: Some("/tmp/explicit-project".into()),
         };
 
-        let response = backend_session_ready_inner_with_hints(
-            &state,
-            "ses_gated_with_hints".into(),
-            hints,
-        )
-        .await;
+        let response =
+            backend_session_ready_inner_with_hints(&state, "ses_gated_with_hints".into(), hints)
+                .await;
 
         assert_eq!(response["delivered"], false);
         assert!(
@@ -3410,20 +3373,15 @@ mod tests {
         let state = crate::state::AppState::new_for_test();
         // Seed a matching pane anyway. Hint path must NOT fire (cwd missing),
         // so the scan path will run and miss because opencode serve is down.
-        *state.cached_assistant_panes.write().await =
-            vec![pane_in("/tmp/half-hinted", "%31")];
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/half-hinted", "%31")];
 
         let hints = BackendSessionReadyHints {
             pane: Some("%31".into()),
             cwd: None,
         };
 
-        let response = backend_session_ready_inner_with_hints(
-            &state,
-            "ses_half".into(),
-            hints,
-        )
-        .await;
+        let response =
+            backend_session_ready_inner_with_hints(&state, "ses_half".into(), hints).await;
 
         // Fallback path: no dir -> strict error, no session.
         assert_eq!(response["delivered"], false);
@@ -3458,12 +3416,8 @@ mod tests {
             cwd: Some("/tmp/unrelated".into()),
         };
 
-        let response = backend_session_ready_inner_with_hints(
-            &state,
-            "ses_known".into(),
-            hints,
-        )
-        .await;
+        let response =
+            backend_session_ready_inner_with_hints(&state, "ses_known".into(), hints).await;
 
         assert_eq!(
             response["session"].as_str(),
@@ -3489,8 +3443,7 @@ mod tests {
         // the hint path must match that contract explicitly.
         let state = crate::state::AppState::new_for_test();
         // Seed panes that do NOT include %99.
-        *state.cached_assistant_panes.write().await =
-            vec![pane_in("/tmp/unrelated", "%11")];
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/unrelated", "%11")];
 
         let result = auto_provision_with_explicit_pane(
             &state,
@@ -3518,8 +3471,7 @@ mod tests {
         // And project_dir would be persisted as the empty string. Reject
         // this at the hint-path entry rather than letting it corrupt state.
         let state = crate::state::AppState::new_for_test();
-        *state.cached_assistant_panes.write().await =
-            vec![pane_in("/tmp/ignored", "%17")];
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/ignored", "%17")];
 
         let result = auto_provision_with_explicit_pane(
             &state,
@@ -3542,16 +3494,9 @@ mod tests {
         // falls through to "unnamed" and project_dir is persisted as "/".
         // No realistic caller has / as their project root.
         let state = crate::state::AppState::new_for_test();
-        *state.cached_assistant_panes.write().await =
-            vec![pane_in("/tmp/ignored", "%17")];
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/ignored", "%17")];
 
-        let result = auto_provision_with_explicit_pane(
-            &state,
-            "ses_root_cwd",
-            "%17",
-            "/",
-        )
-        .await;
+        let result = auto_provision_with_explicit_pane(&state, "ses_root_cwd", "%17", "/").await;
 
         assert!(
             result.is_none(),
@@ -3567,16 +3512,10 @@ mod tests {
         // (adoption, scan-by-dir, bulletin dedup, etc.) that string-compare
         // project_dir. Reject at the boundary instead.
         let state = crate::state::AppState::new_for_test();
-        *state.cached_assistant_panes.write().await =
-            vec![pane_in("/tmp/ignored", "%17")];
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/ignored", "%17")];
 
-        let result = auto_provision_with_explicit_pane(
-            &state,
-            "ses_rel_cwd",
-            "%17",
-            "relative/path",
-        )
-        .await;
+        let result =
+            auto_provision_with_explicit_pane(&state, "ses_rel_cwd", "%17", "relative/path").await;
 
         assert!(
             result.is_none(),
@@ -3596,7 +3535,8 @@ mod tests {
         // BOTH pane and cwd, triggering a slow scan-path fallback with no
         // diagnostic. Postel's law: accept unknown fields, use the known
         // ones. This test pins that contract.
-        let body = br#"{"pane":"%17","cwd":"/tmp/foo","tty_path":"/dev/pts/3","plugin_version":"2.0"}"#;
+        let body =
+            br#"{"pane":"%17","cwd":"/tmp/foo","tty_path":"/dev/pts/3","plugin_version":"2.0"}"#;
         let hints: BackendSessionReadyHints =
             serde_json::from_slice(body).expect("unknown fields must not fail parsing");
         assert_eq!(hints.pane.as_deref(), Some("%17"));
@@ -3612,8 +3552,7 @@ mod tests {
         // SessionStart, a prior auto-provision, or a manual `ouija register`
         // would all be vulnerable. The hint path must fail closed instead.
         let state = crate::state::AppState::new_for_test();
-        *state.cached_assistant_panes.write().await =
-            vec![pane_in("/tmp/freshproject", "%17")];
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/freshproject", "%17")];
         // Pre-bind the pane to another session (e.g. the claude-code hook
         // got there first).
         state
@@ -3672,8 +3611,7 @@ mod tests {
     fn session_name_body_force_reset_defaults_to_none() {
         // When the caller omits the field, it must default to None —
         // which start_session treats as force_reset=false (the safe default).
-        let body: SessionNameBody =
-            serde_json::from_str(r#"{"name":"s"}"#).expect("body parses");
+        let body: SessionNameBody = serde_json::from_str(r#"{"name":"s"}"#).expect("body parses");
         assert_eq!(
             body.force_reset, None,
             "omitted force_reset must deserialize to None (safe default)"
@@ -3697,10 +3635,8 @@ mod tests {
 
     #[test]
     fn restart_drops_destructive_intent_fires_for_force_reset_true() {
-        let body: SessionNameBody = serde_json::from_str(
-            r#"{"name":"s","force_reset":true}"#,
-        )
-        .unwrap();
+        let body: SessionNameBody =
+            serde_json::from_str(r#"{"name":"s","force_reset":true}"#).unwrap();
         let warn = restart_drops_destructive_intent(&body);
         assert!(
             warn.is_some(),
@@ -3715,10 +3651,8 @@ mod tests {
 
     #[test]
     fn restart_drops_destructive_intent_fires_for_base_branch() {
-        let body: SessionNameBody = serde_json::from_str(
-            r#"{"name":"s","base_branch":"main"}"#,
-        )
-        .unwrap();
+        let body: SessionNameBody =
+            serde_json::from_str(r#"{"name":"s","base_branch":"main"}"#).unwrap();
         let warn = restart_drops_destructive_intent(&body);
         assert!(
             warn.is_some(),
@@ -3743,10 +3677,8 @@ mod tests {
     #[test]
     fn restart_drops_destructive_intent_silent_when_force_reset_false() {
         // Explicit force_reset=false is not an opt-in; nothing is dropped.
-        let body: SessionNameBody = serde_json::from_str(
-            r#"{"name":"s","force_reset":false}"#,
-        )
-        .unwrap();
+        let body: SessionNameBody =
+            serde_json::from_str(r#"{"name":"s","force_reset":false}"#).unwrap();
         assert!(
             restart_drops_destructive_intent(&body).is_none(),
             "force_reset=false is not an opt-in; no warn"

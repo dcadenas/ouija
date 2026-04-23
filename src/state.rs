@@ -1560,10 +1560,7 @@ pub(crate) mod tests {
         // because some other id_to_pane entry happens to also be None.
         let mut map = HashMap::new();
         map.insert("ouija".into(), None);
-        assert_eq!(
-            resolve_unique_session_id(&map, "ouija", None),
-            "ouija-2"
-        );
+        assert_eq!(resolve_unique_session_id(&map, "ouija", None), "ouija-2");
     }
 
     #[test]

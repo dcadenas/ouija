@@ -1787,10 +1787,7 @@ mod tests {
         assert!(!meta.has_active_reminder(), "empty string is not active");
 
         meta.reminder = Some("   \t\n".into());
-        assert!(
-            !meta.has_active_reminder(),
-            "whitespace-only is not active"
-        );
+        assert!(!meta.has_active_reminder(), "whitespace-only is not active");
     }
 
     #[test]
