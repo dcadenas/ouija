@@ -2528,6 +2528,35 @@ fn run_reset(wt_dir: &str, branch_name: &str, base: &str) -> anyhow::Result<()> 
     }
 }
 
+/// Return a warning message when a legacy-layout worktree short-circuit
+/// will silently drop a caller's destructive intent.
+///
+/// The legacy path (`<repo>/.ouija/worktrees/<name>`) is returned
+/// as-is for running-session compatibility — no `git checkout -B` is
+/// run, even when the caller passed `force_reset=true` with a
+/// `base_branch`. This matches the explicit design of the legacy
+/// short-circuit, but it makes `force_reset=true` unobservably dropped.
+///
+/// Returns `None` when nothing was dropped (no `base_branch`, or
+/// `force_reset=false` where the new path would also skip). Returns
+/// `Some(msg)` to be logged at WARN when the opt-in is silenced.
+/// Caller emits the log; predicate is pure for unit testing.
+fn legacy_drops_destructive_intent(
+    base_branch: Option<&str>,
+    force_reset: bool,
+) -> Option<String> {
+    if !force_reset || base_branch.is_none() {
+        return None;
+    }
+    let base = base_branch.unwrap();
+    Some(format!(
+        "legacy-layout worktree short-circuit: force_reset=true + base_branch={base} \
+         silently dropped (legacy path returns the dir as-is for running-session \
+         compatibility). If destructive intent was load-bearing here, migrate the \
+         worktree to the new <home>/.ouija/worktrees/ layout."
+    ))
+}
+
 /// Create an ouija-managed git worktree at `<home>/.ouija/worktrees/<repo-slug>/<name>`.
 ///
 /// Worktrees live outside the repo directory tree to prevent Claude Code from
@@ -2555,6 +2584,9 @@ fn create_ouija_worktree(
     // Check legacy location first (running sessions may use it)
     let legacy_dir = format!("{repo_dir}/.ouija/worktrees/{name}");
     if std::path::Path::new(&legacy_dir).exists() {
+        if let Some(msg) = legacy_drops_destructive_intent(base_branch, force_reset) {
+            tracing::warn!("worktree {name}: {msg}");
+        }
         return Ok(legacy_dir);
     }
     // New location: <home>/.ouija/worktrees/<repo-slug>/<name>
@@ -3901,6 +3933,45 @@ mod tests {
         assert!(std::path::Path::new(&out).exists());
         assert!(std::path::Path::new(&format!("{out}/README")).exists());
         assert_eq!(branch_tip(&out, "feat-new"), branch_tip(&out, "main"));
+    }
+
+    // --- Legacy-path dropped-intent predicate (hub#528 review) ---
+    //
+    // The legacy short-circuit returns `Ok(legacy_dir)` without running
+    // any reset logic or honoring force_reset. That is correct for
+    // running-session compatibility, but silently drops an explicit
+    // `force_reset=true` opt-in. `legacy_drops_destructive_intent` is
+    // the single-source predicate the caller consults before emitting a
+    // WARN log; tests cover it so a future refactor cannot accidentally
+    // silence the drop.
+
+    #[test]
+    fn legacy_drops_destructive_intent_fires_for_force_reset_true() {
+        assert!(
+            legacy_drops_destructive_intent(Some("main"), true).is_some(),
+            "force_reset=true + base_branch must produce a warn"
+        );
+    }
+
+    #[test]
+    fn legacy_drops_destructive_intent_silent_when_no_force_reset() {
+        // base_branch alone (without force_reset) is a safe default —
+        // the guard on the non-legacy path would also skip when the
+        // branch is ahead. Don't warn for that.
+        assert!(
+            legacy_drops_destructive_intent(Some("main"), false).is_none(),
+            "force_reset=false on legacy path is not a dropped intent"
+        );
+    }
+
+    #[test]
+    fn legacy_drops_destructive_intent_silent_when_no_base_branch() {
+        // Without base_branch, even the new-path code takes no reset
+        // action. Nothing would have been dropped regardless of path.
+        assert!(
+            legacy_drops_destructive_intent(None, true).is_none(),
+            "no base_branch means no reset target; nothing dropped"
+        );
     }
 
     /// Legacy-location worktrees predate the guard. If the legacy path
