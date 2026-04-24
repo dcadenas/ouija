@@ -958,7 +958,9 @@ pub struct CompactBody {
 ///   and the continuation is parked on the session agent for the post-compact
 ///   hook to drain. `compacted: true` on the response means the compact command
 ///   was successfully queued; the backend performs the actual compaction
-///   asynchronously.
+///   asynchronously. `continuation_delivered` is always `false` on this
+///   branch because delivery (if any) happens later — after this response
+///   returns — when the post-compact hook drains the parked continuation.
 /// - HTTP backends (e.g. OpenCode) call `POST /session/:id/summarize` on the
 ///   opencode serve with `{providerID, modelID}` resolved from the session's
 ///   configured model (falling back to `/config/providers` defaults). The
@@ -967,7 +969,7 @@ pub struct CompactBody {
 ///   On success, the continuation (if any) is delivered as a fresh user turn
 ///   via `prompt_async`. `compacted: true` means the summarize call
 ///   succeeded; `continuation_delivered: <bool>` reports whether the
-///   continuation turn landed on the session.
+///   continuation turn landed on the session in this same request.
 ///
 /// HTTP partial-success: if summarize succeeds but the continuation delivery
 /// fails, the endpoint returns 200 with `{compacted: true,
@@ -995,6 +997,28 @@ pub async fn compact(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let (status, value) = compact_inner(&state, session_id, body).await;
     (status, Json(value))
+}
+
+/// Build the success envelope promised by [`compact`]'s docstring:
+/// `{status, compacted, continuation_delivered}`, with an optional `error`
+/// field appended for the HTTP partial-success case.
+///
+/// The shape must stay consistent across backends so a typed client
+/// deserializer works uniformly on TUI and HTTP responses. On TUI the caller
+/// always passes `continuation_delivered = false` because TUI delivery is
+/// asynchronous: the continuation is parked on the session agent and the
+/// post-compact hook drains it after this response has already returned, so
+/// at response-construction time nothing has been synchronously delivered.
+fn compact_success_body(continuation_delivered: bool, error: Option<String>) -> serde_json::Value {
+    let mut body = json!({
+        "status": "ok",
+        "compacted": true,
+        "continuation_delivered": continuation_delivered,
+    });
+    if let Some(err) = error {
+        body["error"] = json!(err);
+    }
+    body
 }
 
 async fn compact_inner(
@@ -1110,7 +1134,10 @@ async fn compact_inner(
                 );
             }
 
-            (StatusCode::OK, json!({"status": "ok", "compacted": true}))
+            // On TUI, delivery (if any) happens asynchronously via the
+            // post-compact hook draining the parked continuation, so nothing
+            // has been delivered at response time — always `false` here.
+            (StatusCode::OK, compact_success_body(false, None))
         }
         crate::backend::DeliveryMode::HttpApi { .. } => {
             let Some(backend_session_id) = lookup.backend_session_id else {
@@ -1203,12 +1230,10 @@ async fn compact_inner(
                         );
                         return (
                             StatusCode::OK,
-                            json!({
-                                "status": "ok",
-                                "compacted": true,
-                                "continuation_delivered": false,
-                                "error": format!("opencode continuation delivery failed: {e}"),
-                            }),
+                            compact_success_body(
+                                false,
+                                Some(format!("opencode continuation delivery failed: {e}")),
+                            ),
                         );
                     }
                 }
@@ -1218,11 +1243,7 @@ async fn compact_inner(
 
             (
                 StatusCode::OK,
-                json!({
-                    "status": "ok",
-                    "compacted": true,
-                    "continuation_delivered": continuation_delivered,
-                }),
+                compact_success_body(continuation_delivered, None),
             )
         }
     }
@@ -3105,6 +3126,53 @@ mod tests {
             err.to_string().contains("unknown field"),
             "expected unknown-field error, got: {err}"
         );
+    }
+
+    #[test]
+    fn compact_success_body_matches_docstring_envelope() {
+        // compact()'s docstring advertises {status, compacted, continuation_delivered}
+        // as the success envelope across BOTH backends. A typed deserializer that
+        // requires all three fields must work against TUI responses too, so the
+        // TUI and HTTP full-success sites must route through the same builder.
+        let body = compact_success_body(false, None);
+        let obj = body.as_object().expect("success body is a JSON object");
+        assert_eq!(
+            obj.len(),
+            3,
+            "success body must have exactly 3 keys; got {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["compacted"], true);
+        assert_eq!(body["continuation_delivered"], false);
+    }
+
+    #[test]
+    fn compact_success_body_propagates_continuation_delivered_flag() {
+        assert_eq!(
+            compact_success_body(true, None)["continuation_delivered"],
+            true
+        );
+        assert_eq!(
+            compact_success_body(false, None)["continuation_delivered"],
+            false
+        );
+    }
+
+    #[test]
+    fn compact_success_body_with_error_preserves_envelope() {
+        // The HTTP partial-success path (summarize OK, delivery failed) adds an
+        // `error` field on top of the same envelope so callers can read a
+        // human-readable reason without losing the shape a typed deserializer
+        // expects. All four fields must be present and the base envelope must
+        // not be mutated.
+        let body = compact_success_body(false, Some("boom".into()));
+        let obj = body.as_object().expect("success body is a JSON object");
+        assert_eq!(obj.len(), 4);
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["compacted"], true);
+        assert_eq!(body["continuation_delivered"], false);
+        assert_eq!(body["error"], "boom");
     }
 
     #[tokio::test]
