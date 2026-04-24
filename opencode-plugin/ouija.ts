@@ -17,10 +17,6 @@ export const OuijaPlugin: Plugin = async (ctx) => {
 
   console.error(`ouija plugin v${OUIJA_VERSION}: connected to daemon at ${base}`)
 
-  async function fetchStatus(): Promise<any> {
-    return fetch(`${base}/api/status`).then(r => r.json())
-  }
-
   /** Build hook body with pane or backend_session_id. */
   function hookBody(sessionID?: string): Record<string, string> {
     const body: Record<string, string> = {}
@@ -32,11 +28,40 @@ export const OuijaPlugin: Plugin = async (ctx) => {
 
   return {
     "experimental.chat.system.transform": async (input, output) => {
+      // Resolve the ouija session id synchronously here, before composing the
+      // system prompt. Otherwise we race the session.status event handler
+      // below (which registers the backend_session_id via `setTimeout(0)`)
+      // and turn 1 gets "(unknown)" — which then flips to the real id on
+      // turn 2, breaking Anthropic prompt caching on the second system
+      // message. Awaiting /ready has the added benefit of flushing any
+      // prompt queued for this session (HttpApi-mode delivery) without
+      // waiting for the 10s fallback timer in schedule_prompt_injection.
+      let sid = "(unknown)"
+      if (input.sessionID) {
+        try {
+          const readyBody: Record<string, string> = {}
+          const pane = process.env.TMUX_PANE
+          if (pane) readyBody.pane = pane
+          try { readyBody.cwd = process.cwd() } catch {}
+          const resp = await fetch(
+            `${base}/api/backend-session/${encodeURIComponent(input.sessionID)}/ready`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(readyBody),
+            },
+          )
+          if (resp.ok) {
+            const body: any = await resp.json().catch(() => ({}))
+            if (typeof body?.session === "string" && body.session.length > 0) {
+              sid = body.session
+            }
+          }
+        } catch {
+          // Daemon unreachable or /ready errored — fall through to "(unknown)".
+        }
+      }
       try {
-        const status = await fetchStatus()
-        const sessions = status.sessions || []
-        const match = sessions.find((s: any) => s.backend_session_id === input.sessionID)
-        const sid = match?.id || "(unknown)"
         output.system.push(`
 # Ouija Mesh
 
