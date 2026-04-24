@@ -959,24 +959,35 @@ pub struct CompactBody {
 ///   hook to drain. `compacted: true` on the response means the compact command
 ///   was successfully queued; the backend performs the actual compaction
 ///   asynchronously.
-/// - HTTP backends (e.g. OpenCode) skip tmux entirely and deliver the
-///   continuation as a fresh user turn via the backend's HTTP API. Phase 1
-///   does not shrink OC context — only continuation delivery. `compacted:
-///   false` reflects that no context shrink occurred on this path.
+/// - HTTP backends (e.g. OpenCode) call `POST /session/:id/summarize` on the
+///   opencode serve with `{providerID, modelID}` resolved from the session's
+///   configured model (falling back to `/config/providers` defaults). The
+///   request is synchronous — it blocks until opencode's compaction loop
+///   completes — so a 2xx response means the context has really been shrunk.
+///   On success, the continuation (if any) is delivered as a fresh user turn
+///   via `prompt_async`. `compacted: true` means the summarize call
+///   succeeded; `continuation_delivered: <bool>` reports whether the
+///   continuation turn landed on the session.
+///
+/// HTTP partial-success: if summarize succeeds but the continuation delivery
+/// fails, the endpoint returns 200 with `{compacted: true,
+/// continuation_delivered: false, error}` rather than 502. The compaction
+/// side effect already happened — a 502 would tempt the caller to retry the
+/// whole compact and pay for a second summarize LLM call.
 ///
 /// Breaking changes vs. the prior version of this endpoint:
 /// - Response envelope changed from `{status:"compact_triggered"}` to
-///   `{status:"ok", compacted: <bool>}`. Callers asserting on the old literal
-///   must update.
+///   `{status:"ok", compacted: <bool>, continuation_delivered: <bool>}`.
+///   Callers asserting on the old literal must update.
 /// - Request body is now strict: `CompactBody` rejects unknown fields (e.g. a
 ///   typo like `{"continuatino": "..."}` now returns 400 instead of silently
 ///   dropping the value).
 ///
 /// Concurrency: when a `continuation` is supplied the TUI branch rejects
 /// concurrent compact attempts with 409 to prevent overwriting an in-flight
-/// caller's continuation. A bare `/compact` (no continuation) on the TUI
-/// branch and all HTTP-branch calls currently have no concurrency guard —
-/// see follow-up.
+/// caller's continuation. The HTTP branch currently has no concurrency guard
+/// — two racing /compact calls on the same opencode session will each pay
+/// for a separate summarize LLM call. See follow-up.
 pub async fn compact(
     State(state): State<SharedState>,
     axum::extract::Path(session_id): axum::extract::Path<String>,
@@ -1114,34 +1125,105 @@ async fn compact_inner(
                 );
             };
 
-            // Phase 1 only supports continuation delivery on HTTP backends;
-            // a no-op request would silently succeed without the caller
-            // knowing nothing happened.
-            let Some(continuation) = continuation else {
+            let Some((provider_id, model_id)) =
+                resolve_opencode_compact_model(state, lookup.model.as_deref()).await
+            else {
                 return (
                     StatusCode::BAD_REQUEST,
                     json!({
-                        "error": "continuation is required for HTTP backends (phase 1 has no context-shrink path)"
+                        "error": "cannot resolve provider/model for summarize: session has no parseable `model` \
+                                  (expected \"providerID/modelID\") and /config/providers is unreachable \
+                                  or empty. Configure the session with `ouija spawn-session --model <p/m>` \
+                                  or ensure opencode serve has at least one configured provider."
                     }),
                 );
             };
 
-            match tmux::deliver_via_http(
-                state,
-                &backend_session_id,
-                lookup.project_dir.as_deref(),
-                &continuation,
-                lookup.model.as_deref(),
-                lookup.effort.as_deref(),
-            )
-            .await
-            {
-                Ok(()) => (StatusCode::OK, json!({"status": "ok", "compacted": false})),
-                Err(e) => (
-                    StatusCode::BAD_GATEWAY,
-                    json!({"error": format!("opencode delivery failed: {e}")}),
-                ),
+            // Opencode runs /summarize synchronously — the request blocks
+            // until the compaction LLM call and the follow-up prompt.loop
+            // complete. That can take tens of seconds up to a few minutes
+            // for a long session; 300s is a generous ceiling that matches
+            // what the TUI path effectively allows by not timing out at all.
+            let port = state.opencode_serve_port();
+            let summarize_url =
+                format!("http://127.0.0.1:{port}/session/{backend_session_id}/summarize");
+            let summarize_body = json!({
+                "providerID": provider_id,
+                "modelID": model_id,
+            });
+            let mut summarize_req = state
+                .http_client
+                .post(&summarize_url)
+                .json(&summarize_body)
+                .timeout(std::time::Duration::from_secs(300));
+            if let Some(dir) = lookup.project_dir.as_deref() {
+                summarize_req = summarize_req.header("x-opencode-directory", dir);
             }
+            match summarize_req.send().await {
+                Ok(r) if r.status().is_success() => {}
+                Ok(r) => {
+                    let status = r.status();
+                    let text = r.text().await.unwrap_or_default();
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        json!({"error": format!("opencode /summarize returned {status}: {text}")}),
+                    );
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        json!({"error": format!("opencode /summarize request failed: {e}")}),
+                    );
+                }
+            }
+
+            // Context is now compacted on the opencode server. If the caller
+            // supplied a continuation, deliver it as a fresh user turn. A
+            // delivery failure here is surfaced as 200 + continuation_delivered:
+            // false (not 502) because the compaction side effect already
+            // happened — a 502 would tempt the caller to retry the whole
+            // compact, paying for a second summarize on an already-compacted
+            // session.
+            let continuation_delivered = if let Some(continuation) = continuation {
+                match tmux::deliver_via_http(
+                    state,
+                    &backend_session_id,
+                    lookup.project_dir.as_deref(),
+                    &continuation,
+                    lookup.model.as_deref(),
+                    lookup.effort.as_deref(),
+                )
+                .await
+                {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(
+                            session = %session_id,
+                            "continuation delivery failed after successful summarize: {e}"
+                        );
+                        return (
+                            StatusCode::OK,
+                            json!({
+                                "status": "ok",
+                                "compacted": true,
+                                "continuation_delivered": false,
+                                "error": format!("opencode continuation delivery failed: {e}"),
+                            }),
+                        );
+                    }
+                }
+            } else {
+                false
+            };
+
+            (
+                StatusCode::OK,
+                json!({
+                    "status": "ok",
+                    "compacted": true,
+                    "continuation_delivered": continuation_delivered,
+                }),
+            )
         }
     }
 }
@@ -2486,6 +2568,71 @@ async fn lookup_opencode_session_dir(
     body["directory"].as_str().map(str::to_string)
 }
 
+/// Parse an opencode model string of the form `"providerID/modelID"` into its
+/// two segments. Splits on the first `/` only (matching opencode's parser at
+/// `packages/opencode/src/provider/provider.ts`), trims each segment, and
+/// rejects empty segments on either side so callers don't send
+/// `providerID: " "` or `modelID: ""` to opencode's summarize endpoint.
+///
+/// Kept separate from [`crate::nostr_transport::opencode_prompt_body`] (which
+/// has the same parse embedded) so /summarize can reuse the tuple shape
+/// directly. The two parsers must stay consistent: a model string that
+/// `opencode_prompt_body` accepts for `prompt_async` must also parse here so
+/// the same session isn't rejected for compaction.
+fn parse_opencode_model(model: &str) -> Option<(String, String)> {
+    let trimmed = model.trim();
+    let (provider, model_id) = trimmed.split_once('/')?;
+    let provider = provider.trim();
+    let model_id = model_id.trim();
+    if provider.is_empty() || model_id.is_empty() {
+        return None;
+    }
+    Some((provider.to_string(), model_id.to_string()))
+}
+
+/// Resolve `(providerID, modelID)` for the opencode `/session/:id/summarize`
+/// endpoint. First tries to parse the session's configured model (set via
+/// `ouija spawn-session --model`); if absent or unparseable, falls back to
+/// GET `/config/providers` and picks the first entry in the `default` map.
+///
+/// Returns `None` when neither source yields a pair — e.g. the session has no
+/// `model` and the opencode serve is unreachable or has no configured
+/// providers. Callers should surface this as a 400, since `/summarize` cannot
+/// be called without a concrete provider+model pair.
+async fn resolve_opencode_compact_model(
+    state: &std::sync::Arc<crate::state::AppState>,
+    session_model: Option<&str>,
+) -> Option<(String, String)> {
+    if let Some(m) = session_model
+        && let Some(pair) = parse_opencode_model(m)
+    {
+        return Some(pair);
+    }
+
+    let port = state.opencode_serve_port();
+    let url = format!("http://127.0.0.1:{port}/config/providers");
+    let resp = state
+        .http_client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    let default_map = body.get("default")?.as_object()?;
+    // `default` is a map from providerID → first-configured modelID. Picking
+    // `.next()` is non-deterministic across runs when multiple providers are
+    // configured, but for the summarize call any configured default is
+    // acceptable — the caller's preferred model (when set on the session)
+    // always takes precedence via the short-circuit above.
+    let (provider, model) = default_map.iter().next()?;
+    let model_id = model.as_str()?;
+    Some((provider.clone(), model_id.to_string()))
+}
+
 /// Query the opencode serve for a session's directory, find the matching ouija
 /// session, and set its `backend_session_id` + `backend`.
 async fn adopt_backend_session_id(
@@ -2787,10 +2934,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_oc_delivery_failure_returns_502() {
+    async fn compact_oc_summarize_failure_returns_502() {
         // In the test env, opencode_serve_port() == 320 (privileged, unbound)
-        // so the POST connection is refused. The endpoint must surface this
-        // as an upstream failure rather than masquerading it as success.
+        // so the POST connection is refused. The HTTP branch now calls
+        // /summarize before delivery, so the failure surfaces at that step.
+        // A 502 (rather than a silent 200) is required so the caller can
+        // distinguish "compact didn't happen" from "compact done".
         let state = crate::state::AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -2799,6 +2948,11 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_probe".into()),
+                    // A parseable model short-circuits /config/providers, so
+                    // the 502 is specifically the /summarize failure rather
+                    // than model-resolution failure (covered in a separate
+                    // test below).
+                    model: Some("anthropic/claude-sonnet-4-6".into()),
                     ..Default::default()
                 },
             })
@@ -2813,16 +2967,22 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let err = body["error"].as_str().unwrap_or_default();
         assert!(
-            body["error"].as_str().is_some(),
-            "expected error body on delivery failure"
+            err.contains("summarize"),
+            "expected error to mention /summarize, got: {err}"
         );
     }
 
     #[tokio::test]
-    async fn compact_oc_without_continuation_returns_400() {
-        // HTTP backends only do continuation delivery in phase 1. A request
-        // without a continuation is meaningless and must not be silently OK.
+    async fn compact_oc_bare_compact_is_no_longer_rejected_at_api_boundary() {
+        // Before this change, a bare /compact (no continuation) on an HTTP
+        // backend was rejected with 400 at the API boundary because phase-1
+        // had no context-shrink path. With real summarize wired up, a bare
+        // /compact is a legitimate request (just shrink context, deliver
+        // nothing). The test env has no opencode serve, so the call reaches
+        // /summarize and fails there with 502 — which is the proof that the
+        // request was accepted for processing rather than rejected upfront.
         let state = crate::state::AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -2831,6 +2991,7 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_probe".into()),
+                    model: Some("anthropic/claude-sonnet-4-6".into()),
                     ..Default::default()
                 },
             })
@@ -2842,18 +3003,29 @@ mod tests {
             CompactBody { continuation: None },
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "bare /compact must now progress to the summarize call (which 502s in the test env), \
+             not get rejected at the API boundary"
+        );
         assert!(
-            body["error"].as_str().unwrap().contains("continuation"),
-            "expected error to mention continuation, got: {}",
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("summarize"),
+            "expected error to mention /summarize, got: {}",
             body["error"]
         );
     }
 
     #[tokio::test]
-    async fn compact_oc_empty_continuation_returns_400() {
-        // An empty / whitespace-only continuation is normalized to None and
-        // rejected on the HTTP branch for the same reason as None.
+    async fn compact_oc_empty_continuation_normalizes_to_bare_compact() {
+        // Whitespace-only continuation is normalized to None upstream, so
+        // this is equivalent to the bare-compact case — progresses to
+        // summarize and 502s in the test env. The assertion catches a
+        // regression where whitespace would be treated as a meaningful
+        // continuation and sent through prompt_async.
         let state = crate::state::AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -2862,6 +3034,7 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_probe".into()),
+                    model: Some("anthropic/claude-sonnet-4-6".into()),
                     ..Default::default()
                 },
             })
@@ -2875,8 +3048,52 @@ mod tests {
             },
         )
         .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("summarize"),
+            "expected error to mention /summarize, got: {}",
+            body["error"]
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_oc_without_model_and_serve_unreachable_returns_400() {
+        // If the session has no `model` AND opencode serve is unreachable
+        // (so /config/providers also can't supply a default), the endpoint
+        // cannot build a valid {providerID, modelID} body for /summarize.
+        // It must reject with 400 up-front rather than reach a 502 — a 400
+        // is the actionable signal for the operator ("configure a model").
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-no-model".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_probe".into()),
+                    model: None,
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = compact_inner(
+            &state,
+            "oc-no-model".into(),
+            CompactBody {
+                continuation: Some("keep going".into()),
+            },
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(body["error"].as_str().unwrap().contains("continuation"));
+        let err = body["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("provider") || err.contains("model"),
+            "expected error to mention provider/model resolution, got: {err}"
+        );
     }
 
     #[test]
@@ -2996,6 +3213,85 @@ mod tests {
             dir.is_none(),
             "unreachable opencode serve must produce None, got Some({dir:?})"
         );
+    }
+
+    // --- parse_opencode_model / resolve_opencode_compact_model ---
+
+    #[test]
+    fn parse_opencode_model_two_segments() {
+        assert_eq!(
+            parse_opencode_model("anthropic/claude-sonnet-4-6"),
+            Some(("anthropic".into(), "claude-sonnet-4-6".into()))
+        );
+    }
+
+    #[test]
+    fn parse_opencode_model_splits_on_first_slash_only() {
+        // Opencode's parser keeps trailing slashes in the modelID segment;
+        // mirror that so `openrouter/openai/gpt-5.4` maps to the same
+        // providerID our `prompt_async` delivery uses.
+        assert_eq!(
+            parse_opencode_model("openrouter/openai/gpt-5.4"),
+            Some(("openrouter".into(), "openai/gpt-5.4".into()))
+        );
+    }
+
+    #[test]
+    fn parse_opencode_model_trims_whitespace_per_segment() {
+        assert_eq!(
+            parse_opencode_model("  openrouter / gpt-5.4  "),
+            Some(("openrouter".into(), "gpt-5.4".into()))
+        );
+    }
+
+    #[test]
+    fn parse_opencode_model_rejects_no_slash() {
+        assert_eq!(parse_opencode_model("sonnet"), None);
+        assert_eq!(parse_opencode_model(""), None);
+        assert_eq!(parse_opencode_model("   "), None);
+    }
+
+    #[test]
+    fn parse_opencode_model_rejects_empty_segment() {
+        assert_eq!(parse_opencode_model("/"), None);
+        assert_eq!(parse_opencode_model("anthropic/"), None);
+        assert_eq!(parse_opencode_model("/sonnet"), None);
+        assert_eq!(parse_opencode_model("  /  "), None);
+        assert_eq!(parse_opencode_model("anthropic/   "), None);
+    }
+
+    #[tokio::test]
+    async fn resolve_opencode_compact_model_uses_session_model_when_parseable() {
+        // Session model is the primary source — when set and parseable, the
+        // helper must not even attempt the /config/providers HTTP call.
+        let state = crate::state::AppState::new_for_test();
+        let result =
+            resolve_opencode_compact_model(&state, Some("anthropic/claude-sonnet-4-6")).await;
+        assert_eq!(
+            result,
+            Some(("anthropic".into(), "claude-sonnet-4-6".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_opencode_compact_model_returns_none_when_no_model_and_serve_unreachable() {
+        // No session model, opencode serve unreachable in test env
+        // (opencode_serve_port() == 320 for config.port=0) → both sources
+        // fail → None. The compact endpoint must surface this as a 400 so
+        // the caller knows summarize cannot proceed.
+        let state = crate::state::AppState::new_for_test();
+        let result = resolve_opencode_compact_model(&state, None).await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_opencode_compact_model_falls_through_on_unparseable_session_model() {
+        // An unparseable session model (e.g. bare "sonnet" with no provider
+        // segment) must not be used as-is; the helper falls through to the
+        // /config/providers fallback rather than invent a providerID.
+        let state = crate::state::AppState::new_for_test();
+        let result = resolve_opencode_compact_model(&state, Some("sonnet")).await;
+        assert_eq!(result, None, "bare 'sonnet' must not be accepted as a pair");
     }
 
     // --- auto_provision_from_backend_session (issue #35) ---
