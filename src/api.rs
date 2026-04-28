@@ -2097,29 +2097,39 @@ async fn get_pending_replies_inner(
 }
 
 /// Clear a pending reply from a specific sender on a pane's session.
+///
+/// Returns a JSON acknowledgement on success so callers can distinguish
+/// "actually cleared something" (`cleared >= 1`) from "pane exists but the
+/// named sender had no pending slot" (`cleared: 0`). 404 means the pane is
+/// not registered; the response body includes a JSON `error` field.
 pub async fn delete_pending_reply(
     State(state): State<SharedState>,
     axum::extract::Path((pane, from)): axum::extract::Path<(String, String)>,
-) -> StatusCode {
-    delete_pending_reply_inner(&state, pane, from).await
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, value) = delete_pending_reply_inner(&state, pane, from).await;
+    (status, Json(value))
 }
 
 async fn delete_pending_reply_inner(
     state: &SharedState,
     pane: String,
     from: String,
-) -> StatusCode {
+) -> (StatusCode, serde_json::Value) {
     let session_id = {
         let proto = state.protocol.read().await;
         resolve_pane_to_session(&proto, &pane)
     };
-    if let Some(id) = session_id {
+    let Some(id) = session_id else {
+        return (
+            StatusCode::NOT_FOUND,
+            json!({ "error": format!("pane '{pane}' is not registered") }),
+        );
+    };
+    let cleared = {
         let mut proto = state.protocol.write().await;
-        proto.clear_pending_reply_from(&id, &from);
-        StatusCode::OK
-    } else {
-        StatusCode::NOT_FOUND
-    }
+        proto.clear_pending_reply_from(&id, &from)
+    };
+    (StatusCode::OK, json!({ "cleared": cleared }))
 }
 
 /// Notify the session agent that the coding assistant has stopped in a pane.
@@ -4165,8 +4175,126 @@ mod tests {
     #[tokio::test]
     async fn delete_pending_reply_returns_404_for_unknown_pane() {
         let state = crate::state::AppState::new_for_test();
-        let status = delete_pending_reply_inner(&state, "999".into(), "sender".into()).await;
+        let (status, body) =
+            delete_pending_reply_inner(&state, "999".into(), "sender".into()).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            body["error"].as_str().is_some(),
+            "404 response must include a JSON error field, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_pending_reply_returns_cleared_count_when_slot_existed() {
+        // Acceptance criterion: callers must be able to distinguish
+        // "actually cleared something" from "nothing to clear". The body
+        // returns `cleared: N` where N > 0 when a real slot was removed.
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender-a".into(),
+                pane: Some("%74".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    networked: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "receiver-b".into(),
+                pane: Some("%99".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    networked: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Send {
+                from: "sender-a".into(),
+                to: "receiver-b".into(),
+                message: "do a thing".into(),
+                expects_reply: true,
+                responds_to: None,
+                done: false,
+            })
+            .await;
+
+        let (status, body) =
+            delete_pending_reply_inner(&state, "99".into(), "sender-a".into()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["cleared"].as_u64(),
+            Some(1),
+            "one slot existed → cleared must be 1, got body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_pending_reply_reports_cleared_zero_when_nothing_to_clear() {
+        // The pane is registered but the named sender has no pending slot.
+        // This must not 404 (the pane exists) and must not lie about
+        // clearing something — cleared is 0 so the caller can distinguish
+        // "slot was cleared" from "nothing to clear; possibly already gone".
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "receiver-b".into(),
+                pane: Some("%99".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    networked: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) =
+            delete_pending_reply_inner(&state, "99".into(), "ghost-sender".into()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["cleared"].as_u64(),
+            Some(0),
+            "no matching slot → cleared must be 0, got body: {body}"
+        );
+    }
+
+    #[test]
+    fn clear_pending_reply_from_returns_removed_count() {
+        // daemon_protocol helper returns the number of entries actually
+        // removed. 0 when nothing matches (no-op) so callers don't lie.
+        use crate::daemon_protocol::{DaemonState, Event, SessionMeta};
+        let mut state = DaemonState::new_for_model("d".into(), "h".into());
+        state.apply(Event::Register {
+            id: "sender".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                networked: true,
+                ..Default::default()
+            },
+        });
+        state.apply(Event::Register {
+            id: "target".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                networked: true,
+                ..Default::default()
+            },
+        });
+        state.apply(Event::Send {
+            from: "sender".into(),
+            to: "target".into(),
+            message: "x".into(),
+            expects_reply: true,
+            responds_to: None,
+            done: false,
+        });
+
+        assert_eq!(state.clear_pending_reply_from("target", "sender"), 1);
+        // Second call: nothing left to clear.
+        assert_eq!(state.clear_pending_reply_from("target", "sender"), 0);
+        // Unknown session: also 0.
+        assert_eq!(state.clear_pending_reply_from("ghost", "sender"), 0);
     }
 
     /// End-to-end regression through a real axum Router and TCP listener.
@@ -4406,11 +4534,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_pending_reply_clears_stuck_slot_after_sender_gone() {
-        // Full regression for the hub2 symptom: sender is gone but recipient
-        // has a pending-reply slot that the reminder loop keeps firing on.
-        // The recipient must be able to clear it by pane id without restarting
-        // the daemon.
+    async fn delete_pending_reply_clears_stuck_slot_after_sender_renamed() {
+        // Full regression for the hub2 symptom: sender was *renamed*, so the
+        // recipient's pending_replies bucket still has an entry whose `from`
+        // points at a session id that no longer exists in the registry. The
+        // daemon's cascade-on-remove does NOT trigger (no Remove event ran),
+        // so the slot stays stuck and the reminder loop keeps firing on it.
+        // The recipient must be able to clear it by pane id without
+        // restarting the daemon — that is exactly what the hub2 operator
+        // couldn't do before this PR.
         let state = crate::state::AppState::new_for_test();
 
         // Register sender (A) and recipient (B).
@@ -4461,22 +4593,50 @@ mod tests {
             );
         }
 
-        // Sender is gone (removed from registry). Reminder loop still fires.
+        // Model the real hub2 shape: the sender was *renamed*, not removed.
+        // apply_rename migrates the sender's own pending_replies bucket key
+        // but does NOT rewrite `from` values in other sessions' pending
+        // buckets — so B's pending_replies[B] still has an entry whose
+        // `from = "sender-a"` pointing at a name that no longer exists in
+        // the registry. No Event::Remove has fired, so the auto-clean
+        // cascade does NOT kick in. This is exactly the stuck slot the
+        // recipient used to be unable to clear without restarting the
+        // daemon.
         state
-            .apply_and_execute(crate::daemon_protocol::Event::Remove {
-                id: "sender-a".into(),
-                keep_worktree: true,
+            .apply_and_execute(crate::daemon_protocol::Event::Rename {
+                old_id: "sender-a".into(),
+                new_id: "sender-renamed".into(),
             })
             .await;
 
+        // Sanity: the stuck slot is still there post-rename.
+        {
+            let proto = state.protocol.read().await;
+            let entries = proto
+                .pending_replies
+                .get("receiver-b")
+                .expect("receiver bucket must survive rename of sender");
+            assert!(
+                entries.iter().any(|e| e.from == "sender-a"),
+                "sender-a slot must still be there after rename — this is \
+                 the bug shape we're proving we can clear"
+            );
+        }
+
         // B clears the stuck slot by hitting the pane route with the numeric
-        // suffix (what the CLI now sends). This must succeed — not silently
-        // 404 — and the slot must be gone.
-        let status = delete_pending_reply_inner(&state, "99".into(), "sender-a".into()).await;
+        // suffix (what the CLI now sends). This must succeed, report the
+        // cleared count, and the slot must be gone.
+        let (status, body) =
+            delete_pending_reply_inner(&state, "99".into(), "sender-a".into()).await;
         assert_eq!(
             status,
             StatusCode::OK,
             "clear-reply on real pane + real pending slot must return 200"
+        );
+        assert_eq!(
+            body["cleared"].as_u64(),
+            Some(1),
+            "cleared must report the removed slot count so the CLI is not lied to"
         );
 
         let proto = state.protocol.read().await;
