@@ -4169,6 +4169,127 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    /// End-to-end regression through a real axum Router and TCP listener.
+    ///
+    /// The core bug in #646 was a percent-decoding mismatch: axum decodes
+    /// `%74` to `t` in path segments. The `resolve_pane_to_session` unit
+    /// tests cover the handler's side of that; this test additionally proves
+    /// that the CLI's `pane_wire_suffix` convention (send the suffix only)
+    /// actually round-trips through axum's real Path extractor.
+    ///
+    /// What this adds over the inner-fn tests: if axum ever changes its
+    /// percent-decoding behaviour (or if a refactor accidentally reroutes
+    /// through a different extractor), the inner-fn tests keep passing but
+    /// this test would fail. It is the ultimate guard for the bug chain.
+    #[tokio::test]
+    async fn delete_pending_reply_end_to_end_through_axum_router() {
+        use axum::Router;
+        use axum::routing::delete;
+        use tokio::net::TcpListener;
+
+        let state = crate::state::AppState::new_for_test();
+
+        // Register sender (%74) and recipient (%99).
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender-a".into(),
+                pane: Some("%74".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    networked: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "receiver-b".into(),
+                pane: Some("%99".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    networked: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        // Stage a pending-reply slot on the recipient.
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Send {
+                from: "sender-a".into(),
+                to: "receiver-b".into(),
+                message: "do a thing".into(),
+                expects_reply: true,
+                responds_to: None,
+                done: false,
+            })
+            .await;
+
+        // Build a minimal router that mounts the real production route.
+        let app = Router::new()
+            .route(
+                "/api/pane/{pane}/pending-replies/{from}",
+                delete(delete_pending_reply),
+            )
+            .with_state(state.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Send the request the way the CLI now does: suffix, no leading `%`.
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/api/pane/99/pending-replies/sender-a");
+        let resp = client.delete(&url).send().await.unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "DELETE on real pane must return 200, not silent 404"
+        );
+
+        // Slot must be gone.
+        {
+            let proto = state.protocol.read().await;
+            let still_there = proto
+                .pending_replies
+                .get("receiver-b")
+                .map(|v| v.iter().any(|e| e.from == "sender-a"))
+                .unwrap_or(false);
+            assert!(
+                !still_there,
+                "pending-reply slot must be cleared after the DELETE"
+            );
+        }
+
+        // Bonus: a correctly-URL-encoded `%` (sent as `%2599`, extracted by
+        // axum as literal `%99`) must also route to the right pane. This is
+        // the defensive tolerance that `resolve_pane_to_session` provides
+        // for future callers that percent-escape the `%` properly. The
+        // clear is idempotent on the DaemonState side so we still get 200
+        // even though the slot is already empty.
+        let url2 = format!("http://{addr}/api/pane/%2599/pending-replies/sender-a");
+        let resp2 = client.delete(&url2).send().await.unwrap();
+        assert_eq!(
+            resp2.status().as_u16(),
+            200,
+            "%25-encoded `%` form must also route to the right pane"
+        );
+
+        // And the *buggy* pre-fix URL form — raw `%74` in the path — must
+        // not spuriously succeed. Axum decodes `%74` to `t`, the helper
+        // gets a non-matching pane id, and the correct answer is 404. This
+        // is the exact failure the CLI used to silently swallow.
+        let url3 = format!("http://{addr}/api/pane/%74/pending-replies/sender-a");
+        let resp3 = client.delete(&url3).send().await.unwrap();
+        assert_eq!(
+            resp3.status().as_u16(),
+            404,
+            "raw `%74` URL (the pre-fix CLI's bug) must 404, not silently match"
+        );
+
+        server.abort();
+    }
+
     #[tokio::test]
     async fn delete_pending_reply_clears_stuck_slot_after_sender_gone() {
         // Full regression for the hub2 symptom: sender is gone but recipient
