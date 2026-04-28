@@ -1480,38 +1480,78 @@ fn fetch_latest_crate_version(name: &str) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("no versions found for {name} on crates.io"))
 }
 
-/// Look up the registered session ID for the current execution context.
+/// Outcome of priority-resolving the three signals that can identify the
+/// caller's session: the `@ouija_session` tmux pane var, the
+/// `$OUIJA_SESSION_ID` env var, and `$TMUX_PANE`.
 ///
-/// Resolution order:
-/// 1. `$OUIJA_SESSION_ID` env var — explicit override for non-tmux engines
-///    (e.g. opencode HTTP API) and plugin wrappers.
-/// 2. `@ouija_session` tmux pane variable — fast path for tmux callers.
-/// 3. `/api/status` lookup by `$TMUX_PANE` — fallback when the pane var was
-///    cleared but the daemon still tracks the pane.
-async fn resolve_my_session_id() -> Option<String> {
-    if let Ok(id) = std::env::var("OUIJA_SESSION_ID") {
-        if !id.is_empty() {
-            return Some(id);
+/// `LookupByPane` defers an HTTP call to the daemon; the pure decision lives
+/// in [`pick_session_id`] so the precedence is testable without env-var or
+/// tmux mutation.
+#[derive(Debug, PartialEq, Eq)]
+enum SessionIdResolution {
+    Found(String),
+    LookupByPane(String),
+    None,
+}
+
+/// Pick the caller's session id from the three available signals.
+///
+/// Priority when in tmux (`tmux_pane` is `Some`):
+///   1. `@ouija_session` pane var — daemon-controlled, cleared on Remove and
+///      rewritten on Rename, so it always reflects current state.
+///   2. `$OUIJA_SESSION_ID` env var — fallback for the race window before the
+///      daemon's `SetTmuxVar` effect lands, and for opencode bash subshells
+///      that occasionally lose `TMUX_PANE` inheritance.
+///   3. `LookupByPane` — last-resort daemon query.
+///
+/// Outside tmux, only the env var can identify the caller.
+///
+/// The pane var must outrank the env var because `pane_env_args` exports
+/// `OUIJA_SESSION_ID` once at pane fork time and tmux cannot mutate a running
+/// shell's environment afterward — so a shell that outlives its originating
+/// session keeps a stale env var indefinitely (issue #42).
+fn pick_session_id(
+    tmux_pane: Option<&str>,
+    pane_var: Option<String>,
+    env_var: Option<String>,
+) -> SessionIdResolution {
+    if tmux_pane.is_some() {
+        if let Some(id) = pane_var.filter(|s| !s.is_empty()) {
+            return SessionIdResolution::Found(id);
         }
     }
-
-    let pane = std::env::var("TMUX_PANE").ok()?;
-
-    // Fast path: tmux pane variable (no HTTP)
-    if let Some(id) = tmux_var::get(&pane) {
-        return Some(id);
+    if let Some(id) = env_var.filter(|s| !s.is_empty()) {
+        return SessionIdResolution::Found(id);
     }
+    if let Some(pane) = tmux_pane {
+        return SessionIdResolution::LookupByPane(pane.to_string());
+    }
+    SessionIdResolution::None
+}
 
-    // Fallback: query daemon API
-    let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
-    let url = format!("http://localhost:{port}/api/status");
-    let resp = reqwest::get(&url).await.ok()?;
-    let status: serde_json::Value = resp.json().await.ok()?;
-    status["sessions"]
-        .as_array()?
-        .iter()
-        .find(|s| s["pane"].as_str() == Some(&pane))
-        .and_then(|s| s["id"].as_str().map(String::from))
+/// Look up the registered session ID for the current execution context.
+///
+/// See [`pick_session_id`] for the precedence and rationale.
+async fn resolve_my_session_id() -> Option<String> {
+    let tmux_pane = std::env::var("TMUX_PANE").ok();
+    let pane_var = tmux_pane.as_deref().and_then(tmux_var::get);
+    let env_var = std::env::var("OUIJA_SESSION_ID").ok();
+
+    match pick_session_id(tmux_pane.as_deref(), pane_var, env_var) {
+        SessionIdResolution::Found(id) => Some(id),
+        SessionIdResolution::LookupByPane(pane) => {
+            let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
+            let url = format!("http://localhost:{port}/api/status");
+            let resp = reqwest::get(&url).await.ok()?;
+            let status: serde_json::Value = resp.json().await.ok()?;
+            status["sessions"]
+                .as_array()?
+                .iter()
+                .find(|s| s["pane"].as_str() == Some(&pane))
+                .and_then(|s| s["id"].as_str().map(String::from))
+        }
+        SessionIdResolution::None => None,
+    }
 }
 
 /// Resolve session ID or bail with a helpful error.
@@ -1716,6 +1756,72 @@ mod tests {
                 "{code} must be classified as success"
             );
         }
+    }
+
+    // --- pick_session_id (issue #42) ---
+    //
+    // Precedence regression: $OUIJA_SESSION_ID is exported into spawned panes
+    // via `tmux new-window -e KEY=VAL` and cannot be updated once the shell
+    // is running. When a pane outlives its originating session and gets
+    // re-registered to a different ouija id, the env var stays stale while
+    // the daemon-controlled @ouija_session pane var is current. The pane var
+    // must outrank the env var so peers don't reject calls under a stale id.
+
+    #[test]
+    fn pick_session_id_prefers_pane_var_over_env_var_in_tmux() {
+        // In a tmux pane, the daemon-controlled pane var is authoritative.
+        let res = pick_session_id(
+            Some("%74"),
+            Some("keycast".into()),
+            Some("feat/95-stale".into()),
+        );
+        assert_eq!(res, SessionIdResolution::Found("keycast".into()));
+    }
+
+    #[test]
+    fn pick_session_id_falls_back_to_env_var_when_pane_var_missing() {
+        // Race window before the daemon's SetTmuxVar effect lands, or
+        // opencode subshell that lost TMUX_PANE inheritance — env var is the
+        // only signal pointing at the right session.
+        let res = pick_session_id(Some("%74"), None, Some("keycast".into()));
+        assert_eq!(res, SessionIdResolution::Found("keycast".into()));
+    }
+
+    #[test]
+    fn pick_session_id_treats_empty_pane_var_as_absent() {
+        let res = pick_session_id(Some("%74"), Some("".into()), Some("env-id".into()));
+        assert_eq!(res, SessionIdResolution::Found("env-id".into()));
+    }
+
+    #[test]
+    fn pick_session_id_falls_through_to_pane_lookup_when_neither_signal_set() {
+        let res = pick_session_id(Some("%74"), None, None);
+        assert_eq!(res, SessionIdResolution::LookupByPane("%74".into()));
+    }
+
+    #[test]
+    fn pick_session_id_outside_tmux_uses_env_var() {
+        // Non-tmux callers (opencode HTTP API plugin, scripts) have no pane
+        // var to consult — env var is the only signal.
+        let res = pick_session_id(None, None, Some("opencode-session".into()));
+        assert_eq!(res, SessionIdResolution::Found("opencode-session".into()));
+    }
+
+    #[test]
+    fn pick_session_id_outside_tmux_with_no_env_var_returns_none() {
+        // No tmux pane, no env var — caller must pass --from <id> explicitly.
+        let res = pick_session_id(None, None, None);
+        assert_eq!(res, SessionIdResolution::None);
+    }
+
+    #[test]
+    fn pick_session_id_outside_tmux_ignores_stray_pane_var_input() {
+        // Defensive: if a caller somehow supplies a pane var without a pane
+        // (an internally inconsistent state), we don't trust it — the pane
+        // var without a pane id can't be the daemon-controlled signal we
+        // claim it is. Fall through to env var.
+        let res = pick_session_id(None, Some("ghost".into()), Some("real".into()));
+        assert_eq!(res, SessionIdResolution::Found("real".into()));
     }
 
     #[test]
