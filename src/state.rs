@@ -1191,10 +1191,21 @@ impl AppState {
             dirs
         };
         // Check which dirs exist on disk
+        // Only mark presence on clean ENOENT success/failure; other errors skip the session
         let presence_map: std::collections::HashMap<String, bool> = match tokio::task::spawn_blocking(move || {
             let mut map = std::collections::HashMap::new();
             for dir in unique_dirs {
-                map.insert(dir.clone(), std::path::Path::new(&dir).is_dir());
+                let presence = match std::fs::symlink_metadata(&dir) {
+                    Ok(m) => Some(m.is_dir()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+                    Err(e) => {
+                        tracing::debug!("worktree stat failed for {}: {}", dir, e);
+                        None // skip this session
+                    }
+                };
+                if let Some(p) = presence {
+                    map.insert(dir, p);
+                }
             }
             map
         }).await {
@@ -1204,10 +1215,12 @@ impl AppState {
                 return;
             }
         };
-        // Map session IDs back to their presence, carrying expected project_dir for TOCTOU guard
+        // Only update sessions whose dirs were successfully checked
         let updates: Vec<(String, String, bool)> = sessions_with_dirs
             .into_iter()
-            .map(|(id, dir)| (id, dir.clone(), *presence_map.get(&dir).unwrap_or(&false)))
+            .filter_map(|(id, dir)| {
+                presence_map.get(&dir).map(|p| (id, dir.clone(), *p))
+            })
             .collect();
         if !updates.is_empty() {
             let _ = self
