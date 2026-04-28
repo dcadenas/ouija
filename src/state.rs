@@ -1204,10 +1204,10 @@ impl AppState {
                 return;
             }
         };
-        // Map session IDs back to their presence
-        let updates: Vec<(String, bool)> = sessions_with_dirs
+        // Map session IDs back to their presence, carrying expected project_dir for TOCTOU guard
+        let updates: Vec<(String, String, bool)> = sessions_with_dirs
             .into_iter()
-            .map(|(id, dir)| (id, *presence_map.get(&dir).unwrap_or(&false)))
+            .map(|(id, dir)| (id, dir.clone(), *presence_map.get(&dir).unwrap_or(&false)))
             .collect();
         if !updates.is_empty() {
             let _ = self

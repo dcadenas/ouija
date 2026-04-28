@@ -296,8 +296,10 @@ pub enum Event {
     ///
     /// Only meaningful for Local sessions. Remote/Human origins' `project_dir`
     /// lives on another machine and is not locally checkable.
+    /// Carries expected project_dir to avoid TOCTOU races where project_dir
+    /// changes between snapshot and apply.
     MarkWorktreePresence {
-        updates: Vec<(String, bool)>,
+        updates: Vec<(String, String, bool)>,
     },
 }
 
@@ -990,11 +992,10 @@ impl DaemonState {
         effects
     }
 
-    fn apply_mark_worktree_presence(&mut self, updates: Vec<(String, bool)>) -> Vec<Effect> {
+    fn apply_mark_worktree_presence(&mut self, updates: Vec<(String, String, bool)>) -> Vec<Effect> {
         let mut effects = Vec::new();
 
-        for (id, present) in updates {
-            // Skip non-local sessions — their project_dir lives on another machine
+        for (id, expected_dir, present) in updates {
             let Some(session) = self.sessions.get_mut(&id) else {
                 continue;
             };
@@ -1002,7 +1003,11 @@ impl DaemonState {
                 continue;
             }
 
-            // Idempotence: only update if value changed
+            // TOCTOU guard: skip if project_dir changed since snapshot
+            if session.metadata.project_dir.as_ref() != Some(&expected_dir) {
+                continue;
+            }
+
             if session.metadata.worktree_present == Some(present) {
                 continue;
             }
@@ -2941,12 +2946,12 @@ mod tests {
             id: "s1".into(),
             pane: Some("%1".into()),
             metadata: SessionMeta {
-                project_dir: Some("/tmp/missing".into()),
+                project_dir: Some("/tmp/dir1".into()),
                 ..Default::default()
             },
         });
         let effects = state.apply(Event::MarkWorktreePresence {
-            updates: vec![("s1".into(), false)],
+            updates: vec![("s1".into(), "/tmp/dir1".into(), false)],
         });
         assert_eq!(
             state.sessions.get("s1").unwrap().metadata.worktree_present,
@@ -2971,7 +2976,7 @@ mod tests {
             },
         });
         let effects = state.apply(Event::MarkWorktreePresence {
-            updates: vec![("s1".into(), false)],
+            updates: vec![("s1".into(), "/tmp/dir1".into(), false)],
         });
         assert!(
             !effects.iter().any(|e| matches!(e, Effect::Persist)),
@@ -3019,9 +3024,9 @@ mod tests {
         });
         let effects = state.apply(Event::MarkWorktreePresence {
             updates: vec![
-                ("remote/s1".into(), false),
-                ("human/s1".into(), false),
-                ("local/s1".into(), false),
+                ("remote/s1".into(), "/tmp/remote".into(), false),
+                ("human/s1".into(), "/tmp/human".into(), false),
+                ("local/s1".into(), "/tmp/local".into(), false),
             ],
         });
         // Local should be set
