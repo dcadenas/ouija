@@ -261,6 +261,15 @@ pub struct SessionMetadata {
     /// What happens each time a scheduled task fires for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_fire: Option<crate::scheduler::OnFire>,
+    /// Last known on-disk presence of `project_dir` as of the most recent
+    /// worktree sweep. `None` = never checked, `Some(true)` = on disk,
+    /// `Some(false)` = missing (stale registration, issue #661).
+    ///
+    /// Mirror of `SessionMeta::worktree_present` — see that field's doc
+    /// comment for the semantic boundaries (only meaningful for Local
+    /// sessions with `project_dir` set; distinct from metadata staleness).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_present: Option<bool>,
 }
 
 fn default_true() -> bool {
@@ -288,6 +297,7 @@ impl Default for SessionMetadata {
             iteration_log: Vec::new(),
             last_iteration_at: None,
             on_fire: None,
+            worktree_present: None,
         }
     }
 }
@@ -863,6 +873,7 @@ impl AppState {
                         iteration_log: m.iteration_log.clone(),
                         last_iteration_at: m.last_iteration_at,
                         on_fire: m.on_fire.clone(),
+                        worktree_present: m.worktree_present,
                     },
                 };
                 (k.clone(), session)
@@ -1695,6 +1706,7 @@ pub(crate) mod tests {
             iteration_log: vec![],
             last_iteration_at: Some(1_700_000_000),
             on_fire: Some(crate::scheduler::OnFire::NewSession),
+            worktree_present: Some(false),
         };
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -1778,6 +1790,11 @@ pub(crate) mod tests {
         assert!(s.metadata.worktree, "worktree preserved");
         assert!(!s.metadata.networked, "networked=false preserved");
         assert_eq!(s.metadata.iteration, 3, "iteration preserved");
+        assert_eq!(
+            s.metadata.worktree_present,
+            Some(false),
+            "worktree_present dropped by persist (issue #661)"
+        );
 
         // Full restart simulation: feed the persisted SessionMetadata back
         // through metadata_to_session_meta (the function apply_persisted
@@ -1796,6 +1813,7 @@ pub(crate) mod tests {
         assert!(hydrated.on_fire.is_some());
         assert_eq!(hydrated.last_iteration_at, Some(1_700_000_000));
         assert_eq!(hydrated.last_metadata_update, Some(1_700_000_100));
+        assert_eq!(hydrated.worktree_present, Some(false));
     }
 
     #[tokio::test]

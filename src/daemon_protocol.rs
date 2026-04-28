@@ -138,6 +138,19 @@ pub struct SessionMeta {
     /// What happens each time a scheduled task fires for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_fire: Option<crate::scheduler::OnFire>,
+    /// Last known on-disk presence of `project_dir`, as of the most recent
+    /// worktree sweep. `None` = never checked, `Some(true)` = found on disk,
+    /// `Some(false)` = `project_dir` is missing → registration is stale.
+    ///
+    /// Distinct from the metadata-age `stale` signal in `/api/status`
+    /// (which tracks role/bulletin update age). This is strictly the
+    /// filesystem-existence signal for issue #661.
+    ///
+    /// Only meaningful when `project_dir.is_some()` and `origin == Local`.
+    /// The sweep never sets this for Remote/Human sessions — their
+    /// `project_dir` lives on another machine and is not locally checkable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_present: Option<bool>,
 }
 
 /// Metadata becomes stale after 30 minutes without an update.
@@ -223,6 +236,7 @@ impl Default for SessionMeta {
             iteration_log: Vec::new(),
             last_iteration_at: None,
             on_fire: None,
+            worktree_present: None,
         }
     }
 }
@@ -510,6 +524,7 @@ fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>) -> Sessio
             iteration_log: m.iteration_log.clone(),
             last_iteration_at: m.last_iteration_at,
             on_fire: m.on_fire.clone(),
+            worktree_present: m.worktree_present,
         },
         None => SessionMeta::default(),
     }
@@ -1786,6 +1801,52 @@ mod tests {
         let decoded: SessionMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.model.as_deref(), Some("openrouter/openai/gpt-5.4"));
         assert_eq!(decoded.effort.as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn session_meta_worktree_present_defaults_to_none() {
+        let meta = SessionMeta::default();
+        assert_eq!(
+            meta.worktree_present, None,
+            "never-checked is distinct from on-disk/missing"
+        );
+    }
+
+    #[test]
+    fn session_meta_worktree_present_round_trip() {
+        // Missing-on-disk bit survives serde — it's persisted via
+        // `metadata_to_session_meta` and must not silently flip back to None
+        // after a daemon restart, otherwise the stale mark would reset and
+        // the sweep would have to re-stat everything before `ouija ls` could
+        // distinguish again.
+        let meta = SessionMeta {
+            project_dir: Some("/tmp/gone".into()),
+            worktree_present: Some(false),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let decoded: SessionMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.worktree_present, Some(false));
+
+        let meta_present = SessionMeta {
+            project_dir: Some("/tmp/here".into()),
+            worktree_present: Some(true),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&meta_present).unwrap();
+        let decoded: SessionMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.worktree_present, Some(true));
+    }
+
+    #[test]
+    fn session_meta_worktree_present_backward_compat() {
+        // Metadata written before this field existed must still load. The
+        // missing field must deserialize to None (never-checked), not crash,
+        // and not flip to Some(false) (which would spuriously mark every
+        // pre-existing session stale on first daemon upgrade).
+        let legacy = r#"{"project_dir":"/tmp/wt","iteration":0}"#;
+        let decoded: SessionMeta = serde_json::from_str(legacy).unwrap();
+        assert_eq!(decoded.worktree_present, None);
     }
 
     #[test]
