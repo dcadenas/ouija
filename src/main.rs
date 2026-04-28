@@ -764,10 +764,12 @@ async fn main() -> anyhow::Result<()> {
             let url = format!("http://localhost:{port}/api/sessions/prune-stale");
             let client = reqwest::Client::new();
             let body_json = serde_json::json!({ "confirm": yes });
-            let resp = client.post(&url).json(&body_json).send().await?;
+            let mut resp = client.post(&url).json(&body_json).send().await?;
+            resp = resp.error_for_status()?;
             let text = resp.text().await?;
             let value: serde_json::Value = serde_json::from_str(&text)?;
-            if value["dry_run"] == true {
+            let dry_run = value.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(true);
+            if dry_run {
                 if let Some(arr) = value["would_prune"].as_array() {
                     let ids = arr.len();
                     if ids == 0 {
@@ -785,6 +787,10 @@ async fn main() -> anyhow::Result<()> {
                     println!("Pruned {} stale session(s)", arr.len());
                 } else {
                     println!("Pruned 0 stale session(s)");
+                }
+                if let Some(arr) = value["errors"].as_array() {
+                    eprintln!("Failed to prune {} session(s): {}",
+                        arr.len(), value["errors"]);
                 }
             }
         }
