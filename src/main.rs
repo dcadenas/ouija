@@ -506,8 +506,8 @@ async fn main() -> anyhow::Result<()> {
                     let current_hash = reaper_state.local_session_hash().await;
                     let heartbeat_due = heartbeat_counter >= HEARTBEAT_CYCLES;
                     if first_run || current_hash != last_session_hash || heartbeat_due {
-                        // Sweep worktree presence on heartbeat cadence
-                        if heartbeat_due {
+                        // Initial sweep on startup + periodic on heartbeat cadence
+                        if first_run || heartbeat_due {
                             reaper_state.sweep_worktree_presence().await;
                         }
                         transport::broadcast_local_sessions(&reaper_state).await;

@@ -1933,6 +1933,18 @@ pub async fn prune_stale_sessions(
     let mut pruned = Vec::new();
     let mut errors = Vec::new();
     for id in stale_ids {
+        // Re-check still stale to avoid racing with heartbeat sweep
+        // that may have marked worktree_present back to Some(true)
+        let still_stale = {
+            let proto = state.protocol.read().await;
+            proto.sessions.get(&id)
+                .map(|s| s.metadata.worktree_present == Some(false))
+                .unwrap_or(false)
+        };
+        if !still_stale {
+            tracing::debug!("session {} no longer stale, skipping", id);
+            continue;
+        }
         let effects = state
             .apply_and_execute(crate::daemon_protocol::Event::Remove {
                 id: id.clone(),
