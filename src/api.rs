@@ -1934,29 +1934,29 @@ pub async fn prune_stale_sessions(
     let mut errors = Vec::new();
     let mut already_gone = Vec::new();
     for id in stale_ids {
-        // Re-check still stale to avoid racing with heartbeat sweep
-        // that may have marked worktree_present back to Some(true)
-        let still_stale = {
-            let proto = state.protocol.read().await;
-            proto.sessions.get(&id)
-                .map(|s| s.metadata.worktree_present == Some(false))
-                .unwrap_or(false)
-        };
-        if !still_stale {
-            tracing::debug!("session {} no longer stale (vanished between snapshot and prune)", id);
-            already_gone.push(id);
-            continue;
-        }
+        // Use RemoveIfStale for atomic under-the-write-lock guard:
+        // if a heartbeat sweep flipped worktree_present back to Some(true)
+        // between our snapshot and apply, the handler emits RemoveFailed
+        // and the session stays.
         let effects = state
-            .apply_and_execute(crate::daemon_protocol::Event::Remove {
+            .apply_and_execute(crate::daemon_protocol::Event::RemoveIfStale {
                 id: id.clone(),
-                keep_worktree: true,
             })
             .await;
         if effects.iter().any(|e| matches!(e, crate::daemon_protocol::Effect::RemoveFailed { .. }))
         {
-            tracing::warn!("failed to prune session {}", id);
-            errors.push(id);
+            // Distinguish "vanished during race" (session gone) from real failures.
+            let still_present = {
+                let proto = state.protocol.read().await;
+                proto.sessions.contains_key(&id)
+            };
+            if !still_present {
+                tracing::debug!("session {} vanished between snapshot and prune", id);
+                already_gone.push(id);
+            } else {
+                tracing::warn!("failed to prune session {} (no longer stale or guard tripped)", id);
+                errors.push(id);
+            }
         } else {
             pruned.push(id);
         }

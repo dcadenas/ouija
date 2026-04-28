@@ -773,7 +773,7 @@ async fn main() -> anyhow::Result<()> {
             let dry_run = value.get("dry_run").and_then(|v| v.as_bool())
                 .ok_or_else(|| anyhow::anyhow!("server response missing 'dry_run' key: {text}"))?;
 
-            if dry_run != !yes {
+            if dry_run == yes {
                 return Err(anyhow::anyhow!(
                     "server response intent mismatch: requested confirm={} but server returned dry_run={}. Response: {}",
                     yes, dry_run, text
