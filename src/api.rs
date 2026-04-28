@@ -120,6 +120,7 @@ pub async fn get_session(
                     "iteration": s.metadata.iteration,
                     "iteration_log": s.metadata.iteration_log,
                     "last_iteration_at": s.metadata.last_iteration_at,
+                    "worktree_present": s.metadata.worktree_present,
                 })),
             )
         }
@@ -162,6 +163,7 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
                 "iteration": s.metadata.iteration,
                 "iteration_log": s.metadata.iteration_log,
                 "last_iteration_at": s.metadata.last_iteration_at,
+                "worktree_present": s.metadata.worktree_present,
             })
         })
         .collect();
