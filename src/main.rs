@@ -1481,9 +1481,31 @@ async fn cli_delete(path: &str) -> anyhow::Result<()> {
     let url = format!("http://localhost:{port}{path}");
     let client = reqwest::Client::new();
     let resp = client.delete(&url).send().await?;
+    let status = resp.status();
     let text = resp.text().await?;
-    println!("{text}");
+    let body = classify_http_response(status, &text)?;
+    println!("{body}");
     Ok(())
+}
+
+/// Classify an HTTP response into a CLI success-or-error.
+///
+/// Returns `Ok(body)` for 2xx, `Err` for everything else. The previous
+/// behaviour in `cli_delete` printed the body and returned Ok for any
+/// status, which made daemon 404s look like a silent success — half of
+/// the silent-failure chain issue #646 is fixing.
+///
+/// Pulled out as a pure function so it is testable without a reqwest
+/// round-trip; the HTTP-dependent parts (URL building, connecting,
+/// body read) are orchestration, not logic.
+fn classify_http_response(status: reqwest::StatusCode, body: &str) -> anyhow::Result<String> {
+    if status.is_success() {
+        Ok(body.to_string())
+    } else if body.is_empty() {
+        anyhow::bail!("request failed with HTTP {status}")
+    } else {
+        anyhow::bail!("request failed with HTTP {status}: {body}")
+    }
 }
 
 /// Strip the leading `%` from a tmux pane id for wire transport.
@@ -1590,5 +1612,67 @@ mod tests {
         // Control chars and `#` / `?` would terminate the path segment or
         // start a query string / fragment on the wire; encode them.
         assert_eq!(encode_path_segment("a b#c?d"), "a%20b%23c%3Fd");
+    }
+
+    // --- classify_http_response (issue #646 review follow-up) ---
+    //
+    // cli_delete (and any future HTTP helper built on top of this) must
+    // surface non-2xx responses as hard errors so the CLI exits non-zero.
+    // The previous behaviour — print the body and exit 0 for any status —
+    // made 404s from the daemon look like success, which is half of the
+    // silent-failure chain this PR is fixing.
+
+    #[test]
+    fn classify_http_response_success_returns_body() {
+        use reqwest::StatusCode;
+        let out = classify_http_response(StatusCode::OK, "{\"ok\":true}").unwrap();
+        assert_eq!(out, "{\"ok\":true}");
+    }
+
+    #[test]
+    fn classify_http_response_2xx_range_all_pass() {
+        use reqwest::StatusCode;
+        for code in [
+            StatusCode::OK,
+            StatusCode::CREATED,
+            StatusCode::ACCEPTED,
+            StatusCode::NO_CONTENT,
+        ] {
+            assert!(
+                classify_http_response(code, "").is_ok(),
+                "{code} must be classified as success"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_http_response_404_surfaces_as_error() {
+        use reqwest::StatusCode;
+        let err = classify_http_response(StatusCode::NOT_FOUND, "{\"error\":\"pane 'x' is not registered\"}")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("404"),
+            "error message must include the status code, got: {msg}"
+        );
+        assert!(
+            msg.contains("pane 'x' is not registered"),
+            "error message must include the response body, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn classify_http_response_500_surfaces_as_error() {
+        use reqwest::StatusCode;
+        let err = classify_http_response(StatusCode::INTERNAL_SERVER_ERROR, "boom").unwrap_err();
+        assert!(err.to_string().contains("500"));
+    }
+
+    #[test]
+    fn classify_http_response_400_with_empty_body_still_errors() {
+        // Empty body must not swallow the error — status alone is sufficient.
+        use reqwest::StatusCode;
+        let err = classify_http_response(StatusCode::BAD_REQUEST, "").unwrap_err();
+        assert!(err.to_string().contains("400"));
     }
 }
