@@ -1912,7 +1912,7 @@ pub async fn prune_stale_sessions(
     State(state): State<SharedState>,
     Json(body): Json<PruneStaleBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let stale_ids: Vec<String> = {
+    let stale_sessions: Vec<(String, String)> = {
         let proto = state.protocol.read().await;
         proto
             .sessions
@@ -1921,19 +1921,19 @@ pub async fn prune_stale_sessions(
                 matches!(s.origin, crate::daemon_protocol::Origin::Local)
                     && s.metadata.worktree_present == Some(false)
             })
-            .map(|s| s.id.clone())
+            .filter_map(|s| s.metadata.project_dir.as_ref().map(|d| (s.id.clone(), d.clone())))
             .collect()
     };
     if !body.confirm {
         return (
             StatusCode::OK,
-            Json(json!({ "dry_run": true, "would_prune": stale_ids })),
+            Json(json!({ "dry_run": true, "would_prune": stale_sessions.iter().map(|(id, _)| id).cloned().collect::<Vec<_>>() })),
         );
     }
     let mut pruned = Vec::new();
     let mut errors = Vec::new();
     let mut already_gone = Vec::new();
-    for id in stale_ids {
+    for (id, project_dir) in stale_sessions {
         // Use RemoveIfStale for atomic under-the-write-lock guard:
         // if a heartbeat sweep flipped worktree_present back to Some(true)
         // between our snapshot and apply, the handler emits RemoveFailed
@@ -1941,6 +1941,7 @@ pub async fn prune_stale_sessions(
         let effects = state
             .apply_and_execute(crate::daemon_protocol::Event::RemoveIfStale {
                 id: id.clone(),
+                expected_project_dir: Some(project_dir),
             })
             .await;
         if effects.iter().any(|e| matches!(e, crate::daemon_protocol::Effect::RemoveFailed { .. }))

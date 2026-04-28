@@ -159,6 +159,8 @@ pub struct AppState {
     /// Per-fire worktree panes: pane_id → project_dir.
     /// Reaper runs `git worktree prune` when these panes die.
     pub perfire_worktree_panes: RwLock<HashMap<String, String>>,
+    /// Dedup: prevents concurrent sweeps from accumulating hung blocking threads.
+    sweep_in_progress: std::sync::atomic::AtomicBool,
     pub backends: crate::backend::BackendRegistry,
     pub http_client: reqwest::Client,
     /// Queued prompts for HttpApi sessions awaiting a readiness signal.
@@ -381,6 +383,7 @@ impl AppState {
             pending_commands: std::sync::Mutex::new(Vec::new()),
             cached_assistant_panes: RwLock::new(Vec::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
+            sweep_in_progress: std::sync::atomic::AtomicBool::new(false),
             backends: crate::backend::BackendRegistry::default_registry(),
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -413,6 +416,7 @@ impl AppState {
             pending_commands: std::sync::Mutex::new(Vec::new()),
             cached_assistant_panes: RwLock::new(Vec::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
+            sweep_in_progress: std::sync::atomic::AtomicBool::new(false),
             backends: crate::backend::BackendRegistry::default_registry(),
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1178,6 +1182,12 @@ impl AppState {
                 .collect()
         };
         if sessions_with_dirs.is_empty() {
+            self.sweep_in_progress.store(false, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        // Dedup: skip if a prior sweep is still running
+        if self.sweep_in_progress.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::debug!("worktree sweep already in progress, skipping");
             return;
         }
         // Deduplicate project dirs to avoid N² stat calls
@@ -1222,10 +1232,12 @@ impl AppState {
             Ok(Ok(m)) => m,
             Ok(Err(e)) => {
                 tracing::warn!("worktree sweep spawn_blocking failed: {e}");
+                self.sweep_in_progress.store(false, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
             Err(_) => {
                 tracing::warn!("worktree sweep timed out after {SWEEP_TIMEOUT_SECS}s - possible hung mount");
+                self.sweep_in_progress.store(false, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
         };
@@ -1243,6 +1255,8 @@ impl AppState {
                 })
                 .await;
         }
+        // Always reset the dedup flag, even on early return or timeout
+        self.sweep_in_progress.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn persist_sessions_from(&self, sessions: &HashMap<String, Session>) {

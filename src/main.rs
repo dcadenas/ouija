@@ -809,6 +809,16 @@ async fn main() -> anyhow::Result<()> {
                         return Err(anyhow::anyhow!("partial failure: {} session(s) failed to prune", err_arr.len()));
                     }
                 }
+
+                // Check for already_gone key - sessions that vanished during prune
+                if value.get("already_gone").is_some() {
+                    let gone_arr = value.get("already_gone").and_then(|v| v.as_array())
+                        .ok_or_else(|| anyhow::anyhow!("server response 'already_gone' key is not an array: {text}"))?;
+                    if !gone_arr.is_empty() {
+                        eprintln!("Skipped {} session(s) that vanished during prune: {}",
+                            gone_arr.len(), value["already_gone"]);
+                    }
+                }
             }
         }
         Command::RestartSession {
