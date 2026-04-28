@@ -777,6 +777,9 @@ async fn main() -> anyhow::Result<()> {
         Command::ClearReply { sender_id } => {
             let pane = std::env::var("TMUX_PANE")
                 .context("TMUX_PANE not set — must be run from a tmux pane")?;
+            // Strip the leading `%` — axum percent-decodes `%74` to `t` and
+            // would silently 404. See `pane_wire_suffix` docstring and #646.
+            let pane = pane_wire_suffix(&pane);
             cli_delete(&format!("/api/pane/{pane}/pending-replies/{sender_id}")).await?;
         }
         Command::StopServer => {
@@ -1476,4 +1479,43 @@ async fn cli_delete(path: &str) -> anyhow::Result<()> {
     let text = resp.text().await?;
     println!("{text}");
     Ok(())
+}
+
+/// Strip the leading `%` from a tmux pane id for wire transport.
+///
+/// Axum percent-decodes path segments, so placing a raw `%74` in the URL
+/// arrives at the handler as `t` (0x74 == ASCII `t`) and silently 404s.
+/// The canonical form on the wire is the numeric suffix only; the server
+/// prepends `%` on receive (and tolerates `%` defensively). See issue #646.
+fn pane_wire_suffix(pane: &str) -> &str {
+    pane.strip_prefix('%').unwrap_or(pane)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pane_wire_suffix_strips_leading_percent() {
+        assert_eq!(pane_wire_suffix("%74"), "74");
+    }
+
+    #[test]
+    fn pane_wire_suffix_leaves_bare_suffix_alone() {
+        assert_eq!(pane_wire_suffix("74"), "74");
+    }
+
+    #[test]
+    fn pane_wire_suffix_only_strips_first_percent() {
+        // Defensive: if something handed us a doubly-prefixed form, we only
+        // peel one layer. The server helper is equally tolerant, so either
+        // `74` or `%74` resolves. A hypothetical `%%74` would stay `%74`
+        // which the server still resolves correctly.
+        assert_eq!(pane_wire_suffix("%%74"), "%74");
+    }
+
+    #[test]
+    fn pane_wire_suffix_handles_empty_string() {
+        assert_eq!(pane_wire_suffix(""), "");
+    }
 }
