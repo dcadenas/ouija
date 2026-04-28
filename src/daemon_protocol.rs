@@ -314,6 +314,16 @@ pub enum Event {
     MarkWorktreePresence {
         updates: Vec<(String, String, bool)>,
     },
+    /// Batched atomic prune of multiple stale local sessions under one lock.
+    ///
+    /// Each `(id, expected_project_dir)` pair gets the same guard checks as
+    /// [`Event::RemoveIfStale`] (Local origin, project_dir match, worktree_present
+    /// == Some(false)). Coalesces persistence: only one [`Effect::Persist`] and
+    /// one [`Effect::BroadcastSessionList`] are emitted for the whole batch,
+    /// regardless of how many sessions were removed.
+    PruneStale {
+        sessions: Vec<(String, String)>,
+    },
 }
 
 // --- Effects ---
@@ -654,6 +664,7 @@ impl DaemonState {
                 done,
             } => self.apply_send(&from, &to, &message, expects_reply, responds_to, done),
             Event::MarkWorktreePresence { updates } => self.apply_mark_worktree_presence(updates),
+            Event::PruneStale { sessions } => self.apply_prune_stale_many(sessions),
         }
     }
 
@@ -1051,6 +1062,32 @@ impl DaemonState {
         // Guard passed under the write lock; delegate to apply_remove.
         // keep_worktree: true because the dir is already missing.
         self.apply_remove(id, true)
+    }
+
+    /// Batched prune-stale handler: for each `(id, expected_project_dir)` runs
+    /// the same guard checks as [`Self::apply_remove_if_stale`] and removes the
+    /// session if they pass. Coalesces persistence: a single [`Effect::Persist`]
+    /// and a single [`Effect::BroadcastSessionList`] cover the whole batch
+    /// instead of one per pruned session.
+    fn apply_prune_stale_many(&mut self, sessions: Vec<(String, String)>) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        let mut any_removed = false;
+        for (id, expected_dir) in sessions {
+            let sub_effects = self.apply_remove_if_stale(&id, Some(&expected_dir));
+            for e in sub_effects {
+                match e {
+                    Effect::Persist | Effect::BroadcastSessionList => {
+                        any_removed = true;
+                    }
+                    other => effects.push(other),
+                }
+            }
+        }
+        if any_removed {
+            effects.push(Effect::Persist);
+            effects.push(Effect::BroadcastSessionList);
+        }
+        effects
     }
 
     fn apply_mark_worktree_presence(&mut self, updates: Vec<(String, String, bool)>) -> Vec<Effect> {
@@ -3238,6 +3275,114 @@ mod tests {
             !effects.iter().any(|e| matches!(e, Effect::CleanupWorktree { .. })),
             "prune with keep_worktree=true should not emit CleanupWorktree"
         );
+    }
+
+    fn register_stale_session(state: &mut DaemonState, id: &str, dir: &str, pane: &str) {
+        state.apply(Event::Register {
+            id: id.into(),
+            pane: Some(pane.into()),
+            metadata: SessionMeta {
+                project_dir: Some(dir.into()),
+                worktree_present: Some(false),
+                ..Default::default()
+            },
+        });
+    }
+
+    #[test]
+    fn prune_stale_many_emits_single_persist_for_batch() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        register_stale_session(&mut state, "s1", "/tmp/gone1", "%1");
+        register_stale_session(&mut state, "s2", "/tmp/gone2", "%2");
+        register_stale_session(&mut state, "s3", "/tmp/gone3", "%3");
+        let effects = state.apply(Event::PruneStale {
+            sessions: vec![
+                ("s1".into(), "/tmp/gone1".into()),
+                ("s2".into(), "/tmp/gone2".into()),
+                ("s3".into(), "/tmp/gone3".into()),
+            ],
+        });
+        assert!(!state.sessions.contains_key("s1"));
+        assert!(!state.sessions.contains_key("s2"));
+        assert!(!state.sessions.contains_key("s3"));
+        let persist_count = effects.iter().filter(|e| matches!(e, Effect::Persist)).count();
+        assert_eq!(persist_count, 1, "batch must emit exactly one Persist (got {persist_count})");
+        let broadcast_count = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::BroadcastSessionList))
+            .count();
+        assert_eq!(
+            broadcast_count, 1,
+            "batch must emit exactly one BroadcastSessionList (got {broadcast_count})"
+        );
+        let remove_ok_count = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::RemoveOk { .. }))
+            .count();
+        assert_eq!(remove_ok_count, 3, "should emit one RemoveOk per pruned session");
+    }
+
+    #[test]
+    fn prune_stale_many_no_persist_when_all_fail() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        // Sessions that don't exist
+        let effects = state.apply(Event::PruneStale {
+            sessions: vec![
+                ("missing1".into(), "/tmp/x".into()),
+                ("missing2".into(), "/tmp/y".into()),
+            ],
+        });
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Persist)),
+            "all-failure batch must not emit Persist"
+        );
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::BroadcastSessionList)),
+            "all-failure batch must not emit BroadcastSessionList"
+        );
+        let failed_count = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::RemoveFailed { .. }))
+            .count();
+        assert_eq!(failed_count, 2, "should emit RemoveFailed per missing session");
+    }
+
+    #[test]
+    fn prune_stale_many_handles_mixed_outcomes() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        register_stale_session(&mut state, "stale", "/tmp/gone", "%1");
+        // Live session — worktree_present=Some(true)
+        state.apply(Event::Register {
+            id: "live".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/here".into()),
+                worktree_present: Some(true),
+                ..Default::default()
+            },
+        });
+        let effects = state.apply(Event::PruneStale {
+            sessions: vec![
+                ("stale".into(), "/tmp/gone".into()),
+                ("live".into(), "/tmp/here".into()),
+                ("missing".into(), "/tmp/anywhere".into()),
+            ],
+        });
+        // Stale was pruned; live and missing failed
+        assert!(!state.sessions.contains_key("stale"));
+        assert!(state.sessions.contains_key("live"));
+        let persist_count = effects.iter().filter(|e| matches!(e, Effect::Persist)).count();
+        assert_eq!(persist_count, 1, "exactly one Persist for the one successful prune");
+        let remove_ok_count = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::RemoveOk { .. }))
+            .count();
+        assert_eq!(remove_ok_count, 1);
+        let remove_failed_count = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::RemoveFailed { .. }))
+            .count();
+        assert_eq!(remove_failed_count, 2);
     }
 
     // --- IncomingWire tests ---

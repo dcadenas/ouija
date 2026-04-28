@@ -1933,33 +1933,46 @@ pub async fn prune_stale_sessions(
     let mut pruned = Vec::new();
     let mut errors = Vec::new();
     let mut already_gone = Vec::new();
-    for (id, project_dir) in stale_sessions {
-        // Use RemoveIfStale for atomic under-the-write-lock guard:
-        // if a heartbeat sweep flipped worktree_present back to Some(true)
-        // between our snapshot and apply, the handler emits RemoveFailed
-        // and the session stays.
-        let effects = state
-            .apply_and_execute(crate::daemon_protocol::Event::RemoveIfStale {
-                id: id.clone(),
-                expected_project_dir: Some(project_dir),
-            })
-            .await;
-        if effects.iter().any(|e| matches!(e, crate::daemon_protocol::Effect::RemoveFailed { .. }))
-        {
-            // Distinguish "vanished during race" (session gone) from real failures.
-            let still_present = {
-                let proto = state.protocol.read().await;
-                proto.sessions.contains_key(&id)
-            };
-            if !still_present {
-                tracing::debug!("session {} vanished between snapshot and prune", id);
-                already_gone.push(id);
-            } else {
-                tracing::warn!("failed to prune session {} (no longer stale or guard tripped)", id);
-                errors.push(id);
-            }
-        } else {
+    // Single batched apply: the handler runs each session's RemoveIfStale guard
+    // under one write lock and coalesces Persist + BroadcastSessionList into
+    // one of each, rather than N full state writes for N stale sessions.
+    let input_ids: Vec<String> = stale_sessions.iter().map(|(id, _)| id.clone()).collect();
+    let effects = state
+        .apply_and_execute(crate::daemon_protocol::Event::PruneStale {
+            sessions: stale_sessions,
+        })
+        .await;
+    let pruned_set: std::collections::HashSet<String> = effects
+        .iter()
+        .filter_map(|e| match e {
+            crate::daemon_protocol::Effect::RemoveOk { id } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    let failed_ids: Vec<String> = input_ids
+        .iter()
+        .filter(|id| !pruned_set.contains(id.as_str()))
+        .cloned()
+        .collect();
+    let still_present_set: std::collections::HashSet<String> = if failed_ids.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        let proto = state.protocol.read().await;
+        failed_ids
+            .iter()
+            .filter(|id| proto.sessions.contains_key(id.as_str()))
+            .cloned()
+            .collect()
+    };
+    for id in input_ids {
+        if pruned_set.contains(&id) {
             pruned.push(id);
+        } else if still_present_set.contains(&id) {
+            tracing::warn!("failed to prune session {} (no longer stale or guard tripped)", id);
+            errors.push(id);
+        } else {
+            tracing::debug!("session {} vanished between snapshot and prune", id);
+            already_gone.push(id);
         }
     }
     let response = if errors.is_empty() && already_gone.is_empty() {
