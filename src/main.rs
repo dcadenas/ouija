@@ -780,6 +780,11 @@ async fn main() -> anyhow::Result<()> {
             // Strip the leading `%` — axum percent-decodes `%74` to `t` and
             // would silently 404. See `pane_wire_suffix` docstring and #646.
             let pane = pane_wire_suffix(&pane);
+            // Percent-encode sender_id: ouija session ids can contain `/`
+            // (branch-name-style ids from `/api/sessions/start`), which would
+            // otherwise break axum's single-segment match on `{from}` and
+            // silently 404. See `encode_path_segment` docstring.
+            let sender_id = encode_path_segment(&sender_id);
             cli_delete(&format!("/api/pane/{pane}/pending-replies/{sender_id}")).await?;
         }
         Command::StopServer => {
@@ -1491,6 +1496,34 @@ fn pane_wire_suffix(pane: &str) -> &str {
     pane.strip_prefix('%').unwrap_or(pane)
 }
 
+/// Chars that must be percent-encoded to keep a string a single URL path
+/// segment. Covers `/` (otherwise axum treats the segment as multiple),
+/// `%` (otherwise axum misreads already-encoded sequences), `?` / `#`
+/// (would start query/fragment), and the controls + space / quote / angle
+/// brackets / backslash that URL parsers commonly disallow in paths.
+const PATH_SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'/')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'\\');
+
+/// Percent-encode a string so it round-trips as a single URL path segment.
+///
+/// ouija session ids can legitimately contain `/` (e.g. branch-name-style
+/// ids like `feat/646-...` pass through the session-spawn API unvalidated
+/// and end up as `sender_id` for downstream commands). Interpolating them
+/// raw into `/api/pane/{pane}/pending-replies/{from}` breaks axum's
+/// single-segment match and silently 404s — the same failure class issue
+/// #646 fixes for the pane segment.
+fn encode_path_segment(segment: &str) -> String {
+    percent_encoding::utf8_percent_encode(segment, PATH_SEGMENT).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1517,5 +1550,45 @@ mod tests {
     #[test]
     fn pane_wire_suffix_handles_empty_string() {
         assert_eq!(pane_wire_suffix(""), "");
+    }
+
+    // --- encode_path_segment (issue #646 review follow-up) ---
+    //
+    // Sender ids in ouija can contain `/` (branch-name-style ids like
+    // `feat/646-...` are accepted by the session spawn API and end up flowing
+    // into `sender_id` for `ouija clear-reply`). Interpolating them raw into
+    // `/api/pane/{pane}/pending-replies/{from}` breaks axum's single-segment
+    // match and silently 404s. The CLI must percent-encode the sender_id
+    // segment before building the URL.
+
+    #[test]
+    fn encode_path_segment_encodes_slashes() {
+        assert_eq!(
+            encode_path_segment("feat/646-foo"),
+            "feat%2F646-foo",
+            "`/` must be percent-encoded so the URL stays a single path segment"
+        );
+    }
+
+    #[test]
+    fn encode_path_segment_passes_through_common_session_chars() {
+        // Alphanumerics plus the typical separators used in ouija session ids
+        // (hyphens and underscores) must round-trip unchanged for legibility
+        // in logs and audit trails.
+        assert_eq!(encode_path_segment("my-session_42"), "my-session_42");
+    }
+
+    #[test]
+    fn encode_path_segment_encodes_percent_literal() {
+        // A caller sending a literal `%` (e.g. an id containing `100%`)
+        // must come out as `%25` so axum decodes it back to `%`.
+        assert_eq!(encode_path_segment("100%"), "100%25");
+    }
+
+    #[test]
+    fn encode_path_segment_encodes_space_and_hash() {
+        // Control chars and `#` / `?` would terminate the path segment or
+        // start a query string / fragment on the wire; encode them.
+        assert_eq!(encode_path_segment("a b#c?d"), "a%20b%23c%3Fd");
     }
 }

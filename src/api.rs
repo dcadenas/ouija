@@ -4290,6 +4290,121 @@ mod tests {
         server.abort();
     }
 
+    /// End-to-end regression for the sender_id = `feat/646-...` case raised in
+    /// code review. ouija session ids can contain `/` (branch-name-style ids
+    /// passed to `/api/sessions/start` without validation), so `sender_id`
+    /// in the DELETE URL must be percent-encoded or axum's two-segment
+    /// route matcher fails and we hit the same silent-404 class.
+    ///
+    /// This test proves the full chain works end-to-end: register a session
+    /// whose id contains `/`, stage a pending-reply slot for it, DELETE with
+    /// the id percent-encoded, assert 200 and the slot is cleared.
+    #[tokio::test]
+    async fn delete_pending_reply_handles_slash_containing_sender_id() {
+        use axum::Router;
+        use axum::routing::delete;
+        use tokio::net::TcpListener;
+
+        let state = crate::state::AppState::new_for_test();
+
+        // Register a sender with a branch-name-style id (contains `/`).
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "feat/646-test".into(),
+                pane: Some("%74".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    networked: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "receiver-b".into(),
+                pane: Some("%99".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    networked: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        // Stage a pending-reply slot from the slash-id sender.
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Send {
+                from: "feat/646-test".into(),
+                to: "receiver-b".into(),
+                message: "do a thing".into(),
+                expects_reply: true,
+                responds_to: None,
+                done: false,
+            })
+            .await;
+
+        let app = Router::new()
+            .route(
+                "/api/pane/{pane}/pending-replies/{from}",
+                delete(delete_pending_reply),
+            )
+            .with_state(state.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+
+        // First, prove the broken form — raw `/` in the path — does NOT
+        // match the two-segment route. Axum must not accept it; we get 404
+        // (route not found) rather than the DELETE handler being called.
+        // This is the exact failure the review flagged.
+        let buggy_url =
+            format!("http://{addr}/api/pane/99/pending-replies/feat/646-test");
+        let buggy_resp = client.delete(&buggy_url).send().await.unwrap();
+        assert_eq!(
+            buggy_resp.status().as_u16(),
+            404,
+            "raw `/` in sender_id must break route matching (not silently \
+             succeed); the CLI fix is to percent-encode it"
+        );
+
+        // Slot must still be there — the buggy URL was a no-op.
+        {
+            let proto = state.protocol.read().await;
+            let entries = proto
+                .pending_replies
+                .get("receiver-b")
+                .expect("slot should still exist after a 404");
+            assert!(entries.iter().any(|e| e.from == "feat/646-test"));
+        }
+
+        // Now the correctly-encoded form: `feat%2F646-test`. axum decodes it
+        // back to `feat/646-test` on the handler side, the lookup matches,
+        // and the slot is cleared.
+        let encoded_url =
+            format!("http://{addr}/api/pane/99/pending-replies/feat%2F646-test");
+        let resp = client.delete(&encoded_url).send().await.unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "percent-encoded sender_id must route to the handler and clear the slot"
+        );
+
+        let proto = state.protocol.read().await;
+        let still_there = proto
+            .pending_replies
+            .get("receiver-b")
+            .map(|v| v.iter().any(|e| e.from == "feat/646-test"))
+            .unwrap_or(false);
+        assert!(
+            !still_there,
+            "slot from sender `feat/646-test` must be cleared"
+        );
+
+        server.abort();
+    }
+
     #[tokio::test]
     async fn delete_pending_reply_clears_stuck_slot_after_sender_gone() {
         // Full regression for the hub2 symptom: sender is gone but recipient

@@ -1445,6 +1445,7 @@ dependencies = [
  "croner",
  "hostname",
  "nostr-sdk",
+ "percent-encoding",
  "ractor",
  "rand 0.9.2",
  "reqwest",
