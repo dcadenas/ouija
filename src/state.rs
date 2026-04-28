@@ -1191,16 +1191,19 @@ impl AppState {
             dirs
         };
         // Check which dirs exist on disk
-        let presence_map: std::collections::HashMap<String, bool> =
-            tokio::task::spawn_blocking(move || {
-                let mut map = std::collections::HashMap::new();
-                for dir in unique_dirs {
-                    map.insert(dir.clone(), std::path::Path::new(&dir).is_dir());
-                }
-                map
-            })
-            .await
-            .unwrap_or_default();
+        let presence_map: std::collections::HashMap<String, bool> = match tokio::task::spawn_blocking(move || {
+            let mut map = std::collections::HashMap::new();
+            for dir in unique_dirs {
+                map.insert(dir.clone(), std::path::Path::new(&dir).is_dir());
+            }
+            map
+        }).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("worktree sweep spawn_blocking failed: {e}");
+                return;
+            }
+        };
         // Map session IDs back to their presence
         let updates: Vec<(String, bool)> = sessions_with_dirs
             .into_iter()
