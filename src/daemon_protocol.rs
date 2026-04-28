@@ -468,6 +468,10 @@ pub enum Effect {
         id: String,
     },
     RemoveFailed {
+        /// Session id the failure pertains to. Lets callers bucket per-id
+        /// outcomes (pruned vs already_gone vs errors) without parsing
+        /// `reason` strings or relying on effect iteration order.
+        id: String,
         reason: String,
     },
     CleanupWorktree {
@@ -937,12 +941,14 @@ impl DaemonState {
             Some(Origin::Local) => {}
             Some(_) => {
                 effects.push(Effect::RemoveFailed {
+                    id: id.to_string(),
                     reason: format!("cannot remove remote session '{id}'"),
                 });
                 return effects;
             }
             None => {
                 effects.push(Effect::RemoveFailed {
+                    id: id.to_string(),
                     reason: format!("session '{id}' not found"),
                 });
                 return effects;
@@ -1030,6 +1036,7 @@ impl DaemonState {
             Some(session) => {
                 if !matches!(session.origin, Origin::Local) {
                     return vec![Effect::RemoveFailed {
+                        id: id.to_string(),
                         reason: format!("cannot prune remote session '{id}'"),
                     }];
                 }
@@ -1037,6 +1044,7 @@ impl DaemonState {
                 if let Some(exp_dir) = expected_project_dir {
                     if session.metadata.project_dir.as_ref() != Some(&exp_dir.to_string()) {
                         return vec![Effect::RemoveFailed {
+                            id: id.to_string(),
                             reason: format!(
                                 "session '{id}' project_dir mismatch (expected {}, got {:?})",
                                 exp_dir, session.metadata.project_dir
@@ -1046,6 +1054,7 @@ impl DaemonState {
                 }
                 if session.metadata.worktree_present != Some(false) {
                     return vec![Effect::RemoveFailed {
+                        id: id.to_string(),
                         reason: format!(
                             "session '{id}' is not stale (worktree_present={:?}); refusing to prune",
                             session.metadata.worktree_present
@@ -1055,6 +1064,7 @@ impl DaemonState {
             }
             None => {
                 return vec![Effect::RemoveFailed {
+                    id: id.to_string(),
                     reason: format!("session '{id}' not found"),
                 }];
             }
@@ -3383,6 +3393,42 @@ mod tests {
             .filter(|e| matches!(e, Effect::RemoveFailed { .. }))
             .count();
         assert_eq!(remove_failed_count, 2);
+    }
+
+    #[test]
+    fn prune_stale_failed_effects_carry_session_id() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        register_stale_session(&mut state, "stale", "/tmp/gone", "%1");
+        state.apply(Event::Register {
+            id: "live".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/here".into()),
+                worktree_present: Some(true),
+                ..Default::default()
+            },
+        });
+        let effects = state.apply(Event::PruneStale {
+            sessions: vec![
+                ("stale".into(), "/tmp/gone".into()),
+                ("live".into(), "/tmp/here".into()),
+                ("missing".into(), "/tmp/anywhere".into()),
+            ],
+        });
+        // Each failure must carry the session id so callers can pair without
+        // parsing reason strings or relying on iteration order.
+        let live_failure = effects.iter().find_map(|e| match e {
+            Effect::RemoveFailed { id, reason } if id == "live" => Some(reason.clone()),
+            _ => None,
+        });
+        let missing_failure = effects.iter().find_map(|e| match e {
+            Effect::RemoveFailed { id, reason } if id == "missing" => Some(reason.clone()),
+            _ => None,
+        });
+        let live_reason = live_failure.expect("live session must produce RemoveFailed { id: \"live\", .. }");
+        let missing_reason = missing_failure.expect("missing session must produce RemoveFailed { id: \"missing\", .. }");
+        assert!(live_reason.contains("not stale"), "live reason should say not stale, got: {live_reason}");
+        assert!(missing_reason.contains("not found"), "missing reason should say not found, got: {missing_reason}");
     }
 
     // --- IncomingWire tests ---

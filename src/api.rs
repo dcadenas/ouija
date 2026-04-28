@@ -832,7 +832,7 @@ pub async fn remove(
         let reason = effects
             .iter()
             .find_map(|e| match e {
-                crate::daemon_protocol::Effect::RemoveFailed { reason } => Some(reason.clone()),
+                crate::daemon_protocol::Effect::RemoveFailed { reason, .. } => Some(reason.clone()),
                 _ => None,
             })
             .unwrap_or_else(|| format!("session '{}' not found", body.id));
@@ -1949,30 +1949,31 @@ pub async fn prune_stale_sessions(
             _ => None,
         })
         .collect();
-    let failed_ids: Vec<String> = input_ids
+    // Bucket failures by reading the RemoveFailed reason (which apply_remove_if_stale
+    // distinguishes between 'not found' and the various guard-tripped cases) instead of
+    // re-querying state via contains_key. The state-read approach was racy: a concurrent
+    // Register could re-insert a vanished id between the apply and the read, flipping
+    // an `already_gone` outcome into `errors`.
+    let already_gone_set: std::collections::HashSet<String> = effects
         .iter()
-        .filter(|id| !pruned_set.contains(id.as_str()))
-        .cloned()
+        .filter_map(|e| match e {
+            crate::daemon_protocol::Effect::RemoveFailed { id, reason }
+                if reason.contains("not found") =>
+            {
+                Some(id.clone())
+            }
+            _ => None,
+        })
         .collect();
-    let still_present_set: std::collections::HashSet<String> = if failed_ids.is_empty() {
-        std::collections::HashSet::new()
-    } else {
-        let proto = state.protocol.read().await;
-        failed_ids
-            .iter()
-            .filter(|id| proto.sessions.contains_key(id.as_str()))
-            .cloned()
-            .collect()
-    };
     for id in input_ids {
         if pruned_set.contains(&id) {
             pruned.push(id);
-        } else if still_present_set.contains(&id) {
-            tracing::warn!("failed to prune session {} (no longer stale or guard tripped)", id);
-            errors.push(id);
-        } else {
+        } else if already_gone_set.contains(&id) {
             tracing::debug!("session {} vanished between snapshot and prune", id);
             already_gone.push(id);
+        } else {
+            tracing::warn!("failed to prune session {} (no longer stale or guard tripped)", id);
+            errors.push(id);
         }
     }
     let response = if errors.is_empty() && already_gone.is_empty() {
