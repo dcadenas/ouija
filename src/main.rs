@@ -777,6 +777,14 @@ async fn main() -> anyhow::Result<()> {
         Command::ClearReply { sender_id } => {
             let pane = std::env::var("TMUX_PANE")
                 .context("TMUX_PANE not set — must be run from a tmux pane")?;
+            // Strip the leading `%` — axum percent-decodes `%74` to `t` and
+            // would silently 404. See `pane_wire_suffix` docstring and #646.
+            let pane = pane_wire_suffix(&pane);
+            // Percent-encode sender_id: ouija session ids can contain `/`
+            // (branch-name-style ids from `/api/sessions/start`), which would
+            // otherwise break axum's single-segment match on `{from}` and
+            // silently 404. See `encode_path_segment` docstring.
+            let sender_id = encode_path_segment(&sender_id);
             cli_delete(&format!("/api/pane/{pane}/pending-replies/{sender_id}")).await?;
         }
         Command::StopServer => {
@@ -1473,7 +1481,198 @@ async fn cli_delete(path: &str) -> anyhow::Result<()> {
     let url = format!("http://localhost:{port}{path}");
     let client = reqwest::Client::new();
     let resp = client.delete(&url).send().await?;
+    let status = resp.status();
     let text = resp.text().await?;
-    println!("{text}");
+    let body = classify_http_response(status, &text)?;
+    println!("{body}");
     Ok(())
+}
+
+/// Classify an HTTP response into a CLI success-or-error.
+///
+/// Returns `Ok(body)` for 2xx, `Err` for everything else. The previous
+/// behaviour in `cli_delete` printed the body and returned Ok for any
+/// status, which made daemon 404s look like a silent success — half of
+/// the silent-failure chain issue #646 is fixing.
+///
+/// Pulled out as a pure function so it is testable without a reqwest
+/// round-trip; the HTTP-dependent parts (URL building, connecting,
+/// body read) are orchestration, not logic.
+fn classify_http_response(status: reqwest::StatusCode, body: &str) -> anyhow::Result<String> {
+    if status.is_success() {
+        Ok(body.to_string())
+    } else if body.is_empty() {
+        anyhow::bail!("request failed with HTTP {status}")
+    } else {
+        anyhow::bail!("request failed with HTTP {status}: {body}")
+    }
+}
+
+/// Strip the leading `%` from a tmux pane id for wire transport.
+///
+/// Axum percent-decodes path segments, so placing a raw `%74` in the URL
+/// arrives at the handler as `t` (0x74 == ASCII `t`) and silently 404s.
+/// The canonical form on the wire is the numeric suffix only; the server
+/// prepends `%` on receive (and tolerates `%` defensively). See issue #646.
+fn pane_wire_suffix(pane: &str) -> &str {
+    pane.strip_prefix('%').unwrap_or(pane)
+}
+
+/// Chars that must be percent-encoded to keep a string a single URL path
+/// segment. Covers `/` (otherwise axum treats the segment as multiple),
+/// `%` (otherwise axum misreads already-encoded sequences), `?` / `#`
+/// (would start query/fragment), and the controls + space / quote / angle
+/// brackets / backslash that URL parsers commonly disallow in paths.
+const PATH_SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'/')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'\\');
+
+/// Percent-encode a string so it round-trips as a single URL path segment.
+///
+/// ouija session ids can legitimately contain `/` (e.g. branch-name-style
+/// ids like `feat/646-...` pass through the session-spawn API unvalidated
+/// and end up as `sender_id` for downstream commands). Interpolating them
+/// raw into `/api/pane/{pane}/pending-replies/{from}` breaks axum's
+/// single-segment match and silently 404s — the same failure class issue
+/// #646 fixes for the pane segment.
+fn encode_path_segment(segment: &str) -> String {
+    percent_encoding::utf8_percent_encode(segment, PATH_SEGMENT).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pane_wire_suffix_strips_leading_percent() {
+        assert_eq!(pane_wire_suffix("%74"), "74");
+    }
+
+    #[test]
+    fn pane_wire_suffix_leaves_bare_suffix_alone() {
+        assert_eq!(pane_wire_suffix("74"), "74");
+    }
+
+    #[test]
+    fn pane_wire_suffix_only_strips_first_percent() {
+        // Defensive: if something handed us a doubly-prefixed form, we only
+        // peel one layer. The server helper is equally tolerant, so either
+        // `74` or `%74` resolves. A hypothetical `%%74` would stay `%74`
+        // which the server still resolves correctly.
+        assert_eq!(pane_wire_suffix("%%74"), "%74");
+    }
+
+    #[test]
+    fn pane_wire_suffix_handles_empty_string() {
+        assert_eq!(pane_wire_suffix(""), "");
+    }
+
+    // --- encode_path_segment (issue #646 review follow-up) ---
+    //
+    // Sender ids in ouija can contain `/` (branch-name-style ids like
+    // `feat/646-...` are accepted by the session spawn API and end up flowing
+    // into `sender_id` for `ouija clear-reply`). Interpolating them raw into
+    // `/api/pane/{pane}/pending-replies/{from}` breaks axum's single-segment
+    // match and silently 404s. The CLI must percent-encode the sender_id
+    // segment before building the URL.
+
+    #[test]
+    fn encode_path_segment_encodes_slashes() {
+        assert_eq!(
+            encode_path_segment("feat/646-foo"),
+            "feat%2F646-foo",
+            "`/` must be percent-encoded so the URL stays a single path segment"
+        );
+    }
+
+    #[test]
+    fn encode_path_segment_passes_through_common_session_chars() {
+        // Alphanumerics plus the typical separators used in ouija session ids
+        // (hyphens and underscores) must round-trip unchanged for legibility
+        // in logs and audit trails.
+        assert_eq!(encode_path_segment("my-session_42"), "my-session_42");
+    }
+
+    #[test]
+    fn encode_path_segment_encodes_percent_literal() {
+        // A caller sending a literal `%` (e.g. an id containing `100%`)
+        // must come out as `%25` so axum decodes it back to `%`.
+        assert_eq!(encode_path_segment("100%"), "100%25");
+    }
+
+    #[test]
+    fn encode_path_segment_encodes_space_and_hash() {
+        // Control chars and `#` / `?` would terminate the path segment or
+        // start a query string / fragment on the wire; encode them.
+        assert_eq!(encode_path_segment("a b#c?d"), "a%20b%23c%3Fd");
+    }
+
+    // --- classify_http_response (issue #646 review follow-up) ---
+    //
+    // cli_delete (and any future HTTP helper built on top of this) must
+    // surface non-2xx responses as hard errors so the CLI exits non-zero.
+    // The previous behaviour — print the body and exit 0 for any status —
+    // made 404s from the daemon look like success, which is half of the
+    // silent-failure chain this PR is fixing.
+
+    #[test]
+    fn classify_http_response_success_returns_body() {
+        use reqwest::StatusCode;
+        let out = classify_http_response(StatusCode::OK, "{\"ok\":true}").unwrap();
+        assert_eq!(out, "{\"ok\":true}");
+    }
+
+    #[test]
+    fn classify_http_response_2xx_range_all_pass() {
+        use reqwest::StatusCode;
+        for code in [
+            StatusCode::OK,
+            StatusCode::CREATED,
+            StatusCode::ACCEPTED,
+            StatusCode::NO_CONTENT,
+        ] {
+            assert!(
+                classify_http_response(code, "").is_ok(),
+                "{code} must be classified as success"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_http_response_404_surfaces_as_error() {
+        use reqwest::StatusCode;
+        let err = classify_http_response(StatusCode::NOT_FOUND, "{\"error\":\"pane 'x' is not registered\"}")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("404"),
+            "error message must include the status code, got: {msg}"
+        );
+        assert!(
+            msg.contains("pane 'x' is not registered"),
+            "error message must include the response body, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn classify_http_response_500_surfaces_as_error() {
+        use reqwest::StatusCode;
+        let err = classify_http_response(StatusCode::INTERNAL_SERVER_ERROR, "boom").unwrap_err();
+        assert!(err.to_string().contains("500"));
+    }
+
+    #[test]
+    fn classify_http_response_400_with_empty_body_still_errors() {
+        // Empty body must not swallow the error — status alone is sufficient.
+        use reqwest::StatusCode;
+        let err = classify_http_response(StatusCode::BAD_REQUEST, "").unwrap_err();
+        assert!(err.to_string().contains("400"));
+    }
 }

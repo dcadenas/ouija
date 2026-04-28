@@ -2038,68 +2038,112 @@ pub async fn clear_block_interactive(
     StatusCode::OK
 }
 
+/// Resolve a pane URL segment to the session id registered on that pane.
+///
+/// Axum percent-decodes path segments, so a literal tmux pane id like `%74`
+/// placed raw in the URL arrives here as `t` (0x74 == ASCII `t`). Callers
+/// must therefore send the pane *suffix* (just the number). We tolerate an
+/// optional leading `%` defensively so a future caller that correctly
+/// URL-encodes the percent as `%25` (extracted value: `%74`) also works.
+///
+/// See issue #646: `/api/pane/{pane}/...` routes used to silently 404 on
+/// raw `%`-prefixed pane ids, and one handler (get_pending_replies) even
+/// masked the bug by returning `200 + []` on pane lookup miss.
+fn resolve_pane_to_session(proto: &crate::daemon_protocol::DaemonState, raw: &str) -> Option<String> {
+    let suffix = raw.strip_prefix('%').unwrap_or(raw);
+    let pane_id = format!("%{suffix}");
+    proto
+        .sessions
+        .values()
+        .find(|s| s.pane.as_deref() == Some(&pane_id))
+        .map(|s| s.id.clone())
+}
+
 /// Return pending reply entries for a session identified by pane.
+///
+/// Returns 404 when the pane is not registered: the old fail-open behaviour
+/// (`200 + []` on miss) masked the silent-404 bug described above.
 pub async fn get_pending_replies(
     State(state): State<SharedState>,
     axum::extract::Path(pane): axum::extract::Path<String>,
-) -> Json<serde_json::Value> {
-    let pane_id = format!("%{pane}");
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, value) = get_pending_replies_inner(&state, pane).await;
+    (status, Json(value))
+}
+
+async fn get_pending_replies_inner(
+    state: &SharedState,
+    pane: String,
+) -> (StatusCode, serde_json::Value) {
     let session_id = {
         let proto = state.protocol.read().await;
-        proto
-            .sessions
-            .values()
-            .find(|s| s.pane.as_deref() == Some(&pane_id))
-            .map(|s| s.id.clone())
+        resolve_pane_to_session(&proto, &pane)
     };
-    let replies = if let Some(id) = session_id {
-        state.query_agent_pending_replies(&id).await
-    } else {
-        Vec::new()
+    let Some(id) = session_id else {
+        return (
+            StatusCode::NOT_FOUND,
+            json!({ "error": format!("pane '{pane}' is not registered") }),
+        );
     };
+    let replies = state.query_agent_pending_replies(&id).await;
     let list: Vec<_> = replies
         .iter()
         .map(|r| json!({ "msg_id": r.msg_id, "from": r.from, "message": r.message, "received_at": r.received_at }))
         .collect();
-    Json(json!({ "pending_replies": list, "count": list.len() }))
+    (
+        StatusCode::OK,
+        json!({ "pending_replies": list, "count": list.len() }),
+    )
 }
 
 /// Clear a pending reply from a specific sender on a pane's session.
+///
+/// Returns a JSON acknowledgement on success so callers can distinguish
+/// "actually cleared something" (`cleared >= 1`) from "pane exists but the
+/// named sender had no pending slot" (`cleared: 0`). 404 means the pane is
+/// not registered; the response body includes a JSON `error` field.
 pub async fn delete_pending_reply(
     State(state): State<SharedState>,
     axum::extract::Path((pane, from)): axum::extract::Path<(String, String)>,
-) -> StatusCode {
-    let pane_id = format!("%{pane}");
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (status, value) = delete_pending_reply_inner(&state, pane, from).await;
+    (status, Json(value))
+}
+
+async fn delete_pending_reply_inner(
+    state: &SharedState,
+    pane: String,
+    from: String,
+) -> (StatusCode, serde_json::Value) {
     let session_id = {
         let proto = state.protocol.read().await;
-        proto
-            .sessions
-            .values()
-            .find(|s| s.pane.as_deref() == Some(&pane_id))
-            .map(|s| s.id.clone())
+        resolve_pane_to_session(&proto, &pane)
     };
-    if let Some(id) = session_id {
+    let Some(id) = session_id else {
+        return (
+            StatusCode::NOT_FOUND,
+            json!({ "error": format!("pane '{pane}' is not registered") }),
+        );
+    };
+    let cleared = {
         let mut proto = state.protocol.write().await;
-        proto.clear_pending_reply_from(&id, &from);
-        StatusCode::OK
-    } else {
-        StatusCode::NOT_FOUND
-    }
+        proto.clear_pending_reply_from(&id, &from)
+    };
+    (StatusCode::OK, json!({ "cleared": cleared }))
 }
 
 /// Notify the session agent that the coding assistant has stopped in a pane.
+///
+/// Idempotent: returns 200 even when the pane is not registered. Hooks call
+/// this on every Stop, and a transient pane-lookup miss should not surface
+/// as an error to the hook script.
 pub async fn session_stopped(
     State(state): State<SharedState>,
     axum::extract::Path(pane): axum::extract::Path<String>,
 ) -> StatusCode {
-    let pane_id = format!("%{pane}");
     let session_id = {
         let proto = state.protocol.read().await;
-        proto
-            .sessions
-            .values()
-            .find(|s| s.pane.as_deref() == Some(&pane_id))
-            .map(|s| s.id.clone())
+        resolve_pane_to_session(&proto, &pane)
     };
     if let Some(id) = session_id {
         state
@@ -2110,18 +2154,15 @@ pub async fn session_stopped(
 }
 
 /// Notify the session agent that the coding assistant is active in a pane.
+///
+/// Idempotent: see `session_stopped` for the 200-on-miss rationale.
 pub async fn session_active(
     State(state): State<SharedState>,
     axum::extract::Path(pane): axum::extract::Path<String>,
 ) -> StatusCode {
-    let pane_id = format!("%{pane}");
     let session_id = {
         let proto = state.protocol.read().await;
-        proto
-            .sessions
-            .values()
-            .find(|s| s.pane.as_deref() == Some(&pane_id))
-            .map(|s| s.id.clone())
+        resolve_pane_to_session(&proto, &pane)
     };
     if let Some(id) = session_id {
         state
@@ -4046,6 +4087,567 @@ mod tests {
         assert!(
             restart_drops_destructive_intent(&body).is_none(),
             "force_reset=false is not an opt-in; no warn"
+        );
+    }
+
+    // --- /api/pane/{pane}/... routing and %-prefix tolerance (issue #646) ---
+    //
+    // Regression harness for "silent 404 on %-prefixed pane ids". Axum
+    // percent-decodes path segments, so a literal `%74` on the wire arrives
+    // at the handler as `t`. Callers now send the pane *suffix* (without the
+    // leading `%`), and the handler tolerates both forms defensively.
+
+    #[tokio::test]
+    async fn resolve_pane_to_session_accepts_bare_suffix() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sess-a".into(),
+                pane: Some("%74".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+
+        let proto = state.protocol.read().await;
+        assert_eq!(
+            resolve_pane_to_session(&proto, "74").as_deref(),
+            Some("sess-a"),
+            "bare numeric suffix must resolve"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_pane_to_session_accepts_percent_prefix() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sess-a".into(),
+                pane: Some("%74".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+
+        let proto = state.protocol.read().await;
+        assert_eq!(
+            resolve_pane_to_session(&proto, "%74").as_deref(),
+            Some("sess-a"),
+            "%-prefixed form must also resolve (future %25-encoded callers)"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_pane_to_session_none_for_unknown_pane() {
+        let state = crate::state::AppState::new_for_test();
+        let proto = state.protocol.read().await;
+        assert!(resolve_pane_to_session(&proto, "999").is_none());
+        assert!(resolve_pane_to_session(&proto, "%999").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_pending_replies_returns_404_for_unknown_pane() {
+        // Fail-closed: the old code returned 200 + empty list for an unknown
+        // pane, which masked the %-prefix silent-404 bug for read callers.
+        let state = crate::state::AppState::new_for_test();
+        let (status, _) = get_pending_replies_inner(&state, "999".into()).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "unknown pane must 404, never 200 + empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_pending_replies_returns_200_for_known_pane() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sess-a".into(),
+                pane: Some("%74".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+
+        let (status, body) = get_pending_replies_inner(&state, "74".into()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["count"].as_u64(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn delete_pending_reply_returns_404_for_unknown_pane() {
+        let state = crate::state::AppState::new_for_test();
+        let (status, body) =
+            delete_pending_reply_inner(&state, "999".into(), "sender".into()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            body["error"].as_str().is_some(),
+            "404 response must include a JSON error field, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_pending_reply_returns_cleared_count_when_slot_existed() {
+        // Acceptance criterion: callers must be able to distinguish
+        // "actually cleared something" from "nothing to clear". The body
+        // returns `cleared: N` where N > 0 when a real slot was removed.
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender-a".into(),
+                pane: Some("%74".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    networked: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "receiver-b".into(),
+                pane: Some("%99".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    networked: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Send {
+                from: "sender-a".into(),
+                to: "receiver-b".into(),
+                message: "do a thing".into(),
+                expects_reply: true,
+                responds_to: None,
+                done: false,
+            })
+            .await;
+
+        let (status, body) =
+            delete_pending_reply_inner(&state, "99".into(), "sender-a".into()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["cleared"].as_u64(),
+            Some(1),
+            "one slot existed → cleared must be 1, got body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_pending_reply_reports_cleared_zero_when_nothing_to_clear() {
+        // The pane is registered but the named sender has no pending slot.
+        // This must not 404 (the pane exists) and must not lie about
+        // clearing something — cleared is 0 so the caller can distinguish
+        // "slot was cleared" from "nothing to clear; possibly already gone".
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "receiver-b".into(),
+                pane: Some("%99".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    networked: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) =
+            delete_pending_reply_inner(&state, "99".into(), "ghost-sender".into()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["cleared"].as_u64(),
+            Some(0),
+            "no matching slot → cleared must be 0, got body: {body}"
+        );
+    }
+
+    #[test]
+    fn clear_pending_reply_from_returns_removed_count() {
+        // daemon_protocol helper returns the number of entries actually
+        // removed. 0 when nothing matches (no-op) so callers don't lie.
+        use crate::daemon_protocol::{DaemonState, Event, SessionMeta};
+        let mut state = DaemonState::new_for_model("d".into(), "h".into());
+        state.apply(Event::Register {
+            id: "sender".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                networked: true,
+                ..Default::default()
+            },
+        });
+        state.apply(Event::Register {
+            id: "target".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                networked: true,
+                ..Default::default()
+            },
+        });
+        state.apply(Event::Send {
+            from: "sender".into(),
+            to: "target".into(),
+            message: "x".into(),
+            expects_reply: true,
+            responds_to: None,
+            done: false,
+        });
+
+        assert_eq!(state.clear_pending_reply_from("target", "sender"), 1);
+        // Second call: nothing left to clear.
+        assert_eq!(state.clear_pending_reply_from("target", "sender"), 0);
+        // Unknown session: also 0.
+        assert_eq!(state.clear_pending_reply_from("ghost", "sender"), 0);
+    }
+
+    /// End-to-end regression through a real axum Router and TCP listener.
+    ///
+    /// The core bug in #646 was a percent-decoding mismatch: axum decodes
+    /// `%74` to `t` in path segments. The `resolve_pane_to_session` unit
+    /// tests cover the handler's side of that; this test additionally proves
+    /// that the CLI's `pane_wire_suffix` convention (send the suffix only)
+    /// actually round-trips through axum's real Path extractor.
+    ///
+    /// What this adds over the inner-fn tests: if axum ever changes its
+    /// percent-decoding behaviour (or if a refactor accidentally reroutes
+    /// through a different extractor), the inner-fn tests keep passing but
+    /// this test would fail. It is the ultimate guard for the bug chain.
+    #[tokio::test]
+    async fn delete_pending_reply_end_to_end_through_axum_router() {
+        use axum::Router;
+        use axum::routing::delete;
+        use tokio::net::TcpListener;
+
+        let state = crate::state::AppState::new_for_test();
+
+        // Register sender (%74) and recipient (%99).
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender-a".into(),
+                pane: Some("%74".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    networked: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "receiver-b".into(),
+                pane: Some("%99".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    networked: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        // Stage a pending-reply slot on the recipient.
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Send {
+                from: "sender-a".into(),
+                to: "receiver-b".into(),
+                message: "do a thing".into(),
+                expects_reply: true,
+                responds_to: None,
+                done: false,
+            })
+            .await;
+
+        // Build a minimal router that mounts the real production route.
+        let app = Router::new()
+            .route(
+                "/api/pane/{pane}/pending-replies/{from}",
+                delete(delete_pending_reply),
+            )
+            .with_state(state.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Send the request the way the CLI now does: suffix, no leading `%`.
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/api/pane/99/pending-replies/sender-a");
+        let resp = client.delete(&url).send().await.unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "DELETE on real pane must return 200, not silent 404"
+        );
+
+        // Slot must be gone.
+        {
+            let proto = state.protocol.read().await;
+            let still_there = proto
+                .pending_replies
+                .get("receiver-b")
+                .map(|v| v.iter().any(|e| e.from == "sender-a"))
+                .unwrap_or(false);
+            assert!(
+                !still_there,
+                "pending-reply slot must be cleared after the DELETE"
+            );
+        }
+
+        // Bonus: a correctly-URL-encoded `%` (sent as `%2599`, extracted by
+        // axum as literal `%99`) must also route to the right pane. This is
+        // the defensive tolerance that `resolve_pane_to_session` provides
+        // for future callers that percent-escape the `%` properly. The
+        // clear is idempotent on the DaemonState side so we still get 200
+        // even though the slot is already empty.
+        let url2 = format!("http://{addr}/api/pane/%2599/pending-replies/sender-a");
+        let resp2 = client.delete(&url2).send().await.unwrap();
+        assert_eq!(
+            resp2.status().as_u16(),
+            200,
+            "%25-encoded `%` form must also route to the right pane"
+        );
+
+        // And the *buggy* pre-fix URL form — raw `%74` in the path — must
+        // not spuriously succeed. Axum decodes `%74` to `t`, the helper
+        // gets a non-matching pane id, and the correct answer is 404. This
+        // is the exact failure the CLI used to silently swallow.
+        let url3 = format!("http://{addr}/api/pane/%74/pending-replies/sender-a");
+        let resp3 = client.delete(&url3).send().await.unwrap();
+        assert_eq!(
+            resp3.status().as_u16(),
+            404,
+            "raw `%74` URL (the pre-fix CLI's bug) must 404, not silently match"
+        );
+
+        server.abort();
+    }
+
+    /// End-to-end regression for the sender_id = `feat/646-...` case raised in
+    /// code review. ouija session ids can contain `/` (branch-name-style ids
+    /// passed to `/api/sessions/start` without validation), so `sender_id`
+    /// in the DELETE URL must be percent-encoded or axum's two-segment
+    /// route matcher fails and we hit the same silent-404 class.
+    ///
+    /// This test proves the full chain works end-to-end: register a session
+    /// whose id contains `/`, stage a pending-reply slot for it, DELETE with
+    /// the id percent-encoded, assert 200 and the slot is cleared.
+    #[tokio::test]
+    async fn delete_pending_reply_handles_slash_containing_sender_id() {
+        use axum::Router;
+        use axum::routing::delete;
+        use tokio::net::TcpListener;
+
+        let state = crate::state::AppState::new_for_test();
+
+        // Register a sender with a branch-name-style id (contains `/`).
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "feat/646-test".into(),
+                pane: Some("%74".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    networked: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "receiver-b".into(),
+                pane: Some("%99".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    networked: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        // Stage a pending-reply slot from the slash-id sender.
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Send {
+                from: "feat/646-test".into(),
+                to: "receiver-b".into(),
+                message: "do a thing".into(),
+                expects_reply: true,
+                responds_to: None,
+                done: false,
+            })
+            .await;
+
+        let app = Router::new()
+            .route(
+                "/api/pane/{pane}/pending-replies/{from}",
+                delete(delete_pending_reply),
+            )
+            .with_state(state.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+
+        // First, prove the broken form — raw `/` in the path — does NOT
+        // match the two-segment route. Axum must not accept it; we get 404
+        // (route not found) rather than the DELETE handler being called.
+        // This is the exact failure the review flagged.
+        let buggy_url =
+            format!("http://{addr}/api/pane/99/pending-replies/feat/646-test");
+        let buggy_resp = client.delete(&buggy_url).send().await.unwrap();
+        assert_eq!(
+            buggy_resp.status().as_u16(),
+            404,
+            "raw `/` in sender_id must break route matching (not silently \
+             succeed); the CLI fix is to percent-encode it"
+        );
+
+        // Slot must still be there — the buggy URL was a no-op.
+        {
+            let proto = state.protocol.read().await;
+            let entries = proto
+                .pending_replies
+                .get("receiver-b")
+                .expect("slot should still exist after a 404");
+            assert!(entries.iter().any(|e| e.from == "feat/646-test"));
+        }
+
+        // Now the correctly-encoded form: `feat%2F646-test`. axum decodes it
+        // back to `feat/646-test` on the handler side, the lookup matches,
+        // and the slot is cleared.
+        let encoded_url =
+            format!("http://{addr}/api/pane/99/pending-replies/feat%2F646-test");
+        let resp = client.delete(&encoded_url).send().await.unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "percent-encoded sender_id must route to the handler and clear the slot"
+        );
+
+        let proto = state.protocol.read().await;
+        let still_there = proto
+            .pending_replies
+            .get("receiver-b")
+            .map(|v| v.iter().any(|e| e.from == "feat/646-test"))
+            .unwrap_or(false);
+        assert!(
+            !still_there,
+            "slot from sender `feat/646-test` must be cleared"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn delete_pending_reply_clears_stuck_slot_after_sender_renamed() {
+        // Full regression for the hub2 symptom: sender was *renamed*, so the
+        // recipient's pending_replies bucket still has an entry whose `from`
+        // points at a session id that no longer exists in the registry. The
+        // daemon's cascade-on-remove does NOT trigger (no Remove event ran),
+        // so the slot stays stuck and the reminder loop keeps firing on it.
+        // The recipient must be able to clear it by pane id without
+        // restarting the daemon — that is exactly what the hub2 operator
+        // couldn't do before this PR.
+        let state = crate::state::AppState::new_for_test();
+
+        // Register sender (A) and recipient (B).
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender-a".into(),
+                pane: Some("%74".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    networked: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "receiver-b".into(),
+                pane: Some("%99".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    networked: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        // A sends B a message that expects a reply → B's pending_replies[B]
+        // has an entry keyed by `from = "sender-a"`.
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Send {
+                from: "sender-a".into(),
+                to: "receiver-b".into(),
+                message: "do a thing".into(),
+                expects_reply: true,
+                responds_to: None,
+                done: false,
+            })
+            .await;
+
+        // Sanity: slot exists.
+        {
+            let proto = state.protocol.read().await;
+            let entries = proto
+                .pending_replies
+                .get("receiver-b")
+                .expect("receiver should have a pending-reply bucket");
+            assert!(
+                entries.iter().any(|e| e.from == "sender-a"),
+                "sender-a slot should exist before clear"
+            );
+        }
+
+        // Model the real hub2 shape: the sender was *renamed*, not removed.
+        // apply_rename migrates the sender's own pending_replies bucket key
+        // but does NOT rewrite `from` values in other sessions' pending
+        // buckets — so B's pending_replies[B] still has an entry whose
+        // `from = "sender-a"` pointing at a name that no longer exists in
+        // the registry. No Event::Remove has fired, so the auto-clean
+        // cascade does NOT kick in. This is exactly the stuck slot the
+        // recipient used to be unable to clear without restarting the
+        // daemon.
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Rename {
+                old_id: "sender-a".into(),
+                new_id: "sender-renamed".into(),
+            })
+            .await;
+
+        // Sanity: the stuck slot is still there post-rename.
+        {
+            let proto = state.protocol.read().await;
+            let entries = proto
+                .pending_replies
+                .get("receiver-b")
+                .expect("receiver bucket must survive rename of sender");
+            assert!(
+                entries.iter().any(|e| e.from == "sender-a"),
+                "sender-a slot must still be there after rename — this is \
+                 the bug shape we're proving we can clear"
+            );
+        }
+
+        // B clears the stuck slot by hitting the pane route with the numeric
+        // suffix (what the CLI now sends). This must succeed, report the
+        // cleared count, and the slot must be gone.
+        let (status, body) =
+            delete_pending_reply_inner(&state, "99".into(), "sender-a".into()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "clear-reply on real pane + real pending slot must return 200"
+        );
+        assert_eq!(
+            body["cleared"].as_u64(),
+            Some(1),
+            "cleared must report the removed slot count so the CLI is not lied to"
+        );
+
+        let proto = state.protocol.read().await;
+        let still_there = proto
+            .pending_replies
+            .get("receiver-b")
+            .map(|v| v.iter().any(|e| e.from == "sender-a"))
+            .unwrap_or(false);
+        assert!(
+            !still_there,
+            "sender-a slot must be cleared after DELETE /api/pane/99/pending-replies/sender-a"
         );
     }
 }

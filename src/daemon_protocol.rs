@@ -557,13 +557,23 @@ impl DaemonState {
     }
 
     /// Clear pending replies from a specific sender on a session.
-    pub fn clear_pending_reply_from(&mut self, session: &str, from: &str) {
-        if let Some(pending) = self.pending_replies.get_mut(session) {
-            pending.retain(|p| p.from != from);
-            if pending.is_empty() {
-                self.pending_replies.remove(session);
-            }
+    ///
+    /// Returns the number of entries actually removed. `0` means either the
+    /// session has no pending-replies bucket, or it exists but has no entry
+    /// from this sender. Callers use this count to distinguish "actually
+    /// cleared something" from "nothing to clear" — see issue #646 for the
+    /// silent-no-op failure shape this defends against.
+    pub fn clear_pending_reply_from(&mut self, session: &str, from: &str) -> usize {
+        let Some(pending) = self.pending_replies.get_mut(session) else {
+            return 0;
+        };
+        let before = pending.len();
+        pending.retain(|p| p.from != from);
+        let removed = before - pending.len();
+        if pending.is_empty() {
+            self.pending_replies.remove(session);
         }
+        removed
     }
 
     /// Clear pending replies for removed sessions (both as target and sender).

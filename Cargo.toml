@@ -41,6 +41,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 async-trait = "0.1"
 ractor = { version = "0.15", default-features = false, features = ["async-trait"] }
 nostr-sdk = { version = "0.44", features = ["nip59"] }
+percent-encoding = "2"
 
 [dev-dependencies]
 stateright = "0.31.0"
