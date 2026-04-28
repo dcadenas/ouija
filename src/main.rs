@@ -773,7 +773,13 @@ async fn main() -> anyhow::Result<()> {
             let dry_run = value.get("dry_run").and_then(|v| v.as_bool())
                 .ok_or_else(|| anyhow::anyhow!("server response missing 'dry_run' key: {text}"))?;
 
-            if dry_run {
+            if dry_run != !yes {
+                return Err(anyhow::anyhow!(
+                    "server response intent mismatch: requested confirm={} but server returned dry_run={}. Response: {}",
+                    yes, dry_run, text
+                ));
+            } else if dry_run {
+                // Would prune branch (dry_run=true requested, yes=false)
                 // Require would_prune key on dry-run
                 if let Some(arr) = value.get("would_prune").and_then(|v| v.as_array()) {
                     let ids = arr.len();
@@ -793,7 +799,10 @@ async fn main() -> anyhow::Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("server response missing 'pruned' key on confirm=true: {text}"))?;
                 println!("Pruned {} stale session(s)", arr.len());
 
-                if let Some(err_arr) = value.get("errors").and_then(|v| v.as_array()) {
+                // Check for errors key with proper array shape; fail on schema drift
+                if value.get("errors").is_some() {
+                    let err_arr = value.get("errors").and_then(|v| v.as_array())
+                        .ok_or_else(|| anyhow::anyhow!("server response 'errors' key is not an array: {text}"))?;
                     eprintln!("Failed to prune {} session(s): {}",
                         err_arr.len(), value["errors"]);
                     if !err_arr.is_empty() {

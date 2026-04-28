@@ -1932,6 +1932,7 @@ pub async fn prune_stale_sessions(
     }
     let mut pruned = Vec::new();
     let mut errors = Vec::new();
+    let mut already_gone = Vec::new();
     for id in stale_ids {
         // Re-check still stale to avoid racing with heartbeat sweep
         // that may have marked worktree_present back to Some(true)
@@ -1942,7 +1943,8 @@ pub async fn prune_stale_sessions(
                 .unwrap_or(false)
         };
         if !still_stale {
-            tracing::debug!("session {} no longer stale, skipping", id);
+            tracing::debug!("session {} no longer stale (vanished between snapshot and prune)", id);
+            already_gone.push(id);
             continue;
         }
         let effects = state
@@ -1959,10 +1961,19 @@ pub async fn prune_stale_sessions(
             pruned.push(id);
         }
     }
-    let response = if errors.is_empty() {
+    let response = if errors.is_empty() && already_gone.is_empty() {
         json!({ "dry_run": false, "pruned": pruned })
     } else {
-        json!({ "dry_run": false, "pruned": pruned, "errors": errors })
+        let mut obj = serde_json::Map::new();
+        obj.insert("dry_run".into(), serde_json::Value::Bool(false));
+        obj.insert("pruned".into(), serde_json::Value::Array(pruned.into_iter().map(serde_json::Value::String).collect()));
+        if !errors.is_empty() {
+            obj.insert("errors".into(), serde_json::Value::Array(errors.into_iter().map(serde_json::Value::String).collect()));
+        }
+        if !already_gone.is_empty() {
+            obj.insert("already_gone".into(), serde_json::Value::Array(already_gone.into_iter().map(serde_json::Value::String).collect()));
+        }
+        serde_json::Value::Object(obj)
     };
     (StatusCode::OK, Json(response))
 }

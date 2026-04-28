@@ -1201,7 +1201,11 @@ impl AppState {
                 let mut map = std::collections::HashMap::new();
                 for dir in unique_dirs {
                     let presence = match std::fs::metadata(&dir) {
-                        Ok(m) => Some(m.is_dir()),
+                        Ok(m) if m.is_dir() => Some(true),
+                        Ok(_) => {
+                            tracing::debug!("worktree path exists but is not a directory: {}", dir);
+                            None // exists but not a directory - skip this session
+                        }
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
                         Err(e) => {
                             tracing::debug!("worktree stat failed for {}: {}", dir, e);
