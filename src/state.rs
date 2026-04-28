@@ -1192,26 +1192,36 @@ impl AppState {
         };
         // Check which dirs exist on disk
         // Only mark presence on clean ENOENT success/failure; other errors skip the session
-        let presence_map: std::collections::HashMap<String, bool> = match tokio::task::spawn_blocking(move || {
-            let mut map = std::collections::HashMap::new();
-            for dir in unique_dirs {
-                let presence = match std::fs::metadata(&dir) {
-                    Ok(m) => Some(m.is_dir()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
-                    Err(e) => {
-                        tracing::debug!("worktree stat failed for {}: {}", dir, e);
-                        None // skip this session
+        // Wrap in timeout to prevent hung NFS/FUSE mounts from blocking the reaper
+        const SWEEP_TIMEOUT_SECS: u64 = 30;
+        let unique_dirs = unique_dirs.clone();
+        let presence_map: std::collections::HashMap<String, bool> = match tokio::time::timeout(
+            std::time::Duration::from_secs(SWEEP_TIMEOUT_SECS),
+            tokio::task::spawn_blocking(move || {
+                let mut map = std::collections::HashMap::new();
+                for dir in unique_dirs {
+                    let presence = match std::fs::metadata(&dir) {
+                        Ok(m) => Some(m.is_dir()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+                        Err(e) => {
+                            tracing::debug!("worktree stat failed for {}: {}", dir, e);
+                            None // skip this session
+                        }
+                    };
+                    if let Some(p) = presence {
+                        map.insert(dir, p);
                     }
-                };
-                if let Some(p) = presence {
-                    map.insert(dir, p);
                 }
-            }
-            map
-        }).await {
-            Ok(m) => m,
-            Err(e) => {
+                map
+            }),
+        ).await {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => {
                 tracing::warn!("worktree sweep spawn_blocking failed: {e}");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!("worktree sweep timed out after {SWEEP_TIMEOUT_SECS}s - possible hung mount");
                 return;
             }
         };

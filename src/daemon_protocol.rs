@@ -994,6 +994,7 @@ impl DaemonState {
 
     fn apply_mark_worktree_presence(&mut self, updates: Vec<(String, String, bool)>) -> Vec<Effect> {
         let mut effects = Vec::new();
+        let mut any_changed = false;
 
         for (id, expected_dir, present) in updates {
             let Some(session) = self.sessions.get_mut(&id) else {
@@ -1013,11 +1014,12 @@ impl DaemonState {
             }
 
             session.metadata.worktree_present = Some(present);
-            effects.push(Effect::Persist);
+            any_changed = true;
         }
 
-        // Broadcast only if something changed (not on pure idempotent re-sweep)
-        if !effects.is_empty() {
+        // Coalesce to single Persist if any value changed (amortizes N sequential writes)
+        if any_changed {
+            effects.push(Effect::Persist);
             effects.push(Effect::BroadcastSessionList);
         }
 

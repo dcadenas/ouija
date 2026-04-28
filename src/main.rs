@@ -768,9 +768,14 @@ async fn main() -> anyhow::Result<()> {
             resp = resp.error_for_status()?;
             let text = resp.text().await?;
             let value: serde_json::Value = serde_json::from_str(&text)?;
-            let dry_run = value.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(true);
+
+            // Require dry_run key presence to detect schema drift / empty response bugs
+            let dry_run = value.get("dry_run").and_then(|v| v.as_bool())
+                .ok_or_else(|| anyhow::anyhow!("server response missing 'dry_run' key: {text}"))?;
+
             if dry_run {
-                if let Some(arr) = value["would_prune"].as_array() {
+                // Require would_prune key on dry-run
+                if let Some(arr) = value.get("would_prune").and_then(|v| v.as_array()) {
                     let ids = arr.len();
                     if ids == 0 {
                         println!("No stale sessions to prune");
@@ -780,17 +785,20 @@ async fn main() -> anyhow::Result<()> {
                         println!("Run with --yes to confirm removal");
                     }
                 } else {
-                    println!("No stale sessions to prune");
+                    return Err(anyhow::anyhow!("server response missing 'would_prune' key on dry_run=true: {text}"));
                 }
             } else {
-                if let Some(arr) = value["pruned"].as_array() {
-                    println!("Pruned {} stale session(s)", arr.len());
-                } else {
-                    println!("Pruned 0 stale session(s)");
-                }
-                if let Some(arr) = value["errors"].as_array() {
+                // Require pruned key on confirm; exit non-zero on errors for scripting
+                let arr = value.get("pruned").and_then(|v| v.as_array())
+                    .ok_or_else(|| anyhow::anyhow!("server response missing 'pruned' key on confirm=true: {text}"))?;
+                println!("Pruned {} stale session(s)", arr.len());
+
+                if let Some(err_arr) = value.get("errors").and_then(|v| v.as_array()) {
                     eprintln!("Failed to prune {} session(s): {}",
-                        arr.len(), value["errors"]);
+                        err_arr.len(), value["errors"]);
+                    if !err_arr.is_empty() {
+                        return Err(anyhow::anyhow!("partial failure: {} session(s) failed to prune", err_arr.len()));
+                    }
                 }
             }
         }
