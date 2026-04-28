@@ -1195,7 +1195,7 @@ impl AppState {
         let presence_map: std::collections::HashMap<String, bool> = match tokio::task::spawn_blocking(move || {
             let mut map = std::collections::HashMap::new();
             for dir in unique_dirs {
-                let presence = match std::fs::symlink_metadata(&dir) {
+                let presence = match std::fs::metadata(&dir) {
                     Ok(m) => Some(m.is_dir()),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
                     Err(e) => {
@@ -2382,6 +2382,42 @@ pub(crate) mod tests {
             // Remote session should be skipped (None)
             let remote = proto.sessions.get("remote/s1").unwrap();
             assert_eq!(remote.metadata.worktree_present, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_worktree_presence_follows_symlinks() {
+        let state = AppState::new_for_test();
+        let real_dir = tempfile::tempdir().unwrap();
+        let real_path = real_dir.path();
+        let symlink_path = real_path.join("symlink_to_dir");
+        std::os::unix::fs::symlink(real_path, &symlink_path).unwrap();
+        let project_dir = symlink_path.to_str().unwrap().to_string();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "local/s1".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "local/s1".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        project_dir: Some(project_dir),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+        state.sweep_worktree_presence().await;
+        {
+            let proto = state.protocol.read().await;
+            let session = proto.sessions.get("local/s1").unwrap();
+            assert_eq!(
+                session.metadata.worktree_present,
+                Some(true),
+                "symlink to existing dir should show as present"
+            );
         }
     }
 }
