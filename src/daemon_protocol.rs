@@ -292,6 +292,13 @@ pub enum Event {
         responds_to: Option<u64>,
         done: bool,
     },
+    /// Mark worktree presence from the periodic sweep.
+    ///
+    /// Only meaningful for Local sessions. Remote/Human origins' `project_dir`
+    /// lives on another machine and is not locally checkable.
+    MarkWorktreePresence {
+        updates: Vec<(String, bool)>,
+    },
 }
 
 // --- Effects ---
@@ -630,6 +637,7 @@ impl DaemonState {
                 responds_to,
                 done,
             } => self.apply_send(&from, &to, &message, expects_reply, responds_to, done),
+            Event::MarkWorktreePresence { updates } => self.apply_mark_worktree_presence(updates),
         }
     }
 
@@ -978,6 +986,35 @@ impl DaemonState {
         effects.push(Effect::BroadcastSessionList);
 
         effects.push(Effect::RemoveOk { id: id.to_string() });
+
+        effects
+    }
+
+    fn apply_mark_worktree_presence(&mut self, updates: Vec<(String, bool)>) -> Vec<Effect> {
+        let mut effects = Vec::new();
+
+        for (id, present) in updates {
+            // Skip non-local sessions — their project_dir lives on another machine
+            let Some(session) = self.sessions.get_mut(&id) else {
+                continue;
+            };
+            if !matches!(session.origin, Origin::Local) {
+                continue;
+            }
+
+            // Idempotence: only update if value changed
+            if session.metadata.worktree_present == Some(present) {
+                continue;
+            }
+
+            session.metadata.worktree_present = Some(present);
+            effects.push(Effect::Persist);
+        }
+
+        // Broadcast only if something changed (not on pure idempotent re-sweep)
+        if !effects.is_empty() {
+            effects.push(Effect::BroadcastSessionList);
+        }
 
         effects
     }
@@ -2894,6 +2931,145 @@ mod tests {
             !effects
                 .iter()
                 .any(|e| matches!(e, Effect::CleanupWorktree { .. }))
+        );
+    }
+
+    #[test]
+    fn mark_worktree_presence_false_sets_field_and_emits_persist() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "s1".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/missing".into()),
+                ..Default::default()
+            },
+        });
+        let effects = state.apply(Event::MarkWorktreePresence {
+            updates: vec![("s1".into(), false)],
+        });
+        assert_eq!(
+            state.sessions.get("s1").unwrap().metadata.worktree_present,
+            Some(false)
+        );
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::Persist)),
+            "should persist when field changes"
+        );
+    }
+
+    #[test]
+    fn mark_worktree_presence_idempotent_no_persist() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "s1".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/missing".into()),
+                worktree_present: Some(false),
+                ..Default::default()
+            },
+        });
+        let effects = state.apply(Event::MarkWorktreePresence {
+            updates: vec![("s1".into(), false)],
+        });
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Persist)),
+            "idempotent update should not persist"
+        );
+    }
+
+    #[test]
+    fn mark_worktree_presence_ignores_non_local() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        // Remote session
+        state.sessions.insert(
+            "remote/s1".into(),
+            SessionEntry {
+                id: "remote/s1".into(),
+                origin: Origin::Remote("npub1xyz".into()),
+                metadata: SessionMeta {
+                    project_dir: Some("/tmp/remote".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        // Human session
+        state.sessions.insert(
+            "human/s1".into(),
+            SessionEntry {
+                id: "human/s1".into(),
+                origin: Origin::Human("npub1xyz".into()),
+                metadata: SessionMeta {
+                    project_dir: Some("/tmp/human".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        // Local session
+        state.apply(Event::Register {
+            id: "local/s1".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/local".into()),
+                ..Default::default()
+            },
+        });
+        let effects = state.apply(Event::MarkWorktreePresence {
+            updates: vec![
+                ("remote/s1".into(), false),
+                ("human/s1".into(), false),
+                ("local/s1".into(), false),
+            ],
+        });
+        // Local should be set
+        assert_eq!(
+            state.sessions.get("local/s1").unwrap().metadata.worktree_present,
+            Some(false)
+        );
+        // Remote and Human should be unchanged (None)
+        assert_eq!(
+            state.sessions.get("remote/s1").unwrap().metadata.worktree_present,
+            None
+        );
+        assert_eq!(
+            state.sessions.get("human/s1").unwrap().metadata.worktree_present,
+            None
+        );
+        // Only one Persist for the local session
+        assert_eq!(
+            effects.iter().filter(|e| matches!(e, Effect::Persist)).count(),
+            1,
+            "only local session should trigger persist"
+        );
+    }
+
+    #[test]
+    fn prune_after_stale_mark_no_cleanup_worktree() {
+        // When we mark a session stale (worktree_present = Some(false)),
+        // then prune it with keep_worktree=true, the CleanupWorktree
+        // effect should NOT fire — the directory is already gone.
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "s1".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/code/ouija/.claude/worktrees/wt".into()),
+                worktree_present: Some(false),
+                ..Default::default()
+            },
+        });
+        // Prune with keep_worktree=true
+        let effects = state.apply(Event::Remove {
+            id: "s1".into(),
+            keep_worktree: true,
+        });
+        assert!(!state.sessions.contains_key("s1"));
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::CleanupWorktree { .. })),
+            "prune with keep_worktree=true should not emit CleanupWorktree"
         );
     }
 
