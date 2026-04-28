@@ -1931,19 +1931,28 @@ pub async fn prune_stale_sessions(
         );
     }
     let mut pruned = Vec::new();
+    let mut errors = Vec::new();
     for id in stale_ids {
-        let _ = state
+        let effects = state
             .apply_and_execute(crate::daemon_protocol::Event::Remove {
                 id: id.clone(),
                 keep_worktree: true,
             })
             .await;
-        pruned.push(id);
+        if effects.iter().any(|e| matches!(e, crate::daemon_protocol::Effect::RemoveFailed { .. }))
+        {
+            tracing::warn!("failed to prune session {}", id);
+            errors.push(id);
+        } else {
+            pruned.push(id);
+        }
     }
-    (
-        StatusCode::OK,
-        Json(json!({ "dry_run": false, "pruned": pruned })),
-    )
+    let response = if errors.is_empty() {
+        json!({ "dry_run": false, "pruned": pruned })
+    } else {
+        json!({ "dry_run": false, "pruned": pruned, "errors": errors })
+    };
+    (StatusCode::OK, Json(response))
 }
 
 #[derive(serde::Deserialize)]
