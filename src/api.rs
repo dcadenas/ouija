@@ -1903,6 +1903,55 @@ pub async fn kill_session(
     (StatusCode::OK, Json(json!({ "result": result })))
 }
 
+/// Prune stale sessions whose worktree is missing.
+///
+/// Default dry-run: returns IDs that would be pruned without removing.
+/// With confirm=true: removes sessions via Remove { keep_worktree: true }
+/// to avoid triggering CleanupWorktree on already-missing dirs.
+pub async fn prune_stale_sessions(
+    State(state): State<SharedState>,
+    Json(body): Json<PruneStaleBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let stale_ids: Vec<String> = {
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .values()
+            .filter(|s| {
+                matches!(s.origin, crate::daemon_protocol::Origin::Local)
+                    && s.metadata.worktree_present == Some(false)
+            })
+            .map(|s| s.id.clone())
+            .collect()
+    };
+    if !body.confirm {
+        return (
+            StatusCode::OK,
+            Json(json!({ "dry_run": true, "would_prune": stale_ids })),
+        );
+    }
+    let mut pruned = Vec::new();
+    for id in stale_ids {
+        let _ = state
+            .apply_and_execute(crate::daemon_protocol::Event::Remove {
+                id: id.clone(),
+                keep_worktree: true,
+            })
+            .await;
+        pruned.push(id);
+    }
+    (
+        StatusCode::OK,
+        Json(json!({ "dry_run": false, "pruned": pruned })),
+    )
+}
+
+#[derive(serde::Deserialize)]
+pub struct PruneStaleBody {
+    #[serde(default)]
+    confirm: bool,
+}
+
 /// Start a new session in a tmux pane, optionally in a worktree.
 pub async fn start_session(
     State(state): State<SharedState>,
@@ -4650,6 +4699,63 @@ mod tests {
         assert!(
             !still_there,
             "sender-a slot must be cleared after DELETE /api/pane/99/pending-replies/sender-a"
-        );
+);
+    }
+
+    #[tokio::test]
+    async fn prune_stale_sessions_dry_run_lists_stale() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "stale-s1".into(),
+                pane: Some("%1".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/nonexistent".into()),
+                    worktree_present: Some(false),
+                    ..Default::default()
+                },
+            })
+            .await;
+        // Call handler directly
+        let (status, body) = prune_stale_sessions(
+            State(state.clone()),
+            Json(PruneStaleBody { confirm: false }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let value = body.0;
+        assert_eq!(value["dry_run"], true);
+        assert_eq!(value["would_prune"], serde_json::json!(["stale-s1"]));
+        // Session should still exist
+        let proto = state.protocol.read().await;
+        assert!(proto.sessions.contains_key("stale-s1"));
+    }
+
+    #[tokio::test]
+    async fn prune_stale_sessions_confirm_removes_stale() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "stale-s1".into(),
+                pane: Some("%1".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/nonexistent".into()),
+                    worktree_present: Some(false),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let (status, body) = prune_stale_sessions(
+            State(state.clone()),
+            Json(PruneStaleBody { confirm: true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let value = body.0;
+        assert_eq!(value["dry_run"], false);
+        assert_eq!(value["pruned"], serde_json::json!(["stale-s1"]));
+        // Session should be removed
+        let proto = state.protocol.read().await;
+        assert!(!proto.sessions.contains_key("stale-s1"));
     }
 }

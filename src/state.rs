@@ -1160,6 +1160,61 @@ impl AppState {
         stale.iter().take(excess).map(|s| s.id.clone()).collect()
     }
 
+    /// Sweep worktree presence for local sessions with project_dir.
+    ///
+    /// Snapshot (id, project_dir) pairs, deduplicate dirs, check existence
+    /// via spawn_blocking, then dispatch MarkWorktreePresence event.
+    pub async fn sweep_worktree_presence(self: &Arc<Self>) {
+        let sessions_with_dirs: Vec<(String, String)> = {
+            let proto = self.protocol.read().await;
+            proto
+                .sessions
+                .values()
+                .filter(|s| {
+                    matches!(s.origin, crate::daemon_protocol::Origin::Local)
+                        && s.metadata.project_dir.is_some()
+                })
+                .filter_map(|s| Some((s.id.clone(), s.metadata.project_dir.clone()?)))
+                .collect()
+        };
+        if sessions_with_dirs.is_empty() {
+            return;
+        }
+        // Deduplicate project dirs to avoid N² stat calls
+        let unique_dirs: Vec<String> = {
+            let mut dirs: Vec<String> = sessions_with_dirs
+                .iter()
+                .map(|(_, d)| d.clone())
+                .collect();
+            dirs.sort();
+            dirs.dedup();
+            dirs
+        };
+        // Check which dirs exist on disk
+        let presence_map: std::collections::HashMap<String, bool> =
+            tokio::task::spawn_blocking(move || {
+                let mut map = std::collections::HashMap::new();
+                for dir in unique_dirs {
+                    map.insert(dir.clone(), std::path::Path::new(&dir).is_dir());
+                }
+                map
+            })
+            .await
+            .unwrap_or_default();
+        // Map session IDs back to their presence
+        let updates: Vec<(String, bool)> = sessions_with_dirs
+            .into_iter()
+            .map(|(id, dir)| (id, *presence_map.get(&dir).unwrap_or(&false)))
+            .collect();
+        if !updates.is_empty() {
+            let _ = self
+                .apply_and_execute(crate::daemon_protocol::Event::MarkWorktreePresence {
+                    updates,
+                })
+                .await;
+        }
+    }
+
     pub fn persist_sessions_from(&self, sessions: &HashMap<String, Session>) {
         let persisted: Vec<_> = sessions
             .values()
@@ -1480,6 +1535,7 @@ impl AppState {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::daemon_protocol::Origin;
 
     // --- Pure functions ---
 
@@ -2200,5 +2256,116 @@ pub(crate) mod tests {
         }
 
         assert!(state.collect_excess_idle_sessions().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sweep_worktree_presence_sets_true_for_existing_dir() {
+        let state = AppState::new_for_test();
+        let tempdir = tempfile::tempdir().unwrap();
+        let project_dir = tempdir.path().to_str().unwrap().to_string();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "local/s1".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "local/s1".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        project_dir: Some(project_dir.clone()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+        state.sweep_worktree_presence().await;
+        {
+            let proto = state.protocol.read().await;
+            let session = proto.sessions.get("local/s1").unwrap();
+            assert_eq!(
+                session.metadata.worktree_present,
+                Some(true),
+                "existing dir should show as present"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_worktree_presence_sets_false_for_missing_dir() {
+        let state = AppState::new_for_test();
+        let missing_dir = "/tmp/ouija-test-nonexistent-dir-12345".to_string();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "local/s1".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "local/s1".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        project_dir: Some(missing_dir.clone()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+        state.sweep_worktree_presence().await;
+        {
+            let proto = state.protocol.read().await;
+            let session = proto.sessions.get("local/s1").unwrap();
+            assert_eq!(
+                session.metadata.worktree_present,
+                Some(false),
+                "missing dir should show as absent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_worktree_presence_skips_non_local() {
+        let state = AppState::new_for_test();
+        let tempdir = tempfile::tempdir().unwrap();
+        let project_dir = tempdir.path().to_str().unwrap().to_string();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "remote/s1".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "remote/s1".into(),
+                    pane: None,
+                    origin: Origin::Remote("npub1x".into()),
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        project_dir: Some(project_dir.clone()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+            proto.sessions.insert(
+                "local/s1".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "local/s1".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        project_dir: Some(project_dir),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+        state.sweep_worktree_presence().await;
+        {
+            let proto = state.protocol.read().await;
+            // Local session should be updated
+            let local = proto.sessions.get("local/s1").unwrap();
+            assert_eq!(local.metadata.worktree_present, Some(true));
+            // Remote session should be skipped (None)
+            let remote = proto.sessions.get("remote/s1").unwrap();
+            assert_eq!(remote.metadata.worktree_present, None);
+        }
     }
 }

@@ -169,6 +169,13 @@ enum Command {
         #[arg(long)]
         keep_worktree: bool,
     },
+    /// Prune stale sessions whose worktree is missing
+    #[command(name = "prune-stale-sessions")]
+    PruneStaleSessions {
+        /// Actually remove (default is dry-run)
+        #[arg(long, short)]
+        yes: bool,
+    },
     /// Restart a session
     #[command(name = "restart-session")]
     RestartSession {
@@ -499,6 +506,10 @@ async fn main() -> anyhow::Result<()> {
                     let current_hash = reaper_state.local_session_hash().await;
                     let heartbeat_due = heartbeat_counter >= HEARTBEAT_CYCLES;
                     if first_run || current_hash != last_session_hash || heartbeat_due {
+                        // Sweep worktree presence on heartbeat cadence
+                        if heartbeat_due {
+                            reaper_state.sweep_worktree_presence().await;
+                        }
                         transport::broadcast_local_sessions(&reaper_state).await;
                         last_session_hash = current_hash;
                         first_run = false;
@@ -747,6 +758,35 @@ async fn main() -> anyhow::Result<()> {
                 "keep_worktree": keep_worktree,
             });
             cli_post("/api/sessions/kill", &body).await?;
+        }
+        Command::PruneStaleSessions { yes } => {
+            let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
+            let url = format!("http://localhost:{port}/api/sessions/prune-stale");
+            let client = reqwest::Client::new();
+            let body_json = serde_json::json!({ "confirm": yes });
+            let resp = client.post(&url).json(&body_json).send().await?;
+            let text = resp.text().await?;
+            let value: serde_json::Value = serde_json::from_str(&text)?;
+            if value["dry_run"] == true {
+                if let Some(arr) = value["would_prune"].as_array() {
+                    let ids = arr.len();
+                    if ids == 0 {
+                        println!("No stale sessions to prune");
+                    } else {
+                        println!("Would prune {} stale session(s): {}",
+                            ids, value["would_prune"]);
+                        println!("Run with --yes to confirm removal");
+                    }
+                } else {
+                    println!("No stale sessions to prune");
+                }
+            } else {
+                if let Some(arr) = value["pruned"].as_array() {
+                    println!("Pruned {} stale session(s)", arr.len());
+                } else {
+                    println!("Pruned 0 stale session(s)");
+                }
+            }
         }
         Command::RestartSession {
             name,
