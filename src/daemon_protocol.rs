@@ -2883,15 +2883,155 @@ mod tests {
         let effects = state.apply(Event::Rename {
             old_id: "s1".into(),
             new_id: "has/slash".into(),
-});
+        });
+        assert!(state.sessions.contains_key("s1"));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::RenameFailed { .. }))
+        );
+    }
+
+    #[test]
+    fn rename_nonexistent_fails() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        let effects = state.apply(Event::Rename {
+            old_id: "nope".into(),
+            new_id: "new".into(),
+        });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::RenameFailed { .. }))
+        );
+    }
+
+    #[test]
+    fn remove_cleans_up() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "s1".into(),
+            pane: Some("%1".into()),
+            metadata: Default::default(),
+        });
+        let effects = state.apply(Event::Remove {
+            id: "s1".into(),
+            keep_worktree: false,
+        });
+        assert!(!state.sessions.contains_key("s1"));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::StopAgent { session_id } if session_id == "s1"))
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::ClearPendingReplies { .. }))
+        );
+        assert!(effects.iter().any(|e| matches!(e, Effect::Persist)));
+    }
+
+    #[test]
+    fn remove_remote_fails() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.sessions.insert(
+            "remote/s1".into(),
+            SessionEntry {
+                id: "remote/s1".into(),
+                origin: Origin::Remote("npub1xyz".into()),
+                ..Default::default()
+            },
+        );
+        let effects = state.apply(Event::Remove {
+            id: "remote/s1".into(),
+            keep_worktree: false,
+        });
+        assert!(state.sessions.contains_key("remote/s1"));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::RemoveFailed { .. }))
+        );
+    }
+
+    #[test]
+    fn remove_triggers_worktree_cleanup() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "wt".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/code/ouija/.claude/worktrees/wt".into()),
+                ..Default::default()
+            },
+        });
+        let effects = state.apply(Event::Remove {
+            id: "wt".into(),
+            keep_worktree: false,
+        });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::CleanupWorktree { .. }))
+        );
+    }
+
+    #[test]
+    fn remove_if_stale_removes_when_worktree_present_false() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "s1".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/gone".into()),
+                worktree_present: Some(false),
+                ..Default::default()
+            },
+        });
+        let effects = state.apply(Event::RemoveIfStale {
+            id: "s1".into(),
+            expected_project_dir: Some("/tmp/gone".into()),
+        });
+        assert!(!state.sessions.contains_key("s1"));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::CleanupWorktree { .. })),
+            "RemoveIfStale must not trigger CleanupWorktree (dir is already gone)"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::RemoveFailed { .. }))
+        );
+    }
+
+    #[test]
+    fn remove_if_stale_fails_when_worktree_present_true() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "s1".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/live".into()),
+                worktree_present: Some(true),
+                ..Default::default()
+            },
+        });
         let effects = state.apply(Event::RemoveIfStale {
             id: "s1".into(),
             expected_project_dir: Some("/tmp/live".into()),
         });
-        assert!(state.sessions.contains_key("s1"));
         assert!(
-            effects.iter().any(|e| matches!(e, Effect::RemoveFailed { .. })),
-            "RemoveIfStale should fail when worktree_present is Some(true)"
+            state.sessions.contains_key("s1"),
+            "live-worktree session must not be removed by RemoveIfStale"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::RemoveFailed { .. })),
+            "RemoveIfStale must emit RemoveFailed when worktree_present flipped back to true"
         );
     }
 
