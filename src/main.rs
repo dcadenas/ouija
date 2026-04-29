@@ -169,6 +169,13 @@ enum Command {
         #[arg(long)]
         keep_worktree: bool,
     },
+    /// Prune stale sessions whose worktree is missing
+    #[command(name = "prune-stale-sessions")]
+    PruneStaleSessions {
+        /// Actually remove (default is dry-run)
+        #[arg(long, short)]
+        yes: bool,
+    },
     /// Restart a session
     #[command(name = "restart-session")]
     RestartSession {
@@ -499,6 +506,10 @@ async fn main() -> anyhow::Result<()> {
                     let current_hash = reaper_state.local_session_hash().await;
                     let heartbeat_due = heartbeat_counter >= HEARTBEAT_CYCLES;
                     if first_run || current_hash != last_session_hash || heartbeat_due {
+                        // Initial sweep on startup + periodic on heartbeat cadence
+                        if first_run || heartbeat_due {
+                            reaper_state.sweep_worktree_presence().await;
+                        }
                         transport::broadcast_local_sessions(&reaper_state).await;
                         last_session_hash = current_hash;
                         first_run = false;
@@ -747,6 +758,68 @@ async fn main() -> anyhow::Result<()> {
                 "keep_worktree": keep_worktree,
             });
             cli_post("/api/sessions/kill", &body).await?;
+        }
+        Command::PruneStaleSessions { yes } => {
+            let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
+            let url = format!("http://localhost:{port}/api/sessions/prune-stale");
+            let client = reqwest::Client::new();
+            let body_json = serde_json::json!({ "confirm": yes });
+            let mut resp = client.post(&url).json(&body_json).send().await?;
+            resp = resp.error_for_status()?;
+            let text = resp.text().await?;
+            let value: serde_json::Value = serde_json::from_str(&text)?;
+
+            // Require dry_run key presence to detect schema drift / empty response bugs
+            let dry_run = value.get("dry_run").and_then(|v| v.as_bool())
+                .ok_or_else(|| anyhow::anyhow!("server response missing 'dry_run' key: {text}"))?;
+
+            if dry_run == yes {
+                return Err(anyhow::anyhow!(
+                    "server response intent mismatch: requested confirm={} but server returned dry_run={}. Response: {}",
+                    yes, dry_run, text
+                ));
+            } else if dry_run {
+                // Would prune branch (dry_run=true requested, yes=false)
+                // Require would_prune key on dry-run
+                if let Some(arr) = value.get("would_prune").and_then(|v| v.as_array()) {
+                    let ids = arr.len();
+                    if ids == 0 {
+                        println!("No stale sessions to prune");
+                    } else {
+                        println!("Would prune {} stale session(s): {}",
+                            ids, value["would_prune"]);
+                        println!("Run with --yes to confirm removal");
+                    }
+                } else {
+                    return Err(anyhow::anyhow!("server response missing 'would_prune' key on dry_run=true: {text}"));
+                }
+            } else {
+                // Require pruned key on confirm; exit non-zero on errors for scripting
+                let arr = value.get("pruned").and_then(|v| v.as_array())
+                    .ok_or_else(|| anyhow::anyhow!("server response missing 'pruned' key on confirm=true: {text}"))?;
+                println!("Pruned {} stale session(s)", arr.len());
+
+                // Check for errors key with proper array shape; fail on schema drift
+                if value.get("errors").is_some() {
+                    let err_arr = value.get("errors").and_then(|v| v.as_array())
+                        .ok_or_else(|| anyhow::anyhow!("server response 'errors' key is not an array: {text}"))?;
+                    eprintln!("Failed to prune {} session(s): {}",
+                        err_arr.len(), value["errors"]);
+                    if !err_arr.is_empty() {
+                        return Err(anyhow::anyhow!("partial failure: {} session(s) failed to prune", err_arr.len()));
+                    }
+                }
+
+                // Check for already_gone key - sessions that vanished during prune
+                if value.get("already_gone").is_some() {
+                    let gone_arr = value.get("already_gone").and_then(|v| v.as_array())
+                        .ok_or_else(|| anyhow::anyhow!("server response 'already_gone' key is not an array: {text}"))?;
+                    if !gone_arr.is_empty() {
+                        eprintln!("Skipped {} session(s) that vanished during prune: {}",
+                            gone_arr.len(), value["already_gone"]);
+                    }
+                }
+            }
         }
         Command::RestartSession {
             name,

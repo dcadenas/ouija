@@ -120,6 +120,7 @@ pub async fn get_session(
                     "iteration": s.metadata.iteration,
                     "iteration_log": s.metadata.iteration_log,
                     "last_iteration_at": s.metadata.last_iteration_at,
+                    "worktree_present": s.metadata.worktree_present,
                 })),
             )
         }
@@ -162,6 +163,7 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
                 "iteration": s.metadata.iteration,
                 "iteration_log": s.metadata.iteration_log,
                 "last_iteration_at": s.metadata.last_iteration_at,
+                "worktree_present": s.metadata.worktree_present,
             })
         })
         .collect();
@@ -830,7 +832,7 @@ pub async fn remove(
         let reason = effects
             .iter()
             .find_map(|e| match e {
-                crate::daemon_protocol::Effect::RemoveFailed { reason } => Some(reason.clone()),
+                crate::daemon_protocol::Effect::RemoveFailed { reason, .. } => Some(reason.clone()),
                 _ => None,
             })
             .unwrap_or_else(|| format!("session '{}' not found", body.id));
@@ -1899,6 +1901,100 @@ pub async fn kill_session(
         crate::nostr_transport::kill_session(&state, &body.name).await
     };
     (StatusCode::OK, Json(json!({ "result": result })))
+}
+
+/// Prune stale sessions whose worktree is missing.
+///
+/// Default dry-run: returns IDs that would be pruned without removing.
+/// With confirm=true: removes sessions via Remove { keep_worktree: true }
+/// to avoid triggering CleanupWorktree on already-missing dirs.
+pub async fn prune_stale_sessions(
+    State(state): State<SharedState>,
+    Json(body): Json<PruneStaleBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let stale_sessions: Vec<(String, String)> = {
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .values()
+            .filter(|s| {
+                matches!(s.origin, crate::daemon_protocol::Origin::Local)
+                    && s.metadata.worktree_present == Some(false)
+            })
+            .filter_map(|s| s.metadata.project_dir.as_ref().map(|d| (s.id.clone(), d.clone())))
+            .collect()
+    };
+    if !body.confirm {
+        return (
+            StatusCode::OK,
+            Json(json!({ "dry_run": true, "would_prune": stale_sessions.iter().map(|(id, _)| id).cloned().collect::<Vec<_>>() })),
+        );
+    }
+    let mut pruned = Vec::new();
+    let mut errors = Vec::new();
+    let mut already_gone = Vec::new();
+    // Single batched apply: the handler runs each session's RemoveIfStale guard
+    // under one write lock and coalesces Persist + BroadcastSessionList into
+    // one of each, rather than N full state writes for N stale sessions.
+    let input_ids: Vec<String> = stale_sessions.iter().map(|(id, _)| id.clone()).collect();
+    let effects = state
+        .apply_and_execute(crate::daemon_protocol::Event::PruneStale {
+            sessions: stale_sessions,
+        })
+        .await;
+    let pruned_set: std::collections::HashSet<String> = effects
+        .iter()
+        .filter_map(|e| match e {
+            crate::daemon_protocol::Effect::RemoveOk { id } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    // Bucket failures via the structured RemoveFailureKind discriminator —
+    // never via reason substring matching (which would misclassify any session
+    // id or project_dir that happens to contain a substring like "not found").
+    let already_gone_set: std::collections::HashSet<String> = effects
+        .iter()
+        .filter_map(|e| match e {
+            crate::daemon_protocol::Effect::RemoveFailed { id, kind, .. }
+                if *kind == crate::daemon_protocol::RemoveFailureKind::NotFound =>
+            {
+                Some(id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    for id in input_ids {
+        if pruned_set.contains(&id) {
+            pruned.push(id);
+        } else if already_gone_set.contains(&id) {
+            tracing::debug!("session {} vanished between snapshot and prune", id);
+            already_gone.push(id);
+        } else {
+            tracing::warn!("failed to prune session {} (no longer stale or guard tripped)", id);
+            errors.push(id);
+        }
+    }
+    let response = if errors.is_empty() && already_gone.is_empty() {
+        json!({ "dry_run": false, "pruned": pruned })
+    } else {
+        let mut obj = serde_json::Map::new();
+        obj.insert("dry_run".into(), serde_json::Value::Bool(false));
+        obj.insert("pruned".into(), serde_json::Value::Array(pruned.into_iter().map(serde_json::Value::String).collect()));
+        if !errors.is_empty() {
+            obj.insert("errors".into(), serde_json::Value::Array(errors.into_iter().map(serde_json::Value::String).collect()));
+        }
+        if !already_gone.is_empty() {
+            obj.insert("already_gone".into(), serde_json::Value::Array(already_gone.into_iter().map(serde_json::Value::String).collect()));
+        }
+        serde_json::Value::Object(obj)
+    };
+    (StatusCode::OK, Json(response))
+}
+
+#[derive(serde::Deserialize)]
+pub struct PruneStaleBody {
+    #[serde(default)]
+    confirm: bool,
 }
 
 /// Start a new session in a tmux pane, optionally in a worktree.
@@ -4648,6 +4744,63 @@ mod tests {
         assert!(
             !still_there,
             "sender-a slot must be cleared after DELETE /api/pane/99/pending-replies/sender-a"
-        );
+);
+    }
+
+    #[tokio::test]
+    async fn prune_stale_sessions_dry_run_lists_stale() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "stale-s1".into(),
+                pane: Some("%1".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/nonexistent".into()),
+                    worktree_present: Some(false),
+                    ..Default::default()
+                },
+            })
+            .await;
+        // Call handler directly
+        let (status, body) = prune_stale_sessions(
+            State(state.clone()),
+            Json(PruneStaleBody { confirm: false }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let value = body.0;
+        assert_eq!(value["dry_run"], true);
+        assert_eq!(value["would_prune"], serde_json::json!(["stale-s1"]));
+        // Session should still exist
+        let proto = state.protocol.read().await;
+        assert!(proto.sessions.contains_key("stale-s1"));
+    }
+
+    #[tokio::test]
+    async fn prune_stale_sessions_confirm_removes_stale() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "stale-s1".into(),
+                pane: Some("%1".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/nonexistent".into()),
+                    worktree_present: Some(false),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let (status, body) = prune_stale_sessions(
+            State(state.clone()),
+            Json(PruneStaleBody { confirm: true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let value = body.0;
+        assert_eq!(value["dry_run"], false);
+        assert_eq!(value["pruned"], serde_json::json!(["stale-s1"]));
+        // Session should be removed
+        let proto = state.protocol.read().await;
+        assert!(!proto.sessions.contains_key("stale-s1"));
     }
 }

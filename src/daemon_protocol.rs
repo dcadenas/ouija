@@ -138,6 +138,19 @@ pub struct SessionMeta {
     /// What happens each time a scheduled task fires for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_fire: Option<crate::scheduler::OnFire>,
+    /// Last known on-disk presence of `project_dir`, as of the most recent
+    /// worktree sweep. `None` = never checked, `Some(true)` = found on disk,
+    /// `Some(false)` = `project_dir` is missing → registration is stale.
+    ///
+    /// Distinct from the metadata-age `stale` signal in `/api/status`
+    /// (which tracks role/bulletin update age). This is strictly the
+    /// filesystem-existence signal for issue #661.
+    ///
+    /// Only meaningful when `project_dir.is_some()` and `origin == Local`.
+    /// The sweep never sets this for Remote/Human sessions — their
+    /// `project_dir` lives on another machine and is not locally checkable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_present: Option<bool>,
 }
 
 /// Metadata becomes stale after 30 minutes without an update.
@@ -223,6 +236,7 @@ impl Default for SessionMeta {
             iteration_log: Vec::new(),
             last_iteration_at: None,
             on_fire: None,
+            worktree_present: None,
         }
     }
 }
@@ -244,6 +258,19 @@ pub enum Event {
     Remove {
         id: String,
         keep_worktree: bool,
+    },
+    /// Remove a local session ONLY if its `worktree_present` is `Some(false)`.
+    ///
+    /// Atomic variant used by the prune-stale-sessions flow: the check and the
+    /// removal happen under the same write lock, so a heartbeat sweep cannot
+    /// flip `worktree_present` back to `Some(true)` between a caller's check
+    /// and the remove. Always implies `keep_worktree: true` (the dir is gone).
+    /// Emits `RemoveFailed` if the session is missing, non-Local, or
+    /// `worktree_present != Some(false)`.
+    RemoveIfStale {
+        id: String,
+        /// Optional TOCTOU guard: project_dir must match this value.
+        expected_project_dir: Option<String>,
     },
     UpdateMetadata {
         id: String,
@@ -278,11 +305,47 @@ pub enum Event {
         responds_to: Option<u64>,
         done: bool,
     },
+    /// Mark worktree presence from the periodic sweep.
+    ///
+    /// Only meaningful for Local sessions. Remote/Human origins' `project_dir`
+    /// lives on another machine and is not locally checkable.
+    /// Carries expected project_dir to avoid TOCTOU races where project_dir
+    /// changes between snapshot and apply.
+    MarkWorktreePresence {
+        updates: Vec<(String, String, bool)>,
+    },
+    /// Batched atomic prune of multiple stale local sessions under one lock.
+    ///
+    /// Each `(id, expected_project_dir)` pair gets the same guard checks as
+    /// [`Event::RemoveIfStale`] (Local origin, project_dir match, worktree_present
+    /// == Some(false)). Coalesces persistence: only one [`Effect::Persist`] and
+    /// one [`Effect::BroadcastSessionList`] are emitted for the whole batch,
+    /// regardless of how many sessions were removed.
+    PruneStale {
+        sessions: Vec<(String, String)>,
+    },
 }
 
 // --- Effects ---
 
 /// Side effects returned by apply(). Values, not actions.
+/// Structured discriminator for `Effect::RemoveFailed`. Used by callers
+/// (notably the prune-stale-sessions API handler) to classify outcomes
+/// without parsing free-form reason strings — which would misclassify
+/// any session id or project_dir that happens to contain a substring
+/// matching one of the categories.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemoveFailureKind {
+    /// Session id is not present in the protocol state.
+    NotFound,
+    /// Session origin is not Local (Remote/Human cannot be removed by the operator).
+    NotLocal,
+    /// Session worktree_present is not Some(false) — worktree is live or unknown.
+    NotStale,
+    /// TOCTOU project_dir mismatch between snapshot and apply.
+    ProjectDirMismatch,
+}
+
 /// The runtime executes them. The model inspects or ignores them.
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -422,6 +485,13 @@ pub enum Effect {
         id: String,
     },
     RemoveFailed {
+        /// Session id the failure pertains to. Lets callers bucket per-id
+        /// outcomes (pruned vs already_gone vs errors) without parsing
+        /// `reason` strings or relying on effect iteration order.
+        id: String,
+        /// Structured discriminator for the failure category. Use this to
+        /// classify outcomes; `reason` is human-readable diagnostic only.
+        kind: RemoveFailureKind,
         reason: String,
     },
     CleanupWorktree {
@@ -510,6 +580,7 @@ fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>) -> Sessio
             iteration_log: m.iteration_log.clone(),
             last_iteration_at: m.last_iteration_at,
             on_fire: m.on_fire.clone(),
+            worktree_present: m.worktree_present,
         },
         None => SessionMeta::default(),
     }
@@ -593,6 +664,7 @@ impl DaemonState {
             Event::Register { id, pane, metadata } => self.apply_register(id, pane, metadata),
             Event::Rename { old_id, new_id } => self.apply_rename(&old_id, &new_id),
             Event::Remove { id, keep_worktree } => self.apply_remove(&id, keep_worktree),
+            Event::RemoveIfStale { id, expected_project_dir } => self.apply_remove_if_stale(&id, expected_project_dir.as_deref()),
             Event::UpdateMetadata {
                 id,
                 role,
@@ -615,6 +687,8 @@ impl DaemonState {
                 responds_to,
                 done,
             } => self.apply_send(&from, &to, &message, expects_reply, responds_to, done),
+            Event::MarkWorktreePresence { updates } => self.apply_mark_worktree_presence(updates),
+            Event::PruneStale { sessions } => self.apply_prune_stale_many(sessions),
         }
     }
 
@@ -887,12 +961,16 @@ impl DaemonState {
             Some(Origin::Local) => {}
             Some(_) => {
                 effects.push(Effect::RemoveFailed {
+                    id: id.to_string(),
+                    kind: RemoveFailureKind::NotLocal,
                     reason: format!("cannot remove remote session '{id}'"),
                 });
                 return effects;
             }
             None => {
                 effects.push(Effect::RemoveFailed {
+                    id: id.to_string(),
+                    kind: RemoveFailureKind::NotFound,
                     reason: format!("session '{id}' not found"),
                 });
                 return effects;
@@ -963,6 +1041,128 @@ impl DaemonState {
         effects.push(Effect::BroadcastSessionList);
 
         effects.push(Effect::RemoveOk { id: id.to_string() });
+
+        effects
+    }
+
+    /// Atomic guarded remove for the prune-stale-sessions flow.
+    ///
+    /// Verifies under the same write lock that the session is Local and has
+    /// `worktree_present == Some(false)`, then delegates to `apply_remove` with
+    /// `keep_worktree: true`. Emits `RemoveFailed` if any guard trips — this
+    /// closes the TOCTOU window where a heartbeat sweep could flip
+    /// `worktree_present` back to `Some(true)` between a caller's pre-check
+    /// and the remove.
+    fn apply_remove_if_stale(&mut self, id: &str, expected_project_dir: Option<&str>) -> Vec<Effect> {
+        match self.sessions.get(id) {
+            Some(session) => {
+                if !matches!(session.origin, Origin::Local) {
+                    return vec![Effect::RemoveFailed {
+                        id: id.to_string(),
+                        kind: RemoveFailureKind::NotLocal,
+                        reason: format!("cannot prune remote session '{id}'"),
+                    }];
+                }
+                // TOCTOU guard: verify project_dir hasn't changed since snapshot
+                if let Some(exp_dir) = expected_project_dir {
+                    if session.metadata.project_dir.as_ref() != Some(&exp_dir.to_string()) {
+                        return vec![Effect::RemoveFailed {
+                            id: id.to_string(),
+                            kind: RemoveFailureKind::ProjectDirMismatch,
+                            reason: format!(
+                                "session '{id}' project_dir mismatch (expected {}, got {:?})",
+                                exp_dir, session.metadata.project_dir
+                            ),
+                        }];
+                    }
+                }
+                if session.metadata.worktree_present != Some(false) {
+                    return vec![Effect::RemoveFailed {
+                        id: id.to_string(),
+                        kind: RemoveFailureKind::NotStale,
+                        reason: format!(
+                            "session '{id}' is not stale (worktree_present={:?}); refusing to prune",
+                            session.metadata.worktree_present
+                        ),
+                    }];
+                }
+            }
+            None => {
+                return vec![Effect::RemoveFailed {
+                    id: id.to_string(),
+                    kind: RemoveFailureKind::NotFound,
+                    reason: format!("session '{id}' not found"),
+                }];
+            }
+        }
+        // Guard passed under the write lock; delegate to apply_remove.
+        // keep_worktree: true because the dir is already missing.
+        self.apply_remove(id, true)
+    }
+
+    /// Batched prune-stale handler: for each `(id, expected_project_dir)` runs
+    /// the same guard checks as [`Self::apply_remove_if_stale`] and removes the
+    /// session if they pass. Coalesces persistence: a single [`Effect::Persist`]
+    /// and a single [`Effect::BroadcastSessionList`] cover the whole batch
+    /// instead of one per pruned session.
+    fn apply_prune_stale_many(&mut self, sessions: Vec<(String, String)>) -> Vec<Effect> {
+        let mut tail = Vec::new();
+        let mut any_removed = false;
+        for (id, expected_dir) in sessions {
+            let sub_effects = self.apply_remove_if_stale(&id, Some(&expected_dir));
+            for e in sub_effects {
+                match e {
+                    Effect::Persist | Effect::BroadcastSessionList => {
+                        any_removed = true;
+                    }
+                    other => tail.push(other),
+                }
+            }
+        }
+        if !any_removed {
+            return tail;
+        }
+        // Persist FIRST so on-disk state matches what we'll announce next; the
+        // single-session apply_remove path follows the same persist-then-announce
+        // ordering. Trailing BroadcastSessionList re-publishes the full session
+        // list once the batch has been persisted.
+        let mut effects = Vec::with_capacity(tail.len() + 2);
+        effects.push(Effect::Persist);
+        effects.extend(tail);
+        effects.push(Effect::BroadcastSessionList);
+        effects
+    }
+
+    fn apply_mark_worktree_presence(&mut self, updates: Vec<(String, String, bool)>) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        let mut any_changed = false;
+
+        for (id, expected_dir, present) in updates {
+            let Some(session) = self.sessions.get_mut(&id) else {
+                continue;
+            };
+            if !matches!(session.origin, Origin::Local) {
+                continue;
+            }
+
+            // TOCTOU guard: skip if project_dir changed since snapshot
+            if session.metadata.project_dir.as_ref() != Some(&expected_dir) {
+                continue;
+            }
+
+            if session.metadata.worktree_present == Some(present) {
+                continue;
+            }
+
+            session.metadata.worktree_present = Some(present);
+            any_changed = true;
+        }
+
+        // Coalesce to single Persist if any value changed (amortizes N sequential writes)
+        if any_changed {
+            effects.push(Effect::Persist);
+            effects.push(Effect::BroadcastSessionList);
+        }
 
         effects
     }
@@ -1786,6 +1986,52 @@ mod tests {
         let decoded: SessionMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.model.as_deref(), Some("openrouter/openai/gpt-5.4"));
         assert_eq!(decoded.effort.as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn session_meta_worktree_present_defaults_to_none() {
+        let meta = SessionMeta::default();
+        assert_eq!(
+            meta.worktree_present, None,
+            "never-checked is distinct from on-disk/missing"
+        );
+    }
+
+    #[test]
+    fn session_meta_worktree_present_round_trip() {
+        // Missing-on-disk bit survives serde — it's persisted via
+        // `metadata_to_session_meta` and must not silently flip back to None
+        // after a daemon restart, otherwise the stale mark would reset and
+        // the sweep would have to re-stat everything before `ouija ls` could
+        // distinguish again.
+        let meta = SessionMeta {
+            project_dir: Some("/tmp/gone".into()),
+            worktree_present: Some(false),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let decoded: SessionMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.worktree_present, Some(false));
+
+        let meta_present = SessionMeta {
+            project_dir: Some("/tmp/here".into()),
+            worktree_present: Some(true),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&meta_present).unwrap();
+        let decoded: SessionMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.worktree_present, Some(true));
+    }
+
+    #[test]
+    fn session_meta_worktree_present_backward_compat() {
+        // Metadata written before this field existed must still load. The
+        // missing field must deserialize to None (never-checked), not crash,
+        // and not flip to Some(false) (which would spuriously mark every
+        // pre-existing session stale on first daemon upgrade).
+        let legacy = r#"{"project_dir":"/tmp/wt","iteration":0}"#;
+        let decoded: SessionMeta = serde_json::from_str(legacy).unwrap();
+        assert_eq!(decoded.worktree_present, None);
     }
 
     #[test]
@@ -2812,6 +3058,105 @@ mod tests {
     }
 
     #[test]
+    fn remove_if_stale_removes_when_worktree_present_false() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "s1".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/gone".into()),
+                worktree_present: Some(false),
+                ..Default::default()
+            },
+        });
+        let effects = state.apply(Event::RemoveIfStale {
+            id: "s1".into(),
+            expected_project_dir: Some("/tmp/gone".into()),
+        });
+        assert!(!state.sessions.contains_key("s1"));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::CleanupWorktree { .. })),
+            "RemoveIfStale must not trigger CleanupWorktree (dir is already gone)"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::RemoveFailed { .. }))
+        );
+    }
+
+    #[test]
+    fn remove_if_stale_fails_when_worktree_present_true() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "s1".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/live".into()),
+                worktree_present: Some(true),
+                ..Default::default()
+            },
+        });
+        let effects = state.apply(Event::RemoveIfStale {
+            id: "s1".into(),
+            expected_project_dir: Some("/tmp/live".into()),
+        });
+        assert!(
+            state.sessions.contains_key("s1"),
+            "live-worktree session must not be removed by RemoveIfStale"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::RemoveFailed { .. })),
+            "RemoveIfStale must emit RemoveFailed when worktree_present flipped back to true"
+        );
+    }
+
+    #[test]
+    fn remove_if_stale_fails_when_worktree_present_none() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "s1".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/unknown".into()),
+                worktree_present: None,
+                ..Default::default()
+            },
+        });
+        let effects = state.apply(Event::RemoveIfStale {
+            id: "s1".into(),
+            expected_project_dir: Some("/tmp/unknown".into()),
+        });
+        assert!(
+            state.sessions.contains_key("s1"),
+            "un-swept session must not be removed by RemoveIfStale"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::RemoveFailed { .. }))
+        );
+    }
+
+    #[test]
+    fn remove_if_stale_fails_on_missing_session() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        let effects = state.apply(Event::RemoveIfStale {
+            id: "nope".into(),
+            expected_project_dir: None,
+        });
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::RemoveFailed { .. }))
+        );
+    }
+
+    #[test]
     fn reap_removes_dead_sessions() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
         state.apply(Event::Register {
@@ -2834,6 +3179,439 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::CleanupWorktree { .. }))
         );
+    }
+
+    #[test]
+    fn mark_worktree_presence_false_sets_field_and_emits_persist() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "s1".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/dir1".into()),
+                ..Default::default()
+            },
+        });
+        let effects = state.apply(Event::MarkWorktreePresence {
+            updates: vec![("s1".into(), "/tmp/dir1".into(), false)],
+        });
+        assert_eq!(
+            state.sessions.get("s1").unwrap().metadata.worktree_present,
+            Some(false)
+        );
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::Persist)),
+            "should persist when field changes"
+        );
+    }
+
+    #[test]
+    fn mark_worktree_presence_idempotent_no_persist() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "s1".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/missing".into()),
+                worktree_present: Some(false),
+                ..Default::default()
+            },
+        });
+        let effects = state.apply(Event::MarkWorktreePresence {
+            updates: vec![("s1".into(), "/tmp/missing".into(), false)],
+        });
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Persist)),
+            "idempotent update should not persist"
+        );
+    }
+
+    #[test]
+    fn mark_worktree_presence_ignores_non_local() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        // Remote session
+        state.sessions.insert(
+            "remote/s1".into(),
+            SessionEntry {
+                id: "remote/s1".into(),
+                origin: Origin::Remote("npub1xyz".into()),
+                metadata: SessionMeta {
+                    project_dir: Some("/tmp/remote".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        // Human session
+        state.sessions.insert(
+            "human/s1".into(),
+            SessionEntry {
+                id: "human/s1".into(),
+                origin: Origin::Human("npub1xyz".into()),
+                metadata: SessionMeta {
+                    project_dir: Some("/tmp/human".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        // Local session
+        state.apply(Event::Register {
+            id: "local/s1".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/local".into()),
+                ..Default::default()
+            },
+        });
+        let effects = state.apply(Event::MarkWorktreePresence {
+            updates: vec![
+                ("remote/s1".into(), "/tmp/remote".into(), false),
+                ("human/s1".into(), "/tmp/human".into(), false),
+                ("local/s1".into(), "/tmp/local".into(), false),
+            ],
+        });
+        // Local should be set
+        assert_eq!(
+            state.sessions.get("local/s1").unwrap().metadata.worktree_present,
+            Some(false)
+        );
+        // Remote and Human should be unchanged (None)
+        assert_eq!(
+            state.sessions.get("remote/s1").unwrap().metadata.worktree_present,
+            None
+        );
+        assert_eq!(
+            state.sessions.get("human/s1").unwrap().metadata.worktree_present,
+            None
+        );
+        // Only one Persist for the local session
+        assert_eq!(
+            effects.iter().filter(|e| matches!(e, Effect::Persist)).count(),
+            1,
+            "only local session should trigger persist"
+        );
+    }
+
+    #[test]
+    fn prune_after_stale_mark_no_cleanup_worktree() {
+        // When we mark a session stale (worktree_present = Some(false)),
+        // then prune it with keep_worktree=true, the CleanupWorktree
+        // effect should NOT fire — the directory is already gone.
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "s1".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/code/ouija/.claude/worktrees/wt".into()),
+                worktree_present: Some(false),
+                ..Default::default()
+            },
+        });
+        // Prune with keep_worktree=true
+        let effects = state.apply(Event::Remove {
+            id: "s1".into(),
+            keep_worktree: true,
+        });
+        assert!(!state.sessions.contains_key("s1"));
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::CleanupWorktree { .. })),
+            "prune with keep_worktree=true should not emit CleanupWorktree"
+        );
+    }
+
+    fn register_stale_session(state: &mut DaemonState, id: &str, dir: &str, pane: &str) {
+        state.apply(Event::Register {
+            id: id.into(),
+            pane: Some(pane.into()),
+            metadata: SessionMeta {
+                project_dir: Some(dir.into()),
+                worktree_present: Some(false),
+                ..Default::default()
+            },
+        });
+    }
+
+    #[test]
+    fn prune_stale_many_emits_single_persist_for_batch() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        register_stale_session(&mut state, "s1", "/tmp/gone1", "%1");
+        register_stale_session(&mut state, "s2", "/tmp/gone2", "%2");
+        register_stale_session(&mut state, "s3", "/tmp/gone3", "%3");
+        let effects = state.apply(Event::PruneStale {
+            sessions: vec![
+                ("s1".into(), "/tmp/gone1".into()),
+                ("s2".into(), "/tmp/gone2".into()),
+                ("s3".into(), "/tmp/gone3".into()),
+            ],
+        });
+        assert!(!state.sessions.contains_key("s1"));
+        assert!(!state.sessions.contains_key("s2"));
+        assert!(!state.sessions.contains_key("s3"));
+        let persist_count = effects.iter().filter(|e| matches!(e, Effect::Persist)).count();
+        assert_eq!(persist_count, 1, "batch must emit exactly one Persist (got {persist_count})");
+        let broadcast_count = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::BroadcastSessionList))
+            .count();
+        assert_eq!(
+            broadcast_count, 1,
+            "batch must emit exactly one BroadcastSessionList (got {broadcast_count})"
+        );
+        let remove_ok_count = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::RemoveOk { .. }))
+            .count();
+        assert_eq!(remove_ok_count, 3, "should emit one RemoveOk per pruned session");
+    }
+
+    #[test]
+    fn prune_stale_many_persists_before_per_session_broadcasts() {
+        // Regression: in the batched prune path, Effect::Persist must be the FIRST
+        // effect emitted (before any per-session Effect::Broadcast(SessionRemove)),
+        // and Effect::BroadcastSessionList must be the LAST. Mirrors single-session
+        // apply_remove's persist-then-announce ordering. The previous batched
+        // implementation appended Persist after all per-session effects, so a
+        // daemon crash between the last wire SessionRemove broadcast and Persist
+        // would leave peers' state ahead of on-disk state.
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        register_stale_session(&mut state, "s1", "/tmp/gone1", "%1");
+        register_stale_session(&mut state, "s2", "/tmp/gone2", "%2");
+        let effects = state.apply(Event::PruneStale {
+            sessions: vec![
+                ("s1".into(), "/tmp/gone1".into()),
+                ("s2".into(), "/tmp/gone2".into()),
+            ],
+        });
+        let persist_idx = effects
+            .iter()
+            .position(|e| matches!(e, Effect::Persist))
+            .expect("Persist must be emitted on any-success batch");
+        let first_remove_broadcast = effects
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    Effect::Broadcast(crate::protocol::WireMessage::SessionRemove { .. })
+                )
+            })
+            .expect("Broadcast(SessionRemove) must be emitted for each pruned session");
+        let broadcast_list_idx = effects
+            .iter()
+            .position(|e| matches!(e, Effect::BroadcastSessionList))
+            .expect("BroadcastSessionList must be emitted on any-success batch");
+        assert!(
+            persist_idx < first_remove_broadcast,
+            "Persist (idx {persist_idx}) must precede first Broadcast(SessionRemove) (idx {first_remove_broadcast}); \
+             single-session apply_remove persists before announcing, batched path must match"
+        );
+        assert!(
+            first_remove_broadcast < broadcast_list_idx,
+            "per-session Broadcast(SessionRemove) (idx {first_remove_broadcast}) must precede final BroadcastSessionList (idx {broadcast_list_idx})"
+        );
+    }
+
+    #[test]
+    fn prune_stale_many_no_persist_when_all_fail() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        // Sessions that don't exist
+        let effects = state.apply(Event::PruneStale {
+            sessions: vec![
+                ("missing1".into(), "/tmp/x".into()),
+                ("missing2".into(), "/tmp/y".into()),
+            ],
+        });
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Persist)),
+            "all-failure batch must not emit Persist"
+        );
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::BroadcastSessionList)),
+            "all-failure batch must not emit BroadcastSessionList"
+        );
+        let failed_count = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::RemoveFailed { .. }))
+            .count();
+        assert_eq!(failed_count, 2, "should emit RemoveFailed per missing session");
+    }
+
+    #[test]
+    fn prune_stale_many_handles_mixed_outcomes() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        register_stale_session(&mut state, "stale", "/tmp/gone", "%1");
+        // Live session — worktree_present=Some(true)
+        state.apply(Event::Register {
+            id: "live".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/here".into()),
+                worktree_present: Some(true),
+                ..Default::default()
+            },
+        });
+        let effects = state.apply(Event::PruneStale {
+            sessions: vec![
+                ("stale".into(), "/tmp/gone".into()),
+                ("live".into(), "/tmp/here".into()),
+                ("missing".into(), "/tmp/anywhere".into()),
+            ],
+        });
+        // Stale was pruned; live and missing failed
+        assert!(!state.sessions.contains_key("stale"));
+        assert!(state.sessions.contains_key("live"));
+        let persist_count = effects.iter().filter(|e| matches!(e, Effect::Persist)).count();
+        assert_eq!(persist_count, 1, "exactly one Persist for the one successful prune");
+        let remove_ok_count = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::RemoveOk { .. }))
+            .count();
+        assert_eq!(remove_ok_count, 1);
+        let remove_failed_count = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::RemoveFailed { .. }))
+            .count();
+        assert_eq!(remove_failed_count, 2);
+    }
+
+    #[test]
+    fn remove_failed_kind_distinguishes_failures_regardless_of_substring() {
+        // Regression: bucketing on `reason.contains("not found")` misclassified
+        // failures whenever the interpolated id or project_dir happened to
+        // contain that substring. A structured RemoveFailureKind discriminator
+        // makes the classification unambiguous regardless of id/path content.
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+
+        // Case A: missing session — kind must be NotFound regardless of substring in id
+        let effects = state.apply(Event::RemoveIfStale {
+            id: "card-not-found-test-1".into(),
+            expected_project_dir: None,
+        });
+        let kind = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::RemoveFailed { kind, .. } => Some(kind.clone()),
+                _ => None,
+            })
+            .expect("RemoveFailed must be emitted for missing session");
+        assert_eq!(
+            kind,
+            RemoveFailureKind::NotFound,
+            "missing session must produce NotFound kind"
+        );
+
+        // Case B: live session — kind must be NotStale even if id contains 'not-found'
+        state.apply(Event::Register {
+            id: "live-not-found-id".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/live".into()),
+                worktree_present: Some(true),
+                ..Default::default()
+            },
+        });
+        let effects = state.apply(Event::RemoveIfStale {
+            id: "live-not-found-id".into(),
+            expected_project_dir: Some("/tmp/live".into()),
+        });
+        let kind = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::RemoveFailed { kind, .. } => Some(kind.clone()),
+                _ => None,
+            })
+            .expect("RemoveFailed must be emitted for live session");
+        assert_eq!(
+            kind,
+            RemoveFailureKind::NotStale,
+            "live session with 'not-found' in id must produce NotStale, NOT NotFound"
+        );
+
+        // Case C: project_dir mismatch — kind must be ProjectDirMismatch even if path contains 'not found'
+        register_stale_session(&mut state, "stale-1", "/tmp/has not found in path", "%2");
+        let effects = state.apply(Event::RemoveIfStale {
+            id: "stale-1".into(),
+            expected_project_dir: Some("/tmp/snapshot-was-different".into()),
+        });
+        let kind = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::RemoveFailed { kind, .. } => Some(kind.clone()),
+                _ => None,
+            })
+            .expect("RemoveFailed must be emitted for project_dir mismatch");
+        assert_eq!(
+            kind,
+            RemoveFailureKind::ProjectDirMismatch,
+            "project_dir mismatch must produce ProjectDirMismatch even when path contains 'not found' substring"
+        );
+
+        // Case D: non-Local origin — kind must be NotLocal
+        state.apply(Event::Register {
+            id: "remote-1".into(),
+            pane: None,
+            metadata: SessionMeta {
+                ..Default::default()
+            },
+        });
+        // Override origin to Remote post-registration (Register defaults to Local).
+        state
+            .sessions
+            .get_mut("remote-1")
+            .unwrap()
+            .origin = Origin::Remote("npub1xyz".into());
+        let effects = state.apply(Event::RemoveIfStale {
+            id: "remote-1".into(),
+            expected_project_dir: None,
+        });
+        let kind = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::RemoveFailed { kind, .. } => Some(kind.clone()),
+                _ => None,
+            })
+            .expect("RemoveFailed must be emitted for non-Local session");
+        assert_eq!(
+            kind,
+            RemoveFailureKind::NotLocal,
+            "remote session must produce NotLocal kind"
+        );
+    }
+
+    #[test]
+    fn prune_stale_failed_effects_carry_session_id() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        register_stale_session(&mut state, "stale", "/tmp/gone", "%1");
+        state.apply(Event::Register {
+            id: "live".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/here".into()),
+                worktree_present: Some(true),
+                ..Default::default()
+            },
+        });
+        let effects = state.apply(Event::PruneStale {
+            sessions: vec![
+                ("stale".into(), "/tmp/gone".into()),
+                ("live".into(), "/tmp/here".into()),
+                ("missing".into(), "/tmp/anywhere".into()),
+            ],
+        });
+        // Each failure must carry the session id so callers can pair without
+        // parsing reason strings or relying on iteration order.
+        let live_failure = effects.iter().find_map(|e| match e {
+            Effect::RemoveFailed { id, reason, .. } if id == "live" => Some(reason.clone()),
+            _ => None,
+        });
+        let missing_failure = effects.iter().find_map(|e| match e {
+            Effect::RemoveFailed { id, reason, .. } if id == "missing" => Some(reason.clone()),
+            _ => None,
+        });
+        let live_reason = live_failure.expect("live session must produce RemoveFailed { id: \"live\", .. }");
+        let missing_reason = missing_failure.expect("missing session must produce RemoveFailed { id: \"missing\", .. }");
+        assert!(live_reason.contains("not stale"), "live reason should say not stale, got: {live_reason}");
+        assert!(missing_reason.contains("not found"), "missing reason should say not found, got: {missing_reason}");
     }
 
     // --- IncomingWire tests ---

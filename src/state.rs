@@ -159,6 +159,15 @@ pub struct AppState {
     /// Per-fire worktree panes: pane_id → project_dir.
     /// Reaper runs `git worktree prune` when these panes die.
     pub perfire_worktree_panes: RwLock<HashMap<String, String>>,
+    /// Dedup: prevents concurrent sweeps from accumulating hung blocking threads.
+    sweep_in_progress: std::sync::atomic::AtomicBool,
+    /// Backoff gate after a sweep timeout. When `Some(t)`, sweeps are skipped
+    /// until `Instant::now() >= t`. The orphan blocking thread from a timed-out
+    /// sweep keeps `sweep_in_progress = true`; this gate prevents subsequent
+    /// sweeps from clearing the dedup claim and spawning another orphan on every
+    /// heartbeat. After the window expires, the next entry clears both the
+    /// backoff and the dedup flag, accepting one more orphan to retain liveness.
+    sweep_backoff_until: std::sync::Mutex<Option<std::time::Instant>>,
     pub backends: crate::backend::BackendRegistry,
     pub http_client: reqwest::Client,
     /// Queued prompts for HttpApi sessions awaiting a readiness signal.
@@ -261,6 +270,15 @@ pub struct SessionMetadata {
     /// What happens each time a scheduled task fires for this session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_fire: Option<crate::scheduler::OnFire>,
+    /// Last known on-disk presence of `project_dir` as of the most recent
+    /// worktree sweep. `None` = never checked, `Some(true)` = on disk,
+    /// `Some(false)` = missing (stale registration, issue #661).
+    ///
+    /// Mirror of `SessionMeta::worktree_present` — see that field's doc
+    /// comment for the semantic boundaries (only meaningful for Local
+    /// sessions with `project_dir` set; distinct from metadata staleness).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_present: Option<bool>,
 }
 
 fn default_true() -> bool {
@@ -288,6 +306,7 @@ impl Default for SessionMetadata {
             iteration_log: Vec::new(),
             last_iteration_at: None,
             on_fire: None,
+            worktree_present: None,
         }
     }
 }
@@ -371,6 +390,8 @@ impl AppState {
             pending_commands: std::sync::Mutex::new(Vec::new()),
             cached_assistant_panes: RwLock::new(Vec::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
+            sweep_in_progress: std::sync::atomic::AtomicBool::new(false),
+            sweep_backoff_until: std::sync::Mutex::new(None),
             backends: crate::backend::BackendRegistry::default_registry(),
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -403,6 +424,8 @@ impl AppState {
             pending_commands: std::sync::Mutex::new(Vec::new()),
             cached_assistant_panes: RwLock::new(Vec::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
+            sweep_in_progress: std::sync::atomic::AtomicBool::new(false),
+            sweep_backoff_until: std::sync::Mutex::new(None),
             backends: crate::backend::BackendRegistry::default_registry(),
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -863,6 +886,7 @@ impl AppState {
                         iteration_log: m.iteration_log.clone(),
                         last_iteration_at: m.last_iteration_at,
                         on_fire: m.on_fire.clone(),
+                        worktree_present: m.worktree_present,
                     },
                 };
                 (k.clone(), session)
@@ -1147,6 +1171,138 @@ impl AppState {
         // Sort by last activity (oldest first)
         stale.sort_by_key(|s| s.metadata.last_metadata_update.unwrap_or(s.registered_at));
         stale.iter().take(excess).map(|s| s.id.clone()).collect()
+    }
+
+    /// Sweep worktree presence for local sessions with project_dir.
+    ///
+    /// Snapshot (id, project_dir) pairs, deduplicate dirs, check existence
+    /// via spawn_blocking, then dispatch MarkWorktreePresence event.
+    pub async fn sweep_worktree_presence(self: &Arc<Self>) {
+        // Backoff gate: if a prior sweep timed out and the cooldown is still
+        // active, skip without acquiring the dedup flag (the orphan blocking
+        // thread that triggered the timeout still holds it). Once the window
+        // has elapsed, force-clear both the backoff and the dedup flag — the
+        // orphan thread is presumed permanently hung; the next sweep accepts
+        // the risk of accumulating one more orphan to keep the feature alive.
+        {
+            let mut backoff = self.sweep_backoff_until.lock().unwrap();
+            if let Some(until) = *backoff {
+                if std::time::Instant::now() < until {
+                    tracing::debug!("worktree sweep in backoff window after recent timeout, skipping");
+                    return;
+                }
+                *backoff = None;
+                self.sweep_in_progress
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let sessions_with_dirs: Vec<(String, String)> = {
+            let proto = self.protocol.read().await;
+            proto
+                .sessions
+                .values()
+                .filter(|s| {
+                    matches!(s.origin, crate::daemon_protocol::Origin::Local)
+                        && s.metadata.project_dir.is_some()
+                })
+                .filter_map(|s| Some((s.id.clone(), s.metadata.project_dir.clone()?)))
+                .collect()
+        };
+        if sessions_with_dirs.is_empty() {
+            // Do NOT clear sweep_in_progress here: this caller never claimed the
+            // flag (the swap(true) acquire below comes after this check), so it
+            // has no business releasing it. Clearing would clobber a concurrent
+            // sweep's claim and let a subsequent sweep run in parallel.
+            return;
+        }
+        // Dedup: skip if a prior sweep is still running
+        if self.sweep_in_progress.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::debug!("worktree sweep already in progress, skipping");
+            return;
+        }
+        // Deduplicate project dirs to avoid N² stat calls
+        let unique_dirs: Vec<String> = {
+            let mut dirs: Vec<String> = sessions_with_dirs
+                .iter()
+                .map(|(_, d)| d.clone())
+                .collect();
+            dirs.sort();
+            dirs.dedup();
+            dirs
+        };
+        // Check which dirs exist on disk
+        // Only mark presence on clean ENOENT success/failure; other errors skip the session
+        // Wrap in timeout to prevent hung NFS/FUSE mounts from blocking the reaper
+        const SWEEP_TIMEOUT_SECS: u64 = 30;
+        // Backoff after a timeout: orphan blocking threads keep running on the
+        // hung FS until the mount unhangs (spawn_blocking is not cancellable).
+        // The backoff caps orphan accumulation rate at 1 per window instead of
+        // 1 per heartbeat (~5s).
+        const SWEEP_BACKOFF_SECS: u64 = 300;
+        let unique_dirs = unique_dirs.clone();
+        let presence_map: std::collections::HashMap<String, bool> = match tokio::time::timeout(
+            std::time::Duration::from_secs(SWEEP_TIMEOUT_SECS),
+            tokio::task::spawn_blocking(move || {
+                let mut map = std::collections::HashMap::new();
+                for dir in unique_dirs {
+                    let presence = match std::fs::metadata(&dir) {
+                        Ok(m) if m.is_dir() => Some(true),
+                        Ok(_) => {
+                            tracing::debug!("worktree path exists but is not a directory: {}", dir);
+                            None // exists but not a directory - skip this session
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(false),
+                        Err(e) => {
+                            tracing::debug!("worktree stat failed for {}: {}", dir, e);
+                            None // skip this session
+                        }
+                    };
+                    if let Some(p) = presence {
+                        map.insert(dir, p);
+                    }
+                }
+                map
+            }),
+        ).await {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => {
+                tracing::warn!("worktree sweep spawn_blocking failed: {e}");
+                self.sweep_in_progress.store(false, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "worktree sweep timed out after {SWEEP_TIMEOUT_SECS}s - possible hung mount; \
+                     backing off for {SWEEP_BACKOFF_SECS}s"
+                );
+                // Do NOT clear sweep_in_progress: the orphan blocking thread is
+                // still running on the hung FS and conceptually still owns the
+                // flag. Combined with the backoff_until gate at entry, this caps
+                // orphan-thread accumulation at 1 per backoff window instead of
+                // 1 per reaper heartbeat.
+                *self.sweep_backoff_until.lock().unwrap() = Some(
+                    std::time::Instant::now()
+                        + std::time::Duration::from_secs(SWEEP_BACKOFF_SECS),
+                );
+                return;
+            }
+        };
+        // Only update sessions whose dirs were successfully checked
+        let updates: Vec<(String, String, bool)> = sessions_with_dirs
+            .into_iter()
+            .filter_map(|(id, dir)| {
+                presence_map.get(&dir).map(|p| (id, dir.clone(), *p))
+            })
+            .collect();
+        if !updates.is_empty() {
+            let _ = self
+                .apply_and_execute(crate::daemon_protocol::Event::MarkWorktreePresence {
+                    updates,
+                })
+                .await;
+        }
+        // Always reset the dedup flag, even on early return or timeout
+        self.sweep_in_progress.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn persist_sessions_from(&self, sessions: &HashMap<String, Session>) {
@@ -1469,6 +1625,7 @@ impl AppState {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::daemon_protocol::Origin;
 
     // --- Pure functions ---
 
@@ -1695,6 +1852,7 @@ pub(crate) mod tests {
             iteration_log: vec![],
             last_iteration_at: Some(1_700_000_000),
             on_fire: Some(crate::scheduler::OnFire::NewSession),
+            worktree_present: Some(false),
         };
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -1778,6 +1936,11 @@ pub(crate) mod tests {
         assert!(s.metadata.worktree, "worktree preserved");
         assert!(!s.metadata.networked, "networked=false preserved");
         assert_eq!(s.metadata.iteration, 3, "iteration preserved");
+        assert_eq!(
+            s.metadata.worktree_present,
+            Some(false),
+            "worktree_present dropped by persist (issue #661)"
+        );
 
         // Full restart simulation: feed the persisted SessionMetadata back
         // through metadata_to_session_meta (the function apply_persisted
@@ -1796,6 +1959,7 @@ pub(crate) mod tests {
         assert!(hydrated.on_fire.is_some());
         assert_eq!(hydrated.last_iteration_at, Some(1_700_000_000));
         assert_eq!(hydrated.last_metadata_update, Some(1_700_000_100));
+        assert_eq!(hydrated.worktree_present, Some(false));
     }
 
     #[tokio::test]
@@ -2182,5 +2346,271 @@ pub(crate) mod tests {
         }
 
         assert!(state.collect_excess_idle_sessions().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sweep_worktree_presence_sets_true_for_existing_dir() {
+        let state = AppState::new_for_test();
+        let tempdir = tempfile::tempdir().unwrap();
+        let project_dir = tempdir.path().to_str().unwrap().to_string();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "local/s1".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "local/s1".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        project_dir: Some(project_dir.clone()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+        state.sweep_worktree_presence().await;
+        {
+            let proto = state.protocol.read().await;
+            let session = proto.sessions.get("local/s1").unwrap();
+            assert_eq!(
+                session.metadata.worktree_present,
+                Some(true),
+                "existing dir should show as present"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_worktree_presence_sets_false_for_missing_dir() {
+        let state = AppState::new_for_test();
+        let missing_dir = "/tmp/ouija-test-nonexistent-dir-12345".to_string();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "local/s1".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "local/s1".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        project_dir: Some(missing_dir.clone()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+        state.sweep_worktree_presence().await;
+        {
+            let proto = state.protocol.read().await;
+            let session = proto.sessions.get("local/s1").unwrap();
+            assert_eq!(
+                session.metadata.worktree_present,
+                Some(false),
+                "missing dir should show as absent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_worktree_presence_skips_non_local() {
+        let state = AppState::new_for_test();
+        let tempdir = tempfile::tempdir().unwrap();
+        let project_dir = tempdir.path().to_str().unwrap().to_string();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "remote/s1".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "remote/s1".into(),
+                    pane: None,
+                    origin: Origin::Remote("npub1x".into()),
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        project_dir: Some(project_dir.clone()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+            proto.sessions.insert(
+                "local/s1".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "local/s1".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        project_dir: Some(project_dir),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+        state.sweep_worktree_presence().await;
+        {
+            let proto = state.protocol.read().await;
+            // Local session should be updated
+            let local = proto.sessions.get("local/s1").unwrap();
+            assert_eq!(local.metadata.worktree_present, Some(true));
+            // Remote session should be skipped (None)
+            let remote = proto.sessions.get("remote/s1").unwrap();
+            assert_eq!(remote.metadata.worktree_present, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_worktree_presence_respects_backoff_after_timeout() {
+        // Regression: when sweep_backoff_until is set and the window has not
+        // expired, sweep_worktree_presence must skip without doing any work
+        // and without touching sweep_in_progress (which is still held by the
+        // orphan blocking thread that triggered the timeout).
+        let state = AppState::new_for_test();
+        // Simulate a prior timeout: dedup flag stays held by the orphan,
+        // and backoff_until is set to the future.
+        state
+            .sweep_in_progress
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        *state.sweep_backoff_until.lock().unwrap() =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        let tempdir = tempfile::tempdir().unwrap();
+        let project_dir = tempdir.path().to_str().unwrap().to_string();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "local/s1".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "local/s1".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        project_dir: Some(project_dir),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+        state.sweep_worktree_presence().await;
+        {
+            let proto = state.protocol.read().await;
+            let session = proto.sessions.get("local/s1").unwrap();
+            assert_eq!(
+                session.metadata.worktree_present, None,
+                "sweep should be skipped during backoff window"
+            );
+        }
+        assert!(
+            state
+                .sweep_in_progress
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "sweep_in_progress flag must remain set during backoff (orphan thread still holds it)"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_worktree_presence_clears_expired_backoff_and_runs() {
+        // Regression: once the backoff window has elapsed, the next sweep entry
+        // clears sweep_backoff_until AND force-clears sweep_in_progress (the
+        // orphan thread is presumed permanently hung; we accept the cost of
+        // potentially accumulating one more orphan to keep sweeps alive).
+        let state = AppState::new_for_test();
+        state
+            .sweep_in_progress
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        *state.sweep_backoff_until.lock().unwrap() =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        let tempdir = tempfile::tempdir().unwrap();
+        let project_dir = tempdir.path().to_str().unwrap().to_string();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "local/s1".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "local/s1".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        project_dir: Some(project_dir),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+        state.sweep_worktree_presence().await;
+        {
+            let proto = state.protocol.read().await;
+            let session = proto.sessions.get("local/s1").unwrap();
+            assert_eq!(
+                session.metadata.worktree_present,
+                Some(true),
+                "sweep should run after backoff window expired"
+            );
+        }
+        assert!(
+            state.sweep_backoff_until.lock().unwrap().is_none(),
+            "backoff_until must be cleared once the window expires"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_worktree_presence_empty_snapshot_does_not_clear_dedup_flag() {
+        // Regression: when sessions_with_dirs is empty, the early return must NOT
+        // call sweep_in_progress.store(false). The flag is owned by whichever caller
+        // successfully ran swap(true); a caller that bypassed swap (because the
+        // session snapshot was empty during transient churn) has no claim on it.
+        // Clearing here would clobber a concurrent sweep's flag and let a subsequent
+        // sweep run in parallel, defeating the dedup invariant.
+        let state = AppState::new_for_test();
+        // Simulate a concurrent sweep mid-flight: another caller has acquired the flag.
+        state
+            .sweep_in_progress
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // No sessions registered, so sessions_with_dirs is empty.
+        state.sweep_worktree_presence().await;
+        // The flag must still be true: this caller never owned it.
+        assert!(
+            state
+                .sweep_in_progress
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "empty-snapshot early return must not clear sweep_in_progress flag it never owned"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_worktree_presence_follows_symlinks() {
+        let state = AppState::new_for_test();
+        let real_dir = tempfile::tempdir().unwrap();
+        let real_path = real_dir.path();
+        let symlink_path = real_path.join("symlink_to_dir");
+        std::os::unix::fs::symlink(real_path, &symlink_path).unwrap();
+        let project_dir = symlink_path.to_str().unwrap().to_string();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "local/s1".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "local/s1".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        project_dir: Some(project_dir),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+        state.sweep_worktree_presence().await;
+        {
+            let proto = state.protocol.read().await;
+            let session = proto.sessions.get("local/s1").unwrap();
+            assert_eq!(
+                session.metadata.worktree_present,
+                Some(true),
+                "symlink to existing dir should show as present"
+            );
+        }
     }
 }

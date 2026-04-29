@@ -2156,6 +2156,11 @@ pub async fn restart_session(
                     iteration_log: m.iteration_log.clone(),
                     last_iteration_at: m.last_iteration_at,
                     on_fire: m.on_fire.clone(),
+                    // Session is being freshly re-registered with a known
+                    // project_dir; let the next worktree sweep populate
+                    // presence rather than carrying a stale bit across
+                    // restart (the dir may have been recreated out of band).
+                    worktree_present: None,
                 },
                 None => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),
