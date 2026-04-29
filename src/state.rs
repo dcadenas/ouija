@@ -1182,7 +1182,10 @@ impl AppState {
                 .collect()
         };
         if sessions_with_dirs.is_empty() {
-            self.sweep_in_progress.store(false, std::sync::atomic::Ordering::Relaxed);
+            // Do NOT clear sweep_in_progress here: this caller never claimed the
+            // flag (the swap(true) acquire below comes after this check), so it
+            // has no business releasing it. Clearing would clobber a concurrent
+            // sweep's claim and let a subsequent sweep run in parallel.
             return;
         }
         // Dedup: skip if a prior sweep is still running
@@ -2411,6 +2414,30 @@ pub(crate) mod tests {
             let remote = proto.sessions.get("remote/s1").unwrap();
             assert_eq!(remote.metadata.worktree_present, None);
         }
+    }
+
+    #[tokio::test]
+    async fn sweep_worktree_presence_empty_snapshot_does_not_clear_dedup_flag() {
+        // Regression: when sessions_with_dirs is empty, the early return must NOT
+        // call sweep_in_progress.store(false). The flag is owned by whichever caller
+        // successfully ran swap(true); a caller that bypassed swap (because the
+        // session snapshot was empty during transient churn) has no claim on it.
+        // Clearing here would clobber a concurrent sweep's flag and let a subsequent
+        // sweep run in parallel, defeating the dedup invariant.
+        let state = AppState::new_for_test();
+        // Simulate a concurrent sweep mid-flight: another caller has acquired the flag.
+        state
+            .sweep_in_progress
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // No sessions registered, so sessions_with_dirs is empty.
+        state.sweep_worktree_presence().await;
+        // The flag must still be true: this caller never owned it.
+        assert!(
+            state
+                .sweep_in_progress
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "empty-snapshot early return must not clear sweep_in_progress flag it never owned"
+        );
     }
 
     #[tokio::test]
