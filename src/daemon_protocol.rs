@@ -1080,7 +1080,7 @@ impl DaemonState {
     /// and a single [`Effect::BroadcastSessionList`] cover the whole batch
     /// instead of one per pruned session.
     fn apply_prune_stale_many(&mut self, sessions: Vec<(String, String)>) -> Vec<Effect> {
-        let mut effects = Vec::new();
+        let mut tail = Vec::new();
         let mut any_removed = false;
         for (id, expected_dir) in sessions {
             let sub_effects = self.apply_remove_if_stale(&id, Some(&expected_dir));
@@ -1089,14 +1089,21 @@ impl DaemonState {
                     Effect::Persist | Effect::BroadcastSessionList => {
                         any_removed = true;
                     }
-                    other => effects.push(other),
+                    other => tail.push(other),
                 }
             }
         }
-        if any_removed {
-            effects.push(Effect::Persist);
-            effects.push(Effect::BroadcastSessionList);
+        if !any_removed {
+            return tail;
         }
+        // Persist FIRST so on-disk state matches what we'll announce next; the
+        // single-session apply_remove path follows the same persist-then-announce
+        // ordering. Trailing BroadcastSessionList re-publishes the full session
+        // list once the batch has been persisted.
+        let mut effects = Vec::with_capacity(tail.len() + 2);
+        effects.push(Effect::Persist);
+        effects.extend(tail);
+        effects.push(Effect::BroadcastSessionList);
         effects
     }
 
@@ -3330,6 +3337,52 @@ mod tests {
             .filter(|e| matches!(e, Effect::RemoveOk { .. }))
             .count();
         assert_eq!(remove_ok_count, 3, "should emit one RemoveOk per pruned session");
+    }
+
+    #[test]
+    fn prune_stale_many_persists_before_per_session_broadcasts() {
+        // Regression: in the batched prune path, Effect::Persist must be the FIRST
+        // effect emitted (before any per-session Effect::Broadcast(SessionRemove)),
+        // and Effect::BroadcastSessionList must be the LAST. Mirrors single-session
+        // apply_remove's persist-then-announce ordering. The previous batched
+        // implementation appended Persist after all per-session effects, so a
+        // daemon crash between the last wire SessionRemove broadcast and Persist
+        // would leave peers' state ahead of on-disk state.
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        register_stale_session(&mut state, "s1", "/tmp/gone1", "%1");
+        register_stale_session(&mut state, "s2", "/tmp/gone2", "%2");
+        let effects = state.apply(Event::PruneStale {
+            sessions: vec![
+                ("s1".into(), "/tmp/gone1".into()),
+                ("s2".into(), "/tmp/gone2".into()),
+            ],
+        });
+        let persist_idx = effects
+            .iter()
+            .position(|e| matches!(e, Effect::Persist))
+            .expect("Persist must be emitted on any-success batch");
+        let first_remove_broadcast = effects
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    Effect::Broadcast(crate::protocol::WireMessage::SessionRemove { .. })
+                )
+            })
+            .expect("Broadcast(SessionRemove) must be emitted for each pruned session");
+        let broadcast_list_idx = effects
+            .iter()
+            .position(|e| matches!(e, Effect::BroadcastSessionList))
+            .expect("BroadcastSessionList must be emitted on any-success batch");
+        assert!(
+            persist_idx < first_remove_broadcast,
+            "Persist (idx {persist_idx}) must precede first Broadcast(SessionRemove) (idx {first_remove_broadcast}); \
+             single-session apply_remove persists before announcing, batched path must match"
+        );
+        assert!(
+            first_remove_broadcast < broadcast_list_idx,
+            "per-session Broadcast(SessionRemove) (idx {first_remove_broadcast}) must precede final BroadcastSessionList (idx {broadcast_list_idx})"
+        );
     }
 
     #[test]
