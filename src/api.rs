@@ -1949,16 +1949,14 @@ pub async fn prune_stale_sessions(
             _ => None,
         })
         .collect();
-    // Bucket failures by reading the RemoveFailed reason (which apply_remove_if_stale
-    // distinguishes between 'not found' and the various guard-tripped cases) instead of
-    // re-querying state via contains_key. The state-read approach was racy: a concurrent
-    // Register could re-insert a vanished id between the apply and the read, flipping
-    // an `already_gone` outcome into `errors`.
+    // Bucket failures via the structured RemoveFailureKind discriminator —
+    // never via reason substring matching (which would misclassify any session
+    // id or project_dir that happens to contain a substring like "not found").
     let already_gone_set: std::collections::HashSet<String> = effects
         .iter()
         .filter_map(|e| match e {
-            crate::daemon_protocol::Effect::RemoveFailed { id, reason }
-                if reason.contains("not found") =>
+            crate::daemon_protocol::Effect::RemoveFailed { id, kind, .. }
+                if *kind == crate::daemon_protocol::RemoveFailureKind::NotFound =>
             {
                 Some(id.clone())
             }

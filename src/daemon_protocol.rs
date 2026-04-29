@@ -329,6 +329,23 @@ pub enum Event {
 // --- Effects ---
 
 /// Side effects returned by apply(). Values, not actions.
+/// Structured discriminator for `Effect::RemoveFailed`. Used by callers
+/// (notably the prune-stale-sessions API handler) to classify outcomes
+/// without parsing free-form reason strings — which would misclassify
+/// any session id or project_dir that happens to contain a substring
+/// matching one of the categories.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemoveFailureKind {
+    /// Session id is not present in the protocol state.
+    NotFound,
+    /// Session origin is not Local (Remote/Human cannot be removed by the operator).
+    NotLocal,
+    /// Session worktree_present is not Some(false) — worktree is live or unknown.
+    NotStale,
+    /// TOCTOU project_dir mismatch between snapshot and apply.
+    ProjectDirMismatch,
+}
+
 /// The runtime executes them. The model inspects or ignores them.
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -472,6 +489,9 @@ pub enum Effect {
         /// outcomes (pruned vs already_gone vs errors) without parsing
         /// `reason` strings or relying on effect iteration order.
         id: String,
+        /// Structured discriminator for the failure category. Use this to
+        /// classify outcomes; `reason` is human-readable diagnostic only.
+        kind: RemoveFailureKind,
         reason: String,
     },
     CleanupWorktree {
@@ -942,6 +962,7 @@ impl DaemonState {
             Some(_) => {
                 effects.push(Effect::RemoveFailed {
                     id: id.to_string(),
+                    kind: RemoveFailureKind::NotLocal,
                     reason: format!("cannot remove remote session '{id}'"),
                 });
                 return effects;
@@ -949,6 +970,7 @@ impl DaemonState {
             None => {
                 effects.push(Effect::RemoveFailed {
                     id: id.to_string(),
+                    kind: RemoveFailureKind::NotFound,
                     reason: format!("session '{id}' not found"),
                 });
                 return effects;
@@ -1037,6 +1059,7 @@ impl DaemonState {
                 if !matches!(session.origin, Origin::Local) {
                     return vec![Effect::RemoveFailed {
                         id: id.to_string(),
+                        kind: RemoveFailureKind::NotLocal,
                         reason: format!("cannot prune remote session '{id}'"),
                     }];
                 }
@@ -1045,6 +1068,7 @@ impl DaemonState {
                     if session.metadata.project_dir.as_ref() != Some(&exp_dir.to_string()) {
                         return vec![Effect::RemoveFailed {
                             id: id.to_string(),
+                            kind: RemoveFailureKind::ProjectDirMismatch,
                             reason: format!(
                                 "session '{id}' project_dir mismatch (expected {}, got {:?})",
                                 exp_dir, session.metadata.project_dir
@@ -1055,6 +1079,7 @@ impl DaemonState {
                 if session.metadata.worktree_present != Some(false) {
                     return vec![Effect::RemoveFailed {
                         id: id.to_string(),
+                        kind: RemoveFailureKind::NotStale,
                         reason: format!(
                             "session '{id}' is not stale (worktree_present={:?}); refusing to prune",
                             session.metadata.worktree_present
@@ -1065,6 +1090,7 @@ impl DaemonState {
             None => {
                 return vec![Effect::RemoveFailed {
                     id: id.to_string(),
+                    kind: RemoveFailureKind::NotFound,
                     reason: format!("session '{id}' not found"),
                 }];
             }
@@ -3449,6 +3475,110 @@ mod tests {
     }
 
     #[test]
+    fn remove_failed_kind_distinguishes_failures_regardless_of_substring() {
+        // Regression: bucketing on `reason.contains("not found")` misclassified
+        // failures whenever the interpolated id or project_dir happened to
+        // contain that substring. A structured RemoveFailureKind discriminator
+        // makes the classification unambiguous regardless of id/path content.
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+
+        // Case A: missing session — kind must be NotFound regardless of substring in id
+        let effects = state.apply(Event::RemoveIfStale {
+            id: "card-not-found-test-1".into(),
+            expected_project_dir: None,
+        });
+        let kind = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::RemoveFailed { kind, .. } => Some(kind.clone()),
+                _ => None,
+            })
+            .expect("RemoveFailed must be emitted for missing session");
+        assert_eq!(
+            kind,
+            RemoveFailureKind::NotFound,
+            "missing session must produce NotFound kind"
+        );
+
+        // Case B: live session — kind must be NotStale even if id contains 'not-found'
+        state.apply(Event::Register {
+            id: "live-not-found-id".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/live".into()),
+                worktree_present: Some(true),
+                ..Default::default()
+            },
+        });
+        let effects = state.apply(Event::RemoveIfStale {
+            id: "live-not-found-id".into(),
+            expected_project_dir: Some("/tmp/live".into()),
+        });
+        let kind = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::RemoveFailed { kind, .. } => Some(kind.clone()),
+                _ => None,
+            })
+            .expect("RemoveFailed must be emitted for live session");
+        assert_eq!(
+            kind,
+            RemoveFailureKind::NotStale,
+            "live session with 'not-found' in id must produce NotStale, NOT NotFound"
+        );
+
+        // Case C: project_dir mismatch — kind must be ProjectDirMismatch even if path contains 'not found'
+        register_stale_session(&mut state, "stale-1", "/tmp/has not found in path", "%2");
+        let effects = state.apply(Event::RemoveIfStale {
+            id: "stale-1".into(),
+            expected_project_dir: Some("/tmp/snapshot-was-different".into()),
+        });
+        let kind = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::RemoveFailed { kind, .. } => Some(kind.clone()),
+                _ => None,
+            })
+            .expect("RemoveFailed must be emitted for project_dir mismatch");
+        assert_eq!(
+            kind,
+            RemoveFailureKind::ProjectDirMismatch,
+            "project_dir mismatch must produce ProjectDirMismatch even when path contains 'not found' substring"
+        );
+
+        // Case D: non-Local origin — kind must be NotLocal
+        state.apply(Event::Register {
+            id: "remote-1".into(),
+            pane: None,
+            metadata: SessionMeta {
+                ..Default::default()
+            },
+        });
+        // Override origin to Remote post-registration (Register defaults to Local).
+        state
+            .sessions
+            .get_mut("remote-1")
+            .unwrap()
+            .origin = Origin::Remote("npub1xyz".into());
+        let effects = state.apply(Event::RemoveIfStale {
+            id: "remote-1".into(),
+            expected_project_dir: None,
+        });
+        let kind = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::RemoveFailed { kind, .. } => Some(kind.clone()),
+                _ => None,
+            })
+            .expect("RemoveFailed must be emitted for non-Local session");
+        assert_eq!(
+            kind,
+            RemoveFailureKind::NotLocal,
+            "remote session must produce NotLocal kind"
+        );
+    }
+
+    #[test]
     fn prune_stale_failed_effects_carry_session_id() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
         register_stale_session(&mut state, "stale", "/tmp/gone", "%1");
@@ -3471,11 +3601,11 @@ mod tests {
         // Each failure must carry the session id so callers can pair without
         // parsing reason strings or relying on iteration order.
         let live_failure = effects.iter().find_map(|e| match e {
-            Effect::RemoveFailed { id, reason } if id == "live" => Some(reason.clone()),
+            Effect::RemoveFailed { id, reason, .. } if id == "live" => Some(reason.clone()),
             _ => None,
         });
         let missing_failure = effects.iter().find_map(|e| match e {
-            Effect::RemoveFailed { id, reason } if id == "missing" => Some(reason.clone()),
+            Effect::RemoveFailed { id, reason, .. } if id == "missing" => Some(reason.clone()),
             _ => None,
         });
         let live_reason = live_failure.expect("live session must produce RemoveFailed { id: \"live\", .. }");
