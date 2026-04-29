@@ -161,6 +161,13 @@ pub struct AppState {
     pub perfire_worktree_panes: RwLock<HashMap<String, String>>,
     /// Dedup: prevents concurrent sweeps from accumulating hung blocking threads.
     sweep_in_progress: std::sync::atomic::AtomicBool,
+    /// Backoff gate after a sweep timeout. When `Some(t)`, sweeps are skipped
+    /// until `Instant::now() >= t`. The orphan blocking thread from a timed-out
+    /// sweep keeps `sweep_in_progress = true`; this gate prevents subsequent
+    /// sweeps from clearing the dedup claim and spawning another orphan on every
+    /// heartbeat. After the window expires, the next entry clears both the
+    /// backoff and the dedup flag, accepting one more orphan to retain liveness.
+    sweep_backoff_until: std::sync::Mutex<Option<std::time::Instant>>,
     pub backends: crate::backend::BackendRegistry,
     pub http_client: reqwest::Client,
     /// Queued prompts for HttpApi sessions awaiting a readiness signal.
@@ -384,6 +391,7 @@ impl AppState {
             cached_assistant_panes: RwLock::new(Vec::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
             sweep_in_progress: std::sync::atomic::AtomicBool::new(false),
+            sweep_backoff_until: std::sync::Mutex::new(None),
             backends: crate::backend::BackendRegistry::default_registry(),
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -417,6 +425,7 @@ impl AppState {
             cached_assistant_panes: RwLock::new(Vec::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
             sweep_in_progress: std::sync::atomic::AtomicBool::new(false),
+            sweep_backoff_until: std::sync::Mutex::new(None),
             backends: crate::backend::BackendRegistry::default_registry(),
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1169,6 +1178,24 @@ impl AppState {
     /// Snapshot (id, project_dir) pairs, deduplicate dirs, check existence
     /// via spawn_blocking, then dispatch MarkWorktreePresence event.
     pub async fn sweep_worktree_presence(self: &Arc<Self>) {
+        // Backoff gate: if a prior sweep timed out and the cooldown is still
+        // active, skip without acquiring the dedup flag (the orphan blocking
+        // thread that triggered the timeout still holds it). Once the window
+        // has elapsed, force-clear both the backoff and the dedup flag — the
+        // orphan thread is presumed permanently hung; the next sweep accepts
+        // the risk of accumulating one more orphan to keep the feature alive.
+        {
+            let mut backoff = self.sweep_backoff_until.lock().unwrap();
+            if let Some(until) = *backoff {
+                if std::time::Instant::now() < until {
+                    tracing::debug!("worktree sweep in backoff window after recent timeout, skipping");
+                    return;
+                }
+                *backoff = None;
+                self.sweep_in_progress
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         let sessions_with_dirs: Vec<(String, String)> = {
             let proto = self.protocol.read().await;
             proto
@@ -1207,6 +1234,11 @@ impl AppState {
         // Only mark presence on clean ENOENT success/failure; other errors skip the session
         // Wrap in timeout to prevent hung NFS/FUSE mounts from blocking the reaper
         const SWEEP_TIMEOUT_SECS: u64 = 30;
+        // Backoff after a timeout: orphan blocking threads keep running on the
+        // hung FS until the mount unhangs (spawn_blocking is not cancellable).
+        // The backoff caps orphan accumulation rate at 1 per window instead of
+        // 1 per heartbeat (~5s).
+        const SWEEP_BACKOFF_SECS: u64 = 300;
         let unique_dirs = unique_dirs.clone();
         let presence_map: std::collections::HashMap<String, bool> = match tokio::time::timeout(
             std::time::Duration::from_secs(SWEEP_TIMEOUT_SECS),
@@ -1239,8 +1271,19 @@ impl AppState {
                 return;
             }
             Err(_) => {
-                tracing::warn!("worktree sweep timed out after {SWEEP_TIMEOUT_SECS}s - possible hung mount");
-                self.sweep_in_progress.store(false, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    "worktree sweep timed out after {SWEEP_TIMEOUT_SECS}s - possible hung mount; \
+                     backing off for {SWEEP_BACKOFF_SECS}s"
+                );
+                // Do NOT clear sweep_in_progress: the orphan blocking thread is
+                // still running on the hung FS and conceptually still owns the
+                // flag. Combined with the backoff_until gate at entry, this caps
+                // orphan-thread accumulation at 1 per backoff window instead of
+                // 1 per reaper heartbeat.
+                *self.sweep_backoff_until.lock().unwrap() = Some(
+                    std::time::Instant::now()
+                        + std::time::Duration::from_secs(SWEEP_BACKOFF_SECS),
+                );
                 return;
             }
         };
@@ -2414,6 +2457,101 @@ pub(crate) mod tests {
             let remote = proto.sessions.get("remote/s1").unwrap();
             assert_eq!(remote.metadata.worktree_present, None);
         }
+    }
+
+    #[tokio::test]
+    async fn sweep_worktree_presence_respects_backoff_after_timeout() {
+        // Regression: when sweep_backoff_until is set and the window has not
+        // expired, sweep_worktree_presence must skip without doing any work
+        // and without touching sweep_in_progress (which is still held by the
+        // orphan blocking thread that triggered the timeout).
+        let state = AppState::new_for_test();
+        // Simulate a prior timeout: dedup flag stays held by the orphan,
+        // and backoff_until is set to the future.
+        state
+            .sweep_in_progress
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        *state.sweep_backoff_until.lock().unwrap() =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        let tempdir = tempfile::tempdir().unwrap();
+        let project_dir = tempdir.path().to_str().unwrap().to_string();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "local/s1".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "local/s1".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        project_dir: Some(project_dir),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+        state.sweep_worktree_presence().await;
+        {
+            let proto = state.protocol.read().await;
+            let session = proto.sessions.get("local/s1").unwrap();
+            assert_eq!(
+                session.metadata.worktree_present, None,
+                "sweep should be skipped during backoff window"
+            );
+        }
+        assert!(
+            state
+                .sweep_in_progress
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "sweep_in_progress flag must remain set during backoff (orphan thread still holds it)"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_worktree_presence_clears_expired_backoff_and_runs() {
+        // Regression: once the backoff window has elapsed, the next sweep entry
+        // clears sweep_backoff_until AND force-clears sweep_in_progress (the
+        // orphan thread is presumed permanently hung; we accept the cost of
+        // potentially accumulating one more orphan to keep sweeps alive).
+        let state = AppState::new_for_test();
+        state
+            .sweep_in_progress
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        *state.sweep_backoff_until.lock().unwrap() =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        let tempdir = tempfile::tempdir().unwrap();
+        let project_dir = tempdir.path().to_str().unwrap().to_string();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "local/s1".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "local/s1".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        project_dir: Some(project_dir),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+        state.sweep_worktree_presence().await;
+        {
+            let proto = state.protocol.read().await;
+            let session = proto.sessions.get("local/s1").unwrap();
+            assert_eq!(
+                session.metadata.worktree_present,
+                Some(true),
+                "sweep should run after backoff window expired"
+            );
+        }
+        assert!(
+            state.sweep_backoff_until.lock().unwrap().is_none(),
+            "backoff_until must be cleared once the window expires"
+        );
     }
 
     #[tokio::test]
