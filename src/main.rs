@@ -1310,7 +1310,120 @@ fn preflight_checks() {
     }
 }
 
-fn stop_daemon() -> anyhow::Result<()> {
+const OUIJA_SYSTEMD_UNIT: &str = "ouija.service";
+
+#[derive(Debug, PartialEq, Eq)]
+struct DaemonStopPlan {
+    stop_systemd: bool,
+    stop_legacy: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DaemonLifecyclePlan {
+    LegacyOnly,
+    SystemdOnly,
+    SystemdAfterLegacyCleanup,
+}
+
+#[derive(Debug, Default)]
+struct LegacyStopOutcome {
+    tmux_killed: bool,
+    process_killed: bool,
+}
+
+impl LegacyStopOutcome {
+    fn stopped_anything(&self) -> bool {
+        self.tmux_killed || self.process_killed
+    }
+}
+
+#[derive(Debug, Default)]
+struct DaemonStopOutcome {
+    systemd_stopped: bool,
+    legacy: LegacyStopOutcome,
+}
+
+impl DaemonStopOutcome {
+    fn stopped_anything(&self) -> bool {
+        self.systemd_stopped || self.legacy.stopped_anything()
+    }
+}
+
+fn plan_daemon_stop(systemd_unit_available: bool) -> DaemonStopPlan {
+    DaemonStopPlan {
+        stop_systemd: systemd_unit_available,
+        // Preserve stop-server's user-facing contract: stop any ouija daemon,
+        // including old tmux/manual processes left behind during migration.
+        stop_legacy: true,
+    }
+}
+
+fn plan_supervised_lifecycle(
+    systemd_unit_available: bool,
+    systemd_unit_active: bool,
+) -> DaemonLifecyclePlan {
+    if !systemd_unit_available {
+        DaemonLifecyclePlan::LegacyOnly
+    } else if systemd_unit_active {
+        DaemonLifecyclePlan::SystemdOnly
+    } else {
+        DaemonLifecyclePlan::SystemdAfterLegacyCleanup
+    }
+}
+
+fn legacy_cleanup_settle_delay(plan: &DaemonLifecyclePlan) -> Option<std::time::Duration> {
+    match plan {
+        DaemonLifecyclePlan::SystemdAfterLegacyCleanup => Some(std::time::Duration::from_secs(1)),
+        DaemonLifecyclePlan::LegacyOnly | DaemonLifecyclePlan::SystemdOnly => None,
+    }
+}
+
+fn wait_for_legacy_cleanup_if_needed(plan: &DaemonLifecyclePlan) {
+    if let Some(delay) = legacy_cleanup_settle_delay(plan) {
+        std::thread::sleep(delay);
+    }
+}
+
+fn systemd_user_unit_available() -> bool {
+    use std::process::Command as Cmd;
+
+    Cmd::new("systemctl")
+        .args(["--user", "cat", OUIJA_SYSTEMD_UNIT])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn systemd_user_unit_active() -> bool {
+    use std::process::Command as Cmd;
+
+    Cmd::new("systemctl")
+        .args(["--user", "is-active", "--quiet", OUIJA_SYSTEMD_UNIT])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn systemctl_user(action: &str) -> anyhow::Result<()> {
+    use std::process::Command as Cmd;
+
+    let status = Cmd::new("systemctl")
+        .args(["--user", action, OUIJA_SYSTEMD_UNIT])
+        .status()
+        .with_context(|| format!("failed to run systemctl --user {action} {OUIJA_SYSTEMD_UNIT}"))?;
+    if !status.success() {
+        anyhow::bail!("systemctl --user {action} {OUIJA_SYSTEMD_UNIT} failed");
+    }
+    Ok(())
+}
+
+fn stop_legacy_daemon() -> LegacyStopOutcome {
     use std::process::Command as Cmd;
 
     // Kill the ouija-daemon tmux session if it exists
@@ -1328,7 +1441,143 @@ fn stop_daemon() -> anyhow::Result<()> {
         .map(|s| s.success())
         .unwrap_or(false);
 
-    if tmux_killed || pkill_killed {
+    LegacyStopOutcome {
+        tmux_killed,
+        process_killed: pkill_killed,
+    }
+}
+
+fn stop_daemon_processes_with(
+    systemd_available: bool,
+    systemd_active: bool,
+    mut stop_systemd: impl FnMut() -> anyhow::Result<()>,
+    mut stop_legacy: impl FnMut() -> LegacyStopOutcome,
+) -> anyhow::Result<DaemonStopOutcome> {
+    let plan = plan_daemon_stop(systemd_available);
+
+    let mut systemd_stopped = false;
+    let mut systemd_error = None;
+    if plan.stop_systemd {
+        match stop_systemd() {
+            Ok(()) => systemd_stopped = systemd_active,
+            Err(err) => systemd_error = Some(err),
+        }
+    }
+
+    let legacy = if plan.stop_legacy {
+        stop_legacy()
+    } else {
+        LegacyStopOutcome::default()
+    };
+
+    if let Some(err) = systemd_error {
+        return Err(err);
+    }
+
+    Ok(DaemonStopOutcome {
+        systemd_stopped,
+        legacy,
+    })
+}
+
+fn stop_daemon_processes() -> anyhow::Result<DaemonStopOutcome> {
+    let systemd_available = systemd_user_unit_available();
+    let systemd_active = systemd_available && systemd_user_unit_active();
+    stop_daemon_processes_with(
+        systemd_available,
+        systemd_active,
+        || systemctl_user("stop"),
+        stop_legacy_daemon,
+    )
+}
+
+fn spawn_legacy_daemon() -> anyhow::Result<()> {
+    use std::process::Command as Cmd;
+
+    Cmd::new("ouija")
+        .arg("start-server")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("failed to spawn ouija start-server")?;
+    Ok(())
+}
+
+fn start_daemon() -> anyhow::Result<()> {
+    let systemd_available = systemd_user_unit_available();
+    let systemd_active = systemd_available && systemd_user_unit_active();
+    let plan = plan_supervised_lifecycle(systemd_available, systemd_active);
+    match plan {
+        DaemonLifecyclePlan::LegacyOnly => spawn_legacy_daemon(),
+        DaemonLifecyclePlan::SystemdOnly => systemctl_user("start"),
+        DaemonLifecyclePlan::SystemdAfterLegacyCleanup => {
+            let _ = stop_legacy_daemon();
+            wait_for_legacy_cleanup_if_needed(&plan);
+            systemctl_user("start")
+        }
+    }
+}
+
+fn restart_daemon() -> anyhow::Result<()> {
+    let systemd_available = systemd_user_unit_available();
+    let systemd_active = systemd_available && systemd_user_unit_active();
+    let plan = plan_supervised_lifecycle(systemd_available, systemd_active);
+    match plan {
+        DaemonLifecyclePlan::LegacyOnly => {
+            let _ = stop_legacy_daemon();
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            spawn_legacy_daemon()
+        }
+        DaemonLifecyclePlan::SystemdOnly => systemctl_user("restart"),
+        DaemonLifecyclePlan::SystemdAfterLegacyCleanup => {
+            let _ = stop_legacy_daemon();
+            wait_for_legacy_cleanup_if_needed(&plan);
+            systemctl_user("restart")
+        }
+    }
+}
+
+fn daemon_http_alive(status_url: &str) -> bool {
+    use std::process::Command as Cmd;
+
+    Cmd::new("curl")
+        .args(["-sf", status_url])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn wait_for_daemon(status_url: &str) -> bool {
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if daemon_http_alive(status_url) {
+            return true;
+        }
+    }
+    false
+}
+
+fn sync_current_exe_from_cargo_bin() {
+    // Replace the running binary with the new one. We can't fs::copy over a
+    // running executable (ETXTBSY), but we can unlink it first — the kernel
+    // keeps the old inode alive for this process while the path becomes free.
+    let cargo_bin = std::env::var("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".cargo/bin/ouija"))
+        .unwrap_or_default();
+    let current_exe = std::env::current_exe().unwrap_or_default();
+    if cargo_bin.exists() && current_exe != cargo_bin && current_exe.exists() {
+        let _ = std::fs::remove_file(&current_exe);
+        if let Err(e) = std::fs::copy(&cargo_bin, &current_exe) {
+            eprintln!("warning: could not update {}: {e}", current_exe.display());
+        }
+    }
+}
+
+fn stop_daemon() -> anyhow::Result<()> {
+    let outcome = stop_daemon_processes()?;
+    if outcome.stopped_anything() {
         println!("ouija daemon stopped");
     } else {
         println!("no running daemon found");
@@ -1343,39 +1592,16 @@ fn update_and_restart() -> anyhow::Result<()> {
     let current = env!("CARGO_PKG_VERSION");
     let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
     let status_url = format!("http://localhost:{port}/api/status");
-    let daemon_alive = Cmd::new("curl")
-        .args(["-sf", &status_url])
-        .stdout(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let daemon_alive = daemon_http_alive(&status_url);
 
     if latest == current {
         println!("already on latest version ({current})");
         backend::claude_code::refresh_plugin_cache(&latest);
         if !daemon_alive {
             println!("daemon is not running — starting it...");
-            Cmd::new("ouija")
-                .arg("start-server")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .context("failed to spawn ouija start-server")?;
-            for i in 0..20 {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                if Cmd::new("curl")
-                    .args(["-sf", &status_url])
-                    .stdout(std::process::Stdio::null())
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false)
-                {
-                    break;
-                }
-                if i == 19 {
-                    eprintln!("warning: daemon did not start within 10s");
-                }
+            start_daemon()?;
+            if !wait_for_daemon(&status_url) {
+                eprintln!("warning: daemon did not start within 10s");
             }
         }
         println!("dashboard: http://localhost:{port}");
@@ -1407,51 +1633,17 @@ fn update_and_restart() -> anyhow::Result<()> {
         );
     }
 
+    sync_current_exe_from_cargo_bin();
+
     println!("restarting daemon...");
-    stop_daemon()?;
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    restart_daemon()?;
 
-    // Replace the running binary with the new one. We can't fs::copy over a
-    // running executable (ETXTBSY), but we can unlink it first — the kernel
-    // keeps the old inode alive for this process while the path becomes free.
-    let cargo_bin = std::env::var("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".cargo/bin/ouija"))
-        .unwrap_or_default();
-    let current_exe = std::env::current_exe().unwrap_or_default();
-    if cargo_bin.exists() && current_exe != cargo_bin && current_exe.exists() {
-        let _ = std::fs::remove_file(&current_exe);
-        if let Err(e) = std::fs::copy(&cargo_bin, &current_exe) {
-            eprintln!("warning: could not update {}: {e}", current_exe.display());
-        }
+    if wait_for_daemon(&status_url) {
+        println!("ouija updated to {latest} and running");
+        println!("dashboard: http://localhost:{port}");
+        return Ok(());
     }
-
-    Cmd::new("ouija")
-        .arg("start-server")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("failed to spawn ouija start-server")?;
-
-    let status_url = format!("http://localhost:{port}/api/status");
-    for i in 0..20 {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        if Cmd::new("curl")
-            .args(["-sf", &status_url])
-            .stdout(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            println!("ouija updated to {latest} and running");
-            println!("dashboard: http://localhost:{port}");
-            return Ok(());
-        }
-        if i == 19 {
-            anyhow::bail!("daemon did not start within 10s");
-        }
-    }
-    Ok(())
+    anyhow::bail!("daemon did not start within 10s")
 }
 
 /// Query crates.io for the latest version of a crate (including prereleases).
@@ -1853,5 +2045,85 @@ mod tests {
         use reqwest::StatusCode;
         let err = classify_http_response(StatusCode::BAD_REQUEST, "").unwrap_err();
         assert!(err.to_string().contains("400"));
+    }
+
+    #[test]
+    fn stop_plan_stops_systemd_and_legacy_when_unit_exists() {
+        let plan = plan_daemon_stop(true);
+        assert!(plan.stop_systemd);
+        assert!(
+            plan.stop_legacy,
+            "stop-server must still clean up stray legacy daemons when a unit exists"
+        );
+    }
+
+    #[test]
+    fn stop_plan_uses_legacy_only_without_systemd_unit() {
+        let plan = plan_daemon_stop(false);
+        assert!(!plan.stop_systemd);
+        assert!(plan.stop_legacy);
+    }
+
+    #[test]
+    fn supervised_lifecycle_uses_systemd_for_active_unit() {
+        assert_eq!(
+            plan_supervised_lifecycle(true, true),
+            DaemonLifecyclePlan::SystemdOnly
+        );
+    }
+
+    #[test]
+    fn supervised_lifecycle_cleans_legacy_before_inactive_unit_start() {
+        assert_eq!(
+            plan_supervised_lifecycle(true, false),
+            DaemonLifecyclePlan::SystemdAfterLegacyCleanup
+        );
+    }
+
+    #[test]
+    fn supervised_lifecycle_uses_legacy_without_systemd_unit() {
+        assert_eq!(
+            plan_supervised_lifecycle(false, false),
+            DaemonLifecyclePlan::LegacyOnly
+        );
+    }
+
+    #[test]
+    fn stop_daemon_processes_runs_legacy_cleanup_when_systemd_stop_fails() {
+        use std::cell::Cell;
+
+        let legacy_called = Cell::new(false);
+        let err = stop_daemon_processes_with(
+            true,
+            true,
+            || -> anyhow::Result<()> { anyhow::bail!("systemd stop failed") },
+            || {
+                legacy_called.set(true);
+                LegacyStopOutcome {
+                    tmux_killed: true,
+                    process_killed: false,
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(legacy_called.get());
+        assert!(err.to_string().contains("systemd stop failed"));
+    }
+
+    #[test]
+    fn systemd_after_legacy_cleanup_has_settle_delay() {
+        assert_eq!(
+            legacy_cleanup_settle_delay(&DaemonLifecyclePlan::SystemdAfterLegacyCleanup),
+            Some(std::time::Duration::from_secs(1))
+        );
+        assert_eq!(
+            legacy_cleanup_settle_delay(&DaemonLifecyclePlan::SystemdOnly),
+            None
+        );
+        assert_eq!(
+            legacy_cleanup_settle_delay(&DaemonLifecyclePlan::LegacyOnly),
+            None
+        );
     }
 }
