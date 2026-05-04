@@ -965,7 +965,7 @@ pub struct CompactBody {
 ///   returns — when the post-compact hook drains the parked continuation.
 /// - HTTP backends (e.g. OpenCode) call `POST /session/:id/summarize` on the
 ///   opencode serve with `{providerID, modelID}` resolved from the session's
-///   configured model (falling back to `/config/providers` defaults). The
+///   configured model (falling back to OpenCode's top-level `/config.model`). The
 ///   request is synchronous — it blocks until opencode's compaction loop
 ///   completes — so a 2xx response means the context has really been shrunk.
 ///   On success, the continuation (if any) is delivered as a fresh user turn
@@ -1155,15 +1155,20 @@ async fn compact_inner(
             };
 
             let Some((provider_id, model_id)) =
-                resolve_opencode_compact_model(state, lookup.model.as_deref()).await
+                resolve_opencode_compact_model(
+                    state,
+                    lookup.model.as_deref(),
+                    lookup.project_dir.as_deref(),
+                )
+                .await
             else {
                 return (
                     StatusCode::BAD_REQUEST,
                     json!({
                         "error": "cannot resolve provider/model for summarize: session has no parseable `model` \
-                                  (expected \"providerID/modelID\") and /config/providers is unreachable \
-                                  or empty. Configure the session with `ouija spawn-session --model <p/m>` \
-                                  or ensure opencode serve has at least one configured provider."
+                                  (expected \"providerID/modelID\") and /config is unreachable \
+                                  or has no top-level `model`. Configure the session with \
+                                  `ouija spawn-session --model <p/m>` or set OpenCode's default model."
                     }),
                 );
             };
@@ -2748,18 +2753,23 @@ fn parse_opencode_model(model: &str) -> Option<(String, String)> {
     Some((provider.to_string(), model_id.to_string()))
 }
 
+fn parse_opencode_config_model(config: &serde_json::Value) -> Option<(String, String)> {
+    config.get("model")?.as_str().and_then(parse_opencode_model)
+}
+
 /// Resolve `(providerID, modelID)` for the opencode `/session/:id/summarize`
 /// endpoint. First tries to parse the session's configured model (set via
 /// `ouija spawn-session --model`); if absent or unparseable, falls back to
-/// GET `/config/providers` and picks the first entry in the `default` map.
+/// GET `/config` and parses the top-level OpenCode `model` key.
 ///
 /// Returns `None` when neither source yields a pair — e.g. the session has no
-/// `model` and the opencode serve is unreachable or has no configured
-/// providers. Callers should surface this as a 400, since `/summarize` cannot
-/// be called without a concrete provider+model pair.
+/// `model` and the opencode serve is unreachable or has no configured default
+/// model. Callers should surface this as a 400, since `/summarize` cannot be
+/// called without a concrete provider+model pair.
 async fn resolve_opencode_compact_model(
     state: &std::sync::Arc<crate::state::AppState>,
     session_model: Option<&str>,
+    project_dir: Option<&str>,
 ) -> Option<(String, String)> {
     if let Some(m) = session_model
         && let Some(pair) = parse_opencode_model(m)
@@ -2768,11 +2778,15 @@ async fn resolve_opencode_compact_model(
     }
 
     let port = state.opencode_serve_port();
-    let url = format!("http://127.0.0.1:{port}/config/providers");
-    let resp = state
+    let url = format!("http://127.0.0.1:{port}/config");
+    let mut req = state
         .http_client
         .get(&url)
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(5));
+    if let Some(dir) = project_dir {
+        req = req.header("x-opencode-directory", dir);
+    }
+    let resp = req
         .send()
         .await
         .ok()?;
@@ -2780,15 +2794,7 @@ async fn resolve_opencode_compact_model(
         return None;
     }
     let body: serde_json::Value = resp.json().await.ok()?;
-    let default_map = body.get("default")?.as_object()?;
-    // `default` is a map from providerID → first-configured modelID. Picking
-    // `.next()` is non-deterministic across runs when multiple providers are
-    // configured, but for the summarize call any configured default is
-    // acceptable — the caller's preferred model (when set on the session)
-    // always takes precedence via the short-circuit above.
-    let (provider, model) = default_map.iter().next()?;
-    let model_id = model.as_str()?;
-    Some((provider.clone(), model_id.to_string()))
+    parse_opencode_config_model(&body)
 }
 
 /// Query the opencode serve for a session's directory, find the matching ouija
@@ -3106,7 +3112,7 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_probe".into()),
-                    // A parseable model short-circuits /config/providers, so
+                    // A parseable model short-circuits /config, so
                     // the 502 is specifically the /summarize failure rather
                     // than model-resolution failure (covered in a separate
                     // test below).
@@ -3220,7 +3226,7 @@ mod tests {
     #[tokio::test]
     async fn compact_oc_without_model_and_serve_unreachable_returns_400() {
         // If the session has no `model` AND opencode serve is unreachable
-        // (so /config/providers also can't supply a default), the endpoint
+        // (so /config also can't supply a default), the endpoint
         // cannot build a valid {providerID, modelID} body for /summarize.
         // It must reject with 400 up-front rather than reach a 502 — a 400
         // is the actionable signal for the operator ("configure a model").
@@ -3465,13 +3471,31 @@ mod tests {
         assert_eq!(parse_opencode_model("anthropic/   "), None);
     }
 
+    #[test]
+    fn parse_opencode_config_model_prefers_top_level_model_over_provider_default() {
+        let config = serde_json::json!({
+            "model": "openrouter/openai/gpt-5.5",
+            "providers": {
+                "default": {
+                    "openai": "gpt-5.5-pro"
+                }
+            }
+        });
+
+        assert_eq!(
+            parse_opencode_config_model(&config),
+            Some(("openrouter".into(), "openai/gpt-5.5".into()))
+        );
+    }
+
     #[tokio::test]
     async fn resolve_opencode_compact_model_uses_session_model_when_parseable() {
         // Session model is the primary source — when set and parseable, the
-        // helper must not even attempt the /config/providers HTTP call.
+        // helper must not even attempt the /config HTTP call.
         let state = crate::state::AppState::new_for_test();
         let result =
-            resolve_opencode_compact_model(&state, Some("anthropic/claude-sonnet-4-6")).await;
+            resolve_opencode_compact_model(&state, Some("anthropic/claude-sonnet-4-6"), None)
+                .await;
         assert_eq!(
             result,
             Some(("anthropic".into(), "claude-sonnet-4-6".into()))
@@ -3485,7 +3509,7 @@ mod tests {
         // fail → None. The compact endpoint must surface this as a 400 so
         // the caller knows summarize cannot proceed.
         let state = crate::state::AppState::new_for_test();
-        let result = resolve_opencode_compact_model(&state, None).await;
+        let result = resolve_opencode_compact_model(&state, None, None).await;
         assert_eq!(result, None);
     }
 
@@ -3493,10 +3517,54 @@ mod tests {
     async fn resolve_opencode_compact_model_falls_through_on_unparseable_session_model() {
         // An unparseable session model (e.g. bare "sonnet" with no provider
         // segment) must not be used as-is; the helper falls through to the
-        // /config/providers fallback rather than invent a providerID.
+        // /config fallback rather than invent a providerID.
         let state = crate::state::AppState::new_for_test();
-        let result = resolve_opencode_compact_model(&state, Some("sonnet")).await;
+        let result = resolve_opencode_compact_model(&state, Some("sonnet"), None).await;
         assert_eq!(result, None, "bare 'sonnet' must not be accepted as a pair");
+    }
+
+    #[tokio::test]
+    async fn resolve_opencode_compact_model_scopes_config_lookup_to_session_directory() {
+        use axum::Router;
+        use axum::http::HeaderMap;
+        use axum::routing::get;
+        use tokio::net::TcpListener;
+
+        async fn config(headers: HeaderMap) -> Json<serde_json::Value> {
+            let model = match headers
+                .get("x-opencode-directory")
+                .and_then(|v| v.to_str().ok())
+            {
+                Some("/tmp/project-a") => "openrouter/openai/gpt-5.5",
+                _ => "openai/gpt-5.5-pro",
+            };
+            Json(serde_json::json!({ "model": model }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_port = listener.local_addr().unwrap().port();
+        assert!(serve_port >= 320, "test listener port must be >= 320");
+        let app = Router::new().route("/config", get(config));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: serve_port - 320,
+            data_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+            config_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+        });
+
+        let result = resolve_opencode_compact_model(&state, None, Some("/tmp/project-a")).await;
+
+        server.abort();
+        assert_eq!(
+            result,
+            Some(("openrouter".into(), "openai/gpt-5.5".into())),
+            "resolver must use the target session directory's OpenCode config model"
+        );
     }
 
     // --- auto_provision_from_backend_session (issue #35) ---
