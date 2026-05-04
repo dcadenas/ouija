@@ -10,22 +10,22 @@ COMPOSE_OPTS="up --build --abort-on-container-exit --exit-code-from tests"
 
 run_local() {
     echo "=== Running local e2e tests ==="
-    docker compose -f "$COMPOSE_LOCAL" $COMPOSE_OPTS
+    docker compose -p ouija-e2e-local -f "$COMPOSE_LOCAL" $COMPOSE_OPTS
 }
 
 run_nostr() {
     echo "=== Running nostr e2e tests ==="
-    docker compose -f "$COMPOSE_NOSTR" $COMPOSE_OPTS
+    docker compose -p ouija-e2e-nostr -f "$COMPOSE_NOSTR" $COMPOSE_OPTS
 }
 
 run_install() {
     echo "=== Running install e2e tests ==="
-    docker compose -f "$COMPOSE_INSTALL" $COMPOSE_OPTS
+    docker compose -p ouija-e2e-install -f "$COMPOSE_INSTALL" $COMPOSE_OPTS
 }
 
 run_opencode() {
     echo "=== Running opencode e2e tests ==="
-    docker compose -f "$COMPOSE_OPENCODE" $COMPOSE_OPTS
+    docker compose -p ouija-e2e-opencode -f "$COMPOSE_OPENCODE" $COMPOSE_OPTS
 }
 
 run_parallel() {
@@ -35,11 +35,11 @@ run_parallel() {
     local opencode_log=$(mktemp)
     local local_ok=0 nostr_ok=0 opencode_ok=0
 
-    docker compose -f "$COMPOSE_LOCAL" $COMPOSE_OPTS >"$local_log" 2>&1 &
+    docker compose -p ouija-e2e-local -f "$COMPOSE_LOCAL" $COMPOSE_OPTS >"$local_log" 2>&1 &
     local local_pid=$!
-    docker compose -f "$COMPOSE_NOSTR" $COMPOSE_OPTS >"$nostr_log" 2>&1 &
+    docker compose -p ouija-e2e-nostr -f "$COMPOSE_NOSTR" $COMPOSE_OPTS >"$nostr_log" 2>&1 &
     local nostr_pid=$!
-    docker compose -f "$COMPOSE_OPENCODE" $COMPOSE_OPTS >"$opencode_log" 2>&1 &
+    docker compose -p ouija-e2e-opencode -f "$COMPOSE_OPENCODE" $COMPOSE_OPTS >"$opencode_log" 2>&1 &
     local opencode_pid=$!
 
     wait $local_pid && local_ok=1 || true
