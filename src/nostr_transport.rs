@@ -1711,10 +1711,14 @@ pub async fn start_session(
                                         "start_session: prompt_async returned {}",
                                         r.status()
                                     );
+                                    let _ = deliver_prompt_fallback(
+                                        &state2, &name2, &pane2, &injected, false,
+                                    )
+                                    .await;
                                 }
                                 Err(e) => {
                                     tracing::warn!("start_session: prompt_async failed: {e}");
-                                    let _ = crate::tmux::locked_inject(
+                                    let _ = deliver_prompt_fallback(
                                         &state2, &name2, &pane2, &injected, false,
                                     )
                                     .await;
@@ -2805,9 +2809,32 @@ pub(crate) fn schedule_prompt_injection(
         let pending = state.pending_prompts.lock().unwrap().remove(&name);
         if let Some((pane, text)) = pending {
             tracing::info!("readiness timeout for {name}, delivering prompt via fallback");
-            let _ = crate::tmux::locked_inject(&state, &name, &pane, &text, false).await;
+            let _ = deliver_prompt_fallback(&state, &name, &pane, &text, false).await;
         }
     });
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptFallbackDelivery {
+    RawTmux,
+}
+
+fn prompt_fallback_delivery() -> PromptFallbackDelivery {
+    PromptFallbackDelivery::RawTmux
+}
+
+async fn deliver_prompt_fallback(
+    state: &AppState,
+    session_id: &str,
+    pane: &str,
+    text: &str,
+    vim_mode: bool,
+) -> anyhow::Result<()> {
+    match prompt_fallback_delivery() {
+        PromptFallbackDelivery::RawTmux => {
+            crate::tmux::locked_inject_raw_tmux(state, session_id, pane, text, vim_mode).await
+        }
+    }
 }
 
 /// Send a plain-text NIP-17 DM to a human's npub.
@@ -3318,6 +3345,11 @@ mod tests {
             cmd,
             "opencode attach http://127.0.0.1:8200 --session ses_test --dir '/tmp/project with spaces'"
         );
+    }
+
+    #[test]
+    fn prompt_async_fallback_uses_raw_tmux_delivery() {
+        assert_eq!(prompt_fallback_delivery(), PromptFallbackDelivery::RawTmux);
     }
 
     #[test]
