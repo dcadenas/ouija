@@ -741,10 +741,15 @@ pub async fn send_msg(
         }
         _ => None,
     }) {
+        let status = if method == "http" {
+            "accepted"
+        } else {
+            "delivered"
+        };
         (
             StatusCode::OK,
             Json(json!({
-                "status": "delivered",
+                "status": status,
                 "method": method,
                 "msg_id": msg_id,
             })),
@@ -3171,6 +3176,129 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "injected");
         assert_eq!(body["delivery"], "tmux");
+    }
+
+    #[tokio::test]
+    async fn send_to_adopted_opencode_live_pane_reports_tmux_delivery() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-live".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = send_msg(
+            State(state),
+            Json(SendBody {
+                from: "sender".into(),
+                to: "oc-live".into(),
+                message: "hello live pane".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "delivered");
+        assert_eq!(body["method"], "tmux");
+    }
+
+    #[tokio::test]
+    async fn send_to_strong_opencode_binding_reports_http_acceptance() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-managed".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(
+                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                    ),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = send_msg(
+            State(state),
+            Json(SendBody {
+                from: "sender".into(),
+                to: "oc-managed".into(),
+                message: "hello http".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "accepted");
+        assert_eq!(body["method"], "http");
+    }
+
+    #[tokio::test]
+    async fn send_to_headless_opencode_session_reports_http_acceptance() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-headless".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = send_msg(
+            State(state),
+            Json(SendBody {
+                from: "sender".into(),
+                to: "oc-headless".into(),
+                message: "hello headless".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "accepted");
+        assert_eq!(body["method"], "http");
     }
 
     #[tokio::test]

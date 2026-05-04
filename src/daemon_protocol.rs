@@ -93,6 +93,12 @@ pub struct SessionMeta {
     pub backend_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
+    /// Strength of an OpenCode backend-session binding.
+    ///
+    /// `None` is treated as weak for backward compatibility with adopted
+    /// sessions whose visible TUI may not match `backend_session_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_binding: Option<OpenCodeBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_description: Option<String>,
     /// Unix timestamp; 0 in model tests.
@@ -153,10 +159,22 @@ pub struct SessionMeta {
     pub worktree_present: Option<bool>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenCodeBinding {
+    StrongManaged,
+    WeakAdopted,
+}
+
 /// Metadata becomes stale after 30 minutes without an update.
 const METADATA_STALE_SECS: i64 = 1800;
 
 impl SessionMeta {
+    pub fn is_strong_opencode_binding(&self) -> bool {
+        self.backend.as_deref() == Some("opencode")
+            && self.opencode_binding == Some(OpenCodeBinding::StrongManaged)
+    }
+
     /// Returns `true` if metadata has never been explicitly set or is older than 30 minutes.
     pub fn is_stale(&self) -> bool {
         match self.last_metadata_update {
@@ -226,6 +244,7 @@ impl Default for SessionMeta {
             vim_mode: false,
             backend_session_id: None,
             backend: None,
+            opencode_binding: None,
             project_description: None,
             last_metadata_update: None,
             model: None,
@@ -376,6 +395,10 @@ pub enum Effect {
         pane: String,
         message: String,
         vim_mode: bool,
+    },
+    DeliverHttpMessage {
+        session_id: String,
+        message: String,
     },
 
     // Agents
@@ -570,6 +593,7 @@ fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>) -> Sessio
             vim_mode: m.vim_mode,
             backend_session_id: m.backend_session_id.clone(),
             backend: m.backend.clone(),
+            opencode_binding: m.opencode_binding.clone(),
             project_description: m.project_description.clone(),
             last_metadata_update: m.last_metadata_update.map(|ts| ts.timestamp()),
             model: m.model.clone(),
@@ -1860,7 +1884,7 @@ impl DaemonState {
                     }
                     // Report actual delivery method based on backend type
                     let transport = match session.metadata.backend.as_deref() {
-                        Some("opencode") => "http",
+                        Some("opencode") if session.metadata.is_strong_opencode_binding() => "http",
                         _ => "tmux",
                     };
                     effects.push(Effect::LogMessage {
@@ -1877,12 +1901,56 @@ impl DaemonState {
                         msg_id,
                     });
                 } else {
-                    effects.push(Effect::SendFailed {
-                        from: from.to_string(),
-                        to: to.to_string(),
-                        reason: "session has no tmux pane".into(),
-                        renamed_to: None,
-                    });
+                    if session.metadata.backend.as_deref() == Some("opencode")
+                        && session.metadata.backend_session_id.is_some()
+                    {
+                        let formatted = format_session_message(
+                            from,
+                            message,
+                            expects_reply,
+                            msg_id,
+                            responds_to,
+                            done,
+                        );
+                        effects.push(Effect::DeliverHttpMessage {
+                            session_id: resolved_to.clone(),
+                            message: formatted,
+                        });
+
+                        if expects_reply {
+                            self.pending_replies
+                                .entry(resolved_to.clone())
+                                .or_default()
+                                .push(PendingReplyEntry {
+                                    msg_id,
+                                    from: from.to_string(),
+                                    message: message.to_string(),
+                                    received_at: chrono::Utc::now().timestamp(),
+                                    last_activity: chrono::Utc::now().timestamp(),
+                                    in_progress: false,
+                                });
+                        }
+                        effects.push(Effect::LogMessage {
+                            from: from.to_string(),
+                            to: resolved_to.clone(),
+                            message: message.to_string(),
+                            delivered: true,
+                            transport: "http".into(),
+                        });
+                        effects.push(Effect::SendDelivered {
+                            from: from.to_string(),
+                            to: resolved_to,
+                            method: "http".into(),
+                            msg_id,
+                        });
+                    } else {
+                        effects.push(Effect::SendFailed {
+                            from: from.to_string(),
+                            to: to.to_string(),
+                            reason: "session has no tmux pane".into(),
+                            renamed_to: None,
+                        });
+                    }
                 }
             }
             Origin::Remote(_) => {
@@ -3933,7 +4001,7 @@ mod tests {
     }
 
     #[test]
-    fn send_to_opencode_session_reports_http_method() {
+    fn send_to_weak_opencode_session_reports_tmux_method() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
         state.apply(Event::Register {
             id: "sender".into(),
@@ -3956,13 +4024,51 @@ mod tests {
             responds_to: None,
             done: false,
         });
-        // SendDelivered should report method="http" for opencode backend
+        // Adopted OpenCode sessions default to weak bindings, so the visible
+        // pane is safer than prompt_async.
+        let delivered = effects.iter().find_map(|e| match e {
+            Effect::SendDelivered { method, .. } => Some(method.clone()),
+            _ => None,
+        });
+        assert_eq!(delivered, Some("tmux".into()));
+        let log_transport = effects.iter().find_map(|e| match e {
+            Effect::LogMessage { transport, .. } => Some(transport.clone()),
+            _ => None,
+        });
+        assert_eq!(log_transport, Some("tmux".into()));
+    }
+
+    #[test]
+    fn send_to_strong_opencode_session_reports_http_method() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "sender".into(),
+            pane: Some("%1".into()),
+            metadata: Default::default(),
+        });
+        state.apply(Event::Register {
+            id: "oc-target".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_oc".into()),
+                opencode_binding: Some(OpenCodeBinding::StrongManaged),
+                ..Default::default()
+            },
+        });
+        let effects = state.apply(Event::Send {
+            from: "sender".into(),
+            to: "oc-target".into(),
+            message: "hello".into(),
+            expects_reply: false,
+            responds_to: None,
+            done: false,
+        });
         let delivered = effects.iter().find_map(|e| match e {
             Effect::SendDelivered { method, .. } => Some(method.clone()),
             _ => None,
         });
         assert_eq!(delivered, Some("http".into()));
-        // LogMessage should also report transport="http"
         let log_transport = effects.iter().find_map(|e| match e {
             Effect::LogMessage { transport, .. } => Some(transport.clone()),
             _ => None,

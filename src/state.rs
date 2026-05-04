@@ -221,6 +221,9 @@ pub struct SessionMetadata {
     /// Which coding assistant backend this session uses (e.g. "claude-code").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
+    /// Strength of an OpenCode backend-session binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_binding: Option<crate::daemon_protocol::OpenCodeBinding>,
     /// Short project description extracted from Cargo.toml, package.json, or README.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_description: Option<String>,
@@ -295,6 +298,7 @@ impl Default for SessionMetadata {
             last_metadata_update: None,
             backend_session_id: None,
             backend: None,
+            opencode_binding: None,
             project_description: None,
             bulletin: None,
             worktree: false,
@@ -599,8 +603,53 @@ impl AppState {
                     message,
                     vim_mode,
                 } => {
-                    let _ = crate::tmux::locked_inject(self, session_id, pane, message, *vim_mode)
+                    let use_raw_tmux = {
+                        let proto = self.protocol.read().await;
+                        proto.sessions.get(session_id).is_some_and(|s| {
+                            s.metadata.backend.as_deref() == Some("opencode")
+                                && !s.metadata.is_strong_opencode_binding()
+                        })
+                    };
+                    let result = if use_raw_tmux {
+                        crate::tmux::locked_inject_raw_tmux(
+                            self, session_id, pane, message, *vim_mode,
+                        )
+                        .await
+                    } else {
+                        crate::tmux::locked_inject(self, session_id, pane, message, *vim_mode).await
+                    };
+                    let _ = result;
+                }
+                Effect::DeliverHttpMessage {
+                    session_id,
+                    message,
+                } => {
+                    if cfg!(test) {
+                        continue;
+                    }
+                    let (backend_session_id, project_dir, model, effort) = {
+                        let proto = self.protocol.read().await;
+                        match proto.sessions.get(session_id) {
+                            Some(s) => (
+                                s.metadata.backend_session_id.clone(),
+                                s.metadata.project_dir.clone(),
+                                s.metadata.model.clone(),
+                                s.metadata.effort.clone(),
+                            ),
+                            None => (None, None, None, None),
+                        }
+                    };
+                    if let Some(backend_session_id) = backend_session_id {
+                        let _ = crate::tmux::deliver_via_http(
+                            self,
+                            &backend_session_id,
+                            project_dir.as_deref(),
+                            message,
+                            model.as_deref(),
+                            effort.as_deref(),
+                        )
                         .await;
+                    }
                 }
                 Effect::SetTmuxVar { pane, name, value } => {
                     let p = pane.clone();
@@ -875,6 +924,7 @@ impl AppState {
                             .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0)),
                         backend_session_id: m.backend_session_id.clone(),
                         backend: m.backend.clone(),
+                        opencode_binding: m.opencode_binding.clone(),
                         project_description: m.project_description.clone(),
                         bulletin: m.bulletin.clone(),
                         worktree: m.worktree,
@@ -1841,6 +1891,7 @@ pub(crate) mod tests {
             last_metadata_update: Some(1_700_000_100),
             backend_session_id: Some("oc_abc123".into()),
             backend: Some("opencode".into()),
+            opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
             project_description: Some("test project".into()),
             vim_mode: true,
             worktree: true,
@@ -1896,6 +1947,11 @@ pub(crate) mod tests {
             s.metadata.backend_session_id.as_deref(),
             Some("oc_abc123"),
             "backend_session_id dropped by persist"
+        );
+        assert_eq!(
+            s.metadata.opencode_binding,
+            Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+            "opencode_binding dropped by persist"
         );
         assert_eq!(
             s.metadata.project_description.as_deref(),
@@ -1956,6 +2012,10 @@ pub(crate) mod tests {
         assert_eq!(hydrated.effort.as_deref(), Some("max"));
         assert_eq!(hydrated.backend.as_deref(), Some("opencode"));
         assert_eq!(hydrated.backend_session_id.as_deref(), Some("oc_abc123"));
+        assert_eq!(
+            hydrated.opencode_binding,
+            Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
+        );
         assert!(hydrated.on_fire.is_some());
         assert_eq!(hydrated.last_iteration_at, Some(1_700_000_000));
         assert_eq!(hydrated.last_metadata_update, Some(1_700_000_100));

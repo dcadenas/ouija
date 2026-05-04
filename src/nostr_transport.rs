@@ -1653,6 +1653,14 @@ pub async fn start_session(
                 worktree,
                 backend: Some(backend_name.clone()),
                 backend_session_id,
+                opencode_binding: if matches!(
+                    backend.delivery_mode(),
+                    crate::backend::DeliveryMode::HttpApi { .. }
+                ) {
+                    Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
+                } else {
+                    None
+                },
                 model: model.map(String::from),
                 effort: effort.map(String::from),
                 reminder: reminder.map(String::from),
@@ -2146,6 +2154,11 @@ pub async fn restart_session(
                     vim_mode: m.vim_mode,
                     backend_session_id,
                     backend: Some(backend_name.clone()),
+                    opencode_binding: if is_http_api {
+                        Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
+                    } else {
+                        None
+                    },
                     project_description: m.project_description.clone(),
                     last_metadata_update: None,
                     model: effective_model.clone(),
@@ -2166,6 +2179,11 @@ pub async fn restart_session(
                     project_dir: Some(dir.clone()),
                     backend: Some(backend_name.clone()),
                     backend_session_id,
+                    opencode_binding: if is_http_api {
+                        Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
+                    } else {
+                        None
+                    },
                     model: effective_model.clone(),
                     effort: effective_effort.clone(),
                     reminder: effective_reminder.clone(),
