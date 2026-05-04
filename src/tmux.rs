@@ -553,6 +553,40 @@ pub async fn locked_inject(
     }
 }
 
+/// Enqueue a message for raw tmux injection regardless of backend delivery mode.
+///
+/// Use this for explicit pane-targeted delivery where the caller's intent is to
+/// drive the visible TUI rather than any backend HTTP session.
+pub async fn locked_inject_raw_tmux(
+    state: &crate::state::AppState,
+    session_id: &str,
+    pane: &str,
+    message: &str,
+    vim_mode: bool,
+) -> anyhow::Result<()> {
+    if cfg!(test) {
+        return Ok(());
+    }
+
+    let backend = state.backend_for_session(session_id).await;
+    let config = backend.inject_config();
+    let tui_pattern = backend.tui_ready_pattern().map(String::from);
+
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let req = InjectRequest {
+        pane: pane.to_string(),
+        message: message.to_string(),
+        vim_mode,
+        inject_config: config,
+        tui_pattern,
+        result_tx,
+    };
+    state.enqueue_inject(req);
+    result_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("inject queue closed"))?
+}
+
 /// Deliver a message to an opencode session via its HTTP API.
 ///
 /// Uses the `prompt_async` endpoint which returns immediately without waiting

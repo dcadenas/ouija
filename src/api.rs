@@ -927,7 +927,7 @@ pub async fn inject(
             }
         }
     };
-    match tmux::locked_inject(
+    match tmux::locked_inject_raw_tmux(
         &state,
         &session_id,
         &body.pane,
@@ -936,7 +936,10 @@ pub async fn inject(
     )
     .await
     {
-        Ok(()) => (StatusCode::OK, Json(json!({ "status": "injected" }))),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({ "status": "injected", "delivery": "tmux" })),
+        ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
@@ -3139,6 +3142,36 @@ mod tests {
     }
 
     // --- compact endpoint ---
+
+    #[tokio::test]
+    async fn inject_for_opencode_pane_reports_tmux_delivery() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-live".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = inject(
+            State(state),
+            Json(InjectBody {
+                pane: "%oc".into(),
+                message: "hello raw tmux".into(),
+                vim_mode: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "injected");
+        assert_eq!(body["delivery"], "tmux");
+    }
 
     #[tokio::test]
     async fn compact_session_not_found_returns_404() {
