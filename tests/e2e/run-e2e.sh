@@ -6,7 +6,7 @@ COMPOSE_LOCAL="$SCRIPT_DIR/docker-compose.yml"
 COMPOSE_NOSTR="$SCRIPT_DIR/docker-compose.nostr.yml"
 COMPOSE_INSTALL="$SCRIPT_DIR/docker-compose.install.yml"
 COMPOSE_OPENCODE="$SCRIPT_DIR/docker-compose.opencode.yml"
-COMPOSE_OPTS="up --build --abort-on-container-exit --exit-code-from tests"
+COMPOSE_OPTS="up --build --force-recreate --abort-on-container-exit --exit-code-from tests"
 
 run_local() {
     echo "=== Running local e2e tests ==="
