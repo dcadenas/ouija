@@ -747,6 +747,7 @@ pub async fn send_msg(
         } => Some((reason.clone(), renamed_to.clone())),
         _ => None,
     }) {
+        rollback_failed_delivery(&state, &effects, rollback).await;
         let mut body = json!({ "error": reason });
         if let Some(new_id) = renamed_to {
             body["renamed_to"] = json!(new_id);
@@ -4098,6 +4099,111 @@ mod tests {
         assert!(!proto.pending_replies.contains_key("sender"));
         assert_eq!(proto.sessions["sender"].metadata.reminder, None);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn send_failed_restores_done_reply_retry_state() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    reminder: Some("keep working".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        {
+            let mut proto = state.protocol.write().await;
+            proto.pending_replies.insert(
+                "sender".into(),
+                vec![crate::daemon_protocol::PendingReplyEntry {
+                    msg_id: 7,
+                    from: "requester".into(),
+                    message: "please respond".into(),
+                    received_at: 100,
+                    last_activity: 100,
+                    in_progress: false,
+                }],
+            );
+        }
+
+        let (status, body) = send_msg(
+            State(state.clone()),
+            Json(SendBody {
+                from: "sender".into(),
+                to: "missing-target".into(),
+                message: "done, but target is gone".into(),
+                expects_reply: false,
+                responds_to: Some(7),
+                done: true,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body["error"].as_str().unwrap().contains("not found"));
+        let proto = state.protocol.read().await;
+        let entries = proto
+            .pending_replies
+            .get("sender")
+            .expect("failed send must restore sender pending reply");
+        assert!(entries.iter().any(|entry| entry.msg_id == 7));
+        assert_eq!(
+            proto.sessions["sender"].metadata.reminder.as_deref(),
+            Some("keep working")
+        );
+    }
+
+    #[tokio::test]
+    async fn send_failed_restores_progress_reply_retry_state() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        {
+            let mut proto = state.protocol.write().await;
+            proto.pending_replies.insert(
+                "sender".into(),
+                vec![crate::daemon_protocol::PendingReplyEntry {
+                    msg_id: 7,
+                    from: "requester".into(),
+                    message: "please respond".into(),
+                    received_at: 100,
+                    last_activity: 100,
+                    in_progress: false,
+                }],
+            );
+        }
+
+        let (status, body) = send_msg(
+            State(state.clone()),
+            Json(SendBody {
+                from: "sender".into(),
+                to: "missing-target".into(),
+                message: "still working, but target is gone".into(),
+                expects_reply: false,
+                responds_to: Some(7),
+                done: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body["error"].as_str().unwrap().contains("not found"));
+        let proto = state.protocol.read().await;
+        let entry = proto
+            .pending_replies
+            .get("sender")
+            .and_then(|entries| entries.iter().find(|entry| entry.msg_id == 7))
+            .expect("failed send must preserve sender pending reply");
+        assert!(!entry.in_progress);
+        assert_eq!(entry.last_activity, 100);
     }
 
     #[tokio::test]
