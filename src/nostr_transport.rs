@@ -2446,9 +2446,11 @@ async fn soft_restart_session(
         let mut proto = state.protocol.write().await;
         match proto.sessions.get_mut(name) {
             Some(session) => {
-                session.metadata.backend_session_id = Some(new_session_id.clone());
-                session.metadata.opencode_binding =
-                    Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged);
+                if pane.is_none() {
+                    session.metadata.backend_session_id = Some(new_session_id.clone());
+                    session.metadata.opencode_binding =
+                        Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged);
+                }
                 if let Some(m) = model {
                     session.metadata.model = Some(m.to_string());
                 }
@@ -2533,15 +2535,50 @@ async fn soft_restart_session(
 
     // 4. Respawn the TUI attach to point at the new session
     if let Some(pane) = pane {
-        let attach_cmd = opencode_attach_command(port, &new_session_id, project_dir);
-        let pane = pane.to_string();
-        let env_args = crate::tmux::pane_env_args(name);
-        tokio::task::spawn_blocking(move || {
-            let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
-            args.extend(env_args.iter().map(String::as_str));
-            args.extend_from_slice(&["-t", &pane, &attach_cmd]);
-            let _ = std::process::Command::new("tmux").args(&args).status();
-        });
+        match respawn_opencode_attach_for_session(pane, project_dir, &new_session_id, port, name)
+            .await
+        {
+            Ok(true) => {
+                let mut proto = state.protocol.write().await;
+                let Some(session) = proto.sessions.get_mut(name) else {
+                    drop(proto);
+                    delete_opencode_session(
+                        &state.http_client,
+                        port,
+                        &new_session_id,
+                        "soft restart cleanup",
+                    )
+                    .await;
+                    return Err(());
+                };
+                session.metadata.backend_session_id = Some(new_session_id.clone());
+                session.metadata.opencode_binding =
+                    Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged);
+                state.persist_protocol_state(&proto);
+            }
+            Ok(false) => {
+                tracing::warn!("soft restart: opencode attach did not start in pane {pane}");
+                delete_opencode_session(
+                    &state.http_client,
+                    port,
+                    &new_session_id,
+                    "soft restart cleanup",
+                )
+                .await;
+                return Err(());
+            }
+            Err(e) => {
+                tracing::warn!("soft restart: respawn-pane {pane} failed: {e}");
+                delete_opencode_session(
+                    &state.http_client,
+                    port,
+                    &new_session_id,
+                    "soft restart cleanup",
+                )
+                .await;
+                return Err(());
+            }
+        }
     }
 
     Ok((
@@ -2602,6 +2639,34 @@ fn opencode_attach_command(port: u16, session_id: &str, project_dir: &str) -> St
     format!(
         "opencode attach http://127.0.0.1:{port} --session {escaped_session_id} --dir {escaped_dir}"
     )
+}
+
+async fn respawn_opencode_attach_for_session(
+    pane_id: &str,
+    project_dir: &str,
+    session_id: &str,
+    port: u16,
+    ouija_session_id: &str,
+) -> anyhow::Result<bool> {
+    let attach_cmd = opencode_attach_command(port, session_id, project_dir);
+    let pane = pane_id.to_string();
+    let wait_pane = pane_id.to_string();
+    let env_args = crate::tmux::pane_env_args(ouija_session_id);
+    tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
+        args.extend(env_args.iter().map(String::as_str));
+        args.extend_from_slice(&["-t", &pane, &attach_cmd]);
+        let status = std::process::Command::new("tmux").args(&args).status()?;
+        if !status.success() {
+            anyhow::bail!("tmux respawn-pane failed for {pane}");
+        }
+        Ok(wait_for_opencode_attach(
+            &wait_pane,
+            std::time::Duration::from_secs(5),
+        ))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("opencode attach respawn task failed: {e}"))?
 }
 
 async fn launch_opencode_attach_for_session(
@@ -3889,6 +3954,79 @@ mod tests {
         assert_eq!(
             metadata.opencode_binding,
             Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn soft_restart_keeps_previous_binding_when_attach_respawn_fails() {
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        async fn create_session() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "id": "ses_new" }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route("/session", post(create_session));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%missing".into()),
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_old".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::WeakAdopted,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let result = soft_restart_session(
+            &state,
+            "oc",
+            Some("%missing"),
+            dir.path().to_str().unwrap(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let proto = state.protocol.read().await;
+        let metadata = &proto.sessions["oc"].metadata;
+        assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_old"));
+        assert_eq!(
+            metadata.opencode_binding,
+            Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
         );
         server.abort();
     }
