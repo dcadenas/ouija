@@ -724,16 +724,19 @@ pub async fn send_msg(
             Json(json!({ "error": format!("cannot send a message to yourself. {hint}") })),
         );
     }
-    let effects = {
+    let from = body.from.clone();
+    let (effects, rollback) = {
         let mut proto = state.protocol.write().await;
-        proto.apply(crate::daemon_protocol::Event::Send {
+        let rollback = FailedSendRollback::capture(&proto, &from, body.responds_to, body.done);
+        let effects = proto.apply(crate::daemon_protocol::Event::Send {
             from: body.from,
             to: body.to,
             message: body.message,
             expects_reply: body.expects_reply,
             responds_to: body.responds_to,
             done: body.done,
-        })
+        });
+        (effects, rollback)
     };
 
     if let Some((reason, renamed_to)) = effects.iter().find_map(|e| match e {
@@ -750,7 +753,7 @@ pub async fn send_msg(
     }
 
     if let Err(e) = execute_send_effects_for_api(&state, &effects).await {
-        clear_pending_reply_for_failed_delivery(&state, &effects).await;
+        rollback_failed_delivery(&state, &effects, rollback).await;
         let method = effects.iter().find_map(|effect| match effect {
             crate::daemon_protocol::Effect::SendDelivered { method, .. } => Some(method.clone()),
             _ => None,
@@ -786,6 +789,69 @@ pub async fn send_msg(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "unexpected send result" })),
         )
+    }
+}
+
+struct FailedSendRollback {
+    sender_id: String,
+    pending_reply_before_send: Option<crate::daemon_protocol::PendingReplyEntry>,
+    sender_reminder: Option<Option<String>>,
+    done: bool,
+}
+
+impl FailedSendRollback {
+    fn capture(
+        proto: &crate::daemon_protocol::DaemonState,
+        sender_id: &str,
+        responds_to: Option<u64>,
+        done: bool,
+    ) -> Self {
+        let pending_reply_before_send = responds_to.and_then(|msg_id| {
+            proto
+                .pending_replies
+                .get(sender_id)
+                .and_then(|pending| pending.iter().find(|entry| entry.msg_id == msg_id).cloned())
+        });
+        Self {
+            sender_id: sender_id.to_string(),
+            pending_reply_before_send,
+            sender_reminder: done.then(|| {
+                proto
+                    .sessions
+                    .get(sender_id)
+                    .and_then(|session| session.metadata.reminder.clone())
+            }),
+            done,
+        }
+    }
+}
+
+async fn rollback_failed_delivery(
+    state: &SharedState,
+    effects: &[crate::daemon_protocol::Effect],
+    rollback: FailedSendRollback,
+) {
+    clear_pending_reply_for_failed_delivery(state, effects).await;
+
+    let mut proto = state.protocol.write().await;
+    if let Some(entry) = rollback.pending_reply_before_send {
+        let pending = proto
+            .pending_replies
+            .entry(rollback.sender_id.clone())
+            .or_default();
+        if let Some(existing) = pending
+            .iter_mut()
+            .find(|pending| pending.msg_id == entry.msg_id)
+        {
+            *existing = entry;
+        } else {
+            pending.push(entry);
+        }
+    }
+    if rollback.done {
+        if let Some(session) = proto.sessions.get_mut(&rollback.sender_id) {
+            session.metadata.reminder = rollback.sender_reminder.flatten();
+        }
     }
 }
 
@@ -3515,6 +3581,70 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         let proto = state.protocol.read().await;
         assert!(!proto.pending_replies.contains_key("oc-managed"));
+    }
+
+    #[tokio::test]
+    async fn failed_done_reply_preserves_sender_retry_state() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    reminder: Some("keep working".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-managed".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        {
+            let mut proto = state.protocol.write().await;
+            proto.pending_replies.insert(
+                "sender".into(),
+                vec![crate::daemon_protocol::PendingReplyEntry {
+                    msg_id: 7,
+                    from: "requester".into(),
+                    message: "please respond".into(),
+                    received_at: 100,
+                    last_activity: 100,
+                    in_progress: false,
+                }],
+            );
+        }
+
+        let (status, _) = send_msg(
+            State(state.clone()),
+            Json(SendBody {
+                from: "sender".into(),
+                to: "oc-managed".into(),
+                message: "done, but unreachable".into(),
+                expects_reply: false,
+                responds_to: Some(7),
+                done: true,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let proto = state.protocol.read().await;
+        let pending = proto.pending_replies.get("sender").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].msg_id, 7);
+        assert_eq!(
+            proto.sessions["sender"].metadata.reminder.as_deref(),
+            Some("keep working")
+        );
     }
 
     #[tokio::test]
