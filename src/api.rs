@@ -2610,17 +2610,10 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
     let http_delivery = {
         let proto = state.protocol.read().await;
         proto.sessions.get(session_name).and_then(|session| {
-            (session.metadata.backend.as_deref() == Some("opencode"))
-                .then(|| {
-                    session.metadata.backend_session_id.as_ref().map(|id| {
-                        crate::daemon_protocol::HttpDeliverySnapshot {
-                            backend_session_id: id.clone(),
-                            project_dir: session.metadata.project_dir.clone(),
-                            model: session.metadata.model.clone(),
-                            effort: session.metadata.effort.clone(),
-                        }
-                    })
-                })
+            session
+                .metadata
+                .is_strong_opencode_binding()
+                .then(|| session.metadata.http_delivery_snapshot())
                 .flatten()
         })
     };
@@ -4891,6 +4884,65 @@ mod tests {
 
         gate.release.notify_one();
         assert!(delivery.await.unwrap());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn readiness_prompt_delivery_uses_raw_tmux_for_weak_opencode_binding() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn prompt_async(AxumState(called): AxumState<StdArc<AtomicBool>>) -> StatusCode {
+            called.store(true, Ordering::SeqCst);
+            StatusCode::NO_CONTENT
+        }
+
+        let called = StdArc::new(AtomicBool::new(false));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(called.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_ready".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .pending_prompts
+            .lock()
+            .unwrap()
+            .insert("oc".into(), ("%17".into(), "queued prompt".into()));
+
+        let delivered = deliver_pending_prompt(&state, "oc").await;
+
+        assert!(delivered);
+        assert!(!called.load(Ordering::SeqCst));
+        assert!(!state.pending_prompts.lock().unwrap().contains_key("oc"));
         server.abort();
     }
 
