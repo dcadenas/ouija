@@ -2209,8 +2209,27 @@ pub async fn restart_session(
                             .await
                         {
                             Ok(r) if r.status().is_success() => {
-                                backend_session_id = Some(prev_sid.clone());
-                                reused_previous_backend_session = true;
+                                match launch_opencode_attach_for_session(
+                                    &pane_id, &dir, prev_sid, port,
+                                )
+                                .await
+                                .and_then(|attach_ready| {
+                                    previous_backend_session_after_attach(
+                                        prev_sid.clone(),
+                                        attach_ready,
+                                        &pane_id,
+                                    )
+                                }) {
+                                    Ok(sid) => {
+                                        backend_session_id = Some(sid);
+                                        reused_previous_backend_session = true;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "previous backend_session_id {prev_sid} is reachable but attach failed: {e}"
+                                        );
+                                    }
+                                }
                             }
                             _ => {
                                 tracing::warn!(
@@ -2536,6 +2555,18 @@ fn shared_serve_session_after_attach(
     }
 }
 
+fn previous_backend_session_after_attach(
+    session_id: String,
+    attach_ready: bool,
+    pane_id: &str,
+) -> anyhow::Result<String> {
+    if attach_ready {
+        Ok(session_id)
+    } else {
+        anyhow::bail!("previous opencode attach did not start in pane {pane_id}")
+    }
+}
+
 fn wait_for_opencode_attach(pane_id: &str, timeout: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -2547,6 +2578,39 @@ fn wait_for_opencode_attach(pane_id: &str, timeout: std::time::Duration) -> bool
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+}
+
+async fn launch_opencode_attach_for_session(
+    pane_id: &str,
+    project_dir: &str,
+    session_id: &str,
+    port: u16,
+) -> anyhow::Result<bool> {
+    let escaped_dir = crate::scheduler::shell_escape(project_dir);
+    let attach_cmd =
+        format!("opencode attach http://127.0.0.1:{port} --session {session_id} --dir {escaped_dir}");
+    let pane = pane_id.to_string();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        // Small delay so the pane shell is ready
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let hidden = format!(" {attach_cmd}");
+        let status = std::process::Command::new("tmux")
+            .args(["send-keys", "-t", &pane, &hidden, "Enter"])
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("tmux send-keys failed while launching opencode attach in pane {pane}");
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("opencode attach launch task failed: {e}"))??;
+
+    let pane = pane_id.to_string();
+    Ok(tokio::task::spawn_blocking(move || {
+        wait_for_opencode_attach(&pane, std::time::Duration::from_secs(5))
+    })
+    .await
+    .unwrap_or(false))
 }
 
 async fn setup_shared_serve_session(
@@ -2617,30 +2681,7 @@ async fn setup_shared_serve_session(
         "opencode shared serve session create: ok"
     );
 
-    let attach_cmd = opencode_attach_command(port, &session_id, project_dir);
-    tracing::info!(pane = %pane_id, attach_cmd, "opencode attach: scheduling tmux send-keys");
-    let pane = pane_id.to_string();
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        // Small delay so the pane shell is ready
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let hidden = format!(" {attach_cmd}");
-        let status = std::process::Command::new("tmux")
-            .args(["send-keys", "-t", &pane, &hidden, "Enter"])
-            .status()?;
-        if !status.success() {
-            anyhow::bail!("tmux send-keys failed while launching opencode attach in pane {pane}");
-        }
-        Ok(())
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("opencode attach launch task failed: {e}"))??;
-
-    let pane = pane_id.to_string();
-    let attach_ready = tokio::task::spawn_blocking(move || {
-        wait_for_opencode_attach(&pane, std::time::Duration::from_secs(5))
-    })
-    .await
-    .unwrap_or(false);
+    let attach_ready = launch_opencode_attach_for_session(pane_id, project_dir, &session_id, port).await?;
 
     shared_serve_session_after_attach(session_id, attach_ready, pane_id)
 }
@@ -3546,6 +3587,12 @@ mod tests {
     #[test]
     fn shared_serve_session_requires_verified_attach() {
         let result = shared_serve_session_after_attach("ses_123".to_string(), false, "%1");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn restart_previous_session_reuse_requires_verified_attach() {
+        let result = previous_backend_session_after_attach("ses_prev".to_string(), false, "%1");
         assert!(result.is_err());
     }
 
