@@ -38,6 +38,24 @@ fn opencode_binding_for_restart_session(
     }
 }
 
+fn start_registration_metadata(
+    is_http_api: bool,
+    pane_id: &str,
+    backend_session_id: Option<String>,
+) -> Option<(
+    Option<String>,
+    Option<String>,
+    Option<crate::daemon_protocol::OpenCodeBinding>,
+)> {
+    if is_http_api && backend_session_id.is_none() {
+        return None;
+    }
+
+    let opencode_binding =
+        opencode_binding_for_backend_session(is_http_api, backend_session_id.as_deref());
+    Some((Some(pane_id.to_string()), backend_session_id, opencode_binding))
+}
+
 /// Timeout when waiting for relay connections to establish.
 const RELAY_CONNECT_TIMEOUT_SECS: u64 = 5;
 /// Maximum size of the seen-events dedup cache before clearing.
@@ -1676,16 +1694,27 @@ pub async fn start_session(
                 None
             };
 
+            let Some((registration_pane, backend_session_id, opencode_binding)) =
+                start_registration_metadata(is_http_api, &pane_id, backend_session_id)
+            else {
+                tracing::warn!(
+                    "start_session: not registering {name} because OpenCode attach setup failed"
+                );
+                return (
+                    format!(
+                        "start failed: OpenCode attach setup failed for '{name}' (pane {pane_id})"
+                    ),
+                    None,
+                );
+            };
+
             let oc_session_id = backend_session_id.clone();
             let proto_meta = crate::daemon_protocol::SessionMeta {
                 project_dir: Some(dir.clone()),
                 worktree,
                 backend: Some(backend_name.clone()),
                 backend_session_id,
-                opencode_binding: opencode_binding_for_backend_session(
-                    is_http_api,
-                    oc_session_id.as_deref(),
-                ),
+                opencode_binding,
                 model: model.map(String::from),
                 effort: effort.map(String::from),
                 reminder: reminder.map(String::from),
@@ -1695,7 +1724,7 @@ pub async fn start_session(
             state
                 .apply_and_execute(crate::daemon_protocol::Event::Register {
                     id: name.to_string(),
-                    pane: Some(pane_id.clone()),
+                    pane: registration_pane,
                     metadata: proto_meta,
                 })
                 .await;
@@ -3450,6 +3479,11 @@ mod tests {
             opencode_binding_for_restart_session(true, Some("previous-session"), true, None),
             Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
         );
+    }
+
+    #[test]
+    fn start_registration_skips_http_api_placeholder_without_backend_session() {
+        assert!(start_registration_metadata(true, "%1", None).is_none());
     }
 
     #[test]
