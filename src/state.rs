@@ -675,31 +675,24 @@ impl AppState {
                     session_id,
                     message,
                 } => {
-                    if cfg!(test) {
-                        continue;
-                    }
-                    let (backend_session_id, project_dir, model, effort) = {
-                        let proto = self.protocol.read().await;
-                        match proto.sessions.get(session_id) {
-                            Some(s) => (
-                                s.metadata.backend_session_id.clone(),
-                                s.metadata.project_dir.clone(),
-                                s.metadata.model.clone(),
-                                s.metadata.effort.clone(),
-                            ),
-                            None => (None, None, None, None),
+                    match recorded_http_delivery {
+                        Some(delivery) => {
+                            let _ = crate::tmux::deliver_via_http(
+                                self,
+                                &delivery.backend_session_id,
+                                delivery.project_dir.as_deref(),
+                                message,
+                                delivery.model.as_deref(),
+                                delivery.effort.as_deref(),
+                            )
+                            .await;
                         }
-                    };
-                    if let Some(backend_session_id) = backend_session_id {
-                        let _ = crate::tmux::deliver_via_http(
-                            self,
-                            &backend_session_id,
-                            project_dir.as_deref(),
-                            message,
-                            model.as_deref(),
-                            effort.as_deref(),
-                        )
-                        .await;
+                        None => {
+                            tracing::warn!(
+                                session = %session_id,
+                                "http delivery skipped: no recorded backend_session_id on send"
+                            );
+                        }
                     }
                 }
                 Effect::SetTmuxVar { pane, name, value } => {
@@ -1934,6 +1927,59 @@ pub(crate) mod tests {
         state.execute_effects(&effects).await;
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn execute_effects_delivers_http_from_recorded_snapshot_without_live_session() {
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use axum::Router;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn prompt_async(AxumState(calls): AxumState<StdArc<AtomicUsize>>) -> StatusCode {
+            calls.fetch_add(1, Ordering::SeqCst);
+            StatusCode::NO_CONTENT
+        }
+
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(calls.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = test_config();
+        config.port = port - 320;
+        let state = AppState::new(config);
+        let effects = vec![
+            crate::daemon_protocol::Effect::DeliverHttpMessage {
+                session_id: "oc".into(),
+                message: "hello".into(),
+            },
+            crate::daemon_protocol::Effect::SendDelivered {
+                from: "sender".into(),
+                to: "oc".into(),
+                method: "http".into(),
+                msg_id: 8,
+                http_delivery: Some(crate::daemon_protocol::HttpDeliverySnapshot {
+                    backend_session_id: "ses_recorded".into(),
+                    project_dir: None,
+                    model: None,
+                    effort: None,
+                }),
+            },
+        ];
+
+        state.execute_effects(&effects).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         server.abort();
     }
 
