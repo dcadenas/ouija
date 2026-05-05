@@ -123,6 +123,11 @@ impl std::error::Error for DuplicateNode {}
 /// Thread-safe shared reference to the daemon's application state.
 pub type SharedState = Arc<AppState>;
 
+#[derive(Clone, Debug)]
+pub(crate) struct EffectDeliveryFailure {
+    reason: String,
+}
+
 /// Central daemon state holding sessions, nodes, and transports.
 pub struct AppState {
     pub config: OuijaConfig,
@@ -587,7 +592,13 @@ impl AppState {
             state.apply(event)
         };
 
-        self.execute_effects(&effects).await;
+        let delivery_failure = self.execute_effects(&effects).await;
+
+        if let Some(failure) = delivery_failure {
+            self.clear_pending_reply_for_failed_effect_delivery(&effects)
+                .await;
+            return rewrite_send_delivery_failure(effects, &failure.reason);
+        }
 
         effects
     }
@@ -595,7 +606,7 @@ impl AppState {
     pub(crate) async fn execute_effects(
         self: &Arc<Self>,
         effects: &[crate::daemon_protocol::Effect],
-    ) {
+    ) -> Option<EffectDeliveryFailure> {
         use crate::daemon_protocol::{Effect, LogLevel};
 
         let recorded_method = effects.iter().find_map(|effect| match effect {
@@ -606,6 +617,7 @@ impl AppState {
             Effect::SendDelivered { http_delivery, .. } => http_delivery.as_ref(),
             _ => None,
         });
+        let mut delivery_failure = None;
 
         for effect in effects {
             match effect {
@@ -634,11 +646,9 @@ impl AppState {
                                 )
                                 .await,
                                 None => {
-                                    tracing::warn!(
-                                        session = %session_id,
+                                    Err(anyhow::anyhow!(
                                         "http delivery skipped: no recorded backend_session_id on send"
-                                    );
-                                    Ok(())
+                                    ))
                                 }
                             }
                         }
@@ -669,7 +679,12 @@ impl AppState {
                             }
                         }
                     };
-                    let _ = result;
+                    if let Err(error) = result {
+                        tracing::warn!(session = %session_id, "message delivery failed: {error}");
+                        delivery_failure.get_or_insert_with(|| EffectDeliveryFailure {
+                            reason: error.to_string(),
+                        });
+                    }
                 }
                 Effect::DeliverHttpMessage {
                     session_id,
@@ -677,7 +692,7 @@ impl AppState {
                 } => {
                     match recorded_http_delivery {
                         Some(delivery) => {
-                            let _ = crate::tmux::deliver_via_http(
+                            if let Err(error) = crate::tmux::deliver_via_http(
                                 self,
                                 &delivery.backend_session_id,
                                 delivery.project_dir.as_deref(),
@@ -685,13 +700,22 @@ impl AppState {
                                 delivery.model.as_deref(),
                                 delivery.effort.as_deref(),
                             )
-                            .await;
+                            .await
+                            {
+                                tracing::warn!(session = %session_id, "http delivery failed: {error}");
+                                delivery_failure.get_or_insert_with(|| EffectDeliveryFailure {
+                                    reason: error.to_string(),
+                                });
+                            }
                         }
                         None => {
-                            tracing::warn!(
-                                session = %session_id,
+                            let error = anyhow::anyhow!(
                                 "http delivery skipped: no recorded backend_session_id on send"
                             );
+                            tracing::warn!(session = %session_id, "{error}");
+                            delivery_failure.get_or_insert_with(|| EffectDeliveryFailure {
+                                reason: error.to_string(),
+                            });
                         }
                     }
                 }
@@ -897,11 +921,16 @@ impl AppState {
                     delivered,
                     transport,
                 } => {
+                    let delivered = if delivery_failure.is_some() {
+                        false
+                    } else {
+                        *delivered
+                    };
                     self.log_message(
                         from.clone(),
                         to.clone(),
                         message.clone(),
-                        *delivered,
+                        delivered,
                         transport,
                     )
                     .await;
@@ -920,6 +949,31 @@ impl AppState {
                 | Effect::RemoveOk { .. }
                 | Effect::RemoveFailed { .. } => {}
             }
+        }
+
+        delivery_failure
+    }
+
+    async fn clear_pending_reply_for_failed_effect_delivery(
+        &self,
+        effects: &[crate::daemon_protocol::Effect],
+    ) {
+        let Some((to, msg_id)) = effects.iter().find_map(|effect| match effect {
+            crate::daemon_protocol::Effect::SendDelivered { to, msg_id, .. } => {
+                Some((to.clone(), *msg_id))
+            }
+            _ => None,
+        }) else {
+            return;
+        };
+
+        let mut proto = self.protocol.write().await;
+        let Some(pending) = proto.pending_replies.get_mut(&to) else {
+            return;
+        };
+        pending.retain(|entry| entry.msg_id != msg_id);
+        if pending.is_empty() {
+            proto.pending_replies.remove(&to);
         }
     }
 
@@ -1714,6 +1768,39 @@ impl AppState {
     }
 }
 
+fn rewrite_send_delivery_failure(
+    effects: Vec<crate::daemon_protocol::Effect>,
+    reason: &str,
+) -> Vec<crate::daemon_protocol::Effect> {
+    effects
+        .into_iter()
+        .filter_map(|effect| match effect {
+            crate::daemon_protocol::Effect::SendDelivered { from, to, .. } => {
+                Some(crate::daemon_protocol::Effect::SendFailed {
+                    from,
+                    to,
+                    reason: reason.to_string(),
+                    renamed_to: None,
+                })
+            }
+            crate::daemon_protocol::Effect::LogMessage {
+                from,
+                to,
+                message,
+                delivered: true,
+                transport,
+            } => Some(crate::daemon_protocol::Effect::LogMessage {
+                from,
+                to,
+                message,
+                delivered: false,
+                transport,
+            }),
+            other => Some(other),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1981,6 +2068,79 @@ pub(crate) mod tests {
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn apply_and_execute_reports_headless_http_send_failure_when_prompt_async_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut config = test_config();
+        config.port = port.checked_sub(320).unwrap();
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "sender".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "sender".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta::default(),
+                    registered_at: 0,
+                },
+            );
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: None,
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_headless".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let effects = state
+            .apply_and_execute(crate::daemon_protocol::Event::Send {
+                from: "sender".into(),
+                to: "oc".into(),
+                message: "hello".into(),
+                expects_reply: true,
+                responds_to: None,
+                done: false,
+            })
+            .await;
+
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                crate::daemon_protocol::Effect::SendFailed { reason, .. }
+                    if reason.contains("prompt_async request failed")
+            )
+        }));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, crate::daemon_protocol::Effect::SendDelivered { .. }))
+        );
+
+        let log = state.message_log.read().await;
+        assert_eq!(log.len(), 1);
+        assert!(!log[0].delivered);
+        drop(log);
+
+        let proto = state.protocol.read().await;
+        assert!(proto.pending_replies.get("oc").is_none());
     }
 
     #[tokio::test]
