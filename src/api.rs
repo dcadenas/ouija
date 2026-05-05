@@ -2643,6 +2643,7 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
                 }
                 Err(fallback_error) => {
                     restore_pending_prompt_if_absent(state, session_name, pane_id, prompt);
+                    schedule_pending_prompt_retry(state, session_name);
                     tracing::warn!(
                         "readiness prompt fallback failed for {session_name}: {fallback_error}"
                     );
@@ -2650,6 +2651,49 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+const PENDING_PROMPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+#[cfg(not(test))]
+const PENDING_PROMPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn schedule_pending_prompt_retry(state: &SharedState, session_name: &str) {
+    let state = state.clone();
+    let session_name = session_name.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(PENDING_PROMPT_RETRY_DELAY).await;
+        let pending = state
+            .pending_prompts
+            .lock()
+            .unwrap()
+            .get(&session_name)
+            .cloned();
+        let Some((pane_id, prompt)) = pending else {
+            return;
+        };
+        match deliver_pending_prompt_via_raw_tmux(&state, &session_name, &pane_id, &prompt).await {
+            Ok(()) => remove_pending_prompt_if_matches(&state, &session_name, &pane_id, &prompt),
+            Err(error) => {
+                tracing::warn!("readiness prompt retry fallback failed for {session_name}: {error}")
+            }
+        }
+    });
+}
+
+fn remove_pending_prompt_if_matches(
+    state: &SharedState,
+    session_name: &str,
+    pane_id: &str,
+    prompt: &str,
+) {
+    let mut pending = state.pending_prompts.lock().unwrap();
+    if pending
+        .get(session_name)
+        .is_some_and(|(pane, text)| pane == pane_id && text == prompt)
+    {
+        pending.remove(session_name);
     }
 }
 
@@ -4884,6 +4928,110 @@ mod tests {
 
         gate.release.notify_one();
         assert!(delivery.await.unwrap());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn readiness_prompt_delivery_retries_after_http_and_fallback_fail() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use tokio::net::TcpListener;
+        use tokio::sync::Notify;
+
+        #[derive(Clone)]
+        struct Gate {
+            started: StdArc<Notify>,
+            release: StdArc<Notify>,
+        }
+
+        async fn prompt_async(AxumState(gate): AxumState<Gate>) -> StatusCode {
+            gate.started.notify_one();
+            gate.release.notified().await;
+            StatusCode::BAD_GATEWAY
+        }
+
+        let gate = Gate {
+            started: StdArc::new(Notify::new()),
+            release: StdArc::new(Notify::new()),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(gate.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_ready".into()),
+                    opencode_binding: Some(
+                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                    ),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .pending_prompts
+            .lock()
+            .unwrap()
+            .insert("oc".into(), ("%17".into(), "queued prompt".into()));
+
+        let delivery = tokio::spawn({
+            let state = state.clone();
+            async move { deliver_pending_prompt(&state, "oc").await }
+        });
+        gate.started.notified().await;
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%18".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_ready".into()),
+                    opencode_binding: Some(
+                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                    ),
+                    ..Default::default()
+                },
+            })
+            .await;
+        gate.release.notify_one();
+
+        assert!(!delivery.await.unwrap());
+        assert_eq!(
+            state.pending_prompts.lock().unwrap().get("oc"),
+            Some(&("%17".into(), "queued prompt".into()))
+        );
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!state.pending_prompts.lock().unwrap().contains_key("oc"));
         server.abort();
     }
 
