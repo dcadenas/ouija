@@ -166,6 +166,14 @@ pub enum OpenCodeBinding {
     WeakAdopted,
 }
 
+#[derive(Clone, Debug)]
+pub struct HttpDeliverySnapshot {
+    pub backend_session_id: String,
+    pub project_dir: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
 /// Metadata becomes stale after 30 minutes without an update.
 const METADATA_STALE_SECS: i64 = 1800;
 
@@ -174,6 +182,17 @@ impl SessionMeta {
         self.backend.as_deref() == Some("opencode")
             && self.opencode_binding == Some(OpenCodeBinding::StrongManaged)
             && self.backend_session_id.is_some()
+    }
+
+    fn http_delivery_snapshot(&self) -> Option<HttpDeliverySnapshot> {
+        self.backend_session_id
+            .as_ref()
+            .map(|backend_session_id| HttpDeliverySnapshot {
+                backend_session_id: backend_session_id.clone(),
+                project_dir: self.project_dir.clone(),
+                model: self.model.clone(),
+                effort: self.effort.clone(),
+            })
     }
 
     /// Returns `true` if metadata has never been explicitly set or is older than 30 minutes.
@@ -491,6 +510,7 @@ pub enum Effect {
         to: String,
         method: String,
         msg_id: u64,
+        http_delivery: Option<HttpDeliverySnapshot>,
     },
     SendFailed {
         from: String,
@@ -1900,6 +1920,11 @@ impl DaemonState {
                         to: resolved_to,
                         method: transport.into(),
                         msg_id,
+                        http_delivery: if transport == "http" {
+                            session.metadata.http_delivery_snapshot()
+                        } else {
+                            None
+                        },
                     });
                 } else {
                     if session.metadata.backend.as_deref() == Some("opencode")
@@ -1943,6 +1968,7 @@ impl DaemonState {
                             to: resolved_to,
                             method: "http".into(),
                             msg_id,
+                            http_delivery: session.metadata.http_delivery_snapshot(),
                         });
                     } else {
                         effects.push(Effect::SendFailed {
@@ -1979,6 +2005,7 @@ impl DaemonState {
                     to: resolved_to,
                     method: "nostr".into(),
                     msg_id,
+                    http_delivery: None,
                 });
             }
             Origin::Human(npub) => {
@@ -1999,6 +2026,7 @@ impl DaemonState {
                     to: resolved_to,
                     method: "nostr-dm".into(),
                     msg_id,
+                    http_delivery: None,
                 });
             }
         }

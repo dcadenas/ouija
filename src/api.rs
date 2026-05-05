@@ -888,6 +888,10 @@ async fn execute_send_effects_for_api(
         Effect::SendDelivered { method, .. } => Some(method.as_str()),
         _ => None,
     });
+    let recorded_http_delivery = effects.iter().find_map(|effect| match effect {
+        Effect::SendDelivered { http_delivery, .. } => http_delivery.as_ref(),
+        _ => None,
+    });
 
     for effect in effects {
         match effect {
@@ -902,7 +906,12 @@ async fn execute_send_effects_for_api(
             } => {
                 match recorded_method {
                     Some("http") => {
-                        deliver_http_message_for_session(state, session_id, message).await?
+                        let delivery = recorded_http_delivery.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "http delivery skipped: no recorded backend_session_id on send"
+                            )
+                        })?;
+                        deliver_http_message(state, delivery, message).await?
                     }
                     Some("tmux") => {
                         tmux::locked_inject_raw_tmux(state, session_id, pane, message, *vim_mode)
@@ -914,10 +923,15 @@ async fn execute_send_effects_for_api(
                 }
             }
             Effect::DeliverHttpMessage {
-                session_id,
+                session_id: _,
                 message,
             } => {
-                deliver_http_message_for_session(state, session_id, message).await?;
+                let delivery = recorded_http_delivery.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "http delivery skipped: no recorded backend_session_id on send"
+                    )
+                })?;
+                deliver_http_message(state, delivery, message).await?;
             }
             Effect::SendToHuman { npub, message } => {
                 let _ = crate::nostr_transport::send_plain_dm(state, npub, message).await;
@@ -949,33 +963,18 @@ async fn execute_send_effects_for_api(
     Ok(())
 }
 
-async fn deliver_http_message_for_session(
+async fn deliver_http_message(
     state: &SharedState,
-    session_id: &str,
+    delivery: &crate::daemon_protocol::HttpDeliverySnapshot,
     message: &str,
 ) -> anyhow::Result<()> {
-    let (backend_session_id, project_dir, model, effort) = {
-        let proto = state.protocol.read().await;
-        match proto.sessions.get(session_id) {
-            Some(s) => (
-                s.metadata.backend_session_id.clone(),
-                s.metadata.project_dir.clone(),
-                s.metadata.model.clone(),
-                s.metadata.effort.clone(),
-            ),
-            None => (None, None, None, None),
-        }
-    };
-    let Some(backend_session_id) = backend_session_id else {
-        anyhow::bail!("http delivery skipped: no backend_session_id on session");
-    };
     tmux::deliver_via_http(
         state,
-        &backend_session_id,
-        project_dir.as_deref(),
+        &delivery.backend_session_id,
+        delivery.project_dir.as_deref(),
         message,
-        model.as_deref(),
-        effort.as_deref(),
+        delivery.model.as_deref(),
+        delivery.effort.as_deref(),
     )
     .await
 }
@@ -3589,6 +3588,85 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("prompt_async"));
+    }
+
+    #[tokio::test]
+    async fn send_effect_execution_uses_recorded_http_session_after_metadata_changes() {
+        use axum::Router;
+        use axum::extract::Path;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        type Captures = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+        async fn prompt_async(
+            Path(session_id): Path<String>,
+            State(captures): State<Captures>,
+        ) -> Json<serde_json::Value> {
+            captures.lock().unwrap().push(session_id);
+            Json(serde_json::json!({ "ok": true }))
+        }
+
+        let captures = Captures::default();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_port = listener.local_addr().unwrap().port();
+        assert!(serve_port >= 320, "test listener port must be >= 320");
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(captures.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: serve_port - 320,
+            data_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+            config_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-managed".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_old".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let effects = {
+            let mut proto = state.protocol.write().await;
+            proto.apply(crate::daemon_protocol::Event::Send {
+                from: "sender".into(),
+                to: "oc-managed".into(),
+                message: "hello old http session".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+            })
+        };
+
+        {
+            let mut proto = state.protocol.write().await;
+            let session = proto.sessions.get_mut("oc-managed").unwrap();
+            session.metadata.backend_session_id = Some("ses_new".into());
+        }
+
+        execute_send_effects_for_api(&state, &effects).await.unwrap();
+
+        server.abort();
+        assert_eq!(captures.lock().unwrap().as_slice(), ["ses_old"]);
     }
 
     #[tokio::test]
