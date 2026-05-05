@@ -184,7 +184,7 @@ impl SessionMeta {
             && self.backend_session_id.is_some()
     }
 
-    fn http_delivery_snapshot(&self) -> Option<HttpDeliverySnapshot> {
+    pub(crate) fn http_delivery_snapshot(&self) -> Option<HttpDeliverySnapshot> {
         self.backend_session_id
             .as_ref()
             .map(|backend_session_id| HttpDeliverySnapshot {
