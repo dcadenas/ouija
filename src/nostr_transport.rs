@@ -59,8 +59,11 @@ fn start_registration_metadata(
 fn should_schedule_restart_prompt_injection(
     is_http_api: bool,
     backend_session_id: Option<&str>,
+    opencode_binding: Option<&crate::daemon_protocol::OpenCodeBinding>,
 ) -> bool {
-    is_http_api && backend_session_id.is_some()
+    is_http_api
+        && backend_session_id.is_some()
+        && opencode_binding == Some(&crate::daemon_protocol::OpenCodeBinding::StrongManaged)
 }
 
 fn should_cleanup_failed_opencode_attach_pane(
@@ -2292,6 +2295,7 @@ pub async fn restart_session(
                 reused_previous_backend_session,
                 prev_metadata.as_ref().and_then(|m| m.opencode_binding.clone()),
             );
+            let restart_opencode_binding = opencode_binding.clone();
             let proto_meta = match prev_metadata {
                 Some(ref m) => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),
@@ -2338,14 +2342,23 @@ pub async fn restart_session(
                     metadata: proto_meta,
                 })
                 .await;
-            // HttpApi: deliver prompt via schedule_prompt_injection (readiness
-            // signal + fallback). TuiInjection prompt was passed as CLI arg.
+            // Strong HttpApi bindings can use readiness delivery; weak reused
+            // panes must stay on raw tmux to preserve the visible-pane boundary.
             if should_schedule_restart_prompt_injection(
                 is_http_api,
                 restart_backend_session_id.as_deref(),
+                restart_opencode_binding.as_ref(),
             ) {
                 if let Some(ref prompt_text) = formatted_prompt {
                     schedule_prompt_injection(state, name, pane_id.clone(), prompt_text.clone());
+                }
+            } else if is_http_api && restart_backend_session_id.is_some() {
+                if let Some(ref prompt_text) = formatted_prompt {
+                    if let Err(e) =
+                        deliver_prompt_fallback(state, name, &pane_id, prompt_text, false).await
+                    {
+                        tracing::warn!("restart prompt fallback delivery failed for {name}: {e}");
+                    }
                 }
             }
             (
@@ -3743,7 +3756,20 @@ mod tests {
 
     #[test]
     fn restart_prompt_injection_requires_backend_session() {
-        assert!(!should_schedule_restart_prompt_injection(true, None));
+        assert!(!should_schedule_restart_prompt_injection(
+            true,
+            None,
+            Some(&crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+        ));
+    }
+
+    #[test]
+    fn restart_prompt_injection_requires_strong_opencode_binding() {
+        assert!(!should_schedule_restart_prompt_injection(
+            true,
+            Some("previous-session"),
+            Some(&crate::daemon_protocol::OpenCodeBinding::WeakAdopted),
+        ));
     }
 
     #[test]
