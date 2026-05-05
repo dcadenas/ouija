@@ -582,14 +582,32 @@ impl AppState {
         self: &Arc<Self>,
         event: crate::daemon_protocol::Event,
     ) -> Vec<crate::daemon_protocol::Effect> {
-        use crate::daemon_protocol::{Effect, LogLevel};
-
         let effects = {
             let mut state = self.protocol.write().await;
             state.apply(event)
         };
 
-        for effect in &effects {
+        self.execute_effects(&effects).await;
+
+        effects
+    }
+
+    pub(crate) async fn execute_effects(
+        self: &Arc<Self>,
+        effects: &[crate::daemon_protocol::Effect],
+    ) {
+        use crate::daemon_protocol::{Effect, LogLevel};
+
+        let recorded_method = effects.iter().find_map(|effect| match effect {
+            Effect::SendDelivered { method, .. } => Some(method.as_str()),
+            _ => None,
+        });
+        let recorded_http_delivery = effects.iter().find_map(|effect| match effect {
+            Effect::SendDelivered { http_delivery, .. } => http_delivery.as_ref(),
+            _ => None,
+        });
+
+        for effect in effects {
             match effect {
                 Effect::Broadcast(msg) => {
                     crate::transport::broadcast(self, msg).await;
@@ -603,20 +621,53 @@ impl AppState {
                     message,
                     vim_mode,
                 } => {
-                    let use_raw_tmux = {
-                        let proto = self.protocol.read().await;
-                        proto.sessions.get(session_id).is_some_and(|s| {
-                            s.metadata.backend.as_deref() == Some("opencode")
-                                && !s.metadata.is_strong_opencode_binding()
-                        })
-                    };
-                    let result = if use_raw_tmux {
-                        crate::tmux::locked_inject_raw_tmux(
-                            self, session_id, pane, message, *vim_mode,
-                        )
-                        .await
-                    } else {
-                        crate::tmux::locked_inject(self, session_id, pane, message, *vim_mode).await
+                    let result = match recorded_method {
+                        Some("http") => {
+                            match recorded_http_delivery {
+                                Some(delivery) => crate::tmux::deliver_via_http(
+                                    self,
+                                    &delivery.backend_session_id,
+                                    delivery.project_dir.as_deref(),
+                                    message,
+                                    delivery.model.as_deref(),
+                                    delivery.effort.as_deref(),
+                                )
+                                .await,
+                                None => {
+                                    tracing::warn!(
+                                        session = %session_id,
+                                        "http delivery skipped: no recorded backend_session_id on send"
+                                    );
+                                    Ok(())
+                                }
+                            }
+                        }
+                        Some("tmux") => {
+                            crate::tmux::locked_inject_raw_tmux(
+                                self, session_id, pane, message, *vim_mode,
+                            )
+                            .await
+                        }
+                        _ => {
+                            let use_raw_tmux = {
+                                let proto = self.protocol.read().await;
+                                proto.sessions.get(session_id).is_some_and(|s| {
+                                    s.metadata.backend.as_deref() == Some("opencode")
+                                        && !s.metadata.is_strong_opencode_binding()
+                                })
+                            };
+                            if use_raw_tmux {
+                                crate::tmux::locked_inject_raw_tmux(
+                                    self, session_id, pane, message, *vim_mode,
+                                )
+                                .await
+                            } else {
+                                crate::tmux::locked_inject(
+                                    self, session_id, pane, message, *vim_mode,
+                                )
+                                .await
+                            }
+                        }
                     };
                     let _ = result;
                 }
@@ -877,8 +928,6 @@ impl AppState {
                 | Effect::RemoveFailed { .. } => {}
             }
         }
-
-        effects
     }
 
     /// Persist protocol state sessions to disk.
@@ -1815,6 +1864,77 @@ pub(crate) mod tests {
                 metadata: crate::daemon_protocol::SessionMeta::default(),
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn execute_effects_uses_recorded_tmux_method_for_send_inject() {
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use axum::Router;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn prompt_async(AxumState(calls): AxumState<StdArc<AtomicUsize>>) -> StatusCode {
+            calls.fetch_add(1, Ordering::SeqCst);
+            StatusCode::NO_CONTENT
+        }
+
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(calls.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = test_config();
+        config.port = port - 320;
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_live".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let effects = vec![
+            crate::daemon_protocol::Effect::InjectMessage {
+                session_id: "oc".into(),
+                pane: "%1".into(),
+                message: "hello".into(),
+                vim_mode: false,
+            },
+            crate::daemon_protocol::Effect::SendDelivered {
+                from: "sender".into(),
+                to: "oc".into(),
+                method: "tmux".into(),
+                msg_id: 7,
+                http_delivery: None,
+            },
+        ];
+
+        state.execute_effects(&effects).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        server.abort();
     }
 
     #[tokio::test]
