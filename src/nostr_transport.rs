@@ -63,6 +63,25 @@ fn should_schedule_restart_prompt_injection(
     is_http_api && backend_session_id.is_some()
 }
 
+fn should_cleanup_failed_start_pane(
+    is_http_api: bool,
+    backend_session_id: Option<&str>,
+) -> bool {
+    is_http_api && backend_session_id.is_none()
+}
+
+fn cleanup_failed_start_pane(pane_id: &str) {
+    if cfg!(test) {
+        return;
+    }
+    let pane = pane_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-pane", "-t", &pane])
+            .status();
+    });
+}
+
 /// Timeout when waiting for relay connections to establish.
 const RELAY_CONNECT_TIMEOUT_SECS: u64 = 5;
 /// Maximum size of the seen-events dedup cache before clearing.
@@ -1707,6 +1726,9 @@ pub async fn start_session(
                 tracing::warn!(
                     "start_session: not registering {name} because OpenCode attach setup failed"
                 );
+                if should_cleanup_failed_start_pane(is_http_api, None) {
+                    cleanup_failed_start_pane(&pane_id);
+                }
                 return (
                     format!(
                         "start failed: OpenCode attach setup failed for '{name}' (pane {pane_id})"
@@ -3582,6 +3604,11 @@ mod tests {
     #[test]
     fn start_registration_skips_http_api_placeholder_without_backend_session() {
         assert!(start_registration_metadata(true, "%1", None).is_none());
+    }
+
+    #[test]
+    fn failed_start_placeholder_cleanup_required_without_backend_session() {
+        assert!(should_cleanup_failed_start_pane(true, None));
     }
 
     #[test]
