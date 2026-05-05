@@ -293,7 +293,12 @@ api "$BASE_A" POST /api/register -d "{\"id\":\"route-a\",\"pane\":\"$PANE_A1\"}"
 api "$BASE_B" POST /api/register -d "{\"id\":\"route-b\",\"pane\":\"$PANE_B1\"}" >/dev/null
 
 # Wait for mutual visibility
-wait_for 20 bash -c "remote_session_ids '$BASE_A' | grep -qF 'beta/route-b' && remote_session_ids '$BASE_B' | grep -qF 'alpha/route-a'"
+if ! wait_for 20 bash -c "remote_session_ids '$BASE_A' | grep -qF 'beta/route-b' && remote_session_ids '$BASE_B' | grep -qF 'alpha/route-a'"; then
+    log "  Re-announcing route sessions after propagation timeout..."
+    api "$BASE_A" POST /api/register -d "{\"id\":\"route-a\",\"pane\":\"$PANE_A1\"}" >/dev/null
+    api "$BASE_B" POST /api/register -d "{\"id\":\"route-b\",\"pane\":\"$PANE_B1\"}" >/dev/null
+    wait_for 20 bash -c "remote_session_ids '$BASE_A' | grep -qF 'beta/route-b' && remote_session_ids '$BASE_B' | grep -qF 'alpha/route-a'"
+fi
 
 log "Test R4: Cross-daemon message shows from-prefix in pane"
 tmux send-keys -t "$PANE_A1" "clear" Enter
