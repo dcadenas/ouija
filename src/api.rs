@@ -884,6 +884,11 @@ async fn execute_send_effects_for_api(
 ) -> anyhow::Result<()> {
     use crate::daemon_protocol::Effect;
 
+    let recorded_method = effects.iter().find_map(|effect| match effect {
+        Effect::SendDelivered { method, .. } => Some(method.as_str()),
+        _ => None,
+    });
+
     for effect in effects {
         match effect {
             Effect::Broadcast(msg) => {
@@ -895,22 +900,15 @@ async fn execute_send_effects_for_api(
                 message,
                 vim_mode,
             } => {
-                let opencode_binding = {
-                    let proto = state.protocol.read().await;
-                    proto.sessions.get(session_id).and_then(|s| {
-                        (s.metadata.backend.as_deref() == Some("opencode"))
-                            .then(|| s.metadata.is_strong_opencode_binding())
-                    })
-                };
-                match opencode_binding {
-                    Some(true) => {
+                match recorded_method {
+                    Some("http") => {
                         deliver_http_message_for_session(state, session_id, message).await?
                     }
-                    Some(false) => {
+                    Some("tmux") => {
                         tmux::locked_inject_raw_tmux(state, session_id, pane, message, *vim_mode)
                             .await?;
                     }
-                    None => {
+                    _ => {
                         tmux::locked_inject(state, session_id, pane, message, *vim_mode).await?;
                     }
                 }
@@ -3540,6 +3538,57 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(body["method"], "http");
         assert!(body["error"].as_str().unwrap().contains("prompt_async"));
+    }
+
+    #[tokio::test]
+    async fn send_effect_execution_uses_recorded_http_method_after_binding_changes() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-managed".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(
+                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                    ),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let effects = {
+            let mut proto = state.protocol.write().await;
+            proto.apply(crate::daemon_protocol::Event::Send {
+                from: "sender".into(),
+                to: "oc-managed".into(),
+                message: "hello http".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+            })
+        };
+
+        {
+            let mut proto = state.protocol.write().await;
+            let session = proto.sessions.get_mut("oc-managed").unwrap();
+            session.metadata.opencode_binding = Some(
+                crate::daemon_protocol::OpenCodeBinding::WeakAdopted,
+            );
+        }
+
+        let result = execute_send_effects_for_api(&state, &effects).await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("prompt_async"));
     }
 
     #[tokio::test]
