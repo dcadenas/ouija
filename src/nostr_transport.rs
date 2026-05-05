@@ -2447,6 +2447,8 @@ async fn soft_restart_session(
         match proto.sessions.get_mut(name) {
             Some(session) => {
                 session.metadata.backend_session_id = Some(new_session_id.clone());
+                session.metadata.opencode_binding =
+                    Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged);
                 if let Some(m) = model {
                     session.metadata.model = Some(m.to_string());
                 }
@@ -3752,6 +3754,79 @@ mod tests {
 
         assert!(cleaned);
         assert!(deleted.load(Ordering::SeqCst));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn soft_restart_marks_new_opencode_session_strong_managed() {
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        async fn create_session() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "id": "ses_new" }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route("/session", post(create_session));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: None,
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_old".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::WeakAdopted,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        soft_restart_session(
+            &state,
+            "oc",
+            None,
+            dir.path().to_str().unwrap(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let proto = state.protocol.read().await;
+        let metadata = &proto.sessions["oc"].metadata;
+        assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_new"));
+        assert_eq!(
+            metadata.opencode_binding,
+            Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
+        );
         server.abort();
     }
 
