@@ -2638,11 +2638,49 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
             true
         }
         Err(e) => {
-            restore_pending_prompt_if_absent(state, session_name, pane_id, prompt);
-            tracing::warn!("readiness prompt delivery failed for {session_name}: {e}");
-            false
+            tracing::warn!(
+                "readiness prompt HTTP delivery failed for {session_name}, trying raw tmux fallback: {e}"
+            );
+            match deliver_pending_prompt_via_raw_tmux(state, session_name, &pane_id, &prompt).await {
+                Ok(()) => {
+                    tracing::info!(
+                        "delivered queued prompt to {session_name} via raw tmux fallback"
+                    );
+                    true
+                }
+                Err(fallback_error) => {
+                    restore_pending_prompt_if_absent(state, session_name, pane_id, prompt);
+                    tracing::warn!(
+                        "readiness prompt fallback failed for {session_name}: {fallback_error}"
+                    );
+                    false
+                }
+            }
         }
     }
+}
+
+async fn deliver_pending_prompt_via_raw_tmux(
+    state: &SharedState,
+    session_name: &str,
+    pane_id: &str,
+    prompt: &str,
+) -> anyhow::Result<()> {
+    let pane_still_registered = {
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .get(session_name)
+            .and_then(|session| session.pane.as_deref())
+            == Some(pane_id)
+    };
+    if !pane_still_registered {
+        anyhow::bail!(
+            "readiness prompt fallback skipped: pane {pane_id} is no longer registered to session {session_name}"
+        );
+    }
+
+    crate::tmux::locked_inject_raw_tmux(state, session_name, pane_id, prompt, false).await
 }
 
 fn restore_pending_prompt_if_absent(
@@ -4728,7 +4766,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_prompt_delivery_keeps_pending_prompt_when_http_delivery_fails() {
+    async fn readiness_prompt_delivery_falls_back_to_tmux_when_http_delivery_fails() {
         use axum::Router;
         use axum::http::StatusCode;
         use axum::routing::post;
@@ -4775,8 +4813,8 @@ mod tests {
 
         let delivered = deliver_pending_prompt(&state, "oc").await;
 
-        assert!(!delivered);
-        assert!(state.pending_prompts.lock().unwrap().contains_key("oc"));
+        assert!(delivered);
+        assert!(!state.pending_prompts.lock().unwrap().contains_key("oc"));
         server.abort();
     }
 
