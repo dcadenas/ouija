@@ -750,6 +750,7 @@ pub async fn send_msg(
     }
 
     if let Err(e) = execute_send_effects_for_api(&state, &effects).await {
+        clear_pending_reply_for_failed_delivery(&state, &effects).await;
         let method = effects.iter().find_map(|effect| match effect {
             crate::daemon_protocol::Effect::SendDelivered { method, .. } => Some(method.clone()),
             _ => None,
@@ -785,6 +786,29 @@ pub async fn send_msg(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "unexpected send result" })),
         )
+    }
+}
+
+async fn clear_pending_reply_for_failed_delivery(
+    state: &SharedState,
+    effects: &[crate::daemon_protocol::Effect],
+) {
+    let Some((to, msg_id)) = effects.iter().find_map(|effect| match effect {
+        crate::daemon_protocol::Effect::SendDelivered { to, msg_id, .. } => {
+            Some((to.clone(), *msg_id))
+        }
+        _ => None,
+    }) else {
+        return;
+    };
+
+    let mut proto = state.protocol.write().await;
+    let Some(pending) = proto.pending_replies.get_mut(&to) else {
+        return;
+    };
+    pending.retain(|entry| entry.msg_id != msg_id);
+    if pending.is_empty() {
+        proto.pending_replies.remove(&to);
     }
 }
 
@@ -3450,6 +3474,47 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(body["method"], "http");
         assert!(body["error"].as_str().unwrap().contains("prompt_async"));
+    }
+
+    #[tokio::test]
+    async fn send_http_failure_does_not_leave_pending_reply() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-managed".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, _) = send_msg(
+            State(state.clone()),
+            Json(SendBody {
+                from: "sender".into(),
+                to: "oc-managed".into(),
+                message: "hello unreachable http".into(),
+                expects_reply: true,
+                responds_to: None,
+                done: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let proto = state.protocol.read().await;
+        assert!(!proto.pending_replies.contains_key("oc-managed"));
     }
 
     #[tokio::test]
