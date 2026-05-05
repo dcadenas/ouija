@@ -587,15 +587,22 @@ impl AppState {
         self: &Arc<Self>,
         event: crate::daemon_protocol::Event,
     ) -> Vec<crate::daemon_protocol::Effect> {
-        let effects = {
+        let (effects, rollback) = {
             let mut state = self.protocol.write().await;
-            state.apply(event)
+            let mut rollback = FailedEffectSendRollback::capture_for_event(&state, &event);
+            let effects = state.apply(event);
+            if let Some(rollback) = &mut rollback {
+                rollback.capture_after_send(&state);
+            }
+            (effects, rollback)
         };
 
         let delivery_failure = self.execute_effects(&effects).await;
 
         if let Some(failure) = delivery_failure {
             self.clear_pending_reply_for_failed_effect_delivery(&effects)
+                .await;
+            self.rollback_sender_state_for_failed_effect_delivery(rollback)
                 .await;
             return rewrite_send_delivery_failure(effects, &failure.reason);
         }
@@ -974,6 +981,54 @@ impl AppState {
         pending.retain(|entry| entry.msg_id != msg_id);
         if pending.is_empty() {
             proto.pending_replies.remove(&to);
+        }
+    }
+
+    async fn rollback_sender_state_for_failed_effect_delivery(
+        &self,
+        rollback: Option<FailedEffectSendRollback>,
+    ) {
+        let Some(rollback) = rollback else {
+            return;
+        };
+
+        let mut proto = self.protocol.write().await;
+        if let Some(entry) = rollback.pending_reply_before_send {
+            let current_entry =
+                proto
+                    .pending_replies
+                    .get(&rollback.sender_id)
+                    .and_then(|pending| {
+                        pending
+                            .iter()
+                            .find(|pending| pending.msg_id == entry.msg_id)
+                            .cloned()
+                    });
+            if rollback.pending_reply_after_send.as_ref() == Some(&current_entry) {
+                let pending = proto
+                    .pending_replies
+                    .entry(rollback.sender_id.clone())
+                    .or_default();
+                if let Some(existing) = pending
+                    .iter_mut()
+                    .find(|pending| pending.msg_id == entry.msg_id)
+                {
+                    *existing = entry;
+                } else {
+                    pending.push(entry);
+                }
+            }
+        }
+        if rollback.done {
+            let current_reminder = proto
+                .sessions
+                .get(&rollback.sender_id)
+                .and_then(|session| session.metadata.reminder.clone());
+            if rollback.sender_reminder_after_send.as_ref() == Some(&current_reminder)
+                && let Some(session) = proto.sessions.get_mut(&rollback.sender_id)
+            {
+                session.metadata.reminder = rollback.sender_reminder.flatten();
+            }
         }
     }
 
@@ -1801,6 +1856,76 @@ fn rewrite_send_delivery_failure(
         .collect()
 }
 
+struct FailedEffectSendRollback {
+    sender_id: String,
+    pending_reply_before_send: Option<crate::daemon_protocol::PendingReplyEntry>,
+    pending_reply_after_send: Option<Option<crate::daemon_protocol::PendingReplyEntry>>,
+    sender_reminder: Option<Option<String>>,
+    sender_reminder_after_send: Option<Option<String>>,
+    done: bool,
+}
+
+impl FailedEffectSendRollback {
+    fn capture_for_event(
+        proto: &crate::daemon_protocol::DaemonState,
+        event: &crate::daemon_protocol::Event,
+    ) -> Option<Self> {
+        let crate::daemon_protocol::Event::Send {
+            from,
+            responds_to,
+            done,
+            ..
+        } = event
+        else {
+            return None;
+        };
+
+        let pending_reply_before_send = responds_to.and_then(|msg_id| {
+            proto
+                .pending_replies
+                .get(from)
+                .and_then(|pending| pending.iter().find(|entry| entry.msg_id == msg_id).cloned())
+        });
+        Some(Self {
+            sender_id: from.clone(),
+            pending_reply_before_send,
+            pending_reply_after_send: None,
+            sender_reminder: done.then(|| {
+                proto
+                    .sessions
+                    .get(from)
+                    .and_then(|session| session.metadata.reminder.clone())
+            }),
+            sender_reminder_after_send: None,
+            done: *done,
+        })
+    }
+
+    fn capture_after_send(&mut self, proto: &crate::daemon_protocol::DaemonState) {
+        if let Some(before) = &self.pending_reply_before_send {
+            self.pending_reply_after_send = Some(
+                proto
+                    .pending_replies
+                    .get(&self.sender_id)
+                    .and_then(|pending| {
+                        pending
+                            .iter()
+                            .find(|entry| entry.msg_id == before.msg_id)
+                            .cloned()
+                    }),
+            );
+        }
+        if self.done {
+            self.sender_reminder_after_send = Some(
+                proto
+                    .sessions
+                    .get(&self.sender_id)
+                    .and_then(|session| session.metadata.reminder.clone()),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2141,6 +2266,89 @@ pub(crate) mod tests {
 
         let proto = state.protocol.read().await;
         assert!(!proto.pending_replies.contains_key("oc"));
+    }
+
+    #[tokio::test]
+    async fn apply_and_execute_restores_sender_reply_state_after_delivery_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut config = test_config();
+        config.port = port.checked_sub(320).unwrap();
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "sender".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "sender".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        reminder: Some("keep working".into()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: None,
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_headless".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+            proto.pending_replies.insert(
+                "sender".into(),
+                vec![crate::daemon_protocol::PendingReplyEntry {
+                    msg_id: 7,
+                    from: "requester".into(),
+                    message: "please respond".into(),
+                    received_at: 100,
+                    last_activity: 100,
+                    in_progress: false,
+                }],
+            );
+        }
+
+        let effects = state
+            .apply_and_execute(crate::daemon_protocol::Event::Send {
+                from: "sender".into(),
+                to: "oc".into(),
+                message: "done, but unreachable".into(),
+                expects_reply: false,
+                responds_to: Some(7),
+                done: true,
+            })
+            .await;
+
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                crate::daemon_protocol::Effect::SendFailed { reason, .. }
+                    if reason.contains("prompt_async request failed")
+            )
+        }));
+
+        let proto = state.protocol.read().await;
+        let pending = proto.pending_replies.get("sender").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].msg_id, 7);
+        assert_eq!(
+            proto.sessions["sender"].metadata.reminder.as_deref(),
+            Some("keep working")
+        );
     }
 
     #[tokio::test]
