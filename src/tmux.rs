@@ -67,15 +67,24 @@ impl ProcessTree {
 
     /// Check if any descendant of `root` matches one of the given `names`.
     ///
-    /// Also matches dot-prefixed variants (e.g. `.opencode`) since some
-    /// binaries appear that way when run via npm/node wrappers.
+    /// Matches against the full comm string, its basename (last path
+    /// component), and dot-prefixed variants (e.g. `.opencode`) since some
+    /// binaries appear with full paths in `ps` output (notably on macOS when
+    /// installed via Homebrew) or with a leading dot when run via npm/node
+    /// wrappers.
     fn has_descendant_named(&self, root: u32, names: &[&str]) -> bool {
         let mut stack = vec![root];
         while let Some(pid) = stack.pop() {
             if self.names.get(&pid).is_some_and(|n| {
-                names
-                    .iter()
-                    .any(|&target| n == target || n.strip_prefix('.') == Some(target))
+                let basename = std::path::Path::new(n)
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or(n);
+                names.iter().any(|&target| {
+                    n == target
+                        || basename == target
+                        || basename.strip_prefix('.') == Some(target)
+                })
             }) {
                 return true;
             }
@@ -823,5 +832,21 @@ mod tests {
                 .collect(),
         };
         assert!(tree.has_descendant_named(1, &["opencode", "claude"]));
+    }
+
+    #[test]
+    fn has_descendant_named_full_path_basename_match() {
+        // On macOS with Homebrew, ps -eo comm returns the full binary path.
+        let tree = ProcessTree {
+            children: [(1, vec![2]), (2, vec![3])].into_iter().collect(),
+            names: [
+                (1, "fish".into()),
+                (2, "/opt/homebrew/opt/node/bin/node".into()),
+                (3, "/opt/homebrew/Cellar/opencode/1.14.30/libexec/lib/node_modules/opencode-ai/node_modules/opencode-darwin-arm64/bin/opencode".into()),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        assert!(tree.has_descendant_named(1, &["opencode"]));
     }
 }
