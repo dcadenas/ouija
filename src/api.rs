@@ -724,8 +724,9 @@ pub async fn send_msg(
             Json(json!({ "error": format!("cannot send a message to yourself. {hint}") })),
         );
     }
-    let effects = state
-        .apply_and_execute(crate::daemon_protocol::Event::Send {
+    let effects = {
+        let mut proto = state.protocol.write().await;
+        proto.apply(crate::daemon_protocol::Event::Send {
             from: body.from,
             to: body.to,
             message: body.message,
@@ -733,7 +734,32 @@ pub async fn send_msg(
             responds_to: body.responds_to,
             done: body.done,
         })
-        .await;
+    };
+
+    if let Some((reason, renamed_to)) = effects.iter().find_map(|e| match e {
+        crate::daemon_protocol::Effect::SendFailed {
+            reason, renamed_to, ..
+        } => Some((reason.clone(), renamed_to.clone())),
+        _ => None,
+    }) {
+        let mut body = json!({ "error": reason });
+        if let Some(new_id) = renamed_to {
+            body["renamed_to"] = json!(new_id);
+        }
+        return (StatusCode::NOT_FOUND, Json(body));
+    }
+
+    if let Err(e) = execute_send_effects_for_api(&state, &effects).await {
+        let method = effects.iter().find_map(|effect| match effect {
+            crate::daemon_protocol::Effect::SendDelivered { method, .. } => Some(method.clone()),
+            _ => None,
+        });
+        let mut body = json!({ "error": e.to_string() });
+        if let Some(method) = method {
+            body["method"] = json!(method);
+        }
+        return (StatusCode::BAD_GATEWAY, Json(body));
+    }
 
     if let Some((method, msg_id)) = effects.iter().find_map(|e| match e {
         crate::daemon_protocol::Effect::SendDelivered { method, msg_id, .. } => {
@@ -754,23 +780,116 @@ pub async fn send_msg(
                 "msg_id": msg_id,
             })),
         )
-    } else if let Some((reason, renamed_to)) = effects.iter().find_map(|e| match e {
-        crate::daemon_protocol::Effect::SendFailed {
-            reason, renamed_to, ..
-        } => Some((reason.clone(), renamed_to.clone())),
-        _ => None,
-    }) {
-        let mut body = json!({ "error": reason });
-        if let Some(new_id) = renamed_to {
-            body["renamed_to"] = json!(new_id);
-        }
-        (StatusCode::NOT_FOUND, Json(body))
     } else {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "unexpected send result" })),
         )
     }
+}
+
+async fn execute_send_effects_for_api(
+    state: &SharedState,
+    effects: &[crate::daemon_protocol::Effect],
+) -> anyhow::Result<()> {
+    use crate::daemon_protocol::Effect;
+
+    for effect in effects {
+        match effect {
+            Effect::Broadcast(msg) => {
+                crate::transport::broadcast(state, msg).await;
+            }
+            Effect::InjectMessage {
+                session_id,
+                pane,
+                message,
+                vim_mode,
+            } => {
+                let opencode_binding = {
+                    let proto = state.protocol.read().await;
+                    proto.sessions.get(session_id).and_then(|s| {
+                        (s.metadata.backend.as_deref() == Some("opencode"))
+                            .then(|| s.metadata.is_strong_opencode_binding())
+                    })
+                };
+                match opencode_binding {
+                    Some(true) => {
+                        deliver_http_message_for_session(state, session_id, message).await?
+                    }
+                    Some(false) => {
+                        tmux::locked_inject_raw_tmux(state, session_id, pane, message, *vim_mode)
+                            .await?;
+                    }
+                    None => {
+                        tmux::locked_inject(state, session_id, pane, message, *vim_mode).await?;
+                    }
+                }
+            }
+            Effect::DeliverHttpMessage {
+                session_id,
+                message,
+            } => {
+                deliver_http_message_for_session(state, session_id, message).await?;
+            }
+            Effect::SendToHuman { npub, message } => {
+                let _ = crate::nostr_transport::send_plain_dm(state, npub, message).await;
+            }
+            Effect::LogMessage {
+                from,
+                to,
+                message,
+                delivered,
+                transport,
+            } => {
+                state
+                    .log_message(
+                        from.clone(),
+                        to.clone(),
+                        message.clone(),
+                        *delivered,
+                        transport,
+                    )
+                    .await;
+            }
+            Effect::SendDelivered { .. } | Effect::SendFailed { .. } => {}
+            _ => {
+                tracing::debug!(?effect, "unexpected send effect in API executor");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn deliver_http_message_for_session(
+    state: &SharedState,
+    session_id: &str,
+    message: &str,
+) -> anyhow::Result<()> {
+    let (backend_session_id, project_dir, model, effort) = {
+        let proto = state.protocol.read().await;
+        match proto.sessions.get(session_id) {
+            Some(s) => (
+                s.metadata.backend_session_id.clone(),
+                s.metadata.project_dir.clone(),
+                s.metadata.model.clone(),
+                s.metadata.effort.clone(),
+            ),
+            None => (None, None, None, None),
+        }
+    };
+    let Some(backend_session_id) = backend_session_id else {
+        anyhow::bail!("http delivery skipped: no backend_session_id on session");
+    };
+    tmux::deliver_via_http(
+        state,
+        &backend_session_id,
+        project_dir.as_deref(),
+        message,
+        model.as_deref(),
+        effort.as_deref(),
+    )
+    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -3218,9 +3337,37 @@ mod tests {
         assert_eq!(body["method"], "tmux");
     }
 
+    async fn state_with_opencode_prompt_server() -> (SharedState, tokio::task::JoinHandle<()>) {
+        use axum::Router;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        async fn prompt_async() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "ok": true }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_port = listener.local_addr().unwrap().port();
+        assert!(serve_port >= 320, "test listener port must be >= 320");
+        let app = Router::new().route("/session/{session_id}/prompt_async", post(prompt_async));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: serve_port - 320,
+            data_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+            config_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+        });
+
+        (state, server)
+    }
+
     #[tokio::test]
     async fn send_to_strong_opencode_binding_reports_http_acceptance() {
-        let state = crate::state::AppState::new_for_test();
+        let (state, server) = state_with_opencode_prompt_server().await;
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
                 id: "sender".into(),
@@ -3256,14 +3403,58 @@ mod tests {
         )
         .await;
 
+        server.abort();
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "accepted");
         assert_eq!(body["method"], "http");
     }
 
     #[tokio::test]
-    async fn send_to_headless_opencode_session_reports_http_acceptance() {
+    async fn send_to_strong_opencode_binding_reports_http_failure() {
         let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-managed".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(
+                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                    ),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = send_msg(
+            State(state),
+            Json(SendBody {
+                from: "sender".into(),
+                to: "oc-managed".into(),
+                message: "hello unreachable http".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["method"], "http");
+        assert!(body["error"].as_str().unwrap().contains("prompt_async"));
+    }
+
+    #[tokio::test]
+    async fn send_to_headless_opencode_session_reports_http_acceptance() {
+        let (state, server) = state_with_opencode_prompt_server().await;
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
                 id: "sender".into(),
@@ -3296,6 +3487,7 @@ mod tests {
         )
         .await;
 
+        server.abort();
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "accepted");
         assert_eq!(body["method"], "http");
