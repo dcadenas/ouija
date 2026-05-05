@@ -2961,13 +2961,16 @@ async fn auto_provision_from_backend_session(
 /// Auto-provision using an explicit `(pane, dir)` pair supplied by the
 /// opencode plugin in the readiness POST body. Skips the opencode-serve
 /// dir lookup and the tmux pane scan lookup-by-dir, but still verifies the
-/// pane against the same two invariants the scan path enforces:
+/// pane against the same invariants the scan path enforces:
 ///
 /// 1. The pane must appear in `list_assistant_panes`. This rejects stale
 ///    `TMUX_PANE` values (pane died between capture and POST), inherited
 ///    env vars from non-opencode callers, and any other caller who hands
 ///    us a pane id that isn't actually running an assistant process.
-/// 2. The pane must not already be bound to another Local session. Without
+/// 2. The pane's current path must resolve to the hinted project root. This
+///    rejects stale or inherited cwd values that point at a different pane's
+///    project.
+/// 3. The pane must not already be bound to another Local session. Without
 ///    this filter, `apply_register`'s pane-dedup silently evicts whoever
 ///    currently owns the pane — a concurrent claude-code SessionStart, a
 ///    prior auto-provision, or a manual `ouija register` would all be
@@ -3025,14 +3028,28 @@ async fn auto_provision_with_explicit_pane(
     // the same liveness + is-an-assistant-pane check the scan path applies
     // implicitly when it iterates find_assistant_panes results.
     let panes = state.list_assistant_panes().await;
-    if !panes.iter().any(|p| p.pane_id == pane) {
+    let Some(hinted_pane) = panes.iter().find(|p| p.pane_id == pane) else {
         tracing::warn!(
             "auto-provision declined: hint pane {pane} is not among current assistant panes (backend_session_id {backend_sid})"
         );
         return None;
+    };
+
+    // Defense 2: the explicit cwd must match the pane's actual cwd after
+    // applying the same project-root normalization as the scan path.
+    let cwd_matches_pane = hinted_pane
+        .pane_current_path
+        .as_deref()
+        .map(|path| crate::state::resolve_project_root(path) == dir)
+        .unwrap_or(false);
+    if !cwd_matches_pane {
+        tracing::warn!(
+            "auto-provision declined: hint pane {pane} is not in hinted cwd {dir} (backend_session_id {backend_sid})"
+        );
+        return None;
     }
 
-    // Defense 2: the supplied pane must not already belong to another
+    // Defense 3: the supplied pane must not already belong to another
     // Local session. Matches the `registered_panes` filter in the scan path
     // (auto_provision_from_backend_session). Without this, apply_register's
     // pane-dedup would silently evict the current owner.
@@ -5089,13 +5106,11 @@ mod tests {
     async fn backend_session_ready_uses_explicit_pane_and_cwd_hints() {
         // Happy path for the enriched opencode plugin: when both pane and
         // cwd arrive in the body, skip the opencode-serve round-trip AND the
-        // scan-path's list-panes-by-dir filter. The pane still has to appear
-        // in list_assistant_panes (defense 1 of the hint-path validation),
-        // so seed it under a DIFFERENT directory than the hint cwd — that
-        // proves the hint cwd is used for dir derivation, not the pane's
-        // pane_current_path that the scan path would have consulted.
+        // scan-path's opencode-serve dir lookup. The pane still has to appear
+        // in list_assistant_panes and its current path must match the hinted
+        // cwd after project-root normalization.
         let state = crate::state::AppState::new_for_test();
-        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/different-dir", "%31")];
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/explicit-project", "%31")];
 
         let hints = BackendSessionReadyHints {
             pane: Some("%31".into()),
@@ -5111,9 +5126,7 @@ mod tests {
             "hint path must auto-provision with id derived from cwd basename, got: {response}"
         );
 
-        // State mutations end-to-end: note that project_dir follows the
-        // explicit cwd hint, NOT the pane's cached pane_current_path —
-        // the scan path would have resolved /tmp/different-dir here.
+        // State mutations end-to-end: project_dir follows the explicit cwd hint.
         let proto = state.protocol.read().await;
         let session = proto
             .sessions
@@ -5262,6 +5275,26 @@ mod tests {
             proto.sessions.is_empty(),
             "no session must be created for an unverified pane"
         );
+    }
+
+    #[tokio::test]
+    async fn hint_path_rejects_pane_whose_actual_cwd_differs_from_hint() {
+        let state = crate::state::AppState::new_for_test();
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/actual-project", "%17")];
+
+        let result = auto_provision_with_explicit_pane(
+            &state,
+            "ses_mismatch",
+            "%17",
+            "/tmp/hinted-project",
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "hint path must reject pane/cwd mismatches, got Some({result:?})"
+        );
+        assert!(state.protocol.read().await.sessions.is_empty());
     }
 
     #[tokio::test]
