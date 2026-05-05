@@ -2524,6 +2524,31 @@ fn opencode_attach_command(port: u16, session_id: &str, project_dir: &str) -> St
 /// and launch `opencode attach` in the tmux pane.
 ///
 /// Returns the opencode session ID on success.
+fn shared_serve_session_after_attach(
+    session_id: String,
+    attach_ready: bool,
+    pane_id: &str,
+) -> anyhow::Result<String> {
+    if attach_ready {
+        Ok(session_id)
+    } else {
+        anyhow::bail!("opencode attach did not start in pane {pane_id}")
+    }
+}
+
+fn wait_for_opencode_attach(pane_id: &str, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if crate::tmux::pane_alive(pane_id, &["opencode"]) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 async fn setup_shared_serve_session(
     state: &std::sync::Arc<AppState>,
     pane_id: &str,
@@ -2595,27 +2620,29 @@ async fn setup_shared_serve_session(
     let attach_cmd = opencode_attach_command(port, &session_id, project_dir);
     tracing::info!(pane = %pane_id, attach_cmd, "opencode attach: scheduling tmux send-keys");
     let pane = pane_id.to_string();
-    tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         // Small delay so the pane shell is ready
         std::thread::sleep(std::time::Duration::from_millis(300));
         let hidden = format!(" {attach_cmd}");
         let status = std::process::Command::new("tmux")
             .args(["send-keys", "-t", &pane, &hidden, "Enter"])
-            .status();
-        match status {
-            Ok(s) if s.success() => {
-                tracing::info!(pane = %pane, "opencode attach: tmux send-keys succeeded");
-            }
-            Ok(s) => {
-                tracing::warn!(pane = %pane, status = %s, "opencode attach: tmux send-keys failed");
-            }
-            Err(e) => {
-                tracing::warn!(pane = %pane, error = %e, "opencode attach: tmux send-keys errored");
-            }
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("tmux send-keys failed while launching opencode attach in pane {pane}");
         }
-    });
+        Ok(())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("opencode attach launch task failed: {e}"))??;
 
-    Ok(session_id)
+    let pane = pane_id.to_string();
+    let attach_ready = tokio::task::spawn_blocking(move || {
+        wait_for_opencode_attach(&pane, std::time::Duration::from_secs(5))
+    })
+    .await
+    .unwrap_or(false);
+
+    shared_serve_session_after_attach(session_id, attach_ready, pane_id)
 }
 
 /// Inject a prompt into a pane after a short delay, giving the backend time to start.
@@ -3514,6 +3541,12 @@ mod tests {
     #[test]
     fn start_registration_skips_http_api_placeholder_without_backend_session() {
         assert!(start_registration_metadata(true, "%1", None).is_none());
+    }
+
+    #[test]
+    fn shared_serve_session_requires_verified_attach() {
+        let result = shared_serve_session_after_attach("ses_123".to_string(), false, "%1");
+        assert!(result.is_err());
     }
 
     #[test]
