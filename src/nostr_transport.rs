@@ -3038,6 +3038,10 @@ fn prompt_fallback_delivery() -> PromptFallbackDelivery {
     PromptFallbackDelivery::RawTmux
 }
 
+fn should_deliver_prompt_fallback(is_http_api: bool, opencode_tui_alive: bool) -> bool {
+    !is_http_api || opencode_tui_alive
+}
+
 async fn deliver_prompt_fallback(
     state: &AppState,
     session_id: &str,
@@ -3045,6 +3049,18 @@ async fn deliver_prompt_fallback(
     text: &str,
     vim_mode: bool,
 ) -> anyhow::Result<()> {
+    let backend = state.backend_for_session(session_id).await;
+    let is_http_api = matches!(
+        backend.delivery_mode(),
+        crate::backend::DeliveryMode::HttpApi { .. }
+    );
+    let opencode_tui_alive = !is_http_api || crate::tmux::pane_alive(pane, &["opencode"]);
+    if !should_deliver_prompt_fallback(is_http_api, opencode_tui_alive) {
+        anyhow::bail!(
+            "prompt fallback skipped: pane {pane} is no longer running an opencode TUI"
+        );
+    }
+
     match prompt_fallback_delivery() {
         PromptFallbackDelivery::RawTmux => {
             crate::tmux::locked_inject_raw_tmux(state, session_id, pane, text, vim_mode).await
@@ -3565,6 +3581,13 @@ mod tests {
     #[test]
     fn prompt_async_fallback_uses_raw_tmux_delivery() {
         assert_eq!(prompt_fallback_delivery(), PromptFallbackDelivery::RawTmux);
+    }
+
+    #[test]
+    fn prompt_fallback_requires_live_opencode_tui_for_http_api() {
+        assert!(!should_deliver_prompt_fallback(true, false));
+        assert!(should_deliver_prompt_fallback(true, true));
+        assert!(should_deliver_prompt_fallback(false, false));
     }
 
     #[test]
