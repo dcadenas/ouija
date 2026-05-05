@@ -3121,6 +3121,20 @@ async fn deliver_prompt_fallback(
     is_http_api: bool,
     vim_mode: bool,
 ) -> anyhow::Result<()> {
+    let pane_still_registered = {
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.pane.as_deref())
+            == Some(pane)
+    };
+    if !pane_still_registered {
+        anyhow::bail!(
+            "prompt fallback skipped: pane {pane} is no longer registered to session {session_id}"
+        );
+    }
+
     let opencode_tui_alive = !is_http_api || crate::tmux::pane_alive(pane, &["opencode"]);
     if !should_deliver_prompt_fallback(is_http_api, opencode_tui_alive) {
         anyhow::bail!(
@@ -3662,6 +3676,23 @@ mod tests {
         let state = AppState::new_for_test();
 
         let result = deliver_prompt_fallback(&state, "missing", "%missing", "hello", true, false)
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn prompt_fallback_rejects_pane_no_longer_registered_to_session() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%current".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+
+        let result = deliver_prompt_fallback(&state, "oc", "%stale", "hello", false, false)
             .await;
 
         assert!(result.is_err());
