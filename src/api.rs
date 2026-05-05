@@ -2534,8 +2534,13 @@ pub async fn session_active(
 }
 
 /// Deliver a pending prompt for the given session, if one is queued.
-fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool {
-    let pending = state.pending_prompts.lock().unwrap().remove(session_name);
+async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool {
+    let pending = state
+        .pending_prompts
+        .lock()
+        .unwrap()
+        .get(session_name)
+        .cloned();
     let Some((pane_id, prompt)) = pending else {
         tracing::info!(
             session = session_name,
@@ -2543,23 +2548,58 @@ fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool {
         );
         return false;
     };
-    let prompt_len = prompt.len();
-    tracing::info!(
-        session = session_name,
-        pane = %pane_id,
-        prompt_len,
-        "opencode pending prompt: delivering queued prompt"
-    );
-    let state = state.clone();
-    let sid = session_name.to_string();
-    tokio::spawn(async move {
-        if let Err(e) = crate::tmux::locked_inject(&state, &sid, &pane_id, &prompt, false).await {
-            tracing::warn!("readiness prompt delivery failed for {sid}: {e}");
-        } else {
-            tracing::info!("delivered queued prompt to {sid} via readiness signal");
+
+    let http_delivery = {
+        let proto = state.protocol.read().await;
+        proto.sessions.get(session_name).and_then(|session| {
+            (session.metadata.backend.as_deref() == Some("opencode"))
+                .then(|| {
+                    session.metadata.backend_session_id.as_ref().map(|id| {
+                        crate::daemon_protocol::HttpDeliverySnapshot {
+                            backend_session_id: id.clone(),
+                            project_dir: session.metadata.project_dir.clone(),
+                            model: session.metadata.model.clone(),
+                            effort: session.metadata.effort.clone(),
+                        }
+                    })
+                })
+                .flatten()
+        })
+    };
+
+    let result = match http_delivery {
+        Some(delivery) => deliver_http_message(state, &delivery, &prompt).await,
+        None => {
+            crate::tmux::locked_inject_raw_tmux(state, session_name, &pane_id, &prompt, false).await
         }
-    });
-    true
+    };
+
+    match result {
+        Ok(()) => {
+            remove_pending_prompt_if_matches(state, session_name, &pane_id, &prompt);
+            tracing::info!("delivered queued prompt to {session_name} via readiness signal");
+            true
+        }
+        Err(e) => {
+            tracing::warn!("readiness prompt delivery failed for {session_name}: {e}");
+            false
+        }
+    }
+}
+
+fn remove_pending_prompt_if_matches(
+    state: &SharedState,
+    session_name: &str,
+    pane_id: &str,
+    prompt: &str,
+) {
+    let mut pending = state.pending_prompts.lock().unwrap();
+    if pending
+        .get(session_name)
+        .is_some_and(|(pane, text)| pane == pane_id && text == prompt)
+    {
+        pending.remove(session_name);
+    }
 }
 
 /// Handle a readiness signal from an HttpApi session's plugin.
@@ -2567,7 +2607,7 @@ pub async fn session_ready(
     State(state): State<SharedState>,
     axum::extract::Path(session_id): axum::extract::Path<String>,
 ) -> Json<serde_json::Value> {
-    let delivered = deliver_pending_prompt(&state, &session_id);
+    let delivered = deliver_pending_prompt(&state, &session_id).await;
     Json(json!({"delivered": delivered}))
 }
 
@@ -2770,7 +2810,7 @@ async fn backend_session_ready_inner_with_hints(
         }
     };
 
-    let delivered = deliver_pending_prompt(state, &name);
+    let delivered = deliver_pending_prompt(state, &name).await;
     tracing::info!(
         target: "ouija::api::backend_session_ready",
         backend_session_id = %backend_sid,
@@ -4394,6 +4434,59 @@ mod tests {
             result,
             Some(("anthropic".into(), "claude-sonnet-4-6".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn readiness_prompt_delivery_keeps_pending_prompt_when_http_delivery_fails() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        async fn prompt_async() -> StatusCode {
+            StatusCode::BAD_GATEWAY
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route("/session/{session_id}/prompt_async", post(prompt_async));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_ready".into()),
+                    opencode_binding: Some(
+                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                    ),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .pending_prompts
+            .lock()
+            .unwrap()
+            .insert("oc".into(), ("%17".into(), "queued prompt".into()));
+
+        let delivered = deliver_pending_prompt(&state, "oc").await;
+
+        assert!(!delivered);
+        assert!(state.pending_prompts.lock().unwrap().contains_key("oc"));
+        server.abort();
     }
 
     #[tokio::test]
