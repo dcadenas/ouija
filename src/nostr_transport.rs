@@ -56,6 +56,13 @@ fn start_registration_metadata(
     Some((Some(pane_id.to_string()), backend_session_id, opencode_binding))
 }
 
+fn should_schedule_restart_prompt_injection(
+    is_http_api: bool,
+    backend_session_id: Option<&str>,
+) -> bool {
+    is_http_api && backend_session_id.is_some()
+}
+
 /// Timeout when waiting for relay connections to establish.
 const RELAY_CONNECT_TIMEOUT_SECS: u64 = 5;
 /// Maximum size of the seen-events dedup cache before clearing.
@@ -2215,6 +2222,26 @@ pub async fn restart_session(
                 }
             }
 
+            if is_http_api && backend_session_id.is_none() {
+                tracing::warn!(
+                    "restart_session: not registering {name} because OpenCode attach setup failed"
+                );
+                state
+                    .apply_and_execute(crate::daemon_protocol::Event::Remove {
+                        id: name.to_string(),
+                        keep_worktree: true,
+                    })
+                    .await;
+                return (
+                    format!(
+                        "restart failed: OpenCode attach setup failed for '{name}' (pane {pane_id})"
+                    ),
+                    None,
+                );
+            }
+
+            let restart_backend_session_id = backend_session_id.clone();
+
             let opencode_binding = opencode_binding_for_restart_session(
                 is_http_api,
                 backend_session_id.as_deref(),
@@ -2269,7 +2296,10 @@ pub async fn restart_session(
                 .await;
             // HttpApi: deliver prompt via schedule_prompt_injection (readiness
             // signal + fallback). TuiInjection prompt was passed as CLI arg.
-            if is_http_api {
+            if should_schedule_restart_prompt_injection(
+                is_http_api,
+                restart_backend_session_id.as_deref(),
+            ) {
                 if let Some(ref prompt_text) = formatted_prompt {
                     schedule_prompt_injection(state, name, pane_id.clone(), prompt_text.clone());
                 }
@@ -3484,6 +3514,11 @@ mod tests {
     #[test]
     fn start_registration_skips_http_api_placeholder_without_backend_session() {
         assert!(start_registration_metadata(true, "%1", None).is_none());
+    }
+
+    #[test]
+    fn restart_prompt_injection_requires_backend_session() {
+        assert!(!should_schedule_restart_prompt_injection(true, None));
     }
 
     #[test]
