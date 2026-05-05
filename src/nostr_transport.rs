@@ -63,14 +63,14 @@ fn should_schedule_restart_prompt_injection(
     is_http_api && backend_session_id.is_some()
 }
 
-fn should_cleanup_failed_start_pane(
+fn should_cleanup_failed_opencode_attach_pane(
     is_http_api: bool,
     backend_session_id: Option<&str>,
 ) -> bool {
     is_http_api && backend_session_id.is_none()
 }
 
-fn cleanup_failed_start_pane(pane_id: &str) {
+fn cleanup_failed_opencode_attach_pane(pane_id: &str) {
     if cfg!(test) {
         return;
     }
@@ -1726,8 +1726,8 @@ pub async fn start_session(
                 tracing::warn!(
                     "start_session: not registering {name} because OpenCode attach setup failed"
                 );
-                if should_cleanup_failed_start_pane(is_http_api, None) {
-                    cleanup_failed_start_pane(&pane_id);
+                if should_cleanup_failed_opencode_attach_pane(is_http_api, None) {
+                    cleanup_failed_opencode_attach_pane(&pane_id);
                 }
                 return (
                     format!(
@@ -2267,6 +2267,9 @@ pub async fn restart_session(
                 tracing::warn!(
                     "restart_session: not registering {name} because OpenCode attach setup failed"
                 );
+                if should_cleanup_failed_opencode_attach_pane(is_http_api, None) {
+                    cleanup_failed_opencode_attach_pane(&pane_id);
+                }
                 state
                     .apply_and_execute(crate::daemon_protocol::Event::Remove {
                         id: name.to_string(),
@@ -3608,7 +3611,12 @@ mod tests {
 
     #[test]
     fn failed_start_placeholder_cleanup_required_without_backend_session() {
-        assert!(should_cleanup_failed_start_pane(true, None));
+        assert!(should_cleanup_failed_opencode_attach_pane(true, None));
+    }
+
+    #[test]
+    fn failed_restart_placeholder_cleanup_required_without_backend_session() {
+        assert!(should_cleanup_failed_opencode_attach_pane(true, None));
     }
 
     #[test]
