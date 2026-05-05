@@ -727,7 +727,7 @@ pub async fn send_msg(
     let from = body.from.clone();
     let (effects, rollback) = {
         let mut proto = state.protocol.write().await;
-        let rollback = FailedSendRollback::capture(&proto, &from, body.responds_to, body.done);
+        let mut rollback = FailedSendRollback::capture(&proto, &from, body.responds_to, body.done);
         let effects = proto.apply(crate::daemon_protocol::Event::Send {
             from: body.from,
             to: body.to,
@@ -736,6 +736,7 @@ pub async fn send_msg(
             responds_to: body.responds_to,
             done: body.done,
         });
+        rollback.capture_after_send(&proto);
         (effects, rollback)
     };
 
@@ -795,7 +796,9 @@ pub async fn send_msg(
 struct FailedSendRollback {
     sender_id: String,
     pending_reply_before_send: Option<crate::daemon_protocol::PendingReplyEntry>,
+    pending_reply_after_send: Option<Option<crate::daemon_protocol::PendingReplyEntry>>,
     sender_reminder: Option<Option<String>>,
+    sender_reminder_after_send: Option<Option<String>>,
     done: bool,
 }
 
@@ -815,13 +818,39 @@ impl FailedSendRollback {
         Self {
             sender_id: sender_id.to_string(),
             pending_reply_before_send,
+            pending_reply_after_send: None,
             sender_reminder: done.then(|| {
                 proto
                     .sessions
                     .get(sender_id)
                     .and_then(|session| session.metadata.reminder.clone())
             }),
+            sender_reminder_after_send: None,
             done,
+        }
+    }
+
+    fn capture_after_send(&mut self, proto: &crate::daemon_protocol::DaemonState) {
+        if let Some(before) = &self.pending_reply_before_send {
+            self.pending_reply_after_send = Some(
+                proto
+                    .pending_replies
+                    .get(&self.sender_id)
+                    .and_then(|pending| {
+                        pending
+                            .iter()
+                            .find(|entry| entry.msg_id == before.msg_id)
+                            .cloned()
+                    }),
+            );
+        }
+        if self.done {
+            self.sender_reminder_after_send = Some(
+                proto
+                    .sessions
+                    .get(&self.sender_id)
+                    .and_then(|session| session.metadata.reminder.clone()),
+            );
         }
     }
 }
@@ -835,21 +864,38 @@ async fn rollback_failed_delivery(
 
     let mut proto = state.protocol.write().await;
     if let Some(entry) = rollback.pending_reply_before_send {
-        let pending = proto
+        let current_entry = proto
             .pending_replies
-            .entry(rollback.sender_id.clone())
-            .or_default();
-        if let Some(existing) = pending
-            .iter_mut()
-            .find(|pending| pending.msg_id == entry.msg_id)
-        {
-            *existing = entry;
-        } else {
-            pending.push(entry);
+            .get(&rollback.sender_id)
+            .and_then(|pending| {
+                pending
+                    .iter()
+                    .find(|pending| pending.msg_id == entry.msg_id)
+                    .cloned()
+            });
+        if rollback.pending_reply_after_send.as_ref() == Some(&current_entry) {
+            let pending = proto
+                .pending_replies
+                .entry(rollback.sender_id.clone())
+                .or_default();
+            if let Some(existing) = pending
+                .iter_mut()
+                .find(|pending| pending.msg_id == entry.msg_id)
+            {
+                *existing = entry;
+            } else {
+                pending.push(entry);
+            }
         }
     }
     if rollback.done {
-        if let Some(session) = proto.sessions.get_mut(&rollback.sender_id) {
+        let current_reminder = proto
+            .sessions
+            .get(&rollback.sender_id)
+            .and_then(|session| session.metadata.reminder.clone());
+        if rollback.sender_reminder_after_send.as_ref() == Some(&current_reminder)
+            && let Some(session) = proto.sessions.get_mut(&rollback.sender_id)
+        {
             session.metadata.reminder = rollback.sender_reminder.flatten();
         }
     }
@@ -3772,6 +3818,61 @@ mod tests {
             proto.sessions["sender"].metadata.reminder.as_deref(),
             Some("keep working")
         );
+    }
+
+    #[tokio::test]
+    async fn failed_send_rollback_does_not_restore_concurrently_cleared_pending_reply() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "target".into(),
+                pane: Some("%target".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+
+        let (effects, rollback) = {
+            let mut proto = state.protocol.write().await;
+            proto.pending_replies.insert(
+                "sender".into(),
+                vec![crate::daemon_protocol::PendingReplyEntry {
+                    msg_id: 7,
+                    from: "requester".into(),
+                    message: "please respond".into(),
+                    received_at: 100,
+                    last_activity: 100,
+                    in_progress: false,
+                }],
+            );
+            let mut rollback = FailedSendRollback::capture(&proto, "sender", Some(7), false);
+            let effects = proto.apply(crate::daemon_protocol::Event::Send {
+                from: "sender".into(),
+                to: "target".into(),
+                message: "progress that will fail".into(),
+                expects_reply: false,
+                responds_to: Some(7),
+                done: false,
+            });
+            rollback.capture_after_send(&proto);
+            (effects, rollback)
+        };
+
+        {
+            let mut proto = state.protocol.write().await;
+            proto.pending_replies.remove("sender");
+        }
+
+        rollback_failed_delivery(&state, &effects, rollback).await;
+
+        let proto = state.protocol.read().await;
+        assert!(!proto.pending_replies.contains_key("sender"));
     }
 
     #[tokio::test]
