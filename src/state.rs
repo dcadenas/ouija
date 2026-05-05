@@ -632,6 +632,17 @@ impl AppState {
         for effect in effects {
             match effect {
                 Effect::Broadcast(msg) => {
+                    if delivery_failure.is_some()
+                        && matches!(
+                            msg,
+                            crate::protocol::WireMessage::SessionSendAck {
+                                delivered: true,
+                                ..
+                            }
+                        )
+                    {
+                        continue;
+                    }
                     crate::transport::broadcast(self, msg).await;
                 }
                 Effect::BroadcastSessionList => {
@@ -2326,6 +2337,116 @@ pub(crate) mod tests {
                 .is_some_and(|failure| failure.reason.contains("prompt_async request failed")),
             "expected observable HTTP delivery failure, got {failure:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_effects_does_not_broadcast_success_ack_after_inject_failure() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingTransport {
+            broadcasts: StdArc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::transport::Transport for CountingTransport {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
+            async fn broadcast(&self, _msg: &crate::protocol::WireMessage) -> bool {
+                self.broadcasts.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+
+            async fn connect(
+                &self,
+                _ticket: &str,
+                _state: Arc<AppState>,
+                _wait: bool,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn ticket_string(&self) -> Option<String> {
+                None
+            }
+
+            async fn regenerate(
+                &self,
+                _config_dir: &std::path::Path,
+                _data_dir: &std::path::Path,
+            ) -> anyhow::Result<String> {
+                Ok("ticket".into())
+            }
+
+            fn endpoint_id(&self) -> Option<String> {
+                None
+            }
+
+            fn is_ready(&self) -> bool {
+                true
+            }
+
+            fn transport_name(&self) -> &'static str {
+                "counting"
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut config = test_config();
+        config.port = port.checked_sub(320).unwrap();
+        let state = AppState::new(config);
+        let broadcasts = StdArc::new(AtomicUsize::new(0));
+        state
+            .add_transport(StdArc::new(CountingTransport {
+                broadcasts: broadcasts.clone(),
+            }))
+            .await;
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_live".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+        let effects = vec![
+            crate::daemon_protocol::Effect::InjectMessage {
+                session_id: "oc".into(),
+                pane: "%1".into(),
+                message: "hello".into(),
+                vim_mode: false,
+            },
+            crate::daemon_protocol::Effect::Broadcast(
+                crate::protocol::WireMessage::SessionSendAck {
+                    from: "remote".into(),
+                    to: "oc".into(),
+                    delivered: true,
+                    daemon_id: "remote-daemon".into(),
+                },
+            ),
+        ];
+
+        let failure = state.execute_effects(&effects).await;
+
+        assert!(failure.is_some());
+        assert_eq!(broadcasts.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
