@@ -173,6 +173,7 @@ impl SessionMeta {
     pub fn is_strong_opencode_binding(&self) -> bool {
         self.backend.as_deref() == Some("opencode")
             && self.opencode_binding == Some(OpenCodeBinding::StrongManaged)
+            && self.backend_session_id.is_some()
     }
 
     /// Returns `true` if metadata has never been explicitly set or is older than 30 minutes.
@@ -2020,6 +2021,18 @@ mod tests {
         assert!(meta.last_iteration_at.is_none());
         assert!(meta.model.is_none());
         assert!(meta.effort.is_none());
+    }
+
+    #[test]
+    fn strong_opencode_binding_requires_backend_session_id() {
+        let meta = SessionMeta {
+            backend: Some("opencode".into()),
+            opencode_binding: Some(OpenCodeBinding::StrongManaged),
+            backend_session_id: None,
+            ..Default::default()
+        };
+
+        assert!(!meta.is_strong_opencode_binding());
     }
 
     #[test]

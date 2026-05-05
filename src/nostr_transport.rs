@@ -10,6 +10,19 @@ use crate::protocol::WireMessage;
 use crate::state::AppState;
 use crate::transport::Transport;
 
+fn opencode_binding_for_backend_session(
+    is_http_api: bool,
+    backend_session_id: Option<&str>,
+) -> Option<crate::daemon_protocol::OpenCodeBinding> {
+    if !is_http_api {
+        None
+    } else if backend_session_id.is_some() {
+        Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
+    } else {
+        Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
+    }
+}
+
 /// Timeout when waiting for relay connections to establish.
 const RELAY_CONNECT_TIMEOUT_SECS: u64 = 5;
 /// Maximum size of the seen-events dedup cache before clearing.
@@ -1632,10 +1645,11 @@ pub async fn start_session(
     match start_result {
         Ok(Ok(pane_id)) => {
             // For HttpApi backends, use the shared opencode serve instance
-            let backend_session_id = if matches!(
+            let is_http_api = matches!(
                 backend.delivery_mode(),
                 crate::backend::DeliveryMode::HttpApi { .. }
-            ) {
+            );
+            let backend_session_id = if is_http_api {
                 match setup_shared_serve_session(state, &pane_id, &dir).await {
                     Ok(sid) => Some(sid),
                     Err(e) => {
@@ -1653,14 +1667,10 @@ pub async fn start_session(
                 worktree,
                 backend: Some(backend_name.clone()),
                 backend_session_id,
-                opencode_binding: if matches!(
-                    backend.delivery_mode(),
-                    crate::backend::DeliveryMode::HttpApi { .. }
-                ) {
-                    Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
-                } else {
-                    None
-                },
+                opencode_binding: opencode_binding_for_backend_session(
+                    is_http_api,
+                    oc_session_id.as_deref(),
+                ),
                 model: model.map(String::from),
                 effort: effort.map(String::from),
                 reminder: reminder.map(String::from),
@@ -2148,6 +2158,8 @@ pub async fn restart_session(
                 }
             }
 
+            let opencode_binding =
+                opencode_binding_for_backend_session(is_http_api, backend_session_id.as_deref());
             let proto_meta = match prev_metadata {
                 Some(ref m) => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),
@@ -2158,11 +2170,7 @@ pub async fn restart_session(
                     vim_mode: m.vim_mode,
                     backend_session_id,
                     backend: Some(backend_name.clone()),
-                    opencode_binding: if is_http_api {
-                        Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
-                    } else {
-                        None
-                    },
+                    opencode_binding: opencode_binding.clone(),
                     project_description: m.project_description.clone(),
                     last_metadata_update: None,
                     model: effective_model.clone(),
@@ -2183,11 +2191,7 @@ pub async fn restart_session(
                     project_dir: Some(dir.clone()),
                     backend: Some(backend_name.clone()),
                     backend_session_id,
-                    opencode_binding: if is_http_api {
-                        Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
-                    } else {
-                        None
-                    },
+                    opencode_binding,
                     model: effective_model.clone(),
                     effort: effective_effort.clone(),
                     reminder: effective_reminder.clone(),
