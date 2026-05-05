@@ -1803,14 +1803,14 @@ pub async fn start_session(
                                         r.status()
                                     );
                                     let _ = deliver_prompt_fallback(
-                                        &state2, &name2, &pane2, &injected, false,
+                                        &state2, &name2, &pane2, &injected, true, false,
                                     )
                                     .await;
                                 }
                                 Err(e) => {
                                     tracing::warn!("start_session: prompt_async failed: {e}");
                                     let _ = deliver_prompt_fallback(
-                                        &state2, &name2, &pane2, &injected, false,
+                                        &state2, &name2, &pane2, &injected, true, false,
                                     )
                                     .await;
                                 }
@@ -2355,7 +2355,8 @@ pub async fn restart_session(
             } else if is_http_api && restart_backend_session_id.is_some() {
                 if let Some(ref prompt_text) = formatted_prompt {
                     if let Err(e) =
-                        deliver_prompt_fallback(state, name, &pane_id, prompt_text, false).await
+                        deliver_prompt_fallback(state, name, &pane_id, prompt_text, true, false)
+                            .await
                     {
                         tracing::warn!("restart prompt fallback delivery failed for {name}: {e}");
                     }
@@ -3047,7 +3048,7 @@ pub(crate) fn schedule_prompt_injection(
         let pending = state.pending_prompts.lock().unwrap().remove(&name);
         if let Some((pane, text)) = pending {
             tracing::info!("readiness timeout for {name}, delivering prompt via fallback");
-            let _ = deliver_prompt_fallback(&state, &name, &pane, &text, false).await;
+            let _ = deliver_prompt_fallback(&state, &name, &pane, &text, true, false).await;
         }
     });
 }
@@ -3097,13 +3098,9 @@ async fn deliver_prompt_fallback(
     session_id: &str,
     pane: &str,
     text: &str,
+    is_http_api: bool,
     vim_mode: bool,
 ) -> anyhow::Result<()> {
-    let backend = state.backend_for_session(session_id).await;
-    let is_http_api = matches!(
-        backend.delivery_mode(),
-        crate::backend::DeliveryMode::HttpApi { .. }
-    );
     let opencode_tui_alive = !is_http_api || crate::tmux::pane_alive(pane, &["opencode"]);
     if !should_deliver_prompt_fallback(is_http_api, opencode_tui_alive) {
         anyhow::bail!(
@@ -3638,6 +3635,16 @@ mod tests {
         assert!(!should_deliver_prompt_fallback(true, false));
         assert!(should_deliver_prompt_fallback(true, true));
         assert!(should_deliver_prompt_fallback(false, false));
+    }
+
+    #[tokio::test]
+    async fn prompt_fallback_uses_recorded_http_api_policy_for_missing_session() {
+        let state = AppState::new_for_test();
+
+        let result = deliver_prompt_fallback(&state, "missing", "%missing", "hello", true, false)
+            .await;
+
+        assert!(result.is_err());
     }
 
     #[test]
