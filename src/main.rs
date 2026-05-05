@@ -694,7 +694,7 @@ async fn main() -> anyhow::Result<()> {
             cli_post("/api/send", &body).await?;
         }
         Command::Ls => {
-            cli_get("/api/status").await?;
+            cli_list_sessions().await?;
         }
         Command::Announce { role, bulletin } => {
             if role.is_none() && bulletin.is_none() {
@@ -1771,6 +1771,39 @@ async fn cli_get(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn cli_list_sessions() -> anyhow::Result<()> {
+    let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
+    let url = format!("http://localhost:{port}/api/status");
+    let status: serde_json::Value = reqwest::get(&url).await?.json().await?;
+    println!("{}", project_session_list(&status));
+    Ok(())
+}
+
+fn project_session_list(status: &serde_json::Value) -> serde_json::Value {
+    let sessions = status
+        .get("sessions")
+        .and_then(|sessions| sessions.as_array())
+        .map(|sessions| {
+            sessions
+                .iter()
+                .map(|session| {
+                    serde_json::json!({
+                        "id": session.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                        "origin": session.get("origin").cloned().unwrap_or(serde_json::Value::Null),
+                        "project_dir": session.get("project_dir").cloned().unwrap_or(serde_json::Value::Null),
+                        "role": session.get("role").cloned().unwrap_or(serde_json::Value::Null),
+                        "bulletin": session.get("bulletin").cloned().unwrap_or(serde_json::Value::Null),
+                        "stale": session.get("stale").cloned().unwrap_or(serde_json::Value::Null),
+                        "worktree_present": session.get("worktree_present").cloned().unwrap_or(serde_json::Value::Null),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    serde_json::json!({ "sessions": sessions })
+}
+
 async fn cli_post(path: &str, body: &serde_json::Value) -> anyhow::Result<()> {
     let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
     let url = format!("http://localhost:{port}{path}");
@@ -2045,6 +2078,49 @@ mod tests {
         use reqwest::StatusCode;
         let err = classify_http_response(StatusCode::BAD_REQUEST, "").unwrap_err();
         assert!(err.to_string().contains("400"));
+    }
+
+    #[test]
+    fn session_list_projection_keeps_discovery_fields_only() {
+        let status = serde_json::json!({
+            "daemon": "locota",
+            "transports": [{"name": "nostr", "ready": true}],
+            "assistant_panes": [{"pane_id": "%1", "session": "ouija"}],
+            "sessions": [{
+                "id": "ouija-next-issue",
+                "origin": "local",
+                "project_dir": "/home/daniel/code/ouija",
+                "role": "working on ouija",
+                "bulletin": "ready",
+                "stale": true,
+                "worktree_present": true,
+                "prompt": "internal prompt that should not be listed",
+                "reminder": "internal reminder that should not be listed",
+                "backend_session_id": "ses_secret_internal",
+                "iteration_log": ["noise"]
+            }]
+        });
+
+        let projected = project_session_list(&status);
+
+        assert_eq!(
+            projected,
+            serde_json::json!({
+                "sessions": [{
+                    "id": "ouija-next-issue",
+                    "origin": "local",
+                    "project_dir": "/home/daniel/code/ouija",
+                    "role": "working on ouija",
+                    "bulletin": "ready",
+                    "stale": true,
+                    "worktree_present": true
+                }]
+            })
+        );
+        assert!(projected.get("daemon").is_none());
+        assert!(projected["sessions"][0].get("prompt").is_none());
+        assert!(projected["sessions"][0].get("reminder").is_none());
+        assert!(projected["sessions"][0].get("backend_session_id").is_none());
     }
 
     #[test]
