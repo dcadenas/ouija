@@ -1684,9 +1684,15 @@ pub async fn start_session(
                     metadata: proto_meta,
                 })
                 .await;
-            let prompt_msg_id = pre_queued_prompt.as_ref().and_then(|(_, id)| *id);
+            let prompt_delivery = pre_queued_prompt
+                .as_ref()
+                .map(|_| start_prompt_delivery(is_http_api, oc_session_id.as_deref()));
+            let prompt_msg_id = start_prompt_msg_id(
+                pre_queued_prompt.as_ref().and_then(|(_, id)| *id),
+                prompt_delivery,
+            );
             if let Some((ref prompt_text, _)) = pre_queued_prompt {
-                match start_prompt_delivery(is_http_api, oc_session_id.as_deref()) {
+                match prompt_delivery.expect("prompt delivery is computed when prompt exists") {
                     StartPromptDelivery::PromptAsync => {
                         let oc_sid = oc_session_id
                             .as_ref()
@@ -1735,12 +1741,13 @@ pub async fn start_session(
                             }
                         });
                     }
-                    StartPromptDelivery::RawTmux => {
-                        let _ = deliver_prompt_fallback(state, name, &pane_id, prompt_text, false)
-                            .await;
-                    }
                     StartPromptDelivery::AlreadyPassedAsCliArg => {
                         // TuiInjection prompts are passed as CLI args before spawn.
+                    }
+                    StartPromptDelivery::Unavailable => {
+                        tracing::warn!(
+                            "start_session: prompt for {name} not delivered because OpenCode attach setup failed"
+                        );
                     }
                 }
             }
@@ -2825,8 +2832,8 @@ pub(crate) fn schedule_prompt_injection(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StartPromptDelivery {
     PromptAsync,
-    RawTmux,
     AlreadyPassedAsCliArg,
+    Unavailable,
 }
 
 fn start_prompt_delivery(
@@ -2838,7 +2845,14 @@ fn start_prompt_delivery(
     } else if backend_session_id.is_some() {
         StartPromptDelivery::PromptAsync
     } else {
-        StartPromptDelivery::RawTmux
+        StartPromptDelivery::Unavailable
+    }
+}
+
+fn start_prompt_msg_id(msg_id: Option<u64>, delivery: Option<StartPromptDelivery>) -> Option<u64> {
+    match delivery {
+        Some(StartPromptDelivery::Unavailable) => None,
+        _ => msg_id,
     }
 }
 
@@ -3381,10 +3395,18 @@ mod tests {
     }
 
     #[test]
-    fn start_prompt_uses_raw_tmux_when_http_api_has_no_backend_session() {
+    fn start_prompt_is_unavailable_when_http_api_has_no_attached_session() {
         assert_eq!(
             start_prompt_delivery(true, None),
-            StartPromptDelivery::RawTmux
+            StartPromptDelivery::Unavailable
+        );
+    }
+
+    #[test]
+    fn unavailable_start_prompt_does_not_expose_msg_id() {
+        assert_eq!(
+            start_prompt_msg_id(Some(42), Some(StartPromptDelivery::Unavailable)),
+            None
         );
     }
 
