@@ -3047,12 +3047,30 @@ pub(crate) fn schedule_prompt_injection(
     let state = state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-        let pending = state.pending_prompts.lock().unwrap().remove(&name);
+        let pending = state.pending_prompts.lock().unwrap().get(&name).cloned();
         if let Some((pane, text)) = pending {
             tracing::info!("readiness timeout for {name}, delivering prompt via fallback");
-            let _ = deliver_prompt_fallback(&state, &name, &pane, &text, true, false).await;
+            match deliver_prompt_fallback(&state, &name, &pane, &text, true, false).await {
+                Ok(()) => remove_pending_prompt_if_matches(&state, &name, &pane, &text),
+                Err(error) => tracing::warn!("readiness timeout fallback failed for {name}: {error}"),
+            }
         }
     });
+}
+
+fn remove_pending_prompt_if_matches(
+    state: &std::sync::Arc<AppState>,
+    session_name: &str,
+    pane_id: &str,
+    prompt: &str,
+) {
+    let mut pending = state.pending_prompts.lock().unwrap();
+    if pending
+        .get(session_name)
+        .is_some_and(|(pane, text)| pane == pane_id && text == prompt)
+    {
+        pending.remove(session_name);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3647,6 +3665,20 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn readiness_timeout_keeps_pending_prompt_when_raw_fallback_fails() {
+        let state = AppState::new_for_test();
+        schedule_prompt_injection(&state, "oc", "%missing".into(), "queued prompt".into());
+
+        tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            state.pending_prompts.lock().unwrap().get("oc"),
+            Some(&("%missing".into(), "queued prompt".into()))
+        );
     }
 
     #[test]
