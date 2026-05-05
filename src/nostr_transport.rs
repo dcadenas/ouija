@@ -2459,30 +2459,8 @@ async fn soft_restart_session(
                 let client = state.http_client.clone();
                 let orphan_id = new_session_id.clone();
                 tokio::spawn(async move {
-                    let url = format!("http://127.0.0.1:{port}/session/{orphan_id}");
-                    match client
-                        .delete(&url)
-                        .timeout(std::time::Duration::from_secs(5))
-                        .send()
-                        .await
-                    {
-                        Ok(r) if r.status().is_success() => {
-                            tracing::debug!(
-                                "soft restart cleanup: deleted orphan opencode session {orphan_id}"
-                            );
-                        }
-                        Ok(r) => {
-                            tracing::warn!(
-                                "soft restart cleanup: DELETE /session/{orphan_id} returned {}",
-                                r.status()
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "soft restart cleanup: DELETE /session/{orphan_id} failed: {e}"
-                            );
-                        }
-                    }
+                    delete_opencode_session(&client, port, &orphan_id, "soft restart cleanup")
+                        .await;
                 });
                 return Err(());
             }
@@ -2638,6 +2616,37 @@ async fn launch_opencode_attach_for_session(
     .unwrap_or(false))
 }
 
+async fn delete_opencode_session(
+    client: &reqwest::Client,
+    port: u16,
+    session_id: &str,
+    context: &str,
+) -> bool {
+    let url = format!("http://127.0.0.1:{port}/session/{session_id}");
+    match client
+        .delete(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => {
+            tracing::debug!("{context}: deleted opencode session {session_id}");
+            true
+        }
+        Ok(r) => {
+            tracing::warn!(
+                "{context}: DELETE /session/{session_id} returned {}",
+                r.status()
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!("{context}: DELETE /session/{session_id} failed: {e}");
+            false
+        }
+    }
+}
+
 async fn setup_shared_serve_session(
     state: &std::sync::Arc<AppState>,
     pane_id: &str,
@@ -2706,9 +2715,34 @@ async fn setup_shared_serve_session(
         "opencode shared serve session create: ok"
     );
 
-    let attach_ready = launch_opencode_attach_for_session(pane_id, project_dir, &session_id, port).await?;
+    let attach_ready =
+        match launch_opencode_attach_for_session(pane_id, project_dir, &session_id, port).await {
+            Ok(ready) => ready,
+            Err(e) => {
+                delete_opencode_session(
+                    &state.http_client,
+                    port,
+                    &session_id,
+                    "shared serve attach cleanup",
+                )
+                .await;
+                return Err(e);
+            }
+        };
 
-    shared_serve_session_after_attach(session_id, attach_ready, pane_id)
+    match shared_serve_session_after_attach(session_id.clone(), attach_ready, pane_id) {
+        Ok(session_id) => Ok(session_id),
+        Err(e) => {
+            delete_opencode_session(
+                &state.http_client,
+                port,
+                &session_id,
+                "shared serve attach cleanup",
+            )
+            .await;
+            Err(e)
+        }
+    }
 }
 
 /// Inject a prompt into a pane after a short delay, giving the backend time to start.
@@ -3646,6 +3680,46 @@ mod tests {
     fn shared_serve_session_requires_verified_attach() {
         let result = shared_serve_session_after_attach("ses_123".to_string(), false, "%1");
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn cleanup_created_opencode_session_sends_delete() {
+        use axum::Router;
+        use axum::extract::{Path, State};
+        use axum::http::StatusCode;
+        use axum::routing::delete;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn delete_session(
+            State(deleted): State<Arc<AtomicBool>>,
+            Path(session_id): Path<String>,
+        ) -> StatusCode {
+            if session_id == "ses_leak" {
+                deleted.store(true, Ordering::SeqCst);
+                StatusCode::NO_CONTENT
+            } else {
+                StatusCode::NOT_FOUND
+            }
+        }
+
+        let deleted = Arc::new(AtomicBool::new(false));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}", delete(delete_session))
+            .with_state(deleted.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let cleaned =
+            delete_opencode_session(&reqwest::Client::new(), port, "ses_leak", "test").await;
+
+        assert!(cleaned);
+        assert!(deleted.load(Ordering::SeqCst));
+        server.abort();
     }
 
     #[test]
