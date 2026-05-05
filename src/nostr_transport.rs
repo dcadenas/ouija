@@ -2517,10 +2517,7 @@ async fn soft_restart_session(
 
     // 4. Respawn the TUI attach to point at the new session
     if let Some(pane) = pane {
-        let escaped_dir = crate::scheduler::shell_escape(project_dir);
-        let attach_cmd = format!(
-            "opencode attach http://127.0.0.1:{port} --session {new_session_id} --dir {escaped_dir}"
-        );
+        let attach_cmd = opencode_attach_command(port, &new_session_id, project_dir);
         let pane = pane.to_string();
         let env_args = crate::tmux::pane_env_args(name);
         tokio::task::spawn_blocking(move || {
@@ -2583,15 +2580,21 @@ fn wait_for_opencode_attach(pane_id: &str, timeout: std::time::Duration) -> bool
     }
 }
 
+fn opencode_attach_command(port: u16, session_id: &str, project_dir: &str) -> String {
+    let escaped_session_id = crate::scheduler::shell_escape(session_id);
+    let escaped_dir = crate::scheduler::shell_escape(project_dir);
+    format!(
+        "opencode attach http://127.0.0.1:{port} --session {escaped_session_id} --dir {escaped_dir}"
+    )
+}
+
 async fn launch_opencode_attach_for_session(
     pane_id: &str,
     project_dir: &str,
     session_id: &str,
     port: u16,
 ) -> anyhow::Result<bool> {
-    let escaped_dir = crate::scheduler::shell_escape(project_dir);
-    let attach_cmd =
-        format!("opencode attach http://127.0.0.1:{port} --session {session_id} --dir {escaped_dir}");
+    let attach_cmd = opencode_attach_command(port, session_id, project_dir);
     let pane = pane_id.to_string();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         // Small delay so the pane shell is ready
@@ -3680,6 +3683,16 @@ mod tests {
     fn shared_serve_session_requires_verified_attach() {
         let result = shared_serve_session_after_attach("ses_123".to_string(), false, "%1");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn opencode_attach_command_shell_escapes_session_id() {
+        let command = opencode_attach_command(7880, "abc; touch PWNED; #", "/tmp/project dir");
+
+        assert_eq!(
+            command,
+            "opencode attach http://127.0.0.1:7880 --session 'abc; touch PWNED; #' --dir '/tmp/project dir'"
+        );
     }
 
     #[tokio::test]
