@@ -593,6 +593,7 @@ impl AppState {
             let effects = state.apply(event);
             if let Some(rollback) = &mut rollback {
                 rollback.capture_after_send(&state);
+                rollback.reserve_sender_state_after_send(&mut state);
             }
             (effects, rollback)
         };
@@ -606,6 +607,8 @@ impl AppState {
                 .await;
             return rewrite_send_delivery_failure(effects, &failure.reason);
         }
+
+        self.finalize_successful_effect_delivery(rollback).await;
 
         effects
     }
@@ -1018,6 +1021,10 @@ impl AppState {
         };
 
         let mut proto = self.protocol.write().await;
+        if rollback.sender_state_reserved() {
+            return;
+        }
+
         if let Some(entry) = rollback.pending_reply_before_send {
             let current_entry =
                 proto
@@ -1054,6 +1061,31 @@ impl AppState {
             {
                 session.metadata.reminder = rollback.sender_reminder.flatten();
             }
+        }
+    }
+
+    async fn finalize_successful_effect_delivery(&self, rollback: Option<FailedEffectSendRollback>) {
+        let Some(rollback) = rollback else {
+            return;
+        };
+        if !rollback.done {
+            return;
+        }
+
+        let mut proto = self.protocol.write().await;
+        if let Some(entry) = rollback.pending_reply_before_send {
+            if let Some(pending) = proto.pending_replies.get_mut(&rollback.sender_id) {
+                pending.retain(|pending| pending.msg_id != entry.msg_id || pending != &entry);
+                if pending.is_empty() {
+                    proto.pending_replies.remove(&rollback.sender_id);
+                }
+            }
+        }
+        if rollback.sender_reminder.is_some()
+            && let Some(session) = proto.sessions.get_mut(&rollback.sender_id)
+            && session.metadata.reminder == rollback.sender_reminder.flatten()
+        {
+            session.metadata.reminder = None;
         }
     }
 
@@ -1887,6 +1919,7 @@ struct FailedEffectSendRollback {
     pending_reply_after_send: Option<Option<crate::daemon_protocol::PendingReplyEntry>>,
     sender_reminder: Option<Option<String>>,
     sender_reminder_after_send: Option<Option<String>>,
+    sender_state_reserved: bool,
     done: bool,
 }
 
@@ -1922,6 +1955,7 @@ impl FailedEffectSendRollback {
                     .and_then(|session| session.metadata.reminder.clone())
             }),
             sender_reminder_after_send: None,
+            sender_state_reserved: false,
             done: *done,
         })
     }
@@ -1948,6 +1982,34 @@ impl FailedEffectSendRollback {
                     .and_then(|session| session.metadata.reminder.clone()),
             );
         }
+    }
+
+    fn reserve_sender_state_after_send(&mut self, proto: &mut crate::daemon_protocol::DaemonState) {
+        if !self.done {
+            return;
+        }
+
+        if let Some(entry) = self.pending_reply_before_send.clone()
+            && self.pending_reply_after_send == Some(None)
+        {
+            proto.pending_replies
+                .entry(self.sender_id.clone())
+                .or_default()
+                .push(entry);
+            self.sender_state_reserved = true;
+        }
+
+        if self.sender_reminder.is_some()
+            && self.sender_reminder_after_send == Some(None)
+            && let Some(session) = proto.sessions.get_mut(&self.sender_id)
+        {
+            session.metadata.reminder = self.sender_reminder.clone().flatten();
+            self.sender_state_reserved = true;
+        }
+    }
+
+    fn sender_state_reserved(&self) -> bool {
+        self.sender_state_reserved
     }
 }
 
@@ -2420,6 +2482,122 @@ pub(crate) mod tests {
             proto.sessions["sender"].metadata.reminder.as_deref(),
             Some("keep working")
         );
+    }
+
+    #[tokio::test]
+    async fn apply_and_execute_does_not_restore_concurrently_cleared_sender_reply_state() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use tokio::sync::Notify;
+
+        #[derive(Clone)]
+        struct Gate {
+            started: StdArc<Notify>,
+            release: StdArc<Notify>,
+        }
+
+        async fn prompt_async(AxumState(gate): AxumState<Gate>) -> StatusCode {
+            gate.started.notify_one();
+            gate.release.notified().await;
+            StatusCode::BAD_GATEWAY
+        }
+
+        let gate = Gate {
+            started: StdArc::new(Notify::new()),
+            release: StdArc::new(Notify::new()),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(gate.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = test_config();
+        config.port = port.checked_sub(320).unwrap();
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "sender".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "sender".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        reminder: Some("keep working".into()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: None,
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_headless".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+            proto.pending_replies.insert(
+                "sender".into(),
+                vec![crate::daemon_protocol::PendingReplyEntry {
+                    msg_id: 7,
+                    from: "requester".into(),
+                    message: "please respond".into(),
+                    received_at: 100,
+                    last_activity: 100,
+                    in_progress: false,
+                }],
+            );
+        }
+
+        let delivery = tokio::spawn({
+            let state = state.clone();
+            async move {
+                state
+                    .apply_and_execute(crate::daemon_protocol::Event::Send {
+                        from: "sender".into(),
+                        to: "oc".into(),
+                        message: "done, but unreachable".into(),
+                        expects_reply: false,
+                        responds_to: Some(7),
+                        done: true,
+                    })
+                    .await
+            }
+        });
+        gate.started.notified().await;
+        {
+            let mut proto = state.protocol.write().await;
+            proto.pending_replies.remove("sender");
+            proto.sessions.get_mut("sender").unwrap().metadata.reminder = None;
+        }
+
+        gate.release.notify_one();
+        let effects = delivery.await.unwrap();
+
+        assert!(effects.iter().any(|effect| {
+            matches!(effect, crate::daemon_protocol::Effect::SendFailed { reason, .. } if reason.contains("prompt_async"))
+        }));
+        let proto = state.protocol.read().await;
+        assert!(!proto.pending_replies.contains_key("sender"));
+        assert_eq!(proto.sessions["sender"].metadata.reminder, None);
+        server.abort();
     }
 
     #[tokio::test]
