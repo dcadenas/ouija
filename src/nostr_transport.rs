@@ -23,6 +23,21 @@ fn opencode_binding_for_backend_session(
     }
 }
 
+fn opencode_binding_for_restart_session(
+    is_http_api: bool,
+    backend_session_id: Option<&str>,
+    reused_previous_backend_session: bool,
+    previous_binding: Option<crate::daemon_protocol::OpenCodeBinding>,
+) -> Option<crate::daemon_protocol::OpenCodeBinding> {
+    if !is_http_api {
+        None
+    } else if reused_previous_backend_session && backend_session_id.is_some() {
+        Some(previous_binding.unwrap_or(crate::daemon_protocol::OpenCodeBinding::WeakAdopted))
+    } else {
+        opencode_binding_for_backend_session(is_http_api, backend_session_id)
+    }
+}
+
 /// Timeout when waiting for relay connections to establish.
 const RELAY_CONNECT_TIMEOUT_SECS: u64 = 5;
 /// Maximum size of the seen-events dedup cache before clearing.
@@ -2126,6 +2141,7 @@ pub async fn restart_session(
     match start_result {
         Ok(Ok(pane_id)) => {
             // For HttpApi backends, use the shared opencode serve instance
+            let mut reused_previous_backend_session = false;
             let mut backend_session_id = if matches!(
                 backend.delivery_mode(),
                 crate::backend::DeliveryMode::HttpApi { .. }
@@ -2158,6 +2174,7 @@ pub async fn restart_session(
                         {
                             Ok(r) if r.status().is_success() => {
                                 backend_session_id = Some(prev_sid.clone());
+                                reused_previous_backend_session = true;
                             }
                             _ => {
                                 tracing::warn!(
@@ -2169,8 +2186,12 @@ pub async fn restart_session(
                 }
             }
 
-            let opencode_binding =
-                opencode_binding_for_backend_session(is_http_api, backend_session_id.as_deref());
+            let opencode_binding = opencode_binding_for_restart_session(
+                is_http_api,
+                backend_session_id.as_deref(),
+                reused_previous_backend_session,
+                prev_metadata.as_ref().and_then(|m| m.opencode_binding.clone()),
+            );
             let proto_meta = match prev_metadata {
                 Some(ref m) => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),
@@ -3407,6 +3428,27 @@ mod tests {
         assert_eq!(
             start_prompt_msg_id(Some(42), Some(StartPromptDelivery::Unavailable)),
             None
+        );
+    }
+
+    #[test]
+    fn restart_reusing_previous_backend_session_preserves_weak_opencode_binding() {
+        assert_eq!(
+            opencode_binding_for_restart_session(
+                true,
+                Some("previous-session"),
+                true,
+                Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted),
+            ),
+            Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
+        );
+    }
+
+    #[test]
+    fn restart_reusing_previous_backend_session_without_binding_defaults_weak() {
+        assert_eq!(
+            opencode_binding_for_restart_session(true, Some("previous-session"), true, None),
+            Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
         );
     }
 
