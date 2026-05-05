@@ -1686,12 +1686,11 @@ pub async fn start_session(
                 .await;
             let prompt_msg_id = pre_queued_prompt.as_ref().and_then(|(_, id)| *id);
             if let Some((ref prompt_text, _)) = pre_queued_prompt {
-                // For HttpApi backends, deliver via prompt_async
-                if let Some(ref oc_sid) = oc_session_id {
-                    if matches!(
-                        backend.delivery_mode(),
-                        crate::backend::DeliveryMode::HttpApi { .. }
-                    ) {
+                match start_prompt_delivery(is_http_api, oc_session_id.as_deref()) {
+                    StartPromptDelivery::PromptAsync => {
+                        let oc_sid = oc_session_id
+                            .as_ref()
+                            .expect("PromptAsync delivery requires an OpenCode backend session id");
                         let port = state.opencode_serve_port();
                         let body = opencode_prompt_body(prompt_text, model, effort);
                         let url = format!("http://127.0.0.1:{port}/session/{oc_sid}/prompt_async");
@@ -1736,9 +1735,14 @@ pub async fn start_session(
                             }
                         });
                     }
-                    // TuiInjection: prompt already passed as CLI arg — no injection needed
+                    StartPromptDelivery::RawTmux => {
+                        let _ = deliver_prompt_fallback(state, name, &pane_id, prompt_text, false)
+                            .await;
+                    }
+                    StartPromptDelivery::AlreadyPassedAsCliArg => {
+                        // TuiInjection prompts are passed as CLI args before spawn.
+                    }
                 }
-                // TuiInjection: prompt already passed as CLI arg — no injection needed
             }
             if auto_worktree {
                 let conflict_name = {
@@ -2819,6 +2823,26 @@ pub(crate) fn schedule_prompt_injection(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartPromptDelivery {
+    PromptAsync,
+    RawTmux,
+    AlreadyPassedAsCliArg,
+}
+
+fn start_prompt_delivery(
+    is_http_api: bool,
+    backend_session_id: Option<&str>,
+) -> StartPromptDelivery {
+    if !is_http_api {
+        StartPromptDelivery::AlreadyPassedAsCliArg
+    } else if backend_session_id.is_some() {
+        StartPromptDelivery::PromptAsync
+    } else {
+        StartPromptDelivery::RawTmux
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PromptFallbackDelivery {
     RawTmux,
 }
@@ -3354,6 +3378,14 @@ mod tests {
     #[test]
     fn prompt_async_fallback_uses_raw_tmux_delivery() {
         assert_eq!(prompt_fallback_delivery(), PromptFallbackDelivery::RawTmux);
+    }
+
+    #[test]
+    fn start_prompt_uses_raw_tmux_when_http_api_has_no_backend_session() {
+        assert_eq!(
+            start_prompt_delivery(true, None),
+            StartPromptDelivery::RawTmux
+        );
     }
 
     #[test]
