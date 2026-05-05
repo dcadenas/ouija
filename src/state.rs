@@ -1774,14 +1774,14 @@ fn rewrite_send_delivery_failure(
 ) -> Vec<crate::daemon_protocol::Effect> {
     effects
         .into_iter()
-        .filter_map(|effect| match effect {
+        .map(|effect| match effect {
             crate::daemon_protocol::Effect::SendDelivered { from, to, .. } => {
-                Some(crate::daemon_protocol::Effect::SendFailed {
+                crate::daemon_protocol::Effect::SendFailed {
                     from,
                     to,
                     reason: reason.to_string(),
                     renamed_to: None,
-                })
+                }
             }
             crate::daemon_protocol::Effect::LogMessage {
                 from,
@@ -1789,14 +1789,14 @@ fn rewrite_send_delivery_failure(
                 message,
                 delivered: true,
                 transport,
-            } => Some(crate::daemon_protocol::Effect::LogMessage {
+            } => crate::daemon_protocol::Effect::LogMessage {
                 from,
                 to,
                 message,
                 delivered: false,
                 transport,
-            }),
-            other => Some(other),
+            },
+            other => other,
         })
         .collect()
 }
@@ -2140,7 +2140,7 @@ pub(crate) mod tests {
         drop(log);
 
         let proto = state.protocol.read().await;
-        assert!(proto.pending_replies.get("oc").is_none());
+        assert!(!proto.pending_replies.contains_key("oc"));
     }
 
     #[tokio::test]
