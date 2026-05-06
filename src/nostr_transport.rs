@@ -2398,6 +2398,11 @@ async fn soft_restart_session(
     ))
 }
 
+fn opencode_attach_command(port: u16, session_id: &str, project_dir: &str) -> String {
+    let escaped_dir = crate::scheduler::shell_escape(project_dir);
+    format!("opencode attach http://127.0.0.1:{port} --session {session_id} --dir {escaped_dir}")
+}
+
 /// Health-check the externally running opencode serve, create a session on it,
 /// and launch `opencode attach` in the tmux pane.
 ///
@@ -2408,6 +2413,12 @@ async fn setup_shared_serve_session(
     project_dir: &str,
 ) -> anyhow::Result<String> {
     let port = state.opencode_serve_port();
+    tracing::info!(
+        pane = %pane_id,
+        project_dir,
+        port,
+        "opencode shared serve setup: starting"
+    );
 
     // Health check: verify serve is reachable
     let health = state
@@ -2416,13 +2427,27 @@ async fn setup_shared_serve_session(
         .timeout(std::time::Duration::from_secs(3))
         .send()
         .await;
-    if health.is_err() {
-        anyhow::bail!(
-            "opencode serve not running on port {port}. Start it with:\n  opencode serve --port {port}"
-        );
+    match health {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::info!(port, status = %resp.status(), "opencode shared serve health ok");
+        }
+        Ok(resp) => {
+            tracing::warn!(port, status = %resp.status(), "opencode shared serve health returned non-success");
+            anyhow::bail!(
+                "opencode serve health check failed on port {port}: {}",
+                resp.status()
+            );
+        }
+        Err(e) => {
+            tracing::warn!(port, error = %e, "opencode shared serve health request failed");
+            anyhow::bail!(
+                "opencode serve not running on port {port}. Start it with:\n  opencode serve --port {port}"
+            );
+        }
     }
 
     // Create session via HTTP API
+    tracing::info!(port, project_dir, "opencode shared serve session create: posting");
     let resp = state
         .http_client
         .post(format!("http://127.0.0.1:{port}/session"))
@@ -2442,20 +2467,35 @@ async fn setup_shared_serve_session(
         .map(String::from)
         .ok_or_else(|| anyhow::anyhow!("no session id in opencode response"))?;
 
-    tracing::info!("created opencode session {session_id} on shared serve (port {port})");
-
-    let escaped_dir = crate::scheduler::shell_escape(project_dir);
-    let attach_cmd = format!(
-        "opencode attach http://127.0.0.1:{port} --session {session_id} --dir {escaped_dir}"
+    tracing::info!(
+        port,
+        project_dir,
+        pane = %pane_id,
+        opencode_session_id = %session_id,
+        "opencode shared serve session create: ok"
     );
+
+    let attach_cmd = opencode_attach_command(port, &session_id, project_dir);
+    tracing::info!(pane = %pane_id, attach_cmd, "opencode attach: scheduling tmux send-keys");
     let pane = pane_id.to_string();
     tokio::task::spawn_blocking(move || {
         // Small delay so the pane shell is ready
         std::thread::sleep(std::time::Duration::from_millis(300));
         let hidden = format!(" {attach_cmd}");
-        let _ = std::process::Command::new("tmux")
+        let status = std::process::Command::new("tmux")
             .args(["send-keys", "-t", &pane, &hidden, "Enter"])
             .status();
+        match status {
+            Ok(s) if s.success() => {
+                tracing::info!(pane = %pane, "opencode attach: tmux send-keys succeeded");
+            }
+            Ok(s) => {
+                tracing::warn!(pane = %pane, status = %s, "opencode attach: tmux send-keys failed");
+            }
+            Err(e) => {
+                tracing::warn!(pane = %pane, error = %e, "opencode attach: tmux send-keys errored");
+            }
+        }
     });
 
     Ok(session_id)
@@ -3250,6 +3290,15 @@ mod tests {
             serde_json::json!({
                 "parts": [{"type": "text", "text": "hello"}]
             })
+        );
+    }
+
+    #[test]
+    fn opencode_attach_command_shell_escapes_project_dir() {
+        let cmd = opencode_attach_command(8200, "ses_test", "/tmp/project with spaces");
+        assert_eq!(
+            cmd,
+            "opencode attach http://127.0.0.1:8200 --session ses_test --dir '/tmp/project with spaces'"
         );
     }
 

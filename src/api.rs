@@ -2277,8 +2277,19 @@ pub async fn session_active(
 fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool {
     let pending = state.pending_prompts.lock().unwrap().remove(session_name);
     let Some((pane_id, prompt)) = pending else {
+        tracing::info!(
+            session = session_name,
+            "opencode pending prompt: none queued at readiness"
+        );
         return false;
     };
+    let prompt_len = prompt.len();
+    tracing::info!(
+        session = session_name,
+        pane = %pane_id,
+        prompt_len,
+        "opencode pending prompt: delivering queued prompt"
+    );
     let state = state.clone();
     let sid = session_name.to_string();
     tokio::spawn(async move {
@@ -2341,6 +2352,13 @@ pub async fn backend_session_ready(
             }
         }
     };
+    tracing::info!(
+        target: "ouija::api::backend_session_ready",
+        backend_session_id = %backend_sid,
+        hint_pane = ?hints.pane,
+        hint_cwd = ?hints.cwd,
+        "backend session ready received"
+    );
     Json(backend_session_ready_inner_with_hints(&state, backend_sid, hints).await)
 }
 
@@ -2390,6 +2408,12 @@ async fn backend_session_ready_inner_with_hints(
     };
 
     let name = if let Some(n) = session_name {
+        tracing::info!(
+            target: "ouija::api::backend_session_ready",
+            backend_session_id = %backend_sid,
+            session = %n,
+            "ready direct lookup matched existing backend session"
+        );
         n
     } else {
         // Step 2: adoption. Consumes one opencode-serve round-trip internally;
@@ -2400,12 +2424,19 @@ async fn backend_session_ready_inner_with_hints(
         let adopted = adopt_backend_session_id(state, &backend_sid).await;
 
         if let Some(n) = adopted {
+            tracing::info!(
+                target: "ouija::api::backend_session_ready",
+                backend_session_id = %backend_sid,
+                session = %n,
+                "ready adopted backend session into existing ouija session"
+            );
             n
         } else {
             // Step 3: auto-provision for ad-hoc opencode sessions (issue #35).
             let auto_register = state.settings.read().await.auto_register;
             if !auto_register {
-                tracing::debug!(
+                tracing::warn!(
+                    target: "ouija::api::backend_session_ready",
                     "auto_register disabled; declining to auto-provision for backend_session_id {backend_sid}"
                 );
                 return json!({"delivered": false, "error": "no session with this backend_session_id"});
@@ -2414,29 +2445,79 @@ async fn backend_session_ready_inner_with_hints(
             // Fast path: plugin sent both pane + cwd. Skip the opencode-serve
             // round-trip AND the tmux pane scan and use the hints directly.
             if let (Some(pane), Some(cwd)) = (hints.pane.as_deref(), hints.cwd.as_deref()) {
+                tracing::info!(
+                    target: "ouija::api::backend_session_ready",
+                    backend_session_id = %backend_sid,
+                    pane,
+                    cwd,
+                    "ready trying explicit pane/cwd auto-provision"
+                );
                 if let Some(n) =
                     auto_provision_with_explicit_pane(state, &backend_sid, pane, cwd).await
                 {
+                    tracing::info!(
+                        target: "ouija::api::backend_session_ready",
+                        backend_session_id = %backend_sid,
+                        session = %n,
+                        "ready explicit auto-provision succeeded"
+                    );
                     n
                 } else {
+                    tracing::warn!(
+                        target: "ouija::api::backend_session_ready",
+                        backend_session_id = %backend_sid,
+                        pane,
+                        cwd,
+                        "ready explicit auto-provision failed"
+                    );
                     return json!({"delivered": false, "error": "no session with this backend_session_id"});
                 }
             } else {
                 // Fallback: resolve dir from opencode serve, then scan tmux.
                 let Some(dir) = lookup_opencode_session_dir(state, &backend_sid).await else {
+                    tracing::warn!(
+                        target: "ouija::api::backend_session_ready",
+                        backend_session_id = %backend_sid,
+                        "ready fallback could not resolve opencode session directory"
+                    );
                     return json!({"delivered": false, "error": "no session with this backend_session_id"});
                 };
+                tracing::info!(
+                    target: "ouija::api::backend_session_ready",
+                    backend_session_id = %backend_sid,
+                    dir,
+                    "ready trying scan-based auto-provision"
+                );
 
                 let Some(n) = auto_provision_from_backend_session(state, &backend_sid, &dir).await
                 else {
+                    tracing::warn!(
+                        target: "ouija::api::backend_session_ready",
+                        backend_session_id = %backend_sid,
+                        dir,
+                        "ready scan-based auto-provision failed"
+                    );
                     return json!({"delivered": false, "error": "no session with this backend_session_id"});
                 };
+                tracing::info!(
+                    target: "ouija::api::backend_session_ready",
+                    backend_session_id = %backend_sid,
+                    session = %n,
+                    "ready scan-based auto-provision succeeded"
+                );
                 n
             }
         }
     };
 
     let delivered = deliver_pending_prompt(state, &name);
+    tracing::info!(
+        target: "ouija::api::backend_session_ready",
+        backend_session_id = %backend_sid,
+        session = %name,
+        delivered,
+        "backend session ready complete"
+    );
     json!({"delivered": delivered, "session": name})
 }
 
@@ -2723,12 +2804,37 @@ async fn lookup_opencode_session_dir(
         .timeout(std::time::Duration::from_secs(3))
         .send()
         .await
+        .map_err(|e| {
+            tracing::warn!(
+                target: "ouija::api::backend_session_ready",
+                backend_session_id = %backend_sid,
+                port,
+                error = %e,
+                "opencode session dir lookup request failed"
+            );
+            e
+        })
         .ok()?;
     if !resp.status().is_success() {
+        tracing::warn!(
+            target: "ouija::api::backend_session_ready",
+            backend_session_id = %backend_sid,
+            port,
+            status = %resp.status(),
+            "opencode session dir lookup returned non-success"
+        );
         return None;
     }
     let body: serde_json::Value = resp.json().await.ok()?;
-    body["directory"].as_str().map(str::to_string)
+    let dir = body["directory"].as_str().map(str::to_string);
+    tracing::info!(
+        target: "ouija::api::backend_session_ready",
+        backend_session_id = %backend_sid,
+        port,
+        directory = ?dir,
+        "opencode session dir lookup complete"
+    );
+    dir
 }
 
 /// Parse an opencode model string of the form `"providerID/modelID"` into its
@@ -2804,6 +2910,12 @@ async fn adopt_backend_session_id(
     backend_sid: &str,
 ) -> Option<String> {
     let dir = lookup_opencode_session_dir(state, backend_sid).await?;
+    tracing::info!(
+        target: "ouija::api::backend_session_ready",
+        backend_session_id = %backend_sid,
+        dir,
+        "adoption resolved opencode session directory"
+    );
 
     // Collect ALL local ouija sessions matching this directory that lack a
     // backend_session_id (issue #15). Silently picking the first match — as
@@ -2826,6 +2938,12 @@ async fn adopt_backend_session_id(
     };
 
     let session_id = disambiguate_adoption_candidates(backend_sid, &dir, candidates)?;
+    tracing::info!(
+        target: "ouija::api::backend_session_ready",
+        backend_session_id = %backend_sid,
+        session = %session_id,
+        "adoption selected existing ouija session"
+    );
 
     tracing::info!(
         "adopting backend_session_id {backend_sid} for session {session_id} (dir: {dir})"
