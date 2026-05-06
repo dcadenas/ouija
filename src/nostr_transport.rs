@@ -3112,30 +3112,48 @@ pub(crate) fn schedule_prompt_injection(
     let state = state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-        let pending = state.pending_prompts.lock().unwrap().get(&name).cloned();
+        let pending = reserve_pending_prompt_if_matches(&state, &name, &pane_id, &prompt);
         if let Some((pane, text)) = pending {
             tracing::info!("readiness timeout for {name}, delivering prompt via fallback");
             match deliver_prompt_fallback(&state, &name, &pane, &text, true, false).await {
-                Ok(()) => remove_pending_prompt_if_matches(&state, &name, &pane, &text),
-                Err(error) => tracing::warn!("readiness timeout fallback failed for {name}: {error}"),
+                Ok(()) => {}
+                Err(error) => {
+                    restore_pending_prompt_if_absent(&state, &name, pane, text);
+                    tracing::warn!("readiness timeout fallback failed for {name}: {error}");
+                }
             }
         }
     });
 }
 
-fn remove_pending_prompt_if_matches(
+fn reserve_pending_prompt_if_matches(
     state: &std::sync::Arc<AppState>,
     session_name: &str,
     pane_id: &str,
     prompt: &str,
-) {
+) -> Option<(String, String)> {
     let mut pending = state.pending_prompts.lock().unwrap();
     if pending
         .get(session_name)
         .is_some_and(|(pane, text)| pane == pane_id && text == prompt)
     {
-        pending.remove(session_name);
+        return pending.remove(session_name);
     }
+    None
+}
+
+fn restore_pending_prompt_if_absent(
+    state: &std::sync::Arc<AppState>,
+    session_name: &str,
+    pane_id: String,
+    prompt: String,
+) {
+    state
+        .pending_prompts
+        .lock()
+        .unwrap()
+        .entry(session_name.to_string())
+        .or_insert((pane_id, prompt));
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3775,6 +3793,21 @@ mod tests {
             state.pending_prompts.lock().unwrap().get("oc"),
             Some(&("%missing".into(), "queued prompt".into()))
         );
+    }
+
+    #[test]
+    fn readiness_timeout_reserves_prompt_before_raw_fallback() {
+        let state = AppState::new_for_test();
+        state
+            .pending_prompts
+            .lock()
+            .unwrap()
+            .insert("oc".into(), ("%pane".into(), "queued prompt".into()));
+
+        let reserved = reserve_pending_prompt_if_matches(&state, "oc", "%pane", "queued prompt");
+
+        assert_eq!(reserved, Some(("%pane".into(), "queued prompt".into())));
+        assert!(state.pending_prompts.lock().unwrap().get("oc").is_none());
     }
 
     #[test]
