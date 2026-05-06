@@ -1031,8 +1031,9 @@ async fn execute_send_effects_for_api(
             Effect::DeliverHttpMessage {
                 session_id: _,
                 message,
+                http_delivery,
             } => {
-                let delivery = recorded_http_delivery.ok_or_else(|| {
+                let delivery = Some(http_delivery).or(recorded_http_delivery).ok_or_else(|| {
                     anyhow::anyhow!(
                         "http delivery skipped: no recorded backend_session_id on send"
                     )

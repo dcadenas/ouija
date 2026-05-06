@@ -422,6 +422,7 @@ pub enum Effect {
     DeliverHttpMessage {
         session_id: String,
         message: String,
+        http_delivery: HttpDeliverySnapshot,
     },
 
     // Agents
@@ -1601,6 +1602,53 @@ impl DaemonState {
                             daemon_id: self.daemon_id.clone(),
                         },
                     ));
+                } else if session.metadata.backend.as_deref() == Some("opencode")
+                    && let Some(http_delivery) = session.metadata.http_delivery_snapshot()
+                {
+                    let formatted = format_session_message(
+                        &display_from,
+                        message,
+                        expects_reply,
+                        local_msg_id,
+                        responds_to,
+                        done,
+                    );
+                    effects.push(Effect::DeliverHttpMessage {
+                        session_id: to.to_string(),
+                        message: formatted,
+                        http_delivery,
+                    });
+
+                    if expects_reply {
+                        self.pending_replies
+                            .entry(to.to_string())
+                            .or_default()
+                            .push(PendingReplyEntry {
+                                msg_id: local_msg_id,
+                                from: display_from.clone(),
+                                message: message.to_string(),
+                                received_at: chrono::Utc::now().timestamp(),
+                                last_activity: chrono::Utc::now().timestamp(),
+                                in_progress: false,
+                            });
+                    }
+
+                    effects.push(Effect::LogMessage {
+                        from: from.to_string(),
+                        to: to.to_string(),
+                        message: message.to_string(),
+                        delivered: true,
+                        transport: "nostr".into(),
+                    });
+
+                    effects.push(Effect::Broadcast(
+                        crate::protocol::WireMessage::SessionSendAck {
+                            from: from.to_string(),
+                            to: to.to_string(),
+                            delivered: true,
+                            daemon_id: self.daemon_id.clone(),
+                        },
+                    ));
                 }
             }
             Some(ref session) if matches!(&session.origin, Origin::Human(..)) => {
@@ -1965,6 +2013,9 @@ impl DaemonState {
                         effects.push(Effect::DeliverHttpMessage {
                             session_id: resolved_to.clone(),
                             message: formatted,
+                            http_delivery: session.metadata.http_delivery_snapshot().expect(
+                                "opencode backend_session_id should produce HTTP delivery snapshot",
+                            ),
                         });
 
                         if expects_reply {
@@ -3999,6 +4050,56 @@ mod tests {
                 ..
             })
         )));
+    }
+
+    #[test]
+    fn incoming_session_send_to_headless_opencode_returns_http_delivery() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "oc".into(),
+            pane: None,
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_live".into()),
+                opencode_binding: Some(OpenCodeBinding::StrongManaged),
+                networked: true,
+                ..Default::default()
+            },
+        });
+
+        let effects = state.apply(Event::IncomingWire {
+            msg: crate::protocol::WireMessage::SessionSend {
+                from: "remote-session".into(),
+                to: "oc".into(),
+                message: "hello".into(),
+                expects_reply: true,
+                msg_id: 42,
+                responds_to: None,
+                done: false,
+            },
+            sender_npub: None,
+        });
+
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::DeliverHttpMessage {
+                session_id,
+                message,
+                ..
+            } if session_id == "oc" && message.contains("id=\"42\"")
+        )));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::Broadcast(crate::protocol::WireMessage::SessionSendAck {
+                delivered: true,
+                ..
+            })
+        )));
+        assert!(
+            state.pending_replies["oc"]
+                .iter()
+                .any(|entry| entry.msg_id == 42)
+        );
     }
 
     #[test]

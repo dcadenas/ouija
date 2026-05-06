@@ -729,8 +729,9 @@ impl AppState {
                 Effect::DeliverHttpMessage {
                     session_id,
                     message,
+                    http_delivery,
                 } => {
-                    match recorded_http_delivery {
+                    match Some(http_delivery).or(recorded_http_delivery) {
                         Some(delivery) => {
                             if let Err(error) = crate::tmux::deliver_via_http(
                                 self,
@@ -2274,6 +2275,12 @@ pub(crate) mod tests {
             crate::daemon_protocol::Effect::DeliverHttpMessage {
                 session_id: "oc".into(),
                 message: "hello".into(),
+                http_delivery: crate::daemon_protocol::HttpDeliverySnapshot {
+                    backend_session_id: "ses_live".into(),
+                    project_dir: None,
+                    model: None,
+                    effort: None,
+                },
             },
             crate::daemon_protocol::Effect::SendDelivered {
                 from: "sender".into(),
