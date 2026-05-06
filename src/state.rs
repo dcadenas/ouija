@@ -177,8 +177,25 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     /// Queued prompts for HttpApi sessions awaiting a readiness signal.
     /// TuiInjection sessions pass prompts as CLI args instead.
-    /// Maps session_id -> (pane_id, prompt_text).
-    pub pending_prompts: std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
+    /// Maps session_id -> queued readiness prompt.
+    pub pending_prompts: std::sync::Mutex<std::collections::HashMap<String, PendingPrompt>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingPrompt {
+    pub pane_id: String,
+    pub prompt: String,
+    pub backend_session_id: Option<String>,
+}
+
+impl PendingPrompt {
+    pub fn new(pane_id: String, prompt: String, backend_session_id: Option<String>) -> Self {
+        Self {
+            pane_id,
+            prompt,
+            backend_session_id,
+        }
+    }
 }
 
 impl std::fmt::Debug for AppState {

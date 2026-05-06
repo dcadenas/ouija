@@ -840,6 +840,7 @@ async fn revive_and_inject(
                 task.session_name(),
                 new_pane.clone(),
                 full_text,
+                None,
             );
         }
     }

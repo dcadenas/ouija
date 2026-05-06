@@ -2596,32 +2596,47 @@ pub async fn session_active(
 /// Deliver a pending prompt for the given session, if one is queued.
 async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool {
     let pending = state.pending_prompts.lock().unwrap().remove(session_name);
-    let Some((pane_id, prompt)) = pending else {
+    let Some(pending) = pending else {
         tracing::info!(
             session = session_name,
             "opencode pending prompt: none queued at readiness"
         );
         return false;
     };
+    let pane_id = pending.pane_id.clone();
+    let prompt = pending.prompt.clone();
 
-    let (pane_still_registered, http_delivery) = {
+    let (pane_still_registered, backend_session_matches, http_delivery) = {
         let proto = state.protocol.read().await;
         match proto.sessions.get(session_name) {
             Some(session) => (
                 session.pane.as_deref() == Some(pane_id.as_str()),
+                pending
+                    .backend_session_id
+                    .as_deref()
+                    .is_none_or(|expected| {
+                        session.metadata.backend_session_id.as_deref() == Some(expected)
+                    }),
                 session
                     .metadata
                     .is_strong_opencode_binding()
                     .then(|| session.metadata.http_delivery_snapshot())
                     .flatten(),
             ),
-            None => (false, None),
+            None => (false, false, None),
         }
     };
     if !pane_still_registered {
-        restore_pending_prompt_if_absent(state, session_name, pane_id, prompt);
+        restore_pending_prompt_if_absent(state, session_name, pending);
         tracing::warn!(
             "readiness prompt delivery skipped for {session_name}: queued pane is no longer registered to the session"
+        );
+        return false;
+    }
+    if !backend_session_matches {
+        restore_pending_prompt_if_absent(state, session_name, pending);
+        tracing::warn!(
+            "readiness prompt delivery skipped for {session_name}: queued OpenCode backend session is no longer current"
         );
         return false;
     }
@@ -2650,13 +2665,8 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
                     true
                 }
                 Err(fallback_error) => {
-                    restore_pending_prompt_if_absent(
-                        state,
-                        session_name,
-                        pane_id.clone(),
-                        prompt.clone(),
-                    );
-                    schedule_pending_prompt_retry(state, session_name, pane_id, prompt);
+                    restore_pending_prompt_if_absent(state, session_name, pending.clone());
+                    schedule_pending_prompt_retry(state, session_name, pending);
                     tracing::warn!(
                         "readiness prompt fallback failed for {session_name}: {fallback_error}"
                     );
@@ -2665,8 +2675,8 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
             }
         }
         Err(e) => {
-            restore_pending_prompt_if_absent(state, session_name, pane_id.clone(), prompt.clone());
-            schedule_pending_prompt_retry(state, session_name, pane_id, prompt);
+            restore_pending_prompt_if_absent(state, session_name, pending.clone());
+            schedule_pending_prompt_retry(state, session_name, pending);
             tracing::warn!("readiness prompt raw tmux delivery failed for {session_name}: {e}");
             false
         }
@@ -2681,21 +2691,33 @@ const PENDING_PROMPT_RETRY_DELAY: std::time::Duration = std::time::Duration::fro
 fn schedule_pending_prompt_retry(
     state: &SharedState,
     session_name: &str,
-    pane_id: String,
-    prompt: String,
+    pending_prompt: crate::state::PendingPrompt,
 ) {
     let state = state.clone();
     let session_name = session_name.to_string();
     tokio::spawn(async move {
         tokio::time::sleep(PENDING_PROMPT_RETRY_DELAY).await;
-        let pending = reserve_pending_prompt_if_matches(&state, &session_name, &pane_id, &prompt);
-        let Some((pane_id, prompt)) = pending else {
+        let pending = reserve_pending_prompt_if_matches(
+            &state,
+            &session_name,
+            &pending_prompt.pane_id,
+            &pending_prompt.prompt,
+            pending_prompt.backend_session_id.as_deref(),
+        );
+        let Some(pending) = pending else {
             return;
         };
-        match deliver_pending_prompt_via_raw_tmux(&state, &session_name, &pane_id, &prompt).await {
+        match deliver_pending_prompt_via_raw_tmux(
+            &state,
+            &session_name,
+            &pending.pane_id,
+            &pending.prompt,
+        )
+        .await
+        {
             Ok(()) => {}
             Err(error) => {
-                restore_pending_prompt_if_absent(&state, &session_name, pane_id, prompt);
+                restore_pending_prompt_if_absent(&state, &session_name, pending);
                 tracing::warn!("readiness prompt retry fallback failed for {session_name}: {error}")
             }
         }
@@ -2707,11 +2729,16 @@ fn reserve_pending_prompt_if_matches(
     session_name: &str,
     pane_id: &str,
     prompt: &str,
-) -> Option<(String, String)> {
+    backend_session_id: Option<&str>,
+) -> Option<crate::state::PendingPrompt> {
     let mut pending = state.pending_prompts.lock().unwrap();
     if pending
         .get(session_name)
-        .is_some_and(|(pane, text)| pane == pane_id && text == prompt)
+        .is_some_and(|pending| {
+            pending.pane_id == pane_id
+                && pending.prompt == prompt
+                && pending.backend_session_id.as_deref() == backend_session_id
+        })
     {
         return pending.remove(session_name);
     }
@@ -2781,13 +2808,12 @@ async fn ensure_pending_prompt_pane_is_live(
 fn restore_pending_prompt_if_absent(
     state: &SharedState,
     session_name: &str,
-    pane_id: String,
-    prompt: String,
+    pending_prompt: crate::state::PendingPrompt,
 ) {
     let mut pending = state.pending_prompts.lock().unwrap();
     pending
         .entry(session_name.to_string())
-        .or_insert((pane_id, prompt));
+        .or_insert(pending_prompt);
 }
 
 /// Handle a readiness signal from an HttpApi session's plugin.
@@ -3509,6 +3535,22 @@ pub async fn clear_reminder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pending_prompt(pane_id: &str, prompt: &str) -> crate::state::PendingPrompt {
+        crate::state::PendingPrompt::new(pane_id.into(), prompt.into(), None)
+    }
+
+    fn pending_opencode_prompt(
+        pane_id: &str,
+        prompt: &str,
+        backend_session_id: &str,
+    ) -> crate::state::PendingPrompt {
+        crate::state::PendingPrompt::new(
+            pane_id.into(),
+            prompt.into(),
+            Some(backend_session_id.into()),
+        )
+    }
 
     #[test]
     fn normalize_optional_string_passthrough() {
@@ -4905,7 +4947,7 @@ mod tests {
             .pending_prompts
             .lock()
             .unwrap()
-            .insert("oc".into(), ("%17".into(), "queued prompt".into()));
+            .insert("oc".into(), pending_opencode_prompt("%17", "queued prompt", "ses_ready"));
 
         let delivered = deliver_pending_prompt(&state, "oc").await;
 
@@ -4975,7 +5017,7 @@ mod tests {
             .pending_prompts
             .lock()
             .unwrap()
-            .insert("oc".into(), ("%17".into(), "queued prompt".into()));
+            .insert("oc".into(), pending_opencode_prompt("%17", "queued prompt", "ses_ready"));
 
         let delivery = tokio::spawn({
             let state = state.clone();
@@ -5051,7 +5093,7 @@ mod tests {
             .pending_prompts
             .lock()
             .unwrap()
-            .insert("oc".into(), ("%17".into(), "queued prompt".into()));
+            .insert("oc".into(), pending_opencode_prompt("%17", "queued prompt", "ses_ready"));
 
         let delivery = tokio::spawn({
             let state = state.clone();
@@ -5078,7 +5120,7 @@ mod tests {
         assert!(!delivery.await.unwrap());
         assert_eq!(
             state.pending_prompts.lock().unwrap().get("oc"),
-            Some(&("%17".into(), "queued prompt".into()))
+            Some(&pending_opencode_prompt("%17", "queued prompt", "ses_ready"))
         );
 
         state
@@ -5102,11 +5144,11 @@ mod tests {
             .pending_prompts
             .lock()
             .unwrap()
-            .insert("oc".into(), ("%17".into(), "queued prompt".into()));
+            .insert("oc".into(), pending_prompt("%17", "queued prompt"));
 
-        let reserved = reserve_pending_prompt_if_matches(&state, "oc", "%17", "queued prompt");
+        let reserved = reserve_pending_prompt_if_matches(&state, "oc", "%17", "queued prompt", None);
 
-        assert_eq!(reserved, Some(("%17".into(), "queued prompt".into())));
+        assert_eq!(reserved, Some(pending_prompt("%17", "queued prompt")));
         assert!(!state.pending_prompts.lock().unwrap().contains_key("oc"));
     }
 
@@ -5160,7 +5202,7 @@ mod tests {
             .pending_prompts
             .lock()
             .unwrap()
-            .insert("oc".into(), ("%17".into(), "queued prompt".into()));
+            .insert("oc".into(), pending_prompt("%17", "queued prompt"));
 
         let delivered = deliver_pending_prompt(&state, "oc").await;
 
@@ -5219,7 +5261,7 @@ mod tests {
             .pending_prompts
             .lock()
             .unwrap()
-            .insert("oc".into(), ("%17".into(), "queued prompt".into()));
+            .insert("oc".into(), pending_prompt("%17", "queued prompt"));
 
         let delivered = deliver_pending_prompt(&state, "oc").await;
 
@@ -5227,7 +5269,7 @@ mod tests {
         assert!(!called.load(Ordering::SeqCst));
         assert_eq!(
             state.pending_prompts.lock().unwrap().get("oc"),
-            Some(&("%17".into(), "queued prompt".into()))
+            Some(&pending_prompt("%17", "queued prompt"))
         );
         server.abort();
     }
@@ -5283,7 +5325,7 @@ mod tests {
             .pending_prompts
             .lock()
             .unwrap()
-            .insert("oc".into(), ("%old".into(), "queued prompt".into()));
+            .insert("oc".into(), pending_opencode_prompt("%old", "queued prompt", "ses_old"));
 
         let delivered = deliver_pending_prompt(&state, "oc").await;
 
@@ -5291,7 +5333,85 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(
             state.pending_prompts.lock().unwrap().get("oc"),
-            Some(&("%old".into(), "queued prompt".into()))
+            Some(&pending_opencode_prompt("%old", "queued prompt", "ses_old"))
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn readiness_prompt_delivery_rejects_stale_opencode_backend_session() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn prompt_async(AxumState(calls): AxumState<StdArc<AtomicUsize>>) -> StatusCode {
+            calls.fetch_add(1, Ordering::SeqCst);
+            StatusCode::NO_CONTENT
+        }
+
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(calls.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_old".into()),
+                    opencode_binding: Some(
+                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                    ),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .pending_prompts
+            .lock()
+            .unwrap()
+            .insert("oc".into(), pending_opencode_prompt("%17", "queued prompt", "ses_old"));
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_new".into()),
+                    opencode_binding: Some(
+                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                    ),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let delivered = deliver_pending_prompt(&state, "oc").await;
+
+        assert!(!delivered);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state.pending_prompts.lock().unwrap().get("oc"),
+            Some(&pending_opencode_prompt("%17", "queued prompt", "ses_old"))
         );
         server.abort();
     }

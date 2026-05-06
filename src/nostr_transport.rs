@@ -2350,7 +2350,13 @@ pub async fn restart_session(
                 restart_opencode_binding.as_ref(),
             ) {
                 if let Some(ref prompt_text) = formatted_prompt {
-                    schedule_prompt_injection(state, name, pane_id.clone(), prompt_text.clone());
+                    schedule_prompt_injection(
+                        state,
+                        name,
+                        pane_id.clone(),
+                        prompt_text.clone(),
+                        restart_backend_session_id.clone(),
+                    );
                 }
             } else if is_http_api && restart_backend_session_id.is_some() {
                 if let Some(ref prompt_text) = formatted_prompt {
@@ -3098,13 +3104,21 @@ pub(crate) fn schedule_prompt_injection(
     session_name: &str,
     pane_id: String,
     prompt: String,
+    backend_session_id: Option<String>,
 ) {
     // Queue prompt synchronously so the plugin's readiness signal finds it.
     state
         .pending_prompts
         .lock()
         .unwrap()
-        .insert(session_name.to_string(), (pane_id.clone(), prompt.clone()));
+        .insert(
+            session_name.to_string(),
+            crate::state::PendingPrompt::new(
+                pane_id.clone(),
+                prompt.clone(),
+                backend_session_id.clone(),
+            ),
+        );
 
     // Fallback timer: if readiness signal doesn't arrive within 10s,
     // deliver via tmux injection.
@@ -3112,13 +3126,28 @@ pub(crate) fn schedule_prompt_injection(
     let state = state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-        let pending = reserve_pending_prompt_if_matches(&state, &name, &pane_id, &prompt);
-        if let Some((pane, text)) = pending {
+        let pending = reserve_pending_prompt_if_matches(
+            &state,
+            &name,
+            &pane_id,
+            &prompt,
+            backend_session_id.as_deref(),
+        );
+        if let Some(pending) = pending {
             tracing::info!("readiness timeout for {name}, delivering prompt via fallback");
-            match deliver_prompt_fallback(&state, &name, &pane, &text, true, false).await {
+            match deliver_prompt_fallback(
+                &state,
+                &name,
+                &pending.pane_id,
+                &pending.prompt,
+                true,
+                false,
+            )
+            .await
+            {
                 Ok(()) => {}
                 Err(error) => {
-                    restore_pending_prompt_if_absent(&state, &name, pane, text);
+                    restore_pending_prompt_if_absent(&state, &name, pending);
                     tracing::warn!("readiness timeout fallback failed for {name}: {error}");
                 }
             }
@@ -3131,11 +3160,16 @@ fn reserve_pending_prompt_if_matches(
     session_name: &str,
     pane_id: &str,
     prompt: &str,
-) -> Option<(String, String)> {
+    backend_session_id: Option<&str>,
+) -> Option<crate::state::PendingPrompt> {
     let mut pending = state.pending_prompts.lock().unwrap();
     if pending
         .get(session_name)
-        .is_some_and(|(pane, text)| pane == pane_id && text == prompt)
+        .is_some_and(|pending| {
+            pending.pane_id == pane_id
+                && pending.prompt == prompt
+                && pending.backend_session_id.as_deref() == backend_session_id
+        })
     {
         return pending.remove(session_name);
     }
@@ -3145,15 +3179,14 @@ fn reserve_pending_prompt_if_matches(
 fn restore_pending_prompt_if_absent(
     state: &std::sync::Arc<AppState>,
     session_name: &str,
-    pane_id: String,
-    prompt: String,
+    pending_prompt: crate::state::PendingPrompt,
 ) {
     state
         .pending_prompts
         .lock()
         .unwrap()
         .entry(session_name.to_string())
-        .or_insert((pane_id, prompt));
+        .or_insert(pending_prompt);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3784,14 +3817,24 @@ mod tests {
     #[tokio::test]
     async fn readiness_timeout_keeps_pending_prompt_when_raw_fallback_fails() {
         let state = AppState::new_for_test();
-        schedule_prompt_injection(&state, "oc", "%missing".into(), "queued prompt".into());
+        schedule_prompt_injection(
+            &state,
+            "oc",
+            "%missing".into(),
+            "queued prompt".into(),
+            None,
+        );
 
         tokio::time::sleep(std::time::Duration::from_secs(11)).await;
         tokio::task::yield_now().await;
 
         assert_eq!(
             state.pending_prompts.lock().unwrap().get("oc"),
-            Some(&("%missing".into(), "queued prompt".into()))
+            Some(&crate::state::PendingPrompt::new(
+                "%missing".into(),
+                "queued prompt".into(),
+                None,
+            ))
         );
     }
 
@@ -3802,11 +3845,21 @@ mod tests {
             .pending_prompts
             .lock()
             .unwrap()
-            .insert("oc".into(), ("%pane".into(), "queued prompt".into()));
+            .insert(
+                "oc".into(),
+                crate::state::PendingPrompt::new("%pane".into(), "queued prompt".into(), None),
+            );
 
-        let reserved = reserve_pending_prompt_if_matches(&state, "oc", "%pane", "queued prompt");
+        let reserved = reserve_pending_prompt_if_matches(&state, "oc", "%pane", "queued prompt", None);
 
-        assert_eq!(reserved, Some(("%pane".into(), "queued prompt".into())));
+        assert_eq!(
+            reserved,
+            Some(crate::state::PendingPrompt::new(
+                "%pane".into(),
+                "queued prompt".into(),
+                None,
+            ))
+        );
         assert!(state.pending_prompts.lock().unwrap().get("oc").is_none());
     }
 
