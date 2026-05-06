@@ -2638,8 +2638,13 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
                     true
                 }
                 Err(fallback_error) => {
-                    restore_pending_prompt_if_absent(state, session_name, pane_id, prompt);
-                    schedule_pending_prompt_retry(state, session_name);
+                    restore_pending_prompt_if_absent(
+                        state,
+                        session_name,
+                        pane_id.clone(),
+                        prompt.clone(),
+                    );
+                    schedule_pending_prompt_retry(state, session_name, pane_id, prompt);
                     tracing::warn!(
                         "readiness prompt fallback failed for {session_name}: {fallback_error}"
                     );
@@ -2648,8 +2653,8 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
             }
         }
         Err(e) => {
-            restore_pending_prompt_if_absent(state, session_name, pane_id, prompt);
-            schedule_pending_prompt_retry(state, session_name);
+            restore_pending_prompt_if_absent(state, session_name, pane_id.clone(), prompt.clone());
+            schedule_pending_prompt_retry(state, session_name, pane_id, prompt);
             tracing::warn!("readiness prompt raw tmux delivery failed for {session_name}: {e}");
             false
         }
@@ -2661,42 +2666,44 @@ const PENDING_PROMPT_RETRY_DELAY: std::time::Duration = std::time::Duration::fro
 #[cfg(not(test))]
 const PENDING_PROMPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
 
-fn schedule_pending_prompt_retry(state: &SharedState, session_name: &str) {
+fn schedule_pending_prompt_retry(
+    state: &SharedState,
+    session_name: &str,
+    pane_id: String,
+    prompt: String,
+) {
     let state = state.clone();
     let session_name = session_name.to_string();
     tokio::spawn(async move {
         tokio::time::sleep(PENDING_PROMPT_RETRY_DELAY).await;
-        let pending = state
-            .pending_prompts
-            .lock()
-            .unwrap()
-            .get(&session_name)
-            .cloned();
+        let pending = reserve_pending_prompt_if_matches(&state, &session_name, &pane_id, &prompt);
         let Some((pane_id, prompt)) = pending else {
             return;
         };
         match deliver_pending_prompt_via_raw_tmux(&state, &session_name, &pane_id, &prompt).await {
-            Ok(()) => remove_pending_prompt_if_matches(&state, &session_name, &pane_id, &prompt),
+            Ok(()) => {}
             Err(error) => {
+                restore_pending_prompt_if_absent(&state, &session_name, pane_id, prompt);
                 tracing::warn!("readiness prompt retry fallback failed for {session_name}: {error}")
             }
         }
     });
 }
 
-fn remove_pending_prompt_if_matches(
+fn reserve_pending_prompt_if_matches(
     state: &SharedState,
     session_name: &str,
     pane_id: &str,
     prompt: &str,
-) {
+) -> Option<(String, String)> {
     let mut pending = state.pending_prompts.lock().unwrap();
     if pending
         .get(session_name)
         .is_some_and(|(pane, text)| pane == pane_id && text == prompt)
     {
-        pending.remove(session_name);
+        return pending.remove(session_name);
     }
+    None
 }
 
 async fn deliver_pending_prompt_via_raw_tmux(
@@ -5074,6 +5081,21 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!state.pending_prompts.lock().unwrap().contains_key("oc"));
         server.abort();
+    }
+
+    #[test]
+    fn pending_prompt_retry_reserves_prompt_before_raw_fallback() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .pending_prompts
+            .lock()
+            .unwrap()
+            .insert("oc".into(), ("%17".into(), "queued prompt".into()));
+
+        let reserved = reserve_pending_prompt_if_matches(&state, "oc", "%17", "queued prompt");
+
+        assert_eq!(reserved, Some(("%17".into(), "queued prompt".into())));
+        assert!(!state.pending_prompts.lock().unwrap().contains_key("oc"));
     }
 
     #[tokio::test]
