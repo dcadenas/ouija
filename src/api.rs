@@ -2604,16 +2604,27 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
         return false;
     };
 
-    let http_delivery = {
+    let (pane_still_registered, http_delivery) = {
         let proto = state.protocol.read().await;
-        proto.sessions.get(session_name).and_then(|session| {
-            session
-                .metadata
-                .is_strong_opencode_binding()
-                .then(|| session.metadata.http_delivery_snapshot())
-                .flatten()
-        })
+        match proto.sessions.get(session_name) {
+            Some(session) => (
+                session.pane.as_deref() == Some(pane_id.as_str()),
+                session
+                    .metadata
+                    .is_strong_opencode_binding()
+                    .then(|| session.metadata.http_delivery_snapshot())
+                    .flatten(),
+            ),
+            None => (false, None),
+        }
     };
+    if !pane_still_registered {
+        restore_pending_prompt_if_absent(state, session_name, pane_id, prompt);
+        tracing::warn!(
+            "readiness prompt delivery skipped for {session_name}: queued pane is no longer registered to the session"
+        );
+        return false;
+    }
 
     let used_http_delivery = http_delivery.is_some();
     let result = match http_delivery {
@@ -5217,6 +5228,70 @@ mod tests {
         assert_eq!(
             state.pending_prompts.lock().unwrap().get("oc"),
             Some(&("%17".into(), "queued prompt".into()))
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn readiness_prompt_delivery_rejects_stale_strong_opencode_pane() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn prompt_async(AxumState(calls): AxumState<StdArc<AtomicUsize>>) -> StatusCode {
+            calls.fetch_add(1, Ordering::SeqCst);
+            StatusCode::NO_CONTENT
+        }
+
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(calls.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%new".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_new".into()),
+                    opencode_binding: Some(
+                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                    ),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .pending_prompts
+            .lock()
+            .unwrap()
+            .insert("oc".into(), ("%old".into(), "queued prompt".into()));
+
+        let delivered = deliver_pending_prompt(&state, "oc").await;
+
+        assert!(!delivered);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state.pending_prompts.lock().unwrap().get("oc"),
+            Some(&("%old".into(), "queued prompt".into()))
         );
         server.abort();
     }
