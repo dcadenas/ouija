@@ -417,6 +417,7 @@ pub enum Effect {
         vim_mode: bool,
         delivery_method: Option<String>,
         http_delivery: Option<HttpDeliverySnapshot>,
+        pending_reply_msg_id: Option<u64>,
     },
     DeliverHttpMessage {
         session_id: String,
@@ -1567,6 +1568,7 @@ impl DaemonState {
                         vim_mode: session.metadata.vim_mode,
                         delivery_method,
                         http_delivery,
+                        pending_reply_msg_id: expects_reply.then_some(local_msg_id),
                     });
 
                     if expects_reply {
@@ -1909,6 +1911,7 @@ impl DaemonState {
                         vim_mode: session.metadata.vim_mode,
                         delivery_method,
                         http_delivery,
+                        pending_reply_msg_id: expects_reply.then_some(msg_id),
                     });
 
                     if expects_reply {
