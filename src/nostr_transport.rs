@@ -73,6 +73,16 @@ fn should_cleanup_failed_opencode_attach_pane(
     is_http_api && backend_session_id.is_none()
 }
 
+fn should_remove_session_after_failed_restart(
+    is_http_api: bool,
+    backend_session_id: Option<&str>,
+    failed_pane_id: &str,
+    existing_pane_id: Option<&str>,
+) -> bool {
+    should_cleanup_failed_opencode_attach_pane(is_http_api, backend_session_id)
+        && existing_pane_id.is_none_or(|existing| existing == failed_pane_id)
+}
+
 fn cleanup_failed_opencode_attach_pane(pane_id: &str) {
     if cfg!(test) {
         return;
@@ -2286,12 +2296,19 @@ pub async fn restart_session(
                 if should_cleanup_failed_opencode_attach_pane(is_http_api, None) {
                     cleanup_failed_opencode_attach_pane(&pane_id);
                 }
-                state
-                    .apply_and_execute(crate::daemon_protocol::Event::Remove {
-                        id: name.to_string(),
-                        keep_worktree: true,
-                    })
-                    .await;
+                if should_remove_session_after_failed_restart(
+                    is_http_api,
+                    None,
+                    &pane_id,
+                    existing_pane.as_deref(),
+                ) {
+                    state
+                        .apply_and_execute(crate::daemon_protocol::Event::Remove {
+                            id: name.to_string(),
+                            keep_worktree: true,
+                        })
+                        .await;
+                }
                 return (
                     format!(
                         "restart failed: OpenCode attach setup failed for '{name}' (pane {pane_id})"
@@ -3966,6 +3983,26 @@ mod tests {
     #[test]
     fn failed_restart_placeholder_cleanup_required_without_backend_session() {
         assert!(should_cleanup_failed_opencode_attach_pane(true, None));
+    }
+
+    #[test]
+    fn failed_restart_placeholder_does_not_remove_original_session() {
+        assert!(!should_remove_session_after_failed_restart(
+            true,
+            None,
+            "%new-placeholder",
+            Some("%original"),
+        ));
+    }
+
+    #[test]
+    fn failed_restart_respawned_pane_removes_session() {
+        assert!(should_remove_session_after_failed_restart(
+            true,
+            None,
+            "%original",
+            Some("%original"),
+        ));
     }
 
     #[test]
