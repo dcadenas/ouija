@@ -3768,7 +3768,7 @@ mod tests {
         let cmd = opencode_attach_command(8200, "ses_test", "/tmp/project with spaces");
         assert_eq!(
             cmd,
-            "opencode attach http://127.0.0.1:8200 --session ses_test --dir '/tmp/project with spaces'"
+            "opencode attach http://127.0.0.1:8200 --session 'ses_test' --dir '/tmp/project with spaces'"
         );
     }
 
