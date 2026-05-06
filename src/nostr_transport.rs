@@ -2436,11 +2436,10 @@ async fn soft_restart_session(
         "soft restart: created new opencode session {new_session_id} for '{name}' (port {port})"
     );
 
-    // 2. Update backend_session_id, model, and effort atomically under one
-    //    write lock before delivering the prompt. A concurrent reader (e.g.
-    //    deliver_via_http from locked_inject) running between these writes
-    //    would otherwise observe the new session id with stale model/effort
-    //    metadata and route the next message through the previous model.
+    // 2. Update metadata before attach/prompt delivery. Headless restarts can
+    //    bind the backend session immediately. Pane-backed restarts only bind
+    //    after the TUI attach has been verified, so an attach failure still
+    //    means no prompt was delivered and the caller can safely hard-restart.
     //
     //    When `model` / `effort` are None we preserve the session's current
     //    metadata rather than clearing it: callers are expected to pre-compute
@@ -2492,54 +2491,9 @@ async fn soft_restart_session(
         state.persist_protocol_state(&proto);
     }
 
-    // 3. Deliver prompt directly via HTTP API
     let mut prompt_msg_id = None;
-    if let Some(text) = prompt {
-        let full_text = match reminder {
-            Some(r) => format!("{text}\n\n{r}"),
-            None => text.to_string(),
-        };
-        let message = if let Some(sender) = from {
-            let er = expects_reply.unwrap_or(true);
-            let msg_id = {
-                let mut proto = state.protocol.write().await;
-                proto.next_seq()
-            };
-            prompt_msg_id = Some(msg_id);
-            crate::daemon_protocol::format_session_message(
-                sender, &full_text, er, msg_id, None, false,
-            )
-        } else {
-            full_text
-        };
 
-        let body = opencode_prompt_body(&message, model, effort);
-        let async_url = format!("http://127.0.0.1:{port}/session/{new_session_id}/prompt_async");
-        let resp = state
-            .http_client
-            .post(&async_url)
-            .header("x-opencode-directory", project_dir)
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await;
-        match resp {
-            Ok(r) if r.status().is_success() => {
-                tracing::info!(
-                    "soft restart: delivered prompt to {new_session_id} via prompt_async"
-                );
-            }
-            Ok(r) => {
-                let status = r.status();
-                tracing::warn!("soft restart: prompt_async returned {status}");
-            }
-            Err(e) => {
-                tracing::warn!("soft restart: prompt_async failed: {e}");
-            }
-        }
-    }
-
-    // 4. Respawn the TUI attach to point at the new session
+    // 3. Respawn the TUI attach to point at the new session.
     if let Some(pane) = pane {
         match respawn_opencode_attach_for_session(pane, project_dir, &new_session_id, port, name)
             .await
@@ -2583,6 +2537,54 @@ async fn soft_restart_session(
                 )
                 .await;
                 return Err(());
+            }
+        }
+    }
+
+    // 4. Deliver prompt directly via HTTP API after any required attach
+    //    succeeded. This preserves the Err boundary: attach failure returns
+    //    before prompt_async can start work in the throwaway session.
+    if let Some(text) = prompt {
+        let full_text = match reminder {
+            Some(r) => format!("{text}\n\n{r}"),
+            None => text.to_string(),
+        };
+        let message = if let Some(sender) = from {
+            let er = expects_reply.unwrap_or(true);
+            let msg_id = {
+                let mut proto = state.protocol.write().await;
+                proto.next_seq()
+            };
+            prompt_msg_id = Some(msg_id);
+            crate::daemon_protocol::format_session_message(
+                sender, &full_text, er, msg_id, None, false,
+            )
+        } else {
+            full_text
+        };
+
+        let body = opencode_prompt_body(&message, model, effort);
+        let async_url = format!("http://127.0.0.1:{port}/session/{new_session_id}/prompt_async");
+        let resp = state
+            .http_client
+            .post(&async_url)
+            .header("x-opencode-directory", project_dir)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                tracing::info!(
+                    "soft restart: delivered prompt to {new_session_id} via prompt_async"
+                );
+            }
+            Ok(r) => {
+                let status = r.status();
+                tracing::warn!("soft restart: prompt_async returned {status}");
+            }
+            Err(e) => {
+                tracing::warn!("soft restart: prompt_async failed: {e}");
             }
         }
     }
@@ -4114,6 +4116,86 @@ mod tests {
             metadata.opencode_binding,
             Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn soft_restart_does_not_prompt_async_before_attach_succeeds() {
+        use axum::Json;
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn create_session() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "id": "ses_new" }))
+        }
+
+        async fn prompt_async(AxumState(calls): AxumState<StdArc<AtomicUsize>>) -> StatusCode {
+            calls.fetch_add(1, Ordering::SeqCst);
+            StatusCode::NO_CONTENT
+        }
+
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session", post(create_session))
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(calls.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%missing".into()),
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_old".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::WeakAdopted,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let result = soft_restart_session(
+            &state,
+            "oc",
+            Some("%missing"),
+            dir.path().to_str().unwrap(),
+            Some("queued prompt"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         server.abort();
     }
 
