@@ -2601,29 +2601,26 @@ async fn soft_restart_session(
             full_text
         };
 
-        let body = opencode_prompt_body(&message, model, effort);
-        let async_url = format!("http://127.0.0.1:{port}/session/{new_session_id}/prompt_async");
-        let resp = state
-            .http_client
-            .post(&async_url)
-            .header("x-opencode-directory", project_dir)
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
+        if let Err(e) = deliver_soft_restart_prompt(
+            state,
+            port,
+            &new_session_id,
+            project_dir,
+            &message,
+            model,
+            effort,
+        )
+        .await
+        {
+            tracing::warn!("soft restart: prompt_async failed for {new_session_id}: {e}");
+            delete_opencode_session(
+                &state.http_client,
+                port,
+                &new_session_id,
+                "soft restart cleanup",
+            )
             .await;
-        match resp {
-            Ok(r) if r.status().is_success() => {
-                tracing::info!(
-                    "soft restart: delivered prompt to {new_session_id} via prompt_async"
-                );
-            }
-            Ok(r) => {
-                let status = r.status();
-                tracing::warn!("soft restart: prompt_async returned {status}");
-            }
-            Err(e) => {
-                tracing::warn!("soft restart: prompt_async failed: {e}");
-            }
+            return Err(());
         }
     }
 
@@ -2631,6 +2628,32 @@ async fn soft_restart_session(
         format!("soft-restarted '{name}' in {project_dir} (session {new_session_id})"),
         prompt_msg_id,
     ))
+}
+
+async fn deliver_soft_restart_prompt(
+    state: &AppState,
+    port: u16,
+    session_id: &str,
+    project_dir: &str,
+    message: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> anyhow::Result<()> {
+    let body = opencode_prompt_body(message, model, effort);
+    let async_url = format!("http://127.0.0.1:{port}/session/{session_id}/prompt_async");
+    let resp = state
+        .http_client
+        .post(&async_url)
+        .header("x-opencode-directory", project_dir)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("prompt_async returned {}", resp.status());
+    }
+    tracing::info!("soft restart: delivered prompt to {session_id} via prompt_async");
+    Ok(())
 }
 
 /// Health-check the externally running opencode serve, create a session on it,
@@ -4284,6 +4307,48 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn soft_restart_prompt_delivery_rejects_prompt_async_non_success() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        async fn prompt_async() -> StatusCode {
+            StatusCode::BAD_GATEWAY
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route("/session/{session_id}/prompt_async", post(prompt_async));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = AppState::new(config);
+
+        let result = deliver_soft_restart_prompt(
+            &state,
+            port,
+            "ses_new",
+            dir.path().to_str().unwrap(),
+            "queued prompt",
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err());
         server.abort();
     }
 
