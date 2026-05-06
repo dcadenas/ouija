@@ -415,6 +415,8 @@ pub enum Effect {
         pane: String,
         message: String,
         vim_mode: bool,
+        delivery_method: Option<String>,
+        http_delivery: Option<HttpDeliverySnapshot>,
     },
     DeliverHttpMessage {
         session_id: String,
@@ -596,6 +598,19 @@ pub fn format_session_message(
         attrs.push_str(r#" done="true""#);
     }
     format!("<msg {attrs}>{message}</msg>")
+}
+
+fn inject_delivery_snapshot(
+    session: &SessionEntry,
+) -> (Option<String>, Option<HttpDeliverySnapshot>) {
+    if session.metadata.backend.as_deref() != Some("opencode") {
+        return (None, None);
+    }
+    if session.metadata.is_strong_opencode_binding() {
+        (Some("http".into()), session.metadata.http_delivery_snapshot())
+    } else {
+        (Some("tmux".into()), None)
+    }
 }
 
 #[cfg(test)]
@@ -1544,11 +1559,14 @@ impl DaemonState {
                         responds_to,
                         done,
                     );
+                    let (delivery_method, http_delivery) = inject_delivery_snapshot(session);
                     effects.push(Effect::InjectMessage {
                         session_id: to.to_string(),
                         pane: pane.clone(),
                         message: formatted,
                         vim_mode: session.metadata.vim_mode,
+                        delivery_method,
+                        http_delivery,
                     });
 
                     if expects_reply {
@@ -1883,11 +1901,14 @@ impl DaemonState {
                         responds_to,
                         done,
                     );
+                    let (delivery_method, http_delivery) = inject_delivery_snapshot(session);
                     effects.push(Effect::InjectMessage {
                         session_id: resolved_to.clone(),
                         pane: pane.clone(),
                         message: formatted,
                         vim_mode: session.metadata.vim_mode,
+                        delivery_method,
+                        http_delivery,
                     });
 
                     if expects_reply {

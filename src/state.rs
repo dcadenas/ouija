@@ -661,10 +661,14 @@ impl AppState {
                     pane,
                     message,
                     vim_mode,
+                    delivery_method,
+                    http_delivery,
                 } => {
-                    let result = match recorded_method {
+                    let effect_method = delivery_method.as_deref().or(recorded_method);
+                    let effect_http_delivery = http_delivery.as_ref().or(recorded_http_delivery);
+                    let result = match effect_method {
                         Some("http") => {
-                            match recorded_http_delivery {
+                            match effect_http_delivery {
                                 Some(delivery) => crate::tmux::deliver_via_http(
                                     self,
                                     &delivery.backend_session_id,
@@ -687,51 +691,8 @@ impl AppState {
                             )
                             .await
                         }
-                        _ => {
-                            let (http_delivery, use_raw_tmux) = {
-                                let proto = self.protocol.read().await;
-                                match proto.sessions.get(session_id) {
-                                    Some(s)
-                                        if s.metadata.backend.as_deref() == Some("opencode")
-                                            && s.metadata.is_strong_opencode_binding() =>
-                                    {
-                                        (Some(s.metadata.http_delivery_snapshot()), false)
-                                    }
-                                    Some(s)
-                                        if s.metadata.backend.as_deref() == Some("opencode") =>
-                                    {
-                                        (None, true)
-                                    }
-                                    _ => (None, false),
-                                }
-                            };
-                            if let Some(delivery) = http_delivery {
-                                match delivery {
-                                    Some(delivery) => crate::tmux::deliver_via_http(
-                                        self,
-                                        &delivery.backend_session_id,
-                                        delivery.project_dir.as_deref(),
-                                        message,
-                                        delivery.model.as_deref(),
-                                        delivery.effort.as_deref(),
-                                    )
-                                    .await,
-                                    None => Err(anyhow::anyhow!(
-                                        "http delivery skipped: no backend_session_id on session"
-                                    )),
-                                }
-                            } else if use_raw_tmux {
-                                crate::tmux::locked_inject_raw_tmux(
-                                    self, session_id, pane, message, *vim_mode,
-                                )
-                                .await
-                            } else {
-                                crate::tmux::locked_inject(
-                                    self, session_id, pane, message, *vim_mode,
-                                )
-                                .await
-                            }
-                        }
+                        _ => crate::tmux::locked_inject(self, session_id, pane, message, *vim_mode)
+                            .await,
                     };
                     if let Err(error) = result {
                         tracing::warn!(session = %session_id, "message delivery failed: {error}");
@@ -2247,6 +2208,8 @@ pub(crate) mod tests {
                 pane: "%1".into(),
                 message: "hello".into(),
                 vim_mode: false,
+                delivery_method: None,
+                http_delivery: None,
             },
             crate::daemon_protocol::Effect::SendDelivered {
                 from: "sender".into(),
@@ -2350,6 +2313,13 @@ pub(crate) mod tests {
             pane: "%1".into(),
             message: "hello".into(),
             vim_mode: false,
+            delivery_method: Some("http".into()),
+            http_delivery: Some(crate::daemon_protocol::HttpDeliverySnapshot {
+                backend_session_id: "ses_live".into(),
+                project_dir: None,
+                model: None,
+                effort: None,
+            }),
         }];
 
         let failure = state.execute_effects(&effects).await;
@@ -2360,6 +2330,61 @@ pub(crate) mod tests {
                 .is_some_and(|failure| failure.reason.contains("prompt_async request failed")),
             "expected observable HTTP delivery failure, got {failure:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn incoming_weak_opencode_inject_uses_apply_time_delivery_method() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut config = test_config();
+        config.port = port.checked_sub(320).unwrap();
+        let state = AppState::new(config);
+        let effects = {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%17".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_old".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::WeakAdopted,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+            proto.apply(crate::daemon_protocol::Event::IncomingWire {
+                msg: crate::protocol::WireMessage::SessionSend {
+                    from: "remote".into(),
+                    to: "oc".into(),
+                    message: "hello".into(),
+                    expects_reply: false,
+                    msg_id: 42,
+                    responds_to: None,
+                    done: false,
+                },
+                sender_npub: Some("npub1remote".into()),
+            })
+        };
+        {
+            let mut proto = state.protocol.write().await;
+            let session = proto.sessions.get_mut("oc").unwrap();
+            session.metadata.backend_session_id = Some("ses_new".into());
+            session.metadata.opencode_binding = Some(
+                crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+            );
+        }
+
+        let failure = state.execute_effects(&effects).await;
+
+        assert!(failure.is_none());
     }
 
     #[tokio::test]
@@ -2455,6 +2480,13 @@ pub(crate) mod tests {
                 pane: "%1".into(),
                 message: "hello".into(),
                 vim_mode: false,
+                delivery_method: Some("http".into()),
+                http_delivery: Some(crate::daemon_protocol::HttpDeliverySnapshot {
+                    backend_session_id: "ses_live".into(),
+                    project_dir: None,
+                    model: None,
+                    effort: None,
+                }),
             },
             crate::daemon_protocol::Effect::Broadcast(
                 crate::protocol::WireMessage::SessionSendAck {

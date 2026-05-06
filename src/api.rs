@@ -1008,6 +1008,7 @@ async fn execute_send_effects_for_api(
                 pane,
                 message,
                 vim_mode,
+                ..
             } => {
                 match recorded_method {
                     Some("http") => {
