@@ -608,6 +608,14 @@ impl AppState {
             return rewrite_send_delivery_failure(effects, &failure.reason);
         }
 
+        if effects.iter().any(|effect| {
+            matches!(effect, crate::daemon_protocol::Effect::SendFailed { .. })
+        }) {
+            self.rollback_sender_state_for_failed_effect_delivery(rollback)
+                .await;
+            return effects;
+        }
+
         self.finalize_successful_effect_delivery(rollback).await;
 
         effects
@@ -2594,6 +2602,63 @@ pub(crate) mod tests {
                     if reason.contains("prompt_async request failed")
             )
         }));
+
+        let proto = state.protocol.read().await;
+        let pending = proto.pending_replies.get("sender").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].msg_id, 7);
+        assert_eq!(
+            proto.sessions["sender"].metadata.reminder.as_deref(),
+            Some("keep working")
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_and_execute_restores_sender_state_after_send_failed_before_delivery() {
+        let state = AppState::new_for_test();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "sender".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "sender".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        reminder: Some("keep working".into()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+            proto.pending_replies.insert(
+                "sender".into(),
+                vec![crate::daemon_protocol::PendingReplyEntry {
+                    msg_id: 7,
+                    from: "requester".into(),
+                    message: "please respond".into(),
+                    received_at: 100,
+                    last_activity: 100,
+                    in_progress: false,
+                }],
+            );
+        }
+
+        let effects = state
+            .apply_and_execute(crate::daemon_protocol::Event::Send {
+                from: "sender".into(),
+                to: "missing".into(),
+                message: "done, but missing".into(),
+                expects_reply: false,
+                responds_to: Some(7),
+                done: true,
+            })
+            .await;
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            crate::daemon_protocol::Effect::SendFailed { to, .. } if to == "missing"
+        )));
 
         let proto = state.protocol.read().await;
         let pending = proto.pending_replies.get("sender").unwrap();
