@@ -2485,10 +2485,11 @@ async fn soft_restart_session(
     //    fallback), but a stale snapshot or a future caller that forgets the
     //    fallback must not silently wipe fields that were set by another
     //    writer between the snapshot and this atomic block.
-    {
+    let previous_metadata = {
         let mut proto = state.protocol.write().await;
-        match proto.sessions.get_mut(name) {
+        let previous_metadata = match proto.sessions.get_mut(name) {
             Some(session) => {
+                let previous_metadata = session.metadata.clone();
                 if pane.is_none() {
                     session.metadata.backend_session_id = Some(new_session_id.clone());
                     session.metadata.opencode_binding =
@@ -2500,6 +2501,7 @@ async fn soft_restart_session(
                 if let Some(e) = effort {
                     session.metadata.effort = Some(e.to_string());
                 }
+                previous_metadata
             }
             None => {
                 // Session was removed between the pre-flight snapshot and
@@ -2525,9 +2527,10 @@ async fn soft_restart_session(
                 });
                 return Err(());
             }
-        }
+        };
         state.persist_protocol_state(&proto);
-    }
+        previous_metadata
+    };
 
     let mut prompt_msg_id = None;
 
@@ -2620,6 +2623,7 @@ async fn soft_restart_session(
                 "soft restart cleanup",
             )
             .await;
+            restore_soft_restart_metadata(state, name, &new_session_id, &previous_metadata).await;
             return Err(());
         }
     }
@@ -2628,6 +2632,26 @@ async fn soft_restart_session(
         format!("soft-restarted '{name}' in {project_dir} (session {new_session_id})"),
         prompt_msg_id,
     ))
+}
+
+async fn restore_soft_restart_metadata(
+    state: &AppState,
+    name: &str,
+    failed_session_id: &str,
+    previous_metadata: &crate::daemon_protocol::SessionMeta,
+) {
+    let mut proto = state.protocol.write().await;
+    let Some(session) = proto.sessions.get_mut(name) else {
+        return;
+    };
+    if session.metadata.backend_session_id.as_deref() != Some(failed_session_id) {
+        return;
+    }
+    session.metadata.backend_session_id = previous_metadata.backend_session_id.clone();
+    session.metadata.opencode_binding = previous_metadata.opencode_binding.clone();
+    session.metadata.model = previous_metadata.model.clone();
+    session.metadata.effort = previous_metadata.effort.clone();
+    state.persist_protocol_state(&proto);
 }
 
 async fn deliver_soft_restart_prompt(
@@ -4349,6 +4373,90 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn soft_restart_restores_previous_metadata_when_prompt_delivery_fails() {
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        async fn create_session() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "id": "ses_new" }))
+        }
+
+        async fn prompt_async() -> StatusCode {
+            StatusCode::BAD_GATEWAY
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session", post(create_session))
+            .route("/session/{session_id}/prompt_async", post(prompt_async));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: None,
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_old".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::WeakAdopted,
+                        ),
+                        model: Some("old-model".into()),
+                        effort: Some("old-effort".into()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let result = soft_restart_session(
+            &state,
+            "oc",
+            None,
+            dir.path().to_str().unwrap(),
+            Some("queued prompt"),
+            None,
+            None,
+            None,
+            Some("new-model"),
+            Some("new-effort"),
+        )
+        .await;
+
+        assert!(result.is_err());
+        let proto = state.protocol.read().await;
+        let metadata = &proto.sessions["oc"].metadata;
+        assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_old"));
+        assert_eq!(
+            metadata.opencode_binding,
+            Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
+        );
+        assert_eq!(metadata.model.as_deref(), Some("old-model"));
+        assert_eq!(metadata.effort.as_deref(), Some("old-effort"));
         server.abort();
     }
 
