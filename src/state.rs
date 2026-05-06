@@ -657,16 +657,23 @@ impl AppState {
         for effect in effects {
             match effect {
                 Effect::Broadcast(msg) => {
-                    if delivery_failure.is_some()
-                        && matches!(
-                            msg,
-                            crate::protocol::WireMessage::SessionSendAck {
-                                delivered: true,
-                                ..
-                            }
-                        )
-                    {
-                        continue;
+                    if delivery_failure.is_some() {
+                        if let crate::protocol::WireMessage::SessionSendAck {
+                            from,
+                            to,
+                            delivered: true,
+                            daemon_id,
+                        } = msg
+                        {
+                            let failed_ack = crate::protocol::WireMessage::SessionSendAck {
+                                from: from.clone(),
+                                to: to.clone(),
+                                delivered: false,
+                                daemon_id: daemon_id.clone(),
+                            };
+                            crate::transport::broadcast(self, &failed_ack).await;
+                            continue;
+                        }
                     }
                     crate::transport::broadcast(self, msg).await;
                 }
@@ -2405,12 +2412,13 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn execute_effects_does_not_broadcast_success_ack_after_inject_failure() {
+    async fn execute_effects_broadcasts_failure_ack_after_inject_failure() {
         use std::sync::Arc as StdArc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct CountingTransport {
             broadcasts: StdArc<AtomicUsize>,
+            failure_acks: StdArc<AtomicUsize>,
         }
 
         #[async_trait::async_trait]
@@ -2419,8 +2427,17 @@ pub(crate) mod tests {
                 self
             }
 
-            async fn broadcast(&self, _msg: &crate::protocol::WireMessage) -> bool {
+            async fn broadcast(&self, msg: &crate::protocol::WireMessage) -> bool {
                 self.broadcasts.fetch_add(1, Ordering::SeqCst);
+                if matches!(
+                    msg,
+                    crate::protocol::WireMessage::SessionSendAck {
+                        delivered: false,
+                        ..
+                    }
+                ) {
+                    self.failure_acks.fetch_add(1, Ordering::SeqCst);
+                }
                 true
             }
 
@@ -2466,9 +2483,11 @@ pub(crate) mod tests {
         config.port = port.checked_sub(320).unwrap();
         let state = AppState::new(config);
         let broadcasts = StdArc::new(AtomicUsize::new(0));
+        let failure_acks = StdArc::new(AtomicUsize::new(0));
         state
             .add_transport(StdArc::new(CountingTransport {
                 broadcasts: broadcasts.clone(),
+                failure_acks: failure_acks.clone(),
             }))
             .await;
         {
@@ -2518,7 +2537,8 @@ pub(crate) mod tests {
         let failure = state.execute_effects(&effects).await;
 
         assert!(failure.is_some());
-        assert_eq!(broadcasts.load(Ordering::SeqCst), 0);
+        assert_eq!(broadcasts.load(Ordering::SeqCst), 1);
+        assert_eq!(failure_acks.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
