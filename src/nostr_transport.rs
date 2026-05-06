@@ -2595,11 +2595,6 @@ async fn soft_restart_session(
     ))
 }
 
-fn opencode_attach_command(port: u16, session_id: &str, project_dir: &str) -> String {
-    let escaped_dir = crate::scheduler::shell_escape(project_dir);
-    format!("opencode attach http://127.0.0.1:{port} --session {session_id} --dir {escaped_dir}")
-}
-
 /// Health-check the externally running opencode serve, create a session on it,
 /// and launch `opencode attach` in the tmux pane.
 ///
