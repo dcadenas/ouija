@@ -2644,7 +2644,16 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
     let used_http_delivery = http_delivery.is_some();
     let result = match http_delivery {
         Some(delivery) => deliver_http_message(state, &delivery, &prompt).await,
-        None => deliver_pending_prompt_via_raw_tmux(state, session_name, &pane_id, &prompt).await,
+        None => {
+            deliver_pending_prompt_via_raw_tmux(
+                state,
+                session_name,
+                &pane_id,
+                &prompt,
+                pending.backend_session_id.as_deref(),
+            )
+            .await
+        }
     };
 
     match result {
@@ -2656,7 +2665,14 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
             tracing::warn!(
                 "readiness prompt HTTP delivery failed for {session_name}, trying raw tmux fallback: {e}"
             );
-            match deliver_pending_prompt_via_raw_tmux(state, session_name, &pane_id, &prompt).await
+            match deliver_pending_prompt_via_raw_tmux(
+                state,
+                session_name,
+                &pane_id,
+                &prompt,
+                pending.backend_session_id.as_deref(),
+            )
+            .await
             {
                 Ok(()) => {
                     tracing::info!(
@@ -2712,6 +2728,7 @@ fn schedule_pending_prompt_retry(
             &session_name,
             &pending.pane_id,
             &pending.prompt,
+            pending.backend_session_id.as_deref(),
         )
         .await
         {
@@ -2750,18 +2767,28 @@ async fn deliver_pending_prompt_via_raw_tmux(
     session_name: &str,
     pane_id: &str,
     prompt: &str,
+    expected_backend_session_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    let pane_still_registered = {
+    let (pane_still_registered, backend_session_matches) = {
         let proto = state.protocol.read().await;
-        proto
-            .sessions
-            .get(session_name)
-            .and_then(|session| session.pane.as_deref())
-            == Some(pane_id)
+        match proto.sessions.get(session_name) {
+            Some(session) => (
+                session.pane.as_deref() == Some(pane_id),
+                expected_backend_session_id.is_none_or(|expected| {
+                    session.metadata.backend_session_id.as_deref() == Some(expected)
+                }),
+            ),
+            None => (false, false),
+        }
     };
     if !pane_still_registered {
         anyhow::bail!(
             "readiness prompt fallback skipped: pane {pane_id} is no longer registered to session {session_name}"
+        );
+    }
+    if !backend_session_matches {
+        anyhow::bail!(
+            "readiness prompt fallback skipped: queued OpenCode backend session is no longer current for session {session_name}"
         );
     }
     ensure_pending_prompt_pane_is_live(state, session_name, pane_id).await?;
@@ -5133,7 +5160,10 @@ mod tests {
         *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/project", "%17")];
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert!(!state.pending_prompts.lock().unwrap().contains_key("oc"));
+        assert_eq!(
+            state.pending_prompts.lock().unwrap().get("oc"),
+            Some(&pending_opencode_prompt("%17", "queued prompt", "ses_ready"))
+        );
         server.abort();
     }
 
@@ -5409,6 +5439,99 @@ mod tests {
 
         assert!(!delivered);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state.pending_prompts.lock().unwrap().get("oc"),
+            Some(&pending_opencode_prompt("%17", "queued prompt", "ses_old"))
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn readiness_prompt_http_fallback_rejects_stale_opencode_backend_session() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use tokio::net::TcpListener;
+        use tokio::sync::Notify;
+
+        #[derive(Clone)]
+        struct Gate {
+            started: StdArc<Notify>,
+            release: StdArc<Notify>,
+        }
+
+        async fn prompt_async(AxumState(gate): AxumState<Gate>) -> StatusCode {
+            gate.started.notify_one();
+            gate.release.notified().await;
+            StatusCode::BAD_GATEWAY
+        }
+
+        let gate = Gate {
+            started: StdArc::new(Notify::new()),
+            release: StdArc::new(Notify::new()),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(gate.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_old".into()),
+                    opencode_binding: Some(
+                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                    ),
+                    ..Default::default()
+                },
+            })
+            .await;
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/project", "%17")];
+        state
+            .pending_prompts
+            .lock()
+            .unwrap()
+            .insert("oc".into(), pending_opencode_prompt("%17", "queued prompt", "ses_old"));
+
+        let delivery = tokio::spawn({
+            let state = state.clone();
+            async move { deliver_pending_prompt(&state, "oc").await }
+        });
+        gate.started.notified().await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_new".into()),
+                    opencode_binding: Some(
+                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                    ),
+                    ..Default::default()
+                },
+            })
+            .await;
+        gate.release.notify_one();
+
+        assert!(!delivery.await.unwrap());
         assert_eq!(
             state.pending_prompts.lock().unwrap().get("oc"),
             Some(&pending_opencode_prompt("%17", "queued prompt", "ses_old"))

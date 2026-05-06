@@ -1780,6 +1780,7 @@ pub async fn start_session(
                         let dir2 = dir.clone();
                         let name2 = name.to_string();
                         let pane2 = pane_id.clone();
+                        let expected_backend_session_id = oc_session_id.clone();
                         let injected = prompt_text.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(std::time::Duration::from_secs(8)).await;
@@ -1803,14 +1804,26 @@ pub async fn start_session(
                                         r.status()
                                     );
                                     let _ = deliver_prompt_fallback(
-                                        &state2, &name2, &pane2, &injected, true, false,
+                                        &state2,
+                                        &name2,
+                                        &pane2,
+                                        &injected,
+                                        true,
+                                        false,
+                                        expected_backend_session_id.as_deref(),
                                     )
                                     .await;
                                 }
                                 Err(e) => {
                                     tracing::warn!("start_session: prompt_async failed: {e}");
                                     let _ = deliver_prompt_fallback(
-                                        &state2, &name2, &pane2, &injected, true, false,
+                                        &state2,
+                                        &name2,
+                                        &pane2,
+                                        &injected,
+                                        true,
+                                        false,
+                                        expected_backend_session_id.as_deref(),
                                     )
                                     .await;
                                 }
@@ -2361,8 +2374,16 @@ pub async fn restart_session(
             } else if is_http_api && restart_backend_session_id.is_some() {
                 if let Some(ref prompt_text) = formatted_prompt {
                     if let Err(e) =
-                        deliver_prompt_fallback(state, name, &pane_id, prompt_text, true, false)
-                            .await
+                        deliver_prompt_fallback(
+                            state,
+                            name,
+                            &pane_id,
+                            prompt_text,
+                            true,
+                            false,
+                            restart_backend_session_id.as_deref(),
+                        )
+                        .await
                     {
                         tracing::warn!("restart prompt fallback delivery failed for {name}: {e}");
                     }
@@ -3139,6 +3160,7 @@ pub(crate) fn schedule_prompt_injection(
                 &pending.prompt,
                 true,
                 false,
+                pending.backend_session_id.as_deref(),
             )
             .await
             {
@@ -3233,18 +3255,28 @@ async fn deliver_prompt_fallback(
     text: &str,
     is_http_api: bool,
     vim_mode: bool,
+    expected_backend_session_id: Option<&str>,
 ) -> anyhow::Result<()> {
-    let pane_still_registered = {
+    let (pane_still_registered, backend_session_matches) = {
         let proto = state.protocol.read().await;
-        proto
-            .sessions
-            .get(session_id)
-            .and_then(|session| session.pane.as_deref())
-            == Some(pane)
+        match proto.sessions.get(session_id) {
+            Some(session) => (
+                session.pane.as_deref() == Some(pane),
+                expected_backend_session_id.is_none_or(|expected| {
+                    session.metadata.backend_session_id.as_deref() == Some(expected)
+                }),
+            ),
+            None => (false, false),
+        }
     };
     if !pane_still_registered {
         anyhow::bail!(
             "prompt fallback skipped: pane {pane} is no longer registered to session {session_id}"
+        );
+    }
+    if !backend_session_matches {
+        anyhow::bail!(
+            "prompt fallback skipped: queued OpenCode backend session is no longer current for session {session_id}"
         );
     }
 
@@ -3788,8 +3820,9 @@ mod tests {
     async fn prompt_fallback_uses_recorded_http_api_policy_for_missing_session() {
         let state = AppState::new_for_test();
 
-        let result = deliver_prompt_fallback(&state, "missing", "%missing", "hello", true, false)
-            .await;
+        let result =
+            deliver_prompt_fallback(&state, "missing", "%missing", "hello", true, false, None)
+                .await;
 
         assert!(result.is_err());
     }
@@ -3805,8 +3838,31 @@ mod tests {
             })
             .await;
 
-        let result = deliver_prompt_fallback(&state, "oc", "%stale", "hello", false, false)
+        let result =
+            deliver_prompt_fallback(&state, "oc", "%stale", "hello", false, false, None).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn prompt_fallback_rejects_stale_opencode_backend_session() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_new".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
             .await;
+
+        let result =
+            deliver_prompt_fallback(&state, "oc", "%17", "hello", false, false, Some("ses_old"))
+                .await;
 
         assert!(result.is_err());
     }
