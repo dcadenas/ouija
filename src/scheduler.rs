@@ -844,10 +844,14 @@ async fn revive_and_inject(
         task,
         project_dir,
         detected_backend_session_id.clone(),
-        backend.name(),
-        opencode_binding,
-        is_tui,
-        clears_context,
+        RevivedSessionSnapshot {
+            model: model.clone(),
+            effort: effort.clone(),
+            backend_name: backend.name(),
+            opencode_binding,
+            is_tui,
+            clears_context,
+        },
     );
     let scheduled_prompt_backend_session_id = proto_meta.backend_session_id.clone();
     state
@@ -890,35 +894,43 @@ async fn revive_and_inject(
     Ok(new_pane)
 }
 
+struct RevivedSessionSnapshot<'a> {
+    model: Option<String>,
+    effort: Option<String>,
+    backend_name: &'a str,
+    opencode_binding: Option<crate::daemon_protocol::OpenCodeBinding>,
+    is_tui: bool,
+    clears_context: bool,
+}
+
 fn revived_session_metadata(
     task: &ScheduledTask,
     project_dir: Option<&str>,
     detected_backend_session_id: Option<String>,
-    backend_name: &str,
-    opencode_binding: Option<crate::daemon_protocol::OpenCodeBinding>,
-    is_tui: bool,
-    clears_context: bool,
+    snapshot: RevivedSessionSnapshot<'_>,
 ) -> crate::daemon_protocol::SessionMeta {
     let backend_session_id = scheduled_prompt_backend_session_id(
         task.backend_session_id.as_deref(),
         detected_backend_session_id,
-        is_tui,
-        clears_context,
+        snapshot.is_tui,
+        snapshot.clears_context,
     );
     let opencode_binding = revived_opencode_binding(
-        backend_name,
+        snapshot.backend_name,
         backend_session_id.as_deref(),
-        is_tui,
-        opencode_binding,
+        snapshot.is_tui,
+        snapshot.opencode_binding,
     );
 
     crate::daemon_protocol::SessionMeta {
         project_dir: project_dir.map(String::from),
         prompt: task.prompt.clone(),
         reminder: task.reminder.clone(),
+        model: snapshot.model,
+        effort: snapshot.effort,
         on_fire: Some(task.on_fire.clone()),
         backend_session_id,
-        backend: Some(backend_name.to_string()),
+        backend: Some(snapshot.backend_name.to_string()),
         opencode_binding,
         ..Default::default()
     }
@@ -1314,14 +1326,20 @@ mod tests {
             &task,
             Some("/tmp/project"),
             Some("ses_detected".to_string()),
-            "opencode",
-            None,
-            false,
-            false,
+            RevivedSessionSnapshot {
+                model: Some("anthropic/claude-sonnet-4".into()),
+                effort: Some("high".into()),
+                backend_name: "opencode",
+                opencode_binding: None,
+                is_tui: false,
+                clears_context: false,
+            },
         );
 
         assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_task"));
         assert_eq!(metadata.backend.as_deref(), Some("opencode"));
+        assert_eq!(metadata.model.as_deref(), Some("anthropic/claude-sonnet-4"));
+        assert_eq!(metadata.effort.as_deref(), Some("high"));
         assert_eq!(
             metadata.opencode_binding,
             Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
