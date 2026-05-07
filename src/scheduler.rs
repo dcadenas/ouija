@@ -629,6 +629,19 @@ async fn revive_and_inject(
         None
     };
     let backend = state.backend_for_session(task.session_name()).await;
+    let is_tui = matches!(
+        backend.delivery_mode(),
+        crate::backend::DeliveryMode::TuiInjection
+    );
+    let detected_backend_session_id = if task.backend_session_id.is_none() {
+        backend.detect_session_id(&dir)
+    } else {
+        None
+    };
+    let resume_backend_session_id = task
+        .backend_session_id
+        .clone()
+        .or_else(|| detected_backend_session_id.clone());
     let launch_cmd = if clears_context {
         backend.build_start_command(&crate::backend::StartOpts {
             project_dir: dir.clone(),
@@ -637,14 +650,10 @@ async fn revive_and_inject(
             effort: effort.clone(),
         })
     } else {
-        let session_id = task
-            .backend_session_id
-            .clone()
-            .or_else(|| backend.detect_session_id(&dir));
         backend
             .build_resume_command(&crate::backend::ResumeOpts {
                 project_dir: dir.clone(),
-                session_id,
+                session_id: resume_backend_session_id.clone(),
                 worktree,
                 model: model.clone(),
                 effort: effort.clone(),
@@ -661,10 +670,6 @@ async fn revive_and_inject(
 
     // Pass prompt as CLI arg so Claude loads CLAUDE.md before processing it.
     // TuiInjection always uses CLI arg; HttpApi only when starting fresh.
-    let is_tui = matches!(
-        backend.delivery_mode(),
-        crate::backend::DeliveryMode::TuiInjection
-    );
     let full_launch_cmd = if clears_context || is_tui {
         if let Some(ref prompt) = task.prompt {
             let full_text = match &task.reminder {
@@ -840,12 +845,32 @@ async fn revive_and_inject(
                 task.session_name(),
                 new_pane.clone(),
                 full_text,
-                None,
+                scheduled_prompt_backend_session_id(
+                    task.backend_session_id.as_deref(),
+                    detected_backend_session_id.clone(),
+                    is_tui,
+                    clears_context,
+                ),
             );
         }
     }
 
     Ok(new_pane)
+}
+
+fn scheduled_prompt_backend_session_id(
+    task_backend_session_id: Option<&str>,
+    detected_backend_session_id: Option<String>,
+    is_tui: bool,
+    clears_context: bool,
+) -> Option<String> {
+    if is_tui || clears_context {
+        None
+    } else {
+        task_backend_session_id
+            .map(str::to_string)
+            .or(detected_backend_session_id)
+    }
 }
 
 /// Poll a pane until one of `names` appears as the current command (blocking).
@@ -1156,5 +1181,37 @@ mod tests {
         );
         assert_eq!(task.prompt.as_deref(), Some("do the work"));
         assert_eq!(task.reminder.as_deref(), Some("call loop_next"));
+    }
+
+    #[test]
+    fn scheduled_http_prompt_uses_resume_backend_session_id() {
+        assert_eq!(
+            scheduled_prompt_backend_session_id(
+                Some("ses_task"),
+                Some("ses_detected".to_string()),
+                false,
+                false,
+            )
+            .as_deref(),
+            Some("ses_task")
+        );
+        assert_eq!(
+            scheduled_prompt_backend_session_id(
+                None,
+                Some("ses_detected".to_string()),
+                false,
+                false,
+            )
+            .as_deref(),
+            Some("ses_detected")
+        );
+        assert_eq!(
+            scheduled_prompt_backend_session_id(Some("ses_task"), None, true, false),
+            None
+        );
+        assert_eq!(
+            scheduled_prompt_backend_session_id(Some("ses_task"), None, false, true),
+            None
+        );
     }
 }
