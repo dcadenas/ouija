@@ -1093,7 +1093,7 @@ impl AppState {
         let mut proto = self.protocol.write().await;
         if let Some(entry) = rollback.pending_reply_before_send {
             if let Some(pending) = proto.pending_replies.get_mut(&rollback.sender_id) {
-                pending.retain(|pending| pending.msg_id != entry.msg_id || pending != &entry);
+                pending.retain(|pending| pending.msg_id != entry.msg_id);
                 if pending.is_empty() {
                     proto.pending_replies.remove(&rollback.sender_id);
                 }
@@ -1101,7 +1101,6 @@ impl AppState {
         }
         if rollback.sender_reminder.is_some()
             && let Some(session) = proto.sessions.get_mut(&rollback.sender_id)
-            && session.metadata.reminder == rollback.sender_reminder.flatten()
         {
             session.metadata.reminder = None;
         }
@@ -3048,6 +3047,59 @@ pub(crate) mod tests {
         assert!(!proto.pending_replies.contains_key("sender"));
         assert_eq!(proto.sessions["sender"].metadata.reminder, None);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn successful_delivery_clears_sender_state_by_msg_id_after_mutations() {
+        let state = AppState::new_for_test();
+        let original_entry = crate::daemon_protocol::PendingReplyEntry {
+            msg_id: 7,
+            from: "requester".into(),
+            message: "please respond".into(),
+            received_at: 100,
+            last_activity: 100,
+            in_progress: false,
+        };
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "sender".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "sender".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        reminder: Some("keep working (activity tick)".into()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+            proto.pending_replies.insert(
+                "sender".into(),
+                vec![crate::daemon_protocol::PendingReplyEntry {
+                    last_activity: 200,
+                    in_progress: true,
+                    ..original_entry.clone()
+                }],
+            );
+        }
+
+        state
+            .finalize_successful_effect_delivery(Some(FailedEffectSendRollback {
+                sender_id: "sender".into(),
+                pending_reply_before_send: Some(original_entry),
+                pending_reply_after_send: None,
+                sender_reminder: Some(Some("keep working".into())),
+                sender_reminder_after_send: None,
+                sender_state_reserved: false,
+                done: true,
+            }))
+            .await;
+
+        let proto = state.protocol.read().await;
+        assert!(!proto.pending_replies.contains_key("sender"));
+        assert_eq!(proto.sessions["sender"].metadata.reminder, None);
     }
 
     #[tokio::test]
