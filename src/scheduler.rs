@@ -806,13 +806,14 @@ async fn revive_and_inject(
     }
 
     // Re-register session with new pane (same ID, so dedup check won't fire)
-    let proto_meta = crate::daemon_protocol::SessionMeta {
-        project_dir: project_dir.map(String::from),
-        prompt: task.prompt.clone(),
-        reminder: task.reminder.clone(),
-        on_fire: Some(task.on_fire.clone()),
-        ..Default::default()
-    };
+    let proto_meta = revived_session_metadata(
+        task,
+        project_dir,
+        detected_backend_session_id.clone(),
+        is_tui,
+        clears_context,
+    );
+    let scheduled_prompt_backend_session_id = proto_meta.backend_session_id.clone();
     state
         .apply_and_execute(crate::daemon_protocol::Event::Register {
             id: task.session_name().to_string(),
@@ -845,17 +846,34 @@ async fn revive_and_inject(
                 task.session_name(),
                 new_pane.clone(),
                 full_text,
-                scheduled_prompt_backend_session_id(
-                    task.backend_session_id.as_deref(),
-                    detected_backend_session_id.clone(),
-                    is_tui,
-                    clears_context,
-                ),
+                scheduled_prompt_backend_session_id,
             );
         }
     }
 
     Ok(new_pane)
+}
+
+fn revived_session_metadata(
+    task: &ScheduledTask,
+    project_dir: Option<&str>,
+    detected_backend_session_id: Option<String>,
+    is_tui: bool,
+    clears_context: bool,
+) -> crate::daemon_protocol::SessionMeta {
+    crate::daemon_protocol::SessionMeta {
+        project_dir: project_dir.map(String::from),
+        prompt: task.prompt.clone(),
+        reminder: task.reminder.clone(),
+        on_fire: Some(task.on_fire.clone()),
+        backend_session_id: scheduled_prompt_backend_session_id(
+            task.backend_session_id.as_deref(),
+            detected_backend_session_id,
+            is_tui,
+            clears_context,
+        ),
+        ..Default::default()
+    }
 }
 
 fn scheduled_prompt_backend_session_id(
@@ -1213,5 +1231,29 @@ mod tests {
             scheduled_prompt_backend_session_id(Some("ses_task"), None, false, true),
             None
         );
+    }
+
+    #[test]
+    fn revived_http_session_metadata_records_queued_backend_session_id() {
+        let task = new_task(
+            "task".into(),
+            "0 0 * * *".into(),
+            None,
+            Some("prompt".into()),
+            None,
+            false,
+            Some("ses_task".into()),
+            OnFire::ContinueSession,
+        );
+
+        let metadata = revived_session_metadata(
+            &task,
+            Some("/tmp/project"),
+            Some("ses_detected".to_string()),
+            false,
+            false,
+        );
+
+        assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_task"));
     }
 }
