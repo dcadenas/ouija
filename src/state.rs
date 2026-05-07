@@ -625,9 +625,10 @@ impl AppState {
             return rewrite_send_delivery_failure(effects, &failure.reason);
         }
 
-        if effects.iter().any(|effect| {
-            matches!(effect, crate::daemon_protocol::Effect::SendFailed { .. })
-        }) {
+        if effects
+            .iter()
+            .any(|effect| matches!(effect, crate::daemon_protocol::Effect::SendFailed { .. }))
+        {
             self.rollback_sender_state_for_failed_effect_delivery(rollback)
                 .await;
             return effects;
@@ -692,9 +693,9 @@ impl AppState {
                     let effect_method = delivery_method.as_deref().or(recorded_method);
                     let effect_http_delivery = http_delivery.as_ref().or(recorded_http_delivery);
                     let result = match effect_method {
-                        Some("http") => {
-                            match effect_http_delivery {
-                                Some(delivery) => crate::tmux::deliver_via_http(
+                        Some("http") => match effect_http_delivery {
+                            Some(delivery) => {
+                                crate::tmux::deliver_via_http(
                                     self,
                                     &delivery.backend_session_id,
                                     delivery.project_dir.as_deref(),
@@ -702,22 +703,22 @@ impl AppState {
                                     delivery.model.as_deref(),
                                     delivery.effort.as_deref(),
                                 )
-                                .await,
-                                None => {
-                                    Err(anyhow::anyhow!(
-                                        "http delivery skipped: no recorded backend_session_id on send"
-                                    ))
-                                }
+                                .await
                             }
-                        }
+                            None => Err(anyhow::anyhow!(
+                                "http delivery skipped: no recorded backend_session_id on send"
+                            )),
+                        },
                         Some("tmux") => {
                             crate::tmux::locked_inject_raw_tmux(
                                 self, session_id, pane, message, *vim_mode,
                             )
                             .await
                         }
-                        _ => crate::tmux::locked_inject(self, session_id, pane, message, *vim_mode)
-                            .await,
+                        _ => {
+                            crate::tmux::locked_inject(self, session_id, pane, message, *vim_mode)
+                                .await
+                        }
                     };
                     if let Err(error) = result {
                         tracing::warn!(session = %session_id, "message delivery failed: {error}");
@@ -731,36 +732,34 @@ impl AppState {
                     message,
                     http_delivery,
                     ..
-                } => {
-                    match Some(http_delivery).or(recorded_http_delivery) {
-                        Some(delivery) => {
-                            if let Err(error) = crate::tmux::deliver_via_http(
-                                self,
-                                &delivery.backend_session_id,
-                                delivery.project_dir.as_deref(),
-                                message,
-                                delivery.model.as_deref(),
-                                delivery.effort.as_deref(),
-                            )
-                            .await
-                            {
-                                tracing::warn!(session = %session_id, "http delivery failed: {error}");
-                                delivery_failure.get_or_insert_with(|| EffectDeliveryFailure {
-                                    reason: error.to_string(),
-                                });
-                            }
-                        }
-                        None => {
-                            let error = anyhow::anyhow!(
-                                "http delivery skipped: no recorded backend_session_id on send"
-                            );
-                            tracing::warn!(session = %session_id, "{error}");
+                } => match Some(http_delivery).or(recorded_http_delivery) {
+                    Some(delivery) => {
+                        if let Err(error) = crate::tmux::deliver_via_http(
+                            self,
+                            &delivery.backend_session_id,
+                            delivery.project_dir.as_deref(),
+                            message,
+                            delivery.model.as_deref(),
+                            delivery.effort.as_deref(),
+                        )
+                        .await
+                        {
+                            tracing::warn!(session = %session_id, "http delivery failed: {error}");
                             delivery_failure.get_or_insert_with(|| EffectDeliveryFailure {
                                 reason: error.to_string(),
                             });
                         }
                     }
-                }
+                    None => {
+                        let error = anyhow::anyhow!(
+                            "http delivery skipped: no recorded backend_session_id on send"
+                        );
+                        tracing::warn!(session = %session_id, "{error}");
+                        delivery_failure.get_or_insert_with(|| EffectDeliveryFailure {
+                            reason: error.to_string(),
+                        });
+                    }
+                },
                 Effect::SetTmuxVar { pane, name, value } => {
                     let p = pane.clone();
                     let n = name.clone();
@@ -1082,7 +1081,10 @@ impl AppState {
         }
     }
 
-    async fn finalize_successful_effect_delivery(&self, rollback: Option<FailedEffectSendRollback>) {
+    async fn finalize_successful_effect_delivery(
+        &self,
+        rollback: Option<FailedEffectSendRollback>,
+    ) {
         let Some(rollback) = rollback else {
             return;
         };
@@ -1463,7 +1465,9 @@ impl AppState {
             let mut backoff = self.sweep_backoff_until.lock().unwrap();
             if let Some(until) = *backoff {
                 if std::time::Instant::now() < until {
-                    tracing::debug!("worktree sweep in backoff window after recent timeout, skipping");
+                    tracing::debug!(
+                        "worktree sweep in backoff window after recent timeout, skipping"
+                    );
                     return;
                 }
                 *backoff = None;
@@ -1491,16 +1495,16 @@ impl AppState {
             return;
         }
         // Dedup: skip if a prior sweep is still running
-        if self.sweep_in_progress.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .sweep_in_progress
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
             tracing::debug!("worktree sweep already in progress, skipping");
             return;
         }
         // Deduplicate project dirs to avoid N² stat calls
         let unique_dirs: Vec<String> = {
-            let mut dirs: Vec<String> = sessions_with_dirs
-                .iter()
-                .map(|(_, d)| d.clone())
-                .collect();
+            let mut dirs: Vec<String> = sessions_with_dirs.iter().map(|(_, d)| d.clone()).collect();
             dirs.sort();
             dirs.dedup();
             dirs
@@ -1538,11 +1542,14 @@ impl AppState {
                 }
                 map
             }),
-        ).await {
+        )
+        .await
+        {
             Ok(Ok(m)) => m,
             Ok(Err(e)) => {
                 tracing::warn!("worktree sweep spawn_blocking failed: {e}");
-                self.sweep_in_progress.store(false, std::sync::atomic::Ordering::Relaxed);
+                self.sweep_in_progress
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
             Err(_) => {
@@ -1556,8 +1563,7 @@ impl AppState {
                 // orphan-thread accumulation at 1 per backoff window instead of
                 // 1 per reaper heartbeat.
                 *self.sweep_backoff_until.lock().unwrap() = Some(
-                    std::time::Instant::now()
-                        + std::time::Duration::from_secs(SWEEP_BACKOFF_SECS),
+                    std::time::Instant::now() + std::time::Duration::from_secs(SWEEP_BACKOFF_SECS),
                 );
                 return;
             }
@@ -1565,19 +1571,16 @@ impl AppState {
         // Only update sessions whose dirs were successfully checked
         let updates: Vec<(String, String, bool)> = sessions_with_dirs
             .into_iter()
-            .filter_map(|(id, dir)| {
-                presence_map.get(&dir).map(|p| (id, dir.clone(), *p))
-            })
+            .filter_map(|(id, dir)| presence_map.get(&dir).map(|p| (id, dir.clone(), *p)))
             .collect();
         if !updates.is_empty() {
             let _ = self
-                .apply_and_execute(crate::daemon_protocol::Event::MarkWorktreePresence {
-                    updates,
-                })
+                .apply_and_execute(crate::daemon_protocol::Event::MarkWorktreePresence { updates })
                 .await;
         }
         // Always reset the dedup flag, even on early return or timeout
-        self.sweep_in_progress.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.sweep_in_progress
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn persist_sessions_from(&self, sessions: &HashMap<String, Session>) {
@@ -2009,7 +2012,8 @@ impl FailedEffectSendRollback {
         if let Some(entry) = self.pending_reply_before_send.clone()
             && self.pending_reply_after_send == Some(None)
         {
-            proto.pending_replies
+            proto
+                .pending_replies
                 .entry(self.sender_id.clone())
                 .or_default()
                 .push(entry);
@@ -2177,10 +2181,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn execute_effects_uses_recorded_tmux_method_for_send_inject() {
+        use axum::Router;
         use axum::extract::State as AxumState;
         use axum::http::StatusCode;
         use axum::routing::post;
-        use axum::Router;
         use std::sync::Arc as StdArc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::net::TcpListener;
@@ -2251,10 +2255,10 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn execute_effects_delivers_http_from_recorded_snapshot_without_live_session() {
+        use axum::Router;
         use axum::extract::State as AxumState;
         use axum::http::StatusCode;
         use axum::routing::post;
-        use axum::Router;
         use std::sync::Arc as StdArc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::net::TcpListener;
@@ -2408,9 +2412,8 @@ pub(crate) mod tests {
             let mut proto = state.protocol.write().await;
             let session = proto.sessions.get_mut("oc").unwrap();
             session.metadata.backend_session_id = Some("ses_new".into());
-            session.metadata.opencode_binding = Some(
-                crate::daemon_protocol::OpenCodeBinding::StrongManaged,
-            );
+            session.metadata.opencode_binding =
+                Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged);
         }
 
         let failure = state.execute_effects(&effects).await;
@@ -2670,9 +2673,10 @@ pub(crate) mod tests {
             )
         }));
         assert!(
-            !effects
-                .iter()
-                .any(|effect| matches!(effect, crate::daemon_protocol::Effect::SendDelivered { .. }))
+            !effects.iter().any(|effect| matches!(
+                effect,
+                crate::daemon_protocol::Effect::SendDelivered { .. }
+            ))
         );
 
         let log = state.message_log.read().await;
@@ -2731,7 +2735,10 @@ pub(crate) mod tests {
 
         assert!(effects.iter().any(|effect| matches!(
             effect,
-            crate::daemon_protocol::Effect::LogMessage { delivered: false, .. }
+            crate::daemon_protocol::Effect::LogMessage {
+                delivered: false,
+                ..
+            }
         )));
 
         let proto = state.protocol.read().await;
@@ -2786,7 +2793,10 @@ pub(crate) mod tests {
 
         assert!(effects.iter().any(|effect| matches!(
             effect,
-            crate::daemon_protocol::Effect::LogMessage { delivered: false, .. }
+            crate::daemon_protocol::Effect::LogMessage {
+                delivered: false,
+                ..
+            }
         )));
 
         let proto = state.protocol.read().await;

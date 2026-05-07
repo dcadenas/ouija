@@ -619,7 +619,10 @@ fn inject_delivery_snapshot(
         return (None, None);
     }
     if session.metadata.is_strong_opencode_binding() {
-        (Some("http".into()), session.metadata.http_delivery_snapshot())
+        (
+            Some("http".into()),
+            session.metadata.http_delivery_snapshot(),
+        )
     } else {
         (Some("tmux".into()), None)
     }
@@ -739,7 +742,10 @@ impl DaemonState {
             }
             Event::Rename { old_id, new_id } => self.apply_rename(&old_id, &new_id),
             Event::Remove { id, keep_worktree } => self.apply_remove(&id, keep_worktree),
-            Event::RemoveIfStale { id, expected_project_dir } => self.apply_remove_if_stale(&id, expected_project_dir.as_deref()),
+            Event::RemoveIfStale {
+                id,
+                expected_project_dir,
+            } => self.apply_remove_if_stale(&id, expected_project_dir.as_deref()),
             Event::UpdateMetadata {
                 id,
                 role,
@@ -1158,7 +1164,11 @@ impl DaemonState {
     /// closes the TOCTOU window where a heartbeat sweep could flip
     /// `worktree_present` back to `Some(true)` between a caller's pre-check
     /// and the remove.
-    fn apply_remove_if_stale(&mut self, id: &str, expected_project_dir: Option<&str>) -> Vec<Effect> {
+    fn apply_remove_if_stale(
+        &mut self,
+        id: &str,
+        expected_project_dir: Option<&str>,
+    ) -> Vec<Effect> {
         match self.sessions.get(id) {
             Some(session) => {
                 if !matches!(session.origin, Origin::Local) {
@@ -1238,7 +1248,10 @@ impl DaemonState {
         effects
     }
 
-    fn apply_mark_worktree_presence(&mut self, updates: Vec<(String, String, bool)>) -> Vec<Effect> {
+    fn apply_mark_worktree_presence(
+        &mut self,
+        updates: Vec<(String, String, bool)>,
+    ) -> Vec<Effect> {
         let mut effects = Vec::new();
         let mut any_changed = false;
 
@@ -3519,21 +3532,39 @@ mod tests {
         });
         // Local should be set
         assert_eq!(
-            state.sessions.get("local/s1").unwrap().metadata.worktree_present,
+            state
+                .sessions
+                .get("local/s1")
+                .unwrap()
+                .metadata
+                .worktree_present,
             Some(false)
         );
         // Remote and Human should be unchanged (None)
         assert_eq!(
-            state.sessions.get("remote/s1").unwrap().metadata.worktree_present,
+            state
+                .sessions
+                .get("remote/s1")
+                .unwrap()
+                .metadata
+                .worktree_present,
             None
         );
         assert_eq!(
-            state.sessions.get("human/s1").unwrap().metadata.worktree_present,
+            state
+                .sessions
+                .get("human/s1")
+                .unwrap()
+                .metadata
+                .worktree_present,
             None
         );
         // Only one Persist for the local session
         assert_eq!(
-            effects.iter().filter(|e| matches!(e, Effect::Persist)).count(),
+            effects
+                .iter()
+                .filter(|e| matches!(e, Effect::Persist))
+                .count(),
             1,
             "only local session should trigger persist"
         );
@@ -3561,7 +3592,9 @@ mod tests {
         });
         assert!(!state.sessions.contains_key("s1"));
         assert!(
-            !effects.iter().any(|e| matches!(e, Effect::CleanupWorktree { .. })),
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::CleanupWorktree { .. })),
             "prune with keep_worktree=true should not emit CleanupWorktree"
         );
     }
@@ -3594,8 +3627,14 @@ mod tests {
         assert!(!state.sessions.contains_key("s1"));
         assert!(!state.sessions.contains_key("s2"));
         assert!(!state.sessions.contains_key("s3"));
-        let persist_count = effects.iter().filter(|e| matches!(e, Effect::Persist)).count();
-        assert_eq!(persist_count, 1, "batch must emit exactly one Persist (got {persist_count})");
+        let persist_count = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::Persist))
+            .count();
+        assert_eq!(
+            persist_count, 1,
+            "batch must emit exactly one Persist (got {persist_count})"
+        );
         let broadcast_count = effects
             .iter()
             .filter(|e| matches!(e, Effect::BroadcastSessionList))
@@ -3608,7 +3647,10 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, Effect::RemoveOk { .. }))
             .count();
-        assert_eq!(remove_ok_count, 3, "should emit one RemoveOk per pruned session");
+        assert_eq!(
+            remove_ok_count, 3,
+            "should emit one RemoveOk per pruned session"
+        );
     }
 
     #[test]
@@ -3672,14 +3714,19 @@ mod tests {
             "all-failure batch must not emit Persist"
         );
         assert!(
-            !effects.iter().any(|e| matches!(e, Effect::BroadcastSessionList)),
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::BroadcastSessionList)),
             "all-failure batch must not emit BroadcastSessionList"
         );
         let failed_count = effects
             .iter()
             .filter(|e| matches!(e, Effect::RemoveFailed { .. }))
             .count();
-        assert_eq!(failed_count, 2, "should emit RemoveFailed per missing session");
+        assert_eq!(
+            failed_count, 2,
+            "should emit RemoveFailed per missing session"
+        );
     }
 
     #[test]
@@ -3706,8 +3753,14 @@ mod tests {
         // Stale was pruned; live and missing failed
         assert!(!state.sessions.contains_key("stale"));
         assert!(state.sessions.contains_key("live"));
-        let persist_count = effects.iter().filter(|e| matches!(e, Effect::Persist)).count();
-        assert_eq!(persist_count, 1, "exactly one Persist for the one successful prune");
+        let persist_count = effects
+            .iter()
+            .filter(|e| matches!(e, Effect::Persist))
+            .count();
+        assert_eq!(
+            persist_count, 1,
+            "exactly one Persist for the one successful prune"
+        );
         let remove_ok_count = effects
             .iter()
             .filter(|e| matches!(e, Effect::RemoveOk { .. }))
@@ -3801,11 +3854,7 @@ mod tests {
             },
         });
         // Override origin to Remote post-registration (Register defaults to Local).
-        state
-            .sessions
-            .get_mut("remote-1")
-            .unwrap()
-            .origin = Origin::Remote("npub1xyz".into());
+        state.sessions.get_mut("remote-1").unwrap().origin = Origin::Remote("npub1xyz".into());
         let effects = state.apply(Event::RemoveIfStale {
             id: "remote-1".into(),
             expected_project_dir: None,
@@ -3854,10 +3903,18 @@ mod tests {
             Effect::RemoveFailed { id, reason, .. } if id == "missing" => Some(reason.clone()),
             _ => None,
         });
-        let live_reason = live_failure.expect("live session must produce RemoveFailed { id: \"live\", .. }");
-        let missing_reason = missing_failure.expect("missing session must produce RemoveFailed { id: \"missing\", .. }");
-        assert!(live_reason.contains("not stale"), "live reason should say not stale, got: {live_reason}");
-        assert!(missing_reason.contains("not found"), "missing reason should say not found, got: {missing_reason}");
+        let live_reason =
+            live_failure.expect("live session must produce RemoveFailed { id: \"live\", .. }");
+        let missing_reason = missing_failure
+            .expect("missing session must produce RemoveFailed { id: \"missing\", .. }");
+        assert!(
+            live_reason.contains("not stale"),
+            "live reason should say not stale, got: {live_reason}"
+        );
+        assert!(
+            missing_reason.contains("not found"),
+            "missing reason should say not found, got: {missing_reason}"
+        );
     }
 
     // --- IncomingWire tests ---

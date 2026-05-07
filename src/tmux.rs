@@ -81,9 +81,7 @@ impl ProcessTree {
                     .and_then(|f| f.to_str())
                     .unwrap_or(n);
                 names.iter().any(|&target| {
-                    n == target
-                        || basename == target
-                        || basename.strip_prefix('.') == Some(target)
+                    n == target || basename == target || basename.strip_prefix('.') == Some(target)
                 })
             }) {
                 return true;

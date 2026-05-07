@@ -592,16 +592,7 @@ async fn revive_from_task(
     backend_name: Option<String>,
 ) -> TaskRun {
     let project_dir = project_dir_override.or(task.project_dir.as_deref());
-    match revive_and_inject(
-        state,
-        task,
-        project_dir,
-        model,
-        effort,
-        backend_name,
-    )
-    .await
-    {
+    match revive_and_inject(state, task, project_dir, model, effort, backend_name).await {
         Ok(new_pane) => {
             if task.on_fire.clears_context() {
                 let mut proto = state.protocol.write().await;
@@ -923,9 +914,7 @@ fn revived_session_metadata(
     }
 }
 
-fn revived_opencode_binding(
-    backend_name: &str,
-) -> Option<crate::daemon_protocol::OpenCodeBinding> {
+fn revived_opencode_binding(backend_name: &str) -> Option<crate::daemon_protocol::OpenCodeBinding> {
     if backend_name != "opencode" {
         return None;
     }

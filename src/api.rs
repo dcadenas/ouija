@@ -868,7 +868,8 @@ impl FailedSendRollback {
         if let Some(entry) = self.pending_reply_before_send.clone()
             && self.pending_reply_after_send == Some(None)
         {
-            proto.pending_replies
+            proto
+                .pending_replies
                 .entry(self.sender_id.clone())
                 .or_default()
                 .push(entry);
@@ -1008,36 +1009,36 @@ async fn execute_send_effects_for_api(
                 message,
                 vim_mode,
                 ..
-            } => {
-                match recorded_method {
-                    Some("http") => {
-                        let delivery = recorded_http_delivery.ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "http delivery skipped: no recorded backend_session_id on send"
-                            )
-                        })?;
-                        deliver_http_message(state, delivery, message).await?
-                    }
-                    Some("tmux") => {
-                        tmux::locked_inject_raw_tmux(state, session_id, pane, message, *vim_mode)
-                            .await?;
-                    }
-                    _ => {
-                        tmux::locked_inject(state, session_id, pane, message, *vim_mode).await?;
-                    }
+            } => match recorded_method {
+                Some("http") => {
+                    let delivery = recorded_http_delivery.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "http delivery skipped: no recorded backend_session_id on send"
+                        )
+                    })?;
+                    deliver_http_message(state, delivery, message).await?
                 }
-            }
+                Some("tmux") => {
+                    tmux::locked_inject_raw_tmux(state, session_id, pane, message, *vim_mode)
+                        .await?;
+                }
+                _ => {
+                    tmux::locked_inject(state, session_id, pane, message, *vim_mode).await?;
+                }
+            },
             Effect::DeliverHttpMessage {
                 session_id: _,
                 message,
                 http_delivery,
                 ..
             } => {
-                let delivery = Some(http_delivery).or(recorded_http_delivery).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "http delivery skipped: no recorded backend_session_id on send"
-                    )
-                })?;
+                let delivery = Some(http_delivery)
+                    .or(recorded_http_delivery)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "http delivery skipped: no recorded backend_session_id on send"
+                        )
+                    })?;
                 deliver_http_message(state, delivery, message).await?;
             }
             Effect::SendToHuman { npub, message } => {
@@ -1475,13 +1476,12 @@ async fn compact_inner(
                 );
             };
 
-            let Some((provider_id, model_id)) =
-                resolve_opencode_compact_model(
-                    state,
-                    lookup.model.as_deref(),
-                    lookup.project_dir.as_deref(),
-                )
-                .await
+            let Some((provider_id, model_id)) = resolve_opencode_compact_model(
+                state,
+                lookup.model.as_deref(),
+                lookup.project_dir.as_deref(),
+            )
+            .await
             else {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -2247,13 +2247,20 @@ pub async fn prune_stale_sessions(
                 matches!(s.origin, crate::daemon_protocol::Origin::Local)
                     && s.metadata.worktree_present == Some(false)
             })
-            .filter_map(|s| s.metadata.project_dir.as_ref().map(|d| (s.id.clone(), d.clone())))
+            .filter_map(|s| {
+                s.metadata
+                    .project_dir
+                    .as_ref()
+                    .map(|d| (s.id.clone(), d.clone()))
+            })
             .collect()
     };
     if !body.confirm {
         return (
             StatusCode::OK,
-            Json(json!({ "dry_run": true, "would_prune": stale_sessions.iter().map(|(id, _)| id).cloned().collect::<Vec<_>>() })),
+            Json(
+                json!({ "dry_run": true, "would_prune": stale_sessions.iter().map(|(id, _)| id).cloned().collect::<Vec<_>>() }),
+            ),
         );
     }
     let mut pruned = Vec::new();
@@ -2296,7 +2303,10 @@ pub async fn prune_stale_sessions(
             tracing::debug!("session {} vanished between snapshot and prune", id);
             already_gone.push(id);
         } else {
-            tracing::warn!("failed to prune session {} (no longer stale or guard tripped)", id);
+            tracing::warn!(
+                "failed to prune session {} (no longer stale or guard tripped)",
+                id
+            );
             errors.push(id);
         }
     }
@@ -2305,12 +2315,28 @@ pub async fn prune_stale_sessions(
     } else {
         let mut obj = serde_json::Map::new();
         obj.insert("dry_run".into(), serde_json::Value::Bool(false));
-        obj.insert("pruned".into(), serde_json::Value::Array(pruned.into_iter().map(serde_json::Value::String).collect()));
+        obj.insert(
+            "pruned".into(),
+            serde_json::Value::Array(pruned.into_iter().map(serde_json::Value::String).collect()),
+        );
         if !errors.is_empty() {
-            obj.insert("errors".into(), serde_json::Value::Array(errors.into_iter().map(serde_json::Value::String).collect()));
+            obj.insert(
+                "errors".into(),
+                serde_json::Value::Array(
+                    errors.into_iter().map(serde_json::Value::String).collect(),
+                ),
+            );
         }
         if !already_gone.is_empty() {
-            obj.insert("already_gone".into(), serde_json::Value::Array(already_gone.into_iter().map(serde_json::Value::String).collect()));
+            obj.insert(
+                "already_gone".into(),
+                serde_json::Value::Array(
+                    already_gone
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
         }
         serde_json::Value::Object(obj)
     };
@@ -2471,7 +2497,10 @@ pub async fn clear_block_interactive(
 /// See issue #646: `/api/pane/{pane}/...` routes used to silently 404 on
 /// raw `%`-prefixed pane ids, and one handler (get_pending_replies) even
 /// masked the bug by returning `200 + []` on pane lookup miss.
-fn resolve_pane_to_session(proto: &crate::daemon_protocol::DaemonState, raw: &str) -> Option<String> {
+fn resolve_pane_to_session(
+    proto: &crate::daemon_protocol::DaemonState,
+    raw: &str,
+) -> Option<String> {
     let suffix = raw.strip_prefix('%').unwrap_or(raw);
     let pane_id = format!("%{suffix}");
     proto
@@ -2770,14 +2799,11 @@ fn reserve_pending_prompt_if_matches(
     backend_session_id: Option<&str>,
 ) -> Option<crate::state::PendingPrompt> {
     let mut pending = state.pending_prompts.lock().unwrap();
-    if pending
-        .get(session_name)
-        .is_some_and(|pending| {
-            pending.pane_id == pane_id
-                && pending.prompt == prompt
-                && pending.backend_session_id.as_deref() == backend_session_id
-        })
-    {
+    if pending.get(session_name).is_some_and(|pending| {
+        pending.pane_id == pane_id
+            && pending.prompt == prompt
+            && pending.backend_session_id.as_deref() == backend_session_id
+    }) {
         return pending.remove(session_name);
     }
     None
@@ -3480,10 +3506,7 @@ async fn resolve_opencode_compact_model(
     if let Some(dir) = project_dir {
         req = req.header("x-opencode-directory", dir);
     }
-    let resp = req
-        .send()
-        .await
-        .ok()?;
+    let resp = req.send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -3859,9 +3882,7 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_oc".into()),
-                    opencode_binding: Some(
-                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
-                    ),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
                     ..Default::default()
                 },
             })
@@ -3903,9 +3924,7 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_oc".into()),
-                    opencode_binding: Some(
-                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
-                    ),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
                     ..Default::default()
                 },
             })
@@ -3946,9 +3965,7 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_oc".into()),
-                    opencode_binding: Some(
-                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
-                    ),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
                     ..Default::default()
                 },
             })
@@ -3969,9 +3986,8 @@ mod tests {
         {
             let mut proto = state.protocol.write().await;
             let session = proto.sessions.get_mut("oc-managed").unwrap();
-            session.metadata.opencode_binding = Some(
-                crate::daemon_protocol::OpenCodeBinding::WeakAdopted,
-            );
+            session.metadata.opencode_binding =
+                Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted);
         }
 
         let result = execute_send_effects_for_api(&state, &effects).await;
@@ -4053,7 +4069,9 @@ mod tests {
             session.metadata.backend_session_id = Some("ses_new".into());
         }
 
-        execute_send_effects_for_api(&state, &effects).await.unwrap();
+        execute_send_effects_for_api(&state, &effects)
+            .await
+            .unwrap();
 
         server.abort();
         assert_eq!(captures.lock().unwrap().as_slice(), ["ses_old"]);
@@ -4436,12 +4454,8 @@ mod tests {
             let pending = proto.pending_replies.get_mut("sender").unwrap();
             pending[0].in_progress = true;
             pending[0].last_activity = 200;
-            proto
-                .sessions
-                .get_mut("sender")
-                .unwrap()
-                .metadata
-                .reminder = Some("keep working (activity tick)".into());
+            proto.sessions.get_mut("sender").unwrap().metadata.reminder =
+                Some("keep working (activity tick)".into());
         }
 
         gate.release.notify_one();
@@ -5075,8 +5089,7 @@ mod tests {
         // helper must not even attempt the /config HTTP call.
         let state = crate::state::AppState::new_for_test();
         let result =
-            resolve_opencode_compact_model(&state, Some("anthropic/claude-sonnet-4-6"), None)
-                .await;
+            resolve_opencode_compact_model(&state, Some("anthropic/claude-sonnet-4-6"), None).await;
         assert_eq!(
             result,
             Some(("anthropic".into(), "claude-sonnet-4-6".into()))
@@ -5116,19 +5129,16 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_ready".into()),
-                    opencode_binding: Some(
-                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
-                    ),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
                     ..Default::default()
                 },
             })
             .await;
         *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/project", "%17")];
-        state
-            .pending_prompts
-            .lock()
-            .unwrap()
-            .insert("oc".into(), pending_opencode_prompt("%17", "queued prompt", "ses_ready"));
+        state.pending_prompts.lock().unwrap().insert(
+            "oc".into(),
+            pending_opencode_prompt("%17", "queued prompt", "ses_ready"),
+        );
 
         let delivered = deliver_pending_prompt(&state, "oc").await;
 
@@ -5187,18 +5197,15 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_ready".into()),
-                    opencode_binding: Some(
-                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
-                    ),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
                     ..Default::default()
                 },
             })
             .await;
-        state
-            .pending_prompts
-            .lock()
-            .unwrap()
-            .insert("oc".into(), pending_opencode_prompt("%17", "queued prompt", "ses_ready"));
+        state.pending_prompts.lock().unwrap().insert(
+            "oc".into(),
+            pending_opencode_prompt("%17", "queued prompt", "ses_ready"),
+        );
 
         let delivery = tokio::spawn({
             let state = state.clone();
@@ -5263,18 +5270,15 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_ready".into()),
-                    opencode_binding: Some(
-                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
-                    ),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
                     ..Default::default()
                 },
             })
             .await;
-        state
-            .pending_prompts
-            .lock()
-            .unwrap()
-            .insert("oc".into(), pending_opencode_prompt("%17", "queued prompt", "ses_ready"));
+        state.pending_prompts.lock().unwrap().insert(
+            "oc".into(),
+            pending_opencode_prompt("%17", "queued prompt", "ses_ready"),
+        );
 
         let delivery = tokio::spawn({
             let state = state.clone();
@@ -5289,9 +5293,7 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_ready".into()),
-                    opencode_binding: Some(
-                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
-                    ),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
                     ..Default::default()
                 },
             })
@@ -5301,7 +5303,11 @@ mod tests {
         assert!(!delivery.await.unwrap());
         assert_eq!(
             state.pending_prompts.lock().unwrap().get("oc"),
-            Some(&pending_opencode_prompt("%17", "queued prompt", "ses_ready"))
+            Some(&pending_opencode_prompt(
+                "%17",
+                "queued prompt",
+                "ses_ready"
+            ))
         );
 
         state
@@ -5316,7 +5322,11 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(
             state.pending_prompts.lock().unwrap().get("oc"),
-            Some(&pending_opencode_prompt("%17", "queued prompt", "ses_ready"))
+            Some(&pending_opencode_prompt(
+                "%17",
+                "queued prompt",
+                "ses_ready"
+            ))
         );
         server.abort();
     }
@@ -5330,7 +5340,8 @@ mod tests {
             .unwrap()
             .insert("oc".into(), pending_prompt("%17", "queued prompt"));
 
-        let reserved = reserve_pending_prompt_if_matches(&state, "oc", "%17", "queued prompt", None);
+        let reserved =
+            reserve_pending_prompt_if_matches(&state, "oc", "%17", "queued prompt", None);
 
         assert_eq!(reserved, Some(pending_prompt("%17", "queued prompt")));
         assert!(!state.pending_prompts.lock().unwrap().contains_key("oc"));
@@ -5537,18 +5548,15 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_new".into()),
-                    opencode_binding: Some(
-                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
-                    ),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
                     ..Default::default()
                 },
             })
             .await;
-        state
-            .pending_prompts
-            .lock()
-            .unwrap()
-            .insert("oc".into(), pending_opencode_prompt("%old", "queued prompt", "ses_old"));
+        state.pending_prompts.lock().unwrap().insert(
+            "oc".into(),
+            pending_opencode_prompt("%old", "queued prompt", "ses_old"),
+        );
 
         let delivered = deliver_pending_prompt(&state, "oc").await;
 
@@ -5601,18 +5609,15 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_old".into()),
-                    opencode_binding: Some(
-                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
-                    ),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
                     ..Default::default()
                 },
             })
             .await;
-        state
-            .pending_prompts
-            .lock()
-            .unwrap()
-            .insert("oc".into(), pending_opencode_prompt("%17", "queued prompt", "ses_old"));
+        state.pending_prompts.lock().unwrap().insert(
+            "oc".into(),
+            pending_opencode_prompt("%17", "queued prompt", "ses_old"),
+        );
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
                 id: "oc".into(),
@@ -5620,9 +5625,7 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_new".into()),
-                    opencode_binding: Some(
-                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
-                    ),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
                     ..Default::default()
                 },
             })
@@ -5689,19 +5692,16 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_old".into()),
-                    opencode_binding: Some(
-                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
-                    ),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
                     ..Default::default()
                 },
             })
             .await;
         *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/project", "%17")];
-        state
-            .pending_prompts
-            .lock()
-            .unwrap()
-            .insert("oc".into(), pending_opencode_prompt("%17", "queued prompt", "ses_old"));
+        state.pending_prompts.lock().unwrap().insert(
+            "oc".into(),
+            pending_opencode_prompt("%17", "queued prompt", "ses_old"),
+        );
 
         let delivery = tokio::spawn({
             let state = state.clone();
@@ -5715,9 +5715,7 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_new".into()),
-                    opencode_binding: Some(
-                        crate::daemon_protocol::OpenCodeBinding::StrongManaged,
-                    ),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
                     ..Default::default()
                 },
             })
@@ -6264,13 +6262,9 @@ mod tests {
         let state = crate::state::AppState::new_for_test();
         *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/actual-project", "%17")];
 
-        let result = auto_provision_with_explicit_pane(
-            &state,
-            "ses_mismatch",
-            "%17",
-            "/tmp/hinted-project",
-        )
-        .await;
+        let result =
+            auto_provision_with_explicit_pane(&state, "ses_mismatch", "%17", "/tmp/hinted-project")
+                .await;
 
         assert!(
             result.is_none(),
@@ -6941,8 +6935,7 @@ mod tests {
         // match the two-segment route. Axum must not accept it; we get 404
         // (route not found) rather than the DELETE handler being called.
         // This is the exact failure the review flagged.
-        let buggy_url =
-            format!("http://{addr}/api/pane/99/pending-replies/feat/646-test");
+        let buggy_url = format!("http://{addr}/api/pane/99/pending-replies/feat/646-test");
         let buggy_resp = client.delete(&buggy_url).send().await.unwrap();
         assert_eq!(
             buggy_resp.status().as_u16(),
@@ -6964,8 +6957,7 @@ mod tests {
         // Now the correctly-encoded form: `feat%2F646-test`. axum decodes it
         // back to `feat/646-test` on the handler side, the lookup matches,
         // and the slot is cleared.
-        let encoded_url =
-            format!("http://{addr}/api/pane/99/pending-replies/feat%2F646-test");
+        let encoded_url = format!("http://{addr}/api/pane/99/pending-replies/feat%2F646-test");
         let resp = client.delete(&encoded_url).send().await.unwrap();
         assert_eq!(
             resp.status().as_u16(),
@@ -7102,7 +7094,7 @@ mod tests {
         assert!(
             !still_there,
             "sender-a slot must be cleared after DELETE /api/pane/99/pending-replies/sender-a"
-);
+        );
     }
 
     #[tokio::test]
@@ -7148,11 +7140,9 @@ mod tests {
                 },
             })
             .await;
-        let (status, body) = prune_stale_sessions(
-            State(state.clone()),
-            Json(PruneStaleBody { confirm: true }),
-        )
-        .await;
+        let (status, body) =
+            prune_stale_sessions(State(state.clone()), Json(PruneStaleBody { confirm: true }))
+                .await;
         assert_eq!(status, StatusCode::OK);
         let value = body.0;
         assert_eq!(value["dry_run"], false);

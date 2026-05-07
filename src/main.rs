@@ -770,13 +770,17 @@ async fn main() -> anyhow::Result<()> {
             let value: serde_json::Value = serde_json::from_str(&text)?;
 
             // Require dry_run key presence to detect schema drift / empty response bugs
-            let dry_run = value.get("dry_run").and_then(|v| v.as_bool())
+            let dry_run = value
+                .get("dry_run")
+                .and_then(|v| v.as_bool())
                 .ok_or_else(|| anyhow::anyhow!("server response missing 'dry_run' key: {text}"))?;
 
             if dry_run == yes {
                 return Err(anyhow::anyhow!(
                     "server response intent mismatch: requested confirm={} but server returned dry_run={}. Response: {}",
-                    yes, dry_run, text
+                    yes,
+                    dry_run,
+                    text
                 ));
             } else if dry_run {
                 // Would prune branch (dry_run=true requested, yes=false)
@@ -786,37 +790,69 @@ async fn main() -> anyhow::Result<()> {
                     if ids == 0 {
                         println!("No stale sessions to prune");
                     } else {
-                        println!("Would prune {} stale session(s): {}",
-                            ids, value["would_prune"]);
+                        println!(
+                            "Would prune {} stale session(s): {}",
+                            ids, value["would_prune"]
+                        );
                         println!("Run with --yes to confirm removal");
                     }
                 } else {
-                    return Err(anyhow::anyhow!("server response missing 'would_prune' key on dry_run=true: {text}"));
+                    return Err(anyhow::anyhow!(
+                        "server response missing 'would_prune' key on dry_run=true: {text}"
+                    ));
                 }
             } else {
                 // Require pruned key on confirm; exit non-zero on errors for scripting
-                let arr = value.get("pruned").and_then(|v| v.as_array())
-                    .ok_or_else(|| anyhow::anyhow!("server response missing 'pruned' key on confirm=true: {text}"))?;
+                let arr = value
+                    .get("pruned")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "server response missing 'pruned' key on confirm=true: {text}"
+                        )
+                    })?;
                 println!("Pruned {} stale session(s)", arr.len());
 
                 // Check for errors key with proper array shape; fail on schema drift
                 if value.get("errors").is_some() {
-                    let err_arr = value.get("errors").and_then(|v| v.as_array())
-                        .ok_or_else(|| anyhow::anyhow!("server response 'errors' key is not an array: {text}"))?;
-                    eprintln!("Failed to prune {} session(s): {}",
-                        err_arr.len(), value["errors"]);
+                    let err_arr =
+                        value
+                            .get("errors")
+                            .and_then(|v| v.as_array())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "server response 'errors' key is not an array: {text}"
+                                )
+                            })?;
+                    eprintln!(
+                        "Failed to prune {} session(s): {}",
+                        err_arr.len(),
+                        value["errors"]
+                    );
                     if !err_arr.is_empty() {
-                        return Err(anyhow::anyhow!("partial failure: {} session(s) failed to prune", err_arr.len()));
+                        return Err(anyhow::anyhow!(
+                            "partial failure: {} session(s) failed to prune",
+                            err_arr.len()
+                        ));
                     }
                 }
 
                 // Check for already_gone key - sessions that vanished during prune
                 if value.get("already_gone").is_some() {
-                    let gone_arr = value.get("already_gone").and_then(|v| v.as_array())
-                        .ok_or_else(|| anyhow::anyhow!("server response 'already_gone' key is not an array: {text}"))?;
+                    let gone_arr = value
+                        .get("already_gone")
+                        .and_then(|v| v.as_array())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "server response 'already_gone' key is not an array: {text}"
+                            )
+                        })?;
                     if !gone_arr.is_empty() {
-                        eprintln!("Skipped {} session(s) that vanished during prune: {}",
-                            gone_arr.len(), value["already_gone"]);
+                        eprintln!(
+                            "Skipped {} session(s) that vanished during prune: {}",
+                            gone_arr.len(),
+                            value["already_gone"]
+                        );
                     }
                 }
             }
@@ -2052,8 +2088,11 @@ mod tests {
     #[test]
     fn classify_http_response_404_surfaces_as_error() {
         use reqwest::StatusCode;
-        let err = classify_http_response(StatusCode::NOT_FOUND, "{\"error\":\"pane 'x' is not registered\"}")
-            .unwrap_err();
+        let err = classify_http_response(
+            StatusCode::NOT_FOUND,
+            "{\"error\":\"pane 'x' is not registered\"}",
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("404"),
