@@ -1693,6 +1693,23 @@ impl DaemonState {
                             daemon_id: self.daemon_id.clone(),
                         },
                     ));
+                } else if session.metadata.backend.as_deref() == Some("opencode") {
+                    effects.push(Effect::LogMessage {
+                        from: from.to_string(),
+                        to: to.to_string(),
+                        message: message.to_string(),
+                        delivered: false,
+                        transport: "nostr".into(),
+                    });
+
+                    effects.push(Effect::Broadcast(
+                        crate::protocol::WireMessage::SessionSendAck {
+                            from: from.to_string(),
+                            to: to.to_string(),
+                            delivered: false,
+                            daemon_id: self.daemon_id.clone(),
+                        },
+                    ));
                 }
             }
             Some(ref session) if matches!(&session.origin, Origin::Human(..)) => {
@@ -4145,6 +4162,58 @@ mod tests {
                 .iter()
                 .any(|entry| entry.msg_id == 42)
         );
+    }
+
+    #[test]
+    fn incoming_session_send_to_undeliverable_opencode_returns_failed_ack() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "oc".into(),
+            pane: None,
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                networked: true,
+                ..Default::default()
+            },
+        });
+
+        let effects = state.apply(Event::IncomingWire {
+            msg: crate::protocol::WireMessage::SessionSend {
+                from: "remote-session".into(),
+                to: "oc".into(),
+                message: "hello".into(),
+                expects_reply: true,
+                msg_id: 42,
+                responds_to: None,
+                done: false,
+            },
+            sender_npub: None,
+        });
+
+        assert!(!effects.iter().any(|e| matches!(
+            e,
+            Effect::InjectMessage { .. } | Effect::DeliverHttpMessage { .. }
+        )));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::LogMessage {
+                from,
+                to,
+                delivered: false,
+                transport,
+                ..
+            } if from == "remote-session" && to == "oc" && transport == "nostr"
+        )));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::Broadcast(crate::protocol::WireMessage::SessionSendAck {
+                from,
+                to,
+                delivered: false,
+                ..
+            }) if from == "remote-session" && to == "oc"
+        )));
+        assert!(!state.pending_replies.contains_key("oc"));
     }
 
     #[test]
