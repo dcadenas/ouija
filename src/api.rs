@@ -2705,11 +2705,21 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
 const PENDING_PROMPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
 #[cfg(not(test))]
 const PENDING_PROMPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+const PENDING_PROMPT_MAX_RETRIES: u8 = 3;
 
 fn schedule_pending_prompt_retry(
     state: &SharedState,
     session_name: &str,
     pending_prompt: crate::state::PendingPrompt,
+) {
+    schedule_pending_prompt_retry_attempt(state, session_name, pending_prompt, 1);
+}
+
+fn schedule_pending_prompt_retry_attempt(
+    state: &SharedState,
+    session_name: &str,
+    pending_prompt: crate::state::PendingPrompt,
+    attempt: u8,
 ) {
     let state = state.clone();
     let session_name = session_name.to_string();
@@ -2736,8 +2746,18 @@ fn schedule_pending_prompt_retry(
         {
             Ok(()) => {}
             Err(error) => {
-                restore_pending_prompt_if_absent(&state, &session_name, pending);
-                tracing::warn!("readiness prompt retry fallback failed for {session_name}: {error}")
+                restore_pending_prompt_if_absent(&state, &session_name, pending.clone());
+                if attempt < PENDING_PROMPT_MAX_RETRIES {
+                    schedule_pending_prompt_retry_attempt(
+                        &state,
+                        &session_name,
+                        pending,
+                        attempt + 1,
+                    );
+                }
+                tracing::warn!(
+                    "readiness prompt retry fallback attempt {attempt}/{PENDING_PROMPT_MAX_RETRIES} failed for {session_name}: {error}"
+                )
             }
         }
     });
@@ -5309,6 +5329,45 @@ mod tests {
 
         assert_eq!(reserved, Some(pending_prompt("%17", "queued prompt")));
         assert!(!state.pending_prompts.lock().unwrap().contains_key("oc"));
+    }
+
+    #[tokio::test]
+    async fn pending_prompt_retry_rearms_after_transient_pane_failure() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_ready".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let pending = pending_opencode_prompt("%17", "queued prompt", "ses_ready");
+        state
+            .pending_prompts
+            .lock()
+            .unwrap()
+            .insert("oc".into(), pending.clone());
+
+        schedule_pending_prompt_retry(&state, "oc", pending.clone());
+        tokio::time::sleep(PENDING_PROMPT_RETRY_DELAY * 2).await;
+        assert_eq!(
+            state.pending_prompts.lock().unwrap().get("oc"),
+            Some(&pending),
+            "first retry should restore the prompt while the pane is not live"
+        );
+
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/project", "%17")];
+        tokio::time::sleep(PENDING_PROMPT_RETRY_DELAY * 2).await;
+
+        assert!(
+            !state.pending_prompts.lock().unwrap().contains_key("oc"),
+            "a follow-up retry should consume the restored prompt once the pane becomes live"
+        );
     }
 
     #[tokio::test]
