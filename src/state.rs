@@ -984,6 +984,7 @@ impl AppState {
                 },
                 // Result effects handled by callers, not executed
                 Effect::RegisterOk { .. }
+                | Effect::RegisterFailed { .. }
                 | Effect::SendDelivered { .. }
                 | Effect::SendFailed { .. }
                 | Effect::RenameOk { .. }

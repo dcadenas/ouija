@@ -3316,15 +3316,24 @@ async fn register_auto_provisioned_session(
         backend_session_id: Some(backend_sid.to_string()),
         ..Default::default()
     };
-    state
-        .apply_and_execute(crate::daemon_protocol::Event::Register {
+    let effects = state
+        .apply_and_execute(crate::daemon_protocol::Event::RegisterIfPaneUnbound {
             id: id.clone(),
-            pane: Some(pane_id.to_string()),
+            pane: pane_id.to_string(),
             metadata,
         })
         .await;
 
-    Some(id)
+    if effects.iter().any(|effect| {
+        matches!(
+            effect,
+            crate::daemon_protocol::Effect::RegisterOk { session_id, .. } if session_id == &id
+        )
+    }) {
+        Some(id)
+    } else {
+        None
+    }
 }
 
 /// Choose at most one candidate session ID for adoption (issue #15).
@@ -6212,6 +6221,50 @@ mod tests {
         assert!(
             survivor.metadata.backend_session_id.is_none(),
             "victim's metadata must not be rewritten with the hijacker's backend_session_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_provision_register_declines_if_pane_becomes_bound_before_apply() {
+        // The outer auto-provision paths validate pane ownership before this
+        // helper runs, but that snapshot can become stale before Register is
+        // applied. The final apply-time guard must fail closed instead of
+        // letting apply_register's pane-dedup evict the incumbent session.
+        let state = crate::state::AppState::new_for_test();
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/freshproject", "%17")];
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "incumbent".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/freshproject".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let result =
+            register_auto_provisioned_session(&state, "ses_late_race", "%17", "/tmp/freshproject")
+                .await;
+
+        assert!(
+            result.is_none(),
+            "late pane ownership race must fail closed, got Some({result:?})"
+        );
+        let proto = state.protocol.read().await;
+        assert_eq!(
+            proto.sessions.len(),
+            1,
+            "auto-provision must not create a second session or evict the incumbent"
+        );
+        let incumbent = proto
+            .sessions
+            .get("incumbent")
+            .expect("incumbent session must survive");
+        assert_eq!(incumbent.pane.as_deref(), Some("%17"));
+        assert!(
+            incumbent.metadata.backend_session_id.is_none(),
+            "incumbent metadata must not be overwritten by late auto-provision"
         );
     }
 

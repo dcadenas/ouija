@@ -290,6 +290,11 @@ pub enum Event {
         pane: Option<String>,
         metadata: SessionMeta,
     },
+    RegisterIfPaneUnbound {
+        id: String,
+        pane: String,
+        metadata: SessionMeta,
+    },
     Rename {
         old_id: String,
         new_id: String,
@@ -510,6 +515,10 @@ pub enum Effect {
         session_id: String,
         replaced: Option<String>,
     },
+    RegisterFailed {
+        session_id: String,
+        reason: String,
+    },
     SendDelivered {
         from: String,
         to: String,
@@ -725,6 +734,9 @@ impl DaemonState {
     pub fn apply(&mut self, event: Event) -> Vec<Effect> {
         match event {
             Event::Register { id, pane, metadata } => self.apply_register(id, pane, metadata),
+            Event::RegisterIfPaneUnbound { id, pane, metadata } => {
+                self.apply_register_if_pane_unbound(id, pane, metadata)
+            }
             Event::Rename { old_id, new_id } => self.apply_rename(&old_id, &new_id),
             Event::Remove { id, keep_worktree } => self.apply_remove(&id, keep_worktree),
             Event::RemoveIfStale { id, expected_project_dir } => self.apply_remove_if_stale(&id, expected_project_dir.as_deref()),
@@ -913,6 +925,36 @@ impl DaemonState {
         });
 
         effects
+    }
+
+    fn apply_register_if_pane_unbound(
+        &mut self,
+        id: String,
+        pane: String,
+        metadata: SessionMeta,
+    ) -> Vec<Effect> {
+        if let Some(owner) = self
+            .sessions
+            .values()
+            .find(|s| matches!(s.origin, Origin::Local) && s.pane.as_deref() == Some(&pane))
+        {
+            let reason = format!(
+                "pane {pane} is already bound to local session '{}'",
+                owner.id
+            );
+            return vec![
+                Effect::Log {
+                    level: LogLevel::Warn,
+                    message: format!("refusing guarded registration for '{id}': {reason}"),
+                },
+                Effect::RegisterFailed {
+                    session_id: id,
+                    reason,
+                },
+            ];
+        }
+
+        self.apply_register(id, Some(pane), metadata)
     }
 
     fn add_alias(&mut self, old_id: &str, new_id: &str) {
