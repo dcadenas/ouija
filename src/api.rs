@@ -946,7 +946,7 @@ async fn finalize_successful_delivery(state: &SharedState, rollback: FailedSendR
     let mut proto = state.protocol.write().await;
     if let Some(entry) = rollback.pending_reply_before_send {
         if let Some(pending) = proto.pending_replies.get_mut(&rollback.sender_id) {
-            pending.retain(|pending| pending.msg_id != entry.msg_id || pending != &entry);
+            pending.retain(|pending| pending.msg_id != entry.msg_id);
             if pending.is_empty() {
                 proto.pending_replies.remove(&rollback.sender_id);
             }
@@ -4310,6 +4310,124 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         let proto = state.protocol.read().await;
         assert!(!proto.pending_replies.contains_key("sender"));
+        assert_eq!(proto.sessions["sender"].metadata.reminder, None);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn successful_done_reply_clears_mutated_reserved_retry_state() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use tokio::net::TcpListener;
+        use tokio::sync::Notify;
+
+        #[derive(Clone)]
+        struct Gate {
+            started: StdArc<Notify>,
+            release: StdArc<Notify>,
+        }
+
+        async fn prompt_async(AxumState(gate): AxumState<Gate>) -> StatusCode {
+            gate.started.notify_one();
+            gate.release.notified().await;
+            StatusCode::NO_CONTENT
+        }
+
+        let gate = Gate {
+            started: StdArc::new(Notify::new()),
+            release: StdArc::new(Notify::new()),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(gate.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    reminder: Some("keep working".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-managed".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        {
+            let mut proto = state.protocol.write().await;
+            proto.pending_replies.insert(
+                "sender".into(),
+                vec![crate::daemon_protocol::PendingReplyEntry {
+                    msg_id: 7,
+                    from: "requester".into(),
+                    message: "please respond".into(),
+                    received_at: 100,
+                    last_activity: 100,
+                    in_progress: false,
+                }],
+            );
+        }
+
+        let delivery = tokio::spawn({
+            let state = state.clone();
+            async move {
+                send_msg(
+                    State(state),
+                    Json(SendBody {
+                        from: "sender".into(),
+                        to: "oc-managed".into(),
+                        message: "done successfully".into(),
+                        expects_reply: false,
+                        responds_to: Some(7),
+                        done: true,
+                    }),
+                )
+                .await
+            }
+        });
+        gate.started.notified().await;
+        {
+            let mut proto = state.protocol.write().await;
+            let pending = proto.pending_replies.get_mut("sender").unwrap();
+            pending[0].in_progress = true;
+            pending[0].last_activity = 200;
+        }
+
+        gate.release.notify_one();
+        let (status, _) = delivery.await.unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        let proto = state.protocol.read().await;
+        assert!(
+            !proto.pending_replies.contains_key("sender"),
+            "successful done delivery must clear the reply slot by msg_id even if the reserved entry mutated"
+        );
         assert_eq!(proto.sessions["sender"].metadata.reminder, None);
         server.abort();
     }
