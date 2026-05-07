@@ -730,6 +730,7 @@ impl AppState {
                     session_id,
                     message,
                     http_delivery,
+                    ..
                 } => {
                     match Some(http_delivery).or(recorded_http_delivery) {
                         Some(delivery) => {
@@ -1004,6 +1005,11 @@ impl AppState {
                 Some((to.clone(), *msg_id))
             }
             crate::daemon_protocol::Effect::InjectMessage {
+                session_id,
+                pending_reply_msg_id,
+                ..
+            } => pending_reply_msg_id.map(|msg_id| (session_id.clone(), msg_id)),
+            crate::daemon_protocol::Effect::DeliverHttpMessage {
                 session_id,
                 pending_reply_msg_id,
                 ..
@@ -2281,6 +2287,7 @@ pub(crate) mod tests {
                     model: None,
                     effort: None,
                 },
+                pending_reply_msg_id: None,
             },
             crate::daemon_protocol::Effect::SendDelivered {
                 from: "sender".into(),
@@ -2700,6 +2707,61 @@ pub(crate) mod tests {
                         opencode_binding: Some(
                             crate::daemon_protocol::OpenCodeBinding::StrongManaged,
                         ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let effects = state
+            .apply_and_execute(crate::daemon_protocol::Event::IncomingWire {
+                msg: crate::protocol::WireMessage::SessionSend {
+                    from: "remote".into(),
+                    to: "oc".into(),
+                    message: "hello".into(),
+                    expects_reply: true,
+                    msg_id: 42,
+                    responds_to: None,
+                    done: false,
+                },
+                sender_npub: Some("npub1remote".into()),
+            })
+            .await;
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            crate::daemon_protocol::Effect::LogMessage { delivered: false, .. }
+        )));
+
+        let proto = state.protocol.read().await;
+        assert!(!proto.pending_replies.contains_key("oc"));
+    }
+
+    #[tokio::test]
+    async fn apply_and_execute_clears_incoming_pending_reply_after_headless_http_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut config = test_config();
+        config.port = port.checked_sub(320).unwrap();
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: None,
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_headless".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        networked: true,
                         ..Default::default()
                     },
                     registered_at: 0,

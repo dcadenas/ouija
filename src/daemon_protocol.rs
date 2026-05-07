@@ -423,6 +423,7 @@ pub enum Effect {
         session_id: String,
         message: String,
         http_delivery: HttpDeliverySnapshot,
+        pending_reply_msg_id: Option<u64>,
     },
 
     // Agents
@@ -1617,6 +1618,7 @@ impl DaemonState {
                         session_id: to.to_string(),
                         message: formatted,
                         http_delivery,
+                        pending_reply_msg_id: expects_reply.then_some(local_msg_id),
                     });
 
                     if expects_reply {
@@ -2016,6 +2018,7 @@ impl DaemonState {
                             http_delivery: session.metadata.http_delivery_snapshot().expect(
                                 "opencode backend_session_id should produce HTTP delivery snapshot",
                             ),
+                            pending_reply_msg_id: expects_reply.then_some(msg_id),
                         });
 
                         if expects_reply {

@@ -1032,6 +1032,7 @@ async fn execute_send_effects_for_api(
                 session_id: _,
                 message,
                 http_delivery,
+                ..
             } => {
                 let delivery = Some(http_delivery).or(recorded_http_delivery).ok_or_else(|| {
                     anyhow::anyhow!(
