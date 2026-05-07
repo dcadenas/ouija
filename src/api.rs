@@ -954,7 +954,6 @@ async fn finalize_successful_delivery(state: &SharedState, rollback: FailedSendR
     }
     if rollback.sender_reminder.is_some()
         && let Some(session) = proto.sessions.get_mut(&rollback.sender_id)
-        && session.metadata.reminder == rollback.sender_reminder.flatten()
     {
         session.metadata.reminder = None;
     }
@@ -4437,6 +4436,12 @@ mod tests {
             let pending = proto.pending_replies.get_mut("sender").unwrap();
             pending[0].in_progress = true;
             pending[0].last_activity = 200;
+            proto
+                .sessions
+                .get_mut("sender")
+                .unwrap()
+                .metadata
+                .reminder = Some("keep working (activity tick)".into());
         }
 
         gate.release.notify_one();
