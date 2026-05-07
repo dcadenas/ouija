@@ -2474,10 +2474,10 @@ async fn soft_restart_session(
         "soft restart: created new opencode session {new_session_id} for '{name}' (port {port})"
     );
 
-    // 2. Update metadata before attach/prompt delivery. Headless restarts can
-    //    bind the backend session immediately. Pane-backed restarts only bind
-    //    after the TUI attach has been verified, so an attach failure still
-    //    means no prompt was delivered and the caller can safely hard-restart.
+    // 2. Snapshot metadata before attach/prompt delivery. Headless restarts
+    //    can bind the backend session immediately. Pane-backed restarts defer
+    //    backend/model metadata changes until after the TUI attach has been
+    //    verified, so an attach failure leaves the existing session untouched.
     //
     //    When `model` / `effort` are None we preserve the session's current
     //    metadata rather than clearing it: callers are expected to pre-compute
@@ -2494,12 +2494,12 @@ async fn soft_restart_session(
                     session.metadata.backend_session_id = Some(new_session_id.clone());
                     session.metadata.opencode_binding =
                         Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged);
-                }
-                if let Some(m) = model {
-                    session.metadata.model = Some(m.to_string());
-                }
-                if let Some(e) = effort {
-                    session.metadata.effort = Some(e.to_string());
+                    if let Some(m) = model {
+                        session.metadata.model = Some(m.to_string());
+                    }
+                    if let Some(e) = effort {
+                        session.metadata.effort = Some(e.to_string());
+                    }
                 }
                 previous_metadata
             }
@@ -2555,6 +2555,12 @@ async fn soft_restart_session(
                 session.metadata.backend_session_id = Some(new_session_id.clone());
                 session.metadata.opencode_binding =
                     Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged);
+                if let Some(m) = model {
+                    session.metadata.model = Some(m.to_string());
+                }
+                if let Some(e) = effort {
+                    session.metadata.effort = Some(e.to_string());
+                }
                 state.persist_protocol_state(&proto);
             }
             Ok(false) => {
@@ -4222,6 +4228,8 @@ mod tests {
                         opencode_binding: Some(
                             crate::daemon_protocol::OpenCodeBinding::WeakAdopted,
                         ),
+                        model: Some("old-model".into()),
+                        effort: Some("old-effort".into()),
                         ..Default::default()
                     },
                     registered_at: 0,
@@ -4238,8 +4246,8 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
+            Some("new-model"),
+            Some("new-effort"),
         )
         .await;
 
@@ -4251,6 +4259,8 @@ mod tests {
             metadata.opencode_binding,
             Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
         );
+        assert_eq!(metadata.model.as_deref(), Some("old-model"));
+        assert_eq!(metadata.effort.as_deref(), Some("old-effort"));
         server.abort();
     }
 
