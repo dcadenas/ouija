@@ -2646,6 +2646,28 @@ async fn soft_restart_session(
         .await
         {
             tracing::warn!("soft restart: prompt_async failed for {new_session_id}: {e}");
+            if let (Some(pane), Some(previous_session_id)) = (
+                pane,
+                previous_backend_session_for_prompt_failure_rollback(pane, &previous_metadata),
+            ) {
+                match respawn_opencode_attach_for_session(
+                    pane,
+                    project_dir,
+                    previous_session_id,
+                    port,
+                    name,
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => tracing::warn!(
+                        "soft restart: failed to reattach pane {pane} to previous opencode session after prompt_async failure"
+                    ),
+                    Err(error) => tracing::warn!(
+                        "soft restart: failed to roll back pane {pane} to previous opencode session after prompt_async failure: {error}"
+                    ),
+                }
+            }
             delete_opencode_session(
                 &state.http_client,
                 port,
@@ -2682,6 +2704,14 @@ async fn restore_soft_restart_metadata(
     session.metadata.model = previous_metadata.model.clone();
     session.metadata.effort = previous_metadata.effort.clone();
     state.persist_protocol_state(&proto);
+}
+
+fn previous_backend_session_for_prompt_failure_rollback<'a>(
+    pane: Option<&str>,
+    previous_metadata: &'a crate::daemon_protocol::SessionMeta,
+) -> Option<&'a str> {
+    pane?;
+    previous_metadata.backend_session_id.as_deref()
 }
 
 async fn deliver_soft_restart_prompt(
@@ -4633,6 +4663,25 @@ mod tests {
         assert_eq!(metadata.model.as_deref(), Some("old-model"));
         assert_eq!(metadata.effort.as_deref(), Some("old-effort"));
         server.abort();
+    }
+
+    #[test]
+    fn pane_backed_soft_restart_prompt_failure_reattaches_previous_backend_session() {
+        let metadata = crate::daemon_protocol::SessionMeta {
+            backend: Some("opencode".into()),
+            backend_session_id: Some("ses_old".into()),
+            opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            previous_backend_session_for_prompt_failure_rollback(Some("%1"), &metadata),
+            Some("ses_old")
+        );
+        assert_eq!(
+            previous_backend_session_for_prompt_failure_rollback(None, &metadata),
+            None
+        );
     }
 
     #[test]
