@@ -99,6 +99,9 @@ pub struct SessionMeta {
     /// sessions whose visible TUI may not match `backend_session_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_binding: Option<OpenCodeBinding>,
+    /// Monotonic token used to reject stale async restart commits.
+    #[serde(default)]
+    pub restart_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_description: Option<String>,
     /// Unix timestamp; 0 in model tests.
@@ -250,6 +253,9 @@ impl SessionMeta {
         if self.effort.is_none() {
             self.effort = source.effort.clone();
         }
+        if self.restart_generation == 0 && source.restart_generation > 0 {
+            self.restart_generation = source.restart_generation;
+        }
     }
 }
 
@@ -265,6 +271,7 @@ impl Default for SessionMeta {
             backend_session_id: None,
             backend: None,
             opencode_binding: None,
+            restart_generation: 0,
             project_description: None,
             last_metadata_update: None,
             model: None,
@@ -645,6 +652,7 @@ fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>) -> Sessio
             backend_session_id: m.backend_session_id.clone(),
             backend: m.backend.clone(),
             opencode_binding: m.opencode_binding.clone(),
+            restart_generation: m.restart_generation,
             project_description: m.project_description.clone(),
             last_metadata_update: m.last_metadata_update.map(|ts| ts.timestamp()),
             model: m.model.clone(),
@@ -2423,6 +2431,32 @@ mod tests {
         target.inherit_recurrence_from(&source);
         assert_eq!(target.model.as_deref(), Some("opus"));
         assert_eq!(target.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn register_re_register_preserves_restart_generation() {
+        let mut state = DaemonState::new_for_model("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "s".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                restart_generation: 7,
+                ..Default::default()
+            },
+        });
+
+        state.apply(Event::Register {
+            id: "s".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta::default(),
+        });
+
+        let meta = &state
+            .sessions
+            .get("s")
+            .expect("session registered")
+            .metadata;
+        assert_eq!(meta.restart_generation, 7);
     }
 
     #[test]

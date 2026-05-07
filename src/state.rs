@@ -179,6 +179,22 @@ pub struct AppState {
     /// TuiInjection sessions pass prompts as CLI args instead.
     /// Maps session_id -> queued readiness prompt.
     pub pending_prompts: std::sync::Mutex<std::collections::HashMap<String, PendingPrompt>>,
+    compact_in_progress: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+pub(crate) struct CompactInProgressGuard<'a> {
+    state: &'a AppState,
+    key: String,
+}
+
+impl Drop for CompactInProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.state
+            .compact_in_progress
+            .lock()
+            .expect("compact_in_progress mutex poisoned")
+            .remove(&self.key);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -246,6 +262,9 @@ pub struct SessionMetadata {
     /// Strength of an OpenCode backend-session binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_binding: Option<crate::daemon_protocol::OpenCodeBinding>,
+    /// Monotonic token used to reject stale async restart commits.
+    #[serde(default)]
+    pub restart_generation: u64,
     /// Short project description extracted from Cargo.toml, package.json, or README.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_description: Option<String>,
@@ -321,6 +340,7 @@ impl Default for SessionMetadata {
             backend_session_id: None,
             backend: None,
             opencode_binding: None,
+            restart_generation: 0,
             project_description: None,
             bulletin: None,
             worktree: false,
@@ -421,6 +441,7 @@ impl AppState {
             backends: crate::backend::BackendRegistry::default_registry(),
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            compact_in_progress: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -455,6 +476,24 @@ impl AppState {
             backends: crate::backend::BackendRegistry::default_registry(),
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            compact_in_progress: std::sync::Mutex::new(std::collections::HashSet::new()),
+        })
+    }
+
+    pub(crate) fn try_acquire_compact_in_progress(
+        &self,
+        key: &str,
+    ) -> Option<CompactInProgressGuard<'_>> {
+        let mut compact_in_progress = self
+            .compact_in_progress
+            .lock()
+            .expect("compact_in_progress mutex poisoned");
+        if !compact_in_progress.insert(key.to_string()) {
+            return None;
+        }
+        Some(CompactInProgressGuard {
+            state: self,
+            key: key.to_string(),
         })
     }
 
@@ -1152,6 +1191,7 @@ impl AppState {
                         backend_session_id: m.backend_session_id.clone(),
                         backend: m.backend.clone(),
                         opencode_binding: m.opencode_binding.clone(),
+                        restart_generation: m.restart_generation,
                         project_description: m.project_description.clone(),
                         bulletin: m.bulletin.clone(),
                         worktree: m.worktree,
@@ -3187,6 +3227,7 @@ pub(crate) mod tests {
             backend_session_id: Some("oc_abc123".into()),
             backend: Some("opencode".into()),
             opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+            restart_generation: 7,
             project_description: Some("test project".into()),
             vim_mode: true,
             worktree: true,
@@ -3247,6 +3288,10 @@ pub(crate) mod tests {
             s.metadata.opencode_binding,
             Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
             "opencode_binding dropped by persist"
+        );
+        assert_eq!(
+            s.metadata.restart_generation, 7,
+            "restart_generation dropped by persist"
         );
         assert_eq!(
             s.metadata.project_description.as_deref(),
@@ -3311,6 +3356,7 @@ pub(crate) mod tests {
             hydrated.opencode_binding,
             Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
         );
+        assert_eq!(hydrated.restart_generation, 7);
         assert!(hydrated.on_fire.is_some());
         assert_eq!(hydrated.last_iteration_at, Some(1_700_000_000));
         assert_eq!(hydrated.last_metadata_update, Some(1_700_000_100));

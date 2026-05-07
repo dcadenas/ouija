@@ -2367,6 +2367,7 @@ pub async fn restart_session(
                     backend_session_id,
                     backend: Some(backend_name.clone()),
                     opencode_binding: opencode_binding.clone(),
+                    restart_generation: m.restart_generation.saturating_add(1),
                     project_description: m.project_description.clone(),
                     last_metadata_update: None,
                     model: effective_model.clone(),
@@ -2525,11 +2526,8 @@ async fn soft_restart_session(
     //    writer between the snapshot and this atomic block.
     let previous_metadata = {
         let mut proto = state.protocol.write().await;
-        let previous_metadata = match proto.sessions.get_mut(name) {
-            Some(session) => {
-                let previous_metadata = session.metadata.clone();
-                previous_metadata
-            }
+        match proto.sessions.get_mut(name) {
+            Some(session) => session.metadata.clone(),
             None => {
                 // Session was removed between the pre-flight snapshot and
                 // this write (concurrent Unregister, racing restart, etc.).
@@ -2554,11 +2552,12 @@ async fn soft_restart_session(
                 });
                 return Err(());
             }
-        };
-        previous_metadata
+        }
     };
+    let restart_generation = previous_metadata.restart_generation;
 
     let mut prompt_msg_id = None;
+    let mut metadata_committed = false;
 
     // 3. Respawn the TUI attach to point at the new session.
     if let Some(pane) = pane {
@@ -2566,9 +2565,16 @@ async fn soft_restart_session(
             .await
         {
             Ok(true) => {
-                if apply_soft_restart_metadata(state, name, &new_session_id, model, effort)
-                    .await
-                    .is_err()
+                if apply_soft_restart_metadata(
+                    state,
+                    name,
+                    &new_session_id,
+                    restart_generation,
+                    model,
+                    effort,
+                )
+                .await
+                .is_err()
                 {
                     delete_opencode_session(
                         &state.http_client,
@@ -2579,6 +2585,7 @@ async fn soft_restart_session(
                     .await;
                     return Err(());
                 }
+                metadata_committed = true;
             }
             Ok(false) => {
                 tracing::warn!("soft restart: opencode attach did not start in pane {pane}");
@@ -2609,6 +2616,30 @@ async fn soft_restart_session(
     //    succeeded. This preserves the Err boundary: attach failure returns
     //    before prompt_async can start work in the throwaway session.
     if let Some(text) = prompt {
+        if pane.is_none() && !metadata_committed {
+            if apply_soft_restart_metadata(
+                state,
+                name,
+                &new_session_id,
+                restart_generation,
+                model,
+                effort,
+            )
+            .await
+            .is_err()
+            {
+                delete_opencode_session(
+                    &state.http_client,
+                    port,
+                    &new_session_id,
+                    "soft restart cleanup",
+                )
+                .await;
+                return Err(());
+            }
+            metadata_committed = true;
+        }
+
         let full_text = match reminder {
             Some(r) => format!("{text}\n\n{r}"),
             None => text.to_string(),
@@ -2673,10 +2704,17 @@ async fn soft_restart_session(
         }
     }
 
-    if pane.is_none()
-        && apply_soft_restart_metadata(state, name, &new_session_id, model, effort)
-            .await
-            .is_err()
+    if !metadata_committed
+        && apply_soft_restart_metadata(
+            state,
+            name,
+            &new_session_id,
+            restart_generation,
+            model,
+            effort,
+        )
+        .await
+        .is_err()
     {
         delete_opencode_session(
             &state.http_client,
@@ -2698,6 +2736,7 @@ async fn apply_soft_restart_metadata(
     state: &AppState,
     name: &str,
     new_session_id: &str,
+    expected_restart_generation: u64,
     model: Option<&str>,
     effort: Option<&str>,
 ) -> Result<(), ()> {
@@ -2705,9 +2744,13 @@ async fn apply_soft_restart_metadata(
     let Some(session) = proto.sessions.get_mut(name) else {
         return Err(());
     };
+    if session.metadata.restart_generation != expected_restart_generation {
+        return Err(());
+    }
     session.metadata.backend_session_id = Some(new_session_id.to_string());
     session.metadata.opencode_binding =
         Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged);
+    session.metadata.restart_generation = session.metadata.restart_generation.saturating_add(1);
     if let Some(m) = model {
         session.metadata.model = Some(m.to_string());
     }
@@ -4737,7 +4780,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn headless_soft_restart_defers_metadata_until_prompt_is_accepted() {
+    async fn headless_soft_restart_commits_metadata_before_prompt_async() {
         use axum::Json;
         use axum::Router;
         use axum::extract::State;
@@ -4753,11 +4796,11 @@ mod tests {
         async fn prompt_async(State(state): State<Arc<AppState>>) -> StatusCode {
             let proto = state.protocol.read().await;
             let metadata = &proto.sessions["oc"].metadata;
-            if metadata.backend_session_id.as_deref() == Some("ses_old")
+            if metadata.backend_session_id.as_deref() == Some("ses_new")
                 && metadata.opencode_binding
-                    == Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
-                && metadata.model.as_deref() == Some("old-model")
-                && metadata.effort.as_deref() == Some("old-effort")
+                    == Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
+                && metadata.model.as_deref() == Some("new-model")
+                && metadata.effort.as_deref() == Some("new-effort")
             {
                 StatusCode::OK
             } else {
@@ -4850,6 +4893,40 @@ mod tests {
             previous_backend_session_for_prompt_failure_rollback(None, &metadata),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn soft_restart_metadata_commit_rejects_stale_generation() {
+        let state = AppState::new_for_test();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: None,
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_current".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        restart_generation: 1,
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let result = apply_soft_restart_metadata(&state, "oc", "ses_stale", 0, None, None).await;
+
+        assert!(result.is_err());
+        let proto = state.protocol.read().await;
+        let metadata = &proto.sessions["oc"].metadata;
+        assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_current"));
+        assert_eq!(metadata.restart_generation, 1);
     }
 
     #[test]

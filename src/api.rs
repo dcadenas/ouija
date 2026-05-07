@@ -1309,11 +1309,10 @@ pub struct CompactBody {
 ///   typo like `{"continuatino": "..."}` now returns 400 instead of silently
 ///   dropping the value).
 ///
-/// Concurrency: when a `continuation` is supplied the TUI branch rejects
-/// concurrent compact attempts with 409 to prevent overwriting an in-flight
-/// caller's continuation. The HTTP branch currently has no concurrency guard
-/// — two racing /compact calls on the same opencode session will each pay
-/// for a separate summarize LLM call. See follow-up.
+/// Concurrency: the TUI branch rejects concurrent compact attempts with a
+/// continuation so it cannot overwrite the in-flight caller's parked
+/// continuation. The HTTP branch rejects any concurrent compact attempt for
+/// the same Ouija session while summarize/prompt delivery is in flight.
 pub async fn compact(
     State(state): State<SharedState>,
     axum::extract::Path(session_id): axum::extract::Path<String>,
@@ -1484,6 +1483,12 @@ async fn compact_inner(
                     }),
                 );
             }
+            let Some(_compact_guard) = state.try_acquire_compact_in_progress(&session_id) else {
+                return (
+                    StatusCode::CONFLICT,
+                    json!({"error": "another compact operation is already in progress for this session"}),
+                );
+            };
 
             let Some((provider_id, model_id)) = resolve_opencode_compact_model(
                 state,
@@ -4863,6 +4868,100 @@ mod tests {
             "expected error to mention /summarize, got: {}",
             body["error"]
         );
+    }
+
+    #[tokio::test]
+    async fn compact_oc_reentrant_request_returns_409_while_summarize_in_flight() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+        use tokio::sync::Notify;
+
+        struct SummarizeState {
+            calls: AtomicUsize,
+            first_started: Notify,
+            release_first: Notify,
+        }
+
+        async fn summarize(AxumState(state): AxumState<StdArc<SummarizeState>>) -> StatusCode {
+            let call = state.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == 1 {
+                state.first_started.notify_waiters();
+                state.release_first.notified().await;
+            }
+            StatusCode::OK
+        }
+
+        let summarize_state = StdArc::new(SummarizeState {
+            calls: AtomicUsize::new(0),
+            first_started: Notify::new(),
+            release_first: Notify::new(),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/summarize", post(summarize))
+            .with_state(summarize_state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = crate::state::AppState::new(config);
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-busy".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_probe".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    model: Some("anthropic/claude-sonnet-4-6".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            compact_inner(
+                &first_state,
+                "oc-busy".into(),
+                CompactBody { continuation: None },
+            )
+            .await
+        });
+        summarize_state.first_started.notified().await;
+
+        let (status, body) =
+            compact_inner(&state, "oc-busy".into(), CompactBody { continuation: None }).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("compact"),
+            "expected compact conflict error, got: {}",
+            body["error"]
+        );
+        assert_eq!(summarize_state.calls.load(Ordering::SeqCst), 1);
+
+        summarize_state.release_first.notify_waiters();
+        let (first_status, _) = first.await.unwrap();
+        assert_eq!(first_status, StatusCode::OK);
+        server.abort();
     }
 
     #[tokio::test]
