@@ -3213,7 +3213,7 @@ pub(crate) fn schedule_prompt_injection(
     let name = session_name.to_string();
     let state = state.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        tokio::time::sleep(PENDING_PROMPT_FALLBACK_DELAY).await;
         let pending = reserve_pending_prompt_if_matches(
             &state,
             &name,
@@ -3236,9 +3236,84 @@ pub(crate) fn schedule_prompt_injection(
             {
                 Ok(()) => {}
                 Err(error) => {
-                    restore_pending_prompt_if_absent(&state, &name, pending);
+                    restore_pending_prompt_if_absent(&state, &name, pending.clone());
+                    schedule_pending_prompt_fallback_retry(&state, &name, pending, true);
                     tracing::warn!("readiness timeout fallback failed for {name}: {error}");
                 }
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+const PENDING_PROMPT_FALLBACK_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+#[cfg(not(test))]
+const PENDING_PROMPT_FALLBACK_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+const PENDING_PROMPT_MAX_FALLBACK_RETRIES: u8 = 3;
+
+fn schedule_pending_prompt_fallback_retry(
+    state: &std::sync::Arc<AppState>,
+    session_name: &str,
+    pending_prompt: crate::state::PendingPrompt,
+    is_http_api: bool,
+) {
+    schedule_pending_prompt_fallback_retry_attempt(
+        state,
+        session_name,
+        pending_prompt,
+        is_http_api,
+        1,
+    );
+}
+
+fn schedule_pending_prompt_fallback_retry_attempt(
+    state: &std::sync::Arc<AppState>,
+    session_name: &str,
+    pending_prompt: crate::state::PendingPrompt,
+    is_http_api: bool,
+    attempt: u8,
+) {
+    let state = state.clone();
+    let session_name = session_name.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(PENDING_PROMPT_FALLBACK_DELAY).await;
+        let pending = reserve_pending_prompt_if_matches(
+            &state,
+            &session_name,
+            &pending_prompt.pane_id,
+            &pending_prompt.prompt,
+            pending_prompt.backend_session_id.as_deref(),
+        );
+        let Some(pending) = pending else {
+            return;
+        };
+
+        match deliver_prompt_fallback(
+            &state,
+            &session_name,
+            &pending.pane_id,
+            &pending.prompt,
+            is_http_api,
+            false,
+            pending.backend_session_id.as_deref(),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(error) => {
+                restore_pending_prompt_if_absent(&state, &session_name, pending.clone());
+                if attempt < PENDING_PROMPT_MAX_FALLBACK_RETRIES {
+                    schedule_pending_prompt_fallback_retry_attempt(
+                        &state,
+                        &session_name,
+                        pending,
+                        is_http_api,
+                        attempt + 1,
+                    );
+                }
+                tracing::warn!(
+                    "readiness timeout fallback retry attempt {attempt}/{PENDING_PROMPT_MAX_FALLBACK_RETRIES} failed for {session_name}: {error}"
+                );
             }
         }
     });
@@ -3643,6 +3718,12 @@ pub(crate) fn opencode_prompt_body(
 mod tests {
     use super::*;
 
+    async fn wait_for_prompt_fallback_timer() {
+        tokio::time::sleep(PENDING_PROMPT_FALLBACK_DELAY + std::time::Duration::from_millis(10))
+            .await;
+        tokio::task::yield_now().await;
+    }
+
     #[test]
     fn load_or_create_keys_generates_and_persists() {
         let dir = tempfile::tempdir().unwrap();
@@ -3948,8 +4029,7 @@ mod tests {
             None,
         );
 
-        tokio::time::sleep(std::time::Duration::from_secs(11)).await;
-        tokio::task::yield_now().await;
+        wait_for_prompt_fallback_timer().await;
 
         assert_eq!(
             state.pending_prompts.lock().unwrap().get("oc"),
@@ -3959,6 +4039,29 @@ mod tests {
                 None,
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn pending_prompt_fallback_retry_consumes_restored_prompt() {
+        let state = AppState::new_for_test();
+        let pending = crate::state::PendingPrompt::new(
+            "%eventual".into(),
+            "queued prompt".into(),
+            None,
+        );
+        restore_pending_prompt_if_absent(&state, "oc", pending.clone());
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%eventual".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        schedule_pending_prompt_fallback_retry(&state, "oc", pending, false);
+        wait_for_prompt_fallback_timer().await;
+
+        assert!(state.pending_prompts.lock().unwrap().get("oc").is_none());
     }
 
     #[test]
