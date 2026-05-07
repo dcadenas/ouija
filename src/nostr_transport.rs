@@ -2432,6 +2432,15 @@ pub async fn restart_session(
                     .await
                     {
                         tracing::warn!("restart prompt fallback delivery failed for {name}: {e}");
+                        restore_restart_prompt_after_fallback_failure(
+                            state,
+                            name,
+                            crate::state::PendingPrompt::new(
+                                pane_id.clone(),
+                                prompt_text.clone(),
+                                restart_backend_session_id.clone(),
+                            ),
+                        );
                     }
                 }
             }
@@ -3436,6 +3445,14 @@ fn restore_start_prompt_after_fallback_failure(
     schedule_pending_prompt_fallback_retry(state, session_name, pending_prompt, true);
 }
 
+fn restore_restart_prompt_after_fallback_failure(
+    state: &std::sync::Arc<AppState>,
+    session_name: &str,
+    pending_prompt: crate::state::PendingPrompt,
+) {
+    restore_start_prompt_after_fallback_failure(state, session_name, pending_prompt);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StartPromptDelivery {
     PromptAsync,
@@ -4152,6 +4169,42 @@ mod tests {
         );
 
         restore_start_prompt_after_fallback_failure(&state, "oc", pending.clone());
+        assert_eq!(
+            state.pending_prompts.lock().unwrap().get("oc"),
+            Some(&pending)
+        );
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%eventual".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        wait_for_prompt_fallback_timer().await;
+
+        assert_eq!(
+            state.pending_prompts.lock().unwrap().get("oc"),
+            Some(&pending)
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_prompt_fallback_failure_restores_pending_prompt() {
+        let state = AppState::new_for_test();
+        let pending = crate::state::PendingPrompt::new(
+            "%eventual".into(),
+            "queued prompt".into(),
+            Some("ses_oc".into()),
+        );
+
+        restore_restart_prompt_after_fallback_failure(&state, "oc", pending.clone());
+
         assert_eq!(
             state.pending_prompts.lock().unwrap().get("oc"),
             Some(&pending)
