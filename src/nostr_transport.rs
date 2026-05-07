@@ -1813,7 +1813,7 @@ pub async fn start_session(
                                         "start_session: prompt_async returned {}",
                                         r.status()
                                     );
-                                    let _ = deliver_prompt_fallback(
+                                    if deliver_prompt_fallback(
                                         &state2,
                                         &name2,
                                         &pane2,
@@ -1822,11 +1822,23 @@ pub async fn start_session(
                                         false,
                                         expected_backend_session_id.as_deref(),
                                     )
-                                    .await;
+                                    .await
+                                    .is_err()
+                                    {
+                                        restore_start_prompt_after_fallback_failure(
+                                            &state2,
+                                            &name2,
+                                            crate::state::PendingPrompt::new(
+                                                pane2.clone(),
+                                                injected.clone(),
+                                                expected_backend_session_id.clone(),
+                                            ),
+                                        );
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!("start_session: prompt_async failed: {e}");
-                                    let _ = deliver_prompt_fallback(
+                                    if deliver_prompt_fallback(
                                         &state2,
                                         &name2,
                                         &pane2,
@@ -1835,7 +1847,19 @@ pub async fn start_session(
                                         false,
                                         expected_backend_session_id.as_deref(),
                                     )
-                                    .await;
+                                    .await
+                                    .is_err()
+                                    {
+                                        restore_start_prompt_after_fallback_failure(
+                                            &state2,
+                                            &name2,
+                                            crate::state::PendingPrompt::new(
+                                                pane2.clone(),
+                                                injected.clone(),
+                                                expected_backend_session_id.clone(),
+                                            ),
+                                        );
+                                    }
                                 }
                             }
                         });
@@ -3353,6 +3377,15 @@ fn restore_pending_prompt_if_absent(
         .or_insert(pending_prompt);
 }
 
+fn restore_start_prompt_after_fallback_failure(
+    state: &std::sync::Arc<AppState>,
+    session_name: &str,
+    pending_prompt: crate::state::PendingPrompt,
+) {
+    restore_pending_prompt_if_absent(state, session_name, pending_prompt.clone());
+    schedule_pending_prompt_fallback_retry(state, session_name, pending_prompt, true);
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StartPromptDelivery {
     PromptAsync,
@@ -4062,6 +4095,35 @@ mod tests {
         wait_for_prompt_fallback_timer().await;
 
         assert!(state.pending_prompts.lock().unwrap().get("oc").is_none());
+    }
+
+    #[tokio::test]
+    async fn start_prompt_fallback_failure_restores_pending_prompt() {
+        let state = AppState::new_for_test();
+        let pending = crate::state::PendingPrompt::new(
+            "%eventual".into(),
+            "queued prompt".into(),
+            Some("ses_oc".into()),
+        );
+
+        restore_start_prompt_after_fallback_failure(&state, "oc", pending.clone());
+        assert_eq!(state.pending_prompts.lock().unwrap().get("oc"), Some(&pending));
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%eventual".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        wait_for_prompt_fallback_timer().await;
+
+        assert_eq!(state.pending_prompts.lock().unwrap().get("oc"), Some(&pending));
     }
 
     #[test]
