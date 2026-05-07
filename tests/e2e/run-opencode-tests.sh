@@ -343,21 +343,23 @@ log "Test 10c: second message exercises plugin chat.message hook"
 # This is the exact code path that had the Zod validation bug.
 send2_result=$(api "$BASE" POST /api/send \
     -d '{"from":"test-sender","to":"oc-e2e","message":"What is 1+1? Reply with just the number.","expects_reply":false}')
-sleep 20
 if curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/global/health" -o /dev/null 2>/dev/null; then
     latest_session=$(curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/session" \
         -H "x-opencode-directory: /tmp" 2>/dev/null \
         | jq -r 'sort_by(.time.updated) | last | .id // empty' 2>/dev/null)
     if [ -n "$latest_session" ]; then
-        msg_count=$(curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/session/${latest_session}/message" \
-            -H "x-opencode-directory: /tmp" 2>/dev/null \
-            | jq '[.[] | select(.info.role == "assistant")] | length' 2>/dev/null || echo 0)
-        if [ "$msg_count" -ge 2 ]; then
-            pass "second message processed ($msg_count assistant responses)"
-        elif [ "$msg_count" -ge 1 ]; then
-            pass "second message sent (lenient: $msg_count assistant response)"
+        second_user_text=""
+        for _ in {1..20}; do
+            msgs=$(curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/session/${latest_session}/message" \
+                -H "x-opencode-directory: /tmp" 2>/dev/null || echo '[]')
+            second_user_text=$(echo "$msgs" | jq -r '[.[] | select(.info.role == "user") | .parts[]? | select(.type == "text") | .text] | join(" ")' 2>/dev/null | tr '[:upper:]' '[:lower:]')
+            echo "$second_user_text" | grep -q "1+1" && break
+            sleep 1
+        done
+        if echo "$second_user_text" | grep -q "1+1"; then
+            pass "second message stored in opencode session"
         else
-            fail "second message" ">=1 assistant responses" "$msg_count responses"
+            fail "second message" "stored user prompt containing 1+1" "$(echo "$second_user_text" | head -c 200)"
         fi
     else
         fail "second message" "session exists" "no session found"
