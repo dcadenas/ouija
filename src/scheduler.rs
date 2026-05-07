@@ -375,7 +375,7 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
     let Some(session) = session else {
         if task.project_dir.is_some() || task.prompt.is_some() {
             tracing::info!("session '{session_name}' not found, creating from task project_dir",);
-            return revive_from_task(state, task, None, None, None, None, None).await;
+            return revive_from_task(state, task, None, None, None, None).await;
         }
         return TaskRun::failed(
             task,
@@ -398,7 +398,6 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
             session.metadata.model.clone(),
             session.metadata.effort.clone(),
             session.metadata.backend.clone(),
-            session.metadata.opencode_binding.clone(),
         )
         .await;
     };
@@ -421,7 +420,6 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
     let snapshot_model = session.metadata.model.clone();
     let snapshot_effort = session.metadata.effort.clone();
     let snapshot_backend = session.metadata.backend.clone();
-    let snapshot_opencode_binding = session.metadata.opencode_binding.clone();
 
     if alive {
         if task.on_fire.kills_alive() {
@@ -459,7 +457,6 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
         snapshot_model,
         snapshot_effort,
         snapshot_backend,
-        snapshot_opencode_binding,
     )
     .await
 }
@@ -593,7 +590,6 @@ async fn revive_from_task(
     model: Option<String>,
     effort: Option<String>,
     backend_name: Option<String>,
-    opencode_binding: Option<crate::daemon_protocol::OpenCodeBinding>,
 ) -> TaskRun {
     let project_dir = project_dir_override.or(task.project_dir.as_deref());
     match revive_and_inject(
@@ -603,7 +599,6 @@ async fn revive_from_task(
         model,
         effort,
         backend_name,
-        opencode_binding,
     )
     .await
     {
@@ -635,7 +630,6 @@ async fn revive_and_inject(
     model: Option<String>,
     effort: Option<String>,
     backend_name: Option<String>,
-    opencode_binding: Option<crate::daemon_protocol::OpenCodeBinding>,
 ) -> anyhow::Result<String> {
     let dir = project_dir
         .map(String::from)
@@ -848,7 +842,6 @@ async fn revive_and_inject(
             model: model.clone(),
             effort: effort.clone(),
             backend_name: backend.name(),
-            opencode_binding,
             is_tui,
             clears_context,
         },
@@ -898,7 +891,6 @@ struct RevivedSessionSnapshot<'a> {
     model: Option<String>,
     effort: Option<String>,
     backend_name: &'a str,
-    opencode_binding: Option<crate::daemon_protocol::OpenCodeBinding>,
     is_tui: bool,
     clears_context: bool,
 }
@@ -915,12 +907,7 @@ fn revived_session_metadata(
         snapshot.is_tui,
         snapshot.clears_context,
     );
-    let opencode_binding = revived_opencode_binding(
-        snapshot.backend_name,
-        backend_session_id.as_deref(),
-        snapshot.is_tui,
-        snapshot.opencode_binding,
-    );
+    let opencode_binding = revived_opencode_binding(snapshot.backend_name);
 
     crate::daemon_protocol::SessionMeta {
         project_dir: project_dir.map(String::from),
@@ -938,18 +925,11 @@ fn revived_session_metadata(
 
 fn revived_opencode_binding(
     backend_name: &str,
-    backend_session_id: Option<&str>,
-    is_tui: bool,
-    prior_binding: Option<crate::daemon_protocol::OpenCodeBinding>,
 ) -> Option<crate::daemon_protocol::OpenCodeBinding> {
     if backend_name != "opencode" {
         return None;
     }
-    if !is_tui && backend_session_id.is_some() {
-        Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
-    } else {
-        prior_binding
-    }
+    Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
 }
 
 fn scheduled_prompt_backend_session_id(
@@ -1330,7 +1310,6 @@ mod tests {
                 model: Some("anthropic/claude-sonnet-4".into()),
                 effort: Some("high".into()),
                 backend_name: "opencode",
-                opencode_binding: None,
                 is_tui: false,
                 clears_context: false,
             },
@@ -1342,7 +1321,7 @@ mod tests {
         assert_eq!(metadata.effort.as_deref(), Some("high"));
         assert_eq!(
             metadata.opencode_binding,
-            Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
+            Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
         );
     }
 }
