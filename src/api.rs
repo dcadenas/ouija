@@ -4630,6 +4630,7 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
                     ..Default::default()
                 },
             })

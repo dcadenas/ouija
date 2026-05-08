@@ -188,6 +188,10 @@ impl SessionMeta {
     }
 
     pub(crate) fn http_delivery_snapshot(&self) -> Option<HttpDeliverySnapshot> {
+        if !self.is_strong_opencode_binding() {
+            return None;
+        }
+
         self.backend_session_id
             .as_ref()
             .map(|backend_session_id| HttpDeliverySnapshot {
@@ -2110,7 +2114,7 @@ impl DaemonState {
                     });
                 } else {
                     if session.metadata.backend.as_deref() == Some("opencode")
-                        && session.metadata.backend_session_id.is_some()
+                        && let Some(http_delivery) = session.metadata.http_delivery_snapshot()
                     {
                         let formatted = format_session_message(
                             from,
@@ -2123,9 +2127,7 @@ impl DaemonState {
                         effects.push(Effect::DeliverHttpMessage {
                             session_id: resolved_to.clone(),
                             message: formatted,
-                            http_delivery: session.metadata.http_delivery_snapshot().expect(
-                                "opencode backend_session_id should produce HTTP delivery snapshot",
-                            ),
+                            http_delivery: http_delivery.clone(),
                             pending_reply_msg_id: expects_reply.then_some(msg_id),
                         });
 
@@ -2154,7 +2156,7 @@ impl DaemonState {
                             to: resolved_to,
                             method: "http".into(),
                             msg_id,
-                            http_delivery: session.metadata.http_delivery_snapshot(),
+                            http_delivery: Some(http_delivery),
                         });
                     } else {
                         effects.push(Effect::SendFailed {
@@ -4473,6 +4475,51 @@ mod tests {
             _ => None,
         });
         assert_eq!(log_transport, Some("http".into()));
+    }
+
+    #[test]
+    fn send_to_weak_headless_opencode_session_fails_delivery() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "sender".into(),
+            pane: Some("%1".into()),
+            metadata: Default::default(),
+        });
+        state.apply(Event::Register {
+            id: "oc-target".into(),
+            pane: None,
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_adopted".into()),
+                opencode_binding: Some(OpenCodeBinding::WeakAdopted),
+                ..Default::default()
+            },
+        });
+
+        let effects = state.apply(Event::Send {
+            from: "sender".into(),
+            to: "oc-target".into(),
+            message: "hello".into(),
+            expects_reply: true,
+            responds_to: None,
+            done: false,
+        });
+
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::DeliverHttpMessage { .. }))
+        );
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::SendFailed {
+                from,
+                to,
+                reason,
+                ..
+            } if from == "sender" && to == "oc-target" && reason == "session has no tmux pane"
+        )));
+        assert!(!state.pending_replies.contains_key("oc-target"));
     }
 
     #[test]
