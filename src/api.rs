@@ -964,10 +964,10 @@ async fn clear_pending_reply_for_failed_delivery(
     state: &SharedState,
     effects: &[crate::daemon_protocol::Effect],
 ) {
-    let Some((to, msg_id)) = effects.iter().find_map(|effect| match effect {
-        crate::daemon_protocol::Effect::SendDelivered { to, msg_id, .. } => {
-            Some((to.clone(), *msg_id))
-        }
+    let Some((to, msg_id, from)) = effects.iter().find_map(|effect| match effect {
+        crate::daemon_protocol::Effect::SendDelivered {
+            from, to, msg_id, ..
+        } => Some((to.clone(), *msg_id, from.clone())),
         _ => None,
     }) else {
         return;
@@ -977,7 +977,7 @@ async fn clear_pending_reply_for_failed_delivery(
     let Some(pending) = proto.pending_replies.get_mut(&to) else {
         return;
     };
-    pending.retain(|entry| entry.msg_id != msg_id);
+    pending.retain(|entry| entry.msg_id != msg_id || entry.from != from);
     if pending.is_empty() {
         proto.pending_replies.remove(&to);
     }
@@ -7163,6 +7163,56 @@ mod tests {
         assert_eq!(state.clear_pending_reply_from("target", "sender"), 0);
         // Unknown session: also 0.
         assert_eq!(state.clear_pending_reply_from("ghost", "sender"), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_api_delivery_clears_only_matching_sender_pending_reply() {
+        let state = crate::state::AppState::new_for_test();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.pending_replies.insert(
+                "target".into(),
+                vec![
+                    crate::daemon_protocol::PendingReplyEntry {
+                        msg_id: 42,
+                        from: "sender-a".into(),
+                        message: "first".into(),
+                        received_at: 0,
+                        last_activity: 0,
+                        in_progress: false,
+                    },
+                    crate::daemon_protocol::PendingReplyEntry {
+                        msg_id: 42,
+                        from: "sender-b".into(),
+                        message: "second".into(),
+                        received_at: 0,
+                        last_activity: 0,
+                        in_progress: false,
+                    },
+                ],
+            );
+        }
+
+        clear_pending_reply_for_failed_delivery(
+            &state,
+            &[crate::daemon_protocol::Effect::SendDelivered {
+                from: "sender-a".into(),
+                to: "target".into(),
+                method: "tmux".into(),
+                msg_id: 42,
+                http_delivery: None,
+            }],
+        )
+        .await;
+
+        let proto = state.protocol.read().await;
+        let pending = proto
+            .pending_replies
+            .get("target")
+            .expect("sender-b pending reply should remain");
+        assert_eq!(pending.len(), 1, "only matching sender/msg_id must be removed");
+        assert_eq!(pending[0].from, "sender-b");
+        assert_eq!(pending[0].msg_id, 42);
     }
 
     /// End-to-end regression through a real axum Router and TCP listener.
