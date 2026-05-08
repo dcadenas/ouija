@@ -3171,11 +3171,26 @@ async fn auto_provision_from_backend_session(
             .collect()
     };
 
-    // Filter to panes in the target dir that are not already registered.
+    let opencode_process_names = state
+        .backends
+        .get("opencode")
+        .map(|backend| {
+            backend
+                .process_names()
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+
+    // Filter to OpenCode panes in the target dir that are not already registered.
     let candidates: Vec<String> = panes
         .into_iter()
         .filter(|p| {
             !registered_panes.contains(&p.pane_id)
+                && p.process_name
+                    .as_deref()
+                    .is_some_and(|name| opencode_process_names.contains(name))
                 && p.pane_current_path
                     .as_deref()
                     .map(|path| crate::state::resolve_project_root(path) == dir)
@@ -6060,6 +6075,26 @@ mod tests {
             proto.sessions.is_empty(),
             "no session must be created on zero-match decline, got: {:?}",
             proto.sessions.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_provision_declines_when_matching_dir_pane_is_not_opencode() {
+        let state = crate::state::AppState::new_for_test();
+        *state.cached_assistant_panes.write().await =
+            vec![pane_for_backend("/tmp/freshproject", "%17", "claude")];
+
+        let result =
+            auto_provision_from_backend_session(&state, "ses_claude", "/tmp/freshproject").await;
+
+        assert!(
+            result.is_none(),
+            "auto-provision must reject non-opencode panes, got Some({result:?})"
+        );
+        let proto = state.protocol.read().await;
+        assert!(
+            proto.sessions.is_empty(),
+            "no session must be created for a non-opencode pane"
         );
     }
 
