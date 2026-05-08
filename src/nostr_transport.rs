@@ -2616,30 +2616,6 @@ async fn soft_restart_session(
     //    succeeded. This preserves the Err boundary: attach failure returns
     //    before prompt_async can start work in the throwaway session.
     if let Some(text) = prompt {
-        if pane.is_none() && !metadata_committed {
-            if apply_soft_restart_metadata(
-                state,
-                name,
-                &new_session_id,
-                restart_generation,
-                model,
-                effort,
-            )
-            .await
-            .is_err()
-            {
-                delete_opencode_session(
-                    &state.http_client,
-                    port,
-                    &new_session_id,
-                    "soft restart cleanup",
-                )
-                .await;
-                return Err(());
-            }
-            metadata_committed = true;
-        }
-
         let full_text = match reminder {
             Some(r) => format!("{text}\n\n{r}"),
             None => text.to_string(),
@@ -4780,7 +4756,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn headless_soft_restart_commits_metadata_before_prompt_async() {
+    async fn headless_soft_restart_defers_metadata_until_prompt_async_accepts() {
         use axum::Json;
         use axum::Router;
         use axum::extract::State;
@@ -4796,11 +4772,11 @@ mod tests {
         async fn prompt_async(State(state): State<Arc<AppState>>) -> StatusCode {
             let proto = state.protocol.read().await;
             let metadata = &proto.sessions["oc"].metadata;
-            if metadata.backend_session_id.as_deref() == Some("ses_new")
+            if metadata.backend_session_id.as_deref() == Some("ses_old")
                 && metadata.opencode_binding
-                    == Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
-                && metadata.model.as_deref() == Some("new-model")
-                && metadata.effort.as_deref() == Some("new-effort")
+                    == Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
+                && metadata.model.as_deref() == Some("old-model")
+                && metadata.effort.as_deref() == Some("old-effort")
             {
                 StatusCode::OK
             } else {
