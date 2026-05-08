@@ -3283,6 +3283,27 @@ async fn auto_provision_with_explicit_pane(
         );
         return None;
     };
+    let opencode_process_names = state
+        .backends
+        .get("opencode")
+        .map(|backend| {
+            backend
+                .process_names()
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let pane_matches_opencode = hinted_pane
+        .process_name
+        .as_deref()
+        .is_some_and(|name| opencode_process_names.contains(name));
+    if !pane_matches_opencode {
+        tracing::warn!(
+            "auto-provision declined: hint pane {pane} is not running opencode (backend_session_id {backend_sid})"
+        );
+        return None;
+    }
 
     // Defense 2: the explicit cwd must match the pane's actual cwd after
     // applying the same project-root normalization as the scan path.
@@ -3380,6 +3401,7 @@ async fn register_auto_provisioned_session(
         .apply_and_execute(crate::daemon_protocol::Event::RegisterIfPaneUnbound {
             id: id.clone(),
             pane: pane_id.to_string(),
+            expected_backend_session_id: Some(backend_sid.to_string()),
             metadata,
         })
         .await;
@@ -5949,6 +5971,16 @@ mod tests {
             pane_id: pane_id.into(),
             session_name: "test".into(),
             pane_current_path: Some(dir.into()),
+            process_name: Some("opencode".into()),
+        }
+    }
+
+    fn pane_for_backend(dir: &str, pane_id: &str, process_name: &str) -> crate::tmux::TmuxPane {
+        crate::tmux::TmuxPane {
+            pane_id: pane_id.into(),
+            session_name: "test".into(),
+            pane_current_path: Some(dir.into()),
+            process_name: Some(process_name.into()),
         }
     }
 
@@ -6416,6 +6448,27 @@ mod tests {
         assert!(
             result.is_none(),
             "hint path must reject pane/cwd mismatches, got Some({result:?})"
+        );
+        assert!(state.protocol.read().await.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hint_path_rejects_non_opencode_pane_even_when_cwd_matches() {
+        let state = crate::state::AppState::new_for_test();
+        *state.cached_assistant_panes.write().await =
+            vec![pane_for_backend("/tmp/freshproject", "%17", "claude")];
+
+        let result = auto_provision_with_explicit_pane(
+            &state,
+            "ses_not_opencode",
+            "%17",
+            "/tmp/freshproject",
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "hint path must reject a non-opencode assistant pane, got Some({result:?})"
         );
         assert!(state.protocol.read().await.sessions.is_empty());
     }

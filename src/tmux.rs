@@ -24,6 +24,7 @@ pub struct TmuxPane {
     pub pane_id: String,
     pub session_name: String,
     pub pane_current_path: Option<String>,
+    pub process_name: Option<String>,
 }
 
 /// Parsed process tree snapshot for efficient descendant lookups.
@@ -73,25 +74,33 @@ impl ProcessTree {
     /// installed via Homebrew) or with a leading dot when run via npm/node
     /// wrappers.
     fn has_descendant_named(&self, root: u32, names: &[&str]) -> bool {
+        self.matching_descendant_name(root, names).is_some()
+    }
+
+    fn matching_descendant_name(&self, root: u32, names: &[&str]) -> Option<String> {
         let mut stack = vec![root];
         while let Some(pid) = stack.pop() {
-            if self.names.get(&pid).is_some_and(|n| {
-                let basename = std::path::Path::new(n)
-                    .file_name()
-                    .and_then(|f| f.to_str())
-                    .unwrap_or(n);
-                names.iter().any(|&target| {
-                    n == target || basename == target || basename.strip_prefix('.') == Some(target)
-                })
-            }) {
-                return true;
+            if let Some(name) = self.names.get(&pid)
+                && let Some(target) = matching_process_name(name, names)
+            {
+                return Some(target.to_string());
             }
             if let Some(kids) = self.children.get(&pid) {
                 stack.extend(kids);
             }
         }
-        false
+        None
     }
+}
+
+fn matching_process_name<'a>(name: &str, names: &'a [&str]) -> Option<&'a str> {
+    let basename = std::path::Path::new(name)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(name);
+    names.iter().copied().find(|target| {
+        name == *target || basename == *target || basename.strip_prefix('.') == Some(*target)
+    })
 }
 
 /// Find all tmux panes that have a matching assistant process.
@@ -130,13 +139,16 @@ pub fn find_assistant_panes(names: &[&str]) -> anyhow::Result<Vec<TmuxPane>> {
         .filter_map(|line| {
             let parts: Vec<&str> = line.split(SEP).collect();
             if parts.len() >= 5 {
-                let is_match = names.contains(&parts[3])
-                    || parts[2].parse::<u32>().ok().is_some_and(|pid| {
-                        proc_tree
-                            .as_ref()
-                            .is_some_and(|t| t.has_descendant_named(pid, names))
+                let process_name = matching_process_name(parts[3], names)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        parts[2].parse::<u32>().ok().and_then(|pid| {
+                            proc_tree
+                                .as_ref()
+                                .and_then(|t| t.matching_descendant_name(pid, names))
+                        })
                     });
-                if is_match {
+                if let Some(process_name) = process_name {
                     let path = parts[4].trim();
                     return Some(TmuxPane {
                         pane_id: parts[0].to_string(),
@@ -146,6 +158,7 @@ pub fn find_assistant_panes(names: &[&str]) -> anyhow::Result<Vec<TmuxPane>> {
                         } else {
                             Some(path.to_string())
                         },
+                        process_name: Some(process_name),
                     });
                 }
             }
