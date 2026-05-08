@@ -1813,30 +1813,36 @@ pub async fn start_session(
                                     );
                                 }
                                 Ok(r) => {
-                                    tracing::warn!(
-                                        "start_session: prompt_async returned {}",
-                                        r.status()
-                                    );
-                                    if deliver_prompt_fallback(
-                                        &state2,
-                                        &name2,
-                                        &pane2,
-                                        &injected,
-                                        true,
-                                        false,
-                                        expected_backend_session_id.as_deref(),
-                                    )
-                                    .await
-                                    .is_err()
-                                    {
-                                        restore_start_prompt_after_fallback_failure(
+                                    let status = r.status();
+                                    tracing::warn!("start_session: prompt_async returned {status}");
+                                    if should_deliver_prompt_fallback_after_prompt_async_status(
+                                        status,
+                                    ) {
+                                        if deliver_prompt_fallback(
                                             &state2,
                                             &name2,
-                                            crate::state::PendingPrompt::new(
-                                                pane2.clone(),
-                                                injected.clone(),
-                                                expected_backend_session_id.clone(),
-                                            ),
+                                            &pane2,
+                                            &injected,
+                                            true,
+                                            false,
+                                            expected_backend_session_id.as_deref(),
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            restore_start_prompt_after_fallback_failure(
+                                                &state2,
+                                                &name2,
+                                                crate::state::PendingPrompt::new(
+                                                    pane2.clone(),
+                                                    injected.clone(),
+                                                    expected_backend_session_id.clone(),
+                                                ),
+                                            );
+                                        }
+                                    } else {
+                                        tracing::warn!(
+                                            "start_session: prompt_async status {status} is ambiguous; not retrying prompt via raw tmux"
                                         );
                                     }
                                 }
@@ -3537,6 +3543,17 @@ fn should_deliver_prompt_fallback(is_http_api: bool, opencode_tui_alive: bool) -
     !is_http_api || opencode_tui_alive
 }
 
+fn should_deliver_prompt_fallback_after_prompt_async_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST
+            | reqwest::StatusCode::NOT_FOUND
+            | reqwest::StatusCode::CONFLICT
+            | reqwest::StatusCode::GONE
+            | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    )
+}
+
 async fn deliver_prompt_fallback(
     state: &AppState,
     session_id: &str,
@@ -4107,6 +4124,26 @@ mod tests {
         assert!(!should_deliver_prompt_fallback(true, false));
         assert!(should_deliver_prompt_fallback(true, true));
         assert!(should_deliver_prompt_fallback(false, false));
+    }
+
+    #[test]
+    fn prompt_async_status_fallback_rejects_ambiguous_server_errors() {
+        assert!(!should_deliver_prompt_fallback_after_prompt_async_status(
+            reqwest::StatusCode::BAD_GATEWAY
+        ));
+        assert!(!should_deliver_prompt_fallback_after_prompt_async_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+    }
+
+    #[test]
+    fn prompt_async_status_fallback_allows_known_not_accepted_errors() {
+        assert!(should_deliver_prompt_fallback_after_prompt_async_status(
+            reqwest::StatusCode::NOT_FOUND
+        ));
+        assert!(should_deliver_prompt_fallback_after_prompt_async_status(
+            reqwest::StatusCode::BAD_REQUEST
+        ));
     }
 
     #[tokio::test]
