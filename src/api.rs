@@ -3054,11 +3054,7 @@ async fn backend_session_ready_inner_with_hints(
     // id, or a stale plugin cwd could shadow the real session.
     let session_name = {
         let proto = state.protocol.read().await;
-        proto
-            .sessions
-            .values()
-            .find(|s| s.metadata.backend_session_id.as_deref() == Some(&backend_sid))
-            .map(|s| s.id.clone())
+        find_local_session_by_backend_session_id(&proto, &backend_sid).map(|s| s.id.clone())
     };
 
     let name = if let Some(n) = session_name {
@@ -3201,11 +3197,7 @@ async fn auto_provision_from_backend_session(
     // the winner's session binds the pane, so the filter would drop it.
     {
         let proto = state.protocol.read().await;
-        if let Some(existing) = proto
-            .sessions
-            .values()
-            .find(|s| s.metadata.backend_session_id.as_deref() == Some(backend_sid))
-        {
+        if let Some(existing) = find_local_session_by_backend_session_id(&proto, backend_sid) {
             return Some(existing.id.clone());
         }
     }
@@ -3330,11 +3322,7 @@ async fn auto_provision_with_explicit_pane(
     // apply_register's pane-dedup would resolve by evicting them.
     {
         let proto = state.protocol.read().await;
-        if let Some(existing) = proto
-            .sessions
-            .values()
-            .find(|s| s.metadata.backend_session_id.as_deref() == Some(backend_sid))
-        {
+        if let Some(existing) = find_local_session_by_backend_session_id(&proto, backend_sid) {
             return Some(existing.id.clone());
         }
     }
@@ -3437,11 +3425,7 @@ async fn register_auto_provisioned_session(
     // id, same pane) — stomping their atomic bind.
     let id = {
         let proto = state.protocol.read().await;
-        if let Some(existing) = proto
-            .sessions
-            .values()
-            .find(|s| s.metadata.backend_session_id.as_deref() == Some(backend_sid))
-        {
+        if let Some(existing) = find_local_session_by_backend_session_id(&proto, backend_sid) {
             return Some(existing.id.clone());
         }
         let id_to_pane: std::collections::HashMap<String, Option<String>> = proto
@@ -3482,6 +3466,16 @@ async fn register_auto_provisioned_session(
     } else {
         None
     }
+}
+
+fn find_local_session_by_backend_session_id<'a>(
+    proto: &'a crate::daemon_protocol::DaemonState,
+    backend_sid: &str,
+) -> Option<&'a crate::daemon_protocol::SessionEntry> {
+    proto.sessions.values().find(|s| {
+        matches!(s.origin, crate::daemon_protocol::Origin::Local)
+            && s.metadata.backend_session_id.as_deref() == Some(backend_sid)
+    })
 }
 
 /// Choose at most one candidate session ID for adoption (issue #15).
@@ -6439,6 +6433,49 @@ mod tests {
             response["session"].as_str(),
             Some("prebound"),
             "direct lookup must surface the session id, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_session_ready_ignores_remote_backend_session_id_collision() {
+        let state = crate::state::AppState::new_for_test();
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/local-project", "%31")];
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "remote-host/local-project".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "remote-host/local-project".into(),
+                    pane: None,
+                    origin: crate::daemon_protocol::Origin::Remote("npub1remote".into()),
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        project_dir: Some("/tmp/remote-project".into()),
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_collision".into()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let hints = BackendSessionReadyHints {
+            pane: Some("%31".into()),
+            cwd: Some("/tmp/local-project".into()),
+        };
+
+        let response =
+            backend_session_ready_inner_with_hints(&state, "ses_collision".into(), hints).await;
+
+        assert_eq!(
+            response["session"].as_str(),
+            Some("local-project"),
+            "remote backend_session_id collision must not satisfy readiness: {response}"
+        );
+        let proto = state.protocol.read().await;
+        assert!(
+            proto.sessions.contains_key("local-project"),
+            "local auto-provision must still create a local session"
         );
     }
 
