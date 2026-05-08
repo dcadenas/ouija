@@ -4286,6 +4286,51 @@ mod tests {
     }
 
     #[test]
+    fn incoming_session_send_to_weak_headless_opencode_returns_failed_ack() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "oc".into(),
+            pane: None,
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_adopted".into()),
+                opencode_binding: Some(OpenCodeBinding::WeakAdopted),
+                networked: true,
+                ..Default::default()
+            },
+        });
+
+        let effects = state.apply(Event::IncomingWire {
+            msg: crate::protocol::WireMessage::SessionSend {
+                from: "remote-session".into(),
+                to: "oc".into(),
+                message: "hello".into(),
+                expects_reply: true,
+                msg_id: 42,
+                responds_to: None,
+                done: false,
+            },
+            sender_npub: None,
+        });
+
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::DeliverHttpMessage { .. }))
+        );
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::Broadcast(crate::protocol::WireMessage::SessionSendAck {
+                from,
+                to,
+                delivered: false,
+                ..
+            }) if from == "remote-session" && to == "oc"
+        )));
+        assert!(!state.pending_replies.contains_key("oc"));
+    }
+
+    #[test]
     fn incoming_session_send_to_undeliverable_opencode_returns_failed_ack() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
         state.apply(Event::Register {
