@@ -2754,6 +2754,7 @@ async fn restore_soft_restart_metadata(
     session.metadata.opencode_binding = previous_metadata.opencode_binding.clone();
     session.metadata.model = previous_metadata.model.clone();
     session.metadata.effort = previous_metadata.effort.clone();
+    session.metadata.restart_generation = previous_metadata.restart_generation;
     state.persist_protocol_state(&proto);
 }
 
@@ -4903,6 +4904,49 @@ mod tests {
         let metadata = &proto.sessions["oc"].metadata;
         assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_current"));
         assert_eq!(metadata.restart_generation, 1);
+    }
+
+    #[tokio::test]
+    async fn soft_restart_metadata_restore_resets_restart_generation() {
+        let state = AppState::new_for_test();
+        let previous_metadata = crate::daemon_protocol::SessionMeta {
+            backend: Some("opencode".into()),
+            backend_session_id: Some("ses_old".into()),
+            opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted),
+            model: Some("old-model".into()),
+            effort: Some("old-effort".into()),
+            restart_generation: 7,
+            ..Default::default()
+        };
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%1".into()),
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: previous_metadata.clone(),
+                    registered_at: 0,
+                },
+            );
+        }
+
+        apply_soft_restart_metadata(&state, "oc", "ses_new", 7, Some("new-model"), None)
+            .await
+            .expect("metadata commit should succeed before simulated prompt failure");
+        restore_soft_restart_metadata(&state, "oc", "ses_new", &previous_metadata).await;
+
+        let proto = state.protocol.read().await;
+        let metadata = &proto.sessions["oc"].metadata;
+        assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_old"));
+        assert_eq!(
+            metadata.opencode_binding,
+            Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
+        );
+        assert_eq!(metadata.model.as_deref(), Some("old-model"));
+        assert_eq!(metadata.effort.as_deref(), Some("old-effort"));
+        assert_eq!(metadata.restart_generation, 7);
     }
 
     #[test]
