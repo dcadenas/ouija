@@ -2690,7 +2690,21 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
 
     let used_http_delivery = http_delivery.is_some();
     let result = match http_delivery {
-        Some(delivery) => deliver_http_message(state, &delivery, &prompt).await,
+        Some(delivery) => match deliver_pending_prompt_via_http(state, &delivery, &prompt).await {
+            Ok(()) => Ok(()),
+            Err(decision) if decision.should_try_raw_tmux() => Err(anyhow::anyhow!(
+                "prompt_async failure confirmed prompt was not accepted"
+            )),
+            Err(crate::nostr_transport::PromptAsyncFallbackDecision::Ambiguous) => {
+                tracing::warn!(
+                    "readiness prompt HTTP delivery failed ambiguously for {session_name}; not retrying via raw tmux"
+                );
+                return false;
+            }
+            Err(crate::nostr_transport::PromptAsyncFallbackDecision::DefiniteNonAcceptance) => {
+                unreachable!("definite non-acceptance is handled by the guard above")
+            }
+        },
         None => {
             deliver_pending_prompt_via_raw_tmux(
                 state,
@@ -2743,6 +2757,41 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
             tracing::warn!("readiness prompt raw tmux delivery failed for {session_name}: {e}");
             false
         }
+    }
+}
+
+async fn deliver_pending_prompt_via_http(
+    state: &SharedState,
+    delivery: &crate::daemon_protocol::HttpDeliverySnapshot,
+    message: &str,
+) -> Result<(), crate::nostr_transport::PromptAsyncFallbackDecision> {
+    let port = state.opencode_serve_port();
+    let body = crate::nostr_transport::opencode_prompt_body(
+        message,
+        delivery.model.as_deref(),
+        delivery.effort.as_deref(),
+    );
+    let async_url = format!(
+        "http://127.0.0.1:{port}/session/{}/prompt_async",
+        delivery.backend_session_id
+    );
+    let mut req = state
+        .http_client
+        .post(&async_url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(10));
+    if let Some(dir) = delivery.project_dir.as_deref() {
+        req = req.header("x-opencode-directory", dir);
+    }
+
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => Ok(()),
+        Ok(resp) => Err(crate::nostr_transport::classify_prompt_async_fallback(
+            crate::nostr_transport::PromptAsyncFailure::Status(resp.status()),
+        )),
+        Err(error) => Err(crate::nostr_transport::classify_prompt_async_fallback(
+            crate::nostr_transport::PromptAsyncFailure::Request(&error),
+        )),
     }
 }
 
@@ -4310,7 +4359,7 @@ mod tests {
         async fn prompt_async(AxumState(gate): AxumState<Gate>) -> StatusCode {
             gate.started.notify_one();
             gate.release.notified().await;
-            StatusCode::BAD_GATEWAY
+            StatusCode::NOT_FOUND
         }
 
         let gate = Gate {
@@ -5380,7 +5429,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_prompt_delivery_falls_back_to_tmux_when_http_delivery_fails() {
+    async fn readiness_prompt_delivery_skips_tmux_fallback_for_ambiguous_http_status() {
         use axum::Router;
         use axum::http::StatusCode;
         use axum::routing::post;
@@ -5425,7 +5474,7 @@ mod tests {
 
         let delivered = deliver_pending_prompt(&state, "oc").await;
 
-        assert!(delivered);
+        assert!(!delivered);
         assert!(!state.pending_prompts.lock().unwrap().contains_key("oc"));
         server.abort();
     }
@@ -5522,7 +5571,7 @@ mod tests {
         async fn prompt_async(AxumState(gate): AxumState<Gate>) -> StatusCode {
             gate.started.notify_one();
             gate.release.notified().await;
-            StatusCode::BAD_GATEWAY
+            StatusCode::NOT_FOUND
         }
 
         let gate = Gate {
@@ -5944,7 +5993,7 @@ mod tests {
         async fn prompt_async(AxumState(gate): AxumState<Gate>) -> StatusCode {
             gate.started.notify_one();
             gate.release.notified().await;
-            StatusCode::BAD_GATEWAY
+            StatusCode::NOT_FOUND
         }
 
         let gate = Gate {

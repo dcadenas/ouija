@@ -1815,9 +1815,10 @@ pub async fn start_session(
                                 Ok(r) => {
                                     let status = r.status();
                                     tracing::warn!("start_session: prompt_async returned {status}");
-                                    if should_deliver_prompt_fallback_after_prompt_async_status(
-                                        status,
-                                    ) {
+                                    let decision = classify_prompt_async_fallback(
+                                        PromptAsyncFailure::Status(status),
+                                    );
+                                    if decision.should_try_raw_tmux() {
                                         if deliver_prompt_fallback(
                                             &state2,
                                             &name2,
@@ -1848,17 +1849,21 @@ pub async fn start_session(
                                 }
                                 Err(e) => {
                                     tracing::warn!("start_session: prompt_async failed: {e}");
-                                    if deliver_prompt_fallback(
-                                        &state2,
-                                        &name2,
-                                        &pane2,
-                                        &injected,
-                                        true,
-                                        false,
-                                        expected_backend_session_id.as_deref(),
-                                    )
-                                    .await
-                                    .is_err()
+                                    let decision = classify_prompt_async_fallback(
+                                        PromptAsyncFailure::Request(&e),
+                                    );
+                                    if decision.should_try_raw_tmux()
+                                        && deliver_prompt_fallback(
+                                            &state2,
+                                            &name2,
+                                            &pane2,
+                                            &injected,
+                                            true,
+                                            false,
+                                            expected_backend_session_id.as_deref(),
+                                        )
+                                        .await
+                                        .is_err()
                                     {
                                         restore_start_prompt_after_fallback_failure(
                                             &state2,
@@ -1868,6 +1873,10 @@ pub async fn start_session(
                                                 injected.clone(),
                                                 expected_backend_session_id.clone(),
                                             ),
+                                        );
+                                    } else if !decision.should_try_raw_tmux() {
+                                        tracing::warn!(
+                                            "start_session: prompt_async request failure is ambiguous; not retrying prompt via raw tmux"
                                         );
                                     }
                                 }
@@ -2814,9 +2823,30 @@ async fn deliver_soft_restart_prompt(
         .json(&body)
         .timeout(std::time::Duration::from_secs(10))
         .send()
-        .await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("prompt_async returned {}", resp.status());
+        .await;
+    match resp {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => {
+            let status = resp.status();
+            let decision = classify_prompt_async_fallback(PromptAsyncFailure::Status(status));
+            if decision.should_try_raw_tmux() {
+                anyhow::bail!("prompt_async returned {status}");
+            }
+            tracing::warn!(
+                "soft restart: prompt_async status {status} is ambiguous; not retrying restart prompt"
+            );
+            return Ok(());
+        }
+        Err(error) => {
+            let decision = classify_prompt_async_fallback(PromptAsyncFailure::Request(&error));
+            if decision.should_try_raw_tmux() {
+                return Err(anyhow::anyhow!("prompt_async request failed: {error}"));
+            }
+            tracing::warn!(
+                "soft restart: prompt_async request failure is ambiguous; not retrying restart prompt: {error}"
+            );
+            return Ok(());
+        }
     }
     tracing::info!("soft restart: delivered prompt to {session_id} via prompt_async");
     Ok(())
@@ -3535,6 +3565,23 @@ enum PromptFallbackDelivery {
     RawTmux,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PromptAsyncFallbackDecision {
+    DefiniteNonAcceptance,
+    Ambiguous,
+}
+
+impl PromptAsyncFallbackDecision {
+    pub(crate) fn should_try_raw_tmux(self) -> bool {
+        matches!(self, Self::DefiniteNonAcceptance)
+    }
+}
+
+pub(crate) enum PromptAsyncFailure<'a> {
+    Status(reqwest::StatusCode),
+    Request(&'a reqwest::Error),
+}
+
 fn prompt_fallback_delivery() -> PromptFallbackDelivery {
     PromptFallbackDelivery::RawTmux
 }
@@ -3543,15 +3590,24 @@ fn should_deliver_prompt_fallback(is_http_api: bool, opencode_tui_alive: bool) -
     !is_http_api || opencode_tui_alive
 }
 
-fn should_deliver_prompt_fallback_after_prompt_async_status(status: reqwest::StatusCode) -> bool {
-    matches!(
-        status,
-        reqwest::StatusCode::BAD_REQUEST
+pub(crate) fn classify_prompt_async_fallback(
+    failure: PromptAsyncFailure<'_>,
+) -> PromptAsyncFallbackDecision {
+    match failure {
+        PromptAsyncFailure::Status(
+            reqwest::StatusCode::BAD_REQUEST
             | reqwest::StatusCode::NOT_FOUND
             | reqwest::StatusCode::CONFLICT
             | reqwest::StatusCode::GONE
-            | reqwest::StatusCode::UNPROCESSABLE_ENTITY
-    )
+            | reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ) => PromptAsyncFallbackDecision::DefiniteNonAcceptance,
+        PromptAsyncFailure::Request(error) if error.is_connect() => {
+            PromptAsyncFallbackDecision::DefiniteNonAcceptance
+        }
+        PromptAsyncFailure::Status(_) | PromptAsyncFailure::Request(_) => {
+            PromptAsyncFallbackDecision::Ambiguous
+        }
+    }
 }
 
 async fn deliver_prompt_fallback(
@@ -4127,23 +4183,83 @@ mod tests {
     }
 
     #[test]
-    fn prompt_async_status_fallback_rejects_ambiguous_server_errors() {
-        assert!(!should_deliver_prompt_fallback_after_prompt_async_status(
-            reqwest::StatusCode::BAD_GATEWAY
-        ));
-        assert!(!should_deliver_prompt_fallback_after_prompt_async_status(
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR
-        ));
+    fn prompt_async_fallback_classifier_rejects_ambiguous_server_errors() {
+        assert_eq!(
+            classify_prompt_async_fallback(PromptAsyncFailure::Status(
+                reqwest::StatusCode::BAD_GATEWAY
+            )),
+            PromptAsyncFallbackDecision::Ambiguous
+        );
+        assert_eq!(
+            classify_prompt_async_fallback(PromptAsyncFailure::Status(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            )),
+            PromptAsyncFallbackDecision::Ambiguous
+        );
     }
 
     #[test]
-    fn prompt_async_status_fallback_allows_known_not_accepted_errors() {
-        assert!(should_deliver_prompt_fallback_after_prompt_async_status(
-            reqwest::StatusCode::NOT_FOUND
-        ));
-        assert!(should_deliver_prompt_fallback_after_prompt_async_status(
-            reqwest::StatusCode::BAD_REQUEST
-        ));
+    fn prompt_async_fallback_classifier_allows_known_not_accepted_statuses() {
+        assert_eq!(
+            classify_prompt_async_fallback(PromptAsyncFailure::Status(
+                reqwest::StatusCode::NOT_FOUND
+            )),
+            PromptAsyncFallbackDecision::DefiniteNonAcceptance
+        );
+        assert_eq!(
+            classify_prompt_async_fallback(PromptAsyncFailure::Status(
+                reqwest::StatusCode::BAD_REQUEST
+            )),
+            PromptAsyncFallbackDecision::DefiniteNonAcceptance
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_async_fallback_classifier_allows_connection_errors() {
+        let error = reqwest::Client::new()
+            .post("http://[::1]:1/session/ses/prompt_async")
+            .send()
+            .await
+            .unwrap_err();
+
+        assert!(error.is_connect());
+        assert_eq!(
+            classify_prompt_async_fallback(PromptAsyncFailure::Request(&error)),
+            PromptAsyncFallbackDecision::DefiniteNonAcceptance
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_async_fallback_classifier_rejects_timeout_errors() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+
+        async fn prompt_async() -> StatusCode {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            StatusCode::NO_CONTENT
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route("/session/{session_id}/prompt_async", post(prompt_async));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let error = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/session/ses/prompt_async"))
+            .timeout(std::time::Duration::from_millis(1))
+            .send()
+            .await
+            .unwrap_err();
+
+        assert!(error.is_timeout());
+        assert_eq!(
+            classify_prompt_async_fallback(PromptAsyncFailure::Request(&error)),
+            PromptAsyncFallbackDecision::Ambiguous
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -4692,7 +4808,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn soft_restart_prompt_delivery_rejects_prompt_async_non_success() {
+    async fn soft_restart_prompt_delivery_rejects_known_not_accepted_status() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        async fn prompt_async() -> StatusCode {
+            StatusCode::NOT_FOUND
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route("/session/{session_id}/prompt_async", post(prompt_async));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = AppState::new(config);
+
+        let result = deliver_soft_restart_prompt(
+            &state,
+            port,
+            "ses_new",
+            dir.path().to_str().unwrap(),
+            "queued prompt",
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn soft_restart_prompt_delivery_accepts_ambiguous_server_error() {
         use axum::Router;
         use axum::http::StatusCode;
         use axum::routing::post;
@@ -4729,8 +4887,65 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
+        assert!(result.is_ok());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn soft_restart_prompt_delivery_accepts_transport_error_after_request_body() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let saw_prompt_body = StdArc::new(AtomicBool::new(false));
+        let saw_prompt_body2 = saw_prompt_body.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request
+                    .windows(b"queued prompt".len())
+                    .any(|w| w == b"queued prompt")
+                {
+                    saw_prompt_body2.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+            stream.shutdown().await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = AppState::new(config);
+
+        let result = deliver_soft_restart_prompt(
+            &state,
+            port,
+            "ses_new",
+            dir.path().to_str().unwrap(),
+            "queued prompt",
+            None,
+            None,
+        )
+        .await;
+
+        assert!(saw_prompt_body.load(Ordering::SeqCst));
+        assert!(result.is_ok());
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -4746,7 +4961,7 @@ mod tests {
         }
 
         async fn prompt_async() -> StatusCode {
-            StatusCode::BAD_GATEWAY
+            StatusCode::NOT_FOUND
         }
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
