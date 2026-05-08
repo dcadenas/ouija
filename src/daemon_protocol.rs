@@ -960,7 +960,9 @@ impl DaemonState {
     ) -> Vec<Effect> {
         if let Some(backend_session_id) = expected_backend_session_id.as_deref()
             && let Some(owner) = self.sessions.values().find(|s| {
-                s.id != id && s.metadata.backend_session_id.as_deref() == Some(backend_session_id)
+                s.id != id
+                    && matches!(s.origin, Origin::Local)
+                    && s.metadata.backend_session_id.as_deref() == Some(backend_session_id)
             })
         {
             let reason = format!(
@@ -4972,6 +4974,45 @@ mod tests {
         );
         assert!(!state.sessions.contains_key("intruder"));
         assert_eq!(state.sessions["owner"].pane.as_deref(), Some("%1"));
+    }
+
+    #[test]
+    fn register_if_pane_unbound_ignores_remote_duplicate_backend_session_id() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.sessions.insert(
+            "remote-host/oc".into(),
+            SessionEntry {
+                id: "remote-host/oc".into(),
+                pane: Some("%remote".into()),
+                origin: Origin::Remote("npub1remote".into()),
+                metadata: SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_same".into()),
+                    ..Default::default()
+                },
+                registered_at: 0,
+            },
+        );
+
+        let effects = state.apply(Event::RegisterIfPaneUnbound {
+            id: "local-oc".into(),
+            pane: "%2".into(),
+            expected_backend_session_id: Some("ses_same".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_same".into()),
+                ..Default::default()
+            },
+        });
+
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::RegisterOk { session_id, .. } if session_id == "local-oc"
+            )),
+            "remote duplicate backend_session_id must not block local guarded register: {effects:?}"
+        );
+        assert!(state.sessions.contains_key("local-oc"));
     }
 
     #[test]
