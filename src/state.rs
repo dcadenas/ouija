@@ -1039,22 +1039,29 @@ impl AppState {
         &self,
         effects: &[crate::daemon_protocol::Effect],
     ) {
-        let Some((to, msg_id)) = effects.iter().find_map(|effect| match effect {
-            crate::daemon_protocol::Effect::SendDelivered { to, msg_id, .. } => {
-                Some((to.clone(), *msg_id))
-            }
+        let Some((to, msg_id, from)) = effects.iter().find_map(|effect| match effect {
+            crate::daemon_protocol::Effect::SendDelivered {
+                from, to, msg_id, ..
+            } => Some((to.clone(), *msg_id, Some(from.clone()))),
             crate::daemon_protocol::Effect::InjectMessage {
                 session_id,
                 pending_reply_msg_id,
+                pending_reply_from,
                 ..
-            } => pending_reply_msg_id.map(|msg_id| (session_id.clone(), msg_id)),
+            } => pending_reply_msg_id
+                .map(|msg_id| (session_id.clone(), msg_id, pending_reply_from.clone())),
             crate::daemon_protocol::Effect::DeliverHttpMessage {
                 session_id,
                 pending_reply_msg_id,
+                pending_reply_from,
                 ..
-            } => pending_reply_msg_id.map(|msg_id| (session_id.clone(), msg_id)),
+            } => pending_reply_msg_id
+                .map(|msg_id| (session_id.clone(), msg_id, pending_reply_from.clone())),
             _ => None,
         }) else {
+            return;
+        };
+        let Some(from) = from else {
             return;
         };
 
@@ -1062,7 +1069,7 @@ impl AppState {
         let Some(pending) = proto.pending_replies.get_mut(&to) else {
             return;
         };
-        pending.retain(|entry| entry.msg_id != msg_id);
+        pending.retain(|entry| entry.msg_id != msg_id || entry.from != from);
         if pending.is_empty() {
             proto.pending_replies.remove(&to);
         }
@@ -2277,6 +2284,7 @@ pub(crate) mod tests {
                 delivery_method: None,
                 http_delivery: None,
                 pending_reply_msg_id: None,
+                pending_reply_from: None,
             },
             crate::daemon_protocol::Effect::SendDelivered {
                 from: "sender".into(),
@@ -2332,6 +2340,7 @@ pub(crate) mod tests {
                     effort: None,
                 },
                 pending_reply_msg_id: None,
+                pending_reply_from: None,
             },
             crate::daemon_protocol::Effect::SendDelivered {
                 from: "sender".into(),
@@ -2395,6 +2404,7 @@ pub(crate) mod tests {
                 effort: None,
             }),
             pending_reply_msg_id: None,
+            pending_reply_from: None,
         }];
 
         let failure = state.execute_effects(&effects).await;
@@ -2574,6 +2584,7 @@ pub(crate) mod tests {
                     effort: None,
                 }),
                 pending_reply_msg_id: None,
+                pending_reply_from: None,
             },
             crate::daemon_protocol::Effect::Broadcast(
                 crate::protocol::WireMessage::SessionSendAck {
@@ -2652,6 +2663,70 @@ pub(crate) mod tests {
         let pending = proto.pending_replies.get("oc").unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].msg_id, 7);
+    }
+
+    #[tokio::test]
+    async fn failed_incoming_delivery_clears_matching_sender_reply_only() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut config = test_config();
+        config.port = port.checked_sub(320).unwrap();
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_live".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        networked: true,
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+            proto.pending_replies.insert(
+                "oc".into(),
+                vec![crate::daemon_protocol::PendingReplyEntry {
+                    msg_id: 42,
+                    from: "other-remote".into(),
+                    message: "older pending".into(),
+                    received_at: 0,
+                    last_activity: 0,
+                    in_progress: false,
+                }],
+            );
+        }
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::IncomingWire {
+                msg: crate::protocol::WireMessage::SessionSend {
+                    from: "remote".into(),
+                    to: "oc".into(),
+                    message: "new pending".into(),
+                    expects_reply: true,
+                    msg_id: 42,
+                    responds_to: None,
+                    done: false,
+                },
+                sender_npub: Some("npub1remote".into()),
+            })
+            .await;
+
+        let proto = state.protocol.read().await;
+        let pending = proto.pending_replies.get("oc").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].msg_id, 42);
+        assert_eq!(pending[0].from, "other-remote");
     }
 
     #[tokio::test]

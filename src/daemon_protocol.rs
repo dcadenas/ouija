@@ -435,12 +435,14 @@ pub enum Effect {
         delivery_method: Option<String>,
         http_delivery: Option<HttpDeliverySnapshot>,
         pending_reply_msg_id: Option<u64>,
+        pending_reply_from: Option<String>,
     },
     DeliverHttpMessage {
         session_id: String,
         message: String,
         http_delivery: HttpDeliverySnapshot,
         pending_reply_msg_id: Option<u64>,
+        pending_reply_from: Option<String>,
     },
 
     // Agents
@@ -1668,6 +1670,7 @@ impl DaemonState {
                         delivery_method,
                         http_delivery,
                         pending_reply_msg_id: expects_reply.then_some(local_msg_id),
+                        pending_reply_from: expects_reply.then(|| display_from.clone()),
                     });
 
                     if expects_reply {
@@ -1716,6 +1719,7 @@ impl DaemonState {
                         message: formatted,
                         http_delivery,
                         pending_reply_msg_id: expects_reply.then_some(local_msg_id),
+                        pending_reply_from: expects_reply.then(|| display_from.clone()),
                     });
 
                     if expects_reply {
@@ -2076,6 +2080,7 @@ impl DaemonState {
                         delivery_method,
                         http_delivery,
                         pending_reply_msg_id: expects_reply.then_some(msg_id),
+                        pending_reply_from: expects_reply.then(|| from.to_string()),
                     });
 
                     if expects_reply {
@@ -2131,6 +2136,7 @@ impl DaemonState {
                             message: formatted,
                             http_delivery: http_delivery.clone(),
                             pending_reply_msg_id: expects_reply.then_some(msg_id),
+                            pending_reply_from: expects_reply.then(|| from.to_string()),
                         });
 
                         if expects_reply {
