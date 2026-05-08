@@ -300,6 +300,7 @@ pub enum Event {
     RegisterIfPaneUnbound {
         id: String,
         pane: String,
+        expected_backend_session_id: Option<String>,
         metadata: SessionMeta,
     },
     Rename {
@@ -745,8 +746,13 @@ impl DaemonState {
     pub fn apply(&mut self, event: Event) -> Vec<Effect> {
         match event {
             Event::Register { id, pane, metadata } => self.apply_register(id, pane, metadata),
-            Event::RegisterIfPaneUnbound { id, pane, metadata } => {
-                self.apply_register_if_pane_unbound(id, pane, metadata)
+            Event::RegisterIfPaneUnbound {
+                id,
+                pane,
+                expected_backend_session_id,
+                metadata,
+            } => {
+                self.apply_register_if_pane_unbound(id, pane, expected_backend_session_id, metadata)
             }
             Event::Rename { old_id, new_id } => self.apply_rename(&old_id, &new_id),
             Event::Remove { id, keep_worktree } => self.apply_remove(&id, keep_worktree),
@@ -945,8 +951,30 @@ impl DaemonState {
         &mut self,
         id: String,
         pane: String,
+        expected_backend_session_id: Option<String>,
         metadata: SessionMeta,
     ) -> Vec<Effect> {
+        if let Some(backend_session_id) = expected_backend_session_id.as_deref()
+            && let Some(owner) = self.sessions.values().find(|s| {
+                s.id != id && s.metadata.backend_session_id.as_deref() == Some(backend_session_id)
+            })
+        {
+            let reason = format!(
+                "backend_session_id {backend_session_id} is already bound to session '{}'",
+                owner.id
+            );
+            return vec![
+                Effect::Log {
+                    level: LogLevel::Warn,
+                    message: format!("refusing guarded registration for '{id}': {reason}"),
+                },
+                Effect::RegisterFailed {
+                    session_id: id,
+                    reason,
+                },
+            ];
+        }
+
         if let Some(owner) = self
             .sessions
             .values()
@@ -4816,6 +4844,42 @@ mod tests {
         assert!(!effects.is_empty());
         assert!(state.sessions.contains_key("placeholder"));
         assert!(state.sessions["placeholder"].pane.is_none());
+    }
+
+    #[test]
+    fn register_if_pane_unbound_rejects_duplicate_backend_session_id() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "owner".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_dup".into()),
+                ..Default::default()
+            },
+        });
+
+        let effects = state.apply(Event::RegisterIfPaneUnbound {
+            id: "intruder".into(),
+            pane: "%2".into(),
+            expected_backend_session_id: Some("ses_dup".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_dup".into()),
+                ..Default::default()
+            },
+        });
+
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::RegisterFailed { session_id, reason }
+                    if session_id == "intruder" && reason.contains("backend_session_id ses_dup")
+            )),
+            "duplicate backend_session_id must fail atomically, got: {effects:?}"
+        );
+        assert!(!state.sessions.contains_key("intruder"));
+        assert_eq!(state.sessions["owner"].pane.as_deref(), Some("%1"));
     }
 
     #[test]
