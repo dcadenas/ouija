@@ -3456,13 +3456,30 @@ async fn register_auto_provisioned_session(
         })
         .await;
 
+    let proto = state.protocol.read().await;
+    auto_provision_register_result(&proto, backend_sid, &id, &effects)
+}
+
+fn auto_provision_register_result(
+    proto: &crate::daemon_protocol::DaemonState,
+    backend_sid: &str,
+    id: &str,
+    effects: &[crate::daemon_protocol::Effect],
+) -> Option<String> {
     if effects.iter().any(|effect| {
         matches!(
             effect,
-            crate::daemon_protocol::Effect::RegisterOk { session_id, .. } if session_id == &id
+            crate::daemon_protocol::Effect::RegisterOk { session_id, .. } if session_id == id
         )
     }) {
-        Some(id)
+        Some(id.to_string())
+    } else if effects.iter().any(|effect| {
+        matches!(
+            effect,
+            crate::daemon_protocol::Effect::RegisterFailed { session_id, .. } if session_id == id
+        )
+    }) {
+        find_local_session_by_backend_session_id(proto, backend_sid).map(|session| session.id.clone())
     } else {
         None
     }
@@ -6345,6 +6362,32 @@ mod tests {
             proto.sessions.len(),
             1,
             "no extra session must be created on the lost race"
+        );
+    }
+
+    #[test]
+    fn auto_provision_register_result_returns_backend_winner_after_register_failed() {
+        let mut proto = crate::daemon_protocol::DaemonState::new_for_model("d".into(), "h".into());
+        proto.apply(crate::daemon_protocol::Event::Register {
+            id: "winner".into(),
+            pane: Some("%17".into()),
+            metadata: crate::daemon_protocol::SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_raced".into()),
+                ..Default::default()
+            },
+        });
+        let effects = vec![crate::daemon_protocol::Effect::RegisterFailed {
+            session_id: "freshproject".into(),
+            reason: "backend_session_id ses_raced is already bound to session 'winner'".into(),
+        }];
+
+        let result = auto_provision_register_result(&proto, "ses_raced", "freshproject", &effects);
+
+        assert_eq!(
+            result.as_deref(),
+            Some("winner"),
+            "lost guarded-register races must surface the concurrent backend owner"
         );
     }
 
