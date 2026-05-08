@@ -957,10 +957,10 @@ impl DaemonState {
         &mut self,
         id: String,
         pane: String,
-        expected_backend_session_id: Option<String>,
+        _expected_backend_session_id: Option<String>,
         metadata: SessionMeta,
     ) -> Vec<Effect> {
-        if let Some(backend_session_id) = expected_backend_session_id.as_deref()
+        if let Some(backend_session_id) = metadata.backend_session_id.as_deref()
             && let Some(owner) = self.sessions.values().find(|s| {
                 s.id != id
                     && matches!(s.origin, Origin::Local)
@@ -4980,6 +4980,41 @@ mod tests {
         );
         assert!(!state.sessions.contains_key("intruder"));
         assert_eq!(state.sessions["owner"].pane.as_deref(), Some("%1"));
+    }
+
+    #[test]
+    fn register_if_pane_unbound_checks_metadata_backend_session_id() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "owner".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_dup".into()),
+                ..Default::default()
+            },
+        });
+
+        let effects = state.apply(Event::RegisterIfPaneUnbound {
+            id: "intruder".into(),
+            pane: "%2".into(),
+            expected_backend_session_id: Some("ses_expected".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_dup".into()),
+                ..Default::default()
+            },
+        });
+
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::RegisterFailed { session_id, reason }
+                    if session_id == "intruder" && reason.contains("backend_session_id ses_dup")
+            )),
+            "duplicate metadata.backend_session_id must fail atomically, got: {effects:?}"
+        );
+        assert!(!state.sessions.contains_key("intruder"));
     }
 
     #[test]
