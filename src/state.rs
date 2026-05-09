@@ -128,6 +128,32 @@ pub(crate) struct EffectDeliveryFailure {
     reason: String,
 }
 
+#[derive(Debug)]
+enum DeliveryAttemptFailure {
+    Definite(String),
+    Ambiguous(String),
+}
+
+fn prompt_async_failure_reason(
+    decision: crate::nostr_transport::PromptAsyncFallbackDecision,
+) -> String {
+    format!("prompt_async request failed: {decision:?}")
+}
+
+fn http_delivery_attempt_failure(
+    decision: crate::nostr_transport::PromptAsyncFallbackDecision,
+) -> DeliveryAttemptFailure {
+    let reason = prompt_async_failure_reason(decision);
+    match decision {
+        crate::nostr_transport::PromptAsyncFallbackDecision::DefiniteNonAcceptance => {
+            DeliveryAttemptFailure::Definite(reason)
+        }
+        crate::nostr_transport::PromptAsyncFallbackDecision::Ambiguous => {
+            DeliveryAttemptFailure::Ambiguous(reason)
+        }
+    }
+}
+
 /// Central daemon state holding sessions, nodes, and transports.
 pub struct AppState {
     pub config: OuijaConfig,
@@ -731,7 +757,7 @@ impl AppState {
                 } => {
                     let effect_method = delivery_method.as_deref().or(recorded_method);
                     let effect_http_delivery = http_delivery.as_ref().or(recorded_http_delivery);
-                    let result = match effect_method {
+                    let result: Result<(), DeliveryAttemptFailure> = match effect_method {
                         Some("http") => match effect_http_delivery {
                             Some(delivery) => {
                                 crate::tmux::deliver_via_http(
@@ -743,9 +769,11 @@ impl AppState {
                                     delivery.effort.as_deref(),
                                 )
                                 .await
+                                .map_err(http_delivery_attempt_failure)
                             }
-                            None => Err(anyhow::anyhow!(
+                            None => Err(DeliveryAttemptFailure::Definite(
                                 "http delivery skipped: no recorded backend_session_id on send"
+                                    .to_string(),
                             )),
                         },
                         Some("tmux") => {
@@ -753,17 +781,26 @@ impl AppState {
                                 self, session_id, pane, message, *vim_mode,
                             )
                             .await
+                            .map_err(|error| DeliveryAttemptFailure::Definite(error.to_string()))
                         }
                         _ => {
                             crate::tmux::locked_inject(self, session_id, pane, message, *vim_mode)
                                 .await
+                                .map_err(|error| DeliveryAttemptFailure::Definite(error.to_string()))
                         }
                     };
                     if let Err(error) = result {
-                        tracing::warn!(session = %session_id, "message delivery failed: {error}");
-                        delivery_failure.get_or_insert_with(|| EffectDeliveryFailure {
-                            reason: error.to_string(),
-                        });
+                        match error {
+                            DeliveryAttemptFailure::Definite(reason) => {
+                                tracing::warn!(session = %session_id, "message delivery failed: {reason}");
+                                delivery_failure.get_or_insert(EffectDeliveryFailure {
+                                    reason,
+                                });
+                            }
+                            DeliveryAttemptFailure::Ambiguous(reason) => {
+                                tracing::warn!(session = %session_id, "message delivery outcome ambiguous; preserving delivered state: {reason}");
+                            }
+                        }
                     }
                 }
                 Effect::DeliverHttpMessage {
@@ -773,7 +810,7 @@ impl AppState {
                     ..
                 } => match Some(http_delivery).or(recorded_http_delivery) {
                     Some(delivery) => {
-                        if let Err(error) = crate::tmux::deliver_via_http(
+                        if let Err(decision) = crate::tmux::deliver_via_http(
                             self,
                             &delivery.backend_session_id,
                             delivery.project_dir.as_deref(),
@@ -783,10 +820,17 @@ impl AppState {
                         )
                         .await
                         {
-                            tracing::warn!(session = %session_id, "http delivery failed: {error}");
-                            delivery_failure.get_or_insert_with(|| EffectDeliveryFailure {
-                                reason: error.to_string(),
-                            });
+                            match http_delivery_attempt_failure(decision) {
+                                DeliveryAttemptFailure::Definite(reason) => {
+                                    tracing::warn!(session = %session_id, "http delivery failed: {reason}");
+                                    delivery_failure.get_or_insert(EffectDeliveryFailure {
+                                        reason,
+                                    });
+                                }
+                                DeliveryAttemptFailure::Ambiguous(reason) => {
+                                    tracing::warn!(session = %session_id, "http delivery outcome ambiguous; preserving delivered state: {reason}");
+                                }
+                            }
                         }
                     }
                     None => {
@@ -2601,6 +2645,171 @@ pub(crate) mod tests {
         assert!(failure.is_some());
         assert_eq!(broadcasts.load(Ordering::SeqCst), 1);
         assert_eq!(failure_acks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_effects_does_not_rewrite_ack_after_ambiguous_http_inject_failure() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingTransport {
+            success_acks: StdArc<AtomicUsize>,
+            failure_acks: StdArc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::transport::Transport for CountingTransport {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
+            async fn broadcast(&self, msg: &crate::protocol::WireMessage) -> bool {
+                match msg {
+                    crate::protocol::WireMessage::SessionSendAck {
+                        delivered: true, ..
+                    } => {
+                        self.success_acks.fetch_add(1, Ordering::SeqCst);
+                    }
+                    crate::protocol::WireMessage::SessionSendAck {
+                        delivered: false, ..
+                    } => {
+                        self.failure_acks.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+                true
+            }
+
+            async fn connect(
+                &self,
+                _ticket: &str,
+                _state: Arc<AppState>,
+                _wait: bool,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn ticket_string(&self) -> Option<String> {
+                None
+            }
+
+            async fn regenerate(
+                &self,
+                _config_dir: &std::path::Path,
+                _data_dir: &std::path::Path,
+            ) -> anyhow::Result<String> {
+                Ok("ticket".into())
+            }
+
+            fn endpoint_id(&self) -> Option<String> {
+                None
+            }
+
+            fn is_ready(&self) -> bool {
+                true
+            }
+
+            fn transport_name(&self) -> &'static str {
+                "counting"
+            }
+        }
+
+        async fn prompt_async() -> StatusCode {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route("/session/{session_id}/prompt_async", post(prompt_async));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = test_config();
+        config.port = port.checked_sub(320).unwrap();
+        let state = AppState::new(config);
+        let success_acks = StdArc::new(AtomicUsize::new(0));
+        let failure_acks = StdArc::new(AtomicUsize::new(0));
+        state
+            .add_transport(StdArc::new(CountingTransport {
+                success_acks: success_acks.clone(),
+                failure_acks: failure_acks.clone(),
+            }))
+            .await;
+        let effects = vec![
+            crate::daemon_protocol::Effect::InjectMessage {
+                session_id: "oc".into(),
+                pane: "%1".into(),
+                message: "hello".into(),
+                vim_mode: false,
+                delivery_method: Some("http".into()),
+                http_delivery: Some(crate::daemon_protocol::HttpDeliverySnapshot {
+                    backend_session_id: "ses_live".into(),
+                    project_dir: None,
+                    model: None,
+                    effort: None,
+                }),
+                pending_reply_msg_id: None,
+                pending_reply_from: None,
+            },
+            crate::daemon_protocol::Effect::Broadcast(
+                crate::protocol::WireMessage::SessionSendAck {
+                    from: "remote".into(),
+                    to: "oc".into(),
+                    delivered: true,
+                    daemon_id: "remote-daemon".into(),
+                },
+            ),
+        ];
+
+        let failure = state.execute_effects(&effects).await;
+
+        assert!(failure.is_none(), "500 response is ambiguous, got {failure:?}");
+        assert_eq!(success_acks.load(Ordering::SeqCst), 1);
+        assert_eq!(failure_acks.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn execute_effects_suppresses_ambiguous_deliver_http_message_failure() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+
+        async fn prompt_async() -> StatusCode {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route("/session/{session_id}/prompt_async", post(prompt_async));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = test_config();
+        config.port = port.checked_sub(320).unwrap();
+        let state = AppState::new(config);
+        let effects = vec![crate::daemon_protocol::Effect::DeliverHttpMessage {
+            session_id: "oc".into(),
+            message: "hello".into(),
+            http_delivery: crate::daemon_protocol::HttpDeliverySnapshot {
+                backend_session_id: "ses_live".into(),
+                project_dir: None,
+                model: None,
+                effort: None,
+            },
+            pending_reply_msg_id: None,
+            pending_reply_from: None,
+        }];
+
+        let failure = state.execute_effects(&effects).await;
+
+        assert!(failure.is_none(), "500 response is ambiguous, got {failure:?}");
+        server.abort();
     }
 
     #[tokio::test]

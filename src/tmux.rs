@@ -531,7 +531,7 @@ pub async fn locked_inject(
             // call deliver_via_http directly.
             match oc_session_id {
                 Some(sid) => {
-                    if let Err(e) = deliver_via_http(
+                    if let Err(decision) = deliver_via_http(
                         state,
                         &sid,
                         project_dir.as_deref(),
@@ -541,7 +541,7 @@ pub async fn locked_inject(
                     )
                     .await
                     {
-                        tracing::warn!(session = %session_id, "http delivery failed: {e}");
+                        tracing::warn!(session = %session_id, ?decision, "http delivery failed");
                     }
                 }
                 None => {
@@ -630,7 +630,7 @@ pub(crate) async fn deliver_via_http(
     message: &str,
     model: Option<&str>,
     effort: Option<&str>,
-) -> anyhow::Result<()> {
+) -> Result<(), crate::nostr_transport::PromptAsyncFallbackDecision> {
     let port = state.opencode_serve_port();
 
     let client = state.http_client.clone();
@@ -644,15 +644,26 @@ pub(crate) async fn deliver_via_http(
     if let Some(dir) = project_dir {
         req = req.header("x-opencode-directory", dir);
     }
-    let resp = req.send().await.context("prompt_async request failed")?;
+    let resp = match req.send().await {
+        Ok(resp) => resp,
+        Err(error) => {
+            return Err(crate::nostr_transport::classify_prompt_async_fallback(
+                crate::nostr_transport::PromptAsyncFailure::Request(&error),
+            ));
+        }
+    };
 
     let status = resp.status();
     if status.is_success() {
         tracing::info!(port, "delivered message via prompt_async");
         Ok(())
     } else {
+        let decision = crate::nostr_transport::classify_prompt_async_fallback(
+            crate::nostr_transport::PromptAsyncFailure::Status(status),
+        );
         let text = resp.text().await.unwrap_or_default();
-        bail!("prompt_async returned {status}: {text}");
+        tracing::warn!(%status, %text, ?decision, "prompt_async returned non-success");
+        Err(decision)
     }
 }
 

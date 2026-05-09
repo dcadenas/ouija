@@ -1085,6 +1085,7 @@ async fn deliver_http_message(
         delivery.effort.as_deref(),
     )
     .await
+    .map_err(|decision| anyhow::anyhow!("prompt_async request failed: {decision:?}"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1567,16 +1568,19 @@ async fn compact_inner(
                 .await
                 {
                     Ok(()) => true,
-                    Err(e) => {
+                    Err(decision) => {
                         tracing::warn!(
                             session = %session_id,
-                            "continuation delivery failed after successful summarize: {e}"
+                            ?decision,
+                            "continuation delivery failed after successful summarize"
                         );
                         return (
                             StatusCode::OK,
                             compact_success_body(
                                 false,
-                                Some(format!("opencode continuation delivery failed: {e}")),
+                                Some(format!(
+                                    "opencode continuation delivery failed: {decision:?}"
+                                )),
                             ),
                         );
                     }
@@ -2692,9 +2696,6 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
     let result = match http_delivery {
         Some(delivery) => match deliver_pending_prompt_via_http(state, &delivery, &prompt).await {
             Ok(()) => Ok(()),
-            Err(decision) if decision.should_try_raw_tmux() => Err(anyhow::anyhow!(
-                "prompt_async failure confirmed prompt was not accepted"
-            )),
             Err(crate::nostr_transport::PromptAsyncFallbackDecision::Ambiguous) => {
                 tracing::warn!(
                     "readiness prompt HTTP delivery failed ambiguously for {session_name}; not retrying via raw tmux"
@@ -2702,7 +2703,9 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
                 return false;
             }
             Err(crate::nostr_transport::PromptAsyncFallbackDecision::DefiniteNonAcceptance) => {
-                unreachable!("definite non-acceptance is handled by the guard above")
+                Err(anyhow::anyhow!(
+                    "prompt_async failure confirmed prompt was not accepted"
+                ))
             }
         },
         None => {
