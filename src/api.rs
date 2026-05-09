@@ -2989,6 +2989,10 @@ pub async fn backend_session_ready(
     axum::extract::Path(backend_sid): axum::extract::Path<String>,
     body_bytes: Bytes,
 ) -> Json<serde_json::Value> {
+    if let Some(error) = validate_backend_session_id_boundary(&backend_sid) {
+        return Json(json!({"delivered": false, "error": error}));
+    }
+
     // Parse the body as optional hints. An empty body, `{}`, or malformed
     // JSON all degrade cleanly to "no hints" — older plugin builds POST an
     // empty body, and we must not 400 them.
@@ -3052,6 +3056,10 @@ async fn backend_session_ready_inner_with_hints(
     backend_sid: String,
     hints: BackendSessionReadyHints,
 ) -> serde_json::Value {
+    if let Some(error) = validate_backend_session_id_boundary(&backend_sid) {
+        return json!({"delivered": false, "error": error});
+    }
+
     // Step 1: direct lookup. This runs FIRST regardless of hints — hub-
     // spawned and previously-adopted sessions must win over any hint-derived
     // id, or a stale plugin cwd could shadow the real session.
@@ -3172,6 +3180,17 @@ async fn backend_session_ready_inner_with_hints(
         "backend session ready complete"
     );
     json!({"delivered": delivered, "session": name})
+}
+
+fn validate_backend_session_id_boundary(backend_sid: &str) -> Option<String> {
+    if backend_sid
+        .chars()
+        .any(|c| matches!(c, '/' | '?' | '#') || c.is_whitespace())
+    {
+        Some("invalid backend_session_id".into())
+    } else {
+        None
+    }
 }
 
 /// Auto-provision a fresh session record for an opencode backend session that
@@ -6480,6 +6499,43 @@ mod tests {
             Some("prebound"),
             "direct lookup must surface the session id, got: {response}"
         );
+    }
+
+    #[tokio::test]
+    async fn backend_session_ready_rejects_backend_session_id_path_separators() {
+        let state = crate::state::AppState::new_for_test();
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/local-project", "%31")];
+        let hints = BackendSessionReadyHints {
+            pane: Some("%31".into()),
+            cwd: Some("/tmp/local-project".into()),
+        };
+
+        let response =
+            backend_session_ready_inner_with_hints(&state, "ses_bad/../../x".into(), hints).await;
+
+        assert_eq!(response["delivered"], false);
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("invalid backend_session_id"),
+            "expected validation error, got: {response}"
+        );
+        assert!(
+            state.protocol.read().await.sessions.is_empty(),
+            "invalid backend_session_id must be rejected before auto-provision"
+        );
+    }
+
+    #[test]
+    fn backend_session_id_boundary_rejects_url_delimiters_and_whitespace() {
+        for backend_sid in ["ses/bad", "ses?bad", "ses#bad", "ses bad", "ses\tbad"] {
+            assert!(
+                validate_backend_session_id_boundary(backend_sid).is_some(),
+                "{backend_sid:?} must be rejected"
+            );
+        }
+        assert!(validate_backend_session_id_boundary("ses_good-123").is_none());
     }
 
     #[tokio::test]
