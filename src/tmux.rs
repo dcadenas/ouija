@@ -375,7 +375,7 @@ fn inject_text(
     message: &str,
     config: &crate::backend::InjectConfig,
 ) -> anyhow::Result<()> {
-    let sanitized = message.replace('\n', " ");
+    let sanitized = sanitize_injection_text(message);
 
     let paste_content = if config.use_inner_bracketed_paste {
         // Wrap in bracketed paste sequences so the TUI treats it as pasted text
@@ -424,6 +424,16 @@ fn inject_text(
     }
 
     Ok(())
+}
+
+fn sanitize_injection_text(message: &str) -> String {
+    message
+        .replace('\n', " ")
+        .replace("\x1b[200~", "")
+        .replace("\x1b[201~", "")
+        .chars()
+        .filter(|c| !matches!(c, '\x1b' | '\u{9b}' | '\r'))
+        .collect()
 }
 
 /// A queued injection request sent to the per-pane background worker.
@@ -786,6 +796,17 @@ mod tests {
             );
             i += 2;
         }
+    }
+
+    #[test]
+    fn sanitize_injection_text_strips_escape_and_carriage_return_bytes() {
+        let sanitized = sanitize_injection_text("prefix\x1b[201~/quit\rsuffix");
+
+        assert!(!sanitized.contains('\x1b'));
+        assert!(!sanitized.contains('\u{9b}'));
+        assert!(!sanitized.contains('\r'));
+        assert!(!sanitized.contains("[201~"));
+        assert_eq!(sanitized, "prefix/quitsuffix");
     }
 
     #[test]
