@@ -432,7 +432,11 @@ fn sanitize_injection_text(message: &str) -> String {
         .replace("\x1b[200~", "")
         .replace("\x1b[201~", "")
         .chars()
-        .filter(|c| !matches!(c, '\x1b' | '\u{9b}' | '\r'))
+        .filter_map(|c| match c {
+            '\t' => Some(' '),
+            c if c <= '\u{1f}' || ('\u{7f}'..='\u{9f}').contains(&c) => None,
+            c => Some(c),
+        })
         .collect()
 }
 
@@ -818,6 +822,19 @@ mod tests {
         assert!(!sanitized.contains('\r'));
         assert!(!sanitized.contains("[201~"));
         assert_eq!(sanitized, "prefix/quitsuffix");
+    }
+
+    #[test]
+    fn sanitize_injection_text_neutralizes_other_c0_and_c1_controls() {
+        let sanitized = sanitize_injection_text("alpha\0\x07\x08beta\tgamma\u{7f}\u{85}omega");
+
+        assert_eq!(sanitized, "alphabeta gammaomega");
+        assert!(
+            !sanitized.chars().any(|c| {
+                c <= '\u{1f}' || ('\u{7f}'..='\u{9f}').contains(&c)
+            }),
+            "sanitized text still contains C0/C1 controls: {sanitized:?}"
+        );
     }
 
     #[test]
