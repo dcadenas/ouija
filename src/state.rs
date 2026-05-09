@@ -3327,7 +3327,7 @@ pub(crate) mod tests {
         async fn prompt_async(AxumState(gate): AxumState<Gate>) -> StatusCode {
             gate.started.notify_one();
             gate.release.notified().await;
-            StatusCode::BAD_GATEWAY
+            StatusCode::NOT_FOUND
         }
 
         let gate = Gate {
