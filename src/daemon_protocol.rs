@@ -957,9 +957,33 @@ impl DaemonState {
         &mut self,
         id: String,
         pane: String,
-        _expected_backend_session_id: Option<String>,
+        expected_backend_session_id: Option<String>,
         metadata: SessionMeta,
     ) -> Vec<Effect> {
+        if let Some(expected_backend_session_id) = expected_backend_session_id.as_deref()
+            && let Some(existing) = self.sessions.get(&id)
+            && existing.metadata.backend_session_id.as_deref() != Some(expected_backend_session_id)
+        {
+            let actual = existing
+                .metadata
+                .backend_session_id
+                .as_deref()
+                .unwrap_or("<none>");
+            let reason = format!(
+                "session '{id}' is bound to backend_session_id {actual}, expected backend_session_id {expected_backend_session_id}"
+            );
+            return vec![
+                Effect::Log {
+                    level: LogLevel::Warn,
+                    message: format!("refusing guarded registration for '{id}': {reason}"),
+                },
+                Effect::RegisterFailed {
+                    session_id: id,
+                    reason,
+                },
+            ];
+        }
+
         if let Some(backend_session_id) = metadata.backend_session_id.as_deref()
             && let Some(owner) = self.sessions.values().find(|s| {
                 s.id != id
@@ -5015,6 +5039,43 @@ mod tests {
             "duplicate metadata.backend_session_id must fail atomically, got: {effects:?}"
         );
         assert!(!state.sessions.contains_key("intruder"));
+    }
+
+    #[test]
+    fn register_if_pane_unbound_rejects_stale_expected_backend_for_existing_id() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "local-oc".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_old".into()),
+                ..Default::default()
+            },
+        });
+
+        let effects = state.apply(Event::RegisterIfPaneUnbound {
+            id: "local-oc".into(),
+            pane: "%2".into(),
+            expected_backend_session_id: Some("ses_new".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_new".into()),
+                ..Default::default()
+            },
+        });
+
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::RegisterFailed { session_id, reason }
+                    if session_id == "local-oc" && reason.contains("expected backend_session_id ses_new")
+            )),
+            "stale expected backend_session_id must fail atomically, got: {effects:?}"
+        );
+        let session = &state.sessions["local-oc"];
+        assert_eq!(session.pane.as_deref(), Some("%1"));
+        assert_eq!(session.metadata.backend_session_id.as_deref(), Some("ses_old"));
     }
 
     #[test]
