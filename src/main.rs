@@ -1160,25 +1160,18 @@ async fn restore_persisted_sessions(state: &state::AppState) {
             id: ps.id.clone(),
             pane: ps.pane.clone(),
             origin: crate::daemon_protocol::Origin::Local,
-            metadata: crate::daemon_protocol::SessionMeta {
-                project_dir: ps.metadata.project_dir.clone(),
-                role: ps.metadata.role.clone(),
-                bulletin: ps.metadata.bulletin.clone(),
-                networked: ps.metadata.networked,
-                worktree: ps.metadata.worktree,
-                vim_mode: ps.metadata.vim_mode,
-                backend_session_id: ps.metadata.backend_session_id.clone(),
-                backend: ps.metadata.backend.clone(),
-                project_description: ps.metadata.project_description.clone(),
-                last_metadata_update: ps.metadata.last_metadata_update.map(|dt| dt.timestamp()),
-                model: ps.metadata.model.clone(),
-                ..Default::default()
-            },
+            metadata: metadata_for_restored_session(&ps.metadata),
             ..Default::default()
         };
         proto.sessions.insert(ps.id.clone(), entry);
     }
     tracing::info!("restored {} persisted sessions", alive.len());
+}
+
+fn metadata_for_restored_session(
+    metadata: &state::SessionMetadata,
+) -> crate::daemon_protocol::SessionMeta {
+    crate::daemon_protocol::metadata_to_session_meta(Some(metadata))
 }
 
 async fn register_human_sessions(state: &state::AppState) {
@@ -2160,6 +2153,57 @@ mod tests {
         assert!(projected["sessions"][0].get("prompt").is_none());
         assert!(projected["sessions"][0].get("reminder").is_none());
         assert!(projected["sessions"][0].get("backend_session_id").is_none());
+    }
+
+    #[test]
+    fn metadata_for_restored_session_preserves_persisted_fields() {
+        let metadata = crate::state::SessionMetadata {
+            project_dir: Some("/tmp/project".into()),
+            role: Some("worker".into()),
+            bulletin: Some("busy".into()),
+            networked: false,
+            worktree: true,
+            vim_mode: true,
+            backend_session_id: Some("ses_old".into()),
+            backend: Some("opencode".into()),
+            opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+            restart_generation: 9,
+            project_description: Some("project".into()),
+            last_metadata_update: chrono::DateTime::from_timestamp(1_700_000_001, 0),
+            model: Some("openrouter/sonnet".into()),
+            effort: Some("high".into()),
+            reminder: Some("keep going".into()),
+            prompt: Some("initial prompt".into()),
+            iteration: 4,
+            iteration_log: vec![],
+            last_iteration_at: Some(1_700_000_002),
+            on_fire: Some(crate::scheduler::OnFire::ContinueSession),
+            worktree_present: Some(true),
+        };
+
+        let restored = metadata_for_restored_session(&metadata);
+
+        assert_eq!(restored.project_dir, metadata.project_dir);
+        assert_eq!(restored.role, metadata.role);
+        assert_eq!(restored.bulletin, metadata.bulletin);
+        assert_eq!(restored.networked, metadata.networked);
+        assert_eq!(restored.worktree, metadata.worktree);
+        assert_eq!(restored.vim_mode, metadata.vim_mode);
+        assert_eq!(restored.backend_session_id, metadata.backend_session_id);
+        assert_eq!(restored.backend, metadata.backend);
+        assert_eq!(restored.opencode_binding, metadata.opencode_binding);
+        assert_eq!(restored.restart_generation, metadata.restart_generation);
+        assert_eq!(restored.project_description, metadata.project_description);
+        assert_eq!(restored.last_metadata_update, Some(1_700_000_001));
+        assert_eq!(restored.model, metadata.model);
+        assert_eq!(restored.effort, metadata.effort);
+        assert_eq!(restored.reminder, metadata.reminder);
+        assert_eq!(restored.prompt, metadata.prompt);
+        assert_eq!(restored.iteration, metadata.iteration);
+        assert_eq!(restored.iteration_log, metadata.iteration_log);
+        assert_eq!(restored.last_iteration_at, metadata.last_iteration_at);
+        assert_eq!(restored.on_fire, metadata.on_fire);
+        assert_eq!(restored.worktree_present, metadata.worktree_present);
     }
 
     #[test]

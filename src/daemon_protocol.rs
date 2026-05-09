@@ -647,7 +647,9 @@ pub(crate) fn metadata_to_session_meta_for_test(m: &crate::state::SessionMetadat
     metadata_to_session_meta(Some(m))
 }
 
-fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>) -> SessionMeta {
+pub(crate) fn metadata_to_session_meta(
+    m: Option<&crate::state::SessionMetadata>,
+) -> SessionMeta {
     match m {
         Some(m) => SessionMeta {
             project_dir: m.project_dir.clone(),
