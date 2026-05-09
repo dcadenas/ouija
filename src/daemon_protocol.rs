@@ -345,6 +345,7 @@ pub enum Event {
         id: String,
         backend: String,
         backend_session_id: String,
+        expected_backend_session_id: Option<String>,
     },
     ReapDead {
         dead_ids: Vec<String>,
@@ -779,7 +780,13 @@ impl DaemonState {
                 id,
                 backend,
                 backend_session_id,
-            } => self.apply_adopt_backend(&id, backend, backend_session_id),
+                expected_backend_session_id,
+            } => self.apply_adopt_backend(
+                &id,
+                backend,
+                backend_session_id,
+                expected_backend_session_id,
+            ),
             Event::ReapDead { dead_ids } => self.apply_reap(dead_ids),
             Event::IncomingWire { msg, sender_npub } => self.apply_incoming_wire(msg, sender_npub),
             Event::Send {
@@ -1391,11 +1398,26 @@ impl DaemonState {
         id: &str,
         backend: String,
         backend_session_id: String,
+        expected_backend_session_id: Option<String>,
     ) -> Vec<Effect> {
-        let session = match self.sessions.get_mut(id) {
-            Some(s) if matches!(s.origin, Origin::Local) => s,
+        let current_backend_session_id = match self.sessions.get(id) {
+            Some(s) if matches!(s.origin, Origin::Local) => s.metadata.backend_session_id.clone(),
             _ => return vec![],
         };
+
+        if expected_backend_session_id.as_deref() != current_backend_session_id.as_deref() {
+            return vec![];
+        }
+
+        if self.sessions.values().any(|s| {
+            s.id != id
+                && matches!(s.origin, Origin::Local)
+                && s.metadata.backend_session_id.as_deref() == Some(backend_session_id.as_str())
+        }) {
+            return vec![];
+        }
+
+        let session = self.sessions.get_mut(id).expect("local session checked above");
         session.metadata.backend = Some(backend);
         session.metadata.backend_session_id = Some(backend_session_id);
         let mut effects = vec![Effect::Persist];
@@ -4837,6 +4859,7 @@ mod tests {
             id: "s1".into(),
             backend: "opencode".into(),
             backend_session_id: "ses_abc123".into(),
+            expected_backend_session_id: None,
         });
         let meta = &state.sessions["s1"].metadata;
         assert_eq!(meta.backend.as_deref(), Some("opencode"));
@@ -4870,6 +4893,7 @@ mod tests {
             id: "s1".into(),
             backend: "opencode".into(),
             backend_session_id: "ses_abc".into(),
+            expected_backend_session_id: None,
         });
         assert!(effects.iter().any(|e| matches!(e, Effect::Persist)));
         assert!(
@@ -4894,6 +4918,7 @@ mod tests {
             id: "remote/s1".into(),
             backend: "opencode".into(),
             backend_session_id: "ses_abc".into(),
+            expected_backend_session_id: None,
         });
         assert!(effects.is_empty());
         assert!(
@@ -4911,8 +4936,63 @@ mod tests {
             id: "nope".into(),
             backend: "opencode".into(),
             backend_session_id: "ses_abc".into(),
+            expected_backend_session_id: None,
         });
         assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn adopt_backend_rejects_stale_expected_backend_session_id() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "s1".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_current".into()),
+                ..Default::default()
+            },
+        });
+
+        let effects = state.apply(Event::AdoptBackend {
+            id: "s1".into(),
+            backend: "opencode".into(),
+            backend_session_id: "ses_new".into(),
+            expected_backend_session_id: Some("ses_old".into()),
+        });
+
+        assert!(effects.is_empty());
+        let meta = &state.sessions["s1"].metadata;
+        assert_eq!(meta.backend_session_id.as_deref(), Some("ses_current"));
+    }
+
+    #[test]
+    fn adopt_backend_rejects_duplicate_local_backend_session_id() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "owner".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_taken".into()),
+                ..Default::default()
+            },
+        });
+        state.apply(Event::Register {
+            id: "candidate".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta::default(),
+        });
+
+        let effects = state.apply(Event::AdoptBackend {
+            id: "candidate".into(),
+            backend: "opencode".into(),
+            backend_session_id: "ses_taken".into(),
+            expected_backend_session_id: None,
+        });
+
+        assert!(effects.is_empty());
+        assert!(state.sessions["candidate"].metadata.backend_session_id.is_none());
     }
 
     // --- Register invariant: pane preservation (issue #14) ---

@@ -3723,6 +3723,7 @@ async fn adopt_backend_session_id(
             id: session_id.clone(),
             backend: "opencode".into(),
             backend_session_id: backend_sid.to_string(),
+            expected_backend_session_id: None,
         })
         .await;
 
