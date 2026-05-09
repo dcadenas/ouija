@@ -206,6 +206,7 @@ pub struct AppState {
     /// Maps session_id -> queued readiness prompt.
     pub pending_prompts: std::sync::Mutex<std::collections::HashMap<String, PendingPrompt>>,
     compact_in_progress: std::sync::Mutex<std::collections::HashSet<String>>,
+    soft_restart_in_progress: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 pub(crate) struct CompactInProgressGuard<'a> {
@@ -220,6 +221,21 @@ impl Drop for CompactInProgressGuard<'_> {
             .lock()
             .expect("compact_in_progress mutex poisoned")
             .remove(&self.key);
+    }
+}
+
+pub(crate) struct SoftRestartInProgressGuard<'a> {
+    state: &'a AppState,
+    session_id: String,
+}
+
+impl Drop for SoftRestartInProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.state
+            .soft_restart_in_progress
+            .lock()
+            .expect("soft_restart_in_progress mutex poisoned")
+            .remove(&self.session_id);
     }
 }
 
@@ -468,6 +484,7 @@ impl AppState {
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
             compact_in_progress: std::sync::Mutex::new(std::collections::HashSet::new()),
+            soft_restart_in_progress: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -503,6 +520,7 @@ impl AppState {
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
             compact_in_progress: std::sync::Mutex::new(std::collections::HashSet::new()),
+            soft_restart_in_progress: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -521,6 +539,30 @@ impl AppState {
             state: self,
             key: key.to_string(),
         })
+    }
+
+    pub(crate) fn try_acquire_soft_restart_in_progress(
+        &self,
+        session_id: &str,
+    ) -> Option<SoftRestartInProgressGuard<'_>> {
+        let mut soft_restart_in_progress = self
+            .soft_restart_in_progress
+            .lock()
+            .expect("soft_restart_in_progress mutex poisoned");
+        if !soft_restart_in_progress.insert(session_id.to_string()) {
+            return None;
+        }
+        Some(SoftRestartInProgressGuard {
+            state: self,
+            session_id: session_id.to_string(),
+        })
+    }
+
+    pub(crate) fn is_soft_restart_in_progress(&self, session_id: &str) -> bool {
+        self.soft_restart_in_progress
+            .lock()
+            .expect("soft_restart_in_progress mutex poisoned")
+            .contains(session_id)
     }
 
     /// Resolve the backend for a given session by looking up its metadata.

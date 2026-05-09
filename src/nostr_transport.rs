@@ -2494,6 +2494,10 @@ async fn soft_restart_session(
     effort: Option<&str>,
 ) -> Result<(String, Option<u64>), ()> {
     let port = state.opencode_serve_port();
+    let Some(_soft_restart_guard) = state.try_acquire_soft_restart_in_progress(name) else {
+        tracing::warn!("soft restart: restart already in progress for '{name}'");
+        return Err(());
+    };
 
     // 1. Create a new session on the opencode serve
     let resp = state

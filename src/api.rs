@@ -724,6 +724,12 @@ pub async fn send_msg(
             Json(json!({ "error": format!("cannot send a message to yourself. {hint}") })),
         );
     }
+    if state.is_soft_restart_in_progress(&body.to) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": format!("soft restart is in progress for session '{}'", body.to) })),
+        );
+    }
     let from = body.from.clone();
     let (effects, rollback) = {
         let mut proto = state.protocol.write().await;
@@ -4041,6 +4047,55 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "accepted");
         assert_eq!(body["method"], "http");
+    }
+
+    #[tokio::test]
+    async fn send_to_session_with_soft_restart_in_progress_returns_conflict() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-managed".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_old".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let _guard = state
+            .try_acquire_soft_restart_in_progress("oc-managed")
+            .expect("soft restart guard should be acquired");
+
+        let (status, body) = send_msg(
+            State(state.clone()),
+            Json(SendBody {
+                from: "sender".into(),
+                to: "oc-managed".into(),
+                message: "hello during restart".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("soft restart is in progress"),
+            "expected in-flight restart error, got {body:?}"
+        );
     }
 
     #[tokio::test]
