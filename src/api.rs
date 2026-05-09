@@ -727,7 +727,9 @@ pub async fn send_msg(
     if state.is_soft_restart_in_progress(&body.to) {
         return (
             StatusCode::CONFLICT,
-            Json(json!({ "error": format!("soft restart is in progress for session '{}'", body.to) })),
+            Json(
+                json!({ "error": format!("soft restart is in progress for session '{}'", body.to) }),
+            ),
         );
     }
     let from = body.from.clone();
@@ -761,20 +763,27 @@ pub async fn send_msg(
         return (StatusCode::NOT_FOUND, Json(body));
     }
 
-    if let Err(e) = execute_send_effects_for_api(&state, &effects).await {
-        rollback_failed_delivery(&state, &effects, rollback).await;
-        let method = effects.iter().find_map(|effect| match effect {
-            crate::daemon_protocol::Effect::SendDelivered { method, .. } => Some(method.clone()),
-            _ => None,
-        });
-        let mut body = json!({ "error": e.to_string() });
-        if let Some(method) = method {
-            body["method"] = json!(method);
+    let delivery_outcome = match execute_send_effects_for_api(&state, &effects).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            rollback_failed_delivery(&state, &effects, rollback).await;
+            let method = effects.iter().find_map(|effect| match effect {
+                crate::daemon_protocol::Effect::SendDelivered { method, .. } => {
+                    Some(method.clone())
+                }
+                _ => None,
+            });
+            let mut body = json!({ "error": e.to_string() });
+            if let Some(method) = method {
+                body["method"] = json!(method);
+            }
+            return (StatusCode::BAD_GATEWAY, Json(body));
         }
-        return (StatusCode::BAD_GATEWAY, Json(body));
-    }
+    };
 
-    finalize_successful_delivery(&state, rollback).await;
+    if delivery_outcome == ApiDeliveryOutcome::Accepted {
+        finalize_successful_delivery(&state, rollback).await;
+    }
 
     if let Some((method, msg_id)) = effects.iter().find_map(|e| match e {
         crate::daemon_protocol::Effect::SendDelivered { method, msg_id, .. } => {
@@ -782,7 +791,9 @@ pub async fn send_msg(
         }
         _ => None,
     }) {
-        let status = if method == "http" {
+        let status = if delivery_outcome == ApiDeliveryOutcome::Ambiguous {
+            "unknown"
+        } else if method == "http" {
             "accepted"
         } else {
             "delivered"
@@ -801,6 +812,12 @@ pub async fn send_msg(
             Json(json!({ "error": "unexpected send result" })),
         )
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApiDeliveryOutcome {
+    Accepted,
+    Ambiguous,
 }
 
 struct FailedSendRollback {
@@ -992,7 +1009,7 @@ async fn clear_pending_reply_for_failed_delivery(
 async fn execute_send_effects_for_api(
     state: &SharedState,
     effects: &[crate::daemon_protocol::Effect],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ApiDeliveryOutcome> {
     use crate::daemon_protocol::Effect;
 
     let recorded_method = effects.iter().find_map(|effect| match effect {
@@ -1003,6 +1020,8 @@ async fn execute_send_effects_for_api(
         Effect::SendDelivered { http_delivery, .. } => http_delivery.as_ref(),
         _ => None,
     });
+
+    let mut outcome = ApiDeliveryOutcome::Accepted;
 
     for effect in effects {
         match effect {
@@ -1022,7 +1041,13 @@ async fn execute_send_effects_for_api(
                             "http delivery skipped: no recorded backend_session_id on send"
                         )
                     })?;
-                    deliver_http_message(state, delivery, message).await?
+                    outcome = outcome.combine(
+                        deliver_http_message_outcome(state, delivery, message)
+                            .await
+                            .map_err(|decision| {
+                                anyhow::anyhow!("prompt_async request failed: {decision:?}")
+                            })?,
+                    )
                 }
                 Some("tmux") => {
                     tmux::locked_inject_raw_tmux(state, session_id, pane, message, *vim_mode)
@@ -1045,7 +1070,13 @@ async fn execute_send_effects_for_api(
                             "http delivery skipped: no recorded backend_session_id on send"
                         )
                     })?;
-                deliver_http_message(state, delivery, message).await?;
+                outcome = outcome.combine(
+                    deliver_http_message_outcome(state, delivery, message)
+                        .await
+                        .map_err(|decision| {
+                            anyhow::anyhow!("prompt_async request failed: {decision:?}")
+                        })?,
+                );
             }
             Effect::SendToHuman { npub, message } => {
                 let _ = crate::nostr_transport::send_plain_dm(state, npub, message).await;
@@ -1074,14 +1105,24 @@ async fn execute_send_effects_for_api(
         }
     }
 
-    Ok(())
+    Ok(outcome)
 }
 
-async fn deliver_http_message(
+impl ApiDeliveryOutcome {
+    fn combine(self, other: Self) -> Self {
+        if self == Self::Ambiguous || other == Self::Ambiguous {
+            Self::Ambiguous
+        } else {
+            Self::Accepted
+        }
+    }
+}
+
+async fn deliver_http_message_outcome(
     state: &SharedState,
     delivery: &crate::daemon_protocol::HttpDeliverySnapshot,
     message: &str,
-) -> anyhow::Result<()> {
+) -> Result<ApiDeliveryOutcome, crate::nostr_transport::PromptAsyncFallbackDecision> {
     tmux::deliver_via_http(
         state,
         &delivery.backend_session_id,
@@ -1091,7 +1132,13 @@ async fn deliver_http_message(
         delivery.effort.as_deref(),
     )
     .await
-    .map_err(|decision| anyhow::anyhow!("prompt_async request failed: {decision:?}"))
+    .map(|()| ApiDeliveryOutcome::Accepted)
+    .or_else(|decision| match decision {
+        crate::nostr_transport::PromptAsyncFallbackDecision::Ambiguous => {
+            Ok(ApiDeliveryOutcome::Ambiguous)
+        }
+        crate::nostr_transport::PromptAsyncFallbackDecision::DefiniteNonAcceptance => Err(decision),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -2700,19 +2747,21 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
 
     let used_http_delivery = http_delivery.is_some();
     let result = match http_delivery {
-        Some(delivery) => match deliver_pending_prompt_via_http(state, &delivery, &prompt).await {
-            Ok(()) => Ok(()),
-            Err(crate::nostr_transport::PromptAsyncFallbackDecision::Ambiguous) => {
+        Some(delivery) => match deliver_http_message_outcome(state, &delivery, &prompt).await {
+            Ok(ApiDeliveryOutcome::Accepted) => Ok(()),
+            Ok(ApiDeliveryOutcome::Ambiguous) => {
+                restore_pending_prompt_if_absent(state, session_name, pending);
                 tracing::warn!(
                     "readiness prompt HTTP delivery failed ambiguously for {session_name}; not retrying via raw tmux"
                 );
                 return false;
             }
-            Err(crate::nostr_transport::PromptAsyncFallbackDecision::DefiniteNonAcceptance) => {
-                Err(anyhow::anyhow!(
-                    "prompt_async failure confirmed prompt was not accepted"
-                ))
-            }
+            Err(crate::nostr_transport::PromptAsyncFallbackDecision::DefiniteNonAcceptance) => Err(
+                anyhow::anyhow!("prompt_async failure confirmed prompt was not accepted"),
+            ),
+            Err(crate::nostr_transport::PromptAsyncFallbackDecision::Ambiguous) => unreachable!(
+                "ambiguous prompt_async outcomes are returned as ApiDeliveryOutcome::Ambiguous"
+            ),
         },
         None => {
             deliver_pending_prompt_via_raw_tmux(
@@ -2766,41 +2815,6 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
             tracing::warn!("readiness prompt raw tmux delivery failed for {session_name}: {e}");
             false
         }
-    }
-}
-
-async fn deliver_pending_prompt_via_http(
-    state: &SharedState,
-    delivery: &crate::daemon_protocol::HttpDeliverySnapshot,
-    message: &str,
-) -> Result<(), crate::nostr_transport::PromptAsyncFallbackDecision> {
-    let port = state.opencode_serve_port();
-    let body = crate::nostr_transport::opencode_prompt_body(
-        message,
-        delivery.model.as_deref(),
-        delivery.effort.as_deref(),
-    );
-    let async_url = format!(
-        "http://127.0.0.1:{port}/session/{}/prompt_async",
-        delivery.backend_session_id
-    );
-    let mut req = state
-        .http_client
-        .post(&async_url)
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(10));
-    if let Some(dir) = delivery.project_dir.as_deref() {
-        req = req.header("x-opencode-directory", dir);
-    }
-
-    match req.send().await {
-        Ok(resp) if resp.status().is_success() => Ok(()),
-        Ok(resp) => Err(crate::nostr_transport::classify_prompt_async_fallback(
-            crate::nostr_transport::PromptAsyncFailure::Status(resp.status()),
-        )),
-        Err(error) => Err(crate::nostr_transport::classify_prompt_async_fallback(
-            crate::nostr_transport::PromptAsyncFailure::Request(&error),
-        )),
     }
 }
 
@@ -3507,7 +3521,8 @@ fn auto_provision_register_result(
             crate::daemon_protocol::Effect::RegisterFailed { session_id, .. } if session_id == id
         )
     }) {
-        find_local_session_by_backend_session_id(proto, backend_sid).map(|session| session.id.clone())
+        find_local_session_by_backend_session_id(proto, backend_sid)
+            .map(|session| session.id.clone())
     } else {
         None
     }
@@ -4307,6 +4322,73 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         let proto = state.protocol.read().await;
         assert!(!proto.pending_replies.contains_key("oc-managed"));
+    }
+
+    #[tokio::test]
+    async fn send_ambiguous_http_failure_keeps_pending_reply_and_reports_unknown() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        async fn prompt_async() -> StatusCode {
+            StatusCode::BAD_GATEWAY
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route("/session/{session_id}/prompt_async", post(prompt_async));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-managed".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = send_msg(
+            State(state.clone()),
+            Json(SendBody {
+                from: "sender".into(),
+                to: "oc-managed".into(),
+                message: "hello maybe accepted".into(),
+                expects_reply: true,
+                responds_to: None,
+                done: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "unknown");
+        assert_eq!(body["method"], "http");
+        let proto = state.protocol.read().await;
+        assert!(proto.pending_replies.contains_key("oc-managed"));
+        server.abort();
     }
 
     #[tokio::test]
@@ -5563,7 +5645,14 @@ mod tests {
         let delivered = deliver_pending_prompt(&state, "oc").await;
 
         assert!(!delivered);
-        assert!(!state.pending_prompts.lock().unwrap().contains_key("oc"));
+        assert_eq!(
+            state.pending_prompts.lock().unwrap().get("oc"),
+            Some(&pending_opencode_prompt(
+                "%17",
+                "queued prompt",
+                "ses_ready"
+            ))
+        );
         server.abort();
     }
 
@@ -7367,7 +7456,11 @@ mod tests {
             .pending_replies
             .get("target")
             .expect("sender-b pending reply should remain");
-        assert_eq!(pending.len(), 1, "only matching sender/msg_id must be removed");
+        assert_eq!(
+            pending.len(),
+            1,
+            "only matching sender/msg_id must be removed"
+        );
         assert_eq!(pending[0].from, "sender-b");
         assert_eq!(pending[0].msg_id, 42);
     }
