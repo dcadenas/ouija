@@ -679,6 +679,17 @@ pub(crate) fn metadata_to_session_meta(
     }
 }
 
+pub(crate) fn validate_backend_session_id_boundary(backend_sid: &str) -> Option<String> {
+    if backend_sid
+        .chars()
+        .any(|c| matches!(c, '/' | '?' | '#') || c.is_whitespace())
+    {
+        Some("invalid backend_session_id".into())
+    } else {
+        None
+    }
+}
+
 // --- Implementation ---
 
 impl DaemonState {

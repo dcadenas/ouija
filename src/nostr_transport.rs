@@ -2513,9 +2513,17 @@ async fn soft_restart_session(
             let body: serde_json::Value = r.json().await.map_err(|e| {
                 tracing::warn!("soft restart: failed to parse session response: {e}");
             })?;
-            body["id"].as_str().map(String::from).ok_or_else(|| {
-                tracing::warn!("soft restart: no session id in opencode response");
-            })?
+            body["id"]
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    tracing::warn!("soft restart: no session id in opencode response");
+                })
+                .and_then(|session_id| {
+                    validate_created_opencode_session_id(&session_id).map_err(|error| {
+                        tracing::warn!("soft restart: {error}");
+                    })
+                })?
         }
         Ok(r) => {
             let status = r.status();
@@ -2872,6 +2880,13 @@ fn shared_serve_session_after_attach(
     }
 }
 
+fn validate_created_opencode_session_id(session_id: &str) -> anyhow::Result<String> {
+    if let Some(error) = crate::daemon_protocol::validate_backend_session_id_boundary(session_id) {
+        anyhow::bail!("{error}: {session_id:?}");
+    }
+    Ok(session_id.to_string())
+}
+
 fn previous_backend_session_after_attach(
     session_id: String,
     attach_ready: bool,
@@ -3056,8 +3071,8 @@ async fn setup_shared_serve_session(
     let body: serde_json::Value = resp.json().await?;
     let session_id = body["id"]
         .as_str()
-        .map(String::from)
-        .ok_or_else(|| anyhow::anyhow!("no session id in opencode response"))?;
+        .ok_or_else(|| anyhow::anyhow!("no session id in opencode response"))
+        .and_then(validate_created_opencode_session_id)?;
 
     tracing::info!(
         port,
@@ -4529,6 +4544,20 @@ mod tests {
     fn shared_serve_session_requires_verified_attach() {
         let result = shared_serve_session_after_attach("ses_123".to_string(), false, "%1");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn created_opencode_session_id_rejects_url_delimiters() {
+        for session_id in ["bad/id", "bad?id", "bad#id", "bad id"] {
+            let error = validate_created_opencode_session_id(session_id)
+                .expect_err("invalid created session id must be rejected");
+            assert!(error.to_string().contains("invalid backend_session_id"));
+        }
+
+        assert_eq!(
+            validate_created_opencode_session_id("ses_good-123").unwrap(),
+            "ses_good-123"
+        );
     }
 
     #[test]

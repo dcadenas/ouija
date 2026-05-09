@@ -3203,14 +3203,7 @@ async fn backend_session_ready_inner_with_hints(
 }
 
 fn validate_backend_session_id_boundary(backend_sid: &str) -> Option<String> {
-    if backend_sid
-        .chars()
-        .any(|c| matches!(c, '/' | '?' | '#') || c.is_whitespace())
-    {
-        Some("invalid backend_session_id".into())
-    } else {
-        None
-    }
+    crate::daemon_protocol::validate_backend_session_id_boundary(backend_sid)
 }
 
 /// Auto-provision a fresh session record for an opencode backend session that
