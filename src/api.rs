@@ -1308,20 +1308,12 @@ pub async fn inject(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let session_id = {
         let proto = state.protocol.read().await;
-        match proto
+        proto
             .sessions
             .values()
             .find(|s| s.pane.as_deref() == Some(&body.pane))
             .map(|s| s.id.clone())
-        {
-            Some(id) => id,
-            None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": "no session registered for this pane"})),
-                );
-            }
-        }
+            .unwrap_or_else(|| "__pane_inject_default__".to_string())
     };
     match tmux::locked_inject_raw_tmux(
         &state,
@@ -3956,6 +3948,25 @@ mod tests {
             Json(InjectBody {
                 pane: "%oc".into(),
                 message: "hello raw tmux".into(),
+                vim_mode: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "injected");
+        assert_eq!(body["delivery"], "tmux");
+    }
+
+    #[tokio::test]
+    async fn inject_unregistered_pane_uses_raw_tmux_delivery() {
+        let state = crate::state::AppState::new_for_test();
+
+        let (status, body) = inject(
+            State(state),
+            Json(InjectBody {
+                pane: "%unregistered".into(),
+                message: "hello raw pane".into(),
                 vim_mode: false,
             }),
         )
