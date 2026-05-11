@@ -2168,6 +2168,7 @@ mod tests {
             backend: Some("opencode".into()),
             opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
             restart_generation: 9,
+            session_incarnation: 13,
             project_description: Some("project".into()),
             last_metadata_update: chrono::DateTime::from_timestamp(1_700_000_001, 0),
             model: Some("openrouter/sonnet".into()),
@@ -2193,6 +2194,7 @@ mod tests {
         assert_eq!(restored.backend, metadata.backend);
         assert_eq!(restored.opencode_binding, metadata.opencode_binding);
         assert_eq!(restored.restart_generation, metadata.restart_generation);
+        assert_eq!(restored.session_incarnation, metadata.session_incarnation);
         assert_eq!(restored.project_description, metadata.project_description);
         assert_eq!(restored.last_metadata_update, Some(1_700_000_001));
         assert_eq!(restored.model, metadata.model);

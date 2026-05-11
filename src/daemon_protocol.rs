@@ -102,6 +102,9 @@ pub struct SessionMeta {
     /// Monotonic token used to reject stale async restart commits.
     #[serde(default)]
     pub restart_generation: u64,
+    /// Per-registration token used to reject stale async commits.
+    #[serde(default)]
+    pub session_incarnation: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_description: Option<String>,
     /// Unix timestamp; 0 in model tests.
@@ -276,6 +279,7 @@ impl Default for SessionMeta {
             backend: None,
             opencode_binding: None,
             restart_generation: 0,
+            session_incarnation: 0,
             project_description: None,
             last_metadata_update: None,
             model: None,
@@ -663,6 +667,7 @@ pub(crate) fn metadata_to_session_meta(
             backend: m.backend.clone(),
             opencode_binding: m.opencode_binding.clone(),
             restart_generation: m.restart_generation,
+            session_incarnation: m.session_incarnation,
             project_description: m.project_description.clone(),
             last_metadata_update: m.last_metadata_update.map(|ts| ts.timestamp()),
             model: m.model.clone(),
@@ -892,6 +897,8 @@ impl DaemonState {
         if let Some(existing) = self.sessions.get(&id) {
             metadata.inherit_recurrence_from(&existing.metadata);
         }
+        let now = chrono::Utc::now();
+        metadata.session_incarnation = now.timestamp_nanos_opt().unwrap_or_else(|| now.timestamp());
 
         // Insert session
         let session = SessionEntry {
@@ -899,7 +906,7 @@ impl DaemonState {
             pane: pane.clone(),
             origin: Origin::Local,
             metadata,
-            registered_at: chrono::Utc::now().timestamp(),
+            registered_at: now.timestamp(),
         };
         self.sessions.insert(id.clone(), session);
         effects.push(Effect::Persist);

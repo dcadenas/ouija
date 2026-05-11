@@ -308,6 +308,9 @@ pub struct SessionMetadata {
     /// Monotonic token used to reject stale async restart commits.
     #[serde(default)]
     pub restart_generation: u64,
+    /// Per-registration token used to reject stale async commits.
+    #[serde(default)]
+    pub session_incarnation: i64,
     /// Short project description extracted from Cargo.toml, package.json, or README.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_description: Option<String>,
@@ -384,6 +387,7 @@ impl Default for SessionMetadata {
             backend: None,
             opencode_binding: None,
             restart_generation: 0,
+            session_incarnation: 0,
             project_description: None,
             bulletin: None,
             worktree: false,
@@ -1280,6 +1284,7 @@ impl AppState {
                         backend: m.backend.clone(),
                         opencode_binding: m.opencode_binding.clone(),
                         restart_generation: m.restart_generation,
+                        session_incarnation: m.session_incarnation,
                         project_description: m.project_description.clone(),
                         bulletin: m.bulletin.clone(),
                         worktree: m.worktree,
@@ -3555,6 +3560,7 @@ pub(crate) mod tests {
             backend: Some("opencode".into()),
             opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
             restart_generation: 7,
+            session_incarnation: 11,
             project_description: Some("test project".into()),
             vim_mode: true,
             worktree: true,

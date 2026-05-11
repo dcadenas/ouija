@@ -2383,6 +2383,7 @@ pub async fn restart_session(
                     backend: Some(backend_name.clone()),
                     opencode_binding: opencode_binding.clone(),
                     restart_generation: m.restart_generation.saturating_add(1),
+                    session_incarnation: m.session_incarnation,
                     project_description: m.project_description.clone(),
                     last_metadata_update: None,
                     model: effective_model.clone(),
@@ -2551,10 +2552,13 @@ async fn soft_restart_session(
     //    fallback), but a stale snapshot or a future caller that forgets the
     //    fallback must not silently wipe fields that were set by another
     //    writer between the snapshot and this atomic block.
-    let previous_metadata = {
+    let (owner_snapshot, previous_metadata) = {
         let mut proto = state.protocol.write().await;
         match proto.sessions.get_mut(name) {
-            Some(session) => session.metadata.clone(),
+            Some(session) => (
+                SoftRestartOwnerSnapshot::from_entry(session),
+                session.metadata.clone(),
+            ),
             None => {
                 // Session was removed between the pre-flight snapshot and
                 // this write (concurrent Unregister, racing restart, etc.).
@@ -2594,7 +2598,7 @@ async fn soft_restart_session(
             Ok(true) => {
                 if apply_soft_restart_metadata(
                     state,
-                    name,
+                    &owner_snapshot,
                     &new_session_id,
                     restart_generation,
                     model,
@@ -2655,7 +2659,7 @@ async fn soft_restart_session(
         if pane.is_none() && !metadata_committed {
             if apply_soft_restart_metadata(
                 state,
-                name,
+                &owner_snapshot,
                 &new_session_id,
                 restart_generation,
                 model,
@@ -2752,7 +2756,7 @@ async fn soft_restart_session(
     if !metadata_committed
         && apply_soft_restart_metadata(
             state,
-            name,
+            &owner_snapshot,
             &new_session_id,
             restart_generation,
             model,
@@ -2779,16 +2783,19 @@ async fn soft_restart_session(
 
 async fn apply_soft_restart_metadata(
     state: &AppState,
-    name: &str,
+    owner: &SoftRestartOwnerSnapshot,
     new_session_id: &str,
     expected_restart_generation: u64,
     model: Option<&str>,
     effort: Option<&str>,
 ) -> Result<(), ()> {
     let mut proto = state.protocol.write().await;
-    let Some(session) = proto.sessions.get_mut(name) else {
+    let Some(session) = proto.sessions.get_mut(&owner.session_id) else {
         return Err(());
     };
+    if session.metadata.session_incarnation != owner.incarnation {
+        return Err(());
+    }
     if session.metadata.restart_generation != expected_restart_generation {
         return Err(());
     }
@@ -2804,6 +2811,21 @@ async fn apply_soft_restart_metadata(
     }
     state.persist_protocol_state(&proto);
     Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SoftRestartOwnerSnapshot {
+    session_id: String,
+    incarnation: i64,
+}
+
+impl SoftRestartOwnerSnapshot {
+    fn from_entry(session: &crate::daemon_protocol::SessionEntry) -> Self {
+        Self {
+            session_id: session.id.clone(),
+            incarnation: session.metadata.session_incarnation,
+        }
+    }
 }
 
 async fn restore_soft_restart_metadata(
@@ -4731,6 +4753,7 @@ mod tests {
                         opencode_binding: Some(
                             crate::daemon_protocol::OpenCodeBinding::WeakAdopted,
                         ),
+                        session_incarnation: 1,
                         ..Default::default()
                     },
                     registered_at: 0,
@@ -5285,6 +5308,7 @@ mod tests {
                             crate::daemon_protocol::OpenCodeBinding::StrongManaged,
                         ),
                         restart_generation: 1,
+                        session_incarnation: 1,
                         ..Default::default()
                     },
                     registered_at: 0,
@@ -5292,13 +5316,64 @@ mod tests {
             );
         }
 
-        let result = apply_soft_restart_metadata(&state, "oc", "ses_stale", 0, None, None).await;
+        let owner = SoftRestartOwnerSnapshot {
+            session_id: "oc".into(),
+            incarnation: 1,
+        };
+        let result = apply_soft_restart_metadata(&state, &owner, "ses_stale", 0, None, None).await;
 
         assert!(result.is_err());
         let proto = state.protocol.read().await;
         let metadata = &proto.sessions["oc"].metadata;
         assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_current"));
         assert_eq!(metadata.restart_generation, 1);
+    }
+
+    #[tokio::test]
+    async fn soft_restart_metadata_commit_rejects_recreated_session_with_same_generation() {
+        let state = AppState::new_for_test();
+        let owner = SoftRestartOwnerSnapshot {
+            session_id: "oc".into(),
+            incarnation: 1,
+        };
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: None,
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_recreated".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        restart_generation: 0,
+                        session_incarnation: 2,
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let result = apply_soft_restart_metadata(
+            &state,
+            &owner,
+            "ses_stale",
+            0,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let proto = state.protocol.read().await;
+        let metadata = &proto.sessions["oc"].metadata;
+        assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_recreated"));
+        assert_eq!(metadata.restart_generation, 0);
     }
 
     #[tokio::test]
@@ -5319,6 +5394,7 @@ mod tests {
                             crate::daemon_protocol::OpenCodeBinding::StrongManaged,
                         ),
                         restart_generation: 2,
+                        session_incarnation: 1,
                         ..Default::default()
                     },
                     registered_at: 0,
@@ -5346,6 +5422,7 @@ mod tests {
             model: Some("old-model".into()),
             effort: Some("old-effort".into()),
             restart_generation: 7,
+            session_incarnation: 1,
             ..Default::default()
         };
         {
@@ -5362,7 +5439,11 @@ mod tests {
             );
         }
 
-        apply_soft_restart_metadata(&state, "oc", "ses_new", 7, Some("new-model"), None)
+        let owner = SoftRestartOwnerSnapshot {
+            session_id: "oc".into(),
+            incarnation: 1,
+        };
+        apply_soft_restart_metadata(&state, &owner, "ses_new", 7, Some("new-model"), None)
             .await
             .expect("metadata commit should succeed before simulated prompt failure");
         restore_soft_restart_metadata(&state, "oc", "ses_new", &previous_metadata).await;
