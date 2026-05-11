@@ -1096,12 +1096,17 @@ async fn execute_send_effects_for_api(
                 delivered,
                 transport,
             } => {
+                let delivered = if matches!(outcome, crate::state::DeliveryOutcome::Rejected(_)) {
+                    false
+                } else {
+                    *delivered
+                };
                 state
                     .log_message(
                         from.clone(),
                         to.clone(),
                         message.clone(),
-                        *delivered,
+                        delivered,
                         transport,
                     )
                     .await;
@@ -4198,6 +4203,48 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(body["method"], "http");
         assert!(body["error"].as_str().unwrap().contains("prompt_async"));
+    }
+
+    #[tokio::test]
+    async fn rejected_api_delivery_logs_not_delivered() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-managed".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, _) = send_msg(
+            State(state.clone()),
+            Json(SendBody {
+                from: "sender".into(),
+                to: "oc-managed".into(),
+                message: "hello unreachable http".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let log = state.message_log.read().await;
+        assert_eq!(log.len(), 1);
+        assert!(!log[0].delivered);
     }
 
     #[tokio::test]
