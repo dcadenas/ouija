@@ -128,9 +128,10 @@ pub(crate) struct EffectDeliveryFailure {
     reason: String,
 }
 
-#[derive(Debug)]
-enum DeliveryAttemptFailure {
-    Definite(String),
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DeliveryOutcome {
+    Accepted,
+    Rejected(String),
     Ambiguous(String),
 }
 
@@ -142,14 +143,14 @@ fn prompt_async_failure_reason(
 
 fn http_delivery_attempt_failure(
     decision: crate::nostr_transport::PromptAsyncFallbackDecision,
-) -> DeliveryAttemptFailure {
+) -> DeliveryOutcome {
     let reason = prompt_async_failure_reason(decision);
     match decision {
         crate::nostr_transport::PromptAsyncFallbackDecision::DefiniteNonAcceptance => {
-            DeliveryAttemptFailure::Definite(reason)
+            DeliveryOutcome::Rejected(reason)
         }
         crate::nostr_transport::PromptAsyncFallbackDecision::Ambiguous => {
-            DeliveryAttemptFailure::Ambiguous(reason)
+            DeliveryOutcome::Ambiguous(reason)
         }
     }
 }
@@ -799,49 +800,43 @@ impl AppState {
                 } => {
                     let effect_method = delivery_method.as_deref().or(recorded_method);
                     let effect_http_delivery = http_delivery.as_ref().or(recorded_http_delivery);
-                    let result: Result<(), DeliveryAttemptFailure> = match effect_method {
+                    let outcome = match effect_method {
                         Some("http") => match effect_http_delivery {
-                            Some(delivery) => {
-                                crate::tmux::deliver_via_http(
-                                    self,
-                                    &delivery.backend_session_id,
-                                    delivery.project_dir.as_deref(),
-                                    message,
-                                    delivery.model.as_deref(),
-                                    delivery.effort.as_deref(),
-                                )
-                                .await
-                                .map_err(http_delivery_attempt_failure)
-                            }
-                            None => Err(DeliveryAttemptFailure::Definite(
-                                "http delivery skipped: no recorded backend_session_id on send"
-                                    .to_string(),
-                            )),
-                        },
-                        Some("tmux") => {
-                            crate::tmux::locked_inject_raw_tmux(
-                                self, session_id, pane, message, *vim_mode,
+                            Some(delivery) => crate::tmux::deliver_via_http(
+                                self,
+                                &delivery.backend_session_id,
+                                delivery.project_dir.as_deref(),
+                                message,
+                                delivery.model.as_deref(),
+                                delivery.effort.as_deref(),
                             )
                             .await
-                            .map_err(|error| DeliveryAttemptFailure::Definite(error.to_string()))
-                        }
-                        _ => {
-                            crate::tmux::locked_inject(self, session_id, pane, message, *vim_mode)
-                                .await
-                                .map_err(|error| DeliveryAttemptFailure::Definite(error.to_string()))
-                        }
+                            .map(|()| DeliveryOutcome::Accepted)
+                            .unwrap_or_else(http_delivery_attempt_failure),
+                            None => DeliveryOutcome::Rejected(
+                                "http delivery skipped: no recorded backend_session_id on send"
+                                    .to_string(),
+                            ),
+                        },
+                        Some("tmux") => crate::tmux::locked_inject_raw_tmux(
+                            self, session_id, pane, message, *vim_mode,
+                        )
+                        .await
+                        .map(|()| DeliveryOutcome::Accepted)
+                        .unwrap_or_else(|error| DeliveryOutcome::Rejected(error.to_string())),
+                        _ => crate::tmux::locked_inject(self, session_id, pane, message, *vim_mode)
+                            .await
+                            .map(|()| DeliveryOutcome::Accepted)
+                            .unwrap_or_else(|error| DeliveryOutcome::Rejected(error.to_string())),
                     };
-                    if let Err(error) = result {
-                        match error {
-                            DeliveryAttemptFailure::Definite(reason) => {
-                                tracing::warn!(session = %session_id, "message delivery failed: {reason}");
-                                delivery_failure.get_or_insert(EffectDeliveryFailure {
-                                    reason,
-                                });
-                            }
-                            DeliveryAttemptFailure::Ambiguous(reason) => {
-                                tracing::warn!(session = %session_id, "message delivery outcome ambiguous; preserving delivered state: {reason}");
-                            }
+                    match outcome {
+                        DeliveryOutcome::Accepted => {}
+                        DeliveryOutcome::Rejected(reason) => {
+                            tracing::warn!(session = %session_id, "message delivery failed: {reason}");
+                            delivery_failure.get_or_insert(EffectDeliveryFailure { reason });
+                        }
+                        DeliveryOutcome::Ambiguous(reason) => {
+                            tracing::warn!(session = %session_id, "message delivery outcome ambiguous; preserving delivered state: {reason}");
                         }
                     }
                 }
@@ -863,13 +858,13 @@ impl AppState {
                         .await
                         {
                             match http_delivery_attempt_failure(decision) {
-                                DeliveryAttemptFailure::Definite(reason) => {
+                                DeliveryOutcome::Accepted => {}
+                                DeliveryOutcome::Rejected(reason) => {
                                     tracing::warn!(session = %session_id, "http delivery failed: {reason}");
-                                    delivery_failure.get_or_insert(EffectDeliveryFailure {
-                                        reason,
-                                    });
+                                    delivery_failure
+                                        .get_or_insert(EffectDeliveryFailure { reason });
                                 }
-                                DeliveryAttemptFailure::Ambiguous(reason) => {
+                                DeliveryOutcome::Ambiguous(reason) => {
                                     tracing::warn!(session = %session_id, "http delivery outcome ambiguous; preserving delivered state: {reason}");
                                 }
                             }
@@ -2809,7 +2804,10 @@ pub(crate) mod tests {
 
         let failure = state.execute_effects(&effects).await;
 
-        assert!(failure.is_none(), "500 response is ambiguous, got {failure:?}");
+        assert!(
+            failure.is_none(),
+            "500 response is ambiguous, got {failure:?}"
+        );
         assert_eq!(success_acks.load(Ordering::SeqCst), 1);
         assert_eq!(failure_acks.load(Ordering::SeqCst), 0);
         server.abort();
@@ -2850,7 +2848,10 @@ pub(crate) mod tests {
 
         let failure = state.execute_effects(&effects).await;
 
-        assert!(failure.is_none(), "500 response is ambiguous, got {failure:?}");
+        assert!(
+            failure.is_none(),
+            "500 response is ambiguous, got {failure:?}"
+        );
         server.abort();
     }
 

@@ -781,8 +781,25 @@ pub async fn send_msg(
         }
     };
 
-    if delivery_outcome == ApiDeliveryOutcome::Accepted {
-        finalize_successful_delivery(&state, rollback).await;
+    match &delivery_outcome {
+        crate::state::DeliveryOutcome::Accepted => {
+            finalize_successful_delivery(&state, rollback).await;
+        }
+        crate::state::DeliveryOutcome::Rejected(reason) => {
+            rollback_failed_delivery(&state, &effects, rollback).await;
+            let method = effects.iter().find_map(|effect| match effect {
+                crate::daemon_protocol::Effect::SendDelivered { method, .. } => {
+                    Some(method.clone())
+                }
+                _ => None,
+            });
+            let mut body = json!({ "error": reason });
+            if let Some(method) = method {
+                body["method"] = json!(method);
+            }
+            return (StatusCode::BAD_GATEWAY, Json(body));
+        }
+        crate::state::DeliveryOutcome::Ambiguous(_) => {}
     }
 
     if let Some((method, msg_id)) = effects.iter().find_map(|e| match e {
@@ -791,7 +808,10 @@ pub async fn send_msg(
         }
         _ => None,
     }) {
-        let status = if delivery_outcome == ApiDeliveryOutcome::Ambiguous {
+        let status = if matches!(
+            delivery_outcome,
+            crate::state::DeliveryOutcome::Ambiguous(_)
+        ) {
             "unknown"
         } else if method == "http" {
             "accepted"
@@ -812,12 +832,6 @@ pub async fn send_msg(
             Json(json!({ "error": "unexpected send result" })),
         )
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ApiDeliveryOutcome {
-    Accepted,
-    Ambiguous,
 }
 
 struct FailedSendRollback {
@@ -1009,7 +1023,7 @@ async fn clear_pending_reply_for_failed_delivery(
 async fn execute_send_effects_for_api(
     state: &SharedState,
     effects: &[crate::daemon_protocol::Effect],
-) -> anyhow::Result<ApiDeliveryOutcome> {
+) -> anyhow::Result<crate::state::DeliveryOutcome> {
     use crate::daemon_protocol::Effect;
 
     let recorded_method = effects.iter().find_map(|effect| match effect {
@@ -1021,7 +1035,7 @@ async fn execute_send_effects_for_api(
         _ => None,
     });
 
-    let mut outcome = ApiDeliveryOutcome::Accepted;
+    let mut outcome = crate::state::DeliveryOutcome::Accepted;
 
     for effect in effects {
         match effect {
@@ -1041,12 +1055,9 @@ async fn execute_send_effects_for_api(
                             "http delivery skipped: no recorded backend_session_id on send"
                         )
                     })?;
-                    outcome = outcome.combine(
-                        deliver_http_message_outcome(state, delivery, message)
-                            .await
-                            .map_err(|decision| {
-                                anyhow::anyhow!("prompt_async request failed: {decision:?}")
-                            })?,
+                    outcome = combine_delivery_outcome(
+                        outcome,
+                        deliver_http_message_outcome(state, delivery, message).await,
                     )
                 }
                 Some("tmux") => {
@@ -1070,12 +1081,9 @@ async fn execute_send_effects_for_api(
                             "http delivery skipped: no recorded backend_session_id on send"
                         )
                     })?;
-                outcome = outcome.combine(
-                    deliver_http_message_outcome(state, delivery, message)
-                        .await
-                        .map_err(|decision| {
-                            anyhow::anyhow!("prompt_async request failed: {decision:?}")
-                        })?,
+                outcome = combine_delivery_outcome(
+                    outcome,
+                    deliver_http_message_outcome(state, delivery, message).await,
                 );
             }
             Effect::SendToHuman { npub, message } => {
@@ -1108,12 +1116,21 @@ async fn execute_send_effects_for_api(
     Ok(outcome)
 }
 
-impl ApiDeliveryOutcome {
-    fn combine(self, other: Self) -> Self {
-        if self == Self::Ambiguous || other == Self::Ambiguous {
-            Self::Ambiguous
-        } else {
-            Self::Accepted
+fn combine_delivery_outcome(
+    left: crate::state::DeliveryOutcome,
+    right: crate::state::DeliveryOutcome,
+) -> crate::state::DeliveryOutcome {
+    match (left, right) {
+        (crate::state::DeliveryOutcome::Rejected(reason), _)
+        | (_, crate::state::DeliveryOutcome::Rejected(reason)) => {
+            crate::state::DeliveryOutcome::Rejected(reason)
+        }
+        (crate::state::DeliveryOutcome::Ambiguous(reason), _)
+        | (_, crate::state::DeliveryOutcome::Ambiguous(reason)) => {
+            crate::state::DeliveryOutcome::Ambiguous(reason)
+        }
+        (crate::state::DeliveryOutcome::Accepted, crate::state::DeliveryOutcome::Accepted) => {
+            crate::state::DeliveryOutcome::Accepted
         }
     }
 }
@@ -1122,7 +1139,7 @@ async fn deliver_http_message_outcome(
     state: &SharedState,
     delivery: &crate::daemon_protocol::HttpDeliverySnapshot,
     message: &str,
-) -> Result<ApiDeliveryOutcome, crate::nostr_transport::PromptAsyncFallbackDecision> {
+) -> crate::state::DeliveryOutcome {
     tmux::deliver_via_http(
         state,
         &delivery.backend_session_id,
@@ -1132,12 +1149,18 @@ async fn deliver_http_message_outcome(
         delivery.effort.as_deref(),
     )
     .await
-    .map(|()| ApiDeliveryOutcome::Accepted)
-    .or_else(|decision| match decision {
+    .map(|()| crate::state::DeliveryOutcome::Accepted)
+    .unwrap_or_else(|decision| match decision {
         crate::nostr_transport::PromptAsyncFallbackDecision::Ambiguous => {
-            Ok(ApiDeliveryOutcome::Ambiguous)
+            crate::state::DeliveryOutcome::Ambiguous(format!(
+                "prompt_async request failed: {decision:?}"
+            ))
         }
-        crate::nostr_transport::PromptAsyncFallbackDecision::DefiniteNonAcceptance => Err(decision),
+        crate::nostr_transport::PromptAsyncFallbackDecision::DefiniteNonAcceptance => {
+            crate::state::DeliveryOutcome::Rejected(format!(
+                "prompt_async request failed: {decision:?}"
+            ))
+        }
     })
 }
 
@@ -2748,20 +2771,15 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
     let used_http_delivery = http_delivery.is_some();
     let result = match http_delivery {
         Some(delivery) => match deliver_http_message_outcome(state, &delivery, &prompt).await {
-            Ok(ApiDeliveryOutcome::Accepted) => Ok(()),
-            Ok(ApiDeliveryOutcome::Ambiguous) => {
+            crate::state::DeliveryOutcome::Accepted => Ok(()),
+            crate::state::DeliveryOutcome::Ambiguous(_) => {
                 restore_pending_prompt_if_absent(state, session_name, pending);
                 tracing::warn!(
                     "readiness prompt HTTP delivery failed ambiguously for {session_name}; not retrying via raw tmux"
                 );
                 return false;
             }
-            Err(crate::nostr_transport::PromptAsyncFallbackDecision::DefiniteNonAcceptance) => Err(
-                anyhow::anyhow!("prompt_async failure confirmed prompt was not accepted"),
-            ),
-            Err(crate::nostr_transport::PromptAsyncFallbackDecision::Ambiguous) => unreachable!(
-                "ambiguous prompt_async outcomes are returned as ApiDeliveryOutcome::Ambiguous"
-            ),
+            crate::state::DeliveryOutcome::Rejected(reason) => Err(anyhow::anyhow!(reason)),
         },
         None => {
             deliver_pending_prompt_via_raw_tmux(
@@ -4192,8 +4210,10 @@ mod tests {
 
         let result = execute_send_effects_for_api(&state, &effects).await;
 
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("prompt_async"));
+        assert!(matches!(
+            result,
+            Ok(crate::state::DeliveryOutcome::Rejected(reason)) if reason.contains("prompt_async")
+        ));
     }
 
     #[tokio::test]

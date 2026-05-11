@@ -2694,7 +2694,7 @@ async fn soft_restart_session(
             full_text
         };
 
-        if let Err(e) = deliver_soft_restart_prompt(
+        match deliver_soft_restart_prompt(
             state,
             port,
             &new_session_id,
@@ -2705,38 +2705,47 @@ async fn soft_restart_session(
         )
         .await
         {
-            tracing::warn!("soft restart: prompt_async failed for {new_session_id}: {e}");
-            if let (Some(pane), Some(previous_session_id)) = (
-                pane,
-                previous_backend_session_for_prompt_failure_rollback(pane, &previous_metadata),
-            ) {
-                match respawn_opencode_attach_for_session(
-                    pane,
-                    project_dir,
-                    previous_session_id,
-                    port,
-                    name,
-                )
-                .await
-                {
-                    Ok(true) => {}
-                    Ok(false) => tracing::warn!(
-                        "soft restart: failed to reattach pane {pane} to previous opencode session after prompt_async failure"
-                    ),
-                    Err(error) => tracing::warn!(
-                        "soft restart: failed to roll back pane {pane} to previous opencode session after prompt_async failure: {error}"
-                    ),
-                }
+            crate::state::DeliveryOutcome::Accepted => {}
+            crate::state::DeliveryOutcome::Ambiguous(reason) => {
+                tracing::warn!(
+                    "soft restart: prompt_async outcome ambiguous for {new_session_id}; preserving restart metadata: {reason}"
+                );
             }
-            delete_opencode_session(
-                &state.http_client,
-                port,
-                &new_session_id,
-                "soft restart cleanup",
-            )
-            .await;
-            restore_soft_restart_metadata(state, name, &new_session_id, &previous_metadata).await;
-            return Err(());
+            crate::state::DeliveryOutcome::Rejected(reason) => {
+                tracing::warn!("soft restart: prompt_async failed for {new_session_id}: {reason}");
+                if let (Some(pane), Some(previous_session_id)) = (
+                    pane,
+                    previous_backend_session_for_prompt_failure_rollback(pane, &previous_metadata),
+                ) {
+                    match respawn_opencode_attach_for_session(
+                        pane,
+                        project_dir,
+                        previous_session_id,
+                        port,
+                        name,
+                    )
+                    .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => tracing::warn!(
+                            "soft restart: failed to reattach pane {pane} to previous opencode session after prompt_async failure"
+                        ),
+                        Err(error) => tracing::warn!(
+                            "soft restart: failed to roll back pane {pane} to previous opencode session after prompt_async failure: {error}"
+                        ),
+                    }
+                }
+                delete_opencode_session(
+                    &state.http_client,
+                    port,
+                    &new_session_id,
+                    "soft restart cleanup",
+                )
+                .await;
+                restore_soft_restart_metadata(state, name, &new_session_id, &previous_metadata)
+                    .await;
+                return Err(());
+            }
         }
     }
 
@@ -2888,7 +2897,7 @@ async fn deliver_soft_restart_prompt(
     message: &str,
     model: Option<&str>,
     effort: Option<&str>,
-) -> anyhow::Result<()> {
+) -> crate::state::DeliveryOutcome {
     let body = opencode_prompt_body(message, model, effort);
     let async_url = format!("http://127.0.0.1:{port}/session/{session_id}/prompt_async");
     let resp = state
@@ -2905,26 +2914,34 @@ async fn deliver_soft_restart_prompt(
             let status = resp.status();
             let decision = classify_prompt_async_fallback(PromptAsyncFailure::Status(status));
             if decision.should_try_raw_tmux() {
-                anyhow::bail!("prompt_async returned {status}");
+                return crate::state::DeliveryOutcome::Rejected(format!(
+                    "prompt_async returned {status}"
+                ));
             }
             tracing::warn!(
                 "soft restart: prompt_async status {status} is ambiguous; not retrying restart prompt"
             );
-            return Ok(());
+            return crate::state::DeliveryOutcome::Ambiguous(format!(
+                "prompt_async returned {status}"
+            ));
         }
         Err(error) => {
             let decision = classify_prompt_async_fallback(PromptAsyncFailure::Request(&error));
             if decision.should_try_raw_tmux() {
-                return Err(anyhow::anyhow!("prompt_async request failed: {error}"));
+                return crate::state::DeliveryOutcome::Rejected(format!(
+                    "prompt_async request failed: {error}"
+                ));
             }
             tracing::warn!(
                 "soft restart: prompt_async request failure is ambiguous; not retrying restart prompt: {error}"
             );
-            return Ok(());
+            return crate::state::DeliveryOutcome::Ambiguous(format!(
+                "prompt_async request failed: {error}"
+            ));
         }
     }
     tracing::info!("soft restart: delivered prompt to {session_id} via prompt_async");
-    Ok(())
+    crate::state::DeliveryOutcome::Accepted
 }
 
 /// Health-check the externally running opencode serve, create a session on it,
@@ -4941,7 +4958,7 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
+        assert!(matches!(result, crate::state::DeliveryOutcome::Rejected(_)));
         server.abort();
     }
 
@@ -4983,7 +5000,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok());
+        assert!(matches!(
+            result,
+            crate::state::DeliveryOutcome::Ambiguous(_)
+        ));
         server.abort();
     }
 
@@ -5040,7 +5060,10 @@ mod tests {
         .await;
 
         assert!(saw_prompt_body.load(Ordering::SeqCst));
-        assert!(result.is_ok());
+        assert!(matches!(
+            result,
+            crate::state::DeliveryOutcome::Ambiguous(_)
+        ));
         server.await.unwrap();
     }
 
