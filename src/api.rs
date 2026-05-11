@@ -3381,6 +3381,20 @@ async fn auto_provision_with_explicit_pane(
         }
     }
 
+    let Some(backend_dir) = lookup_opencode_session_dir(state, backend_sid).await else {
+        tracing::warn!(
+            "auto-provision declined: backend_session_id {backend_sid} is unknown to opencode serve"
+        );
+        return None;
+    };
+    let backend_dir = crate::state::resolve_project_root(&backend_dir);
+    if backend_dir != dir {
+        tracing::warn!(
+            "auto-provision declined: backend_session_id {backend_sid} belongs to dir {backend_dir}, not hinted cwd {dir}"
+        );
+        return None;
+    }
+
     // Defense 1: the supplied pane must be in list_assistant_panes. This is
     // the same liveness + is-an-assistant-pane check the scan path applies
     // implicitly when it iterates find_assistant_panes results.
@@ -6789,7 +6803,29 @@ mod tests {
 
     #[tokio::test]
     async fn backend_session_ready_ignores_remote_backend_session_id_collision() {
-        let state = crate::state::AppState::new_for_test();
+        use axum::Router;
+        use axum::routing::get;
+        use tokio::net::TcpListener;
+
+        async fn session_dir() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "directory": "/tmp/local-project" }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_port = listener.local_addr().unwrap().port();
+        assert!(serve_port >= 320, "test listener port must be >= 320");
+        let app = Router::new().route("/session/{session_id}", get(session_dir));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: serve_port - 320,
+            data_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+            config_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+        });
         *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/local-project", "%31")];
         {
             let mut proto = state.protocol.write().await;
@@ -6828,6 +6864,7 @@ mod tests {
             proto.sessions.contains_key("local-project"),
             "local auto-provision must still create a local session"
         );
+        server.abort();
     }
 
     // --- Plugin-sent pane + cwd hints (fast-path) ---
@@ -6835,11 +6872,33 @@ mod tests {
     #[tokio::test]
     async fn backend_session_ready_uses_explicit_pane_and_cwd_hints() {
         // Happy path for the enriched opencode plugin: when both pane and
-        // cwd arrive in the body, skip the opencode-serve round-trip AND the
-        // scan-path's opencode-serve dir lookup. The pane still has to appear
-        // in list_assistant_panes and its current path must match the hinted
-        // cwd after project-root normalization.
-        let state = crate::state::AppState::new_for_test();
+        // cwd arrive in the body, skip the tmux scan but still verify the
+        // backend_session_id belongs to that cwd in opencode serve. The pane
+        // still has to appear in list_assistant_panes and its current path
+        // must match the hinted cwd after project-root normalization.
+        use axum::Router;
+        use axum::routing::get;
+        use tokio::net::TcpListener;
+
+        async fn session_dir() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "directory": "/tmp/explicit-project" }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_port = listener.local_addr().unwrap().port();
+        assert!(serve_port >= 320, "test listener port must be >= 320");
+        let app = Router::new().route("/session/{session_id}", get(session_dir));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: serve_port - 320,
+            data_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+            config_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+        });
         *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/explicit-project", "%31")];
 
         let hints = BackendSessionReadyHints {
@@ -6871,6 +6930,7 @@ mod tests {
             session.metadata.project_dir.as_deref(),
             Some("/tmp/explicit-project"),
         );
+        server.abort();
     }
 
     #[tokio::test]
@@ -7021,6 +7081,49 @@ mod tests {
             "hint path must reject pane/cwd mismatches, got Some({result:?})"
         );
         assert!(state.protocol.read().await.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hint_path_rejects_backend_session_id_for_different_opencode_directory() {
+        use axum::Router;
+        use axum::routing::get;
+        use tokio::net::TcpListener;
+
+        async fn session_dir() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "directory": "/tmp/other-project" }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_port = listener.local_addr().unwrap().port();
+        assert!(serve_port >= 320, "test listener port must be >= 320");
+        let app = Router::new().route("/session/{session_id}", get(session_dir));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: serve_port - 320,
+            data_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+            config_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+        });
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/hinted-project", "%17")];
+
+        let result = auto_provision_with_explicit_pane(
+            &state,
+            "ses_other_dir",
+            "%17",
+            "/tmp/hinted-project",
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "hint path must reject backend ids whose opencode session directory differs, got Some({result:?})"
+        );
+        assert!(state.protocol.read().await.sessions.is_empty());
+        server.abort();
     }
 
     #[tokio::test]
