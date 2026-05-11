@@ -2603,6 +2603,15 @@ async fn soft_restart_session(
                 .await
                 .is_err()
                 {
+                    rollback_pane_after_failed_soft_restart_commit(
+                        state,
+                        pane,
+                        project_dir,
+                        port,
+                        name,
+                        &previous_metadata,
+                    )
+                    .await;
                     delete_opencode_session(
                         &state.http_client,
                         port,
@@ -2807,6 +2816,60 @@ async fn restore_soft_restart_metadata(
     session.metadata.effort = previous_metadata.effort.clone();
     session.metadata.restart_generation = previous_metadata.restart_generation;
     state.persist_protocol_state(&proto);
+}
+
+async fn failed_soft_restart_commit_rollback_target(
+    state: &AppState,
+    name: &str,
+    previous_metadata: &crate::daemon_protocol::SessionMeta,
+) -> Option<String> {
+    if let Some(previous_session_id) = previous_metadata.backend_session_id.clone() {
+        return Some(previous_session_id);
+    }
+
+    let proto = state.protocol.read().await;
+    proto
+        .sessions
+        .get(name)
+        .and_then(|session| session.metadata.backend_session_id.clone())
+}
+
+async fn rollback_pane_after_failed_soft_restart_commit(
+    state: &AppState,
+    pane: &str,
+    project_dir: &str,
+    port: u16,
+    name: &str,
+    previous_metadata: &crate::daemon_protocol::SessionMeta,
+) {
+    let Some(target_session_id) =
+        failed_soft_restart_commit_rollback_target(state, name, previous_metadata).await
+    else {
+        tracing::warn!(
+            session = %name,
+            pane,
+            "soft restart: metadata commit failed after attach with no rollback backend session"
+        );
+        return;
+    };
+
+    match respawn_opencode_attach_for_session(pane, project_dir, &target_session_id, port, name)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            session = %name,
+            pane,
+            backend_session_id = %target_session_id,
+            "soft restart: failed to roll pane back after stale metadata commit"
+        ),
+        Err(error) => tracing::warn!(
+            session = %name,
+            pane,
+            backend_session_id = %target_session_id,
+            "soft restart: failed to respawn rollback attach after stale metadata commit: {error}"
+        ),
+    }
 }
 
 fn previous_backend_session_for_prompt_failure_rollback<'a>(
@@ -5213,6 +5276,41 @@ mod tests {
         let metadata = &proto.sessions["oc"].metadata;
         assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_current"));
         assert_eq!(metadata.restart_generation, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_soft_restart_commit_rolls_back_to_winning_backend_session() {
+        let state = AppState::new_for_test();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%1".into()),
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_winner".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        restart_generation: 2,
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+        let previous_metadata = crate::daemon_protocol::SessionMeta {
+            backend: Some("opencode".into()),
+            ..Default::default()
+        };
+
+        let target =
+            failed_soft_restart_commit_rollback_target(&state, "oc", &previous_metadata).await;
+
+        assert_eq!(target.as_deref(), Some("ses_winner"));
     }
 
     #[tokio::test]
