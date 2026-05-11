@@ -1438,6 +1438,7 @@ async fn compact_inner(
         match proto.sessions.get(&session_id) {
             Some(s) => SessionLookup {
                 pane: s.pane.clone(),
+                origin: s.origin.clone(),
                 backend_session_id: s.metadata.backend_session_id.clone(),
                 project_dir: s.metadata.project_dir.clone(),
                 backend_name: s.metadata.backend.clone(),
@@ -1453,6 +1454,13 @@ async fn compact_inner(
             }
         }
     };
+
+    if !matches!(lookup.origin, crate::daemon_protocol::Origin::Local) {
+        return (
+            StatusCode::BAD_REQUEST,
+            json!({"error": "compact is only supported for local sessions"}),
+        );
+    }
 
     // Resolve the backend from the name captured above rather than re-reading
     // the protocol lock — prevents the branch decision from diverging from the
@@ -1667,6 +1675,7 @@ async fn compact_inner(
 
 struct SessionLookup {
     pane: Option<String>,
+    origin: crate::daemon_protocol::Origin,
     backend_session_id: Option<String>,
     project_dir: Option<String>,
     backend_name: Option<String>,
@@ -5023,6 +5032,77 @@ mod tests {
             err.contains("strong") || err.contains("binding"),
             "expected error to mention weak binding, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn compact_rejects_remote_tui_session_before_injection() {
+        let state = crate::state::AppState::new_for_test();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "remote-cc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "remote-cc".into(),
+                    pane: Some("%17".into()),
+                    origin: crate::daemon_protocol::Origin::Remote("npub1remote".into()),
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("claude-code".into()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let (status, body) = compact_inner(
+            &state,
+            "remote-cc".into(),
+            CompactBody {
+                continuation: Some("keep going".into()),
+            },
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err = body["error"].as_str().unwrap_or_default();
+        assert!(err.contains("local"), "expected local-session error, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn compact_rejects_remote_http_session_before_summarize() {
+        let state = crate::state::AppState::new_for_test();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "remote-oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "remote-oc".into(),
+                    pane: None,
+                    origin: crate::daemon_protocol::Origin::Remote("npub1remote".into()),
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_remote".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        model: Some("anthropic/claude-sonnet-4-6".into()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let (status, body) = compact_inner(
+            &state,
+            "remote-oc".into(),
+            CompactBody { continuation: None },
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err = body["error"].as_str().unwrap_or_default();
+        assert!(err.contains("local"), "expected local-session error, got: {err}");
     }
 
     #[tokio::test]
