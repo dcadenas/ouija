@@ -495,6 +495,65 @@ pub async fn pane_inject_loop(mut rx: tokio::sync::mpsc::UnboundedReceiver<Injec
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum SessionDeliveryPlan {
+    Http(crate::daemon_protocol::HttpDeliverySnapshot),
+    RawTmux {
+        inject_config: crate::backend::InjectConfig,
+        tui_pattern: Option<String>,
+    },
+    Unavailable(String),
+}
+
+pub(crate) async fn session_delivery_plan(
+    state: &crate::state::AppState,
+    session_id: &str,
+    pane: &str,
+) -> SessionDeliveryPlan {
+    let Some((metadata, registered_pane)) = ({
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .get(session_id)
+            .map(|s| (s.metadata.clone(), s.pane.clone()))
+    }) else {
+        return SessionDeliveryPlan::Unavailable(format!(
+            "session '{session_id}' is not registered"
+        ));
+    };
+
+    let backend = metadata
+        .backend
+        .as_deref()
+        .and_then(|name| state.backends.get(name))
+        .unwrap_or_else(|| state.backends.default());
+
+    match backend.delivery_mode() {
+        crate::backend::DeliveryMode::TuiInjection => SessionDeliveryPlan::RawTmux {
+            inject_config: backend.inject_config(),
+            tui_pattern: backend.tui_ready_pattern().map(String::from),
+        },
+        crate::backend::DeliveryMode::HttpApi { .. } => {
+            if let Some(snapshot) = metadata.http_delivery_snapshot() {
+                return SessionDeliveryPlan::Http(snapshot);
+            }
+
+            if metadata.backend.as_deref() == Some("opencode")
+                && registered_pane.as_deref() == Some(pane)
+            {
+                return SessionDeliveryPlan::RawTmux {
+                    inject_config: backend.inject_config(),
+                    tui_pattern: backend.tui_ready_pattern().map(String::from),
+                };
+            }
+
+            SessionDeliveryPlan::Unavailable(format!(
+                "session '{session_id}' is not safely deliverable via HTTP and does not own pane '{pane}'"
+            ))
+        }
+    }
+}
+
 /// Enqueue a message for injection into a tmux pane.
 ///
 /// Messages are queued in a per-pane FIFO and processed by a background
@@ -507,75 +566,48 @@ pub async fn locked_inject(
     message: &str,
     vim_mode: bool,
 ) -> anyhow::Result<()> {
-    let backend = state.backend_for_session(session_id).await;
-
-    match backend.delivery_mode() {
-        crate::backend::DeliveryMode::HttpApi { .. } => {
-            // Read backend_session_id, project_dir, model, and effort under
-            // one lock acquisition so a concurrent session mutation can't
-            // split them. model/effort are applied on every prompt_async
-            // body so messages after the initial prompt continue to route
-            // through the session's configured model and variant.
-            let (oc_session_id, project_dir, model, effort) = {
-                let proto = state.protocol.read().await;
-                match proto.sessions.get(session_id) {
-                    Some(s) => (
-                        s.metadata.backend_session_id.clone(),
-                        s.metadata.project_dir.clone(),
-                        s.metadata.model.clone(),
-                        s.metadata.effort.clone(),
-                    ),
-                    None => (None, None, None, None),
-                }
-            };
+    match session_delivery_plan(state, session_id, pane).await {
+        SessionDeliveryPlan::Http(delivery) => {
             // locked_inject is the fire-and-forget path used by reminders,
             // session-agent nudges, and similar best-effort senders; log and
             // swallow upstream failures so those callers keep their existing
             // semantics. Callers that need to observe delivery outcomes must
             // call deliver_via_http directly.
-            match oc_session_id {
-                Some(sid) => {
-                    if let Err(decision) = deliver_via_http(
-                        state,
-                        &sid,
-                        project_dir.as_deref(),
-                        message,
-                        model.as_deref(),
-                        effort.as_deref(),
-                    )
-                    .await
-                    {
-                        tracing::warn!(session = %session_id, ?decision, "http delivery failed");
-                    }
-                }
-                None => {
-                    tracing::warn!(
-                        session = %session_id,
-                        "http delivery skipped: no backend_session_id on session"
-                    );
-                }
+            if let Err(decision) = deliver_via_http(
+                state,
+                &delivery.backend_session_id,
+                delivery.project_dir.as_deref(),
+                message,
+                delivery.model.as_deref(),
+                delivery.effort.as_deref(),
+            )
+            .await
+            {
+                tracing::warn!(session = %session_id, ?decision, "http delivery failed");
             }
-            Ok(())
         }
-        crate::backend::DeliveryMode::TuiInjection => {
-            let config = backend.inject_config();
-            let tui_pattern = backend.tui_ready_pattern().map(String::from);
-
+        SessionDeliveryPlan::RawTmux {
+            inject_config,
+            tui_pattern,
+        } => {
             let (result_tx, result_rx) = tokio::sync::oneshot::channel();
             let req = InjectRequest {
                 pane: pane.to_string(),
                 message: message.to_string(),
                 vim_mode,
-                inject_config: config,
+                inject_config,
                 tui_pattern,
                 result_tx,
             };
             state.enqueue_inject(req);
-            result_rx
+            return result_rx
                 .await
-                .map_err(|_| anyhow::anyhow!("inject queue closed"))?
+                .map_err(|_| anyhow::anyhow!("inject queue closed"))?;
         }
+        SessionDeliveryPlan::Unavailable(reason) => anyhow::bail!(reason),
     }
+
+    Ok(())
 }
 
 /// Enqueue a message for raw tmux injection regardless of backend delivery mode.
@@ -830,10 +862,36 @@ mod tests {
 
         assert_eq!(sanitized, "alphabeta gammaomega");
         assert!(
-            !sanitized.chars().any(|c| {
-                c <= '\u{1f}' || ('\u{7f}'..='\u{9f}').contains(&c)
-            }),
+            !sanitized
+                .chars()
+                .any(|c| { c <= '\u{1f}' || ('\u{7f}'..='\u{9f}').contains(&c) }),
             "sanitized text still contains C0/C1 controls: {sanitized:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_delivery_plan_uses_raw_tmux_for_weak_opencode_binding() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .protocol
+            .write()
+            .await
+            .apply(crate::daemon_protocol::Event::Register {
+                id: "weak-opencode".into(),
+                pane: Some("%42".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("oc-session".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted),
+                    ..Default::default()
+                },
+            });
+
+        let plan = session_delivery_plan(&state, "weak-opencode", "%42").await;
+
+        assert!(
+            matches!(plan, SessionDeliveryPlan::RawTmux { .. }),
+            "weak/adopted OpenCode sessions must inject into the visible pane, got {plan:?}"
         );
     }
 
