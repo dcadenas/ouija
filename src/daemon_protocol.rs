@@ -897,6 +897,30 @@ impl DaemonState {
         if let Some(existing) = self.sessions.get(&id) {
             metadata.inherit_recurrence_from(&existing.metadata);
         }
+
+        if let Some(backend_session_id) = metadata.backend_session_id.as_deref()
+            && let Some(owner) = self.sessions.values().find(|s| {
+                s.id != id
+                    && matches!(s.origin, Origin::Local)
+                    && s.metadata.backend_session_id.as_deref() == Some(backend_session_id)
+            })
+        {
+            let reason = format!(
+                "backend_session_id {backend_session_id} is already bound to session '{}'",
+                owner.id
+            );
+            return vec![
+                Effect::Log {
+                    level: LogLevel::Warn,
+                    message: format!("refusing registration for '{id}': {reason}"),
+                },
+                Effect::RegisterFailed {
+                    session_id: id,
+                    reason,
+                },
+            ];
+        }
+
         let now = chrono::Utc::now();
         metadata.session_incarnation = now.timestamp_nanos_opt().unwrap_or_else(|| now.timestamp());
 
@@ -5087,6 +5111,41 @@ mod tests {
             id: "intruder".into(),
             pane: "%2".into(),
             expected_backend_session_id: Some("ses_dup".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_dup".into()),
+                ..Default::default()
+            },
+        });
+
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::RegisterFailed { session_id, reason }
+                    if session_id == "intruder" && reason.contains("backend_session_id ses_dup")
+            )),
+            "duplicate backend_session_id must fail atomically, got: {effects:?}"
+        );
+        assert!(!state.sessions.contains_key("intruder"));
+        assert_eq!(state.sessions["owner"].pane.as_deref(), Some("%1"));
+    }
+
+    #[test]
+    fn register_rejects_duplicate_local_backend_session_id() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "owner".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_dup".into()),
+                ..Default::default()
+            },
+        });
+
+        let effects = state.apply(Event::Register {
+            id: "intruder".into(),
+            pane: Some("%2".into()),
             metadata: SessionMeta {
                 backend: Some("opencode".into()),
                 backend_session_id: Some("ses_dup".into()),
