@@ -1712,22 +1712,6 @@ impl DaemonState {
 
         // Three-tier reply handling — pending is keyed by the session that
         // owes the reply (from), not the recipient of this wire message (to).
-        if let Some(re_id) = responds_to {
-            if done {
-                if let Some(pending) = self.pending_replies.get_mut(from) {
-                    pending.retain(|p| p.msg_id != re_id);
-                    if pending.is_empty() {
-                        self.pending_replies.remove(from);
-                    }
-                }
-            } else if let Some(pending) = self.pending_replies.get_mut(from) {
-                if let Some(entry) = pending.iter_mut().find(|p| p.msg_id == re_id) {
-                    entry.last_activity = chrono::Utc::now().timestamp();
-                    entry.in_progress = true;
-                }
-            }
-        }
-
         // Resolve bare `from` to daemon-prefixed remote session key.
         // First try exact match in known remote sessions.
         // If not found, derive prefix from any remote session sharing the sender's npub.
@@ -1752,6 +1736,25 @@ impl DaemonState {
             }
             from.to_string()
         });
+
+        if let Some(re_id) = responds_to {
+            if done {
+                if let Some(pending) = self.pending_replies.get_mut(&display_from) {
+                    pending.retain(|p| p.msg_id != re_id || p.from != to);
+                    if pending.is_empty() {
+                        self.pending_replies.remove(&display_from);
+                    }
+                }
+            } else if let Some(pending) = self.pending_replies.get_mut(&display_from) {
+                if let Some(entry) = pending
+                    .iter_mut()
+                    .find(|p| p.msg_id == re_id && p.from == to)
+                {
+                    entry.last_activity = chrono::Utc::now().timestamp();
+                    entry.in_progress = true;
+                }
+            }
+        }
 
         let target = self.sessions.get(to).cloned();
 
@@ -2109,14 +2112,17 @@ impl DaemonState {
             if done {
                 // Complete: remove the pending reply
                 if let Some(pending) = self.pending_replies.get_mut(from) {
-                    pending.retain(|p| p.msg_id != re_id);
+                    pending.retain(|p| p.msg_id != re_id || p.from != to);
                     if pending.is_empty() {
                         self.pending_replies.remove(from);
                     }
                 }
             } else if let Some(pending) = self.pending_replies.get_mut(from) {
                 // Progress: update last_activity and set in_progress
-                if let Some(entry) = pending.iter_mut().find(|p| p.msg_id == re_id) {
+                if let Some(entry) = pending
+                    .iter_mut()
+                    .find(|p| p.msg_id == re_id && p.from == to)
+                {
                     entry.last_activity = chrono::Utc::now().timestamp();
                     entry.in_progress = true;
                 }
@@ -2913,6 +2919,62 @@ mod tests {
                 .map(|v| v.is_empty())
                 .unwrap_or(true)
         );
+    }
+
+    #[test]
+    fn reply_with_colliding_responds_to_only_clears_intended_sender() {
+        let mut state = DaemonState::new_for_model("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "s1".into(),
+            pane: Some("%1".into()),
+            metadata: Default::default(),
+        });
+        state.apply(Event::Register {
+            id: "s2".into(),
+            pane: Some("%2".into()),
+            metadata: Default::default(),
+        });
+        state.apply(Event::Register {
+            id: "target".into(),
+            pane: Some("%3".into()),
+            metadata: Default::default(),
+        });
+
+        state.pending_replies.insert(
+            "target".into(),
+            vec![
+                PendingReplyEntry {
+                    msg_id: 7,
+                    from: "s1".into(),
+                    message: "task from s1".into(),
+                    received_at: 1,
+                    last_activity: 1,
+                    in_progress: false,
+                },
+                PendingReplyEntry {
+                    msg_id: 7,
+                    from: "s2".into(),
+                    message: "task from s2".into(),
+                    received_at: 1,
+                    last_activity: 1,
+                    in_progress: false,
+                },
+            ],
+        );
+
+        state.apply(Event::Send {
+            from: "target".into(),
+            to: "s1".into(),
+            message: "done for s1".into(),
+            expects_reply: false,
+            responds_to: Some(7),
+            done: true,
+        });
+
+        let pending = state.pending_replies.get("target").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].from, "s2");
+        assert_eq!(pending[0].msg_id, 7);
     }
 
     #[test]
