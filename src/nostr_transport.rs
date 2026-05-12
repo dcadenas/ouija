@@ -2596,7 +2596,8 @@ async fn soft_restart_session(
             .await
         {
             Ok(true) => {
-                if apply_soft_restart_metadata(
+                if should_commit_soft_restart_metadata_before_prompt(Some(pane), prompt)
+                    && apply_soft_restart_metadata(
                     state,
                     &owner_snapshot,
                     &new_session_id,
@@ -2625,7 +2626,9 @@ async fn soft_restart_session(
                     .await;
                     return Err(());
                 }
-                metadata_committed = true;
+                if should_commit_soft_restart_metadata_before_prompt(Some(pane), prompt) {
+                    metadata_committed = true;
+                }
             }
             Ok(false) => {
                 tracing::warn!("soft restart: opencode attach did not start in pane {pane}");
@@ -2709,11 +2712,90 @@ async fn soft_restart_session(
         )
         .await
         {
-            crate::state::DeliveryOutcome::Accepted => {}
+            crate::state::DeliveryOutcome::Accepted => {
+                if !metadata_committed {
+                    if apply_soft_restart_metadata(
+                        state,
+                        &owner_snapshot,
+                        &new_session_id,
+                        restart_generation,
+                        model,
+                        effort,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        if let (Some(pane), Some(previous_session_id)) = (
+                            pane,
+                            previous_backend_session_for_prompt_failure_rollback(
+                                pane,
+                                &previous_metadata,
+                            ),
+                        ) {
+                            match respawn_opencode_attach_for_session(
+                                pane,
+                                project_dir,
+                                previous_session_id,
+                                port,
+                                name,
+                            )
+                            .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => tracing::warn!(
+                                    "soft restart: failed to reattach pane {pane} to previous opencode session after metadata commit failure"
+                                ),
+                                Err(error) => tracing::warn!(
+                                    "soft restart: failed to roll back pane {pane} to previous opencode session after metadata commit failure: {error}"
+                                ),
+                            }
+                        }
+                        delete_opencode_session(
+                            &state.http_client,
+                            port,
+                            &new_session_id,
+                            "soft restart cleanup",
+                        )
+                        .await;
+                        return Err(());
+                    }
+                    metadata_committed = true;
+                }
+            }
             crate::state::DeliveryOutcome::Ambiguous(reason) => {
                 tracing::warn!(
-                    "soft restart: prompt_async outcome ambiguous for {new_session_id}; preserving restart metadata: {reason}"
+                    "soft restart: prompt_async outcome ambiguous for {new_session_id}: {reason}"
                 );
+                if let (Some(pane), Some(previous_session_id)) = (
+                    pane,
+                    previous_backend_session_for_prompt_failure_rollback(pane, &previous_metadata),
+                ) {
+                    match respawn_opencode_attach_for_session(
+                        pane,
+                        project_dir,
+                        previous_session_id,
+                        port,
+                        name,
+                    )
+                    .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => tracing::warn!(
+                            "soft restart: failed to reattach pane {pane} to previous opencode session after ambiguous prompt_async outcome"
+                        ),
+                        Err(error) => tracing::warn!(
+                            "soft restart: failed to roll back pane {pane} to previous opencode session after ambiguous prompt_async outcome: {error}"
+                        ),
+                    }
+                    delete_opencode_session(
+                        &state.http_client,
+                        port,
+                        &new_session_id,
+                        "soft restart cleanup",
+                    )
+                    .await;
+                    return Err(());
+                }
             }
             crate::state::DeliveryOutcome::Rejected(reason) => {
                 tracing::warn!("soft restart: prompt_async failed for {new_session_id}: {reason}");
@@ -2779,6 +2861,10 @@ async fn soft_restart_session(
         format!("soft-restarted '{name}' in {project_dir} (session {new_session_id})"),
         prompt_msg_id,
     ))
+}
+
+fn should_commit_soft_restart_metadata_before_prompt(pane: Option<&str>, prompt: Option<&str>) -> bool {
+    pane.is_none() || prompt.is_none()
 }
 
 async fn apply_soft_restart_metadata(
@@ -5271,6 +5357,22 @@ mod tests {
         assert_eq!(metadata.model.as_deref(), Some("new-model"));
         assert_eq!(metadata.effort.as_deref(), Some("new-effort"));
         server.abort();
+    }
+
+    #[test]
+    fn pane_backed_soft_restart_with_prompt_defers_metadata_commit() {
+        assert!(!should_commit_soft_restart_metadata_before_prompt(
+            Some("%1"),
+            Some("queued prompt")
+        ));
+        assert!(should_commit_soft_restart_metadata_before_prompt(
+            None,
+            Some("queued prompt")
+        ));
+        assert!(should_commit_soft_restart_metadata_before_prompt(
+            Some("%1"),
+            None
+        ));
     }
 
     #[test]
