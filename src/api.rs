@@ -2791,7 +2791,6 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
         Some(delivery) => match deliver_http_message_outcome(state, &delivery, &prompt).await {
             crate::state::DeliveryOutcome::Accepted => Ok(()),
             crate::state::DeliveryOutcome::Ambiguous(_) => {
-                restore_pending_prompt_if_absent(state, session_name, pending);
                 tracing::warn!(
                     "readiness prompt HTTP delivery failed ambiguously for {session_name}; not retrying via raw tmux"
                 );
@@ -5822,7 +5821,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn readiness_prompt_delivery_skips_tmux_fallback_for_ambiguous_http_status() {
+    async fn readiness_prompt_delivery_quarantines_ambiguous_http_status() {
         use axum::Router;
         use axum::http::StatusCode;
         use axum::routing::post;
@@ -5868,14 +5867,7 @@ mod tests {
         let delivered = deliver_pending_prompt(&state, "oc").await;
 
         assert!(!delivered);
-        assert_eq!(
-            state.pending_prompts.lock().unwrap().get("oc"),
-            Some(&pending_opencode_prompt(
-                "%17",
-                "queued prompt",
-                "ses_ready"
-            ))
-        );
+        assert!(state.pending_prompts.lock().unwrap().get("oc").is_none());
         server.abort();
     }
 
