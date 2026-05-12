@@ -667,6 +667,20 @@ pub async fn register(
     }) {
         Some(ok) => ok,
         None => {
+            if let Some((session_id, reason)) = effects.iter().find_map(|e| match e {
+                crate::daemon_protocol::Effect::RegisterFailed { session_id, reason } => {
+                    Some((session_id.clone(), reason.clone()))
+                }
+                _ => None,
+            }) {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": reason,
+                        "session_id": session_id,
+                    })),
+                );
+            }
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": "unexpected register result" })),
@@ -3819,6 +3833,45 @@ mod tests {
             prompt.into(),
             Some(backend_session_id.into()),
         )
+    }
+
+    #[tokio::test]
+    async fn register_returns_conflict_when_protocol_rejects_duplicate_backend_session_id() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "owner".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_dup".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let body = serde_json::json!({
+            "id": "intruder",
+            "backend": "opencode",
+            "backend_session_id": "ses_dup"
+        });
+        let (status, Json(response)) = register(
+            State(state),
+            ConnectInfo("127.0.0.1:9000".parse().unwrap()),
+            HeaderMap::new(),
+            Bytes::from(body.to_string()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(response["session_id"], "intruder");
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("backend_session_id ses_dup is already bound to session 'owner'"),
+            "protocol failure reason must be preserved, got: {response}"
+        );
     }
 
     #[test]
