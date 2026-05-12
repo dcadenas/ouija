@@ -669,9 +669,7 @@ pub(crate) fn metadata_to_session_meta_for_test(m: &crate::state::SessionMetadat
     metadata_to_session_meta(Some(m))
 }
 
-pub(crate) fn metadata_to_session_meta(
-    m: Option<&crate::state::SessionMetadata>,
-) -> SessionMeta {
+pub(crate) fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>) -> SessionMeta {
     match m {
         Some(m) => SessionMeta {
             project_dir: m.project_dir.clone(),
@@ -1477,7 +1475,10 @@ impl DaemonState {
             return vec![];
         }
 
-        let session = self.sessions.get_mut(id).expect("local session checked above");
+        let session = self
+            .sessions
+            .get_mut(id)
+            .expect("local session checked above");
         session.metadata.backend = Some(backend);
         session.metadata.backend_session_id = Some(backend_session_id);
         let mut effects = vec![Effect::Persist];
@@ -5131,7 +5132,12 @@ mod tests {
         });
 
         assert!(effects.is_empty());
-        assert!(state.sessions["candidate"].metadata.backend_session_id.is_none());
+        assert!(
+            state.sessions["candidate"]
+                .metadata
+                .backend_session_id
+                .is_none()
+        );
     }
 
     // --- Register invariant: pane preservation (issue #14) ---
@@ -5376,7 +5382,10 @@ mod tests {
         );
         let session = &state.sessions["local-oc"];
         assert_eq!(session.pane.as_deref(), Some("%1"));
-        assert_eq!(session.metadata.backend_session_id.as_deref(), Some("ses_old"));
+        assert_eq!(
+            session.metadata.backend_session_id.as_deref(),
+            Some("ses_old")
+        );
     }
 
     #[test]

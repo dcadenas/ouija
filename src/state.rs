@@ -170,36 +170,37 @@ pub(crate) async fn deliver_inject_message_effect(
 ) -> DeliveryOutcome {
     let method = request.delivery_method.or(request.recorded_method);
     match method {
-        Some("http") => match crate::tmux::session_delivery_plan(
-            state,
-            request.session_id,
-            request.pane,
-        )
-        .await
-        {
-            crate::tmux::SessionDeliveryPlan::Http(delivery) => crate::tmux::deliver_via_http(
-                state,
-                &delivery.backend_session_id,
-                delivery.project_dir.as_deref(),
-                request.message,
-                delivery.model.as_deref(),
-                delivery.effort.as_deref(),
-            )
-            .await
-            .map(|()| DeliveryOutcome::Accepted)
-            .unwrap_or_else(http_delivery_attempt_failure),
-            crate::tmux::SessionDeliveryPlan::RawTmux { .. } => crate::tmux::locked_inject_raw_tmux(
-                state,
-                request.session_id,
-                request.pane,
-                request.message,
-                request.vim_mode,
-            )
-            .await
-            .map(|()| DeliveryOutcome::Accepted)
-            .unwrap_or_else(|error| DeliveryOutcome::Rejected(error.to_string())),
-            crate::tmux::SessionDeliveryPlan::Unavailable(reason) => DeliveryOutcome::Rejected(reason),
-        },
+        Some("http") => {
+            match crate::tmux::session_delivery_plan(state, request.session_id, request.pane).await
+            {
+                crate::tmux::SessionDeliveryPlan::Http(delivery) => crate::tmux::deliver_via_http(
+                    state,
+                    &delivery.backend_session_id,
+                    delivery.project_dir.as_deref(),
+                    request.message,
+                    delivery.model.as_deref(),
+                    delivery.effort.as_deref(),
+                )
+                .await
+                .map(|()| DeliveryOutcome::Accepted)
+                .unwrap_or_else(http_delivery_attempt_failure),
+                crate::tmux::SessionDeliveryPlan::RawTmux { .. } => {
+                    crate::tmux::locked_inject_raw_tmux(
+                        state,
+                        request.session_id,
+                        request.pane,
+                        request.message,
+                        request.vim_mode,
+                    )
+                    .await
+                    .map(|()| DeliveryOutcome::Accepted)
+                    .unwrap_or_else(|error| DeliveryOutcome::Rejected(error.to_string()))
+                }
+                crate::tmux::SessionDeliveryPlan::Unavailable(reason) => {
+                    DeliveryOutcome::Rejected(reason)
+                }
+            }
+        }
         Some("tmux") => crate::tmux::locked_inject_raw_tmux(
             state,
             request.session_id,
@@ -2590,7 +2591,9 @@ pub(crate) mod tests {
                     metadata: crate::daemon_protocol::SessionMeta {
                         backend: Some("opencode".into()),
                         backend_session_id: Some("ses_live".into()),
-                        opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::WeakAdopted,
+                        ),
                         ..Default::default()
                     },
                     registered_at: 0,

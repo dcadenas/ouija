@@ -2598,15 +2598,15 @@ async fn soft_restart_session(
             Ok(true) => {
                 if should_commit_soft_restart_metadata_before_prompt(Some(pane), prompt)
                     && apply_soft_restart_metadata(
-                    state,
-                    &owner_snapshot,
-                    &new_session_id,
-                    restart_generation,
-                    model,
-                    effort,
-                )
-                .await
-                .is_err()
+                        state,
+                        &owner_snapshot,
+                        &new_session_id,
+                        restart_generation,
+                        model,
+                        effort,
+                    )
+                    .await
+                    .is_err()
                 {
                     rollback_pane_after_failed_soft_restart_commit(
                         state,
@@ -2863,7 +2863,10 @@ async fn soft_restart_session(
     ))
 }
 
-fn should_commit_soft_restart_metadata_before_prompt(pane: Option<&str>, prompt: Option<&str>) -> bool {
+fn should_commit_soft_restart_metadata_before_prompt(
+    pane: Option<&str>,
+    prompt: Option<&str>,
+) -> bool {
     pane.is_none() || prompt.is_none()
 }
 
@@ -5463,20 +5466,15 @@ mod tests {
             );
         }
 
-        let result = apply_soft_restart_metadata(
-            &state,
-            &owner,
-            "ses_stale",
-            0,
-            None,
-            None,
-        )
-        .await;
+        let result = apply_soft_restart_metadata(&state, &owner, "ses_stale", 0, None, None).await;
 
         assert!(result.is_err());
         let proto = state.protocol.read().await;
         let metadata = &proto.sessions["oc"].metadata;
-        assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_recreated"));
+        assert_eq!(
+            metadata.backend_session_id.as_deref(),
+            Some("ses_recreated")
+        );
         assert_eq!(metadata.restart_generation, 0);
     }
 

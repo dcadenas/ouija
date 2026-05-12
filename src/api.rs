@@ -4342,7 +4342,10 @@ mod tests {
 
         let result = execute_send_effects_for_api(&state, &effects).await;
 
-        assert!(matches!(result, Ok(crate::state::DeliveryOutcome::Accepted)));
+        assert!(matches!(
+            result,
+            Ok(crate::state::DeliveryOutcome::Accepted)
+        ));
     }
 
     #[tokio::test]
@@ -5174,7 +5177,10 @@ mod tests {
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let err = body["error"].as_str().unwrap_or_default();
-        assert!(err.contains("local"), "expected local-session error, got: {err}");
+        assert!(
+            err.contains("local"),
+            "expected local-session error, got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -5211,7 +5217,10 @@ mod tests {
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let err = body["error"].as_str().unwrap_or_default();
-        assert!(err.contains("local"), "expected local-session error, got: {err}");
+        assert!(
+            err.contains("local"),
+            "expected local-session error, got: {err}"
+        );
     }
 
     #[tokio::test]
