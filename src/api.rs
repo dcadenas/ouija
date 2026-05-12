@@ -1061,27 +1061,25 @@ async fn execute_send_effects_for_api(
                 pane,
                 message,
                 vim_mode,
+                delivery_method,
                 ..
-            } => match recorded_method {
-                Some("http") => {
-                    let delivery = recorded_http_delivery.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "http delivery skipped: no recorded backend_session_id on send"
-                        )
-                    })?;
-                    outcome = combine_delivery_outcome(
-                        outcome,
-                        deliver_http_message_outcome(state, delivery, message).await,
+            } => {
+                outcome = combine_delivery_outcome(
+                    outcome,
+                    crate::state::deliver_inject_message_effect(
+                        state,
+                        crate::state::InjectDeliveryRequest {
+                            session_id,
+                            pane,
+                            message,
+                            vim_mode: *vim_mode,
+                            delivery_method: delivery_method.as_deref(),
+                            recorded_method,
+                        },
                     )
-                }
-                Some("tmux") => {
-                    tmux::locked_inject_raw_tmux(state, session_id, pane, message, *vim_mode)
-                        .await?;
-                }
-                _ => {
-                    tmux::locked_inject(state, session_id, pane, message, *vim_mode).await?;
-                }
-            },
+                    .await,
+                );
+            }
             Effect::DeliverHttpMessage {
                 session_id: _,
                 message,
@@ -4301,7 +4299,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_effect_execution_uses_recorded_http_method_after_binding_changes() {
+    async fn send_effect_execution_revalidates_http_method_after_binding_changes() {
         let state = crate::state::AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -4344,14 +4342,11 @@ mod tests {
 
         let result = execute_send_effects_for_api(&state, &effects).await;
 
-        assert!(matches!(
-            result,
-            Ok(crate::state::DeliveryOutcome::Rejected(reason)) if reason.contains("prompt_async")
-        ));
+        assert!(matches!(result, Ok(crate::state::DeliveryOutcome::Accepted)));
     }
 
     #[tokio::test]
-    async fn send_effect_execution_uses_recorded_http_session_after_metadata_changes() {
+    async fn send_effect_execution_uses_current_http_session_after_metadata_changes() {
         use axum::Router;
         use axum::extract::Path;
         use axum::routing::post;
@@ -4428,7 +4423,7 @@ mod tests {
             .unwrap();
 
         server.abort();
-        assert_eq!(captures.lock().unwrap().as_slice(), ["ses_old"]);
+        assert_eq!(captures.lock().unwrap().as_slice(), ["ses_new"]);
     }
 
     #[tokio::test]

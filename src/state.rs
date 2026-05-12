@@ -155,6 +155,74 @@ fn http_delivery_attempt_failure(
     }
 }
 
+pub(crate) struct InjectDeliveryRequest<'a> {
+    pub session_id: &'a str,
+    pub pane: &'a str,
+    pub message: &'a str,
+    pub vim_mode: bool,
+    pub delivery_method: Option<&'a str>,
+    pub recorded_method: Option<&'a str>,
+}
+
+pub(crate) async fn deliver_inject_message_effect(
+    state: &Arc<AppState>,
+    request: InjectDeliveryRequest<'_>,
+) -> DeliveryOutcome {
+    let method = request.delivery_method.or(request.recorded_method);
+    match method {
+        Some("http") => match crate::tmux::session_delivery_plan(
+            state,
+            request.session_id,
+            request.pane,
+        )
+        .await
+        {
+            crate::tmux::SessionDeliveryPlan::Http(delivery) => crate::tmux::deliver_via_http(
+                state,
+                &delivery.backend_session_id,
+                delivery.project_dir.as_deref(),
+                request.message,
+                delivery.model.as_deref(),
+                delivery.effort.as_deref(),
+            )
+            .await
+            .map(|()| DeliveryOutcome::Accepted)
+            .unwrap_or_else(http_delivery_attempt_failure),
+            crate::tmux::SessionDeliveryPlan::RawTmux { .. } => crate::tmux::locked_inject_raw_tmux(
+                state,
+                request.session_id,
+                request.pane,
+                request.message,
+                request.vim_mode,
+            )
+            .await
+            .map(|()| DeliveryOutcome::Accepted)
+            .unwrap_or_else(|error| DeliveryOutcome::Rejected(error.to_string())),
+            crate::tmux::SessionDeliveryPlan::Unavailable(reason) => DeliveryOutcome::Rejected(reason),
+        },
+        Some("tmux") => crate::tmux::locked_inject_raw_tmux(
+            state,
+            request.session_id,
+            request.pane,
+            request.message,
+            request.vim_mode,
+        )
+        .await
+        .map(|()| DeliveryOutcome::Accepted)
+        .unwrap_or_else(|error| DeliveryOutcome::Rejected(error.to_string())),
+        _ => crate::tmux::locked_inject(
+            state,
+            request.session_id,
+            request.pane,
+            request.message,
+            request.vim_mode,
+        )
+        .await
+        .map(|()| DeliveryOutcome::Accepted)
+        .unwrap_or_else(|error| DeliveryOutcome::Rejected(error.to_string())),
+    }
+}
+
 /// Central daemon state holding sessions, nodes, and transports.
 pub struct AppState {
     pub config: OuijaConfig,
@@ -799,40 +867,20 @@ impl AppState {
                     message,
                     vim_mode,
                     delivery_method,
-                    http_delivery,
                     ..
                 } => {
-                    let effect_method = delivery_method.as_deref().or(recorded_method);
-                    let effect_http_delivery = http_delivery.as_ref().or(recorded_http_delivery);
-                    let outcome = match effect_method {
-                        Some("http") => match effect_http_delivery {
-                            Some(delivery) => crate::tmux::deliver_via_http(
-                                self,
-                                &delivery.backend_session_id,
-                                delivery.project_dir.as_deref(),
-                                message,
-                                delivery.model.as_deref(),
-                                delivery.effort.as_deref(),
-                            )
-                            .await
-                            .map(|()| DeliveryOutcome::Accepted)
-                            .unwrap_or_else(http_delivery_attempt_failure),
-                            None => DeliveryOutcome::Rejected(
-                                "http delivery skipped: no recorded backend_session_id on send"
-                                    .to_string(),
-                            ),
+                    let outcome = deliver_inject_message_effect(
+                        self,
+                        InjectDeliveryRequest {
+                            session_id,
+                            pane,
+                            message,
+                            vim_mode: *vim_mode,
+                            delivery_method: delivery_method.as_deref(),
+                            recorded_method,
                         },
-                        Some("tmux") => crate::tmux::locked_inject_raw_tmux(
-                            self, session_id, pane, message, *vim_mode,
-                        )
-                        .await
-                        .map(|()| DeliveryOutcome::Accepted)
-                        .unwrap_or_else(|error| DeliveryOutcome::Rejected(error.to_string())),
-                        _ => crate::tmux::locked_inject(self, session_id, pane, message, *vim_mode)
-                            .await
-                            .map(|()| DeliveryOutcome::Accepted)
-                            .unwrap_or_else(|error| DeliveryOutcome::Rejected(error.to_string())),
-                    };
+                    )
+                    .await;
                     match outcome {
                         DeliveryOutcome::Accepted => {}
                         DeliveryOutcome::Rejected(reason) => {
@@ -2504,6 +2552,80 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn execute_effects_revalidates_http_inject_against_current_opencode_binding() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn prompt_async(AxumState(calls): AxumState<StdArc<AtomicUsize>>) -> StatusCode {
+            calls.fetch_add(1, Ordering::SeqCst);
+            StatusCode::NO_CONTENT
+        }
+
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(calls.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = test_config();
+        config.port = port - 320;
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_live".into()),
+                        opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let effects = vec![crate::daemon_protocol::Effect::InjectMessage {
+            session_id: "oc".into(),
+            pane: "%1".into(),
+            message: "hello".into(),
+            vim_mode: false,
+            delivery_method: Some("http".into()),
+            http_delivery: Some(crate::daemon_protocol::HttpDeliverySnapshot {
+                backend_session_id: "ses_live".into(),
+                project_dir: None,
+                model: None,
+                effort: None,
+            }),
+            pending_reply_msg_id: None,
+            pending_reply_from: None,
+        }];
+
+        let failure = state.execute_effects(&effects).await;
+
+        assert!(failure.is_none());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "stale/forged HTTP inject metadata must not bypass the shared OpenCode delivery gate"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn incoming_weak_opencode_inject_uses_apply_time_delivery_method() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -2773,6 +2895,26 @@ pub(crate) mod tests {
         let mut config = test_config();
         config.port = port.checked_sub(320).unwrap();
         let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_live".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
         let success_acks = StdArc::new(AtomicUsize::new(0));
         let failure_acks = StdArc::new(AtomicUsize::new(0));
         state
