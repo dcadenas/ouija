@@ -1023,7 +1023,12 @@ async fn format_status(state: &AppState) -> String {
     )
 }
 
-async fn route_human_message(state: &AppState, from: &str, to: &str, message: &str) {
+async fn route_human_message(
+    state: &std::sync::Arc<AppState>,
+    from: &str,
+    to: &str,
+    message: &str,
+) {
     // Use the same send path as the API
     let target = state.protocol.read().await.sessions.get(to).cloned();
 
@@ -1039,11 +1044,25 @@ async fn route_human_message(state: &AppState, from: &str, to: &str, message: &s
                     let formatted = crate::daemon_protocol::format_session_message(
                         from, message, true, msg_id, None, false,
                     );
-                    let vim_mode = session.metadata.vim_mode;
-                    let delivered =
-                        crate::tmux::locked_inject(state, to, pane, &formatted, vim_mode)
-                            .await
-                            .is_ok();
+                    let delivery_method = if session.metadata.backend.as_deref() == Some("opencode")
+                    {
+                        Some("http")
+                    } else {
+                        Some("tmux")
+                    };
+                    let outcome = crate::state::deliver_inject_message_effect(
+                        state,
+                        crate::state::InjectDeliveryRequest {
+                            session_id: to,
+                            pane,
+                            message: &formatted,
+                            vim_mode: session.metadata.vim_mode,
+                            delivery_method,
+                            recorded_method: None,
+                        },
+                    )
+                    .await;
+                    let delivered = matches!(outcome, crate::state::DeliveryOutcome::Accepted);
                     state
                         .log_message(
                             from.to_string(),
@@ -4385,6 +4404,31 @@ mod tests {
     #[test]
     fn prompt_async_fallback_uses_raw_tmux_delivery() {
         assert_eq!(prompt_fallback_delivery(), PromptFallbackDelivery::RawTmux);
+    }
+
+    #[tokio::test]
+    async fn route_human_message_marks_failed_http_delivery_undelivered() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "target".into(),
+                pane: Some("%target".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_target".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        route_human_message(&state, "human", "target", "hello").await;
+
+        let log = state.message_log.read().await;
+        let entry = log.back().expect("human DM should be logged");
+        assert_eq!(entry.from, "human");
+        assert_eq!(entry.to, "target");
+        assert!(!entry.delivered, "failed HTTP delivery must be observable");
     }
 
     #[test]
