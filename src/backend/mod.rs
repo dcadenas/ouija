@@ -137,7 +137,7 @@ pub enum WorktreeMode {
     Disposable,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct InjectConfig {
     pub paste_settle_ms: u64,
     pub use_inner_bracketed_paste: bool,

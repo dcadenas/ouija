@@ -1318,26 +1318,64 @@ pub struct InjectBody {
     vim_mode: bool,
 }
 
+struct ForcePaneInjectTarget {
+    session_id: Option<String>,
+    inject_config: crate::backend::InjectConfig,
+    tui_pattern: Option<String>,
+}
+
+async fn resolve_force_pane_inject_target(
+    state: &crate::state::AppState,
+    pane: &str,
+    detected_backend: Option<String>,
+) -> ForcePaneInjectTarget {
+    let registered = {
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .values()
+            .find(|s| s.pane.as_deref() == Some(pane))
+            .map(|s| (s.id.clone(), s.metadata.backend.clone()))
+    };
+    let (session_id, registered_backend_name) = match registered {
+        Some((session_id, backend_name)) => (Some(session_id), backend_name),
+        None => (None, None),
+    };
+    let backend_name = match registered_backend_name {
+        Some(name) => Some(name),
+        None => match detected_backend {
+            Some(name) => Some(name),
+            None => state.detect_backend_in_pane(pane).await,
+        },
+    };
+    let backend = backend_name
+        .as_deref()
+        .and_then(|name| state.backends.get(name))
+        .unwrap_or_else(|| state.backends.default());
+
+    ForcePaneInjectTarget {
+        session_id,
+        inject_config: backend.inject_config(),
+        tui_pattern: backend.tui_ready_pattern().map(String::from),
+    }
+}
+
 /// Inject text into a tmux pane via the queued writer.
 pub async fn inject(
     State(state): State<SharedState>,
     Json(body): Json<InjectBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let session_id = {
-        let proto = state.protocol.read().await;
-        proto
-            .sessions
-            .values()
-            .find(|s| s.pane.as_deref() == Some(&body.pane))
-            .map(|s| s.id.clone())
-            .unwrap_or_else(|| "__pane_inject_default__".to_string())
-    };
-    match tmux::locked_inject_raw_tmux(
+    let target = resolve_force_pane_inject_target(&state, &body.pane, None).await;
+    if let Some(session_id) = target.session_id.as_deref() {
+        tracing::debug!(session = %session_id, pane = %body.pane, "force-pane inject resolved registered session backend");
+    }
+    match tmux::locked_inject_raw_tmux_with_config(
         &state,
-        &session_id,
         &body.pane,
         &body.message,
         body.vim_mode,
+        target.inject_config,
+        target.tui_pattern,
     )
     .await
     {
@@ -4053,6 +4091,40 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "injected");
         assert_eq!(body["delivery"], "tmux");
+    }
+
+    #[tokio::test]
+    async fn force_pane_inject_uses_detected_backend_config_without_fake_session() {
+        let state = crate::state::AppState::new_for_test();
+
+        let target = resolve_force_pane_inject_target(&state, "%oc", Some("opencode".into())).await;
+
+        assert_eq!(target.session_id, None);
+        assert_eq!(target.inject_config.paste_settle_ms, 100);
+        assert!(!target.inject_config.use_inner_bracketed_paste);
+        assert_eq!(target.inject_config.startup_inject_delay_secs, 0);
+        assert_eq!(target.tui_pattern, None);
+    }
+
+    #[tokio::test]
+    async fn force_pane_inject_detects_backend_when_registered_metadata_has_no_backend() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "legacy".into(),
+                pane: Some("%legacy".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+
+        let target =
+            resolve_force_pane_inject_target(&state, "%legacy", Some("opencode".into())).await;
+
+        assert_eq!(target.session_id.as_deref(), Some("legacy"));
+        assert_eq!(target.inject_config.paste_settle_ms, 100);
+        assert!(!target.inject_config.use_inner_bracketed_paste);
+        assert_eq!(target.inject_config.startup_inject_delay_secs, 0);
+        assert_eq!(target.tui_pattern, None);
     }
 
     #[tokio::test]

@@ -663,12 +663,27 @@ pub async fn locked_inject_raw_tmux(
     let config = backend.inject_config();
     let tui_pattern = backend.tui_ready_pattern().map(String::from);
 
+    locked_inject_raw_tmux_with_config(state, pane, message, vim_mode, config, tui_pattern).await
+}
+
+pub async fn locked_inject_raw_tmux_with_config(
+    state: &crate::state::AppState,
+    pane: &str,
+    message: &str,
+    vim_mode: bool,
+    inject_config: crate::backend::InjectConfig,
+    tui_pattern: Option<String>,
+) -> anyhow::Result<()> {
+    if cfg!(test) {
+        return Ok(());
+    }
+
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let req = InjectRequest {
         pane: pane.to_string(),
         message: message.to_string(),
         vim_mode,
-        inject_config: config,
+        inject_config,
         tui_pattern,
         result_tx,
     };
