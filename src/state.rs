@@ -155,6 +155,22 @@ fn http_delivery_attempt_failure(
     }
 }
 
+async fn session_owns_pane(state: &AppState, session_id: &str, pane: &str) -> Result<(), String> {
+    let registered_pane = {
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.pane.clone())
+    };
+
+    if registered_pane.as_deref() == Some(pane) {
+        Ok(())
+    } else {
+        Err(format!("pane {pane} is not owned by session {session_id}"))
+    }
+}
+
 pub(crate) struct InjectDeliveryRequest<'a> {
     pub session_id: &'a str,
     pub pane: &'a str,
@@ -201,16 +217,19 @@ pub(crate) async fn deliver_inject_message_effect(
                 }
             }
         }
-        Some("tmux") => crate::tmux::locked_inject_raw_tmux(
-            state,
-            request.session_id,
-            request.pane,
-            request.message,
-            request.vim_mode,
-        )
-        .await
-        .map(|()| DeliveryOutcome::Accepted)
-        .unwrap_or_else(|error| DeliveryOutcome::Rejected(error.to_string())),
+        Some("tmux") => match session_owns_pane(state, request.session_id, request.pane).await {
+            Ok(()) => crate::tmux::locked_inject_raw_tmux(
+                state,
+                request.session_id,
+                request.pane,
+                request.message,
+                request.vim_mode,
+            )
+            .await
+            .map(|()| DeliveryOutcome::Accepted)
+            .unwrap_or_else(|error| DeliveryOutcome::Rejected(error.to_string())),
+            Err(reason) => DeliveryOutcome::Rejected(reason),
+        },
         _ => crate::tmux::locked_inject(
             state,
             request.session_id,
@@ -2434,6 +2453,30 @@ pub(crate) mod tests {
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn normal_tmux_inject_rejects_pane_not_owned_by_session() {
+        let state = AppState::new_for_test();
+        proto_register(&state, "target", Some("%1")).await;
+
+        let outcome = deliver_inject_message_effect(
+            &state,
+            InjectDeliveryRequest {
+                session_id: "target",
+                pane: "%2",
+                message: "hello",
+                vim_mode: false,
+                delivery_method: Some("tmux"),
+                recorded_method: None,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, DeliveryOutcome::Rejected(ref reason) if reason.contains("pane %2 is not owned by session target")),
+            "expected stale pane rejection, got {outcome:?}"
+        );
     }
 
     #[tokio::test]
