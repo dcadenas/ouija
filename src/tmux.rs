@@ -1,4 +1,5 @@
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,6 +19,8 @@ const VERIFY_DELAY_MS: u64 = 100;
 const MAX_INJECT_RETRIES: u32 = 3;
 /// Base delay for exponential backoff between retries (500ms, 1s, 2s).
 const RETRY_BASE_MS: u64 = 500;
+
+static INJECT_BUFFER_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct TmuxPane {
@@ -343,11 +346,7 @@ fn verify_injected(pane: &str, message: &str) {
         }
     };
 
-    let needle = if message.len() > VERIFY_NEEDLE_LEN {
-        &message[..VERIFY_NEEDLE_LEN]
-    } else {
-        message
-    };
+    let needle = verification_needle(message);
 
     if !content.contains(needle) {
         tracing::warn!(
@@ -355,6 +354,28 @@ fn verify_injected(pane: &str, message: &str) {
             "inject verification: text not found in visible area (may have scrolled off)"
         );
     }
+}
+
+fn verification_needle(message: &str) -> &str {
+    if message.len() <= VERIFY_NEEDLE_LEN {
+        return message;
+    }
+
+    let mut end = 0;
+    for (idx, ch) in message.char_indices() {
+        let next = idx + ch.len_utf8();
+        if next > VERIFY_NEEDLE_LEN {
+            break;
+        }
+        end = next;
+    }
+    &message[..end]
+}
+
+fn next_inject_buffer_name(pane: &str) -> String {
+    let seq = INJECT_BUFFER_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pane_id: String = pane.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    format!("ouija-inject-{pane_id}-{seq}")
 }
 
 /// Inject message text via `tmux paste-buffer` then submit with Enter.
@@ -384,9 +405,13 @@ fn inject_text(
         sanitized
     };
 
-    // Load into tmux paste buffer via stdin
+    let buffer_name = next_inject_buffer_name(pane);
+
+    // Load into a named tmux paste buffer via stdin. The unnamed buffer is
+    // global to the tmux server, so concurrent injections into different panes
+    // must never share it.
     let mut child = Command::new("tmux")
-        .args(["load-buffer", "-"])
+        .args(["load-buffer", "-b", &buffer_name, "-"])
         .stdin(std::process::Stdio::piped())
         .spawn()
         .context("failed to spawn tmux load-buffer")?;
@@ -403,9 +428,18 @@ fn inject_text(
 
     // Paste buffer into target pane (tmux adds outer bracket wrapping)
     let status = Command::new("tmux")
-        .args(["paste-buffer", "-t", pane])
+        .args(["paste-buffer", "-b", &buffer_name, "-t", pane])
         .status()
         .context("failed to run tmux paste-buffer")?;
+
+    let delete_status = Command::new("tmux")
+        .args(["delete-buffer", "-b", &buffer_name])
+        .status()
+        .context("failed to run tmux delete-buffer")?;
+
+    if !delete_status.success() {
+        tracing::warn!(buffer = %buffer_name, "tmux delete-buffer failed after injection");
+    }
 
     if !status.success() {
         bail!("tmux paste-buffer failed for pane {pane}");
@@ -867,6 +901,26 @@ mod tests {
                 .any(|c| { c <= '\u{1f}' || ('\u{7f}'..='\u{9f}').contains(&c) }),
             "sanitized text still contains C0/C1 controls: {sanitized:?}"
         );
+    }
+
+    #[test]
+    fn verification_needle_stops_on_utf8_character_boundary() {
+        let message = format!("{}🙂 suffix", "a".repeat(VERIFY_NEEDLE_LEN - 1));
+
+        let needle = verification_needle(&message);
+
+        assert_eq!(needle, "a".repeat(VERIFY_NEEDLE_LEN - 1));
+        assert!(message.is_char_boundary(needle.len()));
+    }
+
+    #[test]
+    fn tmux_injection_buffer_names_are_unique_and_scoped() {
+        let first = next_inject_buffer_name("%12");
+        let second = next_inject_buffer_name("%12");
+
+        assert_ne!(first, second);
+        assert!(first.starts_with("ouija-inject-12-"));
+        assert!(first.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
     }
 
     #[tokio::test]
