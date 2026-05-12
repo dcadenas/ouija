@@ -885,28 +885,6 @@ impl DaemonState {
             }
         }
 
-        // Pane dedup: same pane registered under different ID
-        let replaced = if let Some(ref pane_id) = pane {
-            let old_key = self
-                .sessions
-                .iter()
-                .find(|(key, s)| {
-                    *key != &id
-                        && matches!(s.origin, Origin::Local)
-                        && s.pane.as_deref() == Some(pane_id)
-                })
-                .map(|(key, _)| key.clone());
-            if let Some(ref old_key) = old_key {
-                self.sessions.remove(old_key);
-                effects.push(Effect::StopAgent {
-                    session_id: old_key.clone(),
-                });
-            }
-            old_key
-        } else {
-            None
-        };
-
         // Preserve recurrence state: the startup hook may re-register after session_start
         // or loop_next's restart, arriving with blank metadata. Without this, the
         // hook's Register would wipe prompt, reminder, and iteration progress.
@@ -937,6 +915,29 @@ impl DaemonState {
                 },
             ];
         }
+
+        // Pane dedup: same pane registered under different ID. This mutates
+        // session ownership, so all registration-level validation must happen first.
+        let replaced = if let Some(ref pane_id) = pane {
+            let old_key = self
+                .sessions
+                .iter()
+                .find(|(key, s)| {
+                    *key != &id
+                        && matches!(s.origin, Origin::Local)
+                        && s.pane.as_deref() == Some(pane_id)
+                })
+                .map(|(key, _)| key.clone());
+            if let Some(ref old_key) = old_key {
+                self.sessions.remove(old_key);
+                effects.push(Effect::StopAgent {
+                    session_id: old_key.clone(),
+                });
+            }
+            old_key
+        } else {
+            None
+        };
 
         let now = chrono::Utc::now();
         metadata.session_incarnation = now.timestamp_nanos_opt().unwrap_or_else(|| now.timestamp());
@@ -5259,6 +5260,51 @@ mod tests {
         );
         assert!(!state.sessions.contains_key("intruder"));
         assert_eq!(state.sessions["owner"].pane.as_deref(), Some("%1"));
+    }
+
+    #[test]
+    fn register_duplicate_backend_session_id_does_not_remove_existing_pane_owner() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "backend-owner".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_dup".into()),
+                ..Default::default()
+            },
+        });
+        state.apply(Event::Register {
+            id: "pane-owner".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_pane".into()),
+                ..Default::default()
+            },
+        });
+
+        let effects = state.apply(Event::Register {
+            id: "intruder".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_dup".into()),
+                ..Default::default()
+            },
+        });
+
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::RegisterFailed { session_id, reason }
+                    if session_id == "intruder" && reason.contains("backend_session_id ses_dup")
+            )),
+            "duplicate backend_session_id must fail, got: {effects:?}"
+        );
+        assert!(!state.sessions.contains_key("intruder"));
+        assert_eq!(state.sessions["backend-owner"].pane.as_deref(), Some("%1"));
+        assert_eq!(state.sessions["pane-owner"].pane.as_deref(), Some("%2"));
     }
 
     #[test]
