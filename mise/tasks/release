@@ -1,0 +1,120 @@
+#!/bin/bash
+# Bump alpha version, commit, push, publish to crates.io, then ouija update
+set -euo pipefail
+
+# All operations scoped to the ouija repo root — prevents CWD drift pushing to wrong repos
+REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+
+PORT="${OUIJA_PORT:-7880}"
+BASE="http://localhost:${PORT}"
+
+# Read current version
+CURRENT=$(grep '^version' "$REPO_DIR/Cargo.toml" | head -1 | sed 's/.*"\(.*\)"/\1/')
+echo "Current version: $CURRENT"
+
+# Bump alpha number: 0.1.0-alpha.65 -> 0.1.0-alpha.66
+PREFIX=$(echo "$CURRENT" | sed 's/\.[0-9]*$//')
+NUM=$(echo "$CURRENT" | grep -o '[0-9]*$')
+NEXT="$PREFIX.$((NUM + 1))"
+echo "Next version: $NEXT"
+
+find_macos_node() {
+  local nodes_json
+  nodes_json="$(curl -sf "${BASE}/api/nodes" 2>/dev/null || true)"
+  if [ -z "$nodes_json" ]; then
+    return 0
+  fi
+
+  jq -r '[.nodes[] | select(.name != null and .status == "connected") | .name] | first // empty' <<<"$nodes_json" 2>/dev/null || true
+}
+
+macos_build_message() {
+  local version="$1"
+  cat <<EOF
+Release v${version} published. Build macOS binaries and upload to the GitHub release.
+
+Steps:
+1. cd ~/code/ouija && git pull
+2. cargo build --release --target x86_64-apple-darwin
+3. cargo build --release --target aarch64-apple-darwin
+4. for TARGET in x86_64-apple-darwin aarch64-apple-darwin; do DIR="ouija-\$TARGET"; mkdir -p "\$DIR"; cp "target/\$TARGET/release/ouija" "\$DIR/"; tar cJf "\$DIR.tar.xz" "\$DIR"; rm -rf "\$DIR"; done
+5. while ! gh release view v${version} --repo dcadenas/ouija >/dev/null 2>&1; do echo waiting for release...; sleep 15; done
+6. gh release upload v${version} --repo dcadenas/ouija ouija-x86_64-apple-darwin.tar.xz ouija-aarch64-apple-darwin.tar.xz
+7. rm -f ouija-x86_64-apple-darwin.tar.xz ouija-aarch64-apple-darwin.tar.xz
+
+IMPORTANT: do NOT use gh release create. Only use gh release upload. The CI workflow creates the release.
+EOF
+}
+
+send_macos_build_request() {
+  local version="$1"
+  local mac_node="$2"
+  local message
+  message="$(macos_build_message "$version")"
+
+  if [ "${OUIJA_RELEASE_MAC_DRY_RUN:-}" = "1" ]; then
+    printf 'target=%s/ouija\n' "$mac_node"
+    printf 'message<<EOF\n%s\nEOF\n' "$message"
+    return 0
+  fi
+
+  curl -sf -X POST "${BASE}/api/send" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n \
+      --arg from "release-task" \
+      --arg to "${mac_node}/ouija" \
+      --arg message "$message" \
+      '{from: $from, to: $to, message: $message, expects_reply: false}')"
+}
+
+request_macos_builds() {
+  local version="$1"
+  local mac_node
+  mac_node="$(find_macos_node)"
+
+  if [ -z "$mac_node" ]; then
+    echo "warning: no remote Mac node connected, skipping macOS builds"
+    return 0
+  fi
+
+  echo "Requesting macOS builds from ${mac_node}..."
+  if send_macos_build_request "$version" "$mac_node"; then
+    if [ "${OUIJA_RELEASE_MAC_DRY_RUN:-}" = "1" ]; then
+      echo "macOS build request dry-run complete"
+    else
+      echo "macOS build request sent"
+    fi
+  else
+    echo "warning: could not send macOS build request"
+  fi
+}
+
+if [ "${OUIJA_RELEASE_MAC_DRY_RUN:-}" = "1" ]; then
+  request_macos_builds "$NEXT"
+  exit 0
+fi
+
+# Update Cargo.toml and regenerate Cargo.lock
+if [[ "$(uname)" == "Darwin" ]]; then
+  sed -i '' "s/^version = \"$CURRENT\"/version = \"$NEXT\"/" "$REPO_DIR/Cargo.toml"
+else
+  sed -i "s/^version = \"$CURRENT\"/version = \"$NEXT\"/" "$REPO_DIR/Cargo.toml"
+fi
+cargo check --quiet --manifest-path "$REPO_DIR/Cargo.toml" 2>/dev/null || true
+
+# Commit, tag, and push
+git -C "$REPO_DIR" add Cargo.toml Cargo.lock
+git -C "$REPO_DIR" commit -m "v$NEXT"
+git -C "$REPO_DIR" tag "v$NEXT"
+git -C "$REPO_DIR" push && git -C "$REPO_DIR" push origin "v$NEXT"
+
+# Publish
+cargo publish --manifest-path "$REPO_DIR/Cargo.toml"
+
+# Update local daemon
+ouija self-update
+
+# Request macOS builds from the Mac via ouija (non-blocking, best-effort)
+request_macos_builds "$NEXT"
+
+echo "Released $NEXT"

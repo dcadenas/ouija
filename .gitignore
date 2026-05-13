@@ -1,0 +1,12 @@
+/target
+/demo
+IDEAS.md
+firebase-debug.log
+.claude/
+*.png
+!screenshot.png
+!admin-screenshot.png
+.playwright-mcp/
+workflow-state.json
+stress-state.json
+.ouija/
