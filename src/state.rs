@@ -2548,9 +2548,9 @@ pub(crate) mod tests {
         let failure = state.execute_effects(&effects).await;
 
         assert!(
-            failure
-                .as_ref()
-                .is_some_and(|failure| failure.reason.contains("pane %1 is not owned by session target")),
+            failure.as_ref().is_some_and(|failure| failure
+                .reason
+                .contains("pane %1 is not owned by session target")),
             "expected stale pane failure, got {failure:?}"
         );
         let log = state.message_log.read().await;
