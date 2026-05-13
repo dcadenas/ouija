@@ -375,7 +375,7 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
     let Some(session) = session else {
         if task.project_dir.is_some() || task.prompt.is_some() {
             tracing::info!("session '{session_name}' not found, creating from task project_dir",);
-            return revive_from_task(state, task, None, None, None).await;
+            return revive_from_task(state, task, None, None, None, None).await;
         }
         return TaskRun::failed(
             task,
@@ -397,6 +397,7 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
             None,
             session.metadata.model.clone(),
             session.metadata.effort.clone(),
+            session.metadata.backend.clone(),
         )
         .await;
     };
@@ -418,6 +419,7 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
     // the same atomic read above at line 368-371.
     let snapshot_model = session.metadata.model.clone();
     let snapshot_effort = session.metadata.effort.clone();
+    let snapshot_backend = session.metadata.backend.clone();
 
     if alive {
         if task.on_fire.kills_alive() {
@@ -448,7 +450,15 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
         .project_dir
         .as_deref()
         .or(session.metadata.project_dir.as_deref());
-    revive_from_task(state, task, project_dir, snapshot_model, snapshot_effort).await
+    revive_from_task(
+        state,
+        task,
+        project_dir,
+        snapshot_model,
+        snapshot_effort,
+        snapshot_backend,
+    )
+    .await
 }
 
 /// Respawn the backend in an existing pane (for clears_context on a live session).
@@ -570,7 +580,7 @@ async fn respawn_and_inject(
 /// Create or revive a session and inject a message.
 ///
 /// `project_dir_override` falls back to `task.project_dir` if `None`.
-/// `model`/`effort` are passed through from the caller's session snapshot;
+/// Backend metadata is passed through from the caller's session snapshot;
 /// for the 'session not found' path the caller passes `None` (there is no
 /// prior metadata to honour).
 async fn revive_from_task(
@@ -579,9 +589,10 @@ async fn revive_from_task(
     project_dir_override: Option<&str>,
     model: Option<String>,
     effort: Option<String>,
+    backend_name: Option<String>,
 ) -> TaskRun {
     let project_dir = project_dir_override.or(task.project_dir.as_deref());
-    match revive_and_inject(state, task, project_dir, model, effort).await {
+    match revive_and_inject(state, task, project_dir, model, effort, backend_name).await {
         Ok(new_pane) => {
             if task.on_fire.clears_context() {
                 let mut proto = state.protocol.write().await;
@@ -597,7 +608,7 @@ async fn revive_from_task(
 
 /// Revive a dead session: create new tmux window, launch the backend, re-register, inject.
 ///
-/// `model` / `effort` are threaded through from the caller's session snapshot
+/// Backend metadata is threaded through from the caller's session snapshot
 /// — `execute_injection` captures them under the same atomic read that
 /// sourced `project_dir`, so a concurrent Unregister between the caller's
 /// read and this function cannot silently downgrade the revive to backend
@@ -609,6 +620,7 @@ async fn revive_and_inject(
     project_dir: Option<&str>,
     model: Option<String>,
     effort: Option<String>,
+    backend_name: Option<String>,
 ) -> anyhow::Result<String> {
     let dir = project_dir
         .map(String::from)
@@ -628,7 +640,27 @@ async fn revive_and_inject(
     } else {
         None
     };
-    let backend = state.backend_for_session(task.session_name()).await;
+    let backend = if let Some(name) = backend_name.as_deref() {
+        state
+            .backends
+            .get(name)
+            .unwrap_or_else(|| state.backends.default())
+    } else {
+        state.backend_for_session(task.session_name()).await
+    };
+    let is_tui = matches!(
+        backend.delivery_mode(),
+        crate::backend::DeliveryMode::TuiInjection
+    );
+    let detected_backend_session_id = if task.backend_session_id.is_none() {
+        backend.detect_session_id(&dir)
+    } else {
+        None
+    };
+    let resume_backend_session_id = task
+        .backend_session_id
+        .clone()
+        .or_else(|| detected_backend_session_id.clone());
     let launch_cmd = if clears_context {
         backend.build_start_command(&crate::backend::StartOpts {
             project_dir: dir.clone(),
@@ -637,14 +669,10 @@ async fn revive_and_inject(
             effort: effort.clone(),
         })
     } else {
-        let session_id = task
-            .backend_session_id
-            .clone()
-            .or_else(|| backend.detect_session_id(&dir));
         backend
             .build_resume_command(&crate::backend::ResumeOpts {
                 project_dir: dir.clone(),
-                session_id,
+                session_id: resume_backend_session_id.clone(),
                 worktree,
                 model: model.clone(),
                 effort: effort.clone(),
@@ -661,10 +689,6 @@ async fn revive_and_inject(
 
     // Pass prompt as CLI arg so Claude loads CLAUDE.md before processing it.
     // TuiInjection always uses CLI arg; HttpApi only when starting fresh.
-    let is_tui = matches!(
-        backend.delivery_mode(),
-        crate::backend::DeliveryMode::TuiInjection
-    );
     let full_launch_cmd = if clears_context || is_tui {
         if let Some(ref prompt) = task.prompt {
             let full_text = match &task.reminder {
@@ -801,13 +825,19 @@ async fn revive_and_inject(
     }
 
     // Re-register session with new pane (same ID, so dedup check won't fire)
-    let proto_meta = crate::daemon_protocol::SessionMeta {
-        project_dir: project_dir.map(String::from),
-        prompt: task.prompt.clone(),
-        reminder: task.reminder.clone(),
-        on_fire: Some(task.on_fire.clone()),
-        ..Default::default()
-    };
+    let proto_meta = revived_session_metadata(
+        task,
+        project_dir,
+        detected_backend_session_id.clone(),
+        RevivedSessionSnapshot {
+            model: model.clone(),
+            effort: effort.clone(),
+            backend_name: backend.name(),
+            is_tui,
+            clears_context,
+        },
+    );
+    let scheduled_prompt_backend_session_id = proto_meta.backend_session_id.clone();
     state
         .apply_and_execute(crate::daemon_protocol::Event::Register {
             id: task.session_name().to_string(),
@@ -840,11 +870,70 @@ async fn revive_and_inject(
                 task.session_name(),
                 new_pane.clone(),
                 full_text,
+                scheduled_prompt_backend_session_id,
             );
         }
     }
 
     Ok(new_pane)
+}
+
+struct RevivedSessionSnapshot<'a> {
+    model: Option<String>,
+    effort: Option<String>,
+    backend_name: &'a str,
+    is_tui: bool,
+    clears_context: bool,
+}
+
+fn revived_session_metadata(
+    task: &ScheduledTask,
+    project_dir: Option<&str>,
+    detected_backend_session_id: Option<String>,
+    snapshot: RevivedSessionSnapshot<'_>,
+) -> crate::daemon_protocol::SessionMeta {
+    let backend_session_id = scheduled_prompt_backend_session_id(
+        task.backend_session_id.as_deref(),
+        detected_backend_session_id,
+        snapshot.is_tui,
+        snapshot.clears_context,
+    );
+    let opencode_binding = revived_opencode_binding(snapshot.backend_name);
+
+    crate::daemon_protocol::SessionMeta {
+        project_dir: project_dir.map(String::from),
+        prompt: task.prompt.clone(),
+        reminder: task.reminder.clone(),
+        model: snapshot.model,
+        effort: snapshot.effort,
+        on_fire: Some(task.on_fire.clone()),
+        backend_session_id,
+        backend: Some(snapshot.backend_name.to_string()),
+        opencode_binding,
+        ..Default::default()
+    }
+}
+
+fn revived_opencode_binding(backend_name: &str) -> Option<crate::daemon_protocol::OpenCodeBinding> {
+    if backend_name != "opencode" {
+        return None;
+    }
+    Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
+}
+
+fn scheduled_prompt_backend_session_id(
+    task_backend_session_id: Option<&str>,
+    detected_backend_session_id: Option<String>,
+    is_tui: bool,
+    clears_context: bool,
+) -> Option<String> {
+    if is_tui || clears_context {
+        None
+    } else {
+        task_backend_session_id
+            .map(str::to_string)
+            .or(detected_backend_session_id)
+    }
 }
 
 /// Poll a pane until one of `names` appears as the current command (blocking).
@@ -1155,5 +1244,73 @@ mod tests {
         );
         assert_eq!(task.prompt.as_deref(), Some("do the work"));
         assert_eq!(task.reminder.as_deref(), Some("call loop_next"));
+    }
+
+    #[test]
+    fn scheduled_http_prompt_uses_resume_backend_session_id() {
+        assert_eq!(
+            scheduled_prompt_backend_session_id(
+                Some("ses_task"),
+                Some("ses_detected".to_string()),
+                false,
+                false,
+            )
+            .as_deref(),
+            Some("ses_task")
+        );
+        assert_eq!(
+            scheduled_prompt_backend_session_id(
+                None,
+                Some("ses_detected".to_string()),
+                false,
+                false,
+            )
+            .as_deref(),
+            Some("ses_detected")
+        );
+        assert_eq!(
+            scheduled_prompt_backend_session_id(Some("ses_task"), None, true, false),
+            None
+        );
+        assert_eq!(
+            scheduled_prompt_backend_session_id(Some("ses_task"), None, false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn revived_http_session_metadata_records_queued_backend_session_id() {
+        let task = new_task(
+            "task".into(),
+            "0 0 * * *".into(),
+            None,
+            Some("prompt".into()),
+            None,
+            false,
+            Some("ses_task".into()),
+            OnFire::ContinueSession,
+        );
+
+        let metadata = revived_session_metadata(
+            &task,
+            Some("/tmp/project"),
+            Some("ses_detected".to_string()),
+            RevivedSessionSnapshot {
+                model: Some("anthropic/claude-sonnet-4".into()),
+                effort: Some("high".into()),
+                backend_name: "opencode",
+                is_tui: false,
+                clears_context: false,
+            },
+        );
+
+        assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_task"));
+        assert_eq!(metadata.backend.as_deref(), Some("opencode"));
+        assert_eq!(metadata.model.as_deref(), Some("anthropic/claude-sonnet-4"));
+        assert_eq!(metadata.effort.as_deref(), Some("high"));
+        assert_eq!(
+            metadata.opencode_binding,
+            Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
+        );
     }
 }

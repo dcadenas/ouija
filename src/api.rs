@@ -667,6 +667,20 @@ pub async fn register(
     }) {
         Some(ok) => ok,
         None => {
+            if let Some((session_id, reason)) = effects.iter().find_map(|e| match e {
+                crate::daemon_protocol::Effect::RegisterFailed { session_id, reason } => {
+                    Some((session_id.clone(), reason.clone()))
+                }
+                _ => None,
+            }) {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": reason,
+                        "session_id": session_id,
+                    })),
+                );
+            }
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": "unexpected register result" })),
@@ -724,16 +738,83 @@ pub async fn send_msg(
             Json(json!({ "error": format!("cannot send a message to yourself. {hint}") })),
         );
     }
-    let effects = state
-        .apply_and_execute(crate::daemon_protocol::Event::Send {
+    if state.is_soft_restart_in_progress(&body.to) {
+        return (
+            StatusCode::CONFLICT,
+            Json(
+                json!({ "error": format!("soft restart is in progress for session '{}'", body.to) }),
+            ),
+        );
+    }
+    let from = body.from.clone();
+    let (effects, rollback) = {
+        let mut proto = state.protocol.write().await;
+        let mut rollback = FailedSendRollback::capture(&proto, &from, body.responds_to, body.done);
+        let effects = proto.apply(crate::daemon_protocol::Event::Send {
             from: body.from,
             to: body.to,
             message: body.message,
             expects_reply: body.expects_reply,
             responds_to: body.responds_to,
             done: body.done,
-        })
-        .await;
+        });
+        rollback.capture_after_send(&proto);
+        rollback.reserve_sender_state_after_send(&mut proto);
+        (effects, rollback)
+    };
+
+    if let Some((reason, renamed_to)) = effects.iter().find_map(|e| match e {
+        crate::daemon_protocol::Effect::SendFailed {
+            reason, renamed_to, ..
+        } => Some((reason.clone(), renamed_to.clone())),
+        _ => None,
+    }) {
+        rollback_failed_delivery(&state, &effects, rollback).await;
+        let mut body = json!({ "error": reason });
+        if let Some(new_id) = renamed_to {
+            body["renamed_to"] = json!(new_id);
+        }
+        return (StatusCode::NOT_FOUND, Json(body));
+    }
+
+    let delivery_outcome = match execute_send_effects_for_api(&state, &effects).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            rollback_failed_delivery(&state, &effects, rollback).await;
+            let method = effects.iter().find_map(|effect| match effect {
+                crate::daemon_protocol::Effect::SendDelivered { method, .. } => {
+                    Some(method.clone())
+                }
+                _ => None,
+            });
+            let mut body = json!({ "error": e.to_string() });
+            if let Some(method) = method {
+                body["method"] = json!(method);
+            }
+            return (StatusCode::BAD_GATEWAY, Json(body));
+        }
+    };
+
+    match &delivery_outcome {
+        crate::state::DeliveryOutcome::Accepted => {
+            finalize_successful_delivery(&state, rollback).await;
+        }
+        crate::state::DeliveryOutcome::Rejected(reason) => {
+            rollback_failed_delivery(&state, &effects, rollback).await;
+            let method = effects.iter().find_map(|effect| match effect {
+                crate::daemon_protocol::Effect::SendDelivered { method, .. } => {
+                    Some(method.clone())
+                }
+                _ => None,
+            });
+            let mut body = json!({ "error": reason });
+            if let Some(method) = method {
+                body["method"] = json!(method);
+            }
+            return (StatusCode::BAD_GATEWAY, Json(body));
+        }
+        crate::state::DeliveryOutcome::Ambiguous(_) => {}
+    }
 
     if let Some((method, msg_id)) = effects.iter().find_map(|e| match e {
         crate::daemon_protocol::Effect::SendDelivered { method, msg_id, .. } => {
@@ -741,31 +822,363 @@ pub async fn send_msg(
         }
         _ => None,
     }) {
+        let status = if matches!(
+            delivery_outcome,
+            crate::state::DeliveryOutcome::Ambiguous(_)
+        ) {
+            "unknown"
+        } else if method == "http" {
+            "accepted"
+        } else {
+            "delivered"
+        };
         (
             StatusCode::OK,
             Json(json!({
-                "status": "delivered",
+                "status": status,
                 "method": method,
                 "msg_id": msg_id,
             })),
         )
-    } else if let Some((reason, renamed_to)) = effects.iter().find_map(|e| match e {
-        crate::daemon_protocol::Effect::SendFailed {
-            reason, renamed_to, ..
-        } => Some((reason.clone(), renamed_to.clone())),
-        _ => None,
-    }) {
-        let mut body = json!({ "error": reason });
-        if let Some(new_id) = renamed_to {
-            body["renamed_to"] = json!(new_id);
-        }
-        (StatusCode::NOT_FOUND, Json(body))
     } else {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": "unexpected send result" })),
         )
     }
+}
+
+struct FailedSendRollback {
+    sender_id: String,
+    pending_reply_before_send: Option<crate::daemon_protocol::PendingReplyEntry>,
+    pending_reply_after_send: Option<Option<crate::daemon_protocol::PendingReplyEntry>>,
+    sender_reminder: Option<Option<String>>,
+    sender_reminder_after_send: Option<Option<String>>,
+    sender_state_reserved: bool,
+    done: bool,
+}
+
+impl FailedSendRollback {
+    fn capture(
+        proto: &crate::daemon_protocol::DaemonState,
+        sender_id: &str,
+        responds_to: Option<u64>,
+        done: bool,
+    ) -> Self {
+        let pending_reply_before_send = responds_to.and_then(|msg_id| {
+            proto
+                .pending_replies
+                .get(sender_id)
+                .and_then(|pending| pending.iter().find(|entry| entry.msg_id == msg_id).cloned())
+        });
+        Self {
+            sender_id: sender_id.to_string(),
+            pending_reply_before_send,
+            pending_reply_after_send: None,
+            sender_reminder: done.then(|| {
+                proto
+                    .sessions
+                    .get(sender_id)
+                    .and_then(|session| session.metadata.reminder.clone())
+            }),
+            sender_reminder_after_send: None,
+            sender_state_reserved: false,
+            done,
+        }
+    }
+
+    fn capture_after_send(&mut self, proto: &crate::daemon_protocol::DaemonState) {
+        if let Some(before) = &self.pending_reply_before_send {
+            self.pending_reply_after_send = Some(
+                proto
+                    .pending_replies
+                    .get(&self.sender_id)
+                    .and_then(|pending| {
+                        pending
+                            .iter()
+                            .find(|entry| entry.msg_id == before.msg_id)
+                            .cloned()
+                    }),
+            );
+        }
+        if self.done {
+            self.sender_reminder_after_send = Some(
+                proto
+                    .sessions
+                    .get(&self.sender_id)
+                    .and_then(|session| session.metadata.reminder.clone()),
+            );
+        }
+    }
+
+    fn reserve_sender_state_after_send(&mut self, proto: &mut crate::daemon_protocol::DaemonState) {
+        if !self.done {
+            return;
+        }
+
+        if let Some(entry) = self.pending_reply_before_send.clone()
+            && self.pending_reply_after_send == Some(None)
+        {
+            proto
+                .pending_replies
+                .entry(self.sender_id.clone())
+                .or_default()
+                .push(entry);
+            self.sender_state_reserved = true;
+        }
+
+        if self.sender_reminder.is_some()
+            && self.sender_reminder_after_send == Some(None)
+            && let Some(session) = proto.sessions.get_mut(&self.sender_id)
+        {
+            session.metadata.reminder = self.sender_reminder.clone().flatten();
+            self.sender_state_reserved = true;
+        }
+    }
+
+    fn sender_state_reserved(&self) -> bool {
+        self.sender_state_reserved
+    }
+}
+
+async fn rollback_failed_delivery(
+    state: &SharedState,
+    effects: &[crate::daemon_protocol::Effect],
+    rollback: FailedSendRollback,
+) {
+    clear_pending_reply_for_failed_delivery(state, effects).await;
+    if rollback.sender_state_reserved() {
+        return;
+    }
+
+    let mut proto = state.protocol.write().await;
+    if let Some(entry) = rollback.pending_reply_before_send {
+        let current_entry = proto
+            .pending_replies
+            .get(&rollback.sender_id)
+            .and_then(|pending| {
+                pending
+                    .iter()
+                    .find(|pending| pending.msg_id == entry.msg_id)
+                    .cloned()
+            });
+        if rollback.pending_reply_after_send.as_ref() == Some(&current_entry) {
+            let pending = proto
+                .pending_replies
+                .entry(rollback.sender_id.clone())
+                .or_default();
+            if let Some(existing) = pending
+                .iter_mut()
+                .find(|pending| pending.msg_id == entry.msg_id)
+            {
+                *existing = entry;
+            } else {
+                pending.push(entry);
+            }
+        }
+    }
+    if rollback.done {
+        let current_reminder = proto
+            .sessions
+            .get(&rollback.sender_id)
+            .and_then(|session| session.metadata.reminder.clone());
+        if rollback.sender_reminder_after_send.as_ref() == Some(&current_reminder)
+            && let Some(session) = proto.sessions.get_mut(&rollback.sender_id)
+        {
+            session.metadata.reminder = rollback.sender_reminder.flatten();
+        }
+    }
+}
+
+async fn finalize_successful_delivery(state: &SharedState, rollback: FailedSendRollback) {
+    if !rollback.done {
+        return;
+    }
+
+    let mut proto = state.protocol.write().await;
+    if let Some(entry) = rollback.pending_reply_before_send {
+        if let Some(pending) = proto.pending_replies.get_mut(&rollback.sender_id) {
+            pending.retain(|pending| pending.msg_id != entry.msg_id);
+            if pending.is_empty() {
+                proto.pending_replies.remove(&rollback.sender_id);
+            }
+        }
+    }
+    if rollback.sender_reminder.is_some()
+        && let Some(session) = proto.sessions.get_mut(&rollback.sender_id)
+    {
+        session.metadata.reminder = None;
+    }
+}
+
+async fn clear_pending_reply_for_failed_delivery(
+    state: &SharedState,
+    effects: &[crate::daemon_protocol::Effect],
+) {
+    let Some((to, msg_id, from)) = effects.iter().find_map(|effect| match effect {
+        crate::daemon_protocol::Effect::SendDelivered {
+            from, to, msg_id, ..
+        } => Some((to.clone(), *msg_id, from.clone())),
+        _ => None,
+    }) else {
+        return;
+    };
+
+    let mut proto = state.protocol.write().await;
+    let Some(pending) = proto.pending_replies.get_mut(&to) else {
+        return;
+    };
+    pending.retain(|entry| entry.msg_id != msg_id || entry.from != from);
+    if pending.is_empty() {
+        proto.pending_replies.remove(&to);
+    }
+}
+
+async fn execute_send_effects_for_api(
+    state: &SharedState,
+    effects: &[crate::daemon_protocol::Effect],
+) -> anyhow::Result<crate::state::DeliveryOutcome> {
+    use crate::daemon_protocol::Effect;
+
+    let recorded_method = effects.iter().find_map(|effect| match effect {
+        Effect::SendDelivered { method, .. } => Some(method.as_str()),
+        _ => None,
+    });
+    let recorded_http_delivery = effects.iter().find_map(|effect| match effect {
+        Effect::SendDelivered { http_delivery, .. } => http_delivery.as_ref(),
+        _ => None,
+    });
+
+    let mut outcome = crate::state::DeliveryOutcome::Accepted;
+
+    for effect in effects {
+        match effect {
+            Effect::Broadcast(msg) => {
+                crate::transport::broadcast(state, msg).await;
+            }
+            Effect::InjectMessage {
+                session_id,
+                pane,
+                message,
+                vim_mode,
+                delivery_method,
+                ..
+            } => {
+                outcome = combine_delivery_outcome(
+                    outcome,
+                    crate::state::deliver_inject_message_effect(
+                        state,
+                        crate::state::InjectDeliveryRequest {
+                            session_id,
+                            pane,
+                            message,
+                            vim_mode: *vim_mode,
+                            delivery_method: delivery_method.as_deref(),
+                            recorded_method,
+                        },
+                    )
+                    .await,
+                );
+            }
+            Effect::DeliverHttpMessage {
+                session_id: _,
+                message,
+                http_delivery,
+                ..
+            } => {
+                let delivery = Some(http_delivery)
+                    .or(recorded_http_delivery)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "http delivery skipped: no recorded backend_session_id on send"
+                        )
+                    })?;
+                outcome = combine_delivery_outcome(
+                    outcome,
+                    deliver_http_message_outcome(state, delivery, message).await,
+                );
+            }
+            Effect::SendToHuman { npub, message } => {
+                let _ = crate::nostr_transport::send_plain_dm(state, npub, message).await;
+            }
+            Effect::LogMessage {
+                from,
+                to,
+                message,
+                delivered,
+                transport,
+            } => {
+                let delivered = if matches!(outcome, crate::state::DeliveryOutcome::Rejected(_)) {
+                    false
+                } else {
+                    *delivered
+                };
+                state
+                    .log_message(
+                        from.clone(),
+                        to.clone(),
+                        message.clone(),
+                        delivered,
+                        transport,
+                    )
+                    .await;
+            }
+            Effect::SendDelivered { .. } | Effect::SendFailed { .. } => {}
+            _ => {
+                tracing::debug!(?effect, "unexpected send effect in API executor");
+            }
+        }
+    }
+
+    Ok(outcome)
+}
+
+fn combine_delivery_outcome(
+    left: crate::state::DeliveryOutcome,
+    right: crate::state::DeliveryOutcome,
+) -> crate::state::DeliveryOutcome {
+    match (left, right) {
+        (crate::state::DeliveryOutcome::Rejected(reason), _)
+        | (_, crate::state::DeliveryOutcome::Rejected(reason)) => {
+            crate::state::DeliveryOutcome::Rejected(reason)
+        }
+        (crate::state::DeliveryOutcome::Ambiguous(reason), _)
+        | (_, crate::state::DeliveryOutcome::Ambiguous(reason)) => {
+            crate::state::DeliveryOutcome::Ambiguous(reason)
+        }
+        (crate::state::DeliveryOutcome::Accepted, crate::state::DeliveryOutcome::Accepted) => {
+            crate::state::DeliveryOutcome::Accepted
+        }
+    }
+}
+
+async fn deliver_http_message_outcome(
+    state: &SharedState,
+    delivery: &crate::daemon_protocol::HttpDeliverySnapshot,
+    message: &str,
+) -> crate::state::DeliveryOutcome {
+    tmux::deliver_via_http(
+        state,
+        &delivery.backend_session_id,
+        delivery.project_dir.as_deref(),
+        message,
+        delivery.model.as_deref(),
+        delivery.effort.as_deref(),
+    )
+    .await
+    .map(|()| crate::state::DeliveryOutcome::Accepted)
+    .unwrap_or_else(|decision| match decision {
+        crate::nostr_transport::PromptAsyncFallbackDecision::Ambiguous => {
+            crate::state::DeliveryOutcome::Ambiguous(format!(
+                "prompt_async request failed: {decision:?}"
+            ))
+        }
+        crate::nostr_transport::PromptAsyncFallbackDecision::DefiniteNonAcceptance => {
+            crate::state::DeliveryOutcome::Rejected(format!(
+                "prompt_async request failed: {decision:?}"
+            ))
+        }
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -905,38 +1318,71 @@ pub struct InjectBody {
     vim_mode: bool,
 }
 
+struct ForcePaneInjectTarget {
+    session_id: Option<String>,
+    inject_config: crate::backend::InjectConfig,
+    tui_pattern: Option<String>,
+}
+
+async fn resolve_force_pane_inject_target(
+    state: &crate::state::AppState,
+    pane: &str,
+    detected_backend: Option<String>,
+) -> ForcePaneInjectTarget {
+    let registered = {
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .values()
+            .find(|s| s.pane.as_deref() == Some(pane))
+            .map(|s| (s.id.clone(), s.metadata.backend.clone()))
+    };
+    let (session_id, registered_backend_name) = match registered {
+        Some((session_id, backend_name)) => (Some(session_id), backend_name),
+        None => (None, None),
+    };
+    let backend_name = match registered_backend_name {
+        Some(name) => Some(name),
+        None => match detected_backend {
+            Some(name) => Some(name),
+            None => state.detect_backend_in_pane(pane).await,
+        },
+    };
+    let backend = backend_name
+        .as_deref()
+        .and_then(|name| state.backends.get(name))
+        .unwrap_or_else(|| state.backends.default());
+
+    ForcePaneInjectTarget {
+        session_id,
+        inject_config: backend.inject_config(),
+        tui_pattern: backend.tui_ready_pattern().map(String::from),
+    }
+}
+
 /// Inject text into a tmux pane via the queued writer.
 pub async fn inject(
     State(state): State<SharedState>,
     Json(body): Json<InjectBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let session_id = {
-        let proto = state.protocol.read().await;
-        match proto
-            .sessions
-            .values()
-            .find(|s| s.pane.as_deref() == Some(&body.pane))
-            .map(|s| s.id.clone())
-        {
-            Some(id) => id,
-            None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": "no session registered for this pane"})),
-                );
-            }
-        }
-    };
-    match tmux::locked_inject(
+    let target = resolve_force_pane_inject_target(&state, &body.pane, None).await;
+    if let Some(session_id) = target.session_id.as_deref() {
+        tracing::debug!(session = %session_id, pane = %body.pane, "force-pane inject resolved registered session backend");
+    }
+    match tmux::locked_inject_raw_tmux_with_config(
         &state,
-        &session_id,
         &body.pane,
         &body.message,
         body.vim_mode,
+        target.inject_config,
+        target.tui_pattern,
     )
     .await
     {
-        Ok(()) => (StatusCode::OK, Json(json!({ "status": "injected" }))),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({ "status": "injected", "delivery": "tmux" })),
+        ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
@@ -987,11 +1433,10 @@ pub struct CompactBody {
 ///   typo like `{"continuatino": "..."}` now returns 400 instead of silently
 ///   dropping the value).
 ///
-/// Concurrency: when a `continuation` is supplied the TUI branch rejects
-/// concurrent compact attempts with 409 to prevent overwriting an in-flight
-/// caller's continuation. The HTTP branch currently has no concurrency guard
-/// — two racing /compact calls on the same opencode session will each pay
-/// for a separate summarize LLM call. See follow-up.
+/// Concurrency: the TUI branch rejects concurrent compact attempts with a
+/// continuation so it cannot overwrite the in-flight caller's parked
+/// continuation. The HTTP branch rejects any concurrent compact attempt for
+/// the same Ouija session while summarize/prompt delivery is in flight.
 pub async fn compact(
     State(state): State<SharedState>,
     axum::extract::Path(session_id): axum::extract::Path<String>,
@@ -1048,11 +1493,13 @@ async fn compact_inner(
         match proto.sessions.get(&session_id) {
             Some(s) => SessionLookup {
                 pane: s.pane.clone(),
+                origin: s.origin.clone(),
                 backend_session_id: s.metadata.backend_session_id.clone(),
                 project_dir: s.metadata.project_dir.clone(),
                 backend_name: s.metadata.backend.clone(),
                 model: s.metadata.model.clone(),
                 effort: s.metadata.effort.clone(),
+                strong_opencode_binding: s.metadata.is_strong_opencode_binding(),
             },
             None => {
                 return (
@@ -1062,6 +1509,13 @@ async fn compact_inner(
             }
         }
     };
+
+    if !matches!(lookup.origin, crate::daemon_protocol::Origin::Local) {
+        return (
+            StatusCode::BAD_REQUEST,
+            json!({"error": "compact is only supported for local sessions"}),
+        );
+    }
 
     // Resolve the backend from the name captured above rather than re-reading
     // the protocol lock — prevents the branch decision from diverging from the
@@ -1153,14 +1607,29 @@ async fn compact_inner(
                     }),
                 );
             };
+            if !lookup.strong_opencode_binding {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    json!({
+                        "error": "opencode compact requires a strong managed backend binding; weak/adopted sessions cannot safely use HTTP-only summarize"
+                    }),
+                );
+            }
+            let Some(_compact_guard) =
+                state.try_acquire_compact_in_progress(&format!("opencode:{backend_session_id}"))
+            else {
+                return (
+                    StatusCode::CONFLICT,
+                    json!({"error": "another compact operation is already in progress for this session"}),
+                );
+            };
 
-            let Some((provider_id, model_id)) =
-                resolve_opencode_compact_model(
-                    state,
-                    lookup.model.as_deref(),
-                    lookup.project_dir.as_deref(),
-                )
-                .await
+            let Some((provider_id, model_id)) = resolve_opencode_compact_model(
+                state,
+                lookup.model.as_deref(),
+                lookup.project_dir.as_deref(),
+            )
+            .await
             else {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -1230,16 +1699,19 @@ async fn compact_inner(
                 .await
                 {
                     Ok(()) => true,
-                    Err(e) => {
+                    Err(decision) => {
                         tracing::warn!(
                             session = %session_id,
-                            "continuation delivery failed after successful summarize: {e}"
+                            ?decision,
+                            "continuation delivery failed after successful summarize"
                         );
                         return (
                             StatusCode::OK,
                             compact_success_body(
                                 false,
-                                Some(format!("opencode continuation delivery failed: {e}")),
+                                Some(format!(
+                                    "opencode continuation delivery failed: {decision:?}"
+                                )),
                             ),
                         );
                     }
@@ -1258,11 +1730,13 @@ async fn compact_inner(
 
 struct SessionLookup {
     pane: Option<String>,
+    origin: crate::daemon_protocol::Origin,
     backend_session_id: Option<String>,
     project_dir: Option<String>,
     backend_name: Option<String>,
     model: Option<String>,
     effort: Option<String>,
+    strong_opencode_binding: bool,
 }
 
 // --- Nodes ---
@@ -1926,13 +2400,20 @@ pub async fn prune_stale_sessions(
                 matches!(s.origin, crate::daemon_protocol::Origin::Local)
                     && s.metadata.worktree_present == Some(false)
             })
-            .filter_map(|s| s.metadata.project_dir.as_ref().map(|d| (s.id.clone(), d.clone())))
+            .filter_map(|s| {
+                s.metadata
+                    .project_dir
+                    .as_ref()
+                    .map(|d| (s.id.clone(), d.clone()))
+            })
             .collect()
     };
     if !body.confirm {
         return (
             StatusCode::OK,
-            Json(json!({ "dry_run": true, "would_prune": stale_sessions.iter().map(|(id, _)| id).cloned().collect::<Vec<_>>() })),
+            Json(
+                json!({ "dry_run": true, "would_prune": stale_sessions.iter().map(|(id, _)| id).cloned().collect::<Vec<_>>() }),
+            ),
         );
     }
     let mut pruned = Vec::new();
@@ -1975,7 +2456,10 @@ pub async fn prune_stale_sessions(
             tracing::debug!("session {} vanished between snapshot and prune", id);
             already_gone.push(id);
         } else {
-            tracing::warn!("failed to prune session {} (no longer stale or guard tripped)", id);
+            tracing::warn!(
+                "failed to prune session {} (no longer stale or guard tripped)",
+                id
+            );
             errors.push(id);
         }
     }
@@ -1984,12 +2468,28 @@ pub async fn prune_stale_sessions(
     } else {
         let mut obj = serde_json::Map::new();
         obj.insert("dry_run".into(), serde_json::Value::Bool(false));
-        obj.insert("pruned".into(), serde_json::Value::Array(pruned.into_iter().map(serde_json::Value::String).collect()));
+        obj.insert(
+            "pruned".into(),
+            serde_json::Value::Array(pruned.into_iter().map(serde_json::Value::String).collect()),
+        );
         if !errors.is_empty() {
-            obj.insert("errors".into(), serde_json::Value::Array(errors.into_iter().map(serde_json::Value::String).collect()));
+            obj.insert(
+                "errors".into(),
+                serde_json::Value::Array(
+                    errors.into_iter().map(serde_json::Value::String).collect(),
+                ),
+            );
         }
         if !already_gone.is_empty() {
-            obj.insert("already_gone".into(), serde_json::Value::Array(already_gone.into_iter().map(serde_json::Value::String).collect()));
+            obj.insert(
+                "already_gone".into(),
+                serde_json::Value::Array(
+                    already_gone
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
         }
         serde_json::Value::Object(obj)
     };
@@ -2150,7 +2650,10 @@ pub async fn clear_block_interactive(
 /// See issue #646: `/api/pane/{pane}/...` routes used to silently 404 on
 /// raw `%`-prefixed pane ids, and one handler (get_pending_replies) even
 /// masked the bug by returning `200 + []` on pane lookup miss.
-fn resolve_pane_to_session(proto: &crate::daemon_protocol::DaemonState, raw: &str) -> Option<String> {
+fn resolve_pane_to_session(
+    proto: &crate::daemon_protocol::DaemonState,
+    raw: &str,
+) -> Option<String> {
     let suffix = raw.strip_prefix('%').unwrap_or(raw);
     let pane_id = format!("%{suffix}");
     proto
@@ -2274,32 +2777,279 @@ pub async fn session_active(
 }
 
 /// Deliver a pending prompt for the given session, if one is queued.
-fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool {
+async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool {
     let pending = state.pending_prompts.lock().unwrap().remove(session_name);
-    let Some((pane_id, prompt)) = pending else {
+    let Some(pending) = pending else {
         tracing::info!(
             session = session_name,
             "opencode pending prompt: none queued at readiness"
         );
         return false;
     };
-    let prompt_len = prompt.len();
-    tracing::info!(
-        session = session_name,
-        pane = %pane_id,
-        prompt_len,
-        "opencode pending prompt: delivering queued prompt"
-    );
+    let pane_id = pending.pane_id.clone();
+    let prompt = pending.prompt.clone();
+
+    let (pane_still_registered, backend_session_matches, http_delivery) = {
+        let proto = state.protocol.read().await;
+        match proto.sessions.get(session_name) {
+            Some(session) => (
+                session.pane.as_deref() == Some(pane_id.as_str()),
+                pending
+                    .backend_session_id
+                    .as_deref()
+                    .is_none_or(|expected| {
+                        session.metadata.backend_session_id.as_deref() == Some(expected)
+                    }),
+                session
+                    .metadata
+                    .is_strong_opencode_binding()
+                    .then(|| session.metadata.http_delivery_snapshot())
+                    .flatten(),
+            ),
+            None => (false, false, None),
+        }
+    };
+    if !pane_still_registered {
+        restore_pending_prompt_if_absent(state, session_name, pending);
+        tracing::warn!(
+            "readiness prompt delivery skipped for {session_name}: queued pane is no longer registered to the session"
+        );
+        return false;
+    }
+    if !backend_session_matches {
+        restore_pending_prompt_if_absent(state, session_name, pending);
+        tracing::warn!(
+            "readiness prompt delivery skipped for {session_name}: queued OpenCode backend session is no longer current"
+        );
+        return false;
+    }
+
+    let used_http_delivery = http_delivery.is_some();
+    let result = match http_delivery {
+        Some(delivery) => match deliver_http_message_outcome(state, &delivery, &prompt).await {
+            crate::state::DeliveryOutcome::Accepted => Ok(()),
+            crate::state::DeliveryOutcome::Ambiguous(_) => {
+                tracing::warn!(
+                    "readiness prompt HTTP delivery failed ambiguously for {session_name}; not retrying via raw tmux"
+                );
+                return false;
+            }
+            crate::state::DeliveryOutcome::Rejected(reason) => Err(anyhow::anyhow!(reason)),
+        },
+        None => {
+            deliver_pending_prompt_via_raw_tmux(
+                state,
+                session_name,
+                &pane_id,
+                &prompt,
+                pending.backend_session_id.as_deref(),
+            )
+            .await
+        }
+    };
+
+    match result {
+        Ok(()) => {
+            tracing::info!("delivered queued prompt to {session_name} via readiness signal");
+            true
+        }
+        Err(e) if used_http_delivery => {
+            tracing::warn!(
+                "readiness prompt HTTP delivery failed for {session_name}, trying raw tmux fallback: {e}"
+            );
+            match deliver_pending_prompt_via_raw_tmux(
+                state,
+                session_name,
+                &pane_id,
+                &prompt,
+                pending.backend_session_id.as_deref(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        "delivered queued prompt to {session_name} via raw tmux fallback"
+                    );
+                    true
+                }
+                Err(fallback_error) => {
+                    restore_pending_prompt_if_absent(state, session_name, pending.clone());
+                    schedule_pending_prompt_retry(state, session_name, pending);
+                    tracing::warn!(
+                        "readiness prompt fallback failed for {session_name}: {fallback_error}"
+                    );
+                    false
+                }
+            }
+        }
+        Err(e) => {
+            restore_pending_prompt_if_absent(state, session_name, pending.clone());
+            schedule_pending_prompt_retry(state, session_name, pending);
+            tracing::warn!("readiness prompt raw tmux delivery failed for {session_name}: {e}");
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+const PENDING_PROMPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+#[cfg(not(test))]
+const PENDING_PROMPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+const PENDING_PROMPT_MAX_RETRIES: u8 = 3;
+
+fn schedule_pending_prompt_retry(
+    state: &SharedState,
+    session_name: &str,
+    pending_prompt: crate::state::PendingPrompt,
+) {
+    schedule_pending_prompt_retry_attempt(state, session_name, pending_prompt, 1);
+}
+
+fn schedule_pending_prompt_retry_attempt(
+    state: &SharedState,
+    session_name: &str,
+    pending_prompt: crate::state::PendingPrompt,
+    attempt: u8,
+) {
     let state = state.clone();
-    let sid = session_name.to_string();
+    let session_name = session_name.to_string();
     tokio::spawn(async move {
-        if let Err(e) = crate::tmux::locked_inject(&state, &sid, &pane_id, &prompt, false).await {
-            tracing::warn!("readiness prompt delivery failed for {sid}: {e}");
-        } else {
-            tracing::info!("delivered queued prompt to {sid} via readiness signal");
+        tokio::time::sleep(PENDING_PROMPT_RETRY_DELAY).await;
+        let pending = reserve_pending_prompt_if_matches(
+            &state,
+            &session_name,
+            &pending_prompt.pane_id,
+            &pending_prompt.prompt,
+            pending_prompt.backend_session_id.as_deref(),
+        );
+        let Some(pending) = pending else {
+            return;
+        };
+        match deliver_pending_prompt_via_raw_tmux(
+            &state,
+            &session_name,
+            &pending.pane_id,
+            &pending.prompt,
+            pending.backend_session_id.as_deref(),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(error) => {
+                restore_pending_prompt_if_absent(&state, &session_name, pending.clone());
+                if attempt < PENDING_PROMPT_MAX_RETRIES {
+                    schedule_pending_prompt_retry_attempt(
+                        &state,
+                        &session_name,
+                        pending,
+                        attempt + 1,
+                    );
+                }
+                tracing::warn!(
+                    "readiness prompt retry fallback attempt {attempt}/{PENDING_PROMPT_MAX_RETRIES} failed for {session_name}: {error}"
+                )
+            }
         }
     });
-    true
+}
+
+fn reserve_pending_prompt_if_matches(
+    state: &SharedState,
+    session_name: &str,
+    pane_id: &str,
+    prompt: &str,
+    backend_session_id: Option<&str>,
+) -> Option<crate::state::PendingPrompt> {
+    let mut pending = state.pending_prompts.lock().unwrap();
+    if pending.get(session_name).is_some_and(|pending| {
+        pending.pane_id == pane_id
+            && pending.prompt == prompt
+            && pending.backend_session_id.as_deref() == backend_session_id
+    }) {
+        return pending.remove(session_name);
+    }
+    None
+}
+
+async fn deliver_pending_prompt_via_raw_tmux(
+    state: &SharedState,
+    session_name: &str,
+    pane_id: &str,
+    prompt: &str,
+    expected_backend_session_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let (pane_still_registered, backend_session_matches) = {
+        let proto = state.protocol.read().await;
+        match proto.sessions.get(session_name) {
+            Some(session) => (
+                session.pane.as_deref() == Some(pane_id),
+                expected_backend_session_id.is_none_or(|expected| {
+                    session.metadata.backend_session_id.as_deref() == Some(expected)
+                }),
+            ),
+            None => (false, false),
+        }
+    };
+    if !pane_still_registered {
+        anyhow::bail!(
+            "readiness prompt fallback skipped: pane {pane_id} is no longer registered to session {session_name}"
+        );
+    }
+    if !backend_session_matches {
+        anyhow::bail!(
+            "readiness prompt fallback skipped: queued OpenCode backend session is no longer current for session {session_name}"
+        );
+    }
+    ensure_pending_prompt_pane_is_live(state, session_name, pane_id).await?;
+
+    crate::tmux::locked_inject_raw_tmux(state, session_name, pane_id, prompt, false).await
+}
+
+async fn ensure_pending_prompt_pane_is_live(
+    state: &SharedState,
+    session_name: &str,
+    pane_id: &str,
+) -> anyhow::Result<()> {
+    let pane_live = if cfg!(test) {
+        state
+            .list_assistant_panes()
+            .await
+            .iter()
+            .any(|pane| pane.pane_id == pane_id)
+    } else {
+        let process_names: Vec<String> = state
+            .backend_for_session(session_name)
+            .await
+            .process_names()
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let pane_id = pane_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            let refs: Vec<&str> = process_names.iter().map(|name| name.as_str()).collect();
+            crate::tmux::pane_alive(&pane_id, &refs)
+        })
+        .await
+        .unwrap_or(false)
+    };
+
+    if !pane_live {
+        anyhow::bail!(
+            "readiness prompt fallback skipped: pane {pane_id} is not running the session backend"
+        );
+    }
+    Ok(())
+}
+
+fn restore_pending_prompt_if_absent(
+    state: &SharedState,
+    session_name: &str,
+    pending_prompt: crate::state::PendingPrompt,
+) {
+    let mut pending = state.pending_prompts.lock().unwrap();
+    pending
+        .entry(session_name.to_string())
+        .or_insert(pending_prompt);
 }
 
 /// Handle a readiness signal from an HttpApi session's plugin.
@@ -2307,7 +3057,7 @@ pub async fn session_ready(
     State(state): State<SharedState>,
     axum::extract::Path(session_id): axum::extract::Path<String>,
 ) -> Json<serde_json::Value> {
-    let delivered = deliver_pending_prompt(&state, &session_id);
+    let delivered = deliver_pending_prompt(&state, &session_id).await;
     Json(json!({"delivered": delivered}))
 }
 
@@ -2332,6 +3082,10 @@ pub async fn backend_session_ready(
     axum::extract::Path(backend_sid): axum::extract::Path<String>,
     body_bytes: Bytes,
 ) -> Json<serde_json::Value> {
+    if let Some(error) = validate_backend_session_id_boundary(&backend_sid) {
+        return Json(json!({"delivered": false, "error": error}));
+    }
+
     // Parse the body as optional hints. An empty body, `{}`, or malformed
     // JSON all degrade cleanly to "no hints" — older plugin builds POST an
     // empty body, and we must not 400 them.
@@ -2395,16 +3149,16 @@ async fn backend_session_ready_inner_with_hints(
     backend_sid: String,
     hints: BackendSessionReadyHints,
 ) -> serde_json::Value {
+    if let Some(error) = validate_backend_session_id_boundary(&backend_sid) {
+        return json!({"delivered": false, "error": error});
+    }
+
     // Step 1: direct lookup. This runs FIRST regardless of hints — hub-
     // spawned and previously-adopted sessions must win over any hint-derived
     // id, or a stale plugin cwd could shadow the real session.
     let session_name = {
         let proto = state.protocol.read().await;
-        proto
-            .sessions
-            .values()
-            .find(|s| s.metadata.backend_session_id.as_deref() == Some(&backend_sid))
-            .map(|s| s.id.clone())
+        find_local_session_by_backend_session_id(&proto, &backend_sid).map(|s| s.id.clone())
     };
 
     let name = if let Some(n) = session_name {
@@ -2510,7 +3264,7 @@ async fn backend_session_ready_inner_with_hints(
         }
     };
 
-    let delivered = deliver_pending_prompt(state, &name);
+    let delivered = deliver_pending_prompt(state, &name).await;
     tracing::info!(
         target: "ouija::api::backend_session_ready",
         backend_session_id = %backend_sid,
@@ -2519,6 +3273,10 @@ async fn backend_session_ready_inner_with_hints(
         "backend session ready complete"
     );
     json!({"delivered": delivered, "session": name})
+}
+
+fn validate_backend_session_id_boundary(backend_sid: &str) -> Option<String> {
+    crate::daemon_protocol::validate_backend_session_id_boundary(backend_sid)
 }
 
 /// Auto-provision a fresh session record for an opencode backend session that
@@ -2547,11 +3305,7 @@ async fn auto_provision_from_backend_session(
     // the winner's session binds the pane, so the filter would drop it.
     {
         let proto = state.protocol.read().await;
-        if let Some(existing) = proto
-            .sessions
-            .values()
-            .find(|s| s.metadata.backend_session_id.as_deref() == Some(backend_sid))
-        {
+        if let Some(existing) = find_local_session_by_backend_session_id(&proto, backend_sid) {
             return Some(existing.id.clone());
         }
     }
@@ -2568,11 +3322,26 @@ async fn auto_provision_from_backend_session(
             .collect()
     };
 
-    // Filter to panes in the target dir that are not already registered.
+    let opencode_process_names = state
+        .backends
+        .get("opencode")
+        .map(|backend| {
+            backend
+                .process_names()
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+
+    // Filter to OpenCode panes in the target dir that are not already registered.
     let candidates: Vec<String> = panes
         .into_iter()
         .filter(|p| {
             !registered_panes.contains(&p.pane_id)
+                && p.process_name
+                    .as_deref()
+                    .is_some_and(|name| opencode_process_names.contains(name))
                 && p.pane_current_path
                     .as_deref()
                     .map(|path| crate::state::resolve_project_root(path) == dir)
@@ -2607,13 +3376,16 @@ async fn auto_provision_from_backend_session(
 /// Auto-provision using an explicit `(pane, dir)` pair supplied by the
 /// opencode plugin in the readiness POST body. Skips the opencode-serve
 /// dir lookup and the tmux pane scan lookup-by-dir, but still verifies the
-/// pane against the same two invariants the scan path enforces:
+/// pane against the same invariants the scan path enforces:
 ///
 /// 1. The pane must appear in `list_assistant_panes`. This rejects stale
 ///    `TMUX_PANE` values (pane died between capture and POST), inherited
 ///    env vars from non-opencode callers, and any other caller who hands
 ///    us a pane id that isn't actually running an assistant process.
-/// 2. The pane must not already be bound to another Local session. Without
+/// 2. The pane's current path must resolve to the hinted project root. This
+///    rejects stale or inherited cwd values that point at a different pane's
+///    project.
+/// 3. The pane must not already be bound to another Local session. Without
 ///    this filter, `apply_register`'s pane-dedup silently evicts whoever
 ///    currently owns the pane — a concurrent claude-code SessionStart, a
 ///    prior auto-provision, or a manual `ouija register` would all be
@@ -2658,27 +3430,72 @@ async fn auto_provision_with_explicit_pane(
     // apply_register's pane-dedup would resolve by evicting them.
     {
         let proto = state.protocol.read().await;
-        if let Some(existing) = proto
-            .sessions
-            .values()
-            .find(|s| s.metadata.backend_session_id.as_deref() == Some(backend_sid))
-        {
+        if let Some(existing) = find_local_session_by_backend_session_id(&proto, backend_sid) {
             return Some(existing.id.clone());
         }
+    }
+
+    let Some(backend_dir) = lookup_opencode_session_dir(state, backend_sid).await else {
+        tracing::warn!(
+            "auto-provision declined: backend_session_id {backend_sid} is unknown to opencode serve"
+        );
+        return None;
+    };
+    let backend_dir = crate::state::resolve_project_root(&backend_dir);
+    if backend_dir != dir {
+        tracing::warn!(
+            "auto-provision declined: backend_session_id {backend_sid} belongs to dir {backend_dir}, not hinted cwd {dir}"
+        );
+        return None;
     }
 
     // Defense 1: the supplied pane must be in list_assistant_panes. This is
     // the same liveness + is-an-assistant-pane check the scan path applies
     // implicitly when it iterates find_assistant_panes results.
     let panes = state.list_assistant_panes().await;
-    if !panes.iter().any(|p| p.pane_id == pane) {
+    let Some(hinted_pane) = panes.iter().find(|p| p.pane_id == pane) else {
         tracing::warn!(
             "auto-provision declined: hint pane {pane} is not among current assistant panes (backend_session_id {backend_sid})"
         );
         return None;
+    };
+    let opencode_process_names = state
+        .backends
+        .get("opencode")
+        .map(|backend| {
+            backend
+                .process_names()
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let pane_matches_opencode = hinted_pane
+        .process_name
+        .as_deref()
+        .is_some_and(|name| opencode_process_names.contains(name));
+    if !pane_matches_opencode {
+        tracing::warn!(
+            "auto-provision declined: hint pane {pane} is not running opencode (backend_session_id {backend_sid})"
+        );
+        return None;
     }
 
-    // Defense 2: the supplied pane must not already belong to another
+    // Defense 2: the explicit cwd must match the pane's actual cwd after
+    // applying the same project-root normalization as the scan path.
+    let cwd_matches_pane = hinted_pane
+        .pane_current_path
+        .as_deref()
+        .map(|path| crate::state::resolve_project_root(path) == dir)
+        .unwrap_or(false);
+    if !cwd_matches_pane {
+        tracing::warn!(
+            "auto-provision declined: hint pane {pane} is not in hinted cwd {dir} (backend_session_id {backend_sid})"
+        );
+        return None;
+    }
+
+    // Defense 3: the supplied pane must not already belong to another
     // Local session. Matches the `registered_panes` filter in the scan path
     // (auto_provision_from_backend_session). Without this, apply_register's
     // pane-dedup would silently evict the current owner.
@@ -2730,11 +3547,7 @@ async fn register_auto_provisioned_session(
     // id, same pane) — stomping their atomic bind.
     let id = {
         let proto = state.protocol.read().await;
-        if let Some(existing) = proto
-            .sessions
-            .values()
-            .find(|s| s.metadata.backend_session_id.as_deref() == Some(backend_sid))
-        {
+        if let Some(existing) = find_local_session_by_backend_session_id(&proto, backend_sid) {
             return Some(existing.id.clone());
         }
         let id_to_pane: std::collections::HashMap<String, Option<String>> = proto
@@ -2756,15 +3569,53 @@ async fn register_auto_provisioned_session(
         backend_session_id: Some(backend_sid.to_string()),
         ..Default::default()
     };
-    state
-        .apply_and_execute(crate::daemon_protocol::Event::Register {
+    let effects = state
+        .apply_and_execute(crate::daemon_protocol::Event::RegisterIfPaneUnbound {
             id: id.clone(),
-            pane: Some(pane_id.to_string()),
+            pane: pane_id.to_string(),
+            expected_backend_session_id: Some(backend_sid.to_string()),
             metadata,
         })
         .await;
 
-    Some(id)
+    let proto = state.protocol.read().await;
+    auto_provision_register_result(&proto, backend_sid, &id, &effects)
+}
+
+fn auto_provision_register_result(
+    proto: &crate::daemon_protocol::DaemonState,
+    backend_sid: &str,
+    id: &str,
+    effects: &[crate::daemon_protocol::Effect],
+) -> Option<String> {
+    if effects.iter().any(|effect| {
+        matches!(
+            effect,
+            crate::daemon_protocol::Effect::RegisterOk { session_id, .. } if session_id == id
+        )
+    }) {
+        Some(id.to_string())
+    } else if effects.iter().any(|effect| {
+        matches!(
+            effect,
+            crate::daemon_protocol::Effect::RegisterFailed { session_id, .. } if session_id == id
+        )
+    }) {
+        find_local_session_by_backend_session_id(proto, backend_sid)
+            .map(|session| session.id.clone())
+    } else {
+        None
+    }
+}
+
+fn find_local_session_by_backend_session_id<'a>(
+    proto: &'a crate::daemon_protocol::DaemonState,
+    backend_sid: &str,
+) -> Option<&'a crate::daemon_protocol::SessionEntry> {
+    proto.sessions.values().find(|s| {
+        matches!(s.origin, crate::daemon_protocol::Origin::Local)
+            && s.metadata.backend_session_id.as_deref() == Some(backend_sid)
+    })
 }
 
 /// Choose at most one candidate session ID for adoption (issue #15).
@@ -2892,10 +3743,7 @@ async fn resolve_opencode_compact_model(
     if let Some(dir) = project_dir {
         req = req.header("x-opencode-directory", dir);
     }
-    let resp = req
-        .send()
-        .await
-        .ok()?;
+    let resp = req.send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -2955,6 +3803,7 @@ async fn adopt_backend_session_id(
             id: session_id.clone(),
             backend: "opencode".into(),
             backend_session_id: backend_sid.to_string(),
+            expected_backend_session_id: None,
         })
         .await;
 
@@ -3004,6 +3853,61 @@ pub async fn clear_reminder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pending_prompt(pane_id: &str, prompt: &str) -> crate::state::PendingPrompt {
+        crate::state::PendingPrompt::new(pane_id.into(), prompt.into(), None)
+    }
+
+    fn pending_opencode_prompt(
+        pane_id: &str,
+        prompt: &str,
+        backend_session_id: &str,
+    ) -> crate::state::PendingPrompt {
+        crate::state::PendingPrompt::new(
+            pane_id.into(),
+            prompt.into(),
+            Some(backend_session_id.into()),
+        )
+    }
+
+    #[tokio::test]
+    async fn register_returns_conflict_when_protocol_rejects_duplicate_backend_session_id() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "owner".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_dup".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let body = serde_json::json!({
+            "id": "intruder",
+            "backend": "opencode",
+            "backend_session_id": "ses_dup"
+        });
+        let (status, Json(response)) = register(
+            State(state),
+            ConnectInfo("127.0.0.1:9000".parse().unwrap()),
+            HeaderMap::new(),
+            Bytes::from(body.to_string()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(response["session_id"], "intruder");
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("backend_session_id ses_dup is already bound to session 'owner'"),
+            "protocol failure reason must be preserved, got: {response}"
+        );
+    }
 
     #[test]
     fn normalize_optional_string_passthrough() {
@@ -3141,6 +4045,1070 @@ mod tests {
     // --- compact endpoint ---
 
     #[tokio::test]
+    async fn inject_for_opencode_pane_reports_tmux_delivery() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-live".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = inject(
+            State(state),
+            Json(InjectBody {
+                pane: "%oc".into(),
+                message: "hello raw tmux".into(),
+                vim_mode: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "injected");
+        assert_eq!(body["delivery"], "tmux");
+    }
+
+    #[tokio::test]
+    async fn inject_unregistered_pane_uses_raw_tmux_delivery() {
+        let state = crate::state::AppState::new_for_test();
+
+        let (status, body) = inject(
+            State(state),
+            Json(InjectBody {
+                pane: "%unregistered".into(),
+                message: "hello raw pane".into(),
+                vim_mode: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "injected");
+        assert_eq!(body["delivery"], "tmux");
+    }
+
+    #[tokio::test]
+    async fn force_pane_inject_uses_detected_backend_config_without_fake_session() {
+        let state = crate::state::AppState::new_for_test();
+
+        let target = resolve_force_pane_inject_target(&state, "%oc", Some("opencode".into())).await;
+
+        assert_eq!(target.session_id, None);
+        assert_eq!(target.inject_config.paste_settle_ms, 100);
+        assert!(!target.inject_config.use_inner_bracketed_paste);
+        assert_eq!(target.inject_config.startup_inject_delay_secs, 0);
+        assert_eq!(target.tui_pattern, None);
+    }
+
+    #[tokio::test]
+    async fn force_pane_inject_detects_backend_when_registered_metadata_has_no_backend() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "legacy".into(),
+                pane: Some("%legacy".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+
+        let target =
+            resolve_force_pane_inject_target(&state, "%legacy", Some("opencode".into())).await;
+
+        assert_eq!(target.session_id.as_deref(), Some("legacy"));
+        assert_eq!(target.inject_config.paste_settle_ms, 100);
+        assert!(!target.inject_config.use_inner_bracketed_paste);
+        assert_eq!(target.inject_config.startup_inject_delay_secs, 0);
+        assert_eq!(target.tui_pattern, None);
+    }
+
+    #[tokio::test]
+    async fn send_to_adopted_opencode_live_pane_reports_tmux_delivery() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-live".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = send_msg(
+            State(state),
+            Json(SendBody {
+                from: "sender".into(),
+                to: "oc-live".into(),
+                message: "hello live pane".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "delivered");
+        assert_eq!(body["method"], "tmux");
+    }
+
+    async fn state_with_opencode_prompt_server() -> (SharedState, tokio::task::JoinHandle<()>) {
+        use axum::Router;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        async fn prompt_async() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "ok": true }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_port = listener.local_addr().unwrap().port();
+        assert!(serve_port >= 320, "test listener port must be >= 320");
+        let app = Router::new().route("/session/{session_id}/prompt_async", post(prompt_async));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: serve_port - 320,
+            data_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+            config_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+        });
+
+        (state, server)
+    }
+
+    #[tokio::test]
+    async fn send_to_strong_opencode_binding_reports_http_acceptance() {
+        let (state, server) = state_with_opencode_prompt_server().await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-managed".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = send_msg(
+            State(state),
+            Json(SendBody {
+                from: "sender".into(),
+                to: "oc-managed".into(),
+                message: "hello http".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+            }),
+        )
+        .await;
+
+        server.abort();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "accepted");
+        assert_eq!(body["method"], "http");
+    }
+
+    #[tokio::test]
+    async fn send_to_session_with_soft_restart_in_progress_returns_conflict() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-managed".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_old".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let _guard = state
+            .try_acquire_soft_restart_in_progress("oc-managed")
+            .expect("soft restart guard should be acquired");
+
+        let (status, body) = send_msg(
+            State(state.clone()),
+            Json(SendBody {
+                from: "sender".into(),
+                to: "oc-managed".into(),
+                message: "hello during restart".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("soft restart is in progress"),
+            "expected in-flight restart error, got {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_to_strong_opencode_binding_reports_http_failure() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-managed".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = send_msg(
+            State(state),
+            Json(SendBody {
+                from: "sender".into(),
+                to: "oc-managed".into(),
+                message: "hello unreachable http".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["method"], "http");
+        assert!(body["error"].as_str().unwrap().contains("prompt_async"));
+    }
+
+    #[tokio::test]
+    async fn rejected_api_delivery_logs_not_delivered() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-managed".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, _) = send_msg(
+            State(state.clone()),
+            Json(SendBody {
+                from: "sender".into(),
+                to: "oc-managed".into(),
+                message: "hello unreachable http".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let log = state.message_log.read().await;
+        assert_eq!(log.len(), 1);
+        assert!(!log[0].delivered);
+    }
+
+    #[tokio::test]
+    async fn send_effect_execution_revalidates_http_method_after_binding_changes() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-managed".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let effects = {
+            let mut proto = state.protocol.write().await;
+            proto.apply(crate::daemon_protocol::Event::Send {
+                from: "sender".into(),
+                to: "oc-managed".into(),
+                message: "hello http".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+            })
+        };
+
+        {
+            let mut proto = state.protocol.write().await;
+            let session = proto.sessions.get_mut("oc-managed").unwrap();
+            session.metadata.opencode_binding =
+                Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted);
+        }
+
+        let result = execute_send_effects_for_api(&state, &effects).await;
+
+        assert!(matches!(
+            result,
+            Ok(crate::state::DeliveryOutcome::Accepted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_effect_execution_uses_current_http_session_after_metadata_changes() {
+        use axum::Router;
+        use axum::extract::Path;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        type Captures = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+        async fn prompt_async(
+            Path(session_id): Path<String>,
+            State(captures): State<Captures>,
+        ) -> Json<serde_json::Value> {
+            captures.lock().unwrap().push(session_id);
+            Json(serde_json::json!({ "ok": true }))
+        }
+
+        let captures = Captures::default();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_port = listener.local_addr().unwrap().port();
+        assert!(serve_port >= 320, "test listener port must be >= 320");
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(captures.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: serve_port - 320,
+            data_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+            config_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-managed".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_old".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let effects = {
+            let mut proto = state.protocol.write().await;
+            proto.apply(crate::daemon_protocol::Event::Send {
+                from: "sender".into(),
+                to: "oc-managed".into(),
+                message: "hello old http session".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+            })
+        };
+
+        {
+            let mut proto = state.protocol.write().await;
+            let session = proto.sessions.get_mut("oc-managed").unwrap();
+            session.metadata.backend_session_id = Some("ses_new".into());
+        }
+
+        execute_send_effects_for_api(&state, &effects)
+            .await
+            .unwrap();
+
+        server.abort();
+        assert_eq!(captures.lock().unwrap().as_slice(), ["ses_new"]);
+    }
+
+    #[tokio::test]
+    async fn send_http_failure_does_not_leave_pending_reply() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-managed".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, _) = send_msg(
+            State(state.clone()),
+            Json(SendBody {
+                from: "sender".into(),
+                to: "oc-managed".into(),
+                message: "hello unreachable http".into(),
+                expects_reply: true,
+                responds_to: None,
+                done: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let proto = state.protocol.read().await;
+        assert!(!proto.pending_replies.contains_key("oc-managed"));
+    }
+
+    #[tokio::test]
+    async fn send_ambiguous_http_failure_keeps_pending_reply_and_reports_unknown() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        async fn prompt_async() -> StatusCode {
+            StatusCode::BAD_GATEWAY
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route("/session/{session_id}/prompt_async", post(prompt_async));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-managed".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = send_msg(
+            State(state.clone()),
+            Json(SendBody {
+                from: "sender".into(),
+                to: "oc-managed".into(),
+                message: "hello maybe accepted".into(),
+                expects_reply: true,
+                responds_to: None,
+                done: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "unknown");
+        assert_eq!(body["method"], "http");
+        let proto = state.protocol.read().await;
+        assert!(proto.pending_replies.contains_key("oc-managed"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_done_reply_preserves_sender_retry_state() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    reminder: Some("keep working".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-managed".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        {
+            let mut proto = state.protocol.write().await;
+            proto.pending_replies.insert(
+                "sender".into(),
+                vec![crate::daemon_protocol::PendingReplyEntry {
+                    msg_id: 7,
+                    from: "requester".into(),
+                    message: "please respond".into(),
+                    received_at: 100,
+                    last_activity: 100,
+                    in_progress: false,
+                }],
+            );
+        }
+
+        let (status, _) = send_msg(
+            State(state.clone()),
+            Json(SendBody {
+                from: "sender".into(),
+                to: "oc-managed".into(),
+                message: "done, but unreachable".into(),
+                expects_reply: false,
+                responds_to: Some(7),
+                done: true,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let proto = state.protocol.read().await;
+        let pending = proto.pending_replies.get("sender").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].msg_id, 7);
+        assert_eq!(
+            proto.sessions["sender"].metadata.reminder.as_deref(),
+            Some("keep working")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_send_rollback_does_not_restore_concurrently_cleared_pending_reply() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "target".into(),
+                pane: Some("%target".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+
+        let (effects, rollback) = {
+            let mut proto = state.protocol.write().await;
+            proto.pending_replies.insert(
+                "sender".into(),
+                vec![crate::daemon_protocol::PendingReplyEntry {
+                    msg_id: 7,
+                    from: "requester".into(),
+                    message: "please respond".into(),
+                    received_at: 100,
+                    last_activity: 100,
+                    in_progress: false,
+                }],
+            );
+            let mut rollback = FailedSendRollback::capture(&proto, "sender", Some(7), false);
+            let effects = proto.apply(crate::daemon_protocol::Event::Send {
+                from: "sender".into(),
+                to: "target".into(),
+                message: "progress that will fail".into(),
+                expects_reply: false,
+                responds_to: Some(7),
+                done: false,
+            });
+            rollback.capture_after_send(&proto);
+            (effects, rollback)
+        };
+
+        {
+            let mut proto = state.protocol.write().await;
+            proto.pending_replies.remove("sender");
+        }
+
+        rollback_failed_delivery(&state, &effects, rollback).await;
+
+        let proto = state.protocol.read().await;
+        assert!(!proto.pending_replies.contains_key("sender"));
+    }
+
+    #[tokio::test]
+    async fn failed_done_reply_does_not_restore_concurrently_cleared_retry_state() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use tokio::net::TcpListener;
+        use tokio::sync::Notify;
+
+        #[derive(Clone)]
+        struct Gate {
+            started: StdArc<Notify>,
+            release: StdArc<Notify>,
+        }
+
+        async fn prompt_async(AxumState(gate): AxumState<Gate>) -> StatusCode {
+            gate.started.notify_one();
+            gate.release.notified().await;
+            StatusCode::NOT_FOUND
+        }
+
+        let gate = Gate {
+            started: StdArc::new(Notify::new()),
+            release: StdArc::new(Notify::new()),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(gate.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    reminder: Some("keep working".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-managed".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        {
+            let mut proto = state.protocol.write().await;
+            proto.pending_replies.insert(
+                "sender".into(),
+                vec![crate::daemon_protocol::PendingReplyEntry {
+                    msg_id: 7,
+                    from: "requester".into(),
+                    message: "please respond".into(),
+                    received_at: 100,
+                    last_activity: 100,
+                    in_progress: false,
+                }],
+            );
+        }
+
+        let delivery = tokio::spawn({
+            let state = state.clone();
+            async move {
+                send_msg(
+                    State(state),
+                    Json(SendBody {
+                        from: "sender".into(),
+                        to: "oc-managed".into(),
+                        message: "done, but unreachable".into(),
+                        expects_reply: false,
+                        responds_to: Some(7),
+                        done: true,
+                    }),
+                )
+                .await
+            }
+        });
+        gate.started.notified().await;
+        {
+            let mut proto = state.protocol.write().await;
+            proto.pending_replies.remove("sender");
+            proto.sessions.get_mut("sender").unwrap().metadata.reminder = None;
+        }
+
+        gate.release.notify_one();
+        let (status, _) = delivery.await.unwrap();
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let proto = state.protocol.read().await;
+        assert!(!proto.pending_replies.contains_key("sender"));
+        assert_eq!(proto.sessions["sender"].metadata.reminder, None);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn successful_done_reply_clears_mutated_reserved_retry_state() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use tokio::net::TcpListener;
+        use tokio::sync::Notify;
+
+        #[derive(Clone)]
+        struct Gate {
+            started: StdArc<Notify>,
+            release: StdArc<Notify>,
+        }
+
+        async fn prompt_async(AxumState(gate): AxumState<Gate>) -> StatusCode {
+            gate.started.notify_one();
+            gate.release.notified().await;
+            StatusCode::NO_CONTENT
+        }
+
+        let gate = Gate {
+            started: StdArc::new(Notify::new()),
+            release: StdArc::new(Notify::new()),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(gate.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    reminder: Some("keep working".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-managed".into(),
+                pane: Some("%oc".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        {
+            let mut proto = state.protocol.write().await;
+            proto.pending_replies.insert(
+                "sender".into(),
+                vec![crate::daemon_protocol::PendingReplyEntry {
+                    msg_id: 7,
+                    from: "requester".into(),
+                    message: "please respond".into(),
+                    received_at: 100,
+                    last_activity: 100,
+                    in_progress: false,
+                }],
+            );
+        }
+
+        let delivery = tokio::spawn({
+            let state = state.clone();
+            async move {
+                send_msg(
+                    State(state),
+                    Json(SendBody {
+                        from: "sender".into(),
+                        to: "oc-managed".into(),
+                        message: "done successfully".into(),
+                        expects_reply: false,
+                        responds_to: Some(7),
+                        done: true,
+                    }),
+                )
+                .await
+            }
+        });
+        gate.started.notified().await;
+        {
+            let mut proto = state.protocol.write().await;
+            let pending = proto.pending_replies.get_mut("sender").unwrap();
+            pending[0].in_progress = true;
+            pending[0].last_activity = 200;
+            proto.sessions.get_mut("sender").unwrap().metadata.reminder =
+                Some("keep working (activity tick)".into());
+        }
+
+        gate.release.notify_one();
+        let (status, _) = delivery.await.unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        let proto = state.protocol.read().await;
+        assert!(
+            !proto.pending_replies.contains_key("sender"),
+            "successful done delivery must clear the reply slot by msg_id even if the reserved entry mutated"
+        );
+        assert_eq!(proto.sessions["sender"].metadata.reminder, None);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn send_failed_restores_done_reply_retry_state() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    reminder: Some("keep working".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        {
+            let mut proto = state.protocol.write().await;
+            proto.pending_replies.insert(
+                "sender".into(),
+                vec![crate::daemon_protocol::PendingReplyEntry {
+                    msg_id: 7,
+                    from: "requester".into(),
+                    message: "please respond".into(),
+                    received_at: 100,
+                    last_activity: 100,
+                    in_progress: false,
+                }],
+            );
+        }
+
+        let (status, body) = send_msg(
+            State(state.clone()),
+            Json(SendBody {
+                from: "sender".into(),
+                to: "missing-target".into(),
+                message: "done, but target is gone".into(),
+                expects_reply: false,
+                responds_to: Some(7),
+                done: true,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body["error"].as_str().unwrap().contains("not found"));
+        let proto = state.protocol.read().await;
+        let entries = proto
+            .pending_replies
+            .get("sender")
+            .expect("failed send must restore sender pending reply");
+        assert!(entries.iter().any(|entry| entry.msg_id == 7));
+        assert_eq!(
+            proto.sessions["sender"].metadata.reminder.as_deref(),
+            Some("keep working")
+        );
+    }
+
+    #[tokio::test]
+    async fn send_failed_restores_progress_reply_retry_state() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        {
+            let mut proto = state.protocol.write().await;
+            proto.pending_replies.insert(
+                "sender".into(),
+                vec![crate::daemon_protocol::PendingReplyEntry {
+                    msg_id: 7,
+                    from: "requester".into(),
+                    message: "please respond".into(),
+                    received_at: 100,
+                    last_activity: 100,
+                    in_progress: false,
+                }],
+            );
+        }
+
+        let (status, body) = send_msg(
+            State(state.clone()),
+            Json(SendBody {
+                from: "sender".into(),
+                to: "missing-target".into(),
+                message: "still working, but target is gone".into(),
+                expects_reply: false,
+                responds_to: Some(7),
+                done: false,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body["error"].as_str().unwrap().contains("not found"));
+        let proto = state.protocol.read().await;
+        let entry = proto
+            .pending_replies
+            .get("sender")
+            .and_then(|entries| entries.iter().find(|entry| entry.msg_id == 7))
+            .expect("failed send must preserve sender pending reply");
+        assert!(!entry.in_progress);
+        assert_eq!(entry.last_activity, 100);
+    }
+
+    #[tokio::test]
+    async fn send_to_headless_opencode_session_reports_http_acceptance() {
+        let (state, server) = state_with_opencode_prompt_server().await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sender".into(),
+                pane: Some("%sender".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-headless".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = send_msg(
+            State(state),
+            Json(SendBody {
+                from: "sender".into(),
+                to: "oc-headless".into(),
+                message: "hello headless".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+            }),
+        )
+        .await;
+
+        server.abort();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "accepted");
+        assert_eq!(body["method"], "http");
+    }
+
+    #[tokio::test]
     async fn compact_session_not_found_returns_404() {
         let state = crate::state::AppState::new_for_test();
         let (status, body) = compact_inner(
@@ -3216,6 +5184,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_oc_weak_binding_returns_400_before_summarize() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-weak".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_probe".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted),
+                    model: Some("anthropic/claude-sonnet-4-6".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = compact_inner(
+            &state,
+            "oc-weak".into(),
+            CompactBody {
+                continuation: Some("keep going".into()),
+            },
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err = body["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("strong") || err.contains("binding"),
+            "expected error to mention weak binding, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_rejects_remote_tui_session_before_injection() {
+        let state = crate::state::AppState::new_for_test();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "remote-cc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "remote-cc".into(),
+                    pane: Some("%17".into()),
+                    origin: crate::daemon_protocol::Origin::Remote("npub1remote".into()),
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("claude-code".into()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let (status, body) = compact_inner(
+            &state,
+            "remote-cc".into(),
+            CompactBody {
+                continuation: Some("keep going".into()),
+            },
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err = body["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("local"),
+            "expected local-session error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_rejects_remote_http_session_before_summarize() {
+        let state = crate::state::AppState::new_for_test();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "remote-oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "remote-oc".into(),
+                    pane: None,
+                    origin: crate::daemon_protocol::Origin::Remote("npub1remote".into()),
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_remote".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        model: Some("anthropic/claude-sonnet-4-6".into()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let (status, body) = compact_inner(
+            &state,
+            "remote-oc".into(),
+            CompactBody { continuation: None },
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err = body["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("local"),
+            "expected local-session error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn compact_oc_summarize_failure_returns_502() {
         // In the test env, opencode_serve_port() == 320 (privileged, unbound)
         // so the POST connection is refused. The HTTP branch now calls
@@ -3230,6 +5309,7 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_probe".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
                     // A parseable model short-circuits /config, so
                     // the 502 is specifically the /summarize failure rather
                     // than model-resolution failure (covered in a separate
@@ -3273,6 +5353,7 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_probe".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
                     model: Some("anthropic/claude-sonnet-4-6".into()),
                     ..Default::default()
                 },
@@ -3316,6 +5397,7 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_probe".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
                     model: Some("anthropic/claude-sonnet-4-6".into()),
                     ..Default::default()
                 },
@@ -3342,6 +5424,196 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_oc_reentrant_request_returns_409_while_summarize_in_flight() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+        use tokio::sync::Notify;
+
+        struct SummarizeState {
+            calls: AtomicUsize,
+            first_started: Notify,
+            release_first: Notify,
+        }
+
+        async fn summarize(AxumState(state): AxumState<StdArc<SummarizeState>>) -> StatusCode {
+            let call = state.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == 1 {
+                state.first_started.notify_waiters();
+                state.release_first.notified().await;
+            }
+            StatusCode::OK
+        }
+
+        let summarize_state = StdArc::new(SummarizeState {
+            calls: AtomicUsize::new(0),
+            first_started: Notify::new(),
+            release_first: Notify::new(),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/summarize", post(summarize))
+            .with_state(summarize_state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = crate::state::AppState::new(config);
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-busy".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_probe".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    model: Some("anthropic/claude-sonnet-4-6".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            compact_inner(
+                &first_state,
+                "oc-busy".into(),
+                CompactBody { continuation: None },
+            )
+            .await
+        });
+        summarize_state.first_started.notified().await;
+
+        let (status, body) =
+            compact_inner(&state, "oc-busy".into(), CompactBody { continuation: None }).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("compact"),
+            "expected compact conflict error, got: {}",
+            body["error"]
+        );
+        assert_eq!(summarize_state.calls.load(Ordering::SeqCst), 1);
+
+        summarize_state.release_first.notify_waiters();
+        let (first_status, _) = first.await.unwrap();
+        assert_eq!(first_status, StatusCode::OK);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn compact_oc_reentrant_request_after_rename_returns_409() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+        use tokio::sync::Notify;
+
+        struct SummarizeState {
+            calls: AtomicUsize,
+            first_started: Notify,
+            release_first: Notify,
+        }
+
+        async fn summarize(AxumState(state): AxumState<StdArc<SummarizeState>>) -> StatusCode {
+            let call = state.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == 1 {
+                state.first_started.notify_waiters();
+                state.release_first.notified().await;
+            }
+            StatusCode::OK
+        }
+
+        let summarize_state = StdArc::new(SummarizeState {
+            calls: AtomicUsize::new(0),
+            first_started: Notify::new(),
+            release_first: Notify::new(),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/summarize", post(summarize))
+            .with_state(summarize_state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = crate::state::AppState::new(config);
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-busy".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_probe".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    model: Some("anthropic/claude-sonnet-4-6".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            compact_inner(
+                &first_state,
+                "oc-busy".into(),
+                CompactBody { continuation: None },
+            )
+            .await
+        });
+        summarize_state.first_started.notified().await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Rename {
+                old_id: "oc-busy".into(),
+                new_id: "oc-renamed".into(),
+            })
+            .await;
+
+        let (status, _) = compact_inner(
+            &state,
+            "oc-renamed".into(),
+            CompactBody { continuation: None },
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(summarize_state.calls.load(Ordering::SeqCst), 1);
+
+        summarize_state.release_first.notify_waiters();
+        let (first_status, _) = first.await.unwrap();
+        assert_eq!(first_status, StatusCode::OK);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn compact_oc_without_model_and_serve_unreachable_returns_400() {
         // If the session has no `model` AND opencode serve is unreachable
         // (so /config also can't supply a default), the endpoint
@@ -3356,6 +5628,7 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_probe".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
                     model: None,
                     ..Default::default()
                 },
@@ -3612,12 +5885,645 @@ mod tests {
         // helper must not even attempt the /config HTTP call.
         let state = crate::state::AppState::new_for_test();
         let result =
-            resolve_opencode_compact_model(&state, Some("anthropic/claude-sonnet-4-6"), None)
-                .await;
+            resolve_opencode_compact_model(&state, Some("anthropic/claude-sonnet-4-6"), None).await;
         assert_eq!(
             result,
             Some(("anthropic".into(), "claude-sonnet-4-6".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn readiness_prompt_delivery_quarantines_ambiguous_http_status() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        async fn prompt_async() -> StatusCode {
+            StatusCode::BAD_GATEWAY
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route("/session/{session_id}/prompt_async", post(prompt_async));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_ready".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/project", "%17")];
+        state.pending_prompts.lock().unwrap().insert(
+            "oc".into(),
+            pending_opencode_prompt("%17", "queued prompt", "ses_ready"),
+        );
+
+        let delivered = deliver_pending_prompt(&state, "oc").await;
+
+        assert!(!delivered);
+        assert!(state.pending_prompts.lock().unwrap().get("oc").is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn readiness_prompt_delivery_reserves_pending_prompt_while_http_is_in_flight() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use tokio::net::TcpListener;
+        use tokio::sync::Notify;
+
+        #[derive(Clone)]
+        struct Gate {
+            started: StdArc<Notify>,
+            release: StdArc<Notify>,
+        }
+
+        async fn prompt_async(AxumState(gate): AxumState<Gate>) -> StatusCode {
+            gate.started.notify_one();
+            gate.release.notified().await;
+            StatusCode::NO_CONTENT
+        }
+
+        let gate = Gate {
+            started: StdArc::new(Notify::new()),
+            release: StdArc::new(Notify::new()),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(gate.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_ready".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state.pending_prompts.lock().unwrap().insert(
+            "oc".into(),
+            pending_opencode_prompt("%17", "queued prompt", "ses_ready"),
+        );
+
+        let delivery = tokio::spawn({
+            let state = state.clone();
+            async move { deliver_pending_prompt(&state, "oc").await }
+        });
+        gate.started.notified().await;
+
+        assert!(!state.pending_prompts.lock().unwrap().contains_key("oc"));
+
+        gate.release.notify_one();
+        assert!(delivery.await.unwrap());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn readiness_prompt_delivery_retries_after_http_and_fallback_fail() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use tokio::net::TcpListener;
+        use tokio::sync::Notify;
+
+        #[derive(Clone)]
+        struct Gate {
+            started: StdArc<Notify>,
+            release: StdArc<Notify>,
+        }
+
+        async fn prompt_async(AxumState(gate): AxumState<Gate>) -> StatusCode {
+            gate.started.notify_one();
+            gate.release.notified().await;
+            StatusCode::NOT_FOUND
+        }
+
+        let gate = Gate {
+            started: StdArc::new(Notify::new()),
+            release: StdArc::new(Notify::new()),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(gate.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_ready".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state.pending_prompts.lock().unwrap().insert(
+            "oc".into(),
+            pending_opencode_prompt("%17", "queued prompt", "ses_ready"),
+        );
+
+        let delivery = tokio::spawn({
+            let state = state.clone();
+            async move { deliver_pending_prompt(&state, "oc").await }
+        });
+        gate.started.notified().await;
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%18".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_ready".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        gate.release.notify_one();
+
+        assert!(!delivery.await.unwrap());
+        assert_eq!(
+            state.pending_prompts.lock().unwrap().get("oc"),
+            Some(&pending_opencode_prompt(
+                "%17",
+                "queued prompt",
+                "ses_ready"
+            ))
+        );
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/project", "%17")];
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            state.pending_prompts.lock().unwrap().get("oc"),
+            Some(&pending_opencode_prompt(
+                "%17",
+                "queued prompt",
+                "ses_ready"
+            ))
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn pending_prompt_retry_reserves_prompt_before_raw_fallback() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .pending_prompts
+            .lock()
+            .unwrap()
+            .insert("oc".into(), pending_prompt("%17", "queued prompt"));
+
+        let reserved =
+            reserve_pending_prompt_if_matches(&state, "oc", "%17", "queued prompt", None);
+
+        assert_eq!(reserved, Some(pending_prompt("%17", "queued prompt")));
+        assert!(!state.pending_prompts.lock().unwrap().contains_key("oc"));
+    }
+
+    #[tokio::test]
+    async fn pending_prompt_retry_rearms_after_transient_pane_failure() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_ready".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let pending = pending_opencode_prompt("%17", "queued prompt", "ses_ready");
+        state
+            .pending_prompts
+            .lock()
+            .unwrap()
+            .insert("oc".into(), pending.clone());
+
+        schedule_pending_prompt_retry(&state, "oc", pending.clone());
+        tokio::time::sleep(PENDING_PROMPT_RETRY_DELAY * 2).await;
+        assert_eq!(
+            state.pending_prompts.lock().unwrap().get("oc"),
+            Some(&pending),
+            "first retry should restore the prompt while the pane is not live"
+        );
+
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/project", "%17")];
+        tokio::time::sleep(PENDING_PROMPT_RETRY_DELAY * 2).await;
+
+        assert!(
+            !state.pending_prompts.lock().unwrap().contains_key("oc"),
+            "a follow-up retry should consume the restored prompt once the pane becomes live"
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_prompt_delivery_uses_raw_tmux_for_weak_opencode_binding() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn prompt_async(AxumState(called): AxumState<StdArc<AtomicBool>>) -> StatusCode {
+            called.store(true, Ordering::SeqCst);
+            StatusCode::NO_CONTENT
+        }
+
+        let called = StdArc::new(AtomicBool::new(false));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(called.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_ready".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted),
+                    ..Default::default()
+                },
+            })
+            .await;
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/project", "%17")];
+        state
+            .pending_prompts
+            .lock()
+            .unwrap()
+            .insert("oc".into(), pending_prompt("%17", "queued prompt"));
+
+        let delivered = deliver_pending_prompt(&state, "oc").await;
+
+        assert!(delivered);
+        assert!(!called.load(Ordering::SeqCst));
+        assert!(!state.pending_prompts.lock().unwrap().contains_key("oc"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn readiness_prompt_delivery_rejects_stale_weak_opencode_pane() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn prompt_async(AxumState(called): AxumState<StdArc<AtomicBool>>) -> StatusCode {
+            called.store(true, Ordering::SeqCst);
+            StatusCode::NO_CONTENT
+        }
+
+        let called = StdArc::new(AtomicBool::new(false));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(called.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_ready".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .pending_prompts
+            .lock()
+            .unwrap()
+            .insert("oc".into(), pending_prompt("%17", "queued prompt"));
+
+        let delivered = deliver_pending_prompt(&state, "oc").await;
+
+        assert!(!delivered);
+        assert!(!called.load(Ordering::SeqCst));
+        assert_eq!(
+            state.pending_prompts.lock().unwrap().get("oc"),
+            Some(&pending_prompt("%17", "queued prompt"))
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn readiness_prompt_delivery_rejects_stale_strong_opencode_pane() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn prompt_async(AxumState(calls): AxumState<StdArc<AtomicUsize>>) -> StatusCode {
+            calls.fetch_add(1, Ordering::SeqCst);
+            StatusCode::NO_CONTENT
+        }
+
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(calls.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%new".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_new".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state.pending_prompts.lock().unwrap().insert(
+            "oc".into(),
+            pending_opencode_prompt("%old", "queued prompt", "ses_old"),
+        );
+
+        let delivered = deliver_pending_prompt(&state, "oc").await;
+
+        assert!(!delivered);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state.pending_prompts.lock().unwrap().get("oc"),
+            Some(&pending_opencode_prompt("%old", "queued prompt", "ses_old"))
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn readiness_prompt_delivery_rejects_stale_opencode_backend_session() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn prompt_async(AxumState(calls): AxumState<StdArc<AtomicUsize>>) -> StatusCode {
+            calls.fetch_add(1, Ordering::SeqCst);
+            StatusCode::NO_CONTENT
+        }
+
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(calls.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_old".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state.pending_prompts.lock().unwrap().insert(
+            "oc".into(),
+            pending_opencode_prompt("%17", "queued prompt", "ses_old"),
+        );
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_new".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let delivered = deliver_pending_prompt(&state, "oc").await;
+
+        assert!(!delivered);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state.pending_prompts.lock().unwrap().get("oc"),
+            Some(&pending_opencode_prompt("%17", "queued prompt", "ses_old"))
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn readiness_prompt_http_fallback_rejects_stale_opencode_backend_session() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use tokio::net::TcpListener;
+        use tokio::sync::Notify;
+
+        #[derive(Clone)]
+        struct Gate {
+            started: StdArc<Notify>,
+            release: StdArc<Notify>,
+        }
+
+        async fn prompt_async(AxumState(gate): AxumState<Gate>) -> StatusCode {
+            gate.started.notify_one();
+            gate.release.notified().await;
+            StatusCode::NOT_FOUND
+        }
+
+        let gate = Gate {
+            started: StdArc::new(Notify::new()),
+            release: StdArc::new(Notify::new()),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(gate.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_old".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/project", "%17")];
+        state.pending_prompts.lock().unwrap().insert(
+            "oc".into(),
+            pending_opencode_prompt("%17", "queued prompt", "ses_old"),
+        );
+
+        let delivery = tokio::spawn({
+            let state = state.clone();
+            async move { deliver_pending_prompt(&state, "oc").await }
+        });
+        gate.started.notified().await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_new".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        gate.release.notify_one();
+
+        assert!(!delivery.await.unwrap());
+        assert_eq!(
+            state.pending_prompts.lock().unwrap().get("oc"),
+            Some(&pending_opencode_prompt("%17", "queued prompt", "ses_old"))
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -3692,6 +6598,16 @@ mod tests {
             pane_id: pane_id.into(),
             session_name: "test".into(),
             pane_current_path: Some(dir.into()),
+            process_name: Some("opencode".into()),
+        }
+    }
+
+    fn pane_for_backend(dir: &str, pane_id: &str, process_name: &str) -> crate::tmux::TmuxPane {
+        crate::tmux::TmuxPane {
+            pane_id: pane_id.into(),
+            session_name: "test".into(),
+            pane_current_path: Some(dir.into()),
+            process_name: Some(process_name.into()),
         }
     }
 
@@ -3770,6 +6686,26 @@ mod tests {
             proto.sessions.is_empty(),
             "no session must be created on zero-match decline, got: {:?}",
             proto.sessions.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_provision_declines_when_matching_dir_pane_is_not_opencode() {
+        let state = crate::state::AppState::new_for_test();
+        *state.cached_assistant_panes.write().await =
+            vec![pane_for_backend("/tmp/freshproject", "%17", "claude")];
+
+        let result =
+            auto_provision_from_backend_session(&state, "ses_claude", "/tmp/freshproject").await;
+
+        assert!(
+            result.is_none(),
+            "auto-provision must reject non-opencode panes, got Some({result:?})"
+        );
+        let proto = state.protocol.read().await;
+        assert!(
+            proto.sessions.is_empty(),
+            "no session must be created for a non-opencode pane"
         );
     }
 
@@ -3882,6 +6818,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn auto_provision_register_result_returns_backend_winner_after_register_failed() {
+        let mut proto = crate::daemon_protocol::DaemonState::new_for_model("d".into(), "h".into());
+        proto.apply(crate::daemon_protocol::Event::Register {
+            id: "winner".into(),
+            pane: Some("%17".into()),
+            metadata: crate::daemon_protocol::SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_raced".into()),
+                ..Default::default()
+            },
+        });
+        let effects = vec![crate::daemon_protocol::Effect::RegisterFailed {
+            session_id: "freshproject".into(),
+            reason: "backend_session_id ses_raced is already bound to session 'winner'".into(),
+        }];
+
+        let result = auto_provision_register_result(&proto, "ses_raced", "freshproject", &effects);
+
+        assert_eq!(
+            result.as_deref(),
+            Some("winner"),
+            "lost guarded-register races must surface the concurrent backend owner"
+        );
+    }
+
     // --- backend_session_ready_inner (end-to-end through the outer handler) ---
 
     #[tokio::test]
@@ -3970,19 +6932,142 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn backend_session_ready_rejects_backend_session_id_path_separators() {
+        let state = crate::state::AppState::new_for_test();
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/local-project", "%31")];
+        let hints = BackendSessionReadyHints {
+            pane: Some("%31".into()),
+            cwd: Some("/tmp/local-project".into()),
+        };
+
+        let response =
+            backend_session_ready_inner_with_hints(&state, "ses_bad/../../x".into(), hints).await;
+
+        assert_eq!(response["delivered"], false);
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("invalid backend_session_id"),
+            "expected validation error, got: {response}"
+        );
+        assert!(
+            state.protocol.read().await.sessions.is_empty(),
+            "invalid backend_session_id must be rejected before auto-provision"
+        );
+    }
+
+    #[test]
+    fn backend_session_id_boundary_rejects_url_delimiters_and_whitespace() {
+        for backend_sid in ["ses/bad", "ses?bad", "ses#bad", "ses bad", "ses\tbad"] {
+            assert!(
+                validate_backend_session_id_boundary(backend_sid).is_some(),
+                "{backend_sid:?} must be rejected"
+            );
+        }
+        assert!(validate_backend_session_id_boundary("ses_good-123").is_none());
+    }
+
+    #[tokio::test]
+    async fn backend_session_ready_ignores_remote_backend_session_id_collision() {
+        use axum::Router;
+        use axum::routing::get;
+        use tokio::net::TcpListener;
+
+        async fn session_dir() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "directory": "/tmp/local-project" }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_port = listener.local_addr().unwrap().port();
+        assert!(serve_port >= 320, "test listener port must be >= 320");
+        let app = Router::new().route("/session/{session_id}", get(session_dir));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: serve_port - 320,
+            data_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+            config_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+        });
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/local-project", "%31")];
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "remote-host/local-project".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "remote-host/local-project".into(),
+                    pane: None,
+                    origin: crate::daemon_protocol::Origin::Remote("npub1remote".into()),
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        project_dir: Some("/tmp/remote-project".into()),
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_collision".into()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let hints = BackendSessionReadyHints {
+            pane: Some("%31".into()),
+            cwd: Some("/tmp/local-project".into()),
+        };
+
+        let response =
+            backend_session_ready_inner_with_hints(&state, "ses_collision".into(), hints).await;
+
+        assert_eq!(
+            response["session"].as_str(),
+            Some("local-project"),
+            "remote backend_session_id collision must not satisfy readiness: {response}"
+        );
+        let proto = state.protocol.read().await;
+        assert!(
+            proto.sessions.contains_key("local-project"),
+            "local auto-provision must still create a local session"
+        );
+        server.abort();
+    }
+
     // --- Plugin-sent pane + cwd hints (fast-path) ---
 
     #[tokio::test]
     async fn backend_session_ready_uses_explicit_pane_and_cwd_hints() {
         // Happy path for the enriched opencode plugin: when both pane and
-        // cwd arrive in the body, skip the opencode-serve round-trip AND the
-        // scan-path's list-panes-by-dir filter. The pane still has to appear
-        // in list_assistant_panes (defense 1 of the hint-path validation),
-        // so seed it under a DIFFERENT directory than the hint cwd — that
-        // proves the hint cwd is used for dir derivation, not the pane's
-        // pane_current_path that the scan path would have consulted.
-        let state = crate::state::AppState::new_for_test();
-        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/different-dir", "%31")];
+        // cwd arrive in the body, skip the tmux scan but still verify the
+        // backend_session_id belongs to that cwd in opencode serve. The pane
+        // still has to appear in list_assistant_panes and its current path
+        // must match the hinted cwd after project-root normalization.
+        use axum::Router;
+        use axum::routing::get;
+        use tokio::net::TcpListener;
+
+        async fn session_dir() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "directory": "/tmp/explicit-project" }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_port = listener.local_addr().unwrap().port();
+        assert!(serve_port >= 320, "test listener port must be >= 320");
+        let app = Router::new().route("/session/{session_id}", get(session_dir));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: serve_port - 320,
+            data_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+            config_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+        });
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/explicit-project", "%31")];
 
         let hints = BackendSessionReadyHints {
             pane: Some("%31".into()),
@@ -3998,9 +7083,7 @@ mod tests {
             "hint path must auto-provision with id derived from cwd basename, got: {response}"
         );
 
-        // State mutations end-to-end: note that project_dir follows the
-        // explicit cwd hint, NOT the pane's cached pane_current_path —
-        // the scan path would have resolved /tmp/different-dir here.
+        // State mutations end-to-end: project_dir follows the explicit cwd hint.
         let proto = state.protocol.read().await;
         let session = proto
             .sessions
@@ -4015,6 +7098,7 @@ mod tests {
             session.metadata.project_dir.as_deref(),
             Some("/tmp/explicit-project"),
         );
+        server.abort();
     }
 
     #[tokio::test]
@@ -4152,6 +7236,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hint_path_rejects_pane_whose_actual_cwd_differs_from_hint() {
+        let state = crate::state::AppState::new_for_test();
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/actual-project", "%17")];
+
+        let result =
+            auto_provision_with_explicit_pane(&state, "ses_mismatch", "%17", "/tmp/hinted-project")
+                .await;
+
+        assert!(
+            result.is_none(),
+            "hint path must reject pane/cwd mismatches, got Some({result:?})"
+        );
+        assert!(state.protocol.read().await.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hint_path_rejects_backend_session_id_for_different_opencode_directory() {
+        use axum::Router;
+        use axum::routing::get;
+        use tokio::net::TcpListener;
+
+        async fn session_dir() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "directory": "/tmp/other-project" }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_port = listener.local_addr().unwrap().port();
+        assert!(serve_port >= 320, "test listener port must be >= 320");
+        let app = Router::new().route("/session/{session_id}", get(session_dir));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: serve_port - 320,
+            data_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+            config_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+        });
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/hinted-project", "%17")];
+
+        let result = auto_provision_with_explicit_pane(
+            &state,
+            "ses_other_dir",
+            "%17",
+            "/tmp/hinted-project",
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "hint path must reject backend ids whose opencode session directory differs, got Some({result:?})"
+        );
+        assert!(state.protocol.read().await.sessions.is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn hint_path_rejects_non_opencode_pane_even_when_cwd_matches() {
+        let state = crate::state::AppState::new_for_test();
+        *state.cached_assistant_panes.write().await =
+            vec![pane_for_backend("/tmp/freshproject", "%17", "claude")];
+
+        let result = auto_provision_with_explicit_pane(
+            &state,
+            "ses_not_opencode",
+            "%17",
+            "/tmp/freshproject",
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "hint path must reject a non-opencode assistant pane, got Some({result:?})"
+        );
+        assert!(state.protocol.read().await.sessions.is_empty());
+    }
+
+    #[tokio::test]
     async fn hint_path_rejects_empty_cwd() {
         // Degenerate cwd = "" makes Path::file_name() return None, which
         // register_auto_provisioned_session turns into the literal "unnamed".
@@ -4275,6 +7439,50 @@ mod tests {
         assert!(
             survivor.metadata.backend_session_id.is_none(),
             "victim's metadata must not be rewritten with the hijacker's backend_session_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_provision_register_declines_if_pane_becomes_bound_before_apply() {
+        // The outer auto-provision paths validate pane ownership before this
+        // helper runs, but that snapshot can become stale before Register is
+        // applied. The final apply-time guard must fail closed instead of
+        // letting apply_register's pane-dedup evict the incumbent session.
+        let state = crate::state::AppState::new_for_test();
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/freshproject", "%17")];
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "incumbent".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/freshproject".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let result =
+            register_auto_provisioned_session(&state, "ses_late_race", "%17", "/tmp/freshproject")
+                .await;
+
+        assert!(
+            result.is_none(),
+            "late pane ownership race must fail closed, got Some({result:?})"
+        );
+        let proto = state.protocol.read().await;
+        assert_eq!(
+            proto.sessions.len(),
+            1,
+            "auto-provision must not create a second session or evict the incumbent"
+        );
+        let incumbent = proto
+            .sessions
+            .get("incumbent")
+            .expect("incumbent session must survive");
+        assert_eq!(incumbent.pane.as_deref(), Some("%17"));
+        assert!(
+            incumbent.metadata.backend_session_id.is_none(),
+            "incumbent metadata must not be overwritten by late auto-provision"
         );
     }
 
@@ -4579,6 +7787,60 @@ mod tests {
         assert_eq!(state.clear_pending_reply_from("ghost", "sender"), 0);
     }
 
+    #[tokio::test]
+    async fn failed_api_delivery_clears_only_matching_sender_pending_reply() {
+        let state = crate::state::AppState::new_for_test();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.pending_replies.insert(
+                "target".into(),
+                vec![
+                    crate::daemon_protocol::PendingReplyEntry {
+                        msg_id: 42,
+                        from: "sender-a".into(),
+                        message: "first".into(),
+                        received_at: 0,
+                        last_activity: 0,
+                        in_progress: false,
+                    },
+                    crate::daemon_protocol::PendingReplyEntry {
+                        msg_id: 42,
+                        from: "sender-b".into(),
+                        message: "second".into(),
+                        received_at: 0,
+                        last_activity: 0,
+                        in_progress: false,
+                    },
+                ],
+            );
+        }
+
+        clear_pending_reply_for_failed_delivery(
+            &state,
+            &[crate::daemon_protocol::Effect::SendDelivered {
+                from: "sender-a".into(),
+                to: "target".into(),
+                method: "tmux".into(),
+                msg_id: 42,
+                http_delivery: None,
+            }],
+        )
+        .await;
+
+        let proto = state.protocol.read().await;
+        let pending = proto
+            .pending_replies
+            .get("target")
+            .expect("sender-b pending reply should remain");
+        assert_eq!(
+            pending.len(),
+            1,
+            "only matching sender/msg_id must be removed"
+        );
+        assert_eq!(pending[0].from, "sender-b");
+        assert_eq!(pending[0].msg_id, 42);
+    }
+
     /// End-to-end regression through a real axum Router and TCP listener.
     ///
     /// The core bug in #646 was a percent-decoding mismatch: axum decodes
@@ -4769,8 +8031,7 @@ mod tests {
         // match the two-segment route. Axum must not accept it; we get 404
         // (route not found) rather than the DELETE handler being called.
         // This is the exact failure the review flagged.
-        let buggy_url =
-            format!("http://{addr}/api/pane/99/pending-replies/feat/646-test");
+        let buggy_url = format!("http://{addr}/api/pane/99/pending-replies/feat/646-test");
         let buggy_resp = client.delete(&buggy_url).send().await.unwrap();
         assert_eq!(
             buggy_resp.status().as_u16(),
@@ -4792,8 +8053,7 @@ mod tests {
         // Now the correctly-encoded form: `feat%2F646-test`. axum decodes it
         // back to `feat/646-test` on the handler side, the lookup matches,
         // and the slot is cleared.
-        let encoded_url =
-            format!("http://{addr}/api/pane/99/pending-replies/feat%2F646-test");
+        let encoded_url = format!("http://{addr}/api/pane/99/pending-replies/feat%2F646-test");
         let resp = client.delete(&encoded_url).send().await.unwrap();
         assert_eq!(
             resp.status().as_u16(),
@@ -4930,7 +8190,7 @@ mod tests {
         assert!(
             !still_there,
             "sender-a slot must be cleared after DELETE /api/pane/99/pending-replies/sender-a"
-);
+        );
     }
 
     #[tokio::test]
@@ -4976,11 +8236,9 @@ mod tests {
                 },
             })
             .await;
-        let (status, body) = prune_stale_sessions(
-            State(state.clone()),
-            Json(PruneStaleBody { confirm: true }),
-        )
-        .await;
+        let (status, body) =
+            prune_stale_sessions(State(state.clone()), Json(PruneStaleBody { confirm: true }))
+                .await;
         assert_eq!(status, StatusCode::OK);
         let value = body.0;
         assert_eq!(value["dry_run"], false);

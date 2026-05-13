@@ -1,4 +1,5 @@
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,11 +20,14 @@ const MAX_INJECT_RETRIES: u32 = 3;
 /// Base delay for exponential backoff between retries (500ms, 1s, 2s).
 const RETRY_BASE_MS: u64 = 500;
 
+static INJECT_BUFFER_SEQ: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Debug, Clone)]
 pub struct TmuxPane {
     pub pane_id: String,
     pub session_name: String,
     pub pane_current_path: Option<String>,
+    pub process_name: Option<String>,
 }
 
 /// Parsed process tree snapshot for efficient descendant lookups.
@@ -73,27 +77,33 @@ impl ProcessTree {
     /// installed via Homebrew) or with a leading dot when run via npm/node
     /// wrappers.
     fn has_descendant_named(&self, root: u32, names: &[&str]) -> bool {
+        self.matching_descendant_name(root, names).is_some()
+    }
+
+    fn matching_descendant_name(&self, root: u32, names: &[&str]) -> Option<String> {
         let mut stack = vec![root];
         while let Some(pid) = stack.pop() {
-            if self.names.get(&pid).is_some_and(|n| {
-                let basename = std::path::Path::new(n)
-                    .file_name()
-                    .and_then(|f| f.to_str())
-                    .unwrap_or(n);
-                names.iter().any(|&target| {
-                    n == target
-                        || basename == target
-                        || basename.strip_prefix('.') == Some(target)
-                })
-            }) {
-                return true;
+            if let Some(name) = self.names.get(&pid)
+                && let Some(target) = matching_process_name(name, names)
+            {
+                return Some(target.to_string());
             }
             if let Some(kids) = self.children.get(&pid) {
                 stack.extend(kids);
             }
         }
-        false
+        None
     }
+}
+
+fn matching_process_name<'a>(name: &str, names: &'a [&str]) -> Option<&'a str> {
+    let basename = std::path::Path::new(name)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(name);
+    names.iter().copied().find(|target| {
+        name == *target || basename == *target || basename.strip_prefix('.') == Some(*target)
+    })
 }
 
 /// Find all tmux panes that have a matching assistant process.
@@ -132,13 +142,16 @@ pub fn find_assistant_panes(names: &[&str]) -> anyhow::Result<Vec<TmuxPane>> {
         .filter_map(|line| {
             let parts: Vec<&str> = line.split(SEP).collect();
             if parts.len() >= 5 {
-                let is_match = names.contains(&parts[3])
-                    || parts[2].parse::<u32>().ok().is_some_and(|pid| {
-                        proc_tree
-                            .as_ref()
-                            .is_some_and(|t| t.has_descendant_named(pid, names))
+                let process_name = matching_process_name(parts[3], names)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        parts[2].parse::<u32>().ok().and_then(|pid| {
+                            proc_tree
+                                .as_ref()
+                                .and_then(|t| t.matching_descendant_name(pid, names))
+                        })
                     });
-                if is_match {
+                if let Some(process_name) = process_name {
                     let path = parts[4].trim();
                     return Some(TmuxPane {
                         pane_id: parts[0].to_string(),
@@ -148,6 +161,7 @@ pub fn find_assistant_panes(names: &[&str]) -> anyhow::Result<Vec<TmuxPane>> {
                         } else {
                             Some(path.to_string())
                         },
+                        process_name: Some(process_name),
                     });
                 }
             }
@@ -332,11 +346,7 @@ fn verify_injected(pane: &str, message: &str) {
         }
     };
 
-    let needle = if message.len() > VERIFY_NEEDLE_LEN {
-        &message[..VERIFY_NEEDLE_LEN]
-    } else {
-        message
-    };
+    let needle = verification_needle(message);
 
     if !content.contains(needle) {
         tracing::warn!(
@@ -344,6 +354,28 @@ fn verify_injected(pane: &str, message: &str) {
             "inject verification: text not found in visible area (may have scrolled off)"
         );
     }
+}
+
+fn verification_needle(message: &str) -> &str {
+    if message.len() <= VERIFY_NEEDLE_LEN {
+        return message;
+    }
+
+    let mut end = 0;
+    for (idx, ch) in message.char_indices() {
+        let next = idx + ch.len_utf8();
+        if next > VERIFY_NEEDLE_LEN {
+            break;
+        }
+        end = next;
+    }
+    &message[..end]
+}
+
+fn next_inject_buffer_name(pane: &str) -> String {
+    let seq = INJECT_BUFFER_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pane_id: String = pane.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    format!("ouija-inject-{pane_id}-{seq}")
 }
 
 /// Inject message text via `tmux paste-buffer` then submit with Enter.
@@ -364,7 +396,7 @@ fn inject_text(
     message: &str,
     config: &crate::backend::InjectConfig,
 ) -> anyhow::Result<()> {
-    let sanitized = message.replace('\n', " ");
+    let sanitized = sanitize_injection_text(message);
 
     let paste_content = if config.use_inner_bracketed_paste {
         // Wrap in bracketed paste sequences so the TUI treats it as pasted text
@@ -373,9 +405,13 @@ fn inject_text(
         sanitized
     };
 
-    // Load into tmux paste buffer via stdin
+    let buffer_name = next_inject_buffer_name(pane);
+
+    // Load into a named tmux paste buffer via stdin. The unnamed buffer is
+    // global to the tmux server, so concurrent injections into different panes
+    // must never share it.
     let mut child = Command::new("tmux")
-        .args(["load-buffer", "-"])
+        .args(["load-buffer", "-b", &buffer_name, "-"])
         .stdin(std::process::Stdio::piped())
         .spawn()
         .context("failed to spawn tmux load-buffer")?;
@@ -392,9 +428,18 @@ fn inject_text(
 
     // Paste buffer into target pane (tmux adds outer bracket wrapping)
     let status = Command::new("tmux")
-        .args(["paste-buffer", "-t", pane])
+        .args(["paste-buffer", "-b", &buffer_name, "-t", pane])
         .status()
         .context("failed to run tmux paste-buffer")?;
+
+    let delete_status = Command::new("tmux")
+        .args(["delete-buffer", "-b", &buffer_name])
+        .status()
+        .context("failed to run tmux delete-buffer")?;
+
+    if !delete_status.success() {
+        tracing::warn!(buffer = %buffer_name, "tmux delete-buffer failed after injection");
+    }
 
     if !status.success() {
         bail!("tmux paste-buffer failed for pane {pane}");
@@ -413,6 +458,20 @@ fn inject_text(
     }
 
     Ok(())
+}
+
+fn sanitize_injection_text(message: &str) -> String {
+    message
+        .replace('\n', " ")
+        .replace("\x1b[200~", "")
+        .replace("\x1b[201~", "")
+        .chars()
+        .filter_map(|c| match c {
+            '\t' => Some(' '),
+            c if c <= '\u{1f}' || ('\u{7f}'..='\u{9f}').contains(&c) => None,
+            c => Some(c),
+        })
+        .collect()
 }
 
 /// A queued injection request sent to the per-pane background worker.
@@ -470,6 +529,65 @@ pub async fn pane_inject_loop(mut rx: tokio::sync::mpsc::UnboundedReceiver<Injec
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum SessionDeliveryPlan {
+    Http(crate::daemon_protocol::HttpDeliverySnapshot),
+    RawTmux {
+        inject_config: crate::backend::InjectConfig,
+        tui_pattern: Option<String>,
+    },
+    Unavailable(String),
+}
+
+pub(crate) async fn session_delivery_plan(
+    state: &crate::state::AppState,
+    session_id: &str,
+    pane: &str,
+) -> SessionDeliveryPlan {
+    let Some((metadata, registered_pane)) = ({
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .get(session_id)
+            .map(|s| (s.metadata.clone(), s.pane.clone()))
+    }) else {
+        return SessionDeliveryPlan::Unavailable(format!(
+            "session '{session_id}' is not registered"
+        ));
+    };
+
+    let backend = metadata
+        .backend
+        .as_deref()
+        .and_then(|name| state.backends.get(name))
+        .unwrap_or_else(|| state.backends.default());
+
+    match backend.delivery_mode() {
+        crate::backend::DeliveryMode::TuiInjection => SessionDeliveryPlan::RawTmux {
+            inject_config: backend.inject_config(),
+            tui_pattern: backend.tui_ready_pattern().map(String::from),
+        },
+        crate::backend::DeliveryMode::HttpApi { .. } => {
+            if let Some(snapshot) = metadata.http_delivery_snapshot() {
+                return SessionDeliveryPlan::Http(snapshot);
+            }
+
+            if metadata.backend.as_deref() == Some("opencode")
+                && registered_pane.as_deref() == Some(pane)
+            {
+                return SessionDeliveryPlan::RawTmux {
+                    inject_config: backend.inject_config(),
+                    tui_pattern: backend.tui_ready_pattern().map(String::from),
+                };
+            }
+
+            SessionDeliveryPlan::Unavailable(format!(
+                "session '{session_id}' is not safely deliverable via HTTP and does not own pane '{pane}'"
+            ))
+        }
+    }
+}
+
 /// Enqueue a message for injection into a tmux pane.
 ///
 /// Messages are queued in a per-pane FIFO and processed by a background
@@ -482,75 +600,97 @@ pub async fn locked_inject(
     message: &str,
     vim_mode: bool,
 ) -> anyhow::Result<()> {
-    let backend = state.backend_for_session(session_id).await;
-
-    match backend.delivery_mode() {
-        crate::backend::DeliveryMode::HttpApi { .. } => {
-            // Read backend_session_id, project_dir, model, and effort under
-            // one lock acquisition so a concurrent session mutation can't
-            // split them. model/effort are applied on every prompt_async
-            // body so messages after the initial prompt continue to route
-            // through the session's configured model and variant.
-            let (oc_session_id, project_dir, model, effort) = {
-                let proto = state.protocol.read().await;
-                match proto.sessions.get(session_id) {
-                    Some(s) => (
-                        s.metadata.backend_session_id.clone(),
-                        s.metadata.project_dir.clone(),
-                        s.metadata.model.clone(),
-                        s.metadata.effort.clone(),
-                    ),
-                    None => (None, None, None, None),
-                }
-            };
+    match session_delivery_plan(state, session_id, pane).await {
+        SessionDeliveryPlan::Http(delivery) => {
             // locked_inject is the fire-and-forget path used by reminders,
             // session-agent nudges, and similar best-effort senders; log and
             // swallow upstream failures so those callers keep their existing
             // semantics. Callers that need to observe delivery outcomes must
             // call deliver_via_http directly.
-            match oc_session_id {
-                Some(sid) => {
-                    if let Err(e) = deliver_via_http(
-                        state,
-                        &sid,
-                        project_dir.as_deref(),
-                        message,
-                        model.as_deref(),
-                        effort.as_deref(),
-                    )
-                    .await
-                    {
-                        tracing::warn!(session = %session_id, "http delivery failed: {e}");
-                    }
-                }
-                None => {
-                    tracing::warn!(
-                        session = %session_id,
-                        "http delivery skipped: no backend_session_id on session"
-                    );
-                }
+            if let Err(decision) = deliver_via_http(
+                state,
+                &delivery.backend_session_id,
+                delivery.project_dir.as_deref(),
+                message,
+                delivery.model.as_deref(),
+                delivery.effort.as_deref(),
+            )
+            .await
+            {
+                tracing::warn!(session = %session_id, ?decision, "http delivery failed");
             }
-            Ok(())
         }
-        crate::backend::DeliveryMode::TuiInjection => {
-            let config = backend.inject_config();
-            let tui_pattern = backend.tui_ready_pattern().map(String::from);
-
+        SessionDeliveryPlan::RawTmux {
+            inject_config,
+            tui_pattern,
+        } => {
             let (result_tx, result_rx) = tokio::sync::oneshot::channel();
             let req = InjectRequest {
                 pane: pane.to_string(),
                 message: message.to_string(),
                 vim_mode,
-                inject_config: config,
+                inject_config,
                 tui_pattern,
                 result_tx,
             };
             state.enqueue_inject(req);
-            result_rx
+            return result_rx
                 .await
-                .map_err(|_| anyhow::anyhow!("inject queue closed"))?
+                .map_err(|_| anyhow::anyhow!("inject queue closed"))?;
         }
+        SessionDeliveryPlan::Unavailable(reason) => anyhow::bail!(reason),
     }
+
+    Ok(())
+}
+
+/// Enqueue a message for raw tmux injection regardless of backend delivery mode.
+///
+/// Use this for explicit pane-targeted delivery where the caller's intent is to
+/// drive the visible TUI rather than any backend HTTP session.
+pub async fn locked_inject_raw_tmux(
+    state: &crate::state::AppState,
+    session_id: &str,
+    pane: &str,
+    message: &str,
+    vim_mode: bool,
+) -> anyhow::Result<()> {
+    if cfg!(test) {
+        return Ok(());
+    }
+
+    let backend = state.backend_for_session(session_id).await;
+    let config = backend.inject_config();
+    let tui_pattern = backend.tui_ready_pattern().map(String::from);
+
+    locked_inject_raw_tmux_with_config(state, pane, message, vim_mode, config, tui_pattern).await
+}
+
+pub async fn locked_inject_raw_tmux_with_config(
+    state: &crate::state::AppState,
+    pane: &str,
+    message: &str,
+    vim_mode: bool,
+    inject_config: crate::backend::InjectConfig,
+    tui_pattern: Option<String>,
+) -> anyhow::Result<()> {
+    if cfg!(test) {
+        return Ok(());
+    }
+
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let req = InjectRequest {
+        pane: pane.to_string(),
+        message: message.to_string(),
+        vim_mode,
+        inject_config,
+        tui_pattern,
+        result_tx,
+    };
+    state.enqueue_inject(req);
+    result_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("inject queue closed"))?
 }
 
 /// Deliver a message to an opencode session via its HTTP API.
@@ -575,7 +715,7 @@ pub(crate) async fn deliver_via_http(
     message: &str,
     model: Option<&str>,
     effort: Option<&str>,
-) -> anyhow::Result<()> {
+) -> Result<(), crate::nostr_transport::PromptAsyncFallbackDecision> {
     let port = state.opencode_serve_port();
 
     let client = state.http_client.clone();
@@ -589,15 +729,26 @@ pub(crate) async fn deliver_via_http(
     if let Some(dir) = project_dir {
         req = req.header("x-opencode-directory", dir);
     }
-    let resp = req.send().await.context("prompt_async request failed")?;
+    let resp = match req.send().await {
+        Ok(resp) => resp,
+        Err(error) => {
+            return Err(crate::nostr_transport::classify_prompt_async_fallback(
+                crate::nostr_transport::PromptAsyncFailure::Request(&error),
+            ));
+        }
+    };
 
     let status = resp.status();
     if status.is_success() {
         tracing::info!(port, "delivered message via prompt_async");
         Ok(())
     } else {
+        let decision = crate::nostr_transport::classify_prompt_async_fallback(
+            crate::nostr_transport::PromptAsyncFailure::Status(status),
+        );
         let text = resp.text().await.unwrap_or_default();
-        bail!("prompt_async returned {status}: {text}");
+        tracing::warn!(%status, %text, ?decision, "prompt_async returned non-success");
+        Err(decision)
     }
 }
 
@@ -741,6 +892,76 @@ mod tests {
             );
             i += 2;
         }
+    }
+
+    #[test]
+    fn sanitize_injection_text_strips_escape_and_carriage_return_bytes() {
+        let sanitized = sanitize_injection_text("prefix\x1b[201~/quit\rsuffix");
+
+        assert!(!sanitized.contains('\x1b'));
+        assert!(!sanitized.contains('\u{9b}'));
+        assert!(!sanitized.contains('\r'));
+        assert!(!sanitized.contains("[201~"));
+        assert_eq!(sanitized, "prefix/quitsuffix");
+    }
+
+    #[test]
+    fn sanitize_injection_text_neutralizes_other_c0_and_c1_controls() {
+        let sanitized = sanitize_injection_text("alpha\0\x07\x08beta\tgamma\u{7f}\u{85}omega");
+
+        assert_eq!(sanitized, "alphabeta gammaomega");
+        assert!(
+            !sanitized
+                .chars()
+                .any(|c| { c <= '\u{1f}' || ('\u{7f}'..='\u{9f}').contains(&c) }),
+            "sanitized text still contains C0/C1 controls: {sanitized:?}"
+        );
+    }
+
+    #[test]
+    fn verification_needle_stops_on_utf8_character_boundary() {
+        let message = format!("{}🙂 suffix", "a".repeat(VERIFY_NEEDLE_LEN - 1));
+
+        let needle = verification_needle(&message);
+
+        assert_eq!(needle, "a".repeat(VERIFY_NEEDLE_LEN - 1));
+        assert!(message.is_char_boundary(needle.len()));
+    }
+
+    #[test]
+    fn tmux_injection_buffer_names_are_unique_and_scoped() {
+        let first = next_inject_buffer_name("%12");
+        let second = next_inject_buffer_name("%12");
+
+        assert_ne!(first, second);
+        assert!(first.starts_with("ouija-inject-12-"));
+        assert!(first.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    }
+
+    #[tokio::test]
+    async fn session_delivery_plan_uses_raw_tmux_for_weak_opencode_binding() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .protocol
+            .write()
+            .await
+            .apply(crate::daemon_protocol::Event::Register {
+                id: "weak-opencode".into(),
+                pane: Some("%42".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("oc-session".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted),
+                    ..Default::default()
+                },
+            });
+
+        let plan = session_delivery_plan(&state, "weak-opencode", "%42").await;
+
+        assert!(
+            matches!(plan, SessionDeliveryPlan::RawTmux { .. }),
+            "weak/adopted OpenCode sessions must inject into the visible pane, got {plan:?}"
+        );
     }
 
     #[test]

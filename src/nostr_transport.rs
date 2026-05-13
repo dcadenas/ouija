@@ -10,6 +10,95 @@ use crate::protocol::WireMessage;
 use crate::state::AppState;
 use crate::transport::Transport;
 
+fn opencode_binding_for_backend_session(
+    is_http_api: bool,
+    backend_session_id: Option<&str>,
+) -> Option<crate::daemon_protocol::OpenCodeBinding> {
+    if !is_http_api {
+        None
+    } else if backend_session_id.is_some() {
+        Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
+    } else {
+        Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
+    }
+}
+
+fn opencode_binding_for_restart_session(
+    is_http_api: bool,
+    backend_session_id: Option<&str>,
+    reused_previous_backend_session: bool,
+    previous_binding: Option<crate::daemon_protocol::OpenCodeBinding>,
+) -> Option<crate::daemon_protocol::OpenCodeBinding> {
+    if !is_http_api {
+        None
+    } else if reused_previous_backend_session && backend_session_id.is_some() {
+        Some(previous_binding.unwrap_or(crate::daemon_protocol::OpenCodeBinding::WeakAdopted))
+    } else {
+        opencode_binding_for_backend_session(is_http_api, backend_session_id)
+    }
+}
+
+fn start_registration_metadata(
+    is_http_api: bool,
+    pane_id: &str,
+    backend_session_id: Option<String>,
+) -> Option<(
+    Option<String>,
+    Option<String>,
+    Option<crate::daemon_protocol::OpenCodeBinding>,
+)> {
+    if is_http_api && backend_session_id.is_none() {
+        return None;
+    }
+
+    let opencode_binding =
+        opencode_binding_for_backend_session(is_http_api, backend_session_id.as_deref());
+    Some((
+        Some(pane_id.to_string()),
+        backend_session_id,
+        opencode_binding,
+    ))
+}
+
+fn should_schedule_restart_prompt_injection(
+    is_http_api: bool,
+    backend_session_id: Option<&str>,
+    opencode_binding: Option<&crate::daemon_protocol::OpenCodeBinding>,
+) -> bool {
+    is_http_api
+        && backend_session_id.is_some()
+        && opencode_binding == Some(&crate::daemon_protocol::OpenCodeBinding::StrongManaged)
+}
+
+fn should_cleanup_failed_opencode_attach_pane(
+    is_http_api: bool,
+    backend_session_id: Option<&str>,
+) -> bool {
+    is_http_api && backend_session_id.is_none()
+}
+
+fn should_remove_session_after_failed_restart(
+    is_http_api: bool,
+    backend_session_id: Option<&str>,
+    failed_pane_id: &str,
+    existing_pane_id: Option<&str>,
+) -> bool {
+    should_cleanup_failed_opencode_attach_pane(is_http_api, backend_session_id)
+        && existing_pane_id.is_none_or(|existing| existing == failed_pane_id)
+}
+
+fn cleanup_failed_opencode_attach_pane(pane_id: &str) {
+    if cfg!(test) {
+        return;
+    }
+    let pane = pane_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-pane", "-t", &pane])
+            .status();
+    });
+}
+
 /// Timeout when waiting for relay connections to establish.
 const RELAY_CONNECT_TIMEOUT_SECS: u64 = 5;
 /// Maximum size of the seen-events dedup cache before clearing.
@@ -934,7 +1023,12 @@ async fn format_status(state: &AppState) -> String {
     )
 }
 
-async fn route_human_message(state: &AppState, from: &str, to: &str, message: &str) {
+async fn route_human_message(
+    state: &std::sync::Arc<AppState>,
+    from: &str,
+    to: &str,
+    message: &str,
+) {
     // Use the same send path as the API
     let target = state.protocol.read().await.sessions.get(to).cloned();
 
@@ -950,11 +1044,25 @@ async fn route_human_message(state: &AppState, from: &str, to: &str, message: &s
                     let formatted = crate::daemon_protocol::format_session_message(
                         from, message, true, msg_id, None, false,
                     );
-                    let vim_mode = session.metadata.vim_mode;
-                    let delivered =
-                        crate::tmux::locked_inject(state, to, pane, &formatted, vim_mode)
-                            .await
-                            .is_ok();
+                    let delivery_method = if session.metadata.backend.as_deref() == Some("opencode")
+                    {
+                        Some("http")
+                    } else {
+                        Some("tmux")
+                    };
+                    let outcome = crate::state::deliver_inject_message_effect(
+                        state,
+                        crate::state::InjectDeliveryRequest {
+                            session_id: to,
+                            pane,
+                            message: &formatted,
+                            vim_mode: session.metadata.vim_mode,
+                            delivery_method,
+                            recorded_method: None,
+                        },
+                    )
+                    .await;
+                    let delivered = matches!(outcome, crate::state::DeliveryOutcome::Accepted);
                     state
                         .log_message(
                             from.to_string(),
@@ -1632,10 +1740,11 @@ pub async fn start_session(
     match start_result {
         Ok(Ok(pane_id)) => {
             // For HttpApi backends, use the shared opencode serve instance
-            let backend_session_id = if matches!(
+            let is_http_api = matches!(
                 backend.delivery_mode(),
                 crate::backend::DeliveryMode::HttpApi { .. }
-            ) {
+            );
+            let backend_session_id = if is_http_api {
                 match setup_shared_serve_session(state, &pane_id, &dir).await {
                     Ok(sid) => Some(sid),
                     Err(e) => {
@@ -1647,12 +1756,30 @@ pub async fn start_session(
                 None
             };
 
+            let Some((registration_pane, backend_session_id, opencode_binding)) =
+                start_registration_metadata(is_http_api, &pane_id, backend_session_id)
+            else {
+                tracing::warn!(
+                    "start_session: not registering {name} because OpenCode attach setup failed"
+                );
+                if should_cleanup_failed_opencode_attach_pane(is_http_api, None) {
+                    cleanup_failed_opencode_attach_pane(&pane_id);
+                }
+                return (
+                    format!(
+                        "start failed: OpenCode attach setup failed for '{name}' (pane {pane_id})"
+                    ),
+                    None,
+                );
+            };
+
             let oc_session_id = backend_session_id.clone();
             let proto_meta = crate::daemon_protocol::SessionMeta {
                 project_dir: Some(dir.clone()),
                 worktree,
                 backend: Some(backend_name.clone()),
                 backend_session_id,
+                opencode_binding,
                 model: model.map(String::from),
                 effort: effort.map(String::from),
                 reminder: reminder.map(String::from),
@@ -1662,18 +1789,23 @@ pub async fn start_session(
             state
                 .apply_and_execute(crate::daemon_protocol::Event::Register {
                     id: name.to_string(),
-                    pane: Some(pane_id.clone()),
+                    pane: registration_pane,
                     metadata: proto_meta,
                 })
                 .await;
-            let prompt_msg_id = pre_queued_prompt.as_ref().and_then(|(_, id)| *id);
+            let prompt_delivery = pre_queued_prompt
+                .as_ref()
+                .map(|_| start_prompt_delivery(is_http_api, oc_session_id.as_deref()));
+            let prompt_msg_id = start_prompt_msg_id(
+                pre_queued_prompt.as_ref().and_then(|(_, id)| *id),
+                prompt_delivery,
+            );
             if let Some((ref prompt_text, _)) = pre_queued_prompt {
-                // For HttpApi backends, deliver via prompt_async
-                if let Some(ref oc_sid) = oc_session_id {
-                    if matches!(
-                        backend.delivery_mode(),
-                        crate::backend::DeliveryMode::HttpApi { .. }
-                    ) {
+                match prompt_delivery.expect("prompt delivery is computed when prompt exists") {
+                    StartPromptDelivery::PromptAsync => {
+                        let oc_sid = oc_session_id
+                            .as_ref()
+                            .expect("PromptAsync delivery requires an OpenCode backend session id");
                         let port = state.opencode_serve_port();
                         let body = opencode_prompt_body(prompt_text, model, effort);
                         let url = format!("http://127.0.0.1:{port}/session/{oc_sid}/prompt_async");
@@ -1681,6 +1813,7 @@ pub async fn start_session(
                         let dir2 = dir.clone();
                         let name2 = name.to_string();
                         let pane2 = pane_id.clone();
+                        let expected_backend_session_id = oc_session_id.clone();
                         let injected = prompt_text.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(std::time::Duration::from_secs(8)).await;
@@ -1699,24 +1832,85 @@ pub async fn start_session(
                                     );
                                 }
                                 Ok(r) => {
-                                    tracing::warn!(
-                                        "start_session: prompt_async returned {}",
-                                        r.status()
+                                    let status = r.status();
+                                    tracing::warn!("start_session: prompt_async returned {status}");
+                                    let decision = classify_prompt_async_fallback(
+                                        PromptAsyncFailure::Status(status),
                                     );
+                                    if decision.should_try_raw_tmux() {
+                                        if deliver_prompt_fallback(
+                                            &state2,
+                                            &name2,
+                                            &pane2,
+                                            &injected,
+                                            true,
+                                            false,
+                                            expected_backend_session_id.as_deref(),
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            restore_start_prompt_after_fallback_failure(
+                                                &state2,
+                                                &name2,
+                                                crate::state::PendingPrompt::new(
+                                                    pane2.clone(),
+                                                    injected.clone(),
+                                                    expected_backend_session_id.clone(),
+                                                ),
+                                            );
+                                        }
+                                    } else {
+                                        tracing::warn!(
+                                            "start_session: prompt_async status {status} is ambiguous; not retrying prompt via raw tmux"
+                                        );
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::warn!("start_session: prompt_async failed: {e}");
-                                    let _ = crate::tmux::locked_inject(
-                                        &state2, &name2, &pane2, &injected, false,
-                                    )
-                                    .await;
+                                    let decision = classify_prompt_async_fallback(
+                                        PromptAsyncFailure::Request(&e),
+                                    );
+                                    if decision.should_try_raw_tmux()
+                                        && deliver_prompt_fallback(
+                                            &state2,
+                                            &name2,
+                                            &pane2,
+                                            &injected,
+                                            true,
+                                            false,
+                                            expected_backend_session_id.as_deref(),
+                                        )
+                                        .await
+                                        .is_err()
+                                    {
+                                        restore_start_prompt_after_fallback_failure(
+                                            &state2,
+                                            &name2,
+                                            crate::state::PendingPrompt::new(
+                                                pane2.clone(),
+                                                injected.clone(),
+                                                expected_backend_session_id.clone(),
+                                            ),
+                                        );
+                                    } else if !decision.should_try_raw_tmux() {
+                                        tracing::warn!(
+                                            "start_session: prompt_async request failure is ambiguous; not retrying prompt via raw tmux"
+                                        );
+                                    }
                                 }
                             }
                         });
                     }
-                    // TuiInjection: prompt already passed as CLI arg — no injection needed
+                    StartPromptDelivery::AlreadyPassedAsCliArg => {
+                        // TuiInjection prompts are passed as CLI args before spawn.
+                    }
+                    StartPromptDelivery::Unavailable => {
+                        tracing::warn!(
+                            "start_session: prompt for {name} not delivered because OpenCode attach setup failed"
+                        );
+                    }
                 }
-                // TuiInjection: prompt already passed as CLI arg — no injection needed
             }
             if auto_worktree {
                 let conflict_name = {
@@ -2093,6 +2287,7 @@ pub async fn restart_session(
     match start_result {
         Ok(Ok(pane_id)) => {
             // For HttpApi backends, use the shared opencode serve instance
+            let mut reused_previous_backend_session = false;
             let mut backend_session_id = if matches!(
                 backend.delivery_mode(),
                 crate::backend::DeliveryMode::HttpApi { .. }
@@ -2124,7 +2319,27 @@ pub async fn restart_session(
                             .await
                         {
                             Ok(r) if r.status().is_success() => {
-                                backend_session_id = Some(prev_sid.clone());
+                                match launch_opencode_attach_for_session(
+                                    &pane_id, &dir, prev_sid, port,
+                                )
+                                .await
+                                .and_then(|attach_ready| {
+                                    previous_backend_session_after_attach(
+                                        prev_sid.clone(),
+                                        attach_ready,
+                                        &pane_id,
+                                    )
+                                }) {
+                                    Ok(sid) => {
+                                        backend_session_id = Some(sid);
+                                        reused_previous_backend_session = true;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "previous backend_session_id {prev_sid} is reachable but attach failed: {e}"
+                                        );
+                                    }
+                                }
                             }
                             _ => {
                                 tracing::warn!(
@@ -2136,6 +2351,45 @@ pub async fn restart_session(
                 }
             }
 
+            if is_http_api && backend_session_id.is_none() {
+                tracing::warn!(
+                    "restart_session: not registering {name} because OpenCode attach setup failed"
+                );
+                if should_cleanup_failed_opencode_attach_pane(is_http_api, None) {
+                    cleanup_failed_opencode_attach_pane(&pane_id);
+                }
+                if should_remove_session_after_failed_restart(
+                    is_http_api,
+                    None,
+                    &pane_id,
+                    existing_pane.as_deref(),
+                ) {
+                    state
+                        .apply_and_execute(crate::daemon_protocol::Event::Remove {
+                            id: name.to_string(),
+                            keep_worktree: true,
+                        })
+                        .await;
+                }
+                return (
+                    format!(
+                        "restart failed: OpenCode attach setup failed for '{name}' (pane {pane_id})"
+                    ),
+                    None,
+                );
+            }
+
+            let restart_backend_session_id = backend_session_id.clone();
+
+            let opencode_binding = opencode_binding_for_restart_session(
+                is_http_api,
+                backend_session_id.as_deref(),
+                reused_previous_backend_session,
+                prev_metadata
+                    .as_ref()
+                    .and_then(|m| m.opencode_binding.clone()),
+            );
+            let restart_opencode_binding = opencode_binding.clone();
             let proto_meta = match prev_metadata {
                 Some(ref m) => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),
@@ -2146,6 +2400,9 @@ pub async fn restart_session(
                     vim_mode: m.vim_mode,
                     backend_session_id,
                     backend: Some(backend_name.clone()),
+                    opencode_binding: opencode_binding.clone(),
+                    restart_generation: m.restart_generation.saturating_add(1),
+                    session_incarnation: m.session_incarnation,
                     project_description: m.project_description.clone(),
                     last_metadata_update: None,
                     model: effective_model.clone(),
@@ -2166,6 +2423,7 @@ pub async fn restart_session(
                     project_dir: Some(dir.clone()),
                     backend: Some(backend_name.clone()),
                     backend_session_id,
+                    opencode_binding,
                     model: effective_model.clone(),
                     effort: effective_effort.clone(),
                     reminder: effective_reminder.clone(),
@@ -2180,11 +2438,46 @@ pub async fn restart_session(
                     metadata: proto_meta,
                 })
                 .await;
-            // HttpApi: deliver prompt via schedule_prompt_injection (readiness
-            // signal + fallback). TuiInjection prompt was passed as CLI arg.
-            if is_http_api {
+            // Strong HttpApi bindings can use readiness delivery; weak reused
+            // panes must stay on raw tmux to preserve the visible-pane boundary.
+            if should_schedule_restart_prompt_injection(
+                is_http_api,
+                restart_backend_session_id.as_deref(),
+                restart_opencode_binding.as_ref(),
+            ) {
                 if let Some(ref prompt_text) = formatted_prompt {
-                    schedule_prompt_injection(state, name, pane_id.clone(), prompt_text.clone());
+                    schedule_prompt_injection(
+                        state,
+                        name,
+                        pane_id.clone(),
+                        prompt_text.clone(),
+                        restart_backend_session_id.clone(),
+                    );
+                }
+            } else if is_http_api && restart_backend_session_id.is_some() {
+                if let Some(ref prompt_text) = formatted_prompt {
+                    if let Err(e) = deliver_prompt_fallback(
+                        state,
+                        name,
+                        &pane_id,
+                        prompt_text,
+                        true,
+                        false,
+                        restart_backend_session_id.as_deref(),
+                    )
+                    .await
+                    {
+                        tracing::warn!("restart prompt fallback delivery failed for {name}: {e}");
+                        restore_restart_prompt_after_fallback_failure(
+                            state,
+                            name,
+                            crate::state::PendingPrompt::new(
+                                pane_id.clone(),
+                                prompt_text.clone(),
+                                restart_backend_session_id.clone(),
+                            ),
+                        );
+                    }
                 }
             }
             (
@@ -2221,6 +2514,10 @@ async fn soft_restart_session(
     effort: Option<&str>,
 ) -> Result<(String, Option<u64>), ()> {
     let port = state.opencode_serve_port();
+    let Some(_soft_restart_guard) = state.try_acquire_soft_restart_in_progress(name) else {
+        tracing::warn!("soft restart: restart already in progress for '{name}'");
+        return Err(());
+    };
 
     // 1. Create a new session on the opencode serve
     let resp = state
@@ -2236,9 +2533,17 @@ async fn soft_restart_session(
             let body: serde_json::Value = r.json().await.map_err(|e| {
                 tracing::warn!("soft restart: failed to parse session response: {e}");
             })?;
-            body["id"].as_str().map(String::from).ok_or_else(|| {
-                tracing::warn!("soft restart: no session id in opencode response");
-            })?
+            body["id"]
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| {
+                    tracing::warn!("soft restart: no session id in opencode response");
+                })
+                .and_then(|session_id| {
+                    validate_created_opencode_session_id(&session_id).map_err(|error| {
+                        tracing::warn!("soft restart: {error}");
+                    })
+                })?
         }
         Ok(r) => {
             let status = r.status();
@@ -2255,11 +2560,10 @@ async fn soft_restart_session(
         "soft restart: created new opencode session {new_session_id} for '{name}' (port {port})"
     );
 
-    // 2. Update backend_session_id, model, and effort atomically under one
-    //    write lock before delivering the prompt. A concurrent reader (e.g.
-    //    deliver_via_http from locked_inject) running between these writes
-    //    would otherwise observe the new session id with stale model/effort
-    //    metadata and route the next message through the previous model.
+    // 2. Snapshot metadata before attach/prompt delivery. Metadata for the
+    //    replacement backend is committed only after the delivery boundary that
+    //    makes the restart safe: attach verification for pane-backed sessions,
+    //    and prompt_async acceptance for headless sessions.
     //
     //    When `model` / `effort` are None we preserve the session's current
     //    metadata rather than clearing it: callers are expected to pre-compute
@@ -2267,18 +2571,13 @@ async fn soft_restart_session(
     //    fallback), but a stale snapshot or a future caller that forgets the
     //    fallback must not silently wipe fields that were set by another
     //    writer between the snapshot and this atomic block.
-    {
+    let (owner_snapshot, previous_metadata) = {
         let mut proto = state.protocol.write().await;
         match proto.sessions.get_mut(name) {
-            Some(session) => {
-                session.metadata.backend_session_id = Some(new_session_id.clone());
-                if let Some(m) = model {
-                    session.metadata.model = Some(m.to_string());
-                }
-                if let Some(e) = effort {
-                    session.metadata.effort = Some(e.to_string());
-                }
-            }
+            Some(session) => (
+                SoftRestartOwnerSnapshot::from_entry(session),
+                session.metadata.clone(),
+            ),
             None => {
                 // Session was removed between the pre-flight snapshot and
                 // this write (concurrent Unregister, racing restart, etc.).
@@ -2298,40 +2597,111 @@ async fn soft_restart_session(
                 let client = state.http_client.clone();
                 let orphan_id = new_session_id.clone();
                 tokio::spawn(async move {
-                    let url = format!("http://127.0.0.1:{port}/session/{orphan_id}");
-                    match client
-                        .delete(&url)
-                        .timeout(std::time::Duration::from_secs(5))
-                        .send()
-                        .await
-                    {
-                        Ok(r) if r.status().is_success() => {
-                            tracing::debug!(
-                                "soft restart cleanup: deleted orphan opencode session {orphan_id}"
-                            );
-                        }
-                        Ok(r) => {
-                            tracing::warn!(
-                                "soft restart cleanup: DELETE /session/{orphan_id} returned {}",
-                                r.status()
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "soft restart cleanup: DELETE /session/{orphan_id} failed: {e}"
-                            );
-                        }
-                    }
+                    delete_opencode_session(&client, port, &orphan_id, "soft restart cleanup")
+                        .await;
                 });
                 return Err(());
             }
         }
-        state.persist_protocol_state(&proto);
+    };
+    let restart_generation = previous_metadata.restart_generation;
+
+    let mut prompt_msg_id = None;
+    let mut metadata_committed = false;
+
+    // 3. Respawn the TUI attach to point at the new session.
+    if let Some(pane) = pane {
+        match respawn_opencode_attach_for_session(pane, project_dir, &new_session_id, port, name)
+            .await
+        {
+            Ok(true) => {
+                if should_commit_soft_restart_metadata_before_prompt(Some(pane), prompt)
+                    && apply_soft_restart_metadata(
+                        state,
+                        &owner_snapshot,
+                        &new_session_id,
+                        restart_generation,
+                        model,
+                        effort,
+                    )
+                    .await
+                    .is_err()
+                {
+                    rollback_pane_after_failed_soft_restart_commit(
+                        state,
+                        pane,
+                        project_dir,
+                        port,
+                        name,
+                        &previous_metadata,
+                    )
+                    .await;
+                    delete_opencode_session(
+                        &state.http_client,
+                        port,
+                        &new_session_id,
+                        "soft restart cleanup",
+                    )
+                    .await;
+                    return Err(());
+                }
+                if should_commit_soft_restart_metadata_before_prompt(Some(pane), prompt) {
+                    metadata_committed = true;
+                }
+            }
+            Ok(false) => {
+                tracing::warn!("soft restart: opencode attach did not start in pane {pane}");
+                delete_opencode_session(
+                    &state.http_client,
+                    port,
+                    &new_session_id,
+                    "soft restart cleanup",
+                )
+                .await;
+                return Err(());
+            }
+            Err(e) => {
+                tracing::warn!("soft restart: respawn-pane {pane} failed: {e}");
+                delete_opencode_session(
+                    &state.http_client,
+                    port,
+                    &new_session_id,
+                    "soft restart cleanup",
+                )
+                .await;
+                return Err(());
+            }
+        }
     }
 
-    // 3. Deliver prompt directly via HTTP API
-    let mut prompt_msg_id = None;
+    // 4. Deliver prompt directly via HTTP API after any required attach
+    //    succeeded. This preserves the Err boundary: attach failure returns
+    //    before prompt_async can start work in the throwaway session.
     if let Some(text) = prompt {
+        if pane.is_none() && !metadata_committed {
+            if apply_soft_restart_metadata(
+                state,
+                &owner_snapshot,
+                &new_session_id,
+                restart_generation,
+                model,
+                effort,
+            )
+            .await
+            .is_err()
+            {
+                delete_opencode_session(
+                    &state.http_client,
+                    port,
+                    &new_session_id,
+                    "soft restart cleanup",
+                )
+                .await;
+                return Err(());
+            }
+            metadata_committed = true;
+        }
+
         let full_text = match reminder {
             Some(r) => format!("{text}\n\n{r}"),
             None => text.to_string(),
@@ -2350,46 +2720,160 @@ async fn soft_restart_session(
             full_text
         };
 
-        let body = opencode_prompt_body(&message, model, effort);
-        let async_url = format!("http://127.0.0.1:{port}/session/{new_session_id}/prompt_async");
-        let resp = state
-            .http_client
-            .post(&async_url)
-            .header("x-opencode-directory", project_dir)
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await;
-        match resp {
-            Ok(r) if r.status().is_success() => {
-                tracing::info!(
-                    "soft restart: delivered prompt to {new_session_id} via prompt_async"
+        match deliver_soft_restart_prompt(
+            state,
+            port,
+            &new_session_id,
+            project_dir,
+            &message,
+            model,
+            effort,
+        )
+        .await
+        {
+            crate::state::DeliveryOutcome::Accepted => {
+                if !metadata_committed {
+                    if apply_soft_restart_metadata(
+                        state,
+                        &owner_snapshot,
+                        &new_session_id,
+                        restart_generation,
+                        model,
+                        effort,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        if let (Some(pane), Some(previous_session_id)) = (
+                            pane,
+                            previous_backend_session_for_prompt_failure_rollback(
+                                pane,
+                                &previous_metadata,
+                            ),
+                        ) {
+                            match respawn_opencode_attach_for_session(
+                                pane,
+                                project_dir,
+                                previous_session_id,
+                                port,
+                                name,
+                            )
+                            .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => tracing::warn!(
+                                    "soft restart: failed to reattach pane {pane} to previous opencode session after metadata commit failure"
+                                ),
+                                Err(error) => tracing::warn!(
+                                    "soft restart: failed to roll back pane {pane} to previous opencode session after metadata commit failure: {error}"
+                                ),
+                            }
+                        }
+                        delete_opencode_session(
+                            &state.http_client,
+                            port,
+                            &new_session_id,
+                            "soft restart cleanup",
+                        )
+                        .await;
+                        return Err(());
+                    }
+                    metadata_committed = true;
+                }
+            }
+            crate::state::DeliveryOutcome::Ambiguous(reason) => {
+                tracing::warn!(
+                    "soft restart: prompt_async outcome ambiguous for {new_session_id}: {reason}"
                 );
+                if let (Some(pane), Some(previous_session_id)) = (
+                    pane,
+                    previous_backend_session_for_prompt_failure_rollback(pane, &previous_metadata),
+                ) {
+                    match respawn_opencode_attach_for_session(
+                        pane,
+                        project_dir,
+                        previous_session_id,
+                        port,
+                        name,
+                    )
+                    .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => tracing::warn!(
+                            "soft restart: failed to reattach pane {pane} to previous opencode session after ambiguous prompt_async outcome"
+                        ),
+                        Err(error) => tracing::warn!(
+                            "soft restart: failed to roll back pane {pane} to previous opencode session after ambiguous prompt_async outcome: {error}"
+                        ),
+                    }
+                    delete_opencode_session(
+                        &state.http_client,
+                        port,
+                        &new_session_id,
+                        "soft restart cleanup",
+                    )
+                    .await;
+                    return Err(());
+                }
             }
-            Ok(r) => {
-                let status = r.status();
-                tracing::warn!("soft restart: prompt_async returned {status}");
-            }
-            Err(e) => {
-                tracing::warn!("soft restart: prompt_async failed: {e}");
+            crate::state::DeliveryOutcome::Rejected(reason) => {
+                tracing::warn!("soft restart: prompt_async failed for {new_session_id}: {reason}");
+                if let (Some(pane), Some(previous_session_id)) = (
+                    pane,
+                    previous_backend_session_for_prompt_failure_rollback(pane, &previous_metadata),
+                ) {
+                    match respawn_opencode_attach_for_session(
+                        pane,
+                        project_dir,
+                        previous_session_id,
+                        port,
+                        name,
+                    )
+                    .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => tracing::warn!(
+                            "soft restart: failed to reattach pane {pane} to previous opencode session after prompt_async failure"
+                        ),
+                        Err(error) => tracing::warn!(
+                            "soft restart: failed to roll back pane {pane} to previous opencode session after prompt_async failure: {error}"
+                        ),
+                    }
+                }
+                delete_opencode_session(
+                    &state.http_client,
+                    port,
+                    &new_session_id,
+                    "soft restart cleanup",
+                )
+                .await;
+                restore_soft_restart_metadata(state, name, &new_session_id, &previous_metadata)
+                    .await;
+                return Err(());
             }
         }
     }
 
-    // 4. Respawn the TUI attach to point at the new session
-    if let Some(pane) = pane {
-        let escaped_dir = crate::scheduler::shell_escape(project_dir);
-        let attach_cmd = format!(
-            "opencode attach http://127.0.0.1:{port} --session {new_session_id} --dir {escaped_dir}"
-        );
-        let pane = pane.to_string();
-        let env_args = crate::tmux::pane_env_args(name);
-        tokio::task::spawn_blocking(move || {
-            let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
-            args.extend(env_args.iter().map(String::as_str));
-            args.extend_from_slice(&["-t", &pane, &attach_cmd]);
-            let _ = std::process::Command::new("tmux").args(&args).status();
-        });
+    if !metadata_committed
+        && apply_soft_restart_metadata(
+            state,
+            &owner_snapshot,
+            &new_session_id,
+            restart_generation,
+            model,
+            effort,
+        )
+        .await
+        .is_err()
+    {
+        delete_opencode_session(
+            &state.http_client,
+            port,
+            &new_session_id,
+            "soft restart cleanup",
+        )
+        .await;
+        return Err(());
     }
 
     Ok((
@@ -2398,15 +2882,346 @@ async fn soft_restart_session(
     ))
 }
 
-fn opencode_attach_command(port: u16, session_id: &str, project_dir: &str) -> String {
-    let escaped_dir = crate::scheduler::shell_escape(project_dir);
-    format!("opencode attach http://127.0.0.1:{port} --session {session_id} --dir {escaped_dir}")
+fn should_commit_soft_restart_metadata_before_prompt(
+    pane: Option<&str>,
+    prompt: Option<&str>,
+) -> bool {
+    pane.is_none() || prompt.is_none()
+}
+
+async fn apply_soft_restart_metadata(
+    state: &AppState,
+    owner: &SoftRestartOwnerSnapshot,
+    new_session_id: &str,
+    expected_restart_generation: u64,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<(), ()> {
+    let mut proto = state.protocol.write().await;
+    let Some(session) = proto.sessions.get_mut(&owner.session_id) else {
+        return Err(());
+    };
+    if session.metadata.session_incarnation != owner.incarnation {
+        return Err(());
+    }
+    if session.metadata.restart_generation != expected_restart_generation {
+        return Err(());
+    }
+    session.metadata.backend = Some("opencode".to_string());
+    session.metadata.backend_session_id = Some(new_session_id.to_string());
+    session.metadata.opencode_binding =
+        Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged);
+    session.metadata.restart_generation = session.metadata.restart_generation.saturating_add(1);
+    if let Some(m) = model {
+        session.metadata.model = Some(m.to_string());
+    }
+    if let Some(e) = effort {
+        session.metadata.effort = Some(e.to_string());
+    }
+    state.persist_protocol_state(&proto);
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SoftRestartOwnerSnapshot {
+    session_id: String,
+    incarnation: i64,
+}
+
+impl SoftRestartOwnerSnapshot {
+    fn from_entry(session: &crate::daemon_protocol::SessionEntry) -> Self {
+        Self {
+            session_id: session.id.clone(),
+            incarnation: session.metadata.session_incarnation,
+        }
+    }
+}
+
+async fn restore_soft_restart_metadata(
+    state: &AppState,
+    name: &str,
+    failed_session_id: &str,
+    previous_metadata: &crate::daemon_protocol::SessionMeta,
+) {
+    let mut proto = state.protocol.write().await;
+    let Some(session) = proto.sessions.get_mut(name) else {
+        return;
+    };
+    if session.metadata.backend_session_id.as_deref() != Some(failed_session_id) {
+        return;
+    }
+    session.metadata.backend = previous_metadata.backend.clone();
+    session.metadata.backend_session_id = previous_metadata.backend_session_id.clone();
+    session.metadata.opencode_binding = previous_metadata.opencode_binding.clone();
+    session.metadata.model = previous_metadata.model.clone();
+    session.metadata.effort = previous_metadata.effort.clone();
+    session.metadata.restart_generation = previous_metadata.restart_generation;
+    state.persist_protocol_state(&proto);
+}
+
+async fn failed_soft_restart_commit_rollback_target(
+    state: &AppState,
+    name: &str,
+    previous_metadata: &crate::daemon_protocol::SessionMeta,
+) -> Option<String> {
+    if let Some(previous_session_id) = previous_metadata.backend_session_id.clone() {
+        return Some(previous_session_id);
+    }
+
+    let proto = state.protocol.read().await;
+    proto
+        .sessions
+        .get(name)
+        .and_then(|session| session.metadata.backend_session_id.clone())
+}
+
+async fn rollback_pane_after_failed_soft_restart_commit(
+    state: &AppState,
+    pane: &str,
+    project_dir: &str,
+    port: u16,
+    name: &str,
+    previous_metadata: &crate::daemon_protocol::SessionMeta,
+) {
+    let Some(target_session_id) =
+        failed_soft_restart_commit_rollback_target(state, name, previous_metadata).await
+    else {
+        tracing::warn!(
+            session = %name,
+            pane,
+            "soft restart: metadata commit failed after attach with no rollback backend session"
+        );
+        return;
+    };
+
+    match respawn_opencode_attach_for_session(pane, project_dir, &target_session_id, port, name)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            session = %name,
+            pane,
+            backend_session_id = %target_session_id,
+            "soft restart: failed to roll pane back after stale metadata commit"
+        ),
+        Err(error) => tracing::warn!(
+            session = %name,
+            pane,
+            backend_session_id = %target_session_id,
+            "soft restart: failed to respawn rollback attach after stale metadata commit: {error}"
+        ),
+    }
+}
+
+fn previous_backend_session_for_prompt_failure_rollback<'a>(
+    pane: Option<&str>,
+    previous_metadata: &'a crate::daemon_protocol::SessionMeta,
+) -> Option<&'a str> {
+    pane?;
+    previous_metadata.backend_session_id.as_deref()
+}
+
+async fn deliver_soft_restart_prompt(
+    state: &AppState,
+    port: u16,
+    session_id: &str,
+    project_dir: &str,
+    message: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> crate::state::DeliveryOutcome {
+    let body = opencode_prompt_body(message, model, effort);
+    let async_url = format!("http://127.0.0.1:{port}/session/{session_id}/prompt_async");
+    let resp = state
+        .http_client
+        .post(&async_url)
+        .header("x-opencode-directory", project_dir)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await;
+    match resp {
+        Ok(resp) if resp.status().is_success() => {}
+        Ok(resp) => {
+            let status = resp.status();
+            let decision = classify_prompt_async_fallback(PromptAsyncFailure::Status(status));
+            if decision.should_try_raw_tmux() {
+                return crate::state::DeliveryOutcome::Rejected(format!(
+                    "prompt_async returned {status}"
+                ));
+            }
+            tracing::warn!(
+                "soft restart: prompt_async status {status} is ambiguous; not retrying restart prompt"
+            );
+            return crate::state::DeliveryOutcome::Ambiguous(format!(
+                "prompt_async returned {status}"
+            ));
+        }
+        Err(error) => {
+            let decision = classify_prompt_async_fallback(PromptAsyncFailure::Request(&error));
+            if decision.should_try_raw_tmux() {
+                return crate::state::DeliveryOutcome::Rejected(format!(
+                    "prompt_async request failed: {error}"
+                ));
+            }
+            tracing::warn!(
+                "soft restart: prompt_async request failure is ambiguous; not retrying restart prompt: {error}"
+            );
+            return crate::state::DeliveryOutcome::Ambiguous(format!(
+                "prompt_async request failed: {error}"
+            ));
+        }
+    }
+    tracing::info!("soft restart: delivered prompt to {session_id} via prompt_async");
+    crate::state::DeliveryOutcome::Accepted
 }
 
 /// Health-check the externally running opencode serve, create a session on it,
 /// and launch `opencode attach` in the tmux pane.
 ///
 /// Returns the opencode session ID on success.
+fn shared_serve_session_after_attach(
+    session_id: String,
+    attach_ready: bool,
+    pane_id: &str,
+) -> anyhow::Result<String> {
+    if attach_ready {
+        Ok(session_id)
+    } else {
+        anyhow::bail!("opencode attach did not start in pane {pane_id}")
+    }
+}
+
+fn validate_created_opencode_session_id(session_id: &str) -> anyhow::Result<String> {
+    if let Some(error) = crate::daemon_protocol::validate_backend_session_id_boundary(session_id) {
+        anyhow::bail!("{error}: {session_id:?}");
+    }
+    Ok(session_id.to_string())
+}
+
+fn previous_backend_session_after_attach(
+    session_id: String,
+    attach_ready: bool,
+    pane_id: &str,
+) -> anyhow::Result<String> {
+    if attach_ready {
+        Ok(session_id)
+    } else {
+        anyhow::bail!("previous opencode attach did not start in pane {pane_id}")
+    }
+}
+
+fn wait_for_opencode_attach(pane_id: &str, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if crate::tmux::pane_alive(pane_id, &["opencode"]) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn opencode_attach_command(port: u16, session_id: &str, project_dir: &str) -> String {
+    let escaped_session_id = crate::scheduler::shell_escape(session_id);
+    let escaped_dir = crate::scheduler::shell_escape(project_dir);
+    format!(
+        "opencode attach http://127.0.0.1:{port} --session {escaped_session_id} --dir {escaped_dir}"
+    )
+}
+
+async fn respawn_opencode_attach_for_session(
+    pane_id: &str,
+    project_dir: &str,
+    session_id: &str,
+    port: u16,
+    ouija_session_id: &str,
+) -> anyhow::Result<bool> {
+    let attach_cmd = opencode_attach_command(port, session_id, project_dir);
+    let pane = pane_id.to_string();
+    let wait_pane = pane_id.to_string();
+    let env_args = crate::tmux::pane_env_args(ouija_session_id);
+    tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
+        args.extend(env_args.iter().map(String::as_str));
+        args.extend_from_slice(&["-t", &pane, &attach_cmd]);
+        let status = std::process::Command::new("tmux").args(&args).status()?;
+        if !status.success() {
+            anyhow::bail!("tmux respawn-pane failed for {pane}");
+        }
+        Ok(wait_for_opencode_attach(
+            &wait_pane,
+            std::time::Duration::from_secs(5),
+        ))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("opencode attach respawn task failed: {e}"))?
+}
+
+async fn launch_opencode_attach_for_session(
+    pane_id: &str,
+    project_dir: &str,
+    session_id: &str,
+    port: u16,
+) -> anyhow::Result<bool> {
+    let attach_cmd = opencode_attach_command(port, session_id, project_dir);
+    let pane = pane_id.to_string();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        // Small delay so the pane shell is ready
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let hidden = format!(" {attach_cmd}");
+        let status = std::process::Command::new("tmux")
+            .args(["send-keys", "-t", &pane, &hidden, "Enter"])
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("tmux send-keys failed while launching opencode attach in pane {pane}");
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("opencode attach launch task failed: {e}"))??;
+
+    let pane = pane_id.to_string();
+    Ok(tokio::task::spawn_blocking(move || {
+        wait_for_opencode_attach(&pane, std::time::Duration::from_secs(5))
+    })
+    .await
+    .unwrap_or(false))
+}
+
+async fn delete_opencode_session(
+    client: &reqwest::Client,
+    port: u16,
+    session_id: &str,
+    context: &str,
+) -> bool {
+    let url = format!("http://127.0.0.1:{port}/session/{session_id}");
+    match client
+        .delete(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => {
+            tracing::debug!("{context}: deleted opencode session {session_id}");
+            true
+        }
+        Ok(r) => {
+            tracing::warn!(
+                "{context}: DELETE /session/{session_id} returned {}",
+                r.status()
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!("{context}: DELETE /session/{session_id} failed: {e}");
+            false
+        }
+    }
+}
+
 async fn setup_shared_serve_session(
     state: &std::sync::Arc<AppState>,
     pane_id: &str,
@@ -2447,7 +3262,11 @@ async fn setup_shared_serve_session(
     }
 
     // Create session via HTTP API
-    tracing::info!(port, project_dir, "opencode shared serve session create: posting");
+    tracing::info!(
+        port,
+        project_dir,
+        "opencode shared serve session create: posting"
+    );
     let resp = state
         .http_client
         .post(format!("http://127.0.0.1:{port}/session"))
@@ -2464,8 +3283,8 @@ async fn setup_shared_serve_session(
     let body: serde_json::Value = resp.json().await?;
     let session_id = body["id"]
         .as_str()
-        .map(String::from)
-        .ok_or_else(|| anyhow::anyhow!("no session id in opencode response"))?;
+        .ok_or_else(|| anyhow::anyhow!("no session id in opencode response"))
+        .and_then(validate_created_opencode_session_id)?;
 
     tracing::info!(
         port,
@@ -2475,30 +3294,34 @@ async fn setup_shared_serve_session(
         "opencode shared serve session create: ok"
     );
 
-    let attach_cmd = opencode_attach_command(port, &session_id, project_dir);
-    tracing::info!(pane = %pane_id, attach_cmd, "opencode attach: scheduling tmux send-keys");
-    let pane = pane_id.to_string();
-    tokio::task::spawn_blocking(move || {
-        // Small delay so the pane shell is ready
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let hidden = format!(" {attach_cmd}");
-        let status = std::process::Command::new("tmux")
-            .args(["send-keys", "-t", &pane, &hidden, "Enter"])
-            .status();
-        match status {
-            Ok(s) if s.success() => {
-                tracing::info!(pane = %pane, "opencode attach: tmux send-keys succeeded");
-            }
-            Ok(s) => {
-                tracing::warn!(pane = %pane, status = %s, "opencode attach: tmux send-keys failed");
-            }
+    let attach_ready =
+        match launch_opencode_attach_for_session(pane_id, project_dir, &session_id, port).await {
+            Ok(ready) => ready,
             Err(e) => {
-                tracing::warn!(pane = %pane, error = %e, "opencode attach: tmux send-keys errored");
+                delete_opencode_session(
+                    &state.http_client,
+                    port,
+                    &session_id,
+                    "shared serve attach cleanup",
+                )
+                .await;
+                return Err(e);
             }
-        }
-    });
+        };
 
-    Ok(session_id)
+    match shared_serve_session_after_attach(session_id.clone(), attach_ready, pane_id) {
+        Ok(session_id) => Ok(session_id),
+        Err(e) => {
+            delete_opencode_session(
+                &state.http_client,
+                port,
+                &session_id,
+                "shared serve attach cleanup",
+            )
+            .await;
+            Err(e)
+        }
+    }
 }
 
 /// Inject a prompt into a pane after a short delay, giving the backend time to start.
@@ -2770,26 +3593,296 @@ pub(crate) fn schedule_prompt_injection(
     session_name: &str,
     pane_id: String,
     prompt: String,
+    backend_session_id: Option<String>,
 ) {
     // Queue prompt synchronously so the plugin's readiness signal finds it.
-    state
-        .pending_prompts
-        .lock()
-        .unwrap()
-        .insert(session_name.to_string(), (pane_id.clone(), prompt.clone()));
+    state.pending_prompts.lock().unwrap().insert(
+        session_name.to_string(),
+        crate::state::PendingPrompt::new(
+            pane_id.clone(),
+            prompt.clone(),
+            backend_session_id.clone(),
+        ),
+    );
 
     // Fallback timer: if readiness signal doesn't arrive within 10s,
     // deliver via tmux injection.
     let name = session_name.to_string();
     let state = state.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-        let pending = state.pending_prompts.lock().unwrap().remove(&name);
-        if let Some((pane, text)) = pending {
+        tokio::time::sleep(PENDING_PROMPT_FALLBACK_DELAY).await;
+        let pending = reserve_pending_prompt_if_matches(
+            &state,
+            &name,
+            &pane_id,
+            &prompt,
+            backend_session_id.as_deref(),
+        );
+        if let Some(pending) = pending {
             tracing::info!("readiness timeout for {name}, delivering prompt via fallback");
-            let _ = crate::tmux::locked_inject(&state, &name, &pane, &text, false).await;
+            match deliver_prompt_fallback(
+                &state,
+                &name,
+                &pending.pane_id,
+                &pending.prompt,
+                true,
+                false,
+                pending.backend_session_id.as_deref(),
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(error) => {
+                    restore_pending_prompt_if_absent(&state, &name, pending.clone());
+                    schedule_pending_prompt_fallback_retry(&state, &name, pending, true);
+                    tracing::warn!("readiness timeout fallback failed for {name}: {error}");
+                }
+            }
         }
     });
+}
+
+#[cfg(test)]
+const PENDING_PROMPT_FALLBACK_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+#[cfg(not(test))]
+const PENDING_PROMPT_FALLBACK_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+const PENDING_PROMPT_MAX_FALLBACK_RETRIES: u8 = 3;
+
+fn schedule_pending_prompt_fallback_retry(
+    state: &std::sync::Arc<AppState>,
+    session_name: &str,
+    pending_prompt: crate::state::PendingPrompt,
+    is_http_api: bool,
+) {
+    schedule_pending_prompt_fallback_retry_attempt(
+        state,
+        session_name,
+        pending_prompt,
+        is_http_api,
+        1,
+    );
+}
+
+fn schedule_pending_prompt_fallback_retry_attempt(
+    state: &std::sync::Arc<AppState>,
+    session_name: &str,
+    pending_prompt: crate::state::PendingPrompt,
+    is_http_api: bool,
+    attempt: u8,
+) {
+    let state = state.clone();
+    let session_name = session_name.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(PENDING_PROMPT_FALLBACK_DELAY).await;
+        let pending = reserve_pending_prompt_if_matches(
+            &state,
+            &session_name,
+            &pending_prompt.pane_id,
+            &pending_prompt.prompt,
+            pending_prompt.backend_session_id.as_deref(),
+        );
+        let Some(pending) = pending else {
+            return;
+        };
+
+        match deliver_prompt_fallback(
+            &state,
+            &session_name,
+            &pending.pane_id,
+            &pending.prompt,
+            is_http_api,
+            false,
+            pending.backend_session_id.as_deref(),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(error) => {
+                restore_pending_prompt_if_absent(&state, &session_name, pending.clone());
+                if attempt < PENDING_PROMPT_MAX_FALLBACK_RETRIES {
+                    schedule_pending_prompt_fallback_retry_attempt(
+                        &state,
+                        &session_name,
+                        pending,
+                        is_http_api,
+                        attempt + 1,
+                    );
+                }
+                tracing::warn!(
+                    "readiness timeout fallback retry attempt {attempt}/{PENDING_PROMPT_MAX_FALLBACK_RETRIES} failed for {session_name}: {error}"
+                );
+            }
+        }
+    });
+}
+
+fn reserve_pending_prompt_if_matches(
+    state: &std::sync::Arc<AppState>,
+    session_name: &str,
+    pane_id: &str,
+    prompt: &str,
+    backend_session_id: Option<&str>,
+) -> Option<crate::state::PendingPrompt> {
+    let mut pending = state.pending_prompts.lock().unwrap();
+    if pending.get(session_name).is_some_and(|pending| {
+        pending.pane_id == pane_id
+            && pending.prompt == prompt
+            && pending.backend_session_id.as_deref() == backend_session_id
+    }) {
+        return pending.remove(session_name);
+    }
+    None
+}
+
+fn restore_pending_prompt_if_absent(
+    state: &std::sync::Arc<AppState>,
+    session_name: &str,
+    pending_prompt: crate::state::PendingPrompt,
+) {
+    state
+        .pending_prompts
+        .lock()
+        .unwrap()
+        .entry(session_name.to_string())
+        .or_insert(pending_prompt);
+}
+
+fn restore_start_prompt_after_fallback_failure(
+    state: &std::sync::Arc<AppState>,
+    session_name: &str,
+    pending_prompt: crate::state::PendingPrompt,
+) {
+    restore_pending_prompt_if_absent(state, session_name, pending_prompt.clone());
+    schedule_pending_prompt_fallback_retry(state, session_name, pending_prompt, true);
+}
+
+fn restore_restart_prompt_after_fallback_failure(
+    state: &std::sync::Arc<AppState>,
+    session_name: &str,
+    pending_prompt: crate::state::PendingPrompt,
+) {
+    restore_start_prompt_after_fallback_failure(state, session_name, pending_prompt);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartPromptDelivery {
+    PromptAsync,
+    AlreadyPassedAsCliArg,
+    Unavailable,
+}
+
+fn start_prompt_delivery(
+    is_http_api: bool,
+    backend_session_id: Option<&str>,
+) -> StartPromptDelivery {
+    if !is_http_api {
+        StartPromptDelivery::AlreadyPassedAsCliArg
+    } else if backend_session_id.is_some() {
+        StartPromptDelivery::PromptAsync
+    } else {
+        StartPromptDelivery::Unavailable
+    }
+}
+
+fn start_prompt_msg_id(msg_id: Option<u64>, delivery: Option<StartPromptDelivery>) -> Option<u64> {
+    match delivery {
+        Some(StartPromptDelivery::Unavailable) => None,
+        _ => msg_id,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptFallbackDelivery {
+    RawTmux,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PromptAsyncFallbackDecision {
+    DefiniteNonAcceptance,
+    Ambiguous,
+}
+
+impl PromptAsyncFallbackDecision {
+    pub(crate) fn should_try_raw_tmux(self) -> bool {
+        matches!(self, Self::DefiniteNonAcceptance)
+    }
+}
+
+pub(crate) enum PromptAsyncFailure<'a> {
+    Status(reqwest::StatusCode),
+    Request(&'a reqwest::Error),
+}
+
+fn prompt_fallback_delivery() -> PromptFallbackDelivery {
+    PromptFallbackDelivery::RawTmux
+}
+
+fn should_deliver_prompt_fallback(is_http_api: bool, opencode_tui_alive: bool) -> bool {
+    !is_http_api || opencode_tui_alive
+}
+
+pub(crate) fn classify_prompt_async_fallback(
+    failure: PromptAsyncFailure<'_>,
+) -> PromptAsyncFallbackDecision {
+    match failure {
+        PromptAsyncFailure::Status(
+            reqwest::StatusCode::BAD_REQUEST
+            | reqwest::StatusCode::NOT_FOUND
+            | reqwest::StatusCode::CONFLICT
+            | reqwest::StatusCode::GONE
+            | reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ) => PromptAsyncFallbackDecision::DefiniteNonAcceptance,
+        PromptAsyncFailure::Request(error) if error.is_connect() => {
+            PromptAsyncFallbackDecision::DefiniteNonAcceptance
+        }
+        PromptAsyncFailure::Status(_) | PromptAsyncFailure::Request(_) => {
+            PromptAsyncFallbackDecision::Ambiguous
+        }
+    }
+}
+
+async fn deliver_prompt_fallback(
+    state: &AppState,
+    session_id: &str,
+    pane: &str,
+    text: &str,
+    is_http_api: bool,
+    vim_mode: bool,
+    expected_backend_session_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let (pane_still_registered, backend_session_matches) = {
+        let proto = state.protocol.read().await;
+        match proto.sessions.get(session_id) {
+            Some(session) => (
+                session.pane.as_deref() == Some(pane),
+                expected_backend_session_id.is_none_or(|expected| {
+                    session.metadata.backend_session_id.as_deref() == Some(expected)
+                }),
+            ),
+            None => (false, false),
+        }
+    };
+    if !pane_still_registered {
+        anyhow::bail!(
+            "prompt fallback skipped: pane {pane} is no longer registered to session {session_id}"
+        );
+    }
+    if !backend_session_matches {
+        anyhow::bail!(
+            "prompt fallback skipped: queued OpenCode backend session is no longer current for session {session_id}"
+        );
+    }
+
+    let opencode_tui_alive = !is_http_api || crate::tmux::pane_alive(pane, &["opencode"]);
+    if !should_deliver_prompt_fallback(is_http_api, opencode_tui_alive) {
+        anyhow::bail!("prompt fallback skipped: pane {pane} is no longer running an opencode TUI");
+    }
+
+    match prompt_fallback_delivery() {
+        PromptFallbackDelivery::RawTmux => {
+            crate::tmux::locked_inject_raw_tmux(state, session_id, pane, text, vim_mode).await
+        }
+    }
 }
 
 /// Send a plain-text NIP-17 DM to a human's npub.
@@ -3071,6 +4164,12 @@ pub(crate) fn opencode_prompt_body(
 mod tests {
     use super::*;
 
+    async fn wait_for_prompt_fallback_timer() {
+        tokio::time::sleep(PENDING_PROMPT_FALLBACK_DELAY + std::time::Duration::from_millis(10))
+            .await;
+        tokio::task::yield_now().await;
+    }
+
     #[test]
     fn load_or_create_keys_generates_and_persists() {
         let dir = tempfile::tempdir().unwrap();
@@ -3298,8 +4397,1317 @@ mod tests {
         let cmd = opencode_attach_command(8200, "ses_test", "/tmp/project with spaces");
         assert_eq!(
             cmd,
-            "opencode attach http://127.0.0.1:8200 --session ses_test --dir '/tmp/project with spaces'"
+            "opencode attach http://127.0.0.1:8200 --session 'ses_test' --dir '/tmp/project with spaces'"
         );
+    }
+
+    #[test]
+    fn prompt_async_fallback_uses_raw_tmux_delivery() {
+        assert_eq!(prompt_fallback_delivery(), PromptFallbackDelivery::RawTmux);
+    }
+
+    #[tokio::test]
+    async fn route_human_message_marks_failed_http_delivery_undelivered() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "target".into(),
+                pane: Some("%target".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_target".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        route_human_message(&state, "human", "target", "hello").await;
+
+        let log = state.message_log.read().await;
+        let entry = log.back().expect("human DM should be logged");
+        assert_eq!(entry.from, "human");
+        assert_eq!(entry.to, "target");
+        assert!(!entry.delivered, "failed HTTP delivery must be observable");
+    }
+
+    #[test]
+    fn prompt_fallback_requires_live_opencode_tui_for_http_api() {
+        assert!(!should_deliver_prompt_fallback(true, false));
+        assert!(should_deliver_prompt_fallback(true, true));
+        assert!(should_deliver_prompt_fallback(false, false));
+    }
+
+    #[test]
+    fn prompt_async_fallback_classifier_rejects_ambiguous_server_errors() {
+        assert_eq!(
+            classify_prompt_async_fallback(PromptAsyncFailure::Status(
+                reqwest::StatusCode::BAD_GATEWAY
+            )),
+            PromptAsyncFallbackDecision::Ambiguous
+        );
+        assert_eq!(
+            classify_prompt_async_fallback(PromptAsyncFailure::Status(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            )),
+            PromptAsyncFallbackDecision::Ambiguous
+        );
+    }
+
+    #[test]
+    fn prompt_async_fallback_classifier_allows_known_not_accepted_statuses() {
+        assert_eq!(
+            classify_prompt_async_fallback(PromptAsyncFailure::Status(
+                reqwest::StatusCode::NOT_FOUND
+            )),
+            PromptAsyncFallbackDecision::DefiniteNonAcceptance
+        );
+        assert_eq!(
+            classify_prompt_async_fallback(PromptAsyncFailure::Status(
+                reqwest::StatusCode::BAD_REQUEST
+            )),
+            PromptAsyncFallbackDecision::DefiniteNonAcceptance
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_async_fallback_classifier_allows_connection_errors() {
+        let error = reqwest::Client::new()
+            .post("http://[::1]:1/session/ses/prompt_async")
+            .send()
+            .await
+            .unwrap_err();
+
+        assert!(error.is_connect());
+        assert_eq!(
+            classify_prompt_async_fallback(PromptAsyncFailure::Request(&error)),
+            PromptAsyncFallbackDecision::DefiniteNonAcceptance
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_async_fallback_classifier_rejects_timeout_errors() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+
+        async fn prompt_async() -> StatusCode {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            StatusCode::NO_CONTENT
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route("/session/{session_id}/prompt_async", post(prompt_async));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let error = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/session/ses/prompt_async"))
+            .timeout(std::time::Duration::from_millis(1))
+            .send()
+            .await
+            .unwrap_err();
+
+        assert!(error.is_timeout());
+        assert_eq!(
+            classify_prompt_async_fallback(PromptAsyncFailure::Request(&error)),
+            PromptAsyncFallbackDecision::Ambiguous
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn prompt_fallback_uses_recorded_http_api_policy_for_missing_session() {
+        let state = AppState::new_for_test();
+
+        let result =
+            deliver_prompt_fallback(&state, "missing", "%missing", "hello", true, false, None)
+                .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn prompt_fallback_rejects_pane_no_longer_registered_to_session() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%current".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+
+        let result =
+            deliver_prompt_fallback(&state, "oc", "%stale", "hello", false, false, None).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn prompt_fallback_rejects_stale_opencode_backend_session() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_new".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let result =
+            deliver_prompt_fallback(&state, "oc", "%17", "hello", false, false, Some("ses_old"))
+                .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn readiness_timeout_keeps_pending_prompt_when_raw_fallback_fails() {
+        let state = AppState::new_for_test();
+        schedule_prompt_injection(
+            &state,
+            "oc",
+            "%missing".into(),
+            "queued prompt".into(),
+            None,
+        );
+
+        wait_for_prompt_fallback_timer().await;
+
+        assert_eq!(
+            state.pending_prompts.lock().unwrap().get("oc"),
+            Some(&crate::state::PendingPrompt::new(
+                "%missing".into(),
+                "queued prompt".into(),
+                None,
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_prompt_fallback_retry_consumes_restored_prompt() {
+        let state = AppState::new_for_test();
+        let pending =
+            crate::state::PendingPrompt::new("%eventual".into(), "queued prompt".into(), None);
+        restore_pending_prompt_if_absent(&state, "oc", pending.clone());
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%eventual".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        schedule_pending_prompt_fallback_retry(&state, "oc", pending, false);
+        wait_for_prompt_fallback_timer().await;
+
+        assert!(state.pending_prompts.lock().unwrap().get("oc").is_none());
+    }
+
+    #[tokio::test]
+    async fn start_prompt_fallback_failure_restores_pending_prompt() {
+        let state = AppState::new_for_test();
+        let pending = crate::state::PendingPrompt::new(
+            "%eventual".into(),
+            "queued prompt".into(),
+            Some("ses_oc".into()),
+        );
+
+        restore_start_prompt_after_fallback_failure(&state, "oc", pending.clone());
+        assert_eq!(
+            state.pending_prompts.lock().unwrap().get("oc"),
+            Some(&pending)
+        );
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%eventual".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        wait_for_prompt_fallback_timer().await;
+
+        assert_eq!(
+            state.pending_prompts.lock().unwrap().get("oc"),
+            Some(&pending)
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_prompt_fallback_failure_restores_pending_prompt() {
+        let state = AppState::new_for_test();
+        let pending = crate::state::PendingPrompt::new(
+            "%eventual".into(),
+            "queued prompt".into(),
+            Some("ses_oc".into()),
+        );
+
+        restore_restart_prompt_after_fallback_failure(&state, "oc", pending.clone());
+
+        assert_eq!(
+            state.pending_prompts.lock().unwrap().get("oc"),
+            Some(&pending)
+        );
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%eventual".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_oc".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        wait_for_prompt_fallback_timer().await;
+
+        assert_eq!(
+            state.pending_prompts.lock().unwrap().get("oc"),
+            Some(&pending)
+        );
+    }
+
+    #[test]
+    fn readiness_timeout_reserves_prompt_before_raw_fallback() {
+        let state = AppState::new_for_test();
+        state.pending_prompts.lock().unwrap().insert(
+            "oc".into(),
+            crate::state::PendingPrompt::new("%pane".into(), "queued prompt".into(), None),
+        );
+
+        let reserved =
+            reserve_pending_prompt_if_matches(&state, "oc", "%pane", "queued prompt", None);
+
+        assert_eq!(
+            reserved,
+            Some(crate::state::PendingPrompt::new(
+                "%pane".into(),
+                "queued prompt".into(),
+                None,
+            ))
+        );
+        assert!(state.pending_prompts.lock().unwrap().get("oc").is_none());
+    }
+
+    #[test]
+    fn start_prompt_is_unavailable_when_http_api_has_no_attached_session() {
+        assert_eq!(
+            start_prompt_delivery(true, None),
+            StartPromptDelivery::Unavailable
+        );
+    }
+
+    #[test]
+    fn unavailable_start_prompt_does_not_expose_msg_id() {
+        assert_eq!(
+            start_prompt_msg_id(Some(42), Some(StartPromptDelivery::Unavailable)),
+            None
+        );
+    }
+
+    #[test]
+    fn restart_reusing_previous_backend_session_preserves_weak_opencode_binding() {
+        assert_eq!(
+            opencode_binding_for_restart_session(
+                true,
+                Some("previous-session"),
+                true,
+                Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted),
+            ),
+            Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
+        );
+    }
+
+    #[test]
+    fn restart_reusing_previous_backend_session_without_binding_defaults_weak() {
+        assert_eq!(
+            opencode_binding_for_restart_session(true, Some("previous-session"), true, None),
+            Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
+        );
+    }
+
+    #[test]
+    fn start_registration_skips_http_api_placeholder_without_backend_session() {
+        assert!(start_registration_metadata(true, "%1", None).is_none());
+    }
+
+    #[test]
+    fn failed_start_placeholder_cleanup_required_without_backend_session() {
+        assert!(should_cleanup_failed_opencode_attach_pane(true, None));
+    }
+
+    #[test]
+    fn failed_restart_placeholder_cleanup_required_without_backend_session() {
+        assert!(should_cleanup_failed_opencode_attach_pane(true, None));
+    }
+
+    #[test]
+    fn failed_restart_placeholder_does_not_remove_original_session() {
+        assert!(!should_remove_session_after_failed_restart(
+            true,
+            None,
+            "%new-placeholder",
+            Some("%original"),
+        ));
+    }
+
+    #[test]
+    fn failed_restart_respawned_pane_removes_session() {
+        assert!(should_remove_session_after_failed_restart(
+            true,
+            None,
+            "%original",
+            Some("%original"),
+        ));
+    }
+
+    #[test]
+    fn shared_serve_session_requires_verified_attach() {
+        let result = shared_serve_session_after_attach("ses_123".to_string(), false, "%1");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn created_opencode_session_id_rejects_url_delimiters() {
+        for session_id in ["bad/id", "bad?id", "bad#id", "bad id"] {
+            let error = validate_created_opencode_session_id(session_id)
+                .expect_err("invalid created session id must be rejected");
+            assert!(error.to_string().contains("invalid backend_session_id"));
+        }
+
+        assert_eq!(
+            validate_created_opencode_session_id("ses_good-123").unwrap(),
+            "ses_good-123"
+        );
+    }
+
+    #[test]
+    fn opencode_attach_command_shell_escapes_session_id() {
+        let command = opencode_attach_command(7880, "abc; touch PWNED; #", "/tmp/project dir");
+
+        assert_eq!(
+            command,
+            "opencode attach http://127.0.0.1:7880 --session 'abc; touch PWNED; #' --dir '/tmp/project dir'"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_created_opencode_session_sends_delete() {
+        use axum::Router;
+        use axum::extract::{Path, State};
+        use axum::http::StatusCode;
+        use axum::routing::delete;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn delete_session(
+            State(deleted): State<Arc<AtomicBool>>,
+            Path(session_id): Path<String>,
+        ) -> StatusCode {
+            if session_id == "ses_leak" {
+                deleted.store(true, Ordering::SeqCst);
+                StatusCode::NO_CONTENT
+            } else {
+                StatusCode::NOT_FOUND
+            }
+        }
+
+        let deleted = Arc::new(AtomicBool::new(false));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}", delete(delete_session))
+            .with_state(deleted.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let cleaned =
+            delete_opencode_session(&reqwest::Client::new(), port, "ses_leak", "test").await;
+
+        assert!(cleaned);
+        assert!(deleted.load(Ordering::SeqCst));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn soft_restart_marks_new_opencode_session_strong_managed() {
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        async fn create_session() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "id": "ses_new" }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route("/session", post(create_session));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: None,
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_old".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::WeakAdopted,
+                        ),
+                        session_incarnation: 1,
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        soft_restart_session(
+            &state,
+            "oc",
+            None,
+            dir.path().to_str().unwrap(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let proto = state.protocol.read().await;
+        let metadata = &proto.sessions["oc"].metadata;
+        assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_new"));
+        assert_eq!(
+            metadata.opencode_binding,
+            Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn soft_restart_keeps_previous_binding_when_attach_respawn_fails() {
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        async fn create_session() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "id": "ses_new" }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route("/session", post(create_session));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%missing".into()),
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_old".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::WeakAdopted,
+                        ),
+                        model: Some("old-model".into()),
+                        effort: Some("old-effort".into()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let result = soft_restart_session(
+            &state,
+            "oc",
+            Some("%missing"),
+            dir.path().to_str().unwrap(),
+            None,
+            None,
+            None,
+            None,
+            Some("new-model"),
+            Some("new-effort"),
+        )
+        .await;
+
+        assert!(result.is_err());
+        let proto = state.protocol.read().await;
+        let metadata = &proto.sessions["oc"].metadata;
+        assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_old"));
+        assert_eq!(
+            metadata.opencode_binding,
+            Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
+        );
+        assert_eq!(metadata.model.as_deref(), Some("old-model"));
+        assert_eq!(metadata.effort.as_deref(), Some("old-effort"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn soft_restart_does_not_prompt_async_before_attach_succeeds() {
+        use axum::Json;
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn create_session() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "id": "ses_new" }))
+        }
+
+        async fn prompt_async(AxumState(calls): AxumState<StdArc<AtomicUsize>>) -> StatusCode {
+            calls.fetch_add(1, Ordering::SeqCst);
+            StatusCode::NO_CONTENT
+        }
+
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session", post(create_session))
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(calls.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%missing".into()),
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_old".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::WeakAdopted,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let result = soft_restart_session(
+            &state,
+            "oc",
+            Some("%missing"),
+            dir.path().to_str().unwrap(),
+            Some("queued prompt"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn soft_restart_prompt_delivery_rejects_known_not_accepted_status() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        async fn prompt_async() -> StatusCode {
+            StatusCode::NOT_FOUND
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route("/session/{session_id}/prompt_async", post(prompt_async));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = AppState::new(config);
+
+        let result = deliver_soft_restart_prompt(
+            &state,
+            port,
+            "ses_new",
+            dir.path().to_str().unwrap(),
+            "queued prompt",
+            None,
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, crate::state::DeliveryOutcome::Rejected(_)));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn soft_restart_prompt_delivery_accepts_ambiguous_server_error() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        async fn prompt_async() -> StatusCode {
+            StatusCode::BAD_GATEWAY
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route("/session/{session_id}/prompt_async", post(prompt_async));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = AppState::new(config);
+
+        let result = deliver_soft_restart_prompt(
+            &state,
+            port,
+            "ses_new",
+            dir.path().to_str().unwrap(),
+            "queued prompt",
+            None,
+            None,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            crate::state::DeliveryOutcome::Ambiguous(_)
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn soft_restart_prompt_delivery_accepts_transport_error_after_request_body() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let saw_prompt_body = StdArc::new(AtomicBool::new(false));
+        let saw_prompt_body2 = saw_prompt_body.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request
+                    .windows(b"queued prompt".len())
+                    .any(|w| w == b"queued prompt")
+                {
+                    saw_prompt_body2.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+            stream.shutdown().await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = AppState::new(config);
+
+        let result = deliver_soft_restart_prompt(
+            &state,
+            port,
+            "ses_new",
+            dir.path().to_str().unwrap(),
+            "queued prompt",
+            None,
+            None,
+        )
+        .await;
+
+        assert!(saw_prompt_body.load(Ordering::SeqCst));
+        assert!(matches!(
+            result,
+            crate::state::DeliveryOutcome::Ambiguous(_)
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn soft_restart_restores_previous_metadata_when_prompt_delivery_fails() {
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        async fn create_session() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "id": "ses_new" }))
+        }
+
+        async fn prompt_async() -> StatusCode {
+            StatusCode::NOT_FOUND
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session", post(create_session))
+            .route("/session/{session_id}/prompt_async", post(prompt_async));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: None,
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_old".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::WeakAdopted,
+                        ),
+                        model: Some("old-model".into()),
+                        effort: Some("old-effort".into()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let result = soft_restart_session(
+            &state,
+            "oc",
+            None,
+            dir.path().to_str().unwrap(),
+            Some("queued prompt"),
+            None,
+            None,
+            None,
+            Some("new-model"),
+            Some("new-effort"),
+        )
+        .await;
+
+        assert!(result.is_err());
+        let proto = state.protocol.read().await;
+        let metadata = &proto.sessions["oc"].metadata;
+        assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_old"));
+        assert_eq!(
+            metadata.opencode_binding,
+            Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
+        );
+        assert_eq!(metadata.model.as_deref(), Some("old-model"));
+        assert_eq!(metadata.effort.as_deref(), Some("old-effort"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn headless_soft_restart_commits_metadata_before_prompt_async() {
+        use axum::Json;
+        use axum::Router;
+        use axum::extract::State;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+
+        async fn create_session() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "id": "ses_new" }))
+        }
+
+        async fn prompt_async(State(state): State<Arc<AppState>>) -> StatusCode {
+            let proto = state.protocol.read().await;
+            let metadata = &proto.sessions["oc"].metadata;
+            if metadata.backend_session_id.as_deref() == Some("ses_new")
+                && metadata.opencode_binding
+                    == Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
+                && metadata.model.as_deref() == Some("new-model")
+                && metadata.effort.as_deref() == Some("new-effort")
+            {
+                StatusCode::OK
+            } else {
+                StatusCode::BAD_REQUEST
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: None,
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_old".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::WeakAdopted,
+                        ),
+                        model: Some("old-model".into()),
+                        effort: Some("old-effort".into()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+        let app = Router::new()
+            .route("/session", post(create_session))
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(Arc::clone(&state));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let result = soft_restart_session(
+            &state,
+            "oc",
+            None,
+            dir.path().to_str().unwrap(),
+            Some("queued prompt"),
+            None,
+            None,
+            None,
+            Some("new-model"),
+            Some("new-effort"),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let proto = state.protocol.read().await;
+        let metadata = &proto.sessions["oc"].metadata;
+        assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_new"));
+        assert_eq!(
+            metadata.opencode_binding,
+            Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
+        );
+        assert_eq!(metadata.model.as_deref(), Some("new-model"));
+        assert_eq!(metadata.effort.as_deref(), Some("new-effort"));
+        server.abort();
+    }
+
+    #[test]
+    fn pane_backed_soft_restart_with_prompt_defers_metadata_commit() {
+        assert!(!should_commit_soft_restart_metadata_before_prompt(
+            Some("%1"),
+            Some("queued prompt")
+        ));
+        assert!(should_commit_soft_restart_metadata_before_prompt(
+            None,
+            Some("queued prompt")
+        ));
+        assert!(should_commit_soft_restart_metadata_before_prompt(
+            Some("%1"),
+            None
+        ));
+    }
+
+    #[test]
+    fn pane_backed_soft_restart_prompt_failure_reattaches_previous_backend_session() {
+        let metadata = crate::daemon_protocol::SessionMeta {
+            backend: Some("opencode".into()),
+            backend_session_id: Some("ses_old".into()),
+            opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            previous_backend_session_for_prompt_failure_rollback(Some("%1"), &metadata),
+            Some("ses_old")
+        );
+        assert_eq!(
+            previous_backend_session_for_prompt_failure_rollback(None, &metadata),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn soft_restart_metadata_commit_rejects_stale_generation() {
+        let state = AppState::new_for_test();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: None,
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_current".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        restart_generation: 1,
+                        session_incarnation: 1,
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let owner = SoftRestartOwnerSnapshot {
+            session_id: "oc".into(),
+            incarnation: 1,
+        };
+        let result = apply_soft_restart_metadata(&state, &owner, "ses_stale", 0, None, None).await;
+
+        assert!(result.is_err());
+        let proto = state.protocol.read().await;
+        let metadata = &proto.sessions["oc"].metadata;
+        assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_current"));
+        assert_eq!(metadata.restart_generation, 1);
+    }
+
+    #[tokio::test]
+    async fn soft_restart_metadata_commit_rejects_recreated_session_with_same_generation() {
+        let state = AppState::new_for_test();
+        let owner = SoftRestartOwnerSnapshot {
+            session_id: "oc".into(),
+            incarnation: 1,
+        };
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: None,
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_recreated".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        restart_generation: 0,
+                        session_incarnation: 2,
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let result = apply_soft_restart_metadata(&state, &owner, "ses_stale", 0, None, None).await;
+
+        assert!(result.is_err());
+        let proto = state.protocol.read().await;
+        let metadata = &proto.sessions["oc"].metadata;
+        assert_eq!(
+            metadata.backend_session_id.as_deref(),
+            Some("ses_recreated")
+        );
+        assert_eq!(metadata.restart_generation, 0);
+    }
+
+    #[tokio::test]
+    async fn soft_restart_metadata_commit_sets_opencode_backend() {
+        let state = AppState::new_for_test();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: None,
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        session_incarnation: 1,
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+        let owner = SoftRestartOwnerSnapshot {
+            session_id: "oc".into(),
+            incarnation: 1,
+        };
+
+        apply_soft_restart_metadata(&state, &owner, "ses_new", 0, None, None)
+            .await
+            .expect("metadata commit should succeed");
+
+        let proto = state.protocol.read().await;
+        let metadata = &proto.sessions["oc"].metadata;
+        assert_eq!(metadata.backend.as_deref(), Some("opencode"));
+        assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_new"));
+        assert_eq!(
+            metadata.opencode_binding,
+            Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_soft_restart_commit_rolls_back_to_winning_backend_session() {
+        let state = AppState::new_for_test();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%1".into()),
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_winner".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        restart_generation: 2,
+                        session_incarnation: 1,
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+        let previous_metadata = crate::daemon_protocol::SessionMeta {
+            backend: Some("opencode".into()),
+            ..Default::default()
+        };
+
+        let target =
+            failed_soft_restart_commit_rollback_target(&state, "oc", &previous_metadata).await;
+
+        assert_eq!(target.as_deref(), Some("ses_winner"));
+    }
+
+    #[tokio::test]
+    async fn soft_restart_metadata_restore_resets_restart_generation() {
+        let state = AppState::new_for_test();
+        let previous_metadata = crate::daemon_protocol::SessionMeta {
+            backend: Some("opencode".into()),
+            backend_session_id: Some("ses_old".into()),
+            opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted),
+            model: Some("old-model".into()),
+            effort: Some("old-effort".into()),
+            restart_generation: 7,
+            session_incarnation: 1,
+            ..Default::default()
+        };
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%1".into()),
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: previous_metadata.clone(),
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let owner = SoftRestartOwnerSnapshot {
+            session_id: "oc".into(),
+            incarnation: 1,
+        };
+        apply_soft_restart_metadata(&state, &owner, "ses_new", 7, Some("new-model"), None)
+            .await
+            .expect("metadata commit should succeed before simulated prompt failure");
+        restore_soft_restart_metadata(&state, "oc", "ses_new", &previous_metadata).await;
+
+        let proto = state.protocol.read().await;
+        let metadata = &proto.sessions["oc"].metadata;
+        assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_old"));
+        assert_eq!(
+            metadata.opencode_binding,
+            Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
+        );
+        assert_eq!(metadata.model.as_deref(), Some("old-model"));
+        assert_eq!(metadata.effort.as_deref(), Some("old-effort"));
+        assert_eq!(metadata.restart_generation, 7);
+    }
+
+    #[tokio::test]
+    async fn soft_restart_metadata_restore_resets_backend() {
+        let state = AppState::new_for_test();
+        let previous_metadata = crate::daemon_protocol::SessionMeta {
+            backend: None,
+            backend_session_id: None,
+            opencode_binding: None,
+            restart_generation: 3,
+            session_incarnation: 1,
+            ..Default::default()
+        };
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%1".into()),
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: previous_metadata.clone(),
+                    registered_at: 0,
+                },
+            );
+        }
+        let owner = SoftRestartOwnerSnapshot {
+            session_id: "oc".into(),
+            incarnation: 1,
+        };
+        apply_soft_restart_metadata(&state, &owner, "ses_new", 3, None, None)
+            .await
+            .expect("metadata commit should succeed before simulated prompt failure");
+
+        restore_soft_restart_metadata(&state, "oc", "ses_new", &previous_metadata).await;
+
+        let proto = state.protocol.read().await;
+        let metadata = &proto.sessions["oc"].metadata;
+        assert_eq!(metadata.backend, None);
+        assert_eq!(metadata.backend_session_id, None);
+        assert_eq!(metadata.opencode_binding, None);
+        assert_eq!(metadata.restart_generation, 3);
+    }
+
+    #[test]
+    fn restart_previous_session_reuse_requires_verified_attach() {
+        let result = previous_backend_session_after_attach("ses_prev".to_string(), false, "%1");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn restart_prompt_injection_requires_backend_session() {
+        assert!(!should_schedule_restart_prompt_injection(
+            true,
+            None,
+            Some(&crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+        ));
+    }
+
+    #[test]
+    fn restart_prompt_injection_requires_strong_opencode_binding() {
+        assert!(!should_schedule_restart_prompt_injection(
+            true,
+            Some("previous-session"),
+            Some(&crate::daemon_protocol::OpenCodeBinding::WeakAdopted),
+        ));
     }
 
     #[test]

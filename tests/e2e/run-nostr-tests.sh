@@ -292,7 +292,8 @@ log "Setting up from-prefix routing test..."
 api "$BASE_A" POST /api/register -d "{\"id\":\"route-a\",\"pane\":\"$PANE_A1\"}" >/dev/null
 api "$BASE_B" POST /api/register -d "{\"id\":\"route-b\",\"pane\":\"$PANE_B1\"}" >/dev/null
 
-# Wait for mutual visibility
+# Wait for mutual visibility. The route contract is one registration per side;
+# reposting here would hide propagation bugs in announcement/session-list exchange.
 wait_for 20 bash -c "remote_session_ids '$BASE_A' | grep -qF 'beta/route-b' && remote_session_ids '$BASE_B' | grep -qF 'alpha/route-a'"
 
 log "Test R4: Cross-daemon message shows from-prefix in pane"

@@ -6,26 +6,42 @@ COMPOSE_LOCAL="$SCRIPT_DIR/docker-compose.yml"
 COMPOSE_NOSTR="$SCRIPT_DIR/docker-compose.nostr.yml"
 COMPOSE_INSTALL="$SCRIPT_DIR/docker-compose.install.yml"
 COMPOSE_OPENCODE="$SCRIPT_DIR/docker-compose.opencode.yml"
-COMPOSE_OPTS="up --build --abort-on-container-exit --exit-code-from tests"
+COMPOSE_OPTS="up --build --force-recreate --abort-on-container-exit --exit-code-from tests"
+DEFAULT_TIMEOUT="${OUIJA_E2E_TIMEOUT:-360s}"
+
+run_compose() {
+    local label="$1"
+    local project="$2"
+    local compose_file="$3"
+    local timeout_secs="${4:-$DEFAULT_TIMEOUT}"
+
+    echo "=== Running ${label} e2e tests (timeout: ${timeout_secs}) ==="
+    if timeout --kill-after=30s "$timeout_secs" \
+        docker compose -p "$project" -f "$compose_file" $COMPOSE_OPTS; then
+        return 0
+    fi
+    local status=$?
+    if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+        echo "=== ${label} e2e timed out after ${timeout_secs}; cleaning up compose project ${project} ===" >&2
+        docker compose -p "$project" -f "$compose_file" down -v --remove-orphans >/dev/null 2>&1 || true
+    fi
+    return "$status"
+}
 
 run_local() {
-    echo "=== Running local e2e tests ==="
-    docker compose -f "$COMPOSE_LOCAL" $COMPOSE_OPTS
+    run_compose "local" "ouija-e2e-local" "$COMPOSE_LOCAL" "${OUIJA_E2E_LOCAL_TIMEOUT:-$DEFAULT_TIMEOUT}"
 }
 
 run_nostr() {
-    echo "=== Running nostr e2e tests ==="
-    docker compose -f "$COMPOSE_NOSTR" $COMPOSE_OPTS
+    run_compose "nostr" "ouija-e2e-nostr" "$COMPOSE_NOSTR" "${OUIJA_E2E_NOSTR_TIMEOUT:-$DEFAULT_TIMEOUT}"
 }
 
 run_install() {
-    echo "=== Running install e2e tests ==="
-    docker compose -f "$COMPOSE_INSTALL" $COMPOSE_OPTS
+    run_compose "install" "ouija-e2e-install" "$COMPOSE_INSTALL" "${OUIJA_E2E_INSTALL_TIMEOUT:-$DEFAULT_TIMEOUT}"
 }
 
 run_opencode() {
-    echo "=== Running opencode e2e tests ==="
-    docker compose -f "$COMPOSE_OPENCODE" $COMPOSE_OPTS
+    run_compose "opencode" "ouija-e2e-opencode" "$COMPOSE_OPENCODE" "${OUIJA_E2E_OPENCODE_TIMEOUT:-$DEFAULT_TIMEOUT}"
 }
 
 run_parallel() {
@@ -35,11 +51,11 @@ run_parallel() {
     local opencode_log=$(mktemp)
     local local_ok=0 nostr_ok=0 opencode_ok=0
 
-    docker compose -f "$COMPOSE_LOCAL" $COMPOSE_OPTS >"$local_log" 2>&1 &
+    run_compose "local" "ouija-e2e-local" "$COMPOSE_LOCAL" "${OUIJA_E2E_LOCAL_TIMEOUT:-$DEFAULT_TIMEOUT}" >"$local_log" 2>&1 &
     local local_pid=$!
-    docker compose -f "$COMPOSE_NOSTR" $COMPOSE_OPTS >"$nostr_log" 2>&1 &
+    run_compose "nostr" "ouija-e2e-nostr" "$COMPOSE_NOSTR" "${OUIJA_E2E_NOSTR_TIMEOUT:-$DEFAULT_TIMEOUT}" >"$nostr_log" 2>&1 &
     local nostr_pid=$!
-    docker compose -f "$COMPOSE_OPENCODE" $COMPOSE_OPTS >"$opencode_log" 2>&1 &
+    run_compose "opencode" "ouija-e2e-opencode" "$COMPOSE_OPENCODE" "${OUIJA_E2E_OPENCODE_TIMEOUT:-$DEFAULT_TIMEOUT}" >"$opencode_log" 2>&1 &
     local opencode_pid=$!
 
     wait $local_pid && local_ok=1 || true

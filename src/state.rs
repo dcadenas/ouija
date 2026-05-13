@@ -123,6 +123,144 @@ impl std::error::Error for DuplicateNode {}
 /// Thread-safe shared reference to the daemon's application state.
 pub type SharedState = Arc<AppState>;
 
+#[derive(Clone, Debug)]
+pub(crate) struct EffectDeliveryFailure {
+    reason: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DeliveryOutcome {
+    Accepted,
+    Rejected(String),
+    Ambiguous(String),
+}
+
+fn prompt_async_failure_reason(
+    decision: crate::nostr_transport::PromptAsyncFallbackDecision,
+) -> String {
+    format!("prompt_async request failed: {decision:?}")
+}
+
+fn http_delivery_attempt_failure(
+    decision: crate::nostr_transport::PromptAsyncFallbackDecision,
+) -> DeliveryOutcome {
+    let reason = prompt_async_failure_reason(decision);
+    match decision {
+        crate::nostr_transport::PromptAsyncFallbackDecision::DefiniteNonAcceptance => {
+            DeliveryOutcome::Rejected(reason)
+        }
+        crate::nostr_transport::PromptAsyncFallbackDecision::Ambiguous => {
+            DeliveryOutcome::Ambiguous(reason)
+        }
+    }
+}
+
+async fn session_owns_pane(state: &AppState, session_id: &str, pane: &str) -> Result<(), String> {
+    let registered_pane = {
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.pane.clone())
+    };
+
+    if registered_pane.as_deref() == Some(pane) {
+        Ok(())
+    } else {
+        Err(format!("pane {pane} is not owned by session {session_id}"))
+    }
+}
+
+async fn deliver_raw_tmux_for_session(
+    state: &AppState,
+    request: &InjectDeliveryRequest<'_>,
+    inject_config: Option<crate::backend::InjectConfig>,
+    tui_pattern: Option<String>,
+) -> DeliveryOutcome {
+    if let Err(reason) = session_owns_pane(state, request.session_id, request.pane).await {
+        return DeliveryOutcome::Rejected(reason);
+    }
+
+    let result = match inject_config {
+        Some(inject_config) => {
+            crate::tmux::locked_inject_raw_tmux_with_config(
+                state,
+                request.pane,
+                request.message,
+                request.vim_mode,
+                inject_config,
+                tui_pattern,
+            )
+            .await
+        }
+        None => {
+            crate::tmux::locked_inject_raw_tmux(
+                state,
+                request.session_id,
+                request.pane,
+                request.message,
+                request.vim_mode,
+            )
+            .await
+        }
+    };
+
+    result
+        .map(|()| DeliveryOutcome::Accepted)
+        .unwrap_or_else(|error| DeliveryOutcome::Rejected(error.to_string()))
+}
+
+async fn deliver_by_current_session_plan(
+    state: &AppState,
+    request: &InjectDeliveryRequest<'_>,
+) -> DeliveryOutcome {
+    match crate::tmux::session_delivery_plan(state, request.session_id, request.pane).await {
+        crate::tmux::SessionDeliveryPlan::Http(delivery) => {
+            if let Err(reason) = session_owns_pane(state, request.session_id, request.pane).await {
+                return DeliveryOutcome::Rejected(reason);
+            }
+
+            crate::tmux::deliver_via_http(
+                state,
+                &delivery.backend_session_id,
+                delivery.project_dir.as_deref(),
+                request.message,
+                delivery.model.as_deref(),
+                delivery.effort.as_deref(),
+            )
+            .await
+            .map(|()| DeliveryOutcome::Accepted)
+            .unwrap_or_else(http_delivery_attempt_failure)
+        }
+        crate::tmux::SessionDeliveryPlan::RawTmux {
+            inject_config,
+            tui_pattern,
+        } => deliver_raw_tmux_for_session(state, request, Some(inject_config), tui_pattern).await,
+        crate::tmux::SessionDeliveryPlan::Unavailable(reason) => DeliveryOutcome::Rejected(reason),
+    }
+}
+
+pub(crate) struct InjectDeliveryRequest<'a> {
+    pub session_id: &'a str,
+    pub pane: &'a str,
+    pub message: &'a str,
+    pub vim_mode: bool,
+    pub delivery_method: Option<&'a str>,
+    pub recorded_method: Option<&'a str>,
+}
+
+pub(crate) async fn deliver_inject_message_effect(
+    state: &Arc<AppState>,
+    request: InjectDeliveryRequest<'_>,
+) -> DeliveryOutcome {
+    let method = request.delivery_method.or(request.recorded_method);
+    match method {
+        Some("http") => deliver_by_current_session_plan(state, &request).await,
+        Some("tmux") => deliver_raw_tmux_for_session(state, &request, None, None).await,
+        _ => deliver_by_current_session_plan(state, &request).await,
+    }
+}
+
 /// Central daemon state holding sessions, nodes, and transports.
 pub struct AppState {
     pub config: OuijaConfig,
@@ -172,8 +310,57 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     /// Queued prompts for HttpApi sessions awaiting a readiness signal.
     /// TuiInjection sessions pass prompts as CLI args instead.
-    /// Maps session_id -> (pane_id, prompt_text).
-    pub pending_prompts: std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
+    /// Maps session_id -> queued readiness prompt.
+    pub pending_prompts: std::sync::Mutex<std::collections::HashMap<String, PendingPrompt>>,
+    compact_in_progress: std::sync::Mutex<std::collections::HashSet<String>>,
+    soft_restart_in_progress: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+pub(crate) struct CompactInProgressGuard<'a> {
+    state: &'a AppState,
+    key: String,
+}
+
+impl Drop for CompactInProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.state
+            .compact_in_progress
+            .lock()
+            .expect("compact_in_progress mutex poisoned")
+            .remove(&self.key);
+    }
+}
+
+pub(crate) struct SoftRestartInProgressGuard<'a> {
+    state: &'a AppState,
+    session_id: String,
+}
+
+impl Drop for SoftRestartInProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.state
+            .soft_restart_in_progress
+            .lock()
+            .expect("soft_restart_in_progress mutex poisoned")
+            .remove(&self.session_id);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingPrompt {
+    pub pane_id: String,
+    pub prompt: String,
+    pub backend_session_id: Option<String>,
+}
+
+impl PendingPrompt {
+    pub fn new(pane_id: String, prompt: String, backend_session_id: Option<String>) -> Self {
+        Self {
+            pane_id,
+            prompt,
+            backend_session_id,
+        }
+    }
 }
 
 impl std::fmt::Debug for AppState {
@@ -221,6 +408,15 @@ pub struct SessionMetadata {
     /// Which coding assistant backend this session uses (e.g. "claude-code").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
+    /// Strength of an OpenCode backend-session binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_binding: Option<crate::daemon_protocol::OpenCodeBinding>,
+    /// Monotonic token used to reject stale async restart commits.
+    #[serde(default)]
+    pub restart_generation: u64,
+    /// Per-registration token used to reject stale async commits.
+    #[serde(default)]
+    pub session_incarnation: i64,
     /// Short project description extracted from Cargo.toml, package.json, or README.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_description: Option<String>,
@@ -295,6 +491,9 @@ impl Default for SessionMetadata {
             last_metadata_update: None,
             backend_session_id: None,
             backend: None,
+            opencode_binding: None,
+            restart_generation: 0,
+            session_incarnation: 0,
             project_description: None,
             bulletin: None,
             worktree: false,
@@ -395,6 +594,8 @@ impl AppState {
             backends: crate::backend::BackendRegistry::default_registry(),
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            compact_in_progress: std::sync::Mutex::new(std::collections::HashSet::new()),
+            soft_restart_in_progress: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -429,7 +630,50 @@ impl AppState {
             backends: crate::backend::BackendRegistry::default_registry(),
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            compact_in_progress: std::sync::Mutex::new(std::collections::HashSet::new()),
+            soft_restart_in_progress: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
+    }
+
+    pub(crate) fn try_acquire_compact_in_progress(
+        &self,
+        key: &str,
+    ) -> Option<CompactInProgressGuard<'_>> {
+        let mut compact_in_progress = self
+            .compact_in_progress
+            .lock()
+            .expect("compact_in_progress mutex poisoned");
+        if !compact_in_progress.insert(key.to_string()) {
+            return None;
+        }
+        Some(CompactInProgressGuard {
+            state: self,
+            key: key.to_string(),
+        })
+    }
+
+    pub(crate) fn try_acquire_soft_restart_in_progress(
+        &self,
+        session_id: &str,
+    ) -> Option<SoftRestartInProgressGuard<'_>> {
+        let mut soft_restart_in_progress = self
+            .soft_restart_in_progress
+            .lock()
+            .expect("soft_restart_in_progress mutex poisoned");
+        if !soft_restart_in_progress.insert(session_id.to_string()) {
+            return None;
+        }
+        Some(SoftRestartInProgressGuard {
+            state: self,
+            session_id: session_id.to_string(),
+        })
+    }
+
+    pub(crate) fn is_soft_restart_in_progress(&self, session_id: &str) -> bool {
+        self.soft_restart_in_progress
+            .lock()
+            .expect("soft_restart_in_progress mutex poisoned")
+            .contains(session_id)
     }
 
     /// Resolve the backend for a given session by looking up its metadata.
@@ -578,16 +822,78 @@ impl AppState {
         self: &Arc<Self>,
         event: crate::daemon_protocol::Event,
     ) -> Vec<crate::daemon_protocol::Effect> {
-        use crate::daemon_protocol::{Effect, LogLevel};
-
-        let effects = {
+        let (effects, rollback) = {
             let mut state = self.protocol.write().await;
-            state.apply(event)
+            let mut rollback = FailedEffectSendRollback::capture_for_event(&state, &event);
+            let effects = state.apply(event);
+            if let Some(rollback) = &mut rollback {
+                rollback.capture_after_send(&state);
+                rollback.reserve_sender_state_after_send(&mut state);
+            }
+            (effects, rollback)
         };
 
-        for effect in &effects {
+        let delivery_failure = self.execute_effects(&effects).await;
+
+        if let Some(failure) = delivery_failure {
+            self.clear_pending_reply_for_failed_effect_delivery(&effects)
+                .await;
+            self.rollback_sender_state_for_failed_effect_delivery(rollback)
+                .await;
+            return rewrite_send_delivery_failure(effects, &failure.reason);
+        }
+
+        if effects
+            .iter()
+            .any(|effect| matches!(effect, crate::daemon_protocol::Effect::SendFailed { .. }))
+        {
+            self.rollback_sender_state_for_failed_effect_delivery(rollback)
+                .await;
+            return effects;
+        }
+
+        self.finalize_successful_effect_delivery(rollback).await;
+
+        effects
+    }
+
+    pub(crate) async fn execute_effects(
+        self: &Arc<Self>,
+        effects: &[crate::daemon_protocol::Effect],
+    ) -> Option<EffectDeliveryFailure> {
+        use crate::daemon_protocol::{Effect, LogLevel};
+
+        let recorded_method = effects.iter().find_map(|effect| match effect {
+            Effect::SendDelivered { method, .. } => Some(method.as_str()),
+            _ => None,
+        });
+        let recorded_http_delivery = effects.iter().find_map(|effect| match effect {
+            Effect::SendDelivered { http_delivery, .. } => http_delivery.as_ref(),
+            _ => None,
+        });
+        let mut delivery_failure = None;
+
+        for effect in effects {
             match effect {
                 Effect::Broadcast(msg) => {
+                    if delivery_failure.is_some() {
+                        if let crate::protocol::WireMessage::SessionSendAck {
+                            from,
+                            to,
+                            delivered: true,
+                            daemon_id,
+                        } = msg
+                        {
+                            let failed_ack = crate::protocol::WireMessage::SessionSendAck {
+                                from: from.clone(),
+                                to: to.clone(),
+                                delivered: false,
+                                daemon_id: daemon_id.clone(),
+                            };
+                            crate::transport::broadcast(self, &failed_ack).await;
+                            continue;
+                        }
+                    }
                     crate::transport::broadcast(self, msg).await;
                 }
                 Effect::BroadcastSessionList => {
@@ -598,10 +904,72 @@ impl AppState {
                     pane,
                     message,
                     vim_mode,
+                    delivery_method,
+                    ..
                 } => {
-                    let _ = crate::tmux::locked_inject(self, session_id, pane, message, *vim_mode)
-                        .await;
+                    let outcome = deliver_inject_message_effect(
+                        self,
+                        InjectDeliveryRequest {
+                            session_id,
+                            pane,
+                            message,
+                            vim_mode: *vim_mode,
+                            delivery_method: delivery_method.as_deref(),
+                            recorded_method,
+                        },
+                    )
+                    .await;
+                    match outcome {
+                        DeliveryOutcome::Accepted => {}
+                        DeliveryOutcome::Rejected(reason) => {
+                            tracing::warn!(session = %session_id, "message delivery failed: {reason}");
+                            delivery_failure.get_or_insert(EffectDeliveryFailure { reason });
+                        }
+                        DeliveryOutcome::Ambiguous(reason) => {
+                            tracing::warn!(session = %session_id, "message delivery outcome ambiguous; preserving delivered state: {reason}");
+                        }
+                    }
                 }
+                Effect::DeliverHttpMessage {
+                    session_id,
+                    message,
+                    http_delivery,
+                    ..
+                } => match Some(http_delivery).or(recorded_http_delivery) {
+                    Some(delivery) => {
+                        if let Err(decision) = crate::tmux::deliver_via_http(
+                            self,
+                            &delivery.backend_session_id,
+                            delivery.project_dir.as_deref(),
+                            message,
+                            delivery.model.as_deref(),
+                            delivery.effort.as_deref(),
+                        )
+                        .await
+                        {
+                            match http_delivery_attempt_failure(decision) {
+                                DeliveryOutcome::Accepted => {}
+                                DeliveryOutcome::Rejected(reason) => {
+                                    tracing::warn!(session = %session_id, "http delivery failed: {reason}");
+                                    delivery_failure
+                                        .get_or_insert(EffectDeliveryFailure { reason });
+                                }
+                                DeliveryOutcome::Ambiguous(reason) => {
+                                    tracing::warn!(session = %session_id, "http delivery outcome ambiguous; preserving delivered state: {reason}");
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        let error = anyhow::anyhow!(
+                            "http delivery skipped: no recorded backend_session_id on send"
+                        );
+                        tracing::warn!(session = %session_id, "{error}");
+                        delivery_failure.get_or_insert_with(|| EffectDeliveryFailure {
+                            reason: error.to_string(),
+                        });
+                    }
+                },
                 Effect::SetTmuxVar { pane, name, value } => {
                     let p = pane.clone();
                     let n = name.clone();
@@ -804,11 +1172,16 @@ impl AppState {
                     delivered,
                     transport,
                 } => {
+                    let delivered = if delivery_failure.is_some() {
+                        false
+                    } else {
+                        *delivered
+                    };
                     self.log_message(
                         from.clone(),
                         to.clone(),
                         message.clone(),
-                        *delivered,
+                        delivered,
                         transport,
                     )
                     .await;
@@ -820,6 +1193,7 @@ impl AppState {
                 },
                 // Result effects handled by callers, not executed
                 Effect::RegisterOk { .. }
+                | Effect::RegisterFailed { .. }
                 | Effect::SendDelivered { .. }
                 | Effect::SendFailed { .. }
                 | Effect::RenameOk { .. }
@@ -829,7 +1203,126 @@ impl AppState {
             }
         }
 
-        effects
+        delivery_failure
+    }
+
+    async fn clear_pending_reply_for_failed_effect_delivery(
+        &self,
+        effects: &[crate::daemon_protocol::Effect],
+    ) {
+        let Some((to, msg_id, from)) = effects.iter().find_map(|effect| match effect {
+            crate::daemon_protocol::Effect::SendDelivered {
+                from, to, msg_id, ..
+            } => Some((to.clone(), *msg_id, Some(from.clone()))),
+            crate::daemon_protocol::Effect::InjectMessage {
+                session_id,
+                pending_reply_msg_id,
+                pending_reply_from,
+                ..
+            } => pending_reply_msg_id
+                .map(|msg_id| (session_id.clone(), msg_id, pending_reply_from.clone())),
+            crate::daemon_protocol::Effect::DeliverHttpMessage {
+                session_id,
+                pending_reply_msg_id,
+                pending_reply_from,
+                ..
+            } => pending_reply_msg_id
+                .map(|msg_id| (session_id.clone(), msg_id, pending_reply_from.clone())),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(from) = from else {
+            return;
+        };
+
+        let mut proto = self.protocol.write().await;
+        let Some(pending) = proto.pending_replies.get_mut(&to) else {
+            return;
+        };
+        pending.retain(|entry| entry.msg_id != msg_id || entry.from != from);
+        if pending.is_empty() {
+            proto.pending_replies.remove(&to);
+        }
+    }
+
+    async fn rollback_sender_state_for_failed_effect_delivery(
+        &self,
+        rollback: Option<FailedEffectSendRollback>,
+    ) {
+        let Some(rollback) = rollback else {
+            return;
+        };
+
+        let mut proto = self.protocol.write().await;
+        if rollback.sender_state_reserved() {
+            return;
+        }
+
+        if let Some(entry) = rollback.pending_reply_before_send {
+            let current_entry =
+                proto
+                    .pending_replies
+                    .get(&rollback.sender_id)
+                    .and_then(|pending| {
+                        pending
+                            .iter()
+                            .find(|pending| pending.msg_id == entry.msg_id)
+                            .cloned()
+                    });
+            if rollback.pending_reply_after_send.as_ref() == Some(&current_entry) {
+                let pending = proto
+                    .pending_replies
+                    .entry(rollback.sender_id.clone())
+                    .or_default();
+                if let Some(existing) = pending
+                    .iter_mut()
+                    .find(|pending| pending.msg_id == entry.msg_id)
+                {
+                    *existing = entry;
+                } else {
+                    pending.push(entry);
+                }
+            }
+        }
+        if rollback.done {
+            let current_reminder = proto
+                .sessions
+                .get(&rollback.sender_id)
+                .and_then(|session| session.metadata.reminder.clone());
+            if rollback.sender_reminder_after_send.as_ref() == Some(&current_reminder)
+                && let Some(session) = proto.sessions.get_mut(&rollback.sender_id)
+            {
+                session.metadata.reminder = rollback.sender_reminder.flatten();
+            }
+        }
+    }
+
+    async fn finalize_successful_effect_delivery(
+        &self,
+        rollback: Option<FailedEffectSendRollback>,
+    ) {
+        let Some(rollback) = rollback else {
+            return;
+        };
+        if !rollback.done {
+            return;
+        }
+
+        let mut proto = self.protocol.write().await;
+        if let Some(entry) = rollback.pending_reply_before_send {
+            if let Some(pending) = proto.pending_replies.get_mut(&rollback.sender_id) {
+                pending.retain(|pending| pending.msg_id != entry.msg_id);
+                if pending.is_empty() {
+                    proto.pending_replies.remove(&rollback.sender_id);
+                }
+            }
+        }
+        if rollback.sender_reminder.is_some()
+            && let Some(session) = proto.sessions.get_mut(&rollback.sender_id)
+        {
+            session.metadata.reminder = None;
+        }
     }
 
     /// Persist protocol state sessions to disk.
@@ -875,6 +1368,9 @@ impl AppState {
                             .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0)),
                         backend_session_id: m.backend_session_id.clone(),
                         backend: m.backend.clone(),
+                        opencode_binding: m.opencode_binding.clone(),
+                        restart_generation: m.restart_generation,
+                        session_incarnation: m.session_incarnation,
                         project_description: m.project_description.clone(),
                         bulletin: m.bulletin.clone(),
                         worktree: m.worktree,
@@ -1188,7 +1684,9 @@ impl AppState {
             let mut backoff = self.sweep_backoff_until.lock().unwrap();
             if let Some(until) = *backoff {
                 if std::time::Instant::now() < until {
-                    tracing::debug!("worktree sweep in backoff window after recent timeout, skipping");
+                    tracing::debug!(
+                        "worktree sweep in backoff window after recent timeout, skipping"
+                    );
                     return;
                 }
                 *backoff = None;
@@ -1216,16 +1714,16 @@ impl AppState {
             return;
         }
         // Dedup: skip if a prior sweep is still running
-        if self.sweep_in_progress.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .sweep_in_progress
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
             tracing::debug!("worktree sweep already in progress, skipping");
             return;
         }
         // Deduplicate project dirs to avoid N² stat calls
         let unique_dirs: Vec<String> = {
-            let mut dirs: Vec<String> = sessions_with_dirs
-                .iter()
-                .map(|(_, d)| d.clone())
-                .collect();
+            let mut dirs: Vec<String> = sessions_with_dirs.iter().map(|(_, d)| d.clone()).collect();
             dirs.sort();
             dirs.dedup();
             dirs
@@ -1263,11 +1761,14 @@ impl AppState {
                 }
                 map
             }),
-        ).await {
+        )
+        .await
+        {
             Ok(Ok(m)) => m,
             Ok(Err(e)) => {
                 tracing::warn!("worktree sweep spawn_blocking failed: {e}");
-                self.sweep_in_progress.store(false, std::sync::atomic::Ordering::Relaxed);
+                self.sweep_in_progress
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
             Err(_) => {
@@ -1281,8 +1782,7 @@ impl AppState {
                 // orphan-thread accumulation at 1 per backoff window instead of
                 // 1 per reaper heartbeat.
                 *self.sweep_backoff_until.lock().unwrap() = Some(
-                    std::time::Instant::now()
-                        + std::time::Duration::from_secs(SWEEP_BACKOFF_SECS),
+                    std::time::Instant::now() + std::time::Duration::from_secs(SWEEP_BACKOFF_SECS),
                 );
                 return;
             }
@@ -1290,19 +1790,16 @@ impl AppState {
         // Only update sessions whose dirs were successfully checked
         let updates: Vec<(String, String, bool)> = sessions_with_dirs
             .into_iter()
-            .filter_map(|(id, dir)| {
-                presence_map.get(&dir).map(|p| (id, dir.clone(), *p))
-            })
+            .filter_map(|(id, dir)| presence_map.get(&dir).map(|p| (id, dir.clone(), *p)))
             .collect();
         if !updates.is_empty() {
             let _ = self
-                .apply_and_execute(crate::daemon_protocol::Event::MarkWorktreePresence {
-                    updates,
-                })
+                .apply_and_execute(crate::daemon_protocol::Event::MarkWorktreePresence { updates })
                 .await;
         }
         // Always reset the dedup flag, even on early return or timeout
-        self.sweep_in_progress.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.sweep_in_progress
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn persist_sessions_from(&self, sessions: &HashMap<String, Session>) {
@@ -1622,6 +2119,140 @@ impl AppState {
     }
 }
 
+fn rewrite_send_delivery_failure(
+    effects: Vec<crate::daemon_protocol::Effect>,
+    reason: &str,
+) -> Vec<crate::daemon_protocol::Effect> {
+    effects
+        .into_iter()
+        .map(|effect| match effect {
+            crate::daemon_protocol::Effect::SendDelivered { from, to, .. } => {
+                crate::daemon_protocol::Effect::SendFailed {
+                    from,
+                    to,
+                    reason: reason.to_string(),
+                    renamed_to: None,
+                }
+            }
+            crate::daemon_protocol::Effect::LogMessage {
+                from,
+                to,
+                message,
+                delivered: true,
+                transport,
+            } => crate::daemon_protocol::Effect::LogMessage {
+                from,
+                to,
+                message,
+                delivered: false,
+                transport,
+            },
+            other => other,
+        })
+        .collect()
+}
+
+struct FailedEffectSendRollback {
+    sender_id: String,
+    pending_reply_before_send: Option<crate::daemon_protocol::PendingReplyEntry>,
+    pending_reply_after_send: Option<Option<crate::daemon_protocol::PendingReplyEntry>>,
+    sender_reminder: Option<Option<String>>,
+    sender_reminder_after_send: Option<Option<String>>,
+    sender_state_reserved: bool,
+    done: bool,
+}
+
+impl FailedEffectSendRollback {
+    fn capture_for_event(
+        proto: &crate::daemon_protocol::DaemonState,
+        event: &crate::daemon_protocol::Event,
+    ) -> Option<Self> {
+        let crate::daemon_protocol::Event::Send {
+            from,
+            responds_to,
+            done,
+            ..
+        } = event
+        else {
+            return None;
+        };
+
+        let pending_reply_before_send = responds_to.and_then(|msg_id| {
+            proto
+                .pending_replies
+                .get(from)
+                .and_then(|pending| pending.iter().find(|entry| entry.msg_id == msg_id).cloned())
+        });
+        Some(Self {
+            sender_id: from.clone(),
+            pending_reply_before_send,
+            pending_reply_after_send: None,
+            sender_reminder: done.then(|| {
+                proto
+                    .sessions
+                    .get(from)
+                    .and_then(|session| session.metadata.reminder.clone())
+            }),
+            sender_reminder_after_send: None,
+            sender_state_reserved: false,
+            done: *done,
+        })
+    }
+
+    fn capture_after_send(&mut self, proto: &crate::daemon_protocol::DaemonState) {
+        if let Some(before) = &self.pending_reply_before_send {
+            self.pending_reply_after_send = Some(
+                proto
+                    .pending_replies
+                    .get(&self.sender_id)
+                    .and_then(|pending| {
+                        pending
+                            .iter()
+                            .find(|entry| entry.msg_id == before.msg_id)
+                            .cloned()
+                    }),
+            );
+        }
+        if self.done {
+            self.sender_reminder_after_send = Some(
+                proto
+                    .sessions
+                    .get(&self.sender_id)
+                    .and_then(|session| session.metadata.reminder.clone()),
+            );
+        }
+    }
+
+    fn reserve_sender_state_after_send(&mut self, proto: &mut crate::daemon_protocol::DaemonState) {
+        if !self.done {
+            return;
+        }
+
+        if let Some(entry) = self.pending_reply_before_send.clone()
+            && self.pending_reply_after_send == Some(None)
+        {
+            proto
+                .pending_replies
+                .entry(self.sender_id.clone())
+                .or_default()
+                .push(entry);
+            self.sender_state_reserved = true;
+        }
+
+        if self.sender_reminder.is_some()
+            && self.sender_reminder_after_send == Some(None)
+            && let Some(session) = proto.sessions.get_mut(&self.sender_id)
+        {
+            session.metadata.reminder = self.sender_reminder.clone().flatten();
+            self.sender_state_reserved = true;
+        }
+    }
+
+    fn sender_state_reserved(&self) -> bool {
+        self.sender_state_reserved
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1768,6 +2399,1450 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn execute_effects_uses_recorded_tmux_method_for_send_inject() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn prompt_async(AxumState(calls): AxumState<StdArc<AtomicUsize>>) -> StatusCode {
+            calls.fetch_add(1, Ordering::SeqCst);
+            StatusCode::NO_CONTENT
+        }
+
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(calls.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = test_config();
+        config.port = port - 320;
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_live".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let effects = vec![
+            crate::daemon_protocol::Effect::InjectMessage {
+                session_id: "oc".into(),
+                pane: "%1".into(),
+                message: "hello".into(),
+                vim_mode: false,
+                delivery_method: None,
+                http_delivery: None,
+                pending_reply_msg_id: None,
+                pending_reply_from: None,
+            },
+            crate::daemon_protocol::Effect::SendDelivered {
+                from: "sender".into(),
+                to: "oc".into(),
+                method: "tmux".into(),
+                msg_id: 7,
+                http_delivery: None,
+            },
+        ];
+
+        state.execute_effects(&effects).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn normal_tmux_inject_rejects_pane_not_owned_by_session() {
+        let state = AppState::new_for_test();
+        proto_register(&state, "target", Some("%1")).await;
+
+        let outcome = deliver_inject_message_effect(
+            &state,
+            InjectDeliveryRequest {
+                session_id: "target",
+                pane: "%2",
+                message: "hello",
+                vim_mode: false,
+                delivery_method: Some("tmux"),
+                recorded_method: None,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, DeliveryOutcome::Rejected(ref reason) if reason.contains("pane %2 is not owned by session target")),
+            "expected stale pane rejection, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn methodless_inject_rejects_pane_not_owned_by_session() {
+        let state = AppState::new_for_test();
+        proto_register(&state, "target", Some("%1")).await;
+
+        let outcome = deliver_inject_message_effect(
+            &state,
+            InjectDeliveryRequest {
+                session_id: "target",
+                pane: "%2",
+                message: "hello",
+                vim_mode: false,
+                delivery_method: None,
+                recorded_method: None,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, DeliveryOutcome::Rejected(ref reason) if reason.contains("pane %2 is not owned by session target")),
+            "expected stale pane rejection, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn methodless_inject_stale_pane_marks_delivery_failed() {
+        let state = AppState::new_for_test();
+        proto_register(&state, "sender", Some("%9")).await;
+        proto_register(&state, "target", Some("%1")).await;
+
+        let effects = vec![
+            crate::daemon_protocol::Effect::InjectMessage {
+                session_id: "target".into(),
+                pane: "%1".into(),
+                message: "hello".into(),
+                vim_mode: false,
+                delivery_method: None,
+                http_delivery: None,
+                pending_reply_msg_id: None,
+                pending_reply_from: None,
+            },
+            crate::daemon_protocol::Effect::LogMessage {
+                from: "sender".into(),
+                to: "target".into(),
+                message: "hello".into(),
+                delivered: true,
+                transport: "nostr".into(),
+            },
+        ];
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.get_mut("target").unwrap().pane = Some("%2".into());
+        }
+
+        let failure = state.execute_effects(&effects).await;
+
+        assert!(
+            failure.as_ref().is_some_and(|failure| failure
+                .reason
+                .contains("pane %1 is not owned by session target")),
+            "expected stale pane failure, got {failure:?}"
+        );
+        let log = state.message_log.read().await;
+        assert_eq!(log.len(), 1);
+        assert!(!log[0].delivered);
+    }
+
+    #[tokio::test]
+    async fn execute_effects_delivers_http_from_recorded_snapshot_without_live_session() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn prompt_async(AxumState(calls): AxumState<StdArc<AtomicUsize>>) -> StatusCode {
+            calls.fetch_add(1, Ordering::SeqCst);
+            StatusCode::NO_CONTENT
+        }
+
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(calls.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = test_config();
+        config.port = port - 320;
+        let state = AppState::new(config);
+        let effects = vec![
+            crate::daemon_protocol::Effect::DeliverHttpMessage {
+                session_id: "oc".into(),
+                message: "hello".into(),
+                http_delivery: crate::daemon_protocol::HttpDeliverySnapshot {
+                    backend_session_id: "ses_live".into(),
+                    project_dir: None,
+                    model: None,
+                    effort: None,
+                },
+                pending_reply_msg_id: None,
+                pending_reply_from: None,
+            },
+            crate::daemon_protocol::Effect::SendDelivered {
+                from: "sender".into(),
+                to: "oc".into(),
+                method: "http".into(),
+                msg_id: 8,
+                http_delivery: Some(crate::daemon_protocol::HttpDeliverySnapshot {
+                    backend_session_id: "ses_recorded".into(),
+                    project_dir: None,
+                    model: None,
+                    effort: None,
+                }),
+            },
+        ];
+
+        state.execute_effects(&effects).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn execute_effects_reports_strong_opencode_inject_failure_without_recorded_method() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut config = test_config();
+        config.port = port.checked_sub(320).unwrap();
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_live".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+        let effects = vec![crate::daemon_protocol::Effect::InjectMessage {
+            session_id: "oc".into(),
+            pane: "%1".into(),
+            message: "hello".into(),
+            vim_mode: false,
+            delivery_method: Some("http".into()),
+            http_delivery: Some(crate::daemon_protocol::HttpDeliverySnapshot {
+                backend_session_id: "ses_live".into(),
+                project_dir: None,
+                model: None,
+                effort: None,
+            }),
+            pending_reply_msg_id: None,
+            pending_reply_from: None,
+        }];
+
+        let failure = state.execute_effects(&effects).await;
+
+        assert!(
+            failure
+                .as_ref()
+                .is_some_and(|failure| failure.reason.contains("prompt_async request failed")),
+            "expected observable HTTP delivery failure, got {failure:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_effects_revalidates_http_inject_against_current_opencode_binding() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn prompt_async(AxumState(calls): AxumState<StdArc<AtomicUsize>>) -> StatusCode {
+            calls.fetch_add(1, Ordering::SeqCst);
+            StatusCode::NO_CONTENT
+        }
+
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(calls.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = test_config();
+        config.port = port - 320;
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_live".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::WeakAdopted,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let effects = vec![crate::daemon_protocol::Effect::InjectMessage {
+            session_id: "oc".into(),
+            pane: "%1".into(),
+            message: "hello".into(),
+            vim_mode: false,
+            delivery_method: Some("http".into()),
+            http_delivery: Some(crate::daemon_protocol::HttpDeliverySnapshot {
+                backend_session_id: "ses_live".into(),
+                project_dir: None,
+                model: None,
+                effort: None,
+            }),
+            pending_reply_msg_id: None,
+            pending_reply_from: None,
+        }];
+
+        let failure = state.execute_effects(&effects).await;
+
+        assert!(failure.is_none());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "stale/forged HTTP inject metadata must not bypass the shared OpenCode delivery gate"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn execute_effects_rejects_strong_opencode_http_inject_after_session_moves_panes() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn prompt_async(AxumState(calls): AxumState<StdArc<AtomicUsize>>) -> StatusCode {
+            calls.fetch_add(1, Ordering::SeqCst);
+            StatusCode::NO_CONTENT
+        }
+
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(calls.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = test_config();
+        config.port = port - 320;
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_live".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let effects = vec![crate::daemon_protocol::Effect::InjectMessage {
+            session_id: "oc".into(),
+            pane: "%1".into(),
+            message: "hello".into(),
+            vim_mode: false,
+            delivery_method: Some("http".into()),
+            http_delivery: Some(crate::daemon_protocol::HttpDeliverySnapshot {
+                backend_session_id: "ses_live".into(),
+                project_dir: None,
+                model: None,
+                effort: None,
+            }),
+            pending_reply_msg_id: None,
+            pending_reply_from: None,
+        }];
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.get_mut("oc").unwrap().pane = Some("%2".into());
+        }
+
+        let failure = state.execute_effects(&effects).await;
+
+        assert!(
+            failure.as_ref().is_some_and(|failure| failure
+                .reason
+                .contains("pane %1 is not owned by session oc")),
+            "expected stale pane rejection, got {failure:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "stale HTTP inject must not call prompt_async"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn incoming_weak_opencode_inject_uses_apply_time_delivery_method() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut config = test_config();
+        config.port = port.checked_sub(320).unwrap();
+        let state = AppState::new(config);
+        let effects = {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%17".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_old".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::WeakAdopted,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+            proto.apply(crate::daemon_protocol::Event::IncomingWire {
+                msg: crate::protocol::WireMessage::SessionSend {
+                    from: "remote".into(),
+                    to: "oc".into(),
+                    message: "hello".into(),
+                    expects_reply: false,
+                    msg_id: 42,
+                    responds_to: None,
+                    done: false,
+                },
+                sender_npub: Some("npub1remote".into()),
+            })
+        };
+        {
+            let mut proto = state.protocol.write().await;
+            let session = proto.sessions.get_mut("oc").unwrap();
+            session.metadata.backend_session_id = Some("ses_new".into());
+            session.metadata.opencode_binding =
+                Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged);
+        }
+
+        let failure = state.execute_effects(&effects).await;
+
+        assert!(failure.is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_effects_broadcasts_failure_ack_after_inject_failure() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingTransport {
+            broadcasts: StdArc<AtomicUsize>,
+            failure_acks: StdArc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::transport::Transport for CountingTransport {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
+            async fn broadcast(&self, msg: &crate::protocol::WireMessage) -> bool {
+                self.broadcasts.fetch_add(1, Ordering::SeqCst);
+                if matches!(
+                    msg,
+                    crate::protocol::WireMessage::SessionSendAck {
+                        delivered: false,
+                        ..
+                    }
+                ) {
+                    self.failure_acks.fetch_add(1, Ordering::SeqCst);
+                }
+                true
+            }
+
+            async fn connect(
+                &self,
+                _ticket: &str,
+                _state: Arc<AppState>,
+                _wait: bool,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn ticket_string(&self) -> Option<String> {
+                None
+            }
+
+            async fn regenerate(
+                &self,
+                _config_dir: &std::path::Path,
+                _data_dir: &std::path::Path,
+            ) -> anyhow::Result<String> {
+                Ok("ticket".into())
+            }
+
+            fn endpoint_id(&self) -> Option<String> {
+                None
+            }
+
+            fn is_ready(&self) -> bool {
+                true
+            }
+
+            fn transport_name(&self) -> &'static str {
+                "counting"
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut config = test_config();
+        config.port = port.checked_sub(320).unwrap();
+        let state = AppState::new(config);
+        let broadcasts = StdArc::new(AtomicUsize::new(0));
+        let failure_acks = StdArc::new(AtomicUsize::new(0));
+        state
+            .add_transport(StdArc::new(CountingTransport {
+                broadcasts: broadcasts.clone(),
+                failure_acks: failure_acks.clone(),
+            }))
+            .await;
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_live".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+        let effects = vec![
+            crate::daemon_protocol::Effect::InjectMessage {
+                session_id: "oc".into(),
+                pane: "%1".into(),
+                message: "hello".into(),
+                vim_mode: false,
+                delivery_method: Some("http".into()),
+                http_delivery: Some(crate::daemon_protocol::HttpDeliverySnapshot {
+                    backend_session_id: "ses_live".into(),
+                    project_dir: None,
+                    model: None,
+                    effort: None,
+                }),
+                pending_reply_msg_id: None,
+                pending_reply_from: None,
+            },
+            crate::daemon_protocol::Effect::Broadcast(
+                crate::protocol::WireMessage::SessionSendAck {
+                    from: "remote".into(),
+                    to: "oc".into(),
+                    delivered: true,
+                    daemon_id: "remote-daemon".into(),
+                },
+            ),
+        ];
+
+        let failure = state.execute_effects(&effects).await;
+
+        assert!(failure.is_some());
+        assert_eq!(broadcasts.load(Ordering::SeqCst), 1);
+        assert_eq!(failure_acks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_effects_does_not_rewrite_ack_after_ambiguous_http_inject_failure() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingTransport {
+            success_acks: StdArc<AtomicUsize>,
+            failure_acks: StdArc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::transport::Transport for CountingTransport {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+
+            async fn broadcast(&self, msg: &crate::protocol::WireMessage) -> bool {
+                match msg {
+                    crate::protocol::WireMessage::SessionSendAck {
+                        delivered: true, ..
+                    } => {
+                        self.success_acks.fetch_add(1, Ordering::SeqCst);
+                    }
+                    crate::protocol::WireMessage::SessionSendAck {
+                        delivered: false, ..
+                    } => {
+                        self.failure_acks.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+                true
+            }
+
+            async fn connect(
+                &self,
+                _ticket: &str,
+                _state: Arc<AppState>,
+                _wait: bool,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn ticket_string(&self) -> Option<String> {
+                None
+            }
+
+            async fn regenerate(
+                &self,
+                _config_dir: &std::path::Path,
+                _data_dir: &std::path::Path,
+            ) -> anyhow::Result<String> {
+                Ok("ticket".into())
+            }
+
+            fn endpoint_id(&self) -> Option<String> {
+                None
+            }
+
+            fn is_ready(&self) -> bool {
+                true
+            }
+
+            fn transport_name(&self) -> &'static str {
+                "counting"
+            }
+        }
+
+        async fn prompt_async() -> StatusCode {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route("/session/{session_id}/prompt_async", post(prompt_async));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = test_config();
+        config.port = port.checked_sub(320).unwrap();
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_live".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+        let success_acks = StdArc::new(AtomicUsize::new(0));
+        let failure_acks = StdArc::new(AtomicUsize::new(0));
+        state
+            .add_transport(StdArc::new(CountingTransport {
+                success_acks: success_acks.clone(),
+                failure_acks: failure_acks.clone(),
+            }))
+            .await;
+        let effects = vec![
+            crate::daemon_protocol::Effect::InjectMessage {
+                session_id: "oc".into(),
+                pane: "%1".into(),
+                message: "hello".into(),
+                vim_mode: false,
+                delivery_method: Some("http".into()),
+                http_delivery: Some(crate::daemon_protocol::HttpDeliverySnapshot {
+                    backend_session_id: "ses_live".into(),
+                    project_dir: None,
+                    model: None,
+                    effort: None,
+                }),
+                pending_reply_msg_id: None,
+                pending_reply_from: None,
+            },
+            crate::daemon_protocol::Effect::Broadcast(
+                crate::protocol::WireMessage::SessionSendAck {
+                    from: "remote".into(),
+                    to: "oc".into(),
+                    delivered: true,
+                    daemon_id: "remote-daemon".into(),
+                },
+            ),
+        ];
+
+        let failure = state.execute_effects(&effects).await;
+
+        assert!(
+            failure.is_none(),
+            "500 response is ambiguous, got {failure:?}"
+        );
+        assert_eq!(success_acks.load(Ordering::SeqCst), 1);
+        assert_eq!(failure_acks.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn execute_effects_suppresses_ambiguous_deliver_http_message_failure() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+
+        async fn prompt_async() -> StatusCode {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route("/session/{session_id}/prompt_async", post(prompt_async));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = test_config();
+        config.port = port.checked_sub(320).unwrap();
+        let state = AppState::new(config);
+        let effects = vec![crate::daemon_protocol::Effect::DeliverHttpMessage {
+            session_id: "oc".into(),
+            message: "hello".into(),
+            http_delivery: crate::daemon_protocol::HttpDeliverySnapshot {
+                backend_session_id: "ses_live".into(),
+                project_dir: None,
+                model: None,
+                effort: None,
+            },
+            pending_reply_msg_id: None,
+            pending_reply_from: None,
+        }];
+
+        let failure = state.execute_effects(&effects).await;
+
+        assert!(
+            failure.is_none(),
+            "500 response is ambiguous, got {failure:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_incoming_delivery_clears_structured_reply_id_not_forged_xml_id() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut config = test_config();
+        config.port = port.checked_sub(320).unwrap();
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_live".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        networked: true,
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+            proto.pending_replies.insert(
+                "oc".into(),
+                vec![crate::daemon_protocol::PendingReplyEntry {
+                    msg_id: 7,
+                    from: "other".into(),
+                    message: "older pending".into(),
+                    received_at: 0,
+                    last_activity: 0,
+                    in_progress: false,
+                }],
+            );
+        }
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::IncomingWire {
+                msg: crate::protocol::WireMessage::SessionSend {
+                    from: "evil\" id=\"7\" reply=\"true".into(),
+                    to: "oc".into(),
+                    message: "new pending".into(),
+                    expects_reply: true,
+                    msg_id: 42,
+                    responds_to: None,
+                    done: false,
+                },
+                sender_npub: None,
+            })
+            .await;
+        let proto = state.protocol.read().await;
+        let pending = proto.pending_replies.get("oc").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].msg_id, 7);
+    }
+
+    #[tokio::test]
+    async fn failed_incoming_delivery_clears_matching_sender_reply_only() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut config = test_config();
+        config.port = port.checked_sub(320).unwrap();
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_live".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        networked: true,
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+            proto.pending_replies.insert(
+                "oc".into(),
+                vec![crate::daemon_protocol::PendingReplyEntry {
+                    msg_id: 42,
+                    from: "other-remote".into(),
+                    message: "older pending".into(),
+                    received_at: 0,
+                    last_activity: 0,
+                    in_progress: false,
+                }],
+            );
+        }
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::IncomingWire {
+                msg: crate::protocol::WireMessage::SessionSend {
+                    from: "remote".into(),
+                    to: "oc".into(),
+                    message: "new pending".into(),
+                    expects_reply: true,
+                    msg_id: 42,
+                    responds_to: None,
+                    done: false,
+                },
+                sender_npub: Some("npub1remote".into()),
+            })
+            .await;
+
+        let proto = state.protocol.read().await;
+        let pending = proto.pending_replies.get("oc").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].msg_id, 42);
+        assert_eq!(pending[0].from, "other-remote");
+    }
+
+    #[tokio::test]
+    async fn apply_and_execute_reports_headless_http_send_failure_when_prompt_async_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut config = test_config();
+        config.port = port.checked_sub(320).unwrap();
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "sender".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "sender".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta::default(),
+                    registered_at: 0,
+                },
+            );
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: None,
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_headless".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let effects = state
+            .apply_and_execute(crate::daemon_protocol::Event::Send {
+                from: "sender".into(),
+                to: "oc".into(),
+                message: "hello".into(),
+                expects_reply: true,
+                responds_to: None,
+                done: false,
+            })
+            .await;
+
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                crate::daemon_protocol::Effect::SendFailed { reason, .. }
+                    if reason.contains("prompt_async request failed")
+            )
+        }));
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                crate::daemon_protocol::Effect::SendDelivered { .. }
+            ))
+        );
+
+        let log = state.message_log.read().await;
+        assert_eq!(log.len(), 1);
+        assert!(!log[0].delivered);
+        drop(log);
+
+        let proto = state.protocol.read().await;
+        assert!(!proto.pending_replies.contains_key("oc"));
+    }
+
+    #[tokio::test]
+    async fn apply_and_execute_clears_incoming_pending_reply_after_inject_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut config = test_config();
+        config.port = port.checked_sub(320).unwrap();
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%17".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_incoming".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let effects = state
+            .apply_and_execute(crate::daemon_protocol::Event::IncomingWire {
+                msg: crate::protocol::WireMessage::SessionSend {
+                    from: "remote".into(),
+                    to: "oc".into(),
+                    message: "hello".into(),
+                    expects_reply: true,
+                    msg_id: 42,
+                    responds_to: None,
+                    done: false,
+                },
+                sender_npub: Some("npub1remote".into()),
+            })
+            .await;
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            crate::daemon_protocol::Effect::LogMessage {
+                delivered: false,
+                ..
+            }
+        )));
+
+        let proto = state.protocol.read().await;
+        assert!(!proto.pending_replies.contains_key("oc"));
+    }
+
+    #[tokio::test]
+    async fn apply_and_execute_clears_incoming_pending_reply_after_headless_http_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut config = test_config();
+        config.port = port.checked_sub(320).unwrap();
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: None,
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_headless".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        networked: true,
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let effects = state
+            .apply_and_execute(crate::daemon_protocol::Event::IncomingWire {
+                msg: crate::protocol::WireMessage::SessionSend {
+                    from: "remote".into(),
+                    to: "oc".into(),
+                    message: "hello".into(),
+                    expects_reply: true,
+                    msg_id: 42,
+                    responds_to: None,
+                    done: false,
+                },
+                sender_npub: Some("npub1remote".into()),
+            })
+            .await;
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            crate::daemon_protocol::Effect::LogMessage {
+                delivered: false,
+                ..
+            }
+        )));
+
+        let proto = state.protocol.read().await;
+        assert!(!proto.pending_replies.contains_key("oc"));
+    }
+
+    #[tokio::test]
+    async fn apply_and_execute_restores_sender_reply_state_after_delivery_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut config = test_config();
+        config.port = port.checked_sub(320).unwrap();
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "sender".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "sender".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        reminder: Some("keep working".into()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: None,
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_headless".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+            proto.pending_replies.insert(
+                "sender".into(),
+                vec![crate::daemon_protocol::PendingReplyEntry {
+                    msg_id: 7,
+                    from: "requester".into(),
+                    message: "please respond".into(),
+                    received_at: 100,
+                    last_activity: 100,
+                    in_progress: false,
+                }],
+            );
+        }
+
+        let effects = state
+            .apply_and_execute(crate::daemon_protocol::Event::Send {
+                from: "sender".into(),
+                to: "oc".into(),
+                message: "done, but unreachable".into(),
+                expects_reply: false,
+                responds_to: Some(7),
+                done: true,
+            })
+            .await;
+
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                crate::daemon_protocol::Effect::SendFailed { reason, .. }
+                    if reason.contains("prompt_async request failed")
+            )
+        }));
+
+        let proto = state.protocol.read().await;
+        let pending = proto.pending_replies.get("sender").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].msg_id, 7);
+        assert_eq!(
+            proto.sessions["sender"].metadata.reminder.as_deref(),
+            Some("keep working")
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_and_execute_restores_sender_state_after_send_failed_before_delivery() {
+        let state = AppState::new_for_test();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "sender".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "sender".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        reminder: Some("keep working".into()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+            proto.pending_replies.insert(
+                "sender".into(),
+                vec![crate::daemon_protocol::PendingReplyEntry {
+                    msg_id: 7,
+                    from: "requester".into(),
+                    message: "please respond".into(),
+                    received_at: 100,
+                    last_activity: 100,
+                    in_progress: false,
+                }],
+            );
+        }
+
+        let effects = state
+            .apply_and_execute(crate::daemon_protocol::Event::Send {
+                from: "sender".into(),
+                to: "missing".into(),
+                message: "done, but missing".into(),
+                expects_reply: false,
+                responds_to: Some(7),
+                done: true,
+            })
+            .await;
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            crate::daemon_protocol::Effect::SendFailed { to, .. } if to == "missing"
+        )));
+
+        let proto = state.protocol.read().await;
+        let pending = proto.pending_replies.get("sender").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].msg_id, 7);
+        assert_eq!(
+            proto.sessions["sender"].metadata.reminder.as_deref(),
+            Some("keep working")
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_and_execute_does_not_restore_concurrently_cleared_sender_reply_state() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use tokio::sync::Notify;
+
+        #[derive(Clone)]
+        struct Gate {
+            started: StdArc<Notify>,
+            release: StdArc<Notify>,
+        }
+
+        async fn prompt_async(AxumState(gate): AxumState<Gate>) -> StatusCode {
+            gate.started.notify_one();
+            gate.release.notified().await;
+            StatusCode::NOT_FOUND
+        }
+
+        let gate = Gate {
+            started: StdArc::new(Notify::new()),
+            release: StdArc::new(Notify::new()),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(gate.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = test_config();
+        config.port = port.checked_sub(320).unwrap();
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "sender".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "sender".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        reminder: Some("keep working".into()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: None,
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_headless".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+            proto.pending_replies.insert(
+                "sender".into(),
+                vec![crate::daemon_protocol::PendingReplyEntry {
+                    msg_id: 7,
+                    from: "requester".into(),
+                    message: "please respond".into(),
+                    received_at: 100,
+                    last_activity: 100,
+                    in_progress: false,
+                }],
+            );
+        }
+
+        let delivery = tokio::spawn({
+            let state = state.clone();
+            async move {
+                state
+                    .apply_and_execute(crate::daemon_protocol::Event::Send {
+                        from: "sender".into(),
+                        to: "oc".into(),
+                        message: "done, but unreachable".into(),
+                        expects_reply: false,
+                        responds_to: Some(7),
+                        done: true,
+                    })
+                    .await
+            }
+        });
+        gate.started.notified().await;
+        {
+            let mut proto = state.protocol.write().await;
+            proto.pending_replies.remove("sender");
+            proto.sessions.get_mut("sender").unwrap().metadata.reminder = None;
+        }
+
+        gate.release.notify_one();
+        let effects = delivery.await.unwrap();
+
+        assert!(effects.iter().any(|effect| {
+            matches!(effect, crate::daemon_protocol::Effect::SendFailed { reason, .. } if reason.contains("prompt_async"))
+        }));
+        let proto = state.protocol.read().await;
+        assert!(!proto.pending_replies.contains_key("sender"));
+        assert_eq!(proto.sessions["sender"].metadata.reminder, None);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn successful_delivery_clears_sender_state_by_msg_id_after_mutations() {
+        let state = AppState::new_for_test();
+        let original_entry = crate::daemon_protocol::PendingReplyEntry {
+            msg_id: 7,
+            from: "requester".into(),
+            message: "please respond".into(),
+            received_at: 100,
+            last_activity: 100,
+            in_progress: false,
+        };
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "sender".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "sender".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        reminder: Some("keep working (activity tick)".into()),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+            proto.pending_replies.insert(
+                "sender".into(),
+                vec![crate::daemon_protocol::PendingReplyEntry {
+                    last_activity: 200,
+                    in_progress: true,
+                    ..original_entry.clone()
+                }],
+            );
+        }
+
+        state
+            .finalize_successful_effect_delivery(Some(FailedEffectSendRollback {
+                sender_id: "sender".into(),
+                pending_reply_before_send: Some(original_entry),
+                pending_reply_after_send: None,
+                sender_reminder: Some(Some("keep working".into())),
+                sender_reminder_after_send: None,
+                sender_state_reserved: false,
+                done: true,
+            }))
+            .await;
+
+        let proto = state.protocol.read().await;
+        assert!(!proto.pending_replies.contains_key("sender"));
+        assert_eq!(proto.sessions["sender"].metadata.reminder, None);
+    }
+
+    #[tokio::test]
     async fn register_session_basic() {
         let state = AppState::new(test_config());
         proto_register(&state, "s1", Some("%1")).await;
@@ -1841,6 +3916,9 @@ pub(crate) mod tests {
             last_metadata_update: Some(1_700_000_100),
             backend_session_id: Some("oc_abc123".into()),
             backend: Some("opencode".into()),
+            opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+            restart_generation: 7,
+            session_incarnation: 11,
             project_description: Some("test project".into()),
             vim_mode: true,
             worktree: true,
@@ -1896,6 +3974,15 @@ pub(crate) mod tests {
             s.metadata.backend_session_id.as_deref(),
             Some("oc_abc123"),
             "backend_session_id dropped by persist"
+        );
+        assert_eq!(
+            s.metadata.opencode_binding,
+            Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+            "opencode_binding dropped by persist"
+        );
+        assert_eq!(
+            s.metadata.restart_generation, 7,
+            "restart_generation dropped by persist"
         );
         assert_eq!(
             s.metadata.project_description.as_deref(),
@@ -1956,6 +4043,11 @@ pub(crate) mod tests {
         assert_eq!(hydrated.effort.as_deref(), Some("max"));
         assert_eq!(hydrated.backend.as_deref(), Some("opencode"));
         assert_eq!(hydrated.backend_session_id.as_deref(), Some("oc_abc123"));
+        assert_eq!(
+            hydrated.opencode_binding,
+            Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
+        );
+        assert_eq!(hydrated.restart_generation, 7);
         assert!(hydrated.on_fire.is_some());
         assert_eq!(hydrated.last_iteration_at, Some(1_700_000_000));
         assert_eq!(hydrated.last_metadata_update, Some(1_700_000_100));
