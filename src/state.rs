@@ -215,17 +215,23 @@ async fn deliver_by_current_session_plan(
     request: &InjectDeliveryRequest<'_>,
 ) -> DeliveryOutcome {
     match crate::tmux::session_delivery_plan(state, request.session_id, request.pane).await {
-        crate::tmux::SessionDeliveryPlan::Http(delivery) => crate::tmux::deliver_via_http(
-            state,
-            &delivery.backend_session_id,
-            delivery.project_dir.as_deref(),
-            request.message,
-            delivery.model.as_deref(),
-            delivery.effort.as_deref(),
-        )
-        .await
-        .map(|()| DeliveryOutcome::Accepted)
-        .unwrap_or_else(http_delivery_attempt_failure),
+        crate::tmux::SessionDeliveryPlan::Http(delivery) => {
+            if let Err(reason) = session_owns_pane(state, request.session_id, request.pane).await {
+                return DeliveryOutcome::Rejected(reason);
+            }
+
+            crate::tmux::deliver_via_http(
+                state,
+                &delivery.backend_session_id,
+                delivery.project_dir.as_deref(),
+                request.message,
+                delivery.model.as_deref(),
+                delivery.effort.as_deref(),
+            )
+            .await
+            .map(|()| DeliveryOutcome::Accepted)
+            .unwrap_or_else(http_delivery_attempt_failure)
+        }
         crate::tmux::SessionDeliveryPlan::RawTmux {
             inject_config,
             tui_pattern,
@@ -2746,6 +2752,91 @@ pub(crate) mod tests {
             calls.load(Ordering::SeqCst),
             0,
             "stale/forged HTTP inject metadata must not bypass the shared OpenCode delivery gate"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn execute_effects_rejects_strong_opencode_http_inject_after_session_moves_panes() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn prompt_async(AxumState(calls): AxumState<StdArc<AtomicUsize>>) -> StatusCode {
+            calls.fetch_add(1, Ordering::SeqCst);
+            StatusCode::NO_CONTENT
+        }
+
+        let calls = StdArc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(calls.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = test_config();
+        config.port = port - 320;
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%1".into()),
+                    origin: Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_live".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let effects = vec![crate::daemon_protocol::Effect::InjectMessage {
+            session_id: "oc".into(),
+            pane: "%1".into(),
+            message: "hello".into(),
+            vim_mode: false,
+            delivery_method: Some("http".into()),
+            http_delivery: Some(crate::daemon_protocol::HttpDeliverySnapshot {
+                backend_session_id: "ses_live".into(),
+                project_dir: None,
+                model: None,
+                effort: None,
+            }),
+            pending_reply_msg_id: None,
+            pending_reply_from: None,
+        }];
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.get_mut("oc").unwrap().pane = Some("%2".into());
+        }
+
+        let failure = state.execute_effects(&effects).await;
+
+        assert!(
+            failure.as_ref().is_some_and(|failure| failure
+                .reason
+                .contains("pane %1 is not owned by session oc")),
+            "expected stale pane rejection, got {failure:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "stale HTTP inject must not call prompt_async"
         );
         server.abort();
     }
