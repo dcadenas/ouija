@@ -171,6 +171,69 @@ async fn session_owns_pane(state: &AppState, session_id: &str, pane: &str) -> Re
     }
 }
 
+async fn deliver_raw_tmux_for_session(
+    state: &AppState,
+    request: &InjectDeliveryRequest<'_>,
+    inject_config: Option<crate::backend::InjectConfig>,
+    tui_pattern: Option<String>,
+) -> DeliveryOutcome {
+    if let Err(reason) = session_owns_pane(state, request.session_id, request.pane).await {
+        return DeliveryOutcome::Rejected(reason);
+    }
+
+    let result = match inject_config {
+        Some(inject_config) => {
+            crate::tmux::locked_inject_raw_tmux_with_config(
+                state,
+                request.pane,
+                request.message,
+                request.vim_mode,
+                inject_config,
+                tui_pattern,
+            )
+            .await
+        }
+        None => {
+            crate::tmux::locked_inject_raw_tmux(
+                state,
+                request.session_id,
+                request.pane,
+                request.message,
+                request.vim_mode,
+            )
+            .await
+        }
+    };
+
+    result
+        .map(|()| DeliveryOutcome::Accepted)
+        .unwrap_or_else(|error| DeliveryOutcome::Rejected(error.to_string()))
+}
+
+async fn deliver_by_current_session_plan(
+    state: &AppState,
+    request: &InjectDeliveryRequest<'_>,
+) -> DeliveryOutcome {
+    match crate::tmux::session_delivery_plan(state, request.session_id, request.pane).await {
+        crate::tmux::SessionDeliveryPlan::Http(delivery) => crate::tmux::deliver_via_http(
+            state,
+            &delivery.backend_session_id,
+            delivery.project_dir.as_deref(),
+            request.message,
+            delivery.model.as_deref(),
+            delivery.effort.as_deref(),
+        )
+        .await
+        .map(|()| DeliveryOutcome::Accepted)
+        .unwrap_or_else(http_delivery_attempt_failure),
+        crate::tmux::SessionDeliveryPlan::RawTmux {
+            inject_config,
+            tui_pattern,
+        } => deliver_raw_tmux_for_session(state, request, Some(inject_config), tui_pattern).await,
+        crate::tmux::SessionDeliveryPlan::Unavailable(reason) => DeliveryOutcome::Rejected(reason),
+    }
+}
+
 pub(crate) struct InjectDeliveryRequest<'a> {
     pub session_id: &'a str,
     pub pane: &'a str,
@@ -186,60 +249,9 @@ pub(crate) async fn deliver_inject_message_effect(
 ) -> DeliveryOutcome {
     let method = request.delivery_method.or(request.recorded_method);
     match method {
-        Some("http") => {
-            match crate::tmux::session_delivery_plan(state, request.session_id, request.pane).await
-            {
-                crate::tmux::SessionDeliveryPlan::Http(delivery) => crate::tmux::deliver_via_http(
-                    state,
-                    &delivery.backend_session_id,
-                    delivery.project_dir.as_deref(),
-                    request.message,
-                    delivery.model.as_deref(),
-                    delivery.effort.as_deref(),
-                )
-                .await
-                .map(|()| DeliveryOutcome::Accepted)
-                .unwrap_or_else(http_delivery_attempt_failure),
-                crate::tmux::SessionDeliveryPlan::RawTmux { .. } => {
-                    crate::tmux::locked_inject_raw_tmux(
-                        state,
-                        request.session_id,
-                        request.pane,
-                        request.message,
-                        request.vim_mode,
-                    )
-                    .await
-                    .map(|()| DeliveryOutcome::Accepted)
-                    .unwrap_or_else(|error| DeliveryOutcome::Rejected(error.to_string()))
-                }
-                crate::tmux::SessionDeliveryPlan::Unavailable(reason) => {
-                    DeliveryOutcome::Rejected(reason)
-                }
-            }
-        }
-        Some("tmux") => match session_owns_pane(state, request.session_id, request.pane).await {
-            Ok(()) => crate::tmux::locked_inject_raw_tmux(
-                state,
-                request.session_id,
-                request.pane,
-                request.message,
-                request.vim_mode,
-            )
-            .await
-            .map(|()| DeliveryOutcome::Accepted)
-            .unwrap_or_else(|error| DeliveryOutcome::Rejected(error.to_string())),
-            Err(reason) => DeliveryOutcome::Rejected(reason),
-        },
-        _ => crate::tmux::locked_inject(
-            state,
-            request.session_id,
-            request.pane,
-            request.message,
-            request.vim_mode,
-        )
-        .await
-        .map(|()| DeliveryOutcome::Accepted)
-        .unwrap_or_else(|error| DeliveryOutcome::Rejected(error.to_string())),
+        Some("http") => deliver_by_current_session_plan(state, &request).await,
+        Some("tmux") => deliver_raw_tmux_for_session(state, &request, None, None).await,
+        _ => deliver_by_current_session_plan(state, &request).await,
     }
 }
 
@@ -2477,6 +2489,73 @@ pub(crate) mod tests {
             matches!(outcome, DeliveryOutcome::Rejected(ref reason) if reason.contains("pane %2 is not owned by session target")),
             "expected stale pane rejection, got {outcome:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn methodless_inject_rejects_pane_not_owned_by_session() {
+        let state = AppState::new_for_test();
+        proto_register(&state, "target", Some("%1")).await;
+
+        let outcome = deliver_inject_message_effect(
+            &state,
+            InjectDeliveryRequest {
+                session_id: "target",
+                pane: "%2",
+                message: "hello",
+                vim_mode: false,
+                delivery_method: None,
+                recorded_method: None,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, DeliveryOutcome::Rejected(ref reason) if reason.contains("pane %2 is not owned by session target")),
+            "expected stale pane rejection, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn methodless_inject_stale_pane_marks_delivery_failed() {
+        let state = AppState::new_for_test();
+        proto_register(&state, "sender", Some("%9")).await;
+        proto_register(&state, "target", Some("%1")).await;
+
+        let effects = vec![
+            crate::daemon_protocol::Effect::InjectMessage {
+                session_id: "target".into(),
+                pane: "%1".into(),
+                message: "hello".into(),
+                vim_mode: false,
+                delivery_method: None,
+                http_delivery: None,
+                pending_reply_msg_id: None,
+                pending_reply_from: None,
+            },
+            crate::daemon_protocol::Effect::LogMessage {
+                from: "sender".into(),
+                to: "target".into(),
+                message: "hello".into(),
+                delivered: true,
+                transport: "nostr".into(),
+            },
+        ];
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.get_mut("target").unwrap().pane = Some("%2".into());
+        }
+
+        let failure = state.execute_effects(&effects).await;
+
+        assert!(
+            failure
+                .as_ref()
+                .is_some_and(|failure| failure.reason.contains("pane %1 is not owned by session target")),
+            "expected stale pane failure, got {failure:?}"
+        );
+        let log = state.message_log.read().await;
+        assert_eq!(log.len(), 1);
+        assert!(!log[0].delivered);
     }
 
     #[tokio::test]
