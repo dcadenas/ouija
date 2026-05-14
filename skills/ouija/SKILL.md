@@ -48,7 +48,7 @@ ouija reply session-id 47 "done: here is the result"
 ouija ls
 ```
 
-Shows each session's id, role, project_dir, bulletin, and whether its metadata is stale.
+Shows a compact discovery list for choosing message targets. Each session includes `id` and `origin`, plus `project` (basename only), `role`, and `bulletin` when available. Use `ouija status` for full debug metadata such as absolute project paths, stale metadata, and worktree state.
 
 ## 3. Sending messages proactively
 
