@@ -16,7 +16,8 @@ tests/e2e/run-e2e.sh local              # single-daemon e2e only
 ## Release
 
 ```bash
-mise run release    # bump version, commit, tag, push, publish to crates.io, restart daemon
+mise run release         # bump next alpha, commit, tag, push, publish to crates.io, restart daemon
+mise run release-stable  # release v0.1.0 or OUIJA_RELEASE_VERSION=x.y.z as non-prerelease
 ```
 
 Never use `cargo build --release` + manual install. The mise task handles everything.
