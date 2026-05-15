@@ -7,8 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 cargo build                              # dev build
 cargo clippy --all-targets --all-features  # lint (run before commit)
-cargo test                               # unit tests + Stateright model check (~3.5min)
-cargo test -- --skip stateright          # unit tests only (~5s)
+cargo test                               # unit tests; Stateright model check is ignored by default (~5s)
+cargo test model_check_bfs -- --ignored --nocapture  # explicit Stateright model check (CPU-intensive)
 tests/e2e/run-e2e.sh                    # all e2e (Docker, ~2min)
 tests/e2e/run-e2e.sh local              # single-daemon e2e only
 ```
