@@ -1816,15 +1816,50 @@ fn project_session_list(status: &serde_json::Value) -> serde_json::Value {
             sessions
                 .iter()
                 .map(|session| {
-                    serde_json::json!({
-                        "id": session.get("id").cloned().unwrap_or(serde_json::Value::Null),
-                        "origin": session.get("origin").cloned().unwrap_or(serde_json::Value::Null),
-                        "project_dir": session.get("project_dir").cloned().unwrap_or(serde_json::Value::Null),
-                        "role": session.get("role").cloned().unwrap_or(serde_json::Value::Null),
-                        "bulletin": session.get("bulletin").cloned().unwrap_or(serde_json::Value::Null),
-                        "stale": session.get("stale").cloned().unwrap_or(serde_json::Value::Null),
-                        "worktree_present": session.get("worktree_present").cloned().unwrap_or(serde_json::Value::Null),
-                    })
+                    let mut projected = serde_json::Map::new();
+                    projected.insert(
+                        "id".to_string(),
+                        session
+                            .get("id")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                    );
+                    projected.insert(
+                        "origin".to_string(),
+                        session
+                            .get("origin")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                    );
+
+                    if let Some(project) = session
+                        .get("project_dir")
+                        .and_then(|project_dir| project_dir.as_str())
+                        .filter(|project_dir| !project_dir.trim().is_empty())
+                        .and_then(|project_dir| std::path::Path::new(project_dir).file_name())
+                        .and_then(|project| project.to_str())
+                        .filter(|project| !project.trim().is_empty())
+                    {
+                        projected.insert(
+                            "project".to_string(),
+                            serde_json::Value::String(project.to_string()),
+                        );
+                    }
+
+                    for field in ["role", "bulletin"] {
+                        if let Some(value) = session
+                            .get(field)
+                            .and_then(|value| value.as_str())
+                            .filter(|value| !value.trim().is_empty())
+                        {
+                            projected.insert(
+                                field.to_string(),
+                                serde_json::Value::String(value.to_string()),
+                            );
+                        }
+                    }
+
+                    serde_json::Value::Object(projected)
                 })
                 .collect::<Vec<_>>()
         })
@@ -2141,18 +2176,44 @@ mod tests {
                 "sessions": [{
                     "id": "ouija-next-issue",
                     "origin": "local",
-                    "project_dir": "/home/daniel/code/ouija",
+                    "project": "ouija",
                     "role": "working on ouija",
-                    "bulletin": "ready",
-                    "stale": true,
-                    "worktree_present": true
+                    "bulletin": "ready"
                 }]
             })
         );
         assert!(projected.get("daemon").is_none());
+        assert!(projected["sessions"][0].get("project_dir").is_none());
+        assert!(projected["sessions"][0].get("stale").is_none());
+        assert!(projected["sessions"][0].get("worktree_present").is_none());
         assert!(projected["sessions"][0].get("prompt").is_none());
         assert!(projected["sessions"][0].get("reminder").is_none());
         assert!(projected["sessions"][0].get("backend_session_id").is_none());
+    }
+
+    #[test]
+    fn session_list_projection_omits_empty_optional_discovery_fields() {
+        let status = serde_json::json!({
+            "sessions": [{
+                "id": "quiet-session",
+                "origin": "remote:locota",
+                "project_dir": null,
+                "role": "",
+                "bulletin": "   "
+            }]
+        });
+
+        let projected = project_session_list(&status);
+
+        assert_eq!(
+            projected,
+            serde_json::json!({
+                "sessions": [{
+                    "id": "quiet-session",
+                    "origin": "remote:locota"
+                }]
+            })
+        );
     }
 
     #[test]
