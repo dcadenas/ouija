@@ -172,11 +172,11 @@ Fuzzy session pickers that read tmux's display format will show ouija session na
 ## Testing
 
 ```bash
-# Unit tests without the expensive Stateright model check
-cargo test -- --skip stateright
+# Unit tests (the expensive Stateright model check is ignored by default)
+cargo test
 
-# Stateright model check (CPU-intensive)
-cargo test model_check_bfs -- --nocapture
+# Full Stateright model check (CPU-intensive; run explicitly)
+cargo test model_check_bfs -- --ignored --nocapture
 
 # Local + nostr + opencode e2e, in Docker
 tests/e2e/run-e2e.sh
