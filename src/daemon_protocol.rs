@@ -6967,6 +6967,7 @@ mod stateright_model {
     // -- Tests ---------------------------------------------------------------
 
     #[test]
+    #[ignore = "expensive exhaustive Stateright model check; run explicitly"]
     fn model_check_bfs() {
         use std::time::Instant;
         let start = Instant::now();
