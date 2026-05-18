@@ -32,6 +32,16 @@ All session mutations flow through `DaemonState::apply(Event)` in `daemon_protoc
 
 When adding features: update `DaemonState::apply()` first, then wire up effects.
 
+When adding or changing daemon events, decide whether the event should bump `SessionMeta::last_metadata_update` and document the reason near the event. User-facing metadata freshness tracks role/bulletin staleness; internal plumbing such as `AdoptBackend` must not silently change that signal (#458).
+
+Activity signals that reset idle or watchdog timers should use the existing `SessionMsg::Active` path. Do not introduce a parallel timer-reset message unless the existing session-agent semantics are wrong (#448).
+
+### Registration and tmux invariants
+
+`Event::Register` owns local pane binding. `apply_register` deduplicates by pane and can evict the previous Local session for that pane, so every external registration path must apply the same defenses as the canonical scan path: only register assistant panes, skip panes already bound to Local sessions, respect the `@ouija_id` claim marker when scanning, require a usable current path/session name, normalize through `resolve_project_root` + `sanitize_session_id`, and share `resolve_unique_session_id` conflict handling instead of reimplementing it (#1442).
+
+When spawning or respawning tmux panes for Ouija-managed sessions, route environment arguments through `tmux::pane_env_args(session_id)`. That helper exports `OUIJA_SESSION_ID` and the history-suppression variables for `new-window`, `new-session`, and `respawn-pane`; inlining `-e KEY=VALUE` at spawn sites can break `resolve_my_session_id` during the pane-var race window (#1429).
+
 ### Key modules
 
 - **`daemon_protocol.rs`** — `DaemonState`, `Event` enum, `Effect` enum, all session logic. The heart of ouija.
@@ -77,3 +87,7 @@ Remote: Same flow but wrapped in NIP-17 encrypted DMs via Nostr relays.
 Unit tests exercise `apply_and_execute`, which dispatches `Effect::SetTmuxVar`, `Effect::RenameWindow`, etc. Those effects must NEVER reach the host tmux server, or tests will rewrite real pane vars (e.g. `@ouija_session`) and window names when `cargo test` runs inside a tmux session.
 
 The tmux-side primitives in `src/tmux_var.rs` and `src/tmux.rs` (`rename_window`, `enable_automatic_rename`) early-return under `cfg!(test)`. Any new function that shells out to `tmux` from an effect handler must follow the same pattern.
+
+### E2E state restoration
+
+E2E bash tests under `tests/e2e/` run with `set -euo pipefail`, so any test that mutates shared daemon state must install a restore `trap` before the mutating request. This includes `/api/settings` toggles such as `auto_register`, timeout settings, session caps, and projects directories. Clear the trap only after the final assertion and explicit restore; otherwise a mid-test failure leaks state into later tests (#1434).
