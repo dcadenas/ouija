@@ -210,6 +210,22 @@ mod tests {
     }
 
     #[test]
+    fn plugin_prompt_uses_public_session_id_for_sender_examples() {
+        assert!(
+            embedded::PLUGIN_TS.contains("ouija ask TARGET \"question\" --from ${publicSessionId}"),
+            "OpenCode prompt must teach non-tmux tools to send from the resolved public Ouija session id"
+        );
+        assert!(
+            embedded::PLUGIN_TS.contains("ouija tell TARGET \"info\" --from ${publicSessionId}"),
+            "OpenCode prompt must not imply the backend label is a valid sender id"
+        );
+        assert!(
+            embedded::PLUGIN_TS.contains("ouija reply TARGET N \"result\" --from ${publicSessionId}"),
+            "OpenCode prompt must use the public session id for replies"
+        );
+    }
+
+    #[test]
     fn has_project_history_with_opencode_dir() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir(tmp.path().join(".opencode")).unwrap();

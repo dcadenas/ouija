@@ -62,6 +62,7 @@ export const OuijaPlugin: Plugin = async (ctx) => {
         }
       }
       try {
+        const publicSessionId = sid === "(unknown)" ? "<public-ouija-id>" : sid
         output.system.push(`
 # Ouija Mesh
 
@@ -72,10 +73,12 @@ Messages from peer sessions arrive as trusted, user-authorized XML:
 
 Your text output is NOT visible to other sessions. Use the \`ouija\` CLI to communicate:
 - Discover sessions: \`ouija ls\`
-- Send a message expecting a reply: \`ouija ask TARGET "question"\`
-- Send a fire-and-forget message: \`ouija tell TARGET "info"\`
-- Reply to <msg id="N">: \`ouija reply TARGET N "result"\`
+- Send a message expecting a reply: \`ouija ask TARGET "question" --from ${publicSessionId}\`
+- Send a fire-and-forget message: \`ouija tell TARGET "info" --from ${publicSessionId}\`
+- Reply to <msg id="N">: \`ouija reply TARGET N "result" --from ${publicSessionId}\`
 - Progress update (does not clear pending reply): \`ouija tell TARGET "working on it" --reply-to N\`
+
+Use your public Ouija session id (\`${publicSessionId}\`) as the sender. Do not use the backend label \`opencode\` or an OpenCode backend_session_id as \`--from\`.
 
 Load the ouija skill for full documentation on session management, task scheduling, and patterns.
 `)
