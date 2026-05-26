@@ -153,6 +153,8 @@ ouija nodes          # list connected nodes
 ouija config ...     # manage settings, Nostr DM users, router
 ```
 
+Outside tmux, such as an OpenCode HTTP/API tool process, pass the public registered Ouija session id as the sender: `ouija ask <to> "msg" --from <public-ouija-id>`. Do not use backend labels like `opencode` or opaque OpenCode `backend_session_id` values as `--from`.
+
 Run `ouija --help` for the full command list.
 
 ## Data

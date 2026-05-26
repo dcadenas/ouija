@@ -117,20 +117,24 @@ ouija clear-reply SENDER_ID
 
 ## 7. Non-tmux contexts (opencode HTTP API, etc.)
 
-The CLI infers your session ID from `$TMUX_PANE`. In engines whose bash tool runs outside tmux, that variable is unset and `ouija ask/tell/reply` cannot resolve a sender. Two ways to provide it explicitly:
+The CLI infers your session ID from `$TMUX_PANE`. In engines whose bash tool runs outside tmux, that variable is unset and `ouija ask/tell/reply` cannot resolve a sender. Use your public registered Ouija session id/name as the sender, such as `hub` or `feat/123-worker`.
+
+Never use `opencode` or an OpenCode `backend_session_id` as `--from`. Those are backend implementation details, not public Ouija route targets.
+
+Two ways to provide the public Ouija sender id explicitly:
 
 ```bash
 # Per-command flag:
-ouija ask target-id "question" --from my-session-id
-ouija tell target-id "fyi" --from my-session-id
-ouija reply target-id 47 "result" --from my-session-id
+ouija ask target-id "question" --from public-ouija-id
+ouija tell target-id "fyi" --from public-ouija-id
+ouija reply target-id 47 "result" --from public-ouija-id
 
 # Or set once for the shell:
-export OUIJA_SESSION_ID=my-session-id
+export OUIJA_SESSION_ID=public-ouija-id
 ouija ask target-id "question"
 ```
 
-If you see an error about being unable to resolve the current session ID, supply `--from <your-session-id>` or set `OUIJA_SESSION_ID`. **Never run `ouija register` to "fix" this** — it would create a duplicate session entry, not register the caller.
+If you see an error about being unable to resolve the current session ID, supply `--from <public-ouija-id>` or set `OUIJA_SESSION_ID` to your public Ouija id. **Never run `ouija register` to "fix" this** — it would create a duplicate session entry, not register the caller.
 
 ## 8. Patterns
 

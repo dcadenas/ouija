@@ -226,6 +226,18 @@ mod tests {
     }
 
     #[test]
+    fn embedded_skill_distinguishes_public_session_id_from_opencode_backend_ids() {
+        assert!(
+            embedded::SKILL_MD.contains("ouija ask target-id \"question\" --from public-ouija-id"),
+            "skill must show ask with the public Ouija sender id"
+        );
+        assert!(
+            embedded::SKILL_MD.contains("Never use `opencode` or an OpenCode `backend_session_id` as `--from`"),
+            "skill must warn against backend labels and opaque backend session ids"
+        );
+    }
+
+    #[test]
     fn has_project_history_with_opencode_dir() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir(tmp.path().join(".opencode")).unwrap();
