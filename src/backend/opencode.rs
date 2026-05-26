@@ -220,7 +220,8 @@ mod tests {
             "OpenCode prompt must not imply the backend label is a valid sender id"
         );
         assert!(
-            embedded::PLUGIN_TS.contains("ouija reply TARGET N \"result\" --from ${publicSessionId}"),
+            embedded::PLUGIN_TS
+                .contains("ouija reply TARGET N \"result\" --from ${publicSessionId}"),
             "OpenCode prompt must use the public session id for replies"
         );
     }
@@ -232,7 +233,8 @@ mod tests {
             "skill must show ask with the public Ouija sender id"
         );
         assert!(
-            embedded::SKILL_MD.contains("Never use `opencode` or an OpenCode `backend_session_id` as `--from`"),
+            embedded::SKILL_MD
+                .contains("Never use `opencode` or an OpenCode `backend_session_id` as `--from`"),
             "skill must warn against backend labels and opaque backend session ids"
         );
     }
