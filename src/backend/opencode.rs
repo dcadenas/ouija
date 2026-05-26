@@ -210,6 +210,42 @@ mod tests {
     }
 
     #[test]
+    fn plugin_prompt_uses_public_session_id_for_sender_examples() {
+        assert!(
+            embedded::PLUGIN_TS.contains("ouija ask TARGET \"question\" --from ${publicSessionId}"),
+            "OpenCode prompt must teach non-tmux tools to send from the resolved public Ouija session id"
+        );
+        assert!(
+            embedded::PLUGIN_TS.contains("ouija tell TARGET \"info\" --from ${publicSessionId}"),
+            "OpenCode prompt must not imply the backend label is a valid sender id"
+        );
+        assert!(
+            embedded::PLUGIN_TS
+                .contains("ouija reply TARGET N \"result\" --from ${publicSessionId}"),
+            "OpenCode prompt must use the public session id for replies"
+        );
+        assert!(
+            embedded::PLUGIN_TS.contains(
+                "ouija tell TARGET \"working on it\" --reply-to N --from ${publicSessionId}"
+            ),
+            "OpenCode prompt must use the public session id for progress updates"
+        );
+    }
+
+    #[test]
+    fn embedded_skill_distinguishes_public_session_id_from_opencode_backend_ids() {
+        assert!(
+            embedded::SKILL_MD.contains("ouija ask target-id \"question\" --from public-ouija-id"),
+            "skill must show ask with the public Ouija sender id"
+        );
+        assert!(
+            embedded::SKILL_MD
+                .contains("Never use `opencode` or an OpenCode `backend_session_id` as `--from`"),
+            "skill must warn against backend labels and opaque backend session ids"
+        );
+    }
+
+    #[test]
     fn has_project_history_with_opencode_dir() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir(tmp.path().join(".opencode")).unwrap();
