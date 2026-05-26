@@ -224,6 +224,12 @@ mod tests {
                 .contains("ouija reply TARGET N \"result\" --from ${publicSessionId}"),
             "OpenCode prompt must use the public session id for replies"
         );
+        assert!(
+            embedded::PLUGIN_TS.contains(
+                "ouija tell TARGET \"working on it\" --reply-to N --from ${publicSessionId}"
+            ),
+            "OpenCode prompt must use the public session id for progress updates"
+        );
     }
 
     #[test]

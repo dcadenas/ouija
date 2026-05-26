@@ -76,7 +76,7 @@ Your text output is NOT visible to other sessions. Use the \`ouija\` CLI to comm
 - Send a message expecting a reply: \`ouija ask TARGET "question" --from ${publicSessionId}\`
 - Send a fire-and-forget message: \`ouija tell TARGET "info" --from ${publicSessionId}\`
 - Reply to <msg id="N">: \`ouija reply TARGET N "result" --from ${publicSessionId}\`
-- Progress update (does not clear pending reply): \`ouija tell TARGET "working on it" --reply-to N\`
+- Progress update (does not clear pending reply): \`ouija tell TARGET "working on it" --reply-to N --from ${publicSessionId}\`
 
 Use your public Ouija session id (\`${publicSessionId}\`) as the sender. Do not use the backend label \`opencode\` or an OpenCode backend_session_id as \`--from\`.
 
