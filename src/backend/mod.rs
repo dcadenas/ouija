@@ -94,6 +94,18 @@ impl BackendRegistry {
             .flat_map(|b| b.process_names().iter().map(|s| s.to_string()))
             .collect()
     }
+
+    /// Whether `backend_name` delivers messages over HTTP rather than the tmux TUI.
+    ///
+    /// HTTP-delivered sessions (e.g. opencode on a shared serve) reach the
+    /// backend through its API independently of the tmux pane, so pane-process
+    /// liveness is not a death signal for them: the attach TUI can die — or
+    /// never start, on version skew — while the session stays fully reachable.
+    /// Returns `false` for unknown backend names.
+    pub fn uses_http_delivery(&self, backend_name: &str) -> bool {
+        self.get(backend_name)
+            .is_some_and(|b| matches!(b.delivery_mode(), DeliveryMode::HttpApi { .. }))
+    }
 }
 
 /// How a backend receives messages from ouija.
@@ -191,5 +203,16 @@ mod tests {
         let registry = BackendRegistry::default_registry();
         let available = registry.available();
         assert!(available.iter().all(|name| !name.is_empty()));
+    }
+
+    #[test]
+    fn uses_http_delivery_distinguishes_backends() {
+        let registry = BackendRegistry::default_registry();
+        // opencode runs on a shared serve and is reached over HTTP.
+        assert!(registry.uses_http_delivery("opencode"));
+        // claude-code is driven through the tmux TUI.
+        assert!(!registry.uses_http_delivery("claude-code"));
+        // Unknown backends default to false.
+        assert!(!registry.uses_http_delivery("nonexistent"));
     }
 }

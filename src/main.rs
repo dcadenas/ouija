@@ -426,6 +426,12 @@ async fn main() -> anyhow::Result<()> {
                                 matches!(s.origin, crate::daemon_protocol::Origin::Local)
                                     && s.pane.is_some()
                                     && (s.registered_at == 0 || now - s.registered_at > 60)
+                                    // HTTP-delivered sessions (opencode shared serve)
+                                    // are reachable independently of the tmux pane, so a
+                                    // dead/absent attach TUI must not get them reaped.
+                                    && !s.metadata.backend.as_deref().is_some_and(|b| {
+                                        reaper_state.backends.uses_http_delivery(b)
+                                    })
                             })
                             .filter_map(|s| Some((s.id.clone(), s.pane.clone()?)))
                             .collect()
@@ -1134,11 +1140,22 @@ async fn restore_persisted_sessions(state: &state::AppState) {
         return;
     }
 
+    // HTTP-delivered sessions (opencode shared serve) are reachable over their
+    // API regardless of the tmux pane, so pane-process liveness must not gate
+    // their restoration — same reaper-false-positive class as the live reaper.
+    // Keep them unconditionally; only pane-bound (TUI) sessions need the check.
+    let (http_delivered, pane_bound): (Vec<_>, Vec<_>) = sessions.into_iter().partition(|ps| {
+        ps.metadata
+            .backend
+            .as_deref()
+            .is_some_and(|b| state.backends.uses_http_delivery(b))
+    });
+
     // Check pane liveness on blocking thread
     let names: Vec<String> = state.backends.all_process_names();
-    let alive = tokio::task::spawn_blocking(move || {
+    let mut alive = tokio::task::spawn_blocking(move || {
         let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-        sessions
+        pane_bound
             .into_iter()
             .filter(|ps| {
                 ps.pane
@@ -1149,6 +1166,7 @@ async fn restore_persisted_sessions(state: &state::AppState) {
     })
     .await
     .unwrap_or_default();
+    alive.extend(http_delivered);
 
     if alive.is_empty() {
         return;
