@@ -3139,6 +3139,62 @@ fn opencode_attach_command(port: u16, session_id: &str, project_dir: &str) -> St
     )
 }
 
+/// Whether the local `opencode attach` client can drive the running serve.
+///
+/// The attach TUI is a Bun-compiled binary that decodes serve responses by
+/// their exact shape. A mismatched client crashes on launch (observed:
+/// `E?.data?.findLast is not a function`), dropping the tmux pane back to a
+/// bare shell. We treat any non-empty version difference as incompatible —
+/// the attach protocol carries no compatibility range, so equality is the
+/// only safe predicate.
+fn opencode_attach_versions_compatible(serve_version: &str, client_version: &str) -> bool {
+    serve_version.trim() == client_version.trim()
+}
+
+/// Read the `opencode` client version via `opencode --version`.
+///
+/// Returns the trimmed first line of stdout, or `None` when the binary is
+/// missing, exits non-zero, or prints nothing. A `None` result disables the
+/// skew guard (fail open: never block a spawn just because the version could
+/// not be read).
+fn opencode_client_version() -> Option<String> {
+    let output = std::process::Command::new("opencode")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let version = stdout.lines().next()?.trim().to_string();
+    (!version.is_empty()).then_some(version)
+}
+
+/// Replace a crashing `opencode attach` with a persistent, informative notice
+/// in the pane, so an operator sees the version skew instead of a Bun stack
+/// trace. The session stays functional via the HTTP API.
+async fn notify_pane_opencode_attach_skew(
+    pane_id: &str,
+    serve_version: &str,
+    client_version: &str,
+    port: u16,
+) {
+    let notice = format!(
+        "clear; printf '%s\\n' \
+'ouija: opencode attach skipped — version skew (serve {serve_version} vs attach client {client_version}).' \
+'The attach TUI would crash, so this pane is API-only. Message delivery still works.' \
+'View this session'\\''s transcript: curl http://127.0.0.1:{port}/session/<id>/message' \
+'Fix: align the opencode serve and attach client versions, then restart this session.'"
+    );
+    let pane = pane_id.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = std::process::Command::new("tmux")
+            .args(["send-keys", "-t", &pane, &format!(" {notice}"), "Enter"])
+            .status();
+    })
+    .await;
+}
+
 async fn respawn_opencode_attach_for_session(
     pane_id: &str,
     project_dir: &str,
@@ -3249,9 +3305,18 @@ async fn setup_shared_serve_session(
         .timeout(std::time::Duration::from_secs(3))
         .send()
         .await;
+    // The serve reports its own build version here (e.g. {"version":"1.14.31"}),
+    // which we later compare against the local attach client to detect skew.
+    let serve_version: Option<String>;
     match health {
         Ok(resp) if resp.status().is_success() => {
-            tracing::info!(port, status = %resp.status(), "opencode shared serve health ok");
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            serve_version = body
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            tracing::info!(port, status = %status, serve_version = ?serve_version, "opencode shared serve health ok");
         }
         Ok(resp) => {
             tracing::warn!(port, status = %resp.status(), "opencode shared serve health returned non-success");
@@ -3300,6 +3365,26 @@ async fn setup_shared_serve_session(
         opencode_session_id = %session_id,
         "opencode shared serve session create: ok"
     );
+
+    // Guard against serve/attach-client version skew. A mismatched attach TUI
+    // crashes instantly and leaves a bare pane; skip it and leave an
+    // informative notice instead. The session is already created and stays
+    // reachable over HTTP, so we register it API-only rather than failing the
+    // spawn.
+    if let (Some(serve_v), Some(client_v)) = (serve_version.as_deref(), opencode_client_version()) {
+        if !opencode_attach_versions_compatible(serve_v, &client_v) {
+            tracing::warn!(
+                port,
+                pane = %pane_id,
+                opencode_session_id = %session_id,
+                serve_version = serve_v,
+                attach_client_version = %client_v,
+                "opencode attach client/serve version skew; skipping attach TUI (would crash). Session remains functional via HTTP API."
+            );
+            notify_pane_opencode_attach_skew(pane_id, serve_v, &client_v, port).await;
+            return Ok(session_id);
+        }
+    }
 
     let attach_ready =
         match launch_opencode_attach_for_session(pane_id, project_dir, &session_id, port).await {
@@ -4406,6 +4491,20 @@ mod tests {
             cmd,
             "opencode attach http://127.0.0.1:8200 --session 'ses_test' --dir '/tmp/project with spaces'"
         );
+    }
+
+    #[test]
+    fn opencode_attach_versions_compatible_matches_exact_version() {
+        assert!(opencode_attach_versions_compatible("1.14.31", "1.14.31"));
+        // Surrounding whitespace from `--version` output is ignored.
+        assert!(opencode_attach_versions_compatible("1.14.31", " 1.14.31\n"));
+    }
+
+    #[test]
+    fn opencode_attach_versions_compatible_rejects_skew() {
+        // The crash repro: serve 1.14.31, attach client 1.17.7.
+        assert!(!opencode_attach_versions_compatible("1.14.31", "1.17.7"));
+        assert!(!opencode_attach_versions_compatible("1.14.31", ""));
     }
 
     #[test]
