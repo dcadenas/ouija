@@ -202,6 +202,9 @@ enum Command {
     /// Stop the running daemon
     #[command(name = "stop-server")]
     StopServer,
+    /// Restart the running daemon
+    #[command(name = "restart-server")]
+    RestartServer,
     /// Print the message log file path
     LogPath {
         #[arg(long)]
@@ -904,6 +907,18 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::StopServer => {
             stop_daemon()?;
+        }
+        Command::RestartServer => {
+            // systemd/legacy-aware restart, so callers (e.g. the use-published
+            // task) never have to start the foreground `start-server` directly.
+            restart_daemon()?;
+            let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
+            let status_url = format!("http://localhost:{port}/api/status");
+            if wait_for_daemon(&status_url) {
+                println!("daemon restarted");
+            } else {
+                anyhow::bail!("daemon did not come back within 10s");
+            }
         }
         Command::LogPath { data } => {
             let config = config::OuijaConfig::new("_".into(), 0, data, String::new())?;
@@ -1697,8 +1712,15 @@ fn update_and_restart() -> anyhow::Result<()> {
 fn fetch_latest_crate_version(name: &str) -> anyhow::Result<String> {
     use std::process::Command as Cmd;
 
+    // crates.io rejects requests without a descriptive User-Agent (HTTP 403),
+    // so identify ourselves per their crawler policy.
     let output = Cmd::new("curl")
-        .args(["-sf", &format!("https://crates.io/api/v1/crates/{name}")])
+        .args([
+            "-sf",
+            "-A",
+            "ouija-self-update (+https://github.com/dcadenas/ouija)",
+            &format!("https://crates.io/api/v1/crates/{name}"),
+        ])
         .output()
         .context("failed to query crates.io")?;
     if !output.status.success() {
