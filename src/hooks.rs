@@ -617,6 +617,16 @@ async fn session_start_inner(
 
     // Derive name from cwd
     let project_root = crate::state::resolve_project_root(&body.cwd);
+
+    // Refuse a home-cwd registration: an agent whose cwd is still $HOME is a
+    // premature hook mis-fire (e.g. opencode's SessionStart firing before it
+    // cd's into its worktree). Registering it leaks a generic basename($HOME)-N
+    // session that owns the live pane forever (#1483). The authoritative name
+    // arrives via the API session_start path once the pane is bound.
+    if crate::state::is_home_project_root(project_root) {
+        return json!({ "skipped": "home cwd (premature session-start)", "output": "" });
+    }
+
     let basename = std::path::Path::new(project_root)
         .file_name()
         .and_then(|n| n.to_str())
@@ -1751,6 +1761,51 @@ mod tests {
         // output is intentionally empty — session-start no longer injects mesh
         // state into the LLM context window.
         assert_eq!(result["output"], "");
+    }
+
+    #[tokio::test]
+    async fn session_start_refuses_home_cwd() {
+        // Regression for #1483: a SessionStart firing while cwd is still $HOME
+        // (premature opencode mis-fire) must NOT auto-register a generic
+        // basename($HOME)-N session that leaks past task cleanup.
+        let state = crate::state::AppState::new_for_test();
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        let body = SessionStartBody {
+            pane: "%51".into(),
+            cwd: home,
+            backend_session_id: None,
+            backend_identity: None,
+            adapter: None,
+            launch_session_id: None,
+            launch_credential: None,
+        };
+        let result = session_start_inner(&state, body).await;
+        assert!(
+            result.get("skipped").is_some(),
+            "home-cwd must be refused, got {result:?}"
+        );
+        assert!(state.find_session_by_pane("%51").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn session_start_refuses_home_cwd_trailing_slash() {
+        let state = crate::state::AppState::new_for_test();
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        let body = SessionStartBody {
+            pane: "%52".into(),
+            cwd: format!("{}/", home.trim_end_matches('/')),
+            backend_session_id: None,
+            backend_identity: None,
+            adapter: None,
+            launch_session_id: None,
+            launch_credential: None,
+        };
+        let result = session_start_inner(&state, body).await;
+        assert!(
+            result.get("skipped").is_some(),
+            "home-cwd (trailing slash) must be refused, got {result:?}"
+        );
+        assert!(state.find_session_by_pane("%52").await.is_none());
     }
 
     #[tokio::test]
