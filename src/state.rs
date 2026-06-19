@@ -105,6 +105,28 @@ pub fn resolve_project_root(path: &str) -> &str {
     }
 }
 
+/// Returns true when a resolved project root is the user's home directory and
+/// must not be auto-registered.
+///
+/// An agent whose cwd is still `$HOME` at SessionStart is a premature hook
+/// mis-fire — e.g. an opencode SessionStart firing before the agent has cd'd
+/// into its worktree. Registering it derives a generic `basename($HOME)-N`
+/// session ("daniel-N") that then owns the live pane and survives task
+/// cleanup (cleanup targets the real task-slug name), leaking forever (#1483).
+pub fn is_home_project_root(project_root: &str) -> bool {
+    match std::env::var("HOME") {
+        Ok(home) => root_matches_home(project_root, &home),
+        Err(_) => false,
+    }
+}
+
+/// Pure comparison helper: trailing-slash-insensitive equality of a project
+/// root against a (non-empty) home directory.
+fn root_matches_home(project_root: &str, home: &str) -> bool {
+    let home = home.trim_end_matches('/');
+    !home.is_empty() && project_root.trim_end_matches('/') == home
+}
+
 /// Named transport map keyed by transport name (e.g. "nostr").
 type TransportMap = HashMap<String, Arc<dyn Transport>>;
 
@@ -1912,6 +1934,15 @@ impl AppState {
             };
 
             let project_root = resolve_project_root(path);
+
+            // Same defense as the session-start hook: never auto-register a pane
+            // whose resolved root is $HOME. Without this, a home-cwd pane the
+            // hook already refused could still be grabbed generically here as
+            // "daniel-N" and leak past task cleanup (#1483).
+            if is_home_project_root(project_root) {
+                continue;
+            }
+
             let basename = std::path::Path::new(project_root)
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -2290,6 +2321,31 @@ pub(crate) mod tests {
             resolve_project_root("/home/daniel/code/ouija/.ouija/worktrees/feature-x"),
             "/home/daniel/code/ouija"
         );
+    }
+
+    // --- is_home_project_root / root_matches_home (#1483) ---
+
+    #[test]
+    fn root_matches_home_exact() {
+        assert!(root_matches_home("/home/daniel", "/home/daniel"));
+    }
+
+    #[test]
+    fn root_matches_home_trailing_slash_insensitive() {
+        assert!(root_matches_home("/home/daniel/", "/home/daniel"));
+        assert!(root_matches_home("/home/daniel", "/home/daniel/"));
+    }
+
+    #[test]
+    fn root_matches_home_rejects_project_under_home() {
+        assert!(!root_matches_home("/home/daniel/code/ouija", "/home/daniel"));
+    }
+
+    #[test]
+    fn root_matches_home_empty_home_never_matches() {
+        // A blank $HOME must not turn every empty/relative root into "home".
+        assert!(!root_matches_home("", ""));
+        assert!(!root_matches_home("/", ""));
     }
 
     // --- resolve_unique_session_id ---
