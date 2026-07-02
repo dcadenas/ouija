@@ -267,6 +267,20 @@ mod tests {
             !embedded::PLUGIN_TS.contains("<public-ouija-id>"),
             "bare placeholder invites substituting a guessed id; it must be gone"
         );
+        // Fail-closed policy (#1395 review f0, option B): while the id is
+        // unresolved the daemon rejects sends even with a correct hand-typed
+        // --from, so the prompt must say the fix is the environment, not
+        // retrying with another id.
+        assert!(
+            embedded::PLUGIN_TS.contains("fail-closed"),
+            "OpenCode prompt must explain the daemon fail-closes sends while \
+             the caller's identity is unresolved"
+        );
+        assert!(
+            embedded::PLUGIN_TS.contains("even a correct"),
+            "OpenCode prompt must warn that even a correct id is rejected \
+             until identity resolves"
+        );
     }
 
     #[test]

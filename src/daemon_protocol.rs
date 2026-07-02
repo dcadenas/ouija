@@ -2680,6 +2680,32 @@ mod tests {
     }
 
     #[test]
+    fn honest_self_send_with_unresolved_self_id_fails_closed() {
+        // Deliberate policy (#1395 review f0, option B): in an unmanaged
+        // `opencode serve` shell without $OUIJA_SESSION_ID, even a CORRECT
+        // --from is rejected, because the CLI cannot attach a matching
+        // self_id and the daemon cannot tell an honest self-send from a
+        // sibling impersonation. Onboarding cannot inject env into an
+        // already-running serve process, so this stays fail-closed; the
+        // plugin prompt tells agents to fix the environment, not retry.
+        let mut state = claim_state();
+        register_paneless_opencode(&mut state, "oc-serve");
+        let ctx = SenderContext {
+            pane: None,
+            self_id: None,
+        };
+        let err = validate_sender_claim(&state, "oc-serve", &ctx).unwrap_err();
+        assert!(
+            err.contains("unresolved"),
+            "rejection must say the caller's own id is unresolved, got: {err}"
+        );
+        assert!(
+            err.contains("ouija whoami"),
+            "rejection must steer the caller to whoami, got: {err}"
+        );
+    }
+
+    #[test]
     fn paneless_caller_may_claim_paneless_session() {
         let mut state = claim_state();
         state.apply(Event::Register {
