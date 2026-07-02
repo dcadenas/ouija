@@ -660,6 +660,7 @@ async fn main() -> anyhow::Result<()> {
                 "to": to,
                 "message": message,
                 "expects_reply": true,
+                "sender_ctx": sender_context(),
             });
             cli_post("/api/send", &body).await?;
         }
@@ -679,6 +680,7 @@ async fn main() -> anyhow::Result<()> {
                 "message": message,
                 "expects_reply": false,
                 "responds_to": reply_to,
+                "sender_ctx": sender_context(),
             });
             cli_post("/api/send", &body).await?;
         }
@@ -701,6 +703,7 @@ async fn main() -> anyhow::Result<()> {
                 "expects_reply": expect_reply,
                 "responds_to": msg_id,
                 "done": !no_done,
+                "sender_ctx": sender_context(),
             });
             cli_post("/api/send", &body).await?;
         }
@@ -1915,6 +1918,16 @@ fn pick_session_id(
         return SessionIdResolution::LookupByPane(pane.to_string());
     }
     SessionIdResolution::None
+}
+
+/// Caller execution context sent with every `/api/send` so the daemon can
+/// cross-check the claimed sender (task #1395). Always present in bodies
+/// from this CLI version — its very presence tells the daemon the pane
+/// field is a positive report, not an omission by an older caller.
+fn sender_context() -> serde_json::Value {
+    serde_json::json!({
+        "pane": std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty()),
+    })
 }
 
 /// Result of running the full identity-resolution path, with enough detail

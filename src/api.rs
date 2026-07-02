@@ -708,6 +708,11 @@ pub struct SendBody {
     responds_to: Option<u64>,
     #[serde(default)]
     done: bool,
+    /// Caller execution context for sender-claim validation (task #1395).
+    /// Absent for legacy callers (old CLIs, curl); see
+    /// [`crate::daemon_protocol::validate_sender_claim`].
+    #[serde(default)]
+    sender_ctx: Option<crate::daemon_protocol::SenderContext>,
 }
 
 /// Send a message from one session to another.
@@ -737,6 +742,25 @@ pub async fn send_msg(
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": format!("cannot send a message to yourself. {hint}") })),
         );
+    }
+    match &body.sender_ctx {
+        Some(ctx) => {
+            let proto = state.protocol.read().await;
+            if let Err(reason) =
+                crate::daemon_protocol::validate_sender_claim(&proto, &body.from, ctx)
+            {
+                return (StatusCode::FORBIDDEN, Json(json!({ "error": reason })));
+            }
+        }
+        None => {
+            // Legacy caller (old CLI, curl, e2e scripts): no context to
+            // verify. Logged so operators can spot unverified senders.
+            tracing::warn!(
+                from = %body.from,
+                to = %body.to,
+                "send accepted without sender context; sender claim unverified"
+            );
+        }
     }
     if state.is_soft_restart_in_progress(&body.to) {
         return (
@@ -4169,6 +4193,7 @@ mod tests {
                 expects_reply: false,
                 responds_to: None,
                 done: false,
+                sender_ctx: None,
             }),
         )
         .await;
@@ -4176,6 +4201,146 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "delivered");
         assert_eq!(body["method"], "tmux");
+    }
+
+    // --- /api/send sender-claim guardrails (task #1395) ---
+
+    async fn state_with_victim_and_recipient() -> SharedState {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "victim".into(),
+                pane: Some("%victim".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "recipient".into(),
+                pane: Some("%recipient".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        state
+    }
+
+    #[tokio::test]
+    async fn send_rejects_paneless_claim_of_tmux_native_session() {
+        // Incident shape: opencode bash (no $TMUX_PANE) stamping a sibling
+        // tmux session as the sender. Must 403 with whoami diagnostics, not
+        // silently deliver and misroute the reply.
+        let state = state_with_victim_and_recipient().await;
+
+        let (status, body) = send_msg(
+            State(state.clone()),
+            Json(SendBody {
+                from: "victim".into(),
+                to: "recipient".into(),
+                message: "impersonated".into(),
+                expects_reply: true,
+                responds_to: None,
+                done: false,
+                sender_ctx: Some(crate::daemon_protocol::SenderContext { pane: None }),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let err = body["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("ouija whoami"),
+            "rejection must steer the caller to whoami, got: {err}"
+        );
+
+        // The impersonated message must not have left a pending reply on the
+        // recipient — the send never happened.
+        let proto = state.protocol.read().await;
+        assert!(
+            !proto.pending_replies.contains_key("recipient"),
+            "rejected send must not create pending-reply state"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_rejects_claim_from_wrong_pane() {
+        let state = state_with_victim_and_recipient().await;
+
+        let (status, body) = send_msg(
+            State(state),
+            Json(SendBody {
+                from: "victim".into(),
+                to: "recipient".into(),
+                message: "impersonated".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+                sender_ctx: Some(crate::daemon_protocol::SenderContext {
+                    pane: Some("%other".into()),
+                }),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let err = body["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("%victim") && err.contains("%other"),
+            "rejection must name both panes, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_with_matching_sender_ctx_delivers() {
+        let state = state_with_victim_and_recipient().await;
+
+        let (status, body) = send_msg(
+            State(state),
+            Json(SendBody {
+                from: "victim".into(),
+                to: "recipient".into(),
+                message: "genuine".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+                sender_ctx: Some(crate::daemon_protocol::SenderContext {
+                    pane: Some("%victim".into()),
+                }),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body: {:?}", body.0);
+    }
+
+    #[tokio::test]
+    async fn send_without_sender_ctx_is_allowed_for_legacy_callers() {
+        // Old CLIs, curl, and e2e scripts send no context; they must keep
+        // working across the version-skew window.
+        let state = state_with_victim_and_recipient().await;
+
+        let (status, body) = send_msg(
+            State(state),
+            Json(SendBody {
+                from: "victim".into(),
+                to: "recipient".into(),
+                message: "legacy".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+                sender_ctx: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body: {:?}", body.0);
+    }
+
+    #[test]
+    fn send_body_without_sender_ctx_field_still_deserializes() {
+        // Wire-level back-compat: an old CLI's JSON body has no sender_ctx.
+        let body: SendBody = serde_json::from_str(r#"{"from":"a","to":"b","message":"hi"}"#)
+            .expect("legacy body must deserialize");
+        assert!(body.sender_ctx.is_none());
     }
 
     async fn state_with_opencode_prompt_server() -> (SharedState, tokio::task::JoinHandle<()>) {
@@ -4238,6 +4403,7 @@ mod tests {
                 expects_reply: false,
                 responds_to: None,
                 done: false,
+                sender_ctx: None,
             }),
         )
         .await;
@@ -4283,6 +4449,7 @@ mod tests {
                 expects_reply: false,
                 responds_to: None,
                 done: false,
+                sender_ctx: None,
             }),
         )
         .await;
@@ -4329,6 +4496,7 @@ mod tests {
                 expects_reply: false,
                 responds_to: None,
                 done: false,
+                sender_ctx: None,
             }),
         )
         .await;
@@ -4370,6 +4538,7 @@ mod tests {
                 expects_reply: false,
                 responds_to: None,
                 done: false,
+                sender_ctx: None,
             }),
         )
         .await;
@@ -4543,6 +4712,7 @@ mod tests {
                 expects_reply: true,
                 responds_to: None,
                 done: false,
+                sender_ctx: None,
             }),
         )
         .await;
@@ -4607,6 +4777,7 @@ mod tests {
                 expects_reply: true,
                 responds_to: None,
                 done: false,
+                sender_ctx: None,
             }),
         )
         .await;
@@ -4668,6 +4839,7 @@ mod tests {
                 expects_reply: false,
                 responds_to: Some(7),
                 done: true,
+                sender_ctx: None,
             }),
         )
         .await;
@@ -4830,6 +5002,7 @@ mod tests {
                         expects_reply: false,
                         responds_to: Some(7),
                         done: true,
+                        sender_ctx: None,
                     }),
                 )
                 .await
@@ -4944,6 +5117,7 @@ mod tests {
                         expects_reply: false,
                         responds_to: Some(7),
                         done: true,
+                        sender_ctx: None,
                     }),
                 )
                 .await
@@ -5009,6 +5183,7 @@ mod tests {
                 expects_reply: false,
                 responds_to: Some(7),
                 done: true,
+                sender_ctx: None,
             }),
         )
         .await;
@@ -5061,6 +5236,7 @@ mod tests {
                 expects_reply: false,
                 responds_to: Some(7),
                 done: false,
+                sender_ctx: None,
             }),
         )
         .await;
@@ -5109,6 +5285,7 @@ mod tests {
                 expects_reply: false,
                 responds_to: None,
                 done: false,
+                sender_ctx: None,
             }),
         )
         .await;

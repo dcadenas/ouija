@@ -710,6 +710,81 @@ pub(crate) fn validate_backend_session_id_boundary(backend_sid: &str) -> Option<
     }
 }
 
+/// Caller-supplied execution context accompanying an `/api/send` sender
+/// claim, used to cross-check that the claimed `from` is plausibly the
+/// caller's own session (task #1395).
+///
+/// Absence of the whole object means "legacy caller" (old CLI, curl, e2e
+/// scripts) and is exempted at the API layer; `pane: None` inside a present
+/// context means the new CLI positively reports it has no `$TMUX_PANE`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SenderContext {
+    #[serde(default)]
+    pub pane: Option<String>,
+}
+
+/// Boundary validation for `/api/send` sender claims (task #1395).
+///
+/// Pure and called from the API layer BEFORE `apply`, like
+/// [`validate_backend_session_id_boundary`]. Remote inbound messages
+/// (`Event::IncomingWire`) and internal daemon sends never pass through
+/// here, so their sender stamping is unaffected.
+///
+/// A claim fails only when it is provably wrong or unverifiable-but-
+/// verifiable-in-principle:
+/// - the claimed session is remote/human-origin — a local caller can never
+///   be one;
+/// - the claimed session is bound to a tmux pane and the caller reports a
+///   *different* pane;
+/// - the claimed session is bound to a tmux pane, the caller reports no
+///   pane at all, and the session's backend is tmux-native. Backends whose
+///   shell provably drops `$TMUX_PANE` (opencode) are exempt, because a
+///   session sending as itself could never offer pane proof.
+///
+/// Unregistered `from` ids pass: ghost senders (already-removed sessions)
+/// are legitimate in reply-cleanup flows, and existence is not what this
+/// check protects. It exists so one live local session cannot silently
+/// stamp another live local session as the sender.
+pub fn validate_sender_claim(
+    state: &DaemonState,
+    from: &str,
+    ctx: &SenderContext,
+) -> Result<(), String> {
+    let Some(session) = state.sessions.get(from) else {
+        return Ok(());
+    };
+    if !matches!(session.origin, Origin::Local) {
+        return Err(format!(
+            "sender claim rejected: '{from}' is a {} session, and a local caller cannot send \
+             as it. Run `ouija whoami` to get your own session id.",
+            session.origin.label()
+        ));
+    }
+    let Some(session_pane) = session.pane.as_deref() else {
+        return Ok(());
+    };
+    match ctx.pane.as_deref().filter(|p| !p.is_empty()) {
+        Some(caller_pane) if caller_pane == session_pane => Ok(()),
+        Some(caller_pane) => Err(format!(
+            "sender claim rejected: session '{from}' is bound to tmux pane {session_pane}, but \
+             this command ran in pane {caller_pane}. Run `ouija whoami` to get this pane's own \
+             session id. Never guess a sender id."
+        )),
+        None => {
+            if session.metadata.backend.as_deref() == Some("opencode") {
+                Ok(())
+            } else {
+                Err(format!(
+                    "sender claim rejected: session '{from}' is bound to tmux pane \
+                     {session_pane}, but this command ran outside tmux so the claim cannot be \
+                     verified. Your own session id is in your injected system prompt; run \
+                     `ouija whoami` for diagnostics. Never guess a sender id."
+                ))
+            }
+        }
+    }
+}
+
 // --- Implementation ---
 
 impl DaemonState {
@@ -2349,6 +2424,143 @@ impl DaemonState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- validate_sender_claim (task #1395) ---
+    //
+    // An opencode session (bash outside tmux) sent `--from <sibling>` where
+    // sibling was a real session bound to another pane; the reply was
+    // delivered to the wrong pane. /api/send must reject sender claims that
+    // are provably wrong (pane mismatch) or unprovable-but-verifiable
+    // (paneless caller claiming a tmux-native session). Callers that send no
+    // context at all (old CLIs, curl, e2e) are exempted at the API layer.
+
+    fn claim_state() -> DaemonState {
+        let mut state = DaemonState::new_for_model("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "tmux-native".into(),
+            pane: Some("%3".into()),
+            metadata: SessionMeta::default(),
+        });
+        state.apply(Event::Register {
+            id: "oc-session".into(),
+            pane: Some("%7".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_x".into()),
+                ..Default::default()
+            },
+        });
+        state
+    }
+
+    #[test]
+    fn sender_claim_with_matching_pane_is_allowed() {
+        let state = claim_state();
+        let ctx = SenderContext {
+            pane: Some("%3".into()),
+        };
+        assert_eq!(validate_sender_claim(&state, "tmux-native", &ctx), Ok(()));
+    }
+
+    #[test]
+    fn sender_claim_with_mismatched_pane_is_rejected() {
+        let state = claim_state();
+        let ctx = SenderContext {
+            pane: Some("%9".into()),
+        };
+        let err = validate_sender_claim(&state, "tmux-native", &ctx).unwrap_err();
+        assert!(
+            err.contains("%3") && err.contains("%9"),
+            "rejection must name both the session's pane and the caller's pane, got: {err}"
+        );
+        assert!(
+            err.contains("ouija whoami"),
+            "rejection must steer the caller to whoami, got: {err}"
+        );
+    }
+
+    #[test]
+    fn paneless_caller_cannot_claim_tmux_native_session() {
+        // The incident shape: opencode bash (no $TMUX_PANE) claiming a
+        // sibling session that lives in a tmux pane.
+        let state = claim_state();
+        let ctx = SenderContext { pane: None };
+        let err = validate_sender_claim(&state, "tmux-native", &ctx).unwrap_err();
+        assert!(
+            err.contains("ouija whoami"),
+            "rejection must steer the caller to whoami, got: {err}"
+        );
+        assert!(
+            err.contains("Never guess"),
+            "rejection must forbid guessing, got: {err}"
+        );
+    }
+
+    #[test]
+    fn paneless_caller_may_claim_opencode_session() {
+        // opencode's bash tool provably loses $TMUX_PANE, so an opencode
+        // session sending as itself can never offer pane proof.
+        let state = claim_state();
+        let ctx = SenderContext { pane: None };
+        assert_eq!(validate_sender_claim(&state, "oc-session", &ctx), Ok(()));
+    }
+
+    #[test]
+    fn paneless_caller_may_claim_paneless_session() {
+        let mut state = claim_state();
+        state.apply(Event::Register {
+            id: "headless".into(),
+            pane: None,
+            metadata: SessionMeta::default(),
+        });
+        let ctx = SenderContext { pane: None };
+        assert_eq!(validate_sender_claim(&state, "headless", &ctx), Ok(()));
+    }
+
+    #[test]
+    fn unregistered_sender_claim_passes_validation() {
+        // Ghost senders (already-removed sessions) are legitimate /api/send
+        // callers in e2e flows; existence is not this check's job.
+        let state = claim_state();
+        let ctx = SenderContext { pane: None };
+        assert_eq!(validate_sender_claim(&state, "not-a-session", &ctx), Ok(()));
+    }
+
+    #[test]
+    fn sender_claim_of_remote_session_is_rejected() {
+        let mut state = claim_state();
+        state.sessions.insert(
+            "peer/task".into(),
+            SessionEntry {
+                id: "peer/task".into(),
+                pane: None,
+                origin: Origin::Remote("npub1peer".into()),
+                metadata: SessionMeta::default(),
+                registered_at: 0,
+            },
+        );
+        let ctx = SenderContext {
+            pane: Some("%3".into()),
+        };
+        let err = validate_sender_claim(&state, "peer/task", &ctx).unwrap_err();
+        assert!(
+            err.contains("remote"),
+            "must explain a local caller cannot be a remote session, got: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_string_caller_pane_is_treated_as_absent() {
+        let state = claim_state();
+        let ctx = SenderContext {
+            pane: Some(String::new()),
+        };
+        let err = validate_sender_claim(&state, "tmux-native", &ctx).unwrap_err();
+        assert!(
+            err.contains("ouija whoami"),
+            "empty pane must not match anything nor bypass the check, got: {err}"
+        );
+    }
 
     #[test]
     fn session_meta_recurrence_fields_default() {
