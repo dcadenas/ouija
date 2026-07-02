@@ -117,14 +117,18 @@ ouija clear-reply SENDER_ID
 
 ## 7. Non-tmux contexts (opencode HTTP API, etc.)
 
-The CLI infers your session ID from `$TMUX_PANE`. In engines whose bash tool runs outside tmux, that variable is unset and `ouija ask/tell/reply` cannot resolve a sender. Use your public registered Ouija session id/name as the sender, such as `hub` or `feat/123-worker`.
+The CLI infers your session ID from `$TMUX_PANE`. In engines whose bash tool runs outside tmux, that variable is unset and `ouija ask/tell/reply` cannot resolve a sender automatically.
+
+Run `ouija whoami` to learn your own id. It resolves through the same signals the send commands use, prints the id on stdout, and fails loudly with per-signal diagnostics when it cannot identify you.
+
+Use only an exact id as the sender: the output of `ouija whoami`, your `$OUIJA_SESSION_ID`, or the id in your injected system prompt (`You are session "<id>" on the ouija mesh`). Never guess a sender id — not the project directory name, a branch name, or an entry picked from `ouija ls` (`ouija ls` shows all sessions but cannot tell you which one is you). A guessed `--from` impersonates another session and misroutes its replies; the daemon rejects claims it can disprove, but only an exact id is safe.
 
 Never use `opencode` or an OpenCode `backend_session_id` as `--from`. Those are backend implementation details, not public Ouija route targets.
 
 Two ways to provide the public Ouija sender id explicitly:
 
 ```bash
-# Per-command flag:
+# Per-command flag (id from `ouija whoami`, never a guess):
 ouija ask target-id "question" --from public-ouija-id
 ouija tell target-id "fyi" --from public-ouija-id
 ouija reply target-id 47 "result" --from public-ouija-id
@@ -134,7 +138,7 @@ export OUIJA_SESSION_ID=public-ouija-id
 ouija ask target-id "question"
 ```
 
-If you see an error about being unable to resolve the current session ID, supply `--from <public-ouija-id>` or set `OUIJA_SESSION_ID` to your public Ouija id. **Never run `ouija register` to "fix" this** — it would create a duplicate session entry, not register the caller.
+If you see an error about being unable to resolve the current session ID, run `ouija whoami` and follow its diagnostics. **Never run `ouija register` to "fix" this** — it would create a duplicate session entry, not register the caller.
 
 ## 8. Patterns
 

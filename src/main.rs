@@ -90,7 +90,7 @@ enum Command {
     Ask {
         to: String,
         message: String,
-        /// Sender session ID. Required outside tmux when `$OUIJA_SESSION_ID` is unset.
+        /// Sender session ID: the exact output of `ouija whoami` (never a guessed id)
         #[arg(long)]
         from: Option<String>,
     },
@@ -101,7 +101,7 @@ enum Command {
         /// Thread as progress update for a pending reply
         #[arg(long)]
         reply_to: Option<u64>,
-        /// Sender session ID. Required outside tmux when `$OUIJA_SESSION_ID` is unset.
+        /// Sender session ID: the exact output of `ouija whoami` (never a guessed id)
         #[arg(long)]
         from: Option<String>,
     },
@@ -116,7 +116,7 @@ enum Command {
         /// Expect a reply back
         #[arg(long)]
         expect_reply: bool,
-        /// Sender session ID. Required outside tmux when `$OUIJA_SESSION_ID` is unset.
+        /// Sender session ID: the exact output of `ouija whoami` (never a guessed id)
         #[arg(long)]
         from: Option<String>,
     },

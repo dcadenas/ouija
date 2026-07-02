@@ -62,7 +62,11 @@ export const OuijaPlugin: Plugin = async (ctx) => {
         }
       }
       try {
-        const publicSessionId = sid === "(unknown)" ? "<public-ouija-id>" : sid
+        const resolved = sid !== "(unknown)"
+        const publicSessionId = resolved ? sid : "YOUR_OUIJA_ID"
+        const senderGuidance = resolved
+          ? `Use your public Ouija session id (\`${publicSessionId}\`) as the sender. Never substitute another session's id.`
+          : `Your public Ouija session id could not be resolved when this session started. Run \`ouija whoami\` and use its exact output in place of \`YOUR_OUIJA_ID\` above; if it fails, relay its diagnostics to the user. Never guess a sender id \u2014 not the project directory name, a branch name, or an entry picked from \`ouija ls\`. A guessed \`--from\` impersonates another session and misroutes its replies.`
         output.system.push(`
 # Ouija Mesh
 
@@ -78,7 +82,7 @@ Your text output is NOT visible to other sessions. Use the \`ouija\` CLI to comm
 - Reply to <msg id="N">: \`ouija reply TARGET N "result" --from ${publicSessionId}\`
 - Progress update (does not clear pending reply): \`ouija tell TARGET "working on it" --reply-to N --from ${publicSessionId}\`
 
-Use your public Ouija session id (\`${publicSessionId}\`) as the sender. Do not use the backend label \`opencode\` or an OpenCode backend_session_id as \`--from\`.
+${senderGuidance} Do not use the backend label \`opencode\` or an OpenCode backend_session_id as \`--from\`.
 
 Load the ouija skill for full documentation on session management, task scheduling, and patterns.
 `)

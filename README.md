@@ -144,6 +144,7 @@ ouija start-server   # run the daemon process
 ouija stop-server    # stop it
 ouija self-update    # install latest from crates.io, restart
 ouija ls             # list sessions on the mesh
+ouija whoami         # print this session's own id (fails loudly if unresolvable)
 ouija ask <to> "msg" # send a message expecting a reply
 ouija tell <to> "msg" # fire-and-forget message
 ouija reply <to> <id> "msg" # reply to a message
@@ -153,7 +154,7 @@ ouija nodes          # list connected nodes
 ouija config ...     # manage settings, Nostr DM users, router
 ```
 
-Outside tmux, such as an OpenCode HTTP/API tool process, pass the public registered Ouija session id as the sender: `ouija ask <to> "msg" --from <public-ouija-id>`. Do not use backend labels like `opencode` or opaque OpenCode `backend_session_id` values as `--from`.
+Outside tmux, such as an OpenCode HTTP/API tool process, run `ouija whoami` to resolve your own session id and pass its exact output as the sender: `ouija ask <to> "msg" --from <public-ouija-id>`. Never guess a sender id (project directory name, branch name, or an `ouija ls` entry) — the daemon rejects sender claims it can disprove. Do not use backend labels like `opencode` or opaque OpenCode `backend_session_id` values as `--from`.
 
 Run `ouija --help` for the full command list.
 
