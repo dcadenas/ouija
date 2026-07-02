@@ -2130,8 +2130,13 @@ async fn cli_post(path: &str, body: &serde_json::Value) -> anyhow::Result<()> {
     let url = format!("http://localhost:{port}{path}");
     let client = reqwest::Client::new();
     let resp = client.post(&url).json(body).send().await?;
+    let status = resp.status();
     let text = resp.text().await?;
-    println!("{text}");
+    // Non-2xx must exit non-zero (like cli_delete): a rejected send that
+    // prints its error but exits 0 reads as success to scripted callers,
+    // which is the silent-failure shape task #1395 removes.
+    let body = classify_http_response(status, &text)?;
+    println!("{body}");
     Ok(())
 }
 

@@ -1353,6 +1353,68 @@ assert_eq "31c: role updated via REST" "$role3" "hook-registered"
 api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/dev/null
 api "$BASE" POST /api/register -d "{\"id\":\"sess-b\",\"pane\":\"$PANE_B\"}" >/dev/null
 
+# ═══════════════════════════════════════════════════════════════════
+# SENDER IDENTITY GUARDRAILS (task #1395)
+# ═══════════════════════════════════════════════════════════════════
+# sess-a2 (PANE_A) and sess-b (PANE_B) were restored by test 31 cleanup.
+
+log "Test 32: ouija whoami resolves identity and fails loudly when it cannot"
+# (a) env-var resolution of a registered id
+out=$(env -u TMUX_PANE OUIJA_SESSION_ID=sess-b OUIJA_PORT=$PORT ouija whoami 2>/dev/null)
+assert_eq "32a: whoami resolves \$OUIJA_SESSION_ID id" "$out" "sess-b"
+# (b) no signals at all — non-zero exit, per-signal diagnostics, no guessing
+set +e
+err=$(env -u TMUX_PANE -u OUIJA_SESSION_ID OUIJA_PORT=$PORT ouija whoami 2>&1)
+rc=$?
+set -e
+assert_eq "32b: whoami exits non-zero when unresolvable" "$rc" "1"
+assert_contains "32b: diagnostics report missing TMUX_PANE" "$err" '$TMUX_PANE: not set'
+assert_contains "32b: diagnostics report missing OUIJA_SESSION_ID" "$err" '$OUIJA_SESSION_ID: not set'
+assert_contains "32b: diagnostics forbid guessing" "$err" 'Never guess'
+assert_not_contains "32b: diagnostics never suggest ouija register" "$err" 'ouija register'
+# (c) stale env id that is not registered — fails loudly instead of stamping it
+set +e
+err=$(env -u TMUX_PANE OUIJA_SESSION_ID=ghost-stale-id OUIJA_PORT=$PORT ouija whoami 2>&1)
+rc=$?
+set -e
+assert_eq "32c: whoami rejects unregistered stale id" "$rc" "1"
+assert_contains "32c: stale id named in diagnostics" "$err" "ghost-stale-id"
+assert_contains "32c: explains rename/removal cause" "$err" "renamed"
+
+log "Test 33: /api/send rejects disprovable sender claims, keeps legacy callers"
+# (a) incident shape: paneless caller claims a tmux-native session
+result=$(curl -s -X POST "${BASE}/api/send" -H 'Content-Type: application/json' \
+    -d '{"from":"sess-a2","to":"sess-b","message":"impersonated","sender_ctx":{"pane":null}}')
+assert_contains "33a: paneless claim of tmux session rejected" "$result" "sender claim rejected"
+assert_contains "33a: rejection points at whoami" "$result" "ouija whoami"
+# (b) caller in a different pane than the claimed session
+result=$(curl -s -X POST "${BASE}/api/send" -H 'Content-Type: application/json' \
+    -d '{"from":"sess-a2","to":"sess-b","message":"impersonated","sender_ctx":{"pane":"%999"}}')
+assert_contains "33b: wrong-pane claim rejected" "$result" "sender claim rejected"
+assert_contains "33b: rejection names the caller pane" "$result" "%999"
+# (c) matching pane still delivers
+result=$(curl -s -X POST "${BASE}/api/send" -H 'Content-Type: application/json' \
+    -d "{\"from\":\"sess-a2\",\"to\":\"sess-b\",\"message\":\"genuine ctx\",\"sender_ctx\":{\"pane\":\"$PANE_A\"}}")
+assert_contains "33c: matching-pane send delivered" "$result" "delivered"
+# (d) legacy caller without sender_ctx is unaffected (version-skew safety)
+result=$(curl -s -X POST "${BASE}/api/send" -H 'Content-Type: application/json' \
+    -d '{"from":"sess-a2","to":"sess-b","message":"legacy caller"}')
+assert_contains "33d: ctx-less legacy send delivered" "$result" "delivered"
+
+log "Test 34: CLI sends sender_ctx — non-tmux claim of tmux session fails via CLI"
+# The CLI always attaches sender_ctx, so a non-tmux shell claiming a
+# tmux-native session via $OUIJA_SESSION_ID must be rejected end-to-end.
+set +e
+err=$(env -u TMUX_PANE OUIJA_SESSION_ID=sess-b OUIJA_PORT=$PORT \
+    ouija tell sess-a2 "cli impersonation attempt" 2>&1)
+rc=$?
+set -e
+assert_eq "34a: CLI send rejected non-zero" "$rc" "1"
+assert_contains "34a: CLI surfaces sender claim rejection" "$err" "sender claim rejected"
+# Positive control: same claim from the session's own pane succeeds
+out=$(env TMUX_PANE="$PANE_B" OUIJA_PORT=$PORT ouija tell sess-a2 "cli genuine send" 2>&1)
+assert_contains "34b: CLI send from own pane delivered" "$out" "delivered"
+
 # ── Daemon logs ──────────────────────────────────────────────────────
 log "Daemon logs:"
 cat /tmp/ouija-test/daemon.log 2>/dev/null || true
