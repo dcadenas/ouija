@@ -751,7 +751,12 @@ pub struct SenderContext {
 ///   allowed only when the caller's own resolved id (`ctx.self_id`, from
 ///   `$OUIJA_SESSION_ID`) equals `from` — i.e. it is sending as *itself*. A
 ///   paneless claim of a *sibling* opencode session, whose `self_id` differs,
-///   is rejected (task #1395 review).
+///   is rejected (task #1395 review);
+/// - the claimed session is opencode-backed with no pane binding (unmanaged
+///   `opencode serve` adoption). No pane exists to compare, but the claim is
+///   still verifiable: the only honest claimant is the session itself, so
+///   the same `self_id == from` binding applies. Non-opencode paneless
+///   sessions remain genuinely unverifiable and pass (task #1395 review f0).
 ///
 /// Unregistered `from` ids pass: ghost senders (already-removed sessions)
 /// are legitimate in reply-cleanup flows, and existence is not what this
@@ -772,8 +777,17 @@ pub fn validate_sender_claim(
             session.origin.label()
         ));
     }
+    let is_opencode = session.metadata.backend.as_deref() == Some("opencode");
     let Some(session_pane) = session.pane.as_deref() else {
-        return Ok(());
+        // No pane to compare, but an opencode-backed session is still
+        // verifiable: only itself can honestly claim it, and it resolves its
+        // own id via `$OUIJA_SESSION_ID` (#1395 review f0). Other paneless
+        // sessions offer no signal at all and pass.
+        return if is_opencode {
+            verify_opencode_self_claim(from, ctx)
+        } else {
+            Ok(())
+        };
     };
     match ctx.pane.as_deref().filter(|p| !p.is_empty()) {
         Some(caller_pane) if caller_pane == session_pane => Ok(()),
@@ -783,25 +797,12 @@ pub fn validate_sender_claim(
              session id. Never guess a sender id."
         )),
         None => {
-            if session.metadata.backend.as_deref() == Some("opencode") {
+            if is_opencode {
                 // A paneless opencode caller cannot offer pane proof, but it
                 // resolves its OWN id via `$OUIJA_SESSION_ID`. Bind the claim
                 // to that self-report: sending as itself is allowed; claiming
                 // a sibling opencode session (self_id != from) is not.
-                match ctx.self_id.as_deref().filter(|s| !s.is_empty()) {
-                    Some(self_id) if self_id == from => Ok(()),
-                    _ => Err(format!(
-                        "sender claim rejected: '{from}' is an opencode session on tmux pane \
-                         {session_pane}, but this command's own resolved id is {}. A session \
-                         may only send as itself. Run `ouija whoami` for your own id. Never \
-                         guess a sender id.",
-                        ctx.self_id
-                            .as_deref()
-                            .filter(|s| !s.is_empty())
-                            .map(|s| format!("'{s}'"))
-                            .unwrap_or_else(|| "unresolved".into())
-                    )),
-                }
+                verify_opencode_self_claim(from, ctx)
             } else {
                 Err(format!(
                     "sender claim rejected: session '{from}' is bound to tmux pane \
@@ -811,6 +812,26 @@ pub fn validate_sender_claim(
                 ))
             }
         }
+    }
+}
+
+/// Bind a claim of an opencode-backed session to the caller's own resolved
+/// id: only `self_id == from` (a self-send) passes. Unresolved or mismatched
+/// self-reports fail closed — an unmanaged shell without `$OUIJA_SESSION_ID`
+/// has no provable identity (task #1395 review f0).
+fn verify_opencode_self_claim(from: &str, ctx: &SenderContext) -> Result<(), String> {
+    match ctx.self_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(self_id) if self_id == from => Ok(()),
+        _ => Err(format!(
+            "sender claim rejected: '{from}' is an opencode session, and only itself may send \
+             as it, but this command's own resolved id is {}. Run `ouija whoami` for your own \
+             id. Never guess a sender id.",
+            ctx.self_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| format!("'{s}'"))
+                .unwrap_or_else(|| "unresolved".into())
+        )),
     }
 }
 
@@ -2588,6 +2609,74 @@ mod tests {
             err.contains("unresolved"),
             "rejection must note the caller's own id is unresolved, got: {err}"
         );
+    }
+
+    /// Register an OpenCode-backed session with no pane binding, the shape an
+    /// unmanaged `opencode serve` adoption produces.
+    fn register_paneless_opencode(state: &mut DaemonState, id: &str) {
+        state.apply(Event::Register {
+            id: id.into(),
+            pane: None,
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some(format!("ses_{id}")),
+                ..Default::default()
+            },
+        });
+    }
+
+    #[test]
+    fn paneless_caller_cannot_claim_paneless_opencode_session_of_sibling() {
+        // The paneless-victim gap (#1395 review f0): an OpenCode session with
+        // pane:None must not be claimable by a sibling just because there is
+        // no pane to compare. The victim's honest claimant is the session
+        // itself, which resolves its own id via $OUIJA_SESSION_ID.
+        let mut state = claim_state();
+        register_paneless_opencode(&mut state, "oc-serve");
+        let ctx = SenderContext {
+            pane: None,
+            self_id: Some("oc-sibling".into()),
+        };
+        let err = validate_sender_claim(&state, "oc-serve", &ctx).unwrap_err();
+        assert!(
+            err.contains("oc-sibling") && err.contains("oc-serve"),
+            "rejection must name both the caller's own id and the claim, got: {err}"
+        );
+        assert!(
+            err.contains("ouija whoami") && err.contains("Never guess"),
+            "rejection must steer to whoami and forbid guessing, got: {err}"
+        );
+    }
+
+    #[test]
+    fn paned_caller_cannot_claim_paneless_opencode_session() {
+        // A tmux-native session (pane proof for ITS OWN id) claiming a
+        // pane:None OpenCode victim: the victim has no pane to match, so the
+        // claim is judged by self_id, which names a different session.
+        let mut state = claim_state();
+        register_paneless_opencode(&mut state, "oc-serve");
+        let ctx = SenderContext {
+            pane: Some("%3".into()),
+            self_id: Some("tmux-native".into()),
+        };
+        let err = validate_sender_claim(&state, "oc-serve", &ctx).unwrap_err();
+        assert!(
+            err.contains("tmux-native"),
+            "rejection must name the caller's own resolved id, got: {err}"
+        );
+    }
+
+    #[test]
+    fn paneless_opencode_session_may_claim_itself() {
+        // Honest self-send from an unmanaged opencode shell whose
+        // $OUIJA_SESSION_ID resolved: self_id == from proves the claim.
+        let mut state = claim_state();
+        register_paneless_opencode(&mut state, "oc-serve");
+        let ctx = SenderContext {
+            pane: None,
+            self_id: Some("oc-serve".into()),
+        };
+        assert_eq!(validate_sender_claim(&state, "oc-serve", &ctx), Ok(()));
     }
 
     #[test]
