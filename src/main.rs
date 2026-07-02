@@ -1956,8 +1956,10 @@ enum WhoamiOutcome {
 ///
 /// This is the single identity path: `require_my_session_id` (used by
 /// ask/tell/reply/announce/rename) and `ouija whoami` both resolve through
-/// here, so whoami's answer is by construction the sender those commands
-/// would use. See [`pick_session_id`] for the precedence and rationale.
+/// here and then both run [`verify_resolved_id_registered`], so whoami's
+/// answer is by construction the sender those commands would use — including
+/// the registration check, which now rejects a stale id on the send path too.
+/// See [`pick_session_id`] for the precedence and rationale.
 async fn whoami_outcome() -> WhoamiOutcome {
     let tmux_pane = std::env::var("TMUX_PANE").ok();
     let pane_var = tmux_pane.as_deref().and_then(tmux_var::get);
@@ -2006,55 +2008,74 @@ async fn whoami_outcome() -> WhoamiOutcome {
     }
 }
 
-/// Look up the registered session ID for the current execution context.
+/// Verify a resolved id is a registered *local* session, leniently.
 ///
-/// See [`whoami_outcome`] for the shared resolution path.
-async fn resolve_my_session_id() -> Option<String> {
-    match whoami_outcome().await {
-        WhoamiOutcome::Resolved { id, .. } => Some(id),
-        WhoamiOutcome::Unresolved(_) => None,
+/// Both `ouija whoami` and the send path ([`require_my_session_id`]) run this,
+/// so a stale or renamed id (e.g. a persistent shell's `$OUIJA_SESSION_ID`
+/// after a rename) fails on the send path as loudly as in `ouija whoami`
+/// instead of silently stamping a wrong sender.
+///
+/// Only a positive disproof fails: when the daemon is unreachable or its
+/// status is unparseable, we warn and accept, because an outage must not block
+/// an otherwise-correct send. `PaneLookup` ids came from `/api/status` itself,
+/// so registration is already proven and the round trip is skipped.
+async fn verify_resolved_id_registered(id: &str, source: &IdentitySource) -> anyhow::Result<()> {
+    if matches!(source, IdentitySource::PaneLookup) {
+        return Ok(());
+    }
+    let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
+    let url = format!("http://localhost:{port}/api/status");
+    match reqwest::get(&url).await {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(status) => {
+                if status_lists_local_session(&status, id) {
+                    Ok(())
+                } else {
+                    anyhow::bail!(format_unregistered_identity(id, source))
+                }
+            }
+            Err(_) => {
+                eprintln!(
+                    "warning: could not parse daemon status, could not verify '{id}' is registered"
+                );
+                Ok(())
+            }
+        },
+        Err(_) => {
+            eprintln!("warning: daemon unreachable, could not verify '{id}' is registered");
+            Ok(())
+        }
     }
 }
 
 /// Resolve session ID or bail with a helpful error.
 ///
-/// See [`unresolved_sender_error`] for why the message must not mention
-/// `ouija register` or invite a guessed `--from`.
+/// Resolves through [`whoami_outcome`] and then [`verify_resolved_id_registered`],
+/// the exact same two steps `ouija whoami` performs — so whoami's answer is by
+/// construction the sender this returns. See [`unresolved_sender_error`] for
+/// why the unresolved message must not mention `ouija register` or invite a
+/// guessed `--from`.
 async fn require_my_session_id() -> anyhow::Result<String> {
-    resolve_my_session_id()
-        .await
-        .ok_or_else(|| anyhow::anyhow!(unresolved_sender_error()))
+    match whoami_outcome().await {
+        WhoamiOutcome::Resolved { id, source } => {
+            verify_resolved_id_registered(&id, &source).await?;
+            Ok(id)
+        }
+        WhoamiOutcome::Unresolved(_) => Err(anyhow::anyhow!(unresolved_sender_error())),
+    }
 }
 
 /// `ouija whoami`: print the resolved session id to stdout (source note on
 /// stderr, so `--from $(ouija whoami)` stays clean), or fail loudly with
 /// signal-by-signal diagnostics.
 ///
-/// When the daemon is reachable, the resolved id is also verified against
-/// the registered local sessions — a stale `$OUIJA_SESSION_ID` left over
-/// from a rename must fail here rather than stamp a wrong sender later.
+/// Registration is verified via [`verify_resolved_id_registered`], the same
+/// check the send path runs — a stale `$OUIJA_SESSION_ID` left over from a
+/// rename fails here (and there) rather than stamp a wrong sender later.
 async fn cli_whoami() -> anyhow::Result<()> {
     match whoami_outcome().await {
         WhoamiOutcome::Resolved { id, source } => {
-            // PaneLookup ids come from /api/status itself, so registration
-            // is already proven; re-fetching would just repeat the call.
-            if !matches!(source, IdentitySource::PaneLookup) {
-                let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
-                let url = format!("http://localhost:{port}/api/status");
-                match reqwest::get(&url).await {
-                    Ok(resp) => {
-                        let status: serde_json::Value = resp.json().await.unwrap_or_default();
-                        if !status_lists_local_session(&status, &id) {
-                            anyhow::bail!(format_unregistered_identity(&id, &source));
-                        }
-                    }
-                    Err(_) => {
-                        eprintln!(
-                            "warning: daemon unreachable, could not verify '{id}' is registered"
-                        );
-                    }
-                }
-            }
+            verify_resolved_id_registered(&id, &source).await?;
             eprintln!("resolved via {source}");
             println!("{id}");
             Ok(())

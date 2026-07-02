@@ -1415,6 +1415,22 @@ assert_contains "34a: CLI surfaces sender claim rejection" "$err" "sender claim 
 out=$(env TMUX_PANE="$PANE_B" OUIJA_PORT=$PORT ouija tell sess-a2 "cli genuine send" 2>&1)
 assert_contains "34b: CLI send from own pane delivered" "$out" "delivered"
 
+log "Test 35: send path rejects a stale/unregistered resolved id as loudly as whoami"
+# The send path (ouija tell) now runs the same registration check whoami does,
+# so a persistent shell's stale $OUIJA_SESSION_ID fails BEFORE stamping a wrong
+# sender — closing the whoami/send-path asymmetry (#1395 review). Mirrors 32c.
+set +e
+err=$(env -u TMUX_PANE OUIJA_SESSION_ID=ghost-stale-send OUIJA_PORT=$PORT \
+    ouija tell sess-a2 "stale-id send attempt" 2>&1)
+rc=$?
+set -e
+assert_eq "35a: CLI send with stale id exits non-zero" "$rc" "1"
+assert_contains "35a: stale id named in the error" "$err" "ghost-stale-send"
+assert_contains "35a: error explains rename/removal cause" "$err" "renamed"
+# The rejected send must never have reached the recipient as a pending reply.
+result=$(curl -s "${BASE}/api/status")
+assert_not_contains "35a: stale-id send left no pending reply" "$result" "ghost-stale-send"
+
 # ── Daemon logs ──────────────────────────────────────────────────────
 log "Daemon logs:"
 cat /tmp/ouija-test/daemon.log 2>/dev/null || true
