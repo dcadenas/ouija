@@ -1924,9 +1924,24 @@ fn pick_session_id(
 /// cross-check the claimed sender (task #1395). Always present in bodies
 /// from this CLI version — its very presence tells the daemon the pane
 /// field is a positive report, not an omission by an older caller.
+///
+/// `self_id` is the caller's own resolved id from the local (network-free)
+/// signals: the pane var when in tmux, else `$OUIJA_SESSION_ID`. A paneless
+/// opencode session resolves it via `$OUIJA_SESSION_ID`, which is how the
+/// daemon verifies a paneless self-send. The remaining `LookupByPane` case
+/// only occurs when `$TMUX_PANE` is set, and the daemon then validates by
+/// pane match, so leaving `self_id` unset there is harmless.
 fn sender_context() -> serde_json::Value {
+    let tmux_pane = std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty());
+    let pane_var = tmux_pane.as_deref().and_then(tmux_var::get);
+    let env_var = std::env::var("OUIJA_SESSION_ID").ok();
+    let self_id = match pick_session_id(tmux_pane.as_deref(), pane_var, env_var) {
+        SessionIdResolution::Found(id, _) => Some(id),
+        SessionIdResolution::LookupByPane(_) | SessionIdResolution::None => None,
+    };
     serde_json::json!({
-        "pane": std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty()),
+        "pane": tmux_pane,
+        "self_id": self_id,
     })
 }
 

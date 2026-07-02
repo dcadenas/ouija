@@ -4240,7 +4240,10 @@ mod tests {
                 expects_reply: true,
                 responds_to: None,
                 done: false,
-                sender_ctx: Some(crate::daemon_protocol::SenderContext { pane: None }),
+                sender_ctx: Some(crate::daemon_protocol::SenderContext {
+                    pane: None,
+                    self_id: None,
+                }),
             }),
         )
         .await;
@@ -4276,6 +4279,7 @@ mod tests {
                 done: false,
                 sender_ctx: Some(crate::daemon_protocol::SenderContext {
                     pane: Some("%other".into()),
+                    ..Default::default()
                 }),
             }),
         )
@@ -4304,6 +4308,108 @@ mod tests {
                 done: false,
                 sender_ctx: Some(crate::daemon_protocol::SenderContext {
                     pane: Some("%victim".into()),
+                    ..Default::default()
+                }),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body: {:?}", body.0);
+    }
+
+    #[tokio::test]
+    async fn send_rejects_paneless_opencode_sibling_impersonation() {
+        // Two opencode sessions in the same dir. The caller resolved its own
+        // id as "oc-b" but claims "oc-a" as the sender. No pane, mismatched
+        // self_id — the residual hole the #1395 review closed. Must 403.
+        let state = crate::state::AppState::new_for_test();
+        for (id, pane) in [("oc-a", "%a"), ("oc-b", "%b")] {
+            state
+                .apply_and_execute(crate::daemon_protocol::Event::Register {
+                    id: id.into(),
+                    pane: Some(pane.into()),
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some(format!("ses_{id}")),
+                        ..Default::default()
+                    },
+                })
+                .await;
+        }
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "recipient".into(),
+                pane: Some("%recipient".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+
+        let (status, body) = send_msg(
+            State(state.clone()),
+            Json(SendBody {
+                from: "oc-a".into(),
+                to: "recipient".into(),
+                message: "impersonated".into(),
+                expects_reply: true,
+                responds_to: None,
+                done: false,
+                sender_ctx: Some(crate::daemon_protocol::SenderContext {
+                    pane: None,
+                    self_id: Some("oc-b".into()),
+                }),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let err = body["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("ouija whoami"),
+            "rejection must steer the caller to whoami, got: {err}"
+        );
+        let proto = state.protocol.read().await;
+        assert!(
+            !proto.pending_replies.contains_key("recipient"),
+            "rejected send must not create pending-reply state"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_from_opencode_session_as_itself_delivers() {
+        // The legit opencode self-send: no pane, but self_id matches the
+        // claimed sender. Must deliver.
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc-a".into(),
+                pane: Some("%a".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_a".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "recipient".into(),
+                pane: Some("%recipient".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+
+        let (status, body) = send_msg(
+            State(state),
+            Json(SendBody {
+                from: "oc-a".into(),
+                to: "recipient".into(),
+                message: "genuine".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+                sender_ctx: Some(crate::daemon_protocol::SenderContext {
+                    pane: None,
+                    self_id: Some("oc-a".into()),
                 }),
             }),
         )
