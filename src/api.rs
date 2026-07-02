@@ -709,7 +709,9 @@ pub struct SendBody {
     #[serde(default)]
     done: bool,
     /// Caller execution context for sender-claim validation (task #1395).
-    /// Absent for legacy callers (old CLIs, curl); see
+    /// Absent for legacy callers (old CLIs, curl); such bodies are accepted by
+    /// deliberate policy (see the `None` arm of [`send_msg`]) rather than
+    /// fail-closed. Present bodies are checked by
     /// [`crate::daemon_protocol::validate_sender_claim`].
     #[serde(default)]
     sender_ctx: Option<crate::daemon_protocol::SenderContext>,
@@ -753,12 +755,25 @@ pub async fn send_msg(
             }
         }
         None => {
-            // Legacy caller (old CLI, curl, e2e scripts): no context to
-            // verify. Logged so operators can spot unverified senders.
+            // Absent sender_ctx (old CLI, curl, e2e scripts): accepted by
+            // deliberate policy, not fail-closed. See the workflow decision
+            // "How should /api/send treat a body with no sender_ctx".
+            //
+            // Rejecting here would break honest pre-#1395 CLIs, which are
+            // wire-indistinguishable from a spoofing curl once the field is
+            // gone. We do NOT version-fence: the residual bypass is a
+            // deliberate curl, which is outside this feature's threat model
+            // (accidental misattribution by cooperative agents — a caller with
+            // curl access can already forge anything). The honest ctx-less
+            // path sends the caller's own correct `from` and does not misroute,
+            // and the fixed CLI now always attaches sender_ctx, so this covers
+            // only transient version skew and manual ops. Logged at warn so an
+            // operator can still spot unverified senders.
             tracing::warn!(
                 from = %body.from,
                 to = %body.to,
-                "send accepted without sender context; sender claim unverified"
+                "send accepted without sender context (accepted-residual policy); \
+                 sender claim unverified"
             );
         }
     }
@@ -4421,7 +4436,9 @@ mod tests {
     #[tokio::test]
     async fn send_without_sender_ctx_is_allowed_for_legacy_callers() {
         // Old CLIs, curl, and e2e scripts send no context; they must keep
-        // working across the version-skew window.
+        // working across the version-skew window. This is the deliberate
+        // accepted-residual policy (not fail-closed): absent ctx is allowed
+        // and only warned. See the `None` arm of `send_msg`.
         let state = state_with_victim_and_recipient().await;
 
         let (status, body) = send_msg(
