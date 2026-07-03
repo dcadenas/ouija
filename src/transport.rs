@@ -80,6 +80,7 @@ pub async fn broadcast_local_sessions(state: &AppState) {
             metadata: None,
         })
         .collect();
+    let aliases = proto.exportable_local_aliases();
     let seq = proto.wire_seq;
     drop(proto);
 
@@ -87,6 +88,7 @@ pub async fn broadcast_local_sessions(state: &AppState) {
         sessions: local_infos,
         daemon_id: state.config.npub.clone(),
         daemon_name: state.config.name.clone(),
+        aliases,
         seq,
     };
     broadcast(state, &msg).await;

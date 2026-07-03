@@ -1246,6 +1246,22 @@ impl DaemonState {
         }
     }
 
+    /// Rename aliases whose target is a local networked session — the subset
+    /// this daemon owns and may gossip in its [`crate::protocol::WireMessage::SessionList`].
+    /// Aliases for remote sessions (learned from other daemons), non-networked
+    /// targets, and dangling targets are excluded.
+    pub fn exportable_local_aliases(&self) -> std::collections::BTreeMap<String, String> {
+        self.aliases
+            .iter()
+            .filter(|(_, target)| {
+                self.sessions
+                    .get(target.as_str())
+                    .is_some_and(|s| matches!(s.origin, Origin::Local) && s.metadata.networked)
+            })
+            .map(|(old, new)| (old.clone(), new.clone()))
+            .collect()
+    }
+
     fn apply_rename(&mut self, old_id: &str, new_id: &str) -> Vec<Effect> {
         let mut effects = Vec::new();
 
@@ -1742,8 +1758,9 @@ impl DaemonState {
                 sessions,
                 daemon_id,
                 daemon_name,
+                aliases,
                 ..
-            } => self.apply_incoming_session_list(sessions, &daemon_id, &daemon_name),
+            } => self.apply_incoming_session_list(sessions, aliases, &daemon_id, &daemon_name),
             WireMessage::SessionRemove {
                 id,
                 daemon_id,
@@ -2073,6 +2090,7 @@ impl DaemonState {
     fn apply_incoming_session_list(
         &mut self,
         session_infos: Vec<crate::protocol::SessionInfo>,
+        aliases: std::collections::BTreeMap<String, String>,
         daemon_id: &str,
         daemon_name: &str,
     ) -> Vec<Effect> {
@@ -2118,6 +2136,18 @@ impl DaemonState {
             if let Some(ref m) = info.metadata {
                 entry.metadata = metadata_to_session_meta(Some(m));
             }
+        }
+
+        // Install rename aliases carried by the list (same keyed+bare shape
+        // as apply_incoming_renamed). This is the loss-tolerant path: the
+        // one-shot SessionRenamed DM can be dropped, but the list gossip is
+        // rebroadcast on rename and periodically, so the "was renamed to"
+        // send hint survives.
+        for (old_id, new_id) in &aliases {
+            let old_key = remote_session_key(daemon_name, old_id);
+            let new_key = remote_session_key(daemon_name, new_id);
+            self.add_alias(&old_key, &new_key);
+            self.add_alias(old_id, new_id);
         }
 
         // Remove stale entries
@@ -4616,6 +4646,7 @@ mod tests {
                 ],
                 daemon_id: "npub1remote".into(),
                 daemon_name: "remote-host".into(),
+                aliases: Default::default(),
                 seq: 1,
             },
             sender_npub: Some("npub1remote".into()),
@@ -4647,6 +4678,7 @@ mod tests {
                 ],
                 daemon_id: "npub1remote".into(),
                 daemon_name: "remote-host".into(),
+                aliases: Default::default(),
                 seq: 1,
             },
             sender_npub: Some("npub1remote".into()),
@@ -4660,6 +4692,7 @@ mod tests {
                 }],
                 daemon_id: "npub1remote".into(),
                 daemon_name: "remote-host".into(),
+                aliases: Default::default(),
                 seq: 2,
             },
             sender_npub: Some("npub1remote".into()),
@@ -4689,6 +4722,7 @@ mod tests {
                 }],
                 daemon_id: "npub1remote".into(),
                 daemon_name: "remote-host".into(),
+                aliases: Default::default(),
                 seq: 1,
             },
             sender_npub: Some("npub1remote".into()),
@@ -4752,6 +4786,101 @@ mod tests {
         assert_eq!(state.aliases.get("old"), Some(&"new".into()));
     }
 
+    // The SessionRenamed DM is a one-shot with no delivery guarantee; the
+    // rename alias must also ride the (immediately-rebroadcast and periodic)
+    // SessionList gossip so a lost DM cannot permanently strip peers of the
+    // "was renamed to" send hint (e2e-nostr R2 race).
+    #[test]
+    fn incoming_session_list_installs_rename_aliases() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::IncomingWire {
+            msg: crate::protocol::WireMessage::SessionList {
+                sessions: vec![crate::protocol::SessionInfo {
+                    id: "new".into(),
+                    metadata: None,
+                }],
+                daemon_id: "npub1remote".into(),
+                daemon_name: "remote-host".into(),
+                aliases: std::iter::once(("old".to_string(), "new".to_string())).collect(),
+                seq: 1,
+            },
+            sender_npub: Some("npub1remote".into()),
+        });
+        assert!(state.sessions.contains_key("remote-host/new"));
+        assert_eq!(
+            state.aliases.get("remote-host/old"),
+            Some(&"remote-host/new".into())
+        );
+        assert_eq!(state.aliases.get("old"), Some(&"new".into()));
+
+        // A send to the pre-rename name must produce the rename hint,
+        // not a plain not-found.
+        let effects = state.apply(Event::Send {
+            from: "local-sender".into(),
+            to: "remote-host/old".into(),
+            message: "hi".into(),
+            expects_reply: false,
+            responds_to: None,
+            done: false,
+        });
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::SendFailed { renamed_to: Some(new), .. } if new == "remote-host/new"
+        )));
+    }
+
+    #[test]
+    fn exportable_local_aliases_only_includes_local_networked_targets() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.sessions.insert(
+            "dst".into(),
+            SessionEntry {
+                id: "dst".into(),
+                origin: Origin::Local,
+                ..Default::default()
+            },
+        );
+        let hidden_meta = SessionMeta {
+            networked: false,
+            ..Default::default()
+        };
+        state.sessions.insert(
+            "hidden".into(),
+            SessionEntry {
+                id: "hidden".into(),
+                origin: Origin::Local,
+                metadata: hidden_meta,
+                ..Default::default()
+            },
+        );
+        state.sessions.insert(
+            "remote-host/new".into(),
+            SessionEntry {
+                id: "remote-host/new".into(),
+                origin: Origin::Remote("npub1remote".into()),
+                ..Default::default()
+            },
+        );
+        state.aliases.insert("src".into(), "dst".into());
+        state.aliases.insert("old-hidden".into(), "hidden".into());
+        state
+            .aliases
+            .insert("remote-host/old".into(), "remote-host/new".into());
+        state.aliases.insert("dangling".into(), "gone".into());
+
+        let exported = state.exportable_local_aliases();
+        assert_eq!(exported.get("src"), Some(&"dst".to_string()));
+        assert!(
+            !exported.contains_key("old-hidden"),
+            "non-networked targets must not be gossiped"
+        );
+        assert!(
+            !exported.contains_key("remote-host/old"),
+            "remote-session aliases are the owning daemon's to gossip"
+        );
+        assert!(!exported.contains_key("dangling"));
+    }
+
     #[test]
     fn incoming_stale_seq_dropped() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
@@ -4764,6 +4893,7 @@ mod tests {
                 }],
                 daemon_id: "npub1remote".into(),
                 daemon_name: "remote-host".into(),
+                aliases: Default::default(),
                 seq: 5,
             },
             sender_npub: Some("npub1remote".into()),
@@ -4774,6 +4904,7 @@ mod tests {
                 sessions: vec![],
                 daemon_id: "npub1remote".into(),
                 daemon_name: "remote-host".into(),
+                aliases: Default::default(),
                 seq: 3,
             },
             sender_npub: Some("npub1remote".into()),
@@ -5924,6 +6055,7 @@ mod tests {
             ],
             daemon_id: "npub0".into(),
             daemon_name: "host0".into(),
+            aliases: Default::default(),
             seq: d0.wire_seq,
         };
         let d1_list = crate::protocol::WireMessage::SessionList {
@@ -5933,6 +6065,7 @@ mod tests {
             }],
             daemon_id: "npub1".into(),
             daemon_name: "host1".into(),
+            aliases: Default::default(),
             seq: d1.wire_seq,
         };
         d1.apply(Event::IncomingWire {
@@ -6001,6 +6134,7 @@ mod tests {
             sessions: vec![],
             daemon_id: "npub0".into(),
             daemon_name: "host0".into(),
+            aliases: Default::default(),
             seq: d0.wire_seq + 1,
         };
         d1.apply(Event::IncomingWire {
@@ -6023,6 +6157,7 @@ mod tests {
             }],
             daemon_id: "npub0".into(),
             daemon_name: "host0".into(),
+            aliases: Default::default(),
             seq: if final_seq > 2 { 2 } else { final_seq }, // stale
         };
         d1.apply(Event::IncomingWire {
@@ -6459,6 +6594,7 @@ mod stateright_model {
                                     .collect(),
                                 daemon_id,
                                 daemon_name,
+                                aliases: Default::default(),
                                 seq,
                             },
                             sender_npub: None,

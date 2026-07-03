@@ -47,6 +47,13 @@ pub enum WireMessage {
         sessions: Vec<SessionInfo>,
         daemon_id: String,
         daemon_name: String,
+        /// Rename aliases (old id -> current id) for the listed local
+        /// sessions. Lets peers rebuild "was renamed to" send hints even when
+        /// the one-shot [`Self::SessionRenamed`] DM is lost — the session-list
+        /// gossip (rebroadcast on rename and periodically) repairs the alias
+        /// table. Absent in pre-alias daemons; empty map on deserialize.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        aliases: std::collections::BTreeMap<String, String>,
         #[serde(default)]
         seq: u64,
     },
@@ -264,12 +271,24 @@ mod tests {
             ],
             daemon_id: "d1".into(),
             daemon_name: "host1".into(),
+            aliases: std::iter::once(("old".to_string(), "new".to_string())).collect(),
             seq: 1,
         };
         let decoded = round_trip(&msg);
-        assert!(
-            matches!(decoded, WireMessage::SessionList { sessions, .. } if sessions.len() == 2)
-        );
+        assert!(matches!(
+            decoded,
+            WireMessage::SessionList { sessions, aliases, .. }
+            if sessions.len() == 2 && aliases.get("old").map(String::as_str) == Some("new")
+        ));
+    }
+
+    #[test]
+    fn session_list_backward_compat() {
+        // Pre-alias format without the aliases field should deserialize
+        // with an empty alias map.
+        let json = r#"{"type":"SessionList","sessions":[{"id":"s1"}],"daemon_id":"d1","daemon_name":"host1","seq":1}"#;
+        let msg: WireMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, WireMessage::SessionList { aliases, .. } if aliases.is_empty()));
     }
 
     #[test]
