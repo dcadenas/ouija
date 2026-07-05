@@ -1,4 +1,5 @@
 pub mod claude_code;
+pub mod codex;
 pub mod opencode;
 
 use std::path::Path;
@@ -116,6 +117,7 @@ impl BackendRegistry {
             vec![
                 Arc::new(claude_code::ClaudeCode) as _,
                 Arc::new(opencode::OpenCode) as _,
+                Arc::new(codex::Codex) as _,
             ],
             "claude-code",
         )
@@ -308,7 +310,25 @@ mod tests {
         assert!(registry.uses_http_delivery("opencode"));
         // claude-code is driven through the tmux TUI.
         assert!(!registry.uses_http_delivery("claude-code"));
+        // codex-cli is driven through the tmux TUI, not HTTP.
+        assert!(!registry.uses_http_delivery("codex-cli"));
         // Unknown backends default to false.
         assert!(!registry.uses_http_delivery("nonexistent"));
+    }
+
+    #[test]
+    fn registry_includes_codex_backend() {
+        let registry = BackendRegistry::default_registry();
+        let codex = registry
+            .get("codex-cli")
+            .expect("codex-cli backend must be registered");
+        assert_eq!(codex.cli_name(), "codex");
+        // Its process name participates in the global process-name sweep.
+        assert!(
+            registry
+                .all_process_names()
+                .iter()
+                .any(|n| n == "codex")
+        );
     }
 }

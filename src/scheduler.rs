@@ -942,26 +942,20 @@ fn scheduled_prompt_backend_session_id(
     }
 }
 
-/// Poll a pane until one of `names` appears as the current command (blocking).
+/// Poll a pane until one of `names` appears anywhere in its process tree
+/// (blocking).
+///
+/// Uses `pane_alive` (a process-tree walk) rather than matching only
+/// `pane_current_command`: assistants launched through a shell or npx/node
+/// wrapper (e.g. `codex`, whose foreground command reads as `node`) run the
+/// real long-lived process as a descendant, which the current-command check
+/// would miss.
 fn wait_for_process(pane: &str, names: &[&str], timeout_secs: u64) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     while std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_secs(REVIVAL_POLL_SECS));
-        if let Ok(output) = std::process::Command::new("tmux")
-            .args([
-                "display-message",
-                "-t",
-                pane,
-                "-p",
-                "#{pane_current_command}",
-            ])
-            .output()
-        {
-            let current = String::from_utf8_lossy(&output.stdout);
-            let current = current.trim();
-            if names.contains(&current) {
-                return true;
-            }
+        if crate::tmux::pane_alive(pane, names) {
+            return true;
         }
     }
     false

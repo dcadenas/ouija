@@ -378,9 +378,10 @@ async fn main() -> anyhow::Result<()> {
                 let available = registry.available();
                 if available.is_empty() {
                     eprintln!(
-                        "error: no coding backend found in PATH. Install claude-code or opencode.\n\
+                        "error: no coding backend found in PATH. Install claude-code, opencode, or codex.\n\
                          See: https://docs.anthropic.com/en/docs/claude-code\n\
-                         See: https://opencode.ai"
+                         See: https://opencode.ai\n\
+                         See: https://developers.openai.com/codex"
                     );
                     std::process::exit(1);
                 }
