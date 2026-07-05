@@ -36,12 +36,19 @@ fn hooks_dir(codex_home: &Path) -> PathBuf {
 /// Build the merged `hooks.json` content for Codex, layering Ouija's hook
 /// entries onto any existing config without clobbering the user's own hooks.
 ///
+/// Returns `None` when `existing` is present but does not parse as JSON — the
+/// caller must then leave the file untouched rather than overwrite it, so a
+/// routine `start-server` never silently discards user hook config (finding f3).
+/// This is conservative even if Codex accepts a JSON superset: a serde parse
+/// failure would not prove the user's file is actually invalid, so overwriting
+/// it would be wrong. `None`/absent existing installs fresh onto `{}`.
+///
 /// Idempotent: an Ouija-owned group is identified by a `command` that lives under
 /// `hooks_dir`. For each managed event we drop any prior Ouija group and append a
 /// fresh one, so re-installs neither duplicate nor accumulate stale script paths.
 /// Non-Ouija hooks (other events, and the user's own groups within a managed
 /// event) are preserved verbatim.
-fn merge_hooks_json(existing: Option<&str>, hooks_dir: &Path) -> serde_json::Value {
+fn merge_hooks_json(existing: Option<&str>, hooks_dir: &Path) -> Option<serde_json::Value> {
     let dir_prefix = format!("{}/", hooks_dir.display());
     let is_ouija_group = |group: &serde_json::Value| -> bool {
         group["hooks"].as_array().is_some_and(|inner| {
@@ -53,9 +60,11 @@ fn merge_hooks_json(existing: Option<&str>, hooks_dir: &Path) -> serde_json::Val
         })
     };
 
-    let mut root: serde_json::Value = existing
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
+    let mut root: serde_json::Value = match existing {
+        // Present but unparseable → refuse to touch it (return None).
+        Some(s) => serde_json::from_str(s).ok()?,
+        None => serde_json::json!({}),
+    };
     if !root.is_object() {
         root = serde_json::json!({});
     }
@@ -86,7 +95,7 @@ fn merge_hooks_json(existing: Option<&str>, hooks_dir: &Path) -> serde_json::Val
             "hooks": [ { "type": "command", "command": command } ]
         }));
     }
-    root
+    Some(root)
 }
 
 /// Write Ouija's Codex hook scripts and merged `hooks.json` under `codex_home`.
@@ -107,8 +116,16 @@ fn install_to(codex_home: &Path) -> anyhow::Result<()> {
 
     let hooks_path = codex_home.join("hooks.json");
     let existing = std::fs::read_to_string(&hooks_path).ok();
-    let merged = merge_hooks_json(existing.as_deref(), &dir);
-    std::fs::write(&hooks_path, serde_json::to_string_pretty(&merged)?)?;
+    match merge_hooks_json(existing.as_deref(), &dir) {
+        Some(merged) => std::fs::write(&hooks_path, serde_json::to_string_pretty(&merged)?)?,
+        // Existing hooks.json is present but does not parse. Leave it untouched
+        // rather than silently discard the user's config; warn so it's visible.
+        None => eprintln!(
+            "warning: {} is not valid JSON — leaving it untouched. Ouija Codex hooks were not \
+             merged; fix or remove the file and re-run to enable them.",
+            hooks_path.display()
+        ),
+    }
     Ok(())
 }
 
@@ -446,7 +463,7 @@ mod tests {
     #[test]
     fn merge_hooks_json_fresh_registers_all_three_events() {
         let hooks_dir = Path::new("/home/user/.codex/ouija-hooks");
-        let merged = merge_hooks_json(None, hooks_dir);
+        let merged = merge_hooks_json(None, hooks_dir).unwrap();
         let hooks = &merged["hooks"];
         for (event, script) in [
             ("SessionStart", "codex-register.sh"),
@@ -464,8 +481,8 @@ mod tests {
     #[test]
     fn merge_hooks_json_is_idempotent() {
         let hooks_dir = Path::new("/home/user/.codex/ouija-hooks");
-        let once = merge_hooks_json(None, hooks_dir);
-        let twice = merge_hooks_json(Some(&once.to_string()), hooks_dir);
+        let once = merge_hooks_json(None, hooks_dir).unwrap();
+        let twice = merge_hooks_json(Some(&once.to_string()), hooks_dir).unwrap();
         assert_eq!(once, twice, "second install must not duplicate ouija hooks");
         // Exactly one SessionStart group (no duplication).
         assert_eq!(twice["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
@@ -489,7 +506,7 @@ mod tests {
             }
         })
         .to_string();
-        let merged = merge_hooks_json(Some(&existing), hooks_dir);
+        let merged = merge_hooks_json(Some(&existing), hooks_dir).unwrap();
         // Unrelated event preserved verbatim.
         assert_eq!(
             merged["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
@@ -527,7 +544,7 @@ mod tests {
             }
         })
         .to_string();
-        let merged = merge_hooks_json(Some(&stale), hooks_dir);
+        let merged = merge_hooks_json(Some(&stale), hooks_dir).unwrap();
         let stops = merged["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stops.len(), 1, "stale ouija group must be replaced: {merged}");
         assert_eq!(
@@ -573,5 +590,32 @@ mod tests {
             1,
             "re-install must not duplicate hooks: {hooks_json}"
         );
+    }
+
+    #[test]
+    fn merge_hooks_json_none_when_existing_unparseable() {
+        // An existing-but-unparseable hooks.json must signal "do not touch",
+        // never be silently treated as empty and overwritten (finding f3).
+        let hooks_dir = Path::new("/home/user/.codex/ouija-hooks");
+        assert!(merge_hooks_json(Some("{ not valid json"), hooks_dir).is_none());
+        // A present-but-empty string is also unparseable → leave untouched.
+        assert!(merge_hooks_json(Some(""), hooks_dir).is_none());
+        // No existing file still installs fresh.
+        assert!(merge_hooks_json(None, hooks_dir).is_some());
+    }
+
+    #[test]
+    fn install_to_leaves_unparseable_hooks_json_untouched() {
+        let home = tempfile::tempdir().unwrap();
+        let hooks_path = home.path().join("hooks.json");
+        let garbage = "{ this is not valid json — user hand-edit in progress";
+        std::fs::write(&hooks_path, garbage).unwrap();
+
+        install_to(home.path()).unwrap();
+
+        // The user's file must survive verbatim — never silently discarded.
+        assert_eq!(std::fs::read_to_string(&hooks_path).unwrap(), garbage);
+        // Scripts are still written (harmless); only hooks.json is left alone.
+        assert!(home.path().join("ouija-hooks/codex-register.sh").is_file());
     }
 }
