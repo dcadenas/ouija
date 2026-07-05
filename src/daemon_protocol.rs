@@ -12,6 +12,11 @@ pub struct DaemonState {
     pub daemon_name: String,
     pub sessions: BTreeMap<String, SessionEntry>,
     pub aliases: BTreeMap<String, String>,
+    /// Rename aliases this daemon created for its own local sessions
+    /// (`old_id -> new_id`). Provenance-tracked: only [`Self::apply_rename`]
+    /// writes here, so remote-ingested aliases can never be exported as ours.
+    /// This is the sole source for [`Self::exportable_local_aliases`].
+    pub local_rename_aliases: BTreeMap<String, String>,
     pub wire_seq: u64,
     pub last_seen_seq: BTreeMap<String, u64>,
     /// Pending replies: session_id → list of pending msg_ids
@@ -710,6 +715,131 @@ pub(crate) fn validate_backend_session_id_boundary(backend_sid: &str) -> Option<
     }
 }
 
+/// Caller-supplied execution context accompanying an `/api/send` sender
+/// claim, used to cross-check that the claimed `from` is plausibly the
+/// caller's own session (task #1395).
+///
+/// Absence of the whole object means "legacy caller" (old CLI, curl, e2e
+/// scripts) and is exempted at the API layer; `pane: None` inside a present
+/// context means the new CLI positively reports it has no `$TMUX_PANE`.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct SenderContext {
+    /// The caller's `$TMUX_PANE`, if any. `None` (in a present context) means
+    /// the caller positively reports it runs outside tmux.
+    #[serde(default)]
+    pub pane: Option<String>,
+    /// The caller's own resolved session id, from the same signal path
+    /// `ouija whoami` uses (`$OUIJA_SESSION_ID` / pane var). Populated even by
+    /// paneless backends (opencode/HttpApi resolve it via `$OUIJA_SESSION_ID`),
+    /// so a paneless self-send can prove `from` is the caller and a paneless
+    /// claim of a *sibling* session cannot.
+    #[serde(default)]
+    pub self_id: Option<String>,
+}
+
+/// Boundary validation for `/api/send` sender claims (task #1395).
+///
+/// Pure and called from the API layer BEFORE `apply`, like
+/// [`validate_backend_session_id_boundary`]. Remote inbound messages
+/// (`Event::IncomingWire`) and internal daemon sends never pass through
+/// here, so their sender stamping is unaffected.
+///
+/// A claim fails only when it is provably wrong or unverifiable-but-
+/// verifiable-in-principle:
+/// - the claimed session is remote/human-origin — a local caller can never
+///   be one;
+/// - the claimed session is bound to a tmux pane and the caller reports a
+///   *different* pane;
+/// - the claimed session is bound to a tmux pane and the caller reports no
+///   pane at all. A tmux-native session cannot be claimed this way. For a
+///   backend whose shell provably drops `$TMUX_PANE` (opencode), the claim is
+///   allowed only when the caller's own resolved id (`ctx.self_id`, from
+///   `$OUIJA_SESSION_ID`) equals `from` — i.e. it is sending as *itself*. A
+///   paneless claim of a *sibling* opencode session, whose `self_id` differs,
+///   is rejected (task #1395 review);
+/// - the claimed session is opencode-backed with no pane binding (unmanaged
+///   `opencode serve` adoption). No pane exists to compare, but the claim is
+///   still verifiable: the only honest claimant is the session itself, so
+///   the same `self_id == from` binding applies. Non-opencode paneless
+///   sessions remain genuinely unverifiable and pass (task #1395 review f0).
+///
+/// Unregistered `from` ids pass: ghost senders (already-removed sessions)
+/// are legitimate in reply-cleanup flows, and existence is not what this
+/// check protects. It exists so one live local session cannot silently
+/// stamp another live local session as the sender.
+pub fn validate_sender_claim(
+    state: &DaemonState,
+    from: &str,
+    ctx: &SenderContext,
+) -> Result<(), String> {
+    let Some(session) = state.sessions.get(from) else {
+        return Ok(());
+    };
+    if !matches!(session.origin, Origin::Local) {
+        return Err(format!(
+            "sender claim rejected: '{from}' is a {} session, and a local caller cannot send \
+             as it. Run `ouija whoami` to get your own session id.",
+            session.origin.label()
+        ));
+    }
+    let is_opencode = session.metadata.backend.as_deref() == Some("opencode");
+    let Some(session_pane) = session.pane.as_deref() else {
+        // No pane to compare, but an opencode-backed session is still
+        // verifiable: only itself can honestly claim it, and it resolves its
+        // own id via `$OUIJA_SESSION_ID` (#1395 review f0). Other paneless
+        // sessions offer no signal at all and pass.
+        return if is_opencode {
+            verify_opencode_self_claim(from, ctx)
+        } else {
+            Ok(())
+        };
+    };
+    match ctx.pane.as_deref().filter(|p| !p.is_empty()) {
+        Some(caller_pane) if caller_pane == session_pane => Ok(()),
+        Some(caller_pane) => Err(format!(
+            "sender claim rejected: session '{from}' is bound to tmux pane {session_pane}, but \
+             this command ran in pane {caller_pane}. Run `ouija whoami` to get this pane's own \
+             session id. Never guess a sender id."
+        )),
+        None => {
+            if is_opencode {
+                // A paneless opencode caller cannot offer pane proof, but it
+                // resolves its OWN id via `$OUIJA_SESSION_ID`. Bind the claim
+                // to that self-report: sending as itself is allowed; claiming
+                // a sibling opencode session (self_id != from) is not.
+                verify_opencode_self_claim(from, ctx)
+            } else {
+                Err(format!(
+                    "sender claim rejected: session '{from}' is bound to tmux pane \
+                     {session_pane}, but this command ran outside tmux so the claim cannot be \
+                     verified. Your own session id is in your injected system prompt; run \
+                     `ouija whoami` for diagnostics. Never guess a sender id."
+                ))
+            }
+        }
+    }
+}
+
+/// Bind a claim of an opencode-backed session to the caller's own resolved
+/// id: only `self_id == from` (a self-send) passes. Unresolved or mismatched
+/// self-reports fail closed — an unmanaged shell without `$OUIJA_SESSION_ID`
+/// has no provable identity (task #1395 review f0).
+fn verify_opencode_self_claim(from: &str, ctx: &SenderContext) -> Result<(), String> {
+    match ctx.self_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(self_id) if self_id == from => Ok(()),
+        _ => Err(format!(
+            "sender claim rejected: '{from}' is an opencode session, and only itself may send \
+             as it, but this command's own resolved id is {}. Run `ouija whoami` for your own \
+             id. Never guess a sender id.",
+            ctx.self_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| format!("'{s}'"))
+                .unwrap_or_else(|| "unresolved".into())
+        )),
+    }
+}
+
 // --- Implementation ---
 
 impl DaemonState {
@@ -784,6 +914,15 @@ impl DaemonState {
 
     /// Core state machine. Apply an event, return effects.
     pub fn apply(&mut self, event: Event) -> Vec<Effect> {
+        let effects = self.dispatch(event);
+        // Any event may have removed the session a local rename alias points
+        // at; drop dead entries so the exportable set (and thus gossip) stays
+        // bounded regardless of which removal path ran (followup 666).
+        self.prune_local_rename_aliases();
+        effects
+    }
+
+    fn dispatch(&mut self, event: Event) -> Vec<Effect> {
         match event {
             Event::Register { id, pane, metadata } => self.apply_register(id, pane, metadata),
             Event::RegisterIfPaneUnbound {
@@ -1112,6 +1251,43 @@ impl DaemonState {
         self.aliases.retain(|k, v| k != v);
     }
 
+    /// Record a rename this daemon performed on one of its own local sessions.
+    /// Kept separate from [`Self::add_alias`] so provenance is explicit: this
+    /// map is the only thing [`Self::exportable_local_aliases`] gossips.
+    fn add_local_rename_alias(&mut self, old_id: &str, new_id: &str) {
+        if old_id == new_id {
+            return;
+        }
+        // Repoint existing chains (A→old becomes A→new) so a chain of renames
+        // collapses instead of accumulating.
+        for target in self.local_rename_aliases.values_mut() {
+            if *target == old_id {
+                *target = new_id.to_string();
+            }
+        }
+        self.local_rename_aliases
+            .insert(old_id.to_string(), new_id.to_string());
+        self.local_rename_aliases.retain(|k, v| k != v);
+    }
+
+    /// Drop local rename aliases whose target session no longer exists as a
+    /// local session. Bounds the map (and thus SessionList gossip) so a
+    /// long-lived, frequently-renaming daemon cannot grow it without limit.
+    fn prune_local_rename_aliases(&mut self) {
+        self.local_rename_aliases.retain(|_, target| {
+            self.sessions
+                .get(target.as_str())
+                .is_some_and(|s| matches!(s.origin, Origin::Local))
+        });
+    }
+
+    /// Whether `id` currently names a local session.
+    fn local_session_named(&self, id: &str) -> bool {
+        self.sessions
+            .get(id)
+            .is_some_and(|s| matches!(s.origin, Origin::Local))
+    }
+
     pub fn resolve_alias(&self, id: &str) -> Option<&str> {
         let target = self.aliases.get(id)?;
         if self.sessions.contains_key(target.as_str()) {
@@ -1119,6 +1295,22 @@ impl DaemonState {
         } else {
             None
         }
+    }
+
+    /// Rename aliases whose target is a local networked session — the subset
+    /// this daemon owns and may gossip in its [`crate::protocol::WireMessage::SessionList`].
+    /// Reads the provenance-tracked [`Self::local_rename_aliases`]; entries
+    /// with non-networked, non-local, or dangling targets are excluded.
+    pub fn exportable_local_aliases(&self) -> std::collections::BTreeMap<String, String> {
+        self.local_rename_aliases
+            .iter()
+            .filter(|(_, target)| {
+                self.sessions
+                    .get(target.as_str())
+                    .is_some_and(|s| matches!(s.origin, Origin::Local) && s.metadata.networked)
+            })
+            .map(|(old, new)| (old.clone(), new.clone()))
+            .collect()
     }
 
     fn apply_rename(&mut self, old_id: &str, new_id: &str) -> Vec<Effect> {
@@ -1172,6 +1364,8 @@ impl DaemonState {
         }
 
         self.add_alias(old_id, new_id);
+        // Provenance: this is a local rename, so it is exportable.
+        self.add_local_rename_alias(old_id, new_id);
 
         effects.push(Effect::RenameAgent {
             old_id: old_id.to_string(),
@@ -1558,13 +1752,22 @@ impl DaemonState {
             }
         }
 
-        // Drop stale wire messages
+        // Drop stale wire messages. Idempotent gossip drops stay at Debug (the
+        // next snapshot repairs them); dropping a non-idempotent message loses a
+        // one-shot delta, so surface it above Debug and name the type so the
+        // lost update is diagnosable post-hoc (followup 667).
         if let (Some(daemon_id), Some(seq)) = (msg.daemon_id(), msg.seq()) {
             if !self.accept_seq(daemon_id, seq) {
+                let kind = msg.kind();
+                let (level, note) = if msg.is_idempotent_gossip() {
+                    (LogLevel::Debug, "")
+                } else {
+                    (LogLevel::Warn, " — LOST UPDATE")
+                };
                 return vec![Effect::Log {
-                    level: LogLevel::Debug,
+                    level,
                     message: format!(
-                        "dropping stale message from {daemon_id} (seq={seq} < last_seen)"
+                        "dropping stale {kind} from {daemon_id} (seq={seq} < last_seen){note}"
                     ),
                 }];
             }
@@ -1617,8 +1820,9 @@ impl DaemonState {
                 sessions,
                 daemon_id,
                 daemon_name,
+                aliases,
                 ..
-            } => self.apply_incoming_session_list(sessions, &daemon_id, &daemon_name),
+            } => self.apply_incoming_session_list(sessions, aliases, &daemon_id, &daemon_name),
             WireMessage::SessionRemove {
                 id,
                 daemon_id,
@@ -1948,6 +2152,7 @@ impl DaemonState {
     fn apply_incoming_session_list(
         &mut self,
         session_infos: Vec<crate::protocol::SessionInfo>,
+        aliases: std::collections::BTreeMap<String, String>,
         daemon_id: &str,
         daemon_name: &str,
     ) -> Vec<Effect> {
@@ -1992,6 +2197,23 @@ impl DaemonState {
                 });
             if let Some(ref m) = info.metadata {
                 entry.metadata = metadata_to_session_meta(Some(m));
+            }
+        }
+
+        // Install rename aliases carried by the list (same keyed+bare shape
+        // as apply_incoming_renamed). This is the loss-tolerant path: the
+        // one-shot SessionRenamed DM can be dropped, but the list gossip is
+        // rebroadcast on rename and periodically, so the "was renamed to"
+        // send hint survives.
+        for (old_id, new_id) in &aliases {
+            let old_key = remote_session_key(daemon_name, old_id);
+            let new_key = remote_session_key(daemon_name, new_id);
+            self.add_alias(&old_key, &new_key);
+            // Guard: never let a remote rename alias a bare id onto our local
+            // namespace. If the bare new_id names a local session, the bare
+            // alias would misroute a send to old_id into our own session.
+            if !self.local_session_named(new_id) {
+                self.add_alias(old_id, new_id);
             }
         }
 
@@ -2089,7 +2311,11 @@ impl DaemonState {
         self.sessions.insert(new_key.clone(), new_entry);
 
         self.add_alias(&old_key, &new_key);
-        self.add_alias(old_id, new_id);
+        // Guard: see apply_incoming_session_list — a remote rename must not
+        // alias a bare id onto a local session of the same name.
+        if !self.local_session_named(new_id) {
+            self.add_alias(old_id, new_id);
+        }
 
         vec![Effect::Log {
             level: LogLevel::Info,
@@ -2349,6 +2575,301 @@ impl DaemonState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- validate_sender_claim (task #1395) ---
+    //
+    // An opencode session (bash outside tmux) sent `--from <sibling>` where
+    // sibling was a real session bound to another pane; the reply was
+    // delivered to the wrong pane. /api/send must reject sender claims that
+    // are provably wrong (pane mismatch) or unprovable-but-verifiable
+    // (paneless caller claiming a tmux-native session). Callers that send no
+    // context at all (old CLIs, curl, e2e) are exempted at the API layer.
+
+    fn claim_state() -> DaemonState {
+        let mut state = DaemonState::new_for_model("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "tmux-native".into(),
+            pane: Some("%3".into()),
+            metadata: SessionMeta::default(),
+        });
+        state.apply(Event::Register {
+            id: "oc-session".into(),
+            pane: Some("%7".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_x".into()),
+                ..Default::default()
+            },
+        });
+        state
+    }
+
+    #[test]
+    fn sender_claim_with_matching_pane_is_allowed() {
+        let state = claim_state();
+        let ctx = SenderContext {
+            pane: Some("%3".into()),
+            ..Default::default()
+        };
+        assert_eq!(validate_sender_claim(&state, "tmux-native", &ctx), Ok(()));
+    }
+
+    #[test]
+    fn sender_claim_with_mismatched_pane_is_rejected() {
+        let state = claim_state();
+        let ctx = SenderContext {
+            pane: Some("%9".into()),
+            ..Default::default()
+        };
+        let err = validate_sender_claim(&state, "tmux-native", &ctx).unwrap_err();
+        assert!(
+            err.contains("%3") && err.contains("%9"),
+            "rejection must name both the session's pane and the caller's pane, got: {err}"
+        );
+        assert!(
+            err.contains("ouija whoami"),
+            "rejection must steer the caller to whoami, got: {err}"
+        );
+    }
+
+    #[test]
+    fn paneless_caller_cannot_claim_tmux_native_session() {
+        // The incident shape: opencode bash (no $TMUX_PANE) claiming a
+        // sibling session that lives in a tmux pane.
+        let state = claim_state();
+        let ctx = SenderContext {
+            pane: None,
+            self_id: None,
+        };
+        let err = validate_sender_claim(&state, "tmux-native", &ctx).unwrap_err();
+        assert!(
+            err.contains("ouija whoami"),
+            "rejection must steer the caller to whoami, got: {err}"
+        );
+        assert!(
+            err.contains("Never guess"),
+            "rejection must forbid guessing, got: {err}"
+        );
+    }
+
+    #[test]
+    fn paneless_opencode_caller_may_claim_itself() {
+        // opencode's bash tool provably loses $TMUX_PANE, so an opencode
+        // session sending as itself can never offer pane proof. It proves the
+        // claim instead by resolving its own id from $OUIJA_SESSION_ID.
+        let state = claim_state();
+        let ctx = SenderContext {
+            pane: None,
+            self_id: Some("oc-session".into()),
+        };
+        assert_eq!(validate_sender_claim(&state, "oc-session", &ctx), Ok(()));
+    }
+
+    #[test]
+    fn paneless_opencode_caller_cannot_claim_sibling_opencode_session() {
+        // Two opencode sessions in the same dir: the caller resolved its own
+        // id as "oc-sibling" but claims to be "oc-session". No pane proof and
+        // a mismatched self_id — this is the residual impersonation hole the
+        // #1395 review closed. Must be rejected.
+        let mut state = claim_state();
+        state.apply(Event::Register {
+            id: "oc-sibling".into(),
+            pane: Some("%8".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_y".into()),
+                ..Default::default()
+            },
+        });
+        let ctx = SenderContext {
+            pane: None,
+            self_id: Some("oc-sibling".into()),
+        };
+        let err = validate_sender_claim(&state, "oc-session", &ctx).unwrap_err();
+        assert!(
+            err.contains("oc-sibling") && err.contains("oc-session"),
+            "rejection must name both the caller's own id and the claim, got: {err}"
+        );
+        assert!(
+            err.contains("ouija whoami") && err.contains("Never guess"),
+            "rejection must steer to whoami and forbid guessing, got: {err}"
+        );
+    }
+
+    #[test]
+    fn paneless_opencode_caller_without_self_id_is_rejected() {
+        // A present context with no pane AND no resolved self id cannot prove
+        // any claim, even of an opencode session.
+        let state = claim_state();
+        let ctx = SenderContext {
+            pane: None,
+            self_id: None,
+        };
+        let err = validate_sender_claim(&state, "oc-session", &ctx).unwrap_err();
+        assert!(
+            err.contains("unresolved"),
+            "rejection must note the caller's own id is unresolved, got: {err}"
+        );
+    }
+
+    /// Register an OpenCode-backed session with no pane binding, the shape an
+    /// unmanaged `opencode serve` adoption produces.
+    fn register_paneless_opencode(state: &mut DaemonState, id: &str) {
+        state.apply(Event::Register {
+            id: id.into(),
+            pane: None,
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some(format!("ses_{id}")),
+                ..Default::default()
+            },
+        });
+    }
+
+    #[test]
+    fn paneless_caller_cannot_claim_paneless_opencode_session_of_sibling() {
+        // The paneless-victim gap (#1395 review f0): an OpenCode session with
+        // pane:None must not be claimable by a sibling just because there is
+        // no pane to compare. The victim's honest claimant is the session
+        // itself, which resolves its own id via $OUIJA_SESSION_ID.
+        let mut state = claim_state();
+        register_paneless_opencode(&mut state, "oc-serve");
+        let ctx = SenderContext {
+            pane: None,
+            self_id: Some("oc-sibling".into()),
+        };
+        let err = validate_sender_claim(&state, "oc-serve", &ctx).unwrap_err();
+        assert!(
+            err.contains("oc-sibling") && err.contains("oc-serve"),
+            "rejection must name both the caller's own id and the claim, got: {err}"
+        );
+        assert!(
+            err.contains("ouija whoami") && err.contains("Never guess"),
+            "rejection must steer to whoami and forbid guessing, got: {err}"
+        );
+    }
+
+    #[test]
+    fn paned_caller_cannot_claim_paneless_opencode_session() {
+        // A tmux-native session (pane proof for ITS OWN id) claiming a
+        // pane:None OpenCode victim: the victim has no pane to match, so the
+        // claim is judged by self_id, which names a different session.
+        let mut state = claim_state();
+        register_paneless_opencode(&mut state, "oc-serve");
+        let ctx = SenderContext {
+            pane: Some("%3".into()),
+            self_id: Some("tmux-native".into()),
+        };
+        let err = validate_sender_claim(&state, "oc-serve", &ctx).unwrap_err();
+        assert!(
+            err.contains("tmux-native"),
+            "rejection must name the caller's own resolved id, got: {err}"
+        );
+    }
+
+    #[test]
+    fn paneless_opencode_session_may_claim_itself() {
+        // Honest self-send from an unmanaged opencode shell whose
+        // $OUIJA_SESSION_ID resolved: self_id == from proves the claim.
+        let mut state = claim_state();
+        register_paneless_opencode(&mut state, "oc-serve");
+        let ctx = SenderContext {
+            pane: None,
+            self_id: Some("oc-serve".into()),
+        };
+        assert_eq!(validate_sender_claim(&state, "oc-serve", &ctx), Ok(()));
+    }
+
+    #[test]
+    fn honest_self_send_with_unresolved_self_id_fails_closed() {
+        // Deliberate policy (#1395 review f0, option B): in an unmanaged
+        // `opencode serve` shell without $OUIJA_SESSION_ID, even a CORRECT
+        // --from is rejected, because the CLI cannot attach a matching
+        // self_id and the daemon cannot tell an honest self-send from a
+        // sibling impersonation. Onboarding cannot inject env into an
+        // already-running serve process, so this stays fail-closed; the
+        // plugin prompt tells agents to fix the environment, not retry.
+        let mut state = claim_state();
+        register_paneless_opencode(&mut state, "oc-serve");
+        let ctx = SenderContext {
+            pane: None,
+            self_id: None,
+        };
+        let err = validate_sender_claim(&state, "oc-serve", &ctx).unwrap_err();
+        assert!(
+            err.contains("unresolved"),
+            "rejection must say the caller's own id is unresolved, got: {err}"
+        );
+        assert!(
+            err.contains("ouija whoami"),
+            "rejection must steer the caller to whoami, got: {err}"
+        );
+    }
+
+    #[test]
+    fn paneless_caller_may_claim_paneless_session() {
+        let mut state = claim_state();
+        state.apply(Event::Register {
+            id: "headless".into(),
+            pane: None,
+            metadata: SessionMeta::default(),
+        });
+        let ctx = SenderContext {
+            pane: None,
+            self_id: None,
+        };
+        assert_eq!(validate_sender_claim(&state, "headless", &ctx), Ok(()));
+    }
+
+    #[test]
+    fn unregistered_sender_claim_passes_validation() {
+        // Ghost senders (already-removed sessions) are legitimate /api/send
+        // callers in e2e flows; existence is not this check's job.
+        let state = claim_state();
+        let ctx = SenderContext {
+            pane: None,
+            self_id: None,
+        };
+        assert_eq!(validate_sender_claim(&state, "not-a-session", &ctx), Ok(()));
+    }
+
+    #[test]
+    fn sender_claim_of_remote_session_is_rejected() {
+        let mut state = claim_state();
+        state.sessions.insert(
+            "peer/task".into(),
+            SessionEntry {
+                id: "peer/task".into(),
+                pane: None,
+                origin: Origin::Remote("npub1peer".into()),
+                metadata: SessionMeta::default(),
+                registered_at: 0,
+            },
+        );
+        let ctx = SenderContext {
+            pane: Some("%3".into()),
+            ..Default::default()
+        };
+        let err = validate_sender_claim(&state, "peer/task", &ctx).unwrap_err();
+        assert!(
+            err.contains("remote"),
+            "must explain a local caller cannot be a remote session, got: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_string_caller_pane_is_treated_as_absent() {
+        let state = claim_state();
+        let ctx = SenderContext {
+            pane: Some(String::new()),
+            ..Default::default()
+        };
+        let err = validate_sender_claim(&state, "tmux-native", &ctx).unwrap_err();
+        assert!(
+            err.contains("ouija whoami"),
+            "empty pane must not match anything nor bypass the check, got: {err}"
+        );
+    }
 
     #[test]
     fn session_meta_recurrence_fields_default() {
@@ -4196,6 +4717,7 @@ mod tests {
                 ],
                 daemon_id: "npub1remote".into(),
                 daemon_name: "remote-host".into(),
+                aliases: Default::default(),
                 seq: 1,
             },
             sender_npub: Some("npub1remote".into()),
@@ -4227,6 +4749,7 @@ mod tests {
                 ],
                 daemon_id: "npub1remote".into(),
                 daemon_name: "remote-host".into(),
+                aliases: Default::default(),
                 seq: 1,
             },
             sender_npub: Some("npub1remote".into()),
@@ -4240,6 +4763,7 @@ mod tests {
                 }],
                 daemon_id: "npub1remote".into(),
                 daemon_name: "remote-host".into(),
+                aliases: Default::default(),
                 seq: 2,
             },
             sender_npub: Some("npub1remote".into()),
@@ -4269,6 +4793,7 @@ mod tests {
                 }],
                 daemon_id: "npub1remote".into(),
                 daemon_name: "remote-host".into(),
+                aliases: Default::default(),
                 seq: 1,
             },
             sender_npub: Some("npub1remote".into()),
@@ -4332,6 +4857,192 @@ mod tests {
         assert_eq!(state.aliases.get("old"), Some(&"new".into()));
     }
 
+    // The SessionRenamed DM is a one-shot with no delivery guarantee; the
+    // rename alias must also ride the (immediately-rebroadcast and periodic)
+    // SessionList gossip so a lost DM cannot permanently strip peers of the
+    // "was renamed to" send hint (e2e-nostr R2 race).
+    #[test]
+    fn incoming_session_list_installs_rename_aliases() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::IncomingWire {
+            msg: crate::protocol::WireMessage::SessionList {
+                sessions: vec![crate::protocol::SessionInfo {
+                    id: "new".into(),
+                    metadata: None,
+                }],
+                daemon_id: "npub1remote".into(),
+                daemon_name: "remote-host".into(),
+                aliases: std::iter::once(("old".to_string(), "new".to_string())).collect(),
+                seq: 1,
+            },
+            sender_npub: Some("npub1remote".into()),
+        });
+        assert!(state.sessions.contains_key("remote-host/new"));
+        assert_eq!(
+            state.aliases.get("remote-host/old"),
+            Some(&"remote-host/new".into())
+        );
+        assert_eq!(state.aliases.get("old"), Some(&"new".into()));
+
+        // A send to the pre-rename name must produce the rename hint,
+        // not a plain not-found.
+        let effects = state.apply(Event::Send {
+            from: "local-sender".into(),
+            to: "remote-host/old".into(),
+            message: "hi".into(),
+            expects_reply: false,
+            responds_to: None,
+            done: false,
+        });
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::SendFailed { renamed_to: Some(new), .. } if new == "remote-host/new"
+        )));
+    }
+
+    #[test]
+    fn exportable_local_aliases_only_includes_local_networked_targets() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.sessions.insert(
+            "dst".into(),
+            SessionEntry {
+                id: "dst".into(),
+                origin: Origin::Local,
+                ..Default::default()
+            },
+        );
+        let hidden_meta = SessionMeta {
+            networked: false,
+            ..Default::default()
+        };
+        state.sessions.insert(
+            "hidden".into(),
+            SessionEntry {
+                id: "hidden".into(),
+                origin: Origin::Local,
+                metadata: hidden_meta,
+                ..Default::default()
+            },
+        );
+        state.sessions.insert(
+            "remote-host/new".into(),
+            SessionEntry {
+                id: "remote-host/new".into(),
+                origin: Origin::Remote("npub1remote".into()),
+                ..Default::default()
+            },
+        );
+        // Export reads the provenance-tracked local rename map, not the
+        // general alias table. Remote-session aliases are never recorded here,
+        // so a remote entry with a local-networked target still cannot leak.
+        state
+            .local_rename_aliases
+            .insert("src".into(), "dst".into());
+        state
+            .local_rename_aliases
+            .insert("old-hidden".into(), "hidden".into());
+        state
+            .local_rename_aliases
+            .insert("remote-host/old".into(), "remote-host/new".into());
+        state
+            .local_rename_aliases
+            .insert("dangling".into(), "gone".into());
+
+        let exported = state.exportable_local_aliases();
+        assert_eq!(exported.get("src"), Some(&"dst".to_string()));
+        assert!(
+            !exported.contains_key("old-hidden"),
+            "non-networked targets must not be gossiped"
+        );
+        assert!(
+            !exported.contains_key("remote-host/old"),
+            "remote-session aliases are the owning daemon's to gossip"
+        );
+        assert!(!exported.contains_key("dangling"));
+    }
+
+    // A remote daemon renaming one of its sessions to an id that happens to
+    // collide with a local session id must never (a) alias that bare id onto
+    // our local namespace, nor (b) leak into the aliases we gossip as ours.
+    // Provenance is tracked explicitly (local_rename_aliases), not inferred
+    // from a target-name lookup (arch-1).
+    #[test]
+    fn remote_rename_onto_local_id_does_not_alias_or_export_local_namespace() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.sessions.insert(
+            "shared".into(),
+            SessionEntry {
+                id: "shared".into(),
+                origin: Origin::Local,
+                metadata: SessionMeta {
+                    networked: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        // Remote rename: gone -> shared (bare new_id collides with our local id).
+        state.apply(Event::IncomingWire {
+            msg: crate::protocol::WireMessage::SessionRenamed {
+                old_id: "gone".into(),
+                new_id: "shared".into(),
+                daemon_id: "npub1remote".into(),
+                daemon_name: "remote-host".into(),
+                metadata: None,
+                seq: 1,
+            },
+            sender_npub: Some("npub1remote".into()),
+        });
+        assert_eq!(
+            state.resolve_alias("gone"),
+            None,
+            "a remote rename must not alias a bare id onto the local namespace"
+        );
+        assert!(
+            !state.exportable_local_aliases().contains_key("gone"),
+            "a remote-ingested alias must never be exported as our own"
+        );
+    }
+
+    // local_rename_aliases must not grow unboundedly: once the session an
+    // alias points at is gone, the entry is dead and is pruned so it can no
+    // longer ride SessionList gossip (followup 666).
+    #[test]
+    fn local_rename_alias_pruned_when_target_session_removed() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.sessions.insert(
+            "old".into(),
+            SessionEntry {
+                id: "old".into(),
+                origin: Origin::Local,
+                metadata: SessionMeta {
+                    networked: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        state.apply(Event::Rename {
+            old_id: "old".into(),
+            new_id: "new".into(),
+        });
+        assert!(
+            state.exportable_local_aliases().contains_key("old"),
+            "rename alias should export while its target session lives"
+        );
+        assert_eq!(state.local_rename_aliases.get("old"), Some(&"new".into()));
+
+        state.apply(Event::Remove {
+            id: "new".into(),
+            keep_worktree: false,
+        });
+        assert!(
+            !state.local_rename_aliases.contains_key("old"),
+            "dead rename alias must be pruned from the stored map"
+        );
+        assert!(!state.exportable_local_aliases().contains_key("old"));
+    }
+
     #[test]
     fn incoming_stale_seq_dropped() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
@@ -4344,6 +5055,7 @@ mod tests {
                 }],
                 daemon_id: "npub1remote".into(),
                 daemon_name: "remote-host".into(),
+                aliases: Default::default(),
                 seq: 5,
             },
             sender_npub: Some("npub1remote".into()),
@@ -4354,6 +5066,7 @@ mod tests {
                 sessions: vec![],
                 daemon_id: "npub1remote".into(),
                 daemon_name: "remote-host".into(),
+                aliases: Default::default(),
                 seq: 3,
             },
             sender_npub: Some("npub1remote".into()),
@@ -4368,6 +5081,55 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    // Dropping a stale idempotent gossip message is invisible (Debug) and
+    // harmless. Dropping a stale SessionRenamed is a lost update — the exact
+    // failure behind the e2e-nostr R2 investigation — so it must be visible in
+    // default-level logs and name the message type (followup 667).
+    #[test]
+    fn stale_non_idempotent_wire_drop_logged_above_debug() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        // Establish seq=5 from the peer.
+        state.apply(Event::IncomingWire {
+            msg: crate::protocol::WireMessage::SessionList {
+                sessions: vec![],
+                daemon_id: "npub1remote".into(),
+                daemon_name: "remote-host".into(),
+                aliases: Default::default(),
+                seq: 5,
+            },
+            sender_npub: Some("npub1remote".into()),
+        });
+        // A stale SessionRenamed (seq=3) carries rename info that is now lost.
+        let effects = state.apply(Event::IncomingWire {
+            msg: crate::protocol::WireMessage::SessionRenamed {
+                old_id: "old".into(),
+                new_id: "new".into(),
+                daemon_id: "npub1remote".into(),
+                daemon_name: "remote-host".into(),
+                metadata: None,
+                seq: 3,
+            },
+            sender_npub: Some("npub1remote".into()),
+        });
+        let (level, message) = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::Log { level, message } if message.contains("stale") => {
+                    Some((level, message))
+                }
+                _ => None,
+            })
+            .expect("stale drop should log");
+        assert!(
+            matches!(level, LogLevel::Warn),
+            "a stale non-idempotent drop must log above Debug, got {level:?}"
+        );
+        assert!(
+            message.contains("SessionRenamed"),
+            "drop log must name the message type: {message}"
+        );
     }
 
     #[test]
@@ -5504,6 +6266,7 @@ mod tests {
             ],
             daemon_id: "npub0".into(),
             daemon_name: "host0".into(),
+            aliases: Default::default(),
             seq: d0.wire_seq,
         };
         let d1_list = crate::protocol::WireMessage::SessionList {
@@ -5513,6 +6276,7 @@ mod tests {
             }],
             daemon_id: "npub1".into(),
             daemon_name: "host1".into(),
+            aliases: Default::default(),
             seq: d1.wire_seq,
         };
         d1.apply(Event::IncomingWire {
@@ -5581,6 +6345,7 @@ mod tests {
             sessions: vec![],
             daemon_id: "npub0".into(),
             daemon_name: "host0".into(),
+            aliases: Default::default(),
             seq: d0.wire_seq + 1,
         };
         d1.apply(Event::IncomingWire {
@@ -5603,6 +6368,7 @@ mod tests {
             }],
             daemon_id: "npub0".into(),
             daemon_name: "host0".into(),
+            aliases: Default::default(),
             seq: if final_seq > 2 { 2 } else { final_seq }, // stale
         };
         d1.apply(Event::IncomingWire {
@@ -6039,6 +6805,7 @@ mod stateright_model {
                                     .collect(),
                                 daemon_id,
                                 daemon_name,
+                                aliases: Default::default(),
                                 seq,
                             },
                             sender_npub: None,

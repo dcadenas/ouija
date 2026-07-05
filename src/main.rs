@@ -90,7 +90,7 @@ enum Command {
     Ask {
         to: String,
         message: String,
-        /// Sender session ID. Required outside tmux when `$OUIJA_SESSION_ID` is unset.
+        /// Sender session ID: the exact output of `ouija whoami` (never a guessed id)
         #[arg(long)]
         from: Option<String>,
     },
@@ -101,7 +101,7 @@ enum Command {
         /// Thread as progress update for a pending reply
         #[arg(long)]
         reply_to: Option<u64>,
-        /// Sender session ID. Required outside tmux when `$OUIJA_SESSION_ID` is unset.
+        /// Sender session ID: the exact output of `ouija whoami` (never a guessed id)
         #[arg(long)]
         from: Option<String>,
     },
@@ -116,12 +116,14 @@ enum Command {
         /// Expect a reply back
         #[arg(long)]
         expect_reply: bool,
-        /// Sender session ID. Required outside tmux when `$OUIJA_SESSION_ID` is unset.
+        /// Sender session ID: the exact output of `ouija whoami` (never a guessed id)
         #[arg(long)]
         from: Option<String>,
     },
     /// List sessions
     Ls,
+    /// Print this session's Ouija id (same resolution path as ask/tell/reply)
+    Whoami,
     /// Update session metadata
     Announce {
         #[arg(long)]
@@ -658,6 +660,7 @@ async fn main() -> anyhow::Result<()> {
                 "to": to,
                 "message": message,
                 "expects_reply": true,
+                "sender_ctx": sender_context(),
             });
             cli_post("/api/send", &body).await?;
         }
@@ -677,6 +680,7 @@ async fn main() -> anyhow::Result<()> {
                 "message": message,
                 "expects_reply": false,
                 "responds_to": reply_to,
+                "sender_ctx": sender_context(),
             });
             cli_post("/api/send", &body).await?;
         }
@@ -699,11 +703,15 @@ async fn main() -> anyhow::Result<()> {
                 "expects_reply": expect_reply,
                 "responds_to": msg_id,
                 "done": !no_done,
+                "sender_ctx": sender_context(),
             });
             cli_post("/api/send", &body).await?;
         }
         Command::Ls => {
             cli_list_sessions().await?;
+        }
+        Command::Whoami => {
+            cli_whoami().await?;
         }
         Command::Announce { role, bulletin } => {
             if role.is_none() && bulletin.is_none() {
@@ -1750,9 +1758,131 @@ fn fetch_latest_crate_version(name: &str) -> anyhow::Result<String> {
 /// tmux mutation.
 #[derive(Debug, PartialEq, Eq)]
 enum SessionIdResolution {
-    Found(String),
+    Found(String, IdentitySource),
     LookupByPane(String),
     None,
+}
+
+/// Which signal produced a resolved session id. Reported by `ouija whoami`
+/// so agents can see whether their identity came from a daemon-controlled
+/// source or a possibly-stale environment variable.
+#[derive(Debug, PartialEq, Eq)]
+enum IdentitySource {
+    PaneVar,
+    EnvVar,
+    PaneLookup,
+}
+
+impl std::fmt::Display for IdentitySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PaneVar => write!(f, "the @ouija_session tmux pane var"),
+            Self::EnvVar => write!(f, "$OUIJA_SESSION_ID"),
+            Self::PaneLookup => write!(f, "daemon lookup by $TMUX_PANE"),
+        }
+    }
+}
+
+/// Anti-guessing guidance shared by every identity-failure message. The
+/// misattribution incident (#1395) started with an agent inferring `--from`
+/// from the project basename, which named a real sibling session.
+const NO_GUESS_GUIDANCE: &str = "Never guess a sender id — not from the project directory name, \
+a branch name, or an `ouija ls` entry. A guessed sender impersonates another session and \
+misroutes its replies. Use only an exact id: the one in your injected system prompt \
+(\"You are session \\\"<id>\\\" on the ouija mesh\") or a $OUIJA_SESSION_ID provided by your operator.";
+
+/// Diagnostic snapshot of every identity signal `ouija whoami` inspected
+/// before concluding the caller cannot be identified.
+#[derive(Debug)]
+struct WhoamiFailure {
+    tmux_pane: Option<String>,
+    pane_var: Option<String>,
+    env_var: Option<String>,
+    /// `Some` only when a daemon lookup by pane was attempted.
+    lookup: Option<PaneLookupFailure>,
+}
+
+#[derive(Debug)]
+enum PaneLookupFailure {
+    DaemonUnreachable(String),
+    NoSessionForPane,
+}
+
+/// Render a loud, guess-free explanation of why identity resolution failed.
+fn format_whoami_failure(failure: &WhoamiFailure) -> String {
+    let mut lines = vec![
+        "unable to resolve this session's Ouija identity.".to_string(),
+        String::new(),
+        "Signals checked:".to_string(),
+    ];
+    match &failure.tmux_pane {
+        Some(pane) => {
+            lines.push(format!("  - $TMUX_PANE: {pane}"));
+            match failure.pane_var.as_deref() {
+                Some("") => lines.push("  - @ouija_session pane var: set but empty".to_string()),
+                Some(var) => lines.push(format!("  - @ouija_session pane var: {var}")),
+                None => lines.push("  - @ouija_session pane var: not set".to_string()),
+            }
+        }
+        None => lines.push(
+            "  - $TMUX_PANE: not set (this shell is not attached to a tmux pane)".to_string(),
+        ),
+    }
+    match failure.env_var.as_deref() {
+        Some("") => lines.push("  - $OUIJA_SESSION_ID: set but empty".to_string()),
+        Some(var) => lines.push(format!("  - $OUIJA_SESSION_ID: {var}")),
+        None => lines.push("  - $OUIJA_SESSION_ID: not set".to_string()),
+    }
+    match &failure.lookup {
+        Some(PaneLookupFailure::DaemonUnreachable(url)) => {
+            lines.push(format!("  - daemon lookup: daemon unreachable at {url}"));
+        }
+        Some(PaneLookupFailure::NoSessionForPane) => {
+            lines.push(format!(
+                "  - daemon lookup: no registered session for pane {}",
+                failure.tmux_pane.as_deref().unwrap_or("?")
+            ));
+        }
+        None => {}
+    }
+    lines.push(String::new());
+    lines.push(NO_GUESS_GUIDANCE.to_string());
+    lines.join("\n")
+}
+
+/// Message for an id that resolved from a signal but is not registered with
+/// the daemon — a stale `$OUIJA_SESSION_ID` after a rename, typically.
+fn format_unregistered_identity(id: &str, source: &IdentitySource) -> String {
+    format!(
+        "resolved id '{id}' via {source}, but no local session with that id is registered. \
+         The session may have been renamed or removed, or the signal is stale. \
+         Ask the operator for the correct id. {NO_GUESS_GUIDANCE}"
+    )
+}
+
+/// True when `/api/status` lists a *local* session with this id. Remote
+/// sessions (node-prefixed) are never the local caller's own identity.
+fn status_lists_local_session(status: &serde_json::Value, id: &str) -> bool {
+    status["sessions"].as_array().is_some_and(|sessions| {
+        sessions
+            .iter()
+            .any(|s| s["id"].as_str() == Some(id) && s["origin"].as_str() == Some("local"))
+    })
+}
+
+/// Error text for send-path commands that cannot identify the caller.
+///
+/// Intentionally never instructs the caller to run `ouija register`: in
+/// non-tmux engines (e.g. opencode HTTP API) an LLM reading the error
+/// literally would self-trigger a ghost-shape register call. Equally, it
+/// must never invite the caller to pick a plausible-looking `--from` —
+/// that guess is how sender misattribution (#1395) happened.
+fn unresolved_sender_error() -> String {
+    format!(
+        "unable to resolve the current session ID. Run `ouija whoami` for diagnostics. \
+         If you already know your exact session id (from your injected system prompt or \
+         $OUIJA_SESSION_ID), pass `--from <id>`. {NO_GUESS_GUIDANCE}"
+    )
 }
 
 /// Pick the caller's session id from the three available signals.
@@ -1778,11 +1908,11 @@ fn pick_session_id(
 ) -> SessionIdResolution {
     if tmux_pane.is_some() {
         if let Some(id) = pane_var.filter(|s| !s.is_empty()) {
-            return SessionIdResolution::Found(id);
+            return SessionIdResolution::Found(id, IdentitySource::PaneVar);
         }
     }
     if let Some(id) = env_var.filter(|s| !s.is_empty()) {
-        return SessionIdResolution::Found(id);
+        return SessionIdResolution::Found(id, IdentitySource::EnvVar);
     }
     if let Some(pane) = tmux_pane {
         return SessionIdResolution::LookupByPane(pane.to_string());
@@ -1790,45 +1920,168 @@ fn pick_session_id(
     SessionIdResolution::None
 }
 
-/// Look up the registered session ID for the current execution context.
+/// Caller execution context sent with every `/api/send` so the daemon can
+/// cross-check the claimed sender (task #1395). Always present in bodies
+/// from this CLI version — its very presence tells the daemon the pane
+/// field is a positive report, not an omission by an older caller.
 ///
+/// `self_id` is the caller's own resolved id from the local (network-free)
+/// signals: the pane var when in tmux, else `$OUIJA_SESSION_ID`. A paneless
+/// opencode session resolves it via `$OUIJA_SESSION_ID`, which is how the
+/// daemon verifies a paneless self-send. The remaining `LookupByPane` case
+/// only occurs when `$TMUX_PANE` is set, and the daemon then validates by
+/// pane match, so leaving `self_id` unset there is harmless.
+fn sender_context() -> serde_json::Value {
+    let tmux_pane = std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty());
+    let pane_var = tmux_pane.as_deref().and_then(tmux_var::get);
+    let env_var = std::env::var("OUIJA_SESSION_ID").ok();
+    let self_id = match pick_session_id(tmux_pane.as_deref(), pane_var, env_var) {
+        SessionIdResolution::Found(id, _) => Some(id),
+        SessionIdResolution::LookupByPane(_) | SessionIdResolution::None => None,
+    };
+    serde_json::json!({
+        "pane": tmux_pane,
+        "self_id": self_id,
+    })
+}
+
+/// Result of running the full identity-resolution path, with enough detail
+/// for `ouija whoami` to explain a failure.
+enum WhoamiOutcome {
+    Resolved { id: String, source: IdentitySource },
+    Unresolved(WhoamiFailure),
+}
+
+/// Run the full identity resolution path with diagnostics.
+///
+/// This is the single identity path: `require_my_session_id` (used by
+/// ask/tell/reply/announce/rename) and `ouija whoami` both resolve through
+/// here and then both run [`verify_resolved_id_registered`], so whoami's
+/// answer is by construction the sender those commands would use — including
+/// the registration check, which now rejects a stale id on the send path too.
 /// See [`pick_session_id`] for the precedence and rationale.
-async fn resolve_my_session_id() -> Option<String> {
+async fn whoami_outcome() -> WhoamiOutcome {
     let tmux_pane = std::env::var("TMUX_PANE").ok();
     let pane_var = tmux_pane.as_deref().and_then(tmux_var::get);
     let env_var = std::env::var("OUIJA_SESSION_ID").ok();
 
-    match pick_session_id(tmux_pane.as_deref(), pane_var, env_var) {
-        SessionIdResolution::Found(id) => Some(id),
+    match pick_session_id(tmux_pane.as_deref(), pane_var.clone(), env_var.clone()) {
+        SessionIdResolution::Found(id, source) => WhoamiOutcome::Resolved { id, source },
         SessionIdResolution::LookupByPane(pane) => {
+            let failure = |lookup| {
+                WhoamiOutcome::Unresolved(WhoamiFailure {
+                    tmux_pane: tmux_pane.clone(),
+                    pane_var: pane_var.clone(),
+                    env_var: env_var.clone(),
+                    lookup: Some(lookup),
+                })
+            };
             let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
-            let url = format!("http://localhost:{port}/api/status");
-            let resp = reqwest::get(&url).await.ok()?;
-            let status: serde_json::Value = resp.json().await.ok()?;
-            status["sessions"]
-                .as_array()?
-                .iter()
-                .find(|s| s["pane"].as_str() == Some(&pane))
-                .and_then(|s| s["id"].as_str().map(String::from))
+            let base = format!("http://localhost:{port}");
+            let status: serde_json::Value = match reqwest::get(format!("{base}/api/status")).await {
+                Ok(resp) => match resp.json().await {
+                    Ok(status) => status,
+                    Err(_) => return failure(PaneLookupFailure::DaemonUnreachable(base)),
+                },
+                Err(_) => return failure(PaneLookupFailure::DaemonUnreachable(base)),
+            };
+            let id = status["sessions"].as_array().and_then(|sessions| {
+                sessions
+                    .iter()
+                    .find(|s| s["pane"].as_str() == Some(&pane))
+                    .and_then(|s| s["id"].as_str().map(String::from))
+            });
+            match id {
+                Some(id) => WhoamiOutcome::Resolved {
+                    id,
+                    source: IdentitySource::PaneLookup,
+                },
+                None => failure(PaneLookupFailure::NoSessionForPane),
+            }
         }
-        SessionIdResolution::None => None,
+        SessionIdResolution::None => WhoamiOutcome::Unresolved(WhoamiFailure {
+            tmux_pane,
+            pane_var,
+            env_var,
+            lookup: None,
+        }),
+    }
+}
+
+/// Verify a resolved id is a registered *local* session, leniently.
+///
+/// Both `ouija whoami` and the send path ([`require_my_session_id`]) run this,
+/// so a stale or renamed id (e.g. a persistent shell's `$OUIJA_SESSION_ID`
+/// after a rename) fails on the send path as loudly as in `ouija whoami`
+/// instead of silently stamping a wrong sender.
+///
+/// Only a positive disproof fails: when the daemon is unreachable or its
+/// status is unparseable, we warn and accept, because an outage must not block
+/// an otherwise-correct send. `PaneLookup` ids came from `/api/status` itself,
+/// so registration is already proven and the round trip is skipped.
+async fn verify_resolved_id_registered(id: &str, source: &IdentitySource) -> anyhow::Result<()> {
+    if matches!(source, IdentitySource::PaneLookup) {
+        return Ok(());
+    }
+    let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
+    let url = format!("http://localhost:{port}/api/status");
+    match reqwest::get(&url).await {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(status) => {
+                if status_lists_local_session(&status, id) {
+                    Ok(())
+                } else {
+                    anyhow::bail!(format_unregistered_identity(id, source))
+                }
+            }
+            Err(_) => {
+                eprintln!(
+                    "warning: could not parse daemon status, could not verify '{id}' is registered"
+                );
+                Ok(())
+            }
+        },
+        Err(_) => {
+            eprintln!("warning: daemon unreachable, could not verify '{id}' is registered");
+            Ok(())
+        }
     }
 }
 
 /// Resolve session ID or bail with a helpful error.
 ///
-/// The error message intentionally never instructs the caller to run
-/// `ouija register`: in non-tmux engines (e.g. opencode HTTP API) an LLM
-/// reading the error literally would self-trigger a ghost-shape register
-/// call. Steer callers to `--from <id>` or `OUIJA_SESSION_ID` instead.
+/// Resolves through [`whoami_outcome`] and then [`verify_resolved_id_registered`],
+/// the exact same two steps `ouija whoami` performs — so whoami's answer is by
+/// construction the sender this returns. See [`unresolved_sender_error`] for
+/// why the unresolved message must not mention `ouija register` or invite a
+/// guessed `--from`.
 async fn require_my_session_id() -> anyhow::Result<String> {
-    resolve_my_session_id().await.ok_or_else(|| {
-        anyhow::anyhow!(
-            "unable to resolve the current session ID. \
-             Pass `--from <your-session-id>` to this command, \
-             or export `OUIJA_SESSION_ID=<your-session-id>` in your shell."
-        )
-    })
+    match whoami_outcome().await {
+        WhoamiOutcome::Resolved { id, source } => {
+            verify_resolved_id_registered(&id, &source).await?;
+            Ok(id)
+        }
+        WhoamiOutcome::Unresolved(_) => Err(anyhow::anyhow!(unresolved_sender_error())),
+    }
+}
+
+/// `ouija whoami`: print the resolved session id to stdout (source note on
+/// stderr, so `--from $(ouija whoami)` stays clean), or fail loudly with
+/// signal-by-signal diagnostics.
+///
+/// Registration is verified via [`verify_resolved_id_registered`], the same
+/// check the send path runs — a stale `$OUIJA_SESSION_ID` left over from a
+/// rename fails here (and there) rather than stamp a wrong sender later.
+async fn cli_whoami() -> anyhow::Result<()> {
+    match whoami_outcome().await {
+        WhoamiOutcome::Resolved { id, source } => {
+            verify_resolved_id_registered(&id, &source).await?;
+            eprintln!("resolved via {source}");
+            println!("{id}");
+            Ok(())
+        }
+        WhoamiOutcome::Unresolved(failure) => anyhow::bail!(format_whoami_failure(&failure)),
+    }
 }
 
 async fn cli_get(path: &str) -> anyhow::Result<()> {
@@ -1913,8 +2166,13 @@ async fn cli_post(path: &str, body: &serde_json::Value) -> anyhow::Result<()> {
     let url = format!("http://localhost:{port}{path}");
     let client = reqwest::Client::new();
     let resp = client.post(&url).json(body).send().await?;
+    let status = resp.status();
     let text = resp.text().await?;
-    println!("{text}");
+    // Non-2xx must exit non-zero (like cli_delete): a rejected send that
+    // prints its error but exits 0 reads as success to scripted callers,
+    // which is the silent-failure shape task #1395 removes.
+    let body = classify_http_response(status, &text)?;
+    println!("{body}");
     Ok(())
 }
 
@@ -2104,7 +2362,10 @@ mod tests {
             Some("keycast".into()),
             Some("feat/95-stale".into()),
         );
-        assert_eq!(res, SessionIdResolution::Found("keycast".into()));
+        assert_eq!(
+            res,
+            SessionIdResolution::Found("keycast".into(), IdentitySource::PaneVar)
+        );
     }
 
     #[test]
@@ -2113,13 +2374,19 @@ mod tests {
         // opencode subshell that lost TMUX_PANE inheritance — env var is the
         // only signal pointing at the right session.
         let res = pick_session_id(Some("%74"), None, Some("keycast".into()));
-        assert_eq!(res, SessionIdResolution::Found("keycast".into()));
+        assert_eq!(
+            res,
+            SessionIdResolution::Found("keycast".into(), IdentitySource::EnvVar)
+        );
     }
 
     #[test]
     fn pick_session_id_treats_empty_pane_var_as_absent() {
         let res = pick_session_id(Some("%74"), Some("".into()), Some("env-id".into()));
-        assert_eq!(res, SessionIdResolution::Found("env-id".into()));
+        assert_eq!(
+            res,
+            SessionIdResolution::Found("env-id".into(), IdentitySource::EnvVar)
+        );
     }
 
     #[test]
@@ -2133,7 +2400,10 @@ mod tests {
         // Non-tmux callers (opencode HTTP API plugin, scripts) have no pane
         // var to consult — env var is the only signal.
         let res = pick_session_id(None, None, Some("opencode-session".into()));
-        assert_eq!(res, SessionIdResolution::Found("opencode-session".into()));
+        assert_eq!(
+            res,
+            SessionIdResolution::Found("opencode-session".into(), IdentitySource::EnvVar)
+        );
     }
 
     #[test]
@@ -2150,7 +2420,10 @@ mod tests {
         // var without a pane id can't be the daemon-controlled signal we
         // claim it is. Fall through to env var.
         let res = pick_session_id(None, Some("ghost".into()), Some("real".into()));
-        assert_eq!(res, SessionIdResolution::Found("real".into()));
+        assert_eq!(
+            res,
+            SessionIdResolution::Found("real".into(), IdentitySource::EnvVar)
+        );
     }
 
     #[test]
@@ -2386,6 +2659,161 @@ mod tests {
         assert_eq!(
             legacy_cleanup_settle_delay(&DaemonLifecyclePlan::LegacyOnly),
             None
+        );
+    }
+
+    // --- whoami identity diagnostics (task #1395) ---
+    //
+    // An opencode agent whose bash runs outside tmux guessed its sender id
+    // from the project basename, impersonating a sibling session and
+    // misrouting the reply. `ouija whoami` must resolve through the exact
+    // same signal path as `require_my_session_id`, report WHICH signal won,
+    // and on failure explain what was missing without ever inviting a guess.
+
+    #[test]
+    fn pick_session_id_reports_pane_var_as_source() {
+        let res = pick_session_id(Some("%3"), Some("keycast".into()), None);
+        assert_eq!(
+            res,
+            SessionIdResolution::Found("keycast".into(), IdentitySource::PaneVar)
+        );
+    }
+
+    #[test]
+    fn pick_session_id_reports_env_var_as_source() {
+        let res = pick_session_id(None, None, Some("hub".into()));
+        assert_eq!(
+            res,
+            SessionIdResolution::Found("hub".into(), IdentitySource::EnvVar)
+        );
+    }
+
+    #[test]
+    fn whoami_failure_outside_tmux_lists_missing_signals_and_forbids_guessing() {
+        let failure = WhoamiFailure {
+            tmux_pane: None,
+            pane_var: None,
+            env_var: None,
+            lookup: None,
+        };
+        let msg = format_whoami_failure(&failure);
+        assert!(
+            msg.contains("$TMUX_PANE: not set"),
+            "must report the missing tmux pane signal, got: {msg}"
+        );
+        assert!(
+            msg.contains("$OUIJA_SESSION_ID: not set"),
+            "must report the missing env var signal, got: {msg}"
+        );
+        assert!(
+            msg.contains("Never guess"),
+            "must explicitly forbid guessing a sender id, got: {msg}"
+        );
+        assert!(
+            msg.contains("project directory"),
+            "must call out the project-basename guess that caused the incident, got: {msg}"
+        );
+        assert!(
+            !msg.contains("ouija register"),
+            "must never steer an unresolved caller toward `ouija register`, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn whoami_failure_in_tmux_reports_pane_lookup_miss() {
+        let failure = WhoamiFailure {
+            tmux_pane: Some("%3".into()),
+            pane_var: None,
+            env_var: None,
+            lookup: Some(PaneLookupFailure::NoSessionForPane),
+        };
+        let msg = format_whoami_failure(&failure);
+        assert!(
+            msg.contains("$TMUX_PANE: %3"),
+            "must show the pane that was checked, got: {msg}"
+        );
+        assert!(
+            msg.contains("@ouija_session"),
+            "must report the pane var signal by name, got: {msg}"
+        );
+        assert!(
+            msg.contains("no registered session"),
+            "must say the daemon lookup found nothing for this pane, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn whoami_failure_reports_unreachable_daemon() {
+        let failure = WhoamiFailure {
+            tmux_pane: Some("%3".into()),
+            pane_var: None,
+            env_var: None,
+            lookup: Some(PaneLookupFailure::DaemonUnreachable(
+                "http://localhost:7880".into(),
+            )),
+        };
+        let msg = format_whoami_failure(&failure);
+        assert!(
+            msg.contains("daemon unreachable at http://localhost:7880"),
+            "must distinguish an unreachable daemon from a pane miss, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn whoami_unregistered_identity_names_id_and_source_without_guessing() {
+        let msg = format_unregistered_identity("stale-id", &IdentitySource::EnvVar);
+        assert!(
+            msg.contains("stale-id"),
+            "must name the resolved-but-unregistered id, got: {msg}"
+        );
+        assert!(
+            msg.contains("$OUIJA_SESSION_ID"),
+            "must say which signal produced the stale id, got: {msg}"
+        );
+        assert!(
+            msg.contains("renamed"),
+            "must explain the likely cause (rename/removal), got: {msg}"
+        );
+        assert!(
+            msg.contains("Never guess"),
+            "must forbid guessing a replacement id, got: {msg}"
+        );
+        assert!(
+            !msg.contains("ouija register"),
+            "must never suggest `ouija register`, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn status_lists_local_session_matches_local_origin_only() {
+        let status = serde_json::json!({
+            "sessions": [
+                {"id": "mine", "origin": "local"},
+                {"id": "peer/mine", "origin": "remote"},
+            ]
+        });
+        assert!(status_lists_local_session(&status, "mine"));
+        assert!(
+            !status_lists_local_session(&status, "peer/mine"),
+            "a remote session id is never the local caller's identity"
+        );
+        assert!(!status_lists_local_session(&status, "absent"));
+    }
+
+    #[test]
+    fn unresolved_sender_error_points_at_whoami_not_register() {
+        let msg = unresolved_sender_error();
+        assert!(
+            msg.contains("ouija whoami"),
+            "unresolved identity must steer callers to whoami diagnostics, got: {msg}"
+        );
+        assert!(
+            msg.contains("Never guess"),
+            "must forbid guessing a sender id, got: {msg}"
+        );
+        assert!(
+            !msg.contains("ouija register"),
+            "must never steer callers toward `ouija register`, got: {msg}"
         );
     }
 }

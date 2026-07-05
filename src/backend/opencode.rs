@@ -245,6 +245,64 @@ mod tests {
         );
     }
 
+    // --- anti-guessing sender guidance (task #1395) ---
+    //
+    // An opencode agent that could not resolve its identity guessed the
+    // project basename as --from, which named a real sibling session and
+    // misrouted the reply. Both the injected OpenCode prompt and the skill
+    // must direct agents to `ouija whoami` and explicitly forbid inferring
+    // a sender id from anything else.
+
+    #[test]
+    fn plugin_prompt_directs_unresolved_identity_to_whoami_not_guesses() {
+        assert!(
+            embedded::PLUGIN_TS.contains("ouija whoami"),
+            "OpenCode prompt must name the whoami command for unresolved identities"
+        );
+        assert!(
+            embedded::PLUGIN_TS.contains("Never guess"),
+            "OpenCode prompt must explicitly forbid guessing a sender id"
+        );
+        assert!(
+            !embedded::PLUGIN_TS.contains("<public-ouija-id>"),
+            "bare placeholder invites substituting a guessed id; it must be gone"
+        );
+        // Fail-closed policy (#1395 review f0, option B): while the id is
+        // unresolved the daemon rejects sends even with a correct hand-typed
+        // --from, so the prompt must say the fix is the environment, not
+        // retrying with another id.
+        assert!(
+            embedded::PLUGIN_TS.contains("fail-closed"),
+            "OpenCode prompt must explain the daemon fail-closes sends while \
+             the caller's identity is unresolved"
+        );
+        assert!(
+            embedded::PLUGIN_TS.contains("even a correct"),
+            "OpenCode prompt must warn that even a correct id is rejected \
+             until identity resolves"
+        );
+    }
+
+    #[test]
+    fn embedded_skill_forbids_inferring_sender_from_project_basename() {
+        assert!(
+            embedded::SKILL_MD.contains("ouija whoami"),
+            "skill section 7 must teach `ouija whoami` as the identity source"
+        );
+        assert!(
+            embedded::SKILL_MD.contains("Never guess"),
+            "skill must explicitly forbid guessing a sender id"
+        );
+        assert!(
+            embedded::SKILL_MD.contains("project directory"),
+            "skill must name the project-basename guess that caused the incident"
+        );
+        assert!(
+            !embedded::SKILL_MD.contains("such as `hub` or `feat/123-worker`"),
+            "the old example read as an invitation to invent a plausible-looking id"
+        );
+    }
+
     #[test]
     fn has_project_history_with_opencode_dir() {
         let tmp = tempfile::tempdir().unwrap();

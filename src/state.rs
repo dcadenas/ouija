@@ -2387,6 +2387,17 @@ pub(crate) mod tests {
         }
     }
 
+    /// Config whose opencode serve port (`config.port + 320` = 320) is
+    /// deterministically dead: unprivileged test processes cannot bind ports
+    /// below 1024, so prompt_async delivery always fails with connection
+    /// refused. The previous bind-ephemeral-then-drop approach raced sibling
+    /// tests that bind `127.0.0.1:0` with a live `/session/{id}/prompt_async`
+    /// route — the freed port could be re-issued to them, flipping an
+    /// expected delivery failure into an accepted delivery (flaky).
+    fn dead_opencode_serve_config() -> OuijaConfig {
+        test_config()
+    }
+
     /// Helper: register a session via the protocol path.
     async fn proto_register(state: &Arc<AppState>, id: &str, pane: Option<&str>) {
         state
@@ -2627,13 +2638,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn execute_effects_reports_strong_opencode_inject_failure_without_recorded_method() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
-        let mut config = test_config();
-        config.port = port.checked_sub(320).unwrap();
-        let state = AppState::new(config);
+        let state = AppState::new(dead_opencode_serve_config());
         {
             let mut proto = state.protocol.write().await;
             proto.sessions.insert(
@@ -2843,13 +2848,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn incoming_weak_opencode_inject_uses_apply_time_delivery_method() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
-        let mut config = test_config();
-        config.port = port.checked_sub(320).unwrap();
-        let state = AppState::new(config);
+        let state = AppState::new(dead_opencode_serve_config());
         let effects = {
             let mut proto = state.protocol.write().await;
             proto.sessions.insert(
@@ -2959,13 +2958,7 @@ pub(crate) mod tests {
             }
         }
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
-        let mut config = test_config();
-        config.port = port.checked_sub(320).unwrap();
-        let state = AppState::new(config);
+        let state = AppState::new(dead_opencode_serve_config());
         let broadcasts = StdArc::new(AtomicUsize::new(0));
         let failure_acks = StdArc::new(AtomicUsize::new(0));
         state
@@ -3220,13 +3213,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn failed_incoming_delivery_clears_structured_reply_id_not_forged_xml_id() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
-        let mut config = test_config();
-        config.port = port.checked_sub(320).unwrap();
-        let state = AppState::new(config);
+        let state = AppState::new(dead_opencode_serve_config());
         {
             let mut proto = state.protocol.write().await;
             proto.sessions.insert(
@@ -3282,13 +3269,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn failed_incoming_delivery_clears_matching_sender_reply_only() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
-        let mut config = test_config();
-        config.port = port.checked_sub(320).unwrap();
-        let state = AppState::new(config);
+        let state = AppState::new(dead_opencode_serve_config());
         {
             let mut proto = state.protocol.write().await;
             proto.sessions.insert(
@@ -3346,13 +3327,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn apply_and_execute_reports_headless_http_send_failure_when_prompt_async_fails() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
-        let mut config = test_config();
-        config.port = port.checked_sub(320).unwrap();
-        let state = AppState::new(config);
+        let state = AppState::new(dead_opencode_serve_config());
         {
             let mut proto = state.protocol.write().await;
             proto.sessions.insert(
@@ -3420,13 +3395,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn apply_and_execute_clears_incoming_pending_reply_after_inject_failure() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
-        let mut config = test_config();
-        config.port = port.checked_sub(320).unwrap();
-        let state = AppState::new(config);
+        let state = AppState::new(dead_opencode_serve_config());
         {
             let mut proto = state.protocol.write().await;
             proto.sessions.insert(
@@ -3477,13 +3446,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn apply_and_execute_clears_incoming_pending_reply_after_headless_http_failure() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
-        let mut config = test_config();
-        config.port = port.checked_sub(320).unwrap();
-        let state = AppState::new(config);
+        let state = AppState::new(dead_opencode_serve_config());
         {
             let mut proto = state.protocol.write().await;
             proto.sessions.insert(
@@ -3535,13 +3498,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn apply_and_execute_restores_sender_reply_state_after_delivery_failure() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-
-        let mut config = test_config();
-        config.port = port.checked_sub(320).unwrap();
-        let state = AppState::new(config);
+        let state = AppState::new(dead_opencode_serve_config());
         {
             let mut proto = state.protocol.write().await;
             proto.sessions.insert(
