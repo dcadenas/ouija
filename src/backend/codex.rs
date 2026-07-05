@@ -1,6 +1,127 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::{CodingAssistant, DeliveryMode, InjectConfig, ResumeOpts, StartOpts};
+
+// --- Embedded Codex hook scripts ---
+// Compiled into the binary so `ouija start-server` can bootstrap Codex hook
+// integration without needing the source repo on disk. Codex-specific: they
+// emit `hookSpecificOutput.additionalContext` / `{"continue":true}` per the
+// Codex hook output contract, and Stop is turn-scoped (never unregisters).
+mod embedded {
+    pub const SCRIPT_REGISTER: &str = include_str!("../../scripts/codex/codex-register.sh");
+    pub const SCRIPT_PROMPT_SUBMIT: &str =
+        include_str!("../../scripts/codex/codex-prompt-submit.sh");
+    pub const SCRIPT_STOP: &str = include_str!("../../scripts/codex/codex-stop.sh");
+}
+
+/// Codex hook events wired by Ouija, paired with the script that handles each.
+/// SessionStart registers the pane; UserPromptSubmit signals activity; Stop is
+/// turn-scoped bookkeeping. There is deliberately no SessionEnd/unregister hook —
+/// Codex has no such event and cleanup relies on pane/process liveness (#1442).
+const HOOKS: &[(&str, &str, &str)] = &[
+    ("SessionStart", "codex-register.sh", embedded::SCRIPT_REGISTER),
+    (
+        "UserPromptSubmit",
+        "codex-prompt-submit.sh",
+        embedded::SCRIPT_PROMPT_SUBMIT,
+    ),
+    ("Stop", "codex-stop.sh", embedded::SCRIPT_STOP),
+];
+
+/// Directory under CODEX_HOME where Ouija writes its hook scripts.
+fn hooks_dir(codex_home: &Path) -> PathBuf {
+    codex_home.join("ouija-hooks")
+}
+
+/// Build the merged `hooks.json` content for Codex, layering Ouija's hook
+/// entries onto any existing config without clobbering the user's own hooks.
+///
+/// Idempotent: an Ouija-owned group is identified by a `command` that lives under
+/// `hooks_dir`. For each managed event we drop any prior Ouija group and append a
+/// fresh one, so re-installs neither duplicate nor accumulate stale script paths.
+/// Non-Ouija hooks (other events, and the user's own groups within a managed
+/// event) are preserved verbatim.
+fn merge_hooks_json(existing: Option<&str>, hooks_dir: &Path) -> serde_json::Value {
+    let dir_prefix = format!("{}/", hooks_dir.display());
+    let is_ouija_group = |group: &serde_json::Value| -> bool {
+        group["hooks"].as_array().is_some_and(|inner| {
+            inner.iter().any(|h| {
+                h["command"]
+                    .as_str()
+                    .is_some_and(|c| c.starts_with(&dir_prefix))
+            })
+        })
+    };
+
+    let mut root: serde_json::Value = existing
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+    let hooks = root
+        .as_object_mut()
+        .expect("root normalized to object")
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    if !hooks.is_object() {
+        *hooks = serde_json::json!({});
+    }
+    let hooks = hooks.as_object_mut().expect("hooks normalized to object");
+
+    for (event, script, _) in HOOKS {
+        let command = hooks_dir.join(script).display().to_string();
+        let entry = hooks
+            .entry((*event).to_string())
+            .or_insert_with(|| serde_json::json!([]));
+        let arr = match entry.as_array_mut() {
+            Some(a) => a,
+            None => {
+                *entry = serde_json::json!([]);
+                entry.as_array_mut().expect("just set to array")
+            }
+        };
+        arr.retain(|g| !is_ouija_group(g));
+        arr.push(serde_json::json!({
+            "hooks": [ { "type": "command", "command": command } ]
+        }));
+    }
+    root
+}
+
+/// Write Ouija's Codex hook scripts and merged `hooks.json` under `codex_home`.
+/// Idempotent (see [`merge_hooks_json`]); scripts are made executable on unix.
+fn install_to(codex_home: &Path) -> anyhow::Result<()> {
+    let dir = hooks_dir(codex_home);
+    std::fs::create_dir_all(&dir)?;
+
+    for (_, script, content) in HOOKS {
+        let dest = dir.join(script);
+        std::fs::write(&dest, content)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+        }
+    }
+
+    let hooks_path = codex_home.join("hooks.json");
+    let existing = std::fs::read_to_string(&hooks_path).ok();
+    let merged = merge_hooks_json(existing.as_deref(), &dir);
+    std::fs::write(&hooks_path, serde_json::to_string_pretty(&merged)?)?;
+    Ok(())
+}
+
+/// Resolve CODEX_HOME, honoring the `CODEX_HOME` override before `~/.codex`,
+/// matching the Codex CLI's own resolution order.
+fn resolve_codex_home() -> Option<PathBuf> {
+    if let Ok(h) = std::env::var("CODEX_HOME") {
+        if !h.is_empty() {
+            return Some(PathBuf::from(h));
+        }
+    }
+    std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".codex"))
+}
 
 /// Autonomy flags for Ouija-launched Codex sessions.
 ///
@@ -117,9 +238,14 @@ impl CodingAssistant for Codex {
     }
 
     fn install(&self) -> anyhow::Result<()> {
-        // Hook bootstrapping is added in a later chunk (Codex hooks.json +
-        // scripts under ~/.codex). No-op for now so registration compiles.
-        Ok(())
+        // Bootstrap Codex hook integration: write ouija hook scripts + merge
+        // hooks.json under CODEX_HOME (~/.codex). Skip silently if Codex isn't
+        // set up on this host (no resolvable home), matching the other backends'
+        // best-effort install semantics.
+        match resolve_codex_home() {
+            Some(home) => install_to(&home),
+            None => Ok(()),
+        }
     }
 
     // is_available: uses the timeout-aware default so the npx/node `codex`
@@ -281,5 +407,171 @@ mod tests {
         std::fs::create_dir(tmp.path().join(".codex")).unwrap();
         // Even with a local .codex dir, history is global — no per-project marker.
         assert!(!backend().has_project_history(tmp.path()));
+    }
+
+    // --- Hook install (chunk 3) ---
+
+    #[test]
+    fn register_script_wraps_output_as_session_start_context() {
+        let s = embedded::SCRIPT_REGISTER;
+        // Registers via the shared session-start endpoint.
+        assert!(s.contains("/api/hooks/session-start"), "{s}");
+        // Wraps the daemon's `.output` into Codex additionalContext, keyed to the
+        // SessionStart event so the TUI surfaces mesh instructions.
+        assert!(s.contains("hookSpecificOutput"), "{s}");
+        assert!(s.contains("additionalContext"), "{s}");
+        assert!(s.contains("SessionStart"), "{s}");
+        // Must never unregister on session start.
+        assert!(!s.contains("session-end"), "{s}");
+    }
+
+    #[test]
+    fn prompt_submit_script_signals_activity() {
+        let s = embedded::SCRIPT_PROMPT_SUBMIT;
+        assert!(s.contains("/api/hooks/prompt-submit"), "{s}");
+        assert!(s.contains("UserPromptSubmit"), "{s}");
+    }
+
+    #[test]
+    fn stop_script_is_turn_scoped_and_never_unregisters() {
+        let s = embedded::SCRIPT_STOP;
+        // Pings the turn-stop endpoint...
+        assert!(s.contains("/api/hooks/stop"), "{s}");
+        // ...returns {"continue":true} so Codex proceeds...
+        assert!(s.contains(r#"{"continue":true}"#), "{s}");
+        // ...and must NOT unregister (Codex Stop fires every turn).
+        assert!(!s.contains("session-end"), "{s}");
+    }
+
+    #[test]
+    fn merge_hooks_json_fresh_registers_all_three_events() {
+        let hooks_dir = Path::new("/home/user/.codex/ouija-hooks");
+        let merged = merge_hooks_json(None, hooks_dir);
+        let hooks = &merged["hooks"];
+        for (event, script) in [
+            ("SessionStart", "codex-register.sh"),
+            ("UserPromptSubmit", "codex-prompt-submit.sh"),
+            ("Stop", "codex-stop.sh"),
+        ] {
+            let cmd = hooks[event][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap_or_else(|| panic!("missing command for {event}: {merged}"));
+            assert_eq!(cmd, format!("/home/user/.codex/ouija-hooks/{script}"));
+            assert_eq!(hooks[event][0]["hooks"][0]["type"], "command");
+        }
+    }
+
+    #[test]
+    fn merge_hooks_json_is_idempotent() {
+        let hooks_dir = Path::new("/home/user/.codex/ouija-hooks");
+        let once = merge_hooks_json(None, hooks_dir);
+        let twice = merge_hooks_json(Some(&once.to_string()), hooks_dir);
+        assert_eq!(once, twice, "second install must not duplicate ouija hooks");
+        // Exactly one SessionStart group (no duplication).
+        assert_eq!(twice["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn merge_hooks_json_preserves_user_hooks() {
+        let hooks_dir = Path::new("/home/user/.codex/ouija-hooks");
+        let existing = serde_json::json!({
+            "hooks": {
+                "PostToolUse": [
+                    { "matcher": "Write", "hooks": [
+                        { "type": "command", "command": "./scripts/user-thing.sh" }
+                    ] }
+                ],
+                "SessionStart": [
+                    { "hooks": [
+                        { "type": "command", "command": "/opt/user/other-start.sh" }
+                    ] }
+                ]
+            }
+        })
+        .to_string();
+        let merged = merge_hooks_json(Some(&existing), hooks_dir);
+        // Unrelated event preserved verbatim.
+        assert_eq!(
+            merged["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            "./scripts/user-thing.sh"
+        );
+        // The user's own SessionStart group survives alongside ours.
+        let starts = merged["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(starts.len(), 2, "user + ouija groups: {merged}");
+        assert!(
+            starts
+                .iter()
+                .any(|g| g["hooks"][0]["command"] == "/opt/user/other-start.sh"),
+            "user SessionStart hook must be preserved: {merged}"
+        );
+        assert!(
+            starts.iter().any(|g| g["hooks"][0]["command"]
+                == "/home/user/.codex/ouija-hooks/codex-register.sh"),
+            "ouija SessionStart hook must be present: {merged}"
+        );
+    }
+
+    #[test]
+    fn merge_hooks_json_replaces_stale_ouija_command() {
+        // A prior install wrote a different script path under ouija-hooks; a new
+        // install must replace it, not accumulate a second ouija group.
+        let hooks_dir = Path::new("/home/user/.codex/ouija-hooks");
+        let stale = serde_json::json!({
+            "hooks": {
+                "Stop": [
+                    { "hooks": [
+                        { "type": "command",
+                          "command": "/home/user/.codex/ouija-hooks/old-stop.sh" }
+                    ] }
+                ]
+            }
+        })
+        .to_string();
+        let merged = merge_hooks_json(Some(&stale), hooks_dir);
+        let stops = merged["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stops.len(), 1, "stale ouija group must be replaced: {merged}");
+        assert_eq!(
+            stops[0]["hooks"][0]["command"],
+            "/home/user/.codex/ouija-hooks/codex-stop.sh"
+        );
+    }
+
+    #[test]
+    fn install_to_writes_scripts_and_hooks_json() {
+        let home = tempfile::tempdir().unwrap();
+        install_to(home.path()).unwrap();
+
+        let hooks_dir = home.path().join("ouija-hooks");
+        for script in ["codex-register.sh", "codex-prompt-submit.sh", "codex-stop.sh"] {
+            let p = hooks_dir.join(script);
+            assert!(p.is_file(), "missing script {script}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+                assert_eq!(mode & 0o111, 0o111, "{script} must be executable");
+            }
+        }
+
+        let hooks_json = std::fs::read_to_string(home.path().join("hooks.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&hooks_json).unwrap();
+        assert_eq!(
+            parsed["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            hooks_dir.join("codex-register.sh").to_string_lossy().as_ref()
+        );
+    }
+
+    #[test]
+    fn install_to_is_idempotent_on_disk() {
+        let home = tempfile::tempdir().unwrap();
+        install_to(home.path()).unwrap();
+        install_to(home.path()).unwrap();
+        let hooks_json = std::fs::read_to_string(home.path().join("hooks.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&hooks_json).unwrap();
+        assert_eq!(
+            parsed["hooks"]["SessionStart"].as_array().unwrap().len(),
+            1,
+            "re-install must not duplicate hooks: {hooks_json}"
+        );
     }
 }

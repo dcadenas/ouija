@@ -351,6 +351,7 @@ async fn main() -> anyhow::Result<()> {
             preflight_checks();
             let _ = backend::claude_code::ClaudeCode.install();
             let _ = backend::opencode::OpenCode.install();
+            let _ = backend::codex::Codex.install();
 
             let name = name.unwrap_or_else(|| {
                 hostname::get()
