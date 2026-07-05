@@ -239,6 +239,33 @@ pub async fn session_start(
     (StatusCode::OK, Json(result))
 }
 
+/// Mesh onboarding text surfaced to a freshly-registered session, or empty.
+///
+/// Claude Code and OpenCode auto-load the `ouija` skill, so they need nothing
+/// here (returning empty keeps their SessionStart output unchanged). Codex has
+/// no equivalent skill-discovery path, so its register hook wraps this text into
+/// SessionStart `additionalContext`. `public_id` is the session's resolved public
+/// Ouija id, taught as `--from` because Codex's bash tool cannot be relied on to
+/// carry `TMUX_PANE` for sender resolution.
+fn mesh_instructions_for_backend(backend: Option<&str>, public_id: &str) -> String {
+    if backend != Some("codex-cli") {
+        return String::new();
+    }
+    format!(
+        "You are on the Ouija mesh. Message other sessions with the `ouija` CLI \
+         (NOT your own messaging tools — they cannot reach the mesh).\n\
+         Your public Ouija id is `{public_id}`. Pass it as `--from {public_id}` on \
+         every command so the mesh knows who is sending.\n\n\
+         - `ouija ls` — list reachable sessions (targets for messages).\n\
+         - `ouija ask <target> \"question\" --from {public_id}` — ask and wait for a reply.\n\
+         - `ouija tell <target> \"note\" --from {public_id}` — fire-and-forget message.\n\
+         - `ouija reply <target> <msg-id> \"answer\" --from {public_id}` — answer a \
+         `<msg ... reply=\"true\">` you received (the sender is blocked until you reply).\n\n\
+         Incoming messages arrive as `<msg from=\"...\" id=\"N\" reply=\"true\">text</msg>`; \
+         reply to those with `reply=\"true\"` using their `id`."
+    )
+}
+
 async fn session_start_inner(
     state: &std::sync::Arc<crate::state::AppState>,
     body: SessionStartBody,
@@ -290,6 +317,10 @@ async fn session_start_inner(
         None
     };
 
+    // Compute mesh onboarding text before `detected_backend` is moved into the
+    // metadata. Non-empty only for codex-cli (Claude/opencode carry the skill).
+    let output = mesh_instructions_for_backend(detected_backend.as_deref(), &id);
+
     // Register
     let role = format!("working on {basename}");
     let proto_meta = crate::daemon_protocol::SessionMeta {
@@ -309,7 +340,7 @@ async fn session_start_inner(
 
     json!({
         "registered": id,
-        "output": "",
+        "output": output,
     })
 }
 
@@ -509,6 +540,26 @@ mod tests {
         };
         let result = pre_tool_use_inner(&state, body).await;
         assert_eq!(result["block"], false);
+    }
+
+    #[test]
+    fn mesh_instructions_only_for_codex() {
+        // Codex has no auto-loaded ouija skill, so session-start must teach it the
+        // mesh CLI, with its own public id as --from.
+        let codex = mesh_instructions_for_backend(Some("codex-cli"), "feat/123-worker");
+        assert!(codex.contains("ouija ls"), "{codex}");
+        assert!(codex.contains("ouija ask"), "{codex}");
+        assert!(codex.contains("ouija tell"), "{codex}");
+        assert!(codex.contains("ouija reply"), "{codex}");
+        assert!(
+            codex.contains("--from feat/123-worker"),
+            "must teach the resolved public id as --from: {codex}"
+        );
+
+        // Claude/opencode already carry the skill — their output stays empty.
+        assert_eq!(mesh_instructions_for_backend(Some("claude-code"), "x"), "");
+        assert_eq!(mesh_instructions_for_backend(Some("opencode"), "x"), "");
+        assert_eq!(mesh_instructions_for_backend(None, "x"), "");
     }
 
     #[tokio::test]
