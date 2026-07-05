@@ -156,6 +156,35 @@ impl WireMessage {
             _ => None,
         }
     }
+
+    /// Stable variant name, for diagnostics.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::SessionSend { .. } => "SessionSend",
+            Self::SessionSendAck { .. } => "SessionSendAck",
+            Self::SessionAnnounce { .. } => "SessionAnnounce",
+            Self::SessionList { .. } => "SessionList",
+            Self::SessionRemove { .. } => "SessionRemove",
+            Self::SessionRenamed { .. } => "SessionRenamed",
+            Self::ConnectRequest { .. } => "ConnectRequest",
+            Self::Command { .. } => "Command",
+            Self::CommandResult { .. } => "CommandResult",
+            Self::SessionStart { .. } => "SessionStart",
+            Self::SessionRestart { .. } => "SessionRestart",
+        }
+    }
+
+    /// Whether this message is idempotent gossip — a full-state snapshot that
+    /// is rebroadcast on change and periodically, so a dropped copy is
+    /// self-repairing. Non-idempotent messages (renames, removes, orchestration
+    /// commands) carry a one-shot state delta, so a stale-seq drop is a lost
+    /// update that must be visible in logs (followup 667).
+    pub fn is_idempotent_gossip(&self) -> bool {
+        matches!(
+            self,
+            Self::SessionList { .. } | Self::SessionAnnounce { .. }
+        )
+    }
 }
 
 #[cfg(test)]

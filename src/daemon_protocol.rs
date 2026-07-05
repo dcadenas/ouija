@@ -1752,13 +1752,22 @@ impl DaemonState {
             }
         }
 
-        // Drop stale wire messages
+        // Drop stale wire messages. Idempotent gossip drops stay at Debug (the
+        // next snapshot repairs them); dropping a non-idempotent message loses a
+        // one-shot delta, so surface it above Debug and name the type so the
+        // lost update is diagnosable post-hoc (followup 667).
         if let (Some(daemon_id), Some(seq)) = (msg.daemon_id(), msg.seq()) {
             if !self.accept_seq(daemon_id, seq) {
+                let kind = msg.kind();
+                let (level, note) = if msg.is_idempotent_gossip() {
+                    (LogLevel::Debug, "")
+                } else {
+                    (LogLevel::Warn, " — LOST UPDATE")
+                };
                 return vec![Effect::Log {
-                    level: LogLevel::Debug,
+                    level,
                     message: format!(
-                        "dropping stale message from {daemon_id} (seq={seq} < last_seen)"
+                        "dropping stale {kind} from {daemon_id} (seq={seq} < last_seen){note}"
                     ),
                 }];
             }
@@ -5072,6 +5081,55 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    // Dropping a stale idempotent gossip message is invisible (Debug) and
+    // harmless. Dropping a stale SessionRenamed is a lost update — the exact
+    // failure behind the e2e-nostr R2 investigation — so it must be visible in
+    // default-level logs and name the message type (followup 667).
+    #[test]
+    fn stale_non_idempotent_wire_drop_logged_above_debug() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        // Establish seq=5 from the peer.
+        state.apply(Event::IncomingWire {
+            msg: crate::protocol::WireMessage::SessionList {
+                sessions: vec![],
+                daemon_id: "npub1remote".into(),
+                daemon_name: "remote-host".into(),
+                aliases: Default::default(),
+                seq: 5,
+            },
+            sender_npub: Some("npub1remote".into()),
+        });
+        // A stale SessionRenamed (seq=3) carries rename info that is now lost.
+        let effects = state.apply(Event::IncomingWire {
+            msg: crate::protocol::WireMessage::SessionRenamed {
+                old_id: "old".into(),
+                new_id: "new".into(),
+                daemon_id: "npub1remote".into(),
+                daemon_name: "remote-host".into(),
+                metadata: None,
+                seq: 3,
+            },
+            sender_npub: Some("npub1remote".into()),
+        });
+        let (level, message) = effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::Log { level, message } if message.contains("stale") => {
+                    Some((level, message))
+                }
+                _ => None,
+            })
+            .expect("stale drop should log");
+        assert!(
+            matches!(level, LogLevel::Warn),
+            "a stale non-idempotent drop must log above Debug, got {level:?}"
+        );
+        assert!(
+            message.contains("SessionRenamed"),
+            "drop log must name the message type: {message}"
+        );
     }
 
     #[test]
