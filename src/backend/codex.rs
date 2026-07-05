@@ -299,6 +299,12 @@ impl CodingAssistant for Codex {
     }
 
     fn inject_config(&self) -> InjectConfig {
+        // Verified against a live Codex 0.142.5 TUI pane (2026-07-05): inner
+        // bracketed paste + a 300ms settle before Enter delivers text intact
+        // (special chars/quotes preserved, no dropped keystrokes), multi-line
+        // input sanitizes to spaces without premature submit, and Enter reliably
+        // submits the composed prompt. The pane was interactive within ~2s, so
+        // the 5s startup delay is a safe conservative margin. See followup #692.
         InjectConfig {
             paste_settle_ms: 300,
             use_inner_bracketed_paste: true,
@@ -527,6 +533,17 @@ mod tests {
     #[test]
     fn tui_ready_pattern_is_prompt_glyph() {
         assert_eq!(backend().tui_ready_pattern(), Some("\u{203A}"));
+    }
+
+    #[test]
+    fn inject_config_matches_live_verified_values() {
+        // Locks the values verified against a live Codex TUI pane (followup #692).
+        // If injection tuning ever needs to change, re-verify against a live pane
+        // and update both this test and the doc comment together.
+        let cfg = backend().inject_config();
+        assert_eq!(cfg.paste_settle_ms, 300);
+        assert!(cfg.use_inner_bracketed_paste);
+        assert_eq!(cfg.startup_inject_delay_secs, 5);
     }
 
     #[test]
