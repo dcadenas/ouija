@@ -129,6 +129,73 @@ fn install_to(codex_home: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Recursively collect `*.jsonl` rollout files under `dir` (Codex nests session
+/// logs as `sessions/YYYY/MM/DD/rollout-*.jsonl`). Missing/unreadable dirs are
+/// skipped silently.
+fn collect_rollout_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rollout_files(&path, out);
+        } else if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+            out.push(path);
+        }
+    }
+}
+
+/// Read only the first line of a rollout file (the `session_meta` record).
+fn first_line(path: &Path) -> Option<String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    let mut line = String::new();
+    std::io::BufReader::new(file).read_line(&mut line).ok()?;
+    (!line.trim().is_empty()).then_some(line)
+}
+
+/// Find the most recent Codex session whose recorded cwd matches `project_dir`,
+/// returning its session id, or `None` if none match.
+///
+/// Each rollout file's first line is a `session_meta` record carrying
+/// `payload.session_id`, `payload.cwd`, and `payload.timestamp`; only that line
+/// is read. Recency is by `payload.timestamp` (ISO-8601, lexically sortable).
+/// `None` (absent dir or no cwd match) lets the caller fall back to
+/// `codex resume --last`. The cwd match is exact: Ouija launches Codex with
+/// `--cd <project_dir>`, so the recorded cwd is that same string.
+fn latest_session_id_for_cwd(sessions_root: &Path, project_dir: &str) -> Option<String> {
+    let mut files = Vec::new();
+    collect_rollout_files(sessions_root, &mut files);
+
+    let mut best: Option<(String, String)> = None; // (timestamp, session_id)
+    for file in files {
+        let Some(line) = first_line(&file) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
+            continue;
+        }
+        let payload = &v["payload"];
+        if payload.get("cwd").and_then(|c| c.as_str()) != Some(project_dir) {
+            continue;
+        }
+        let (Some(ts), Some(sid)) = (
+            payload.get("timestamp").and_then(|t| t.as_str()),
+            payload.get("session_id").and_then(|s| s.as_str()),
+        ) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(best_ts, _)| ts > best_ts.as_str()) {
+            best = Some((ts.to_string(), sid.to_string()));
+        }
+    }
+    best.map(|(_, sid)| sid)
+}
+
 /// Resolve CODEX_HOME, honoring the `CODEX_HOME` override before `~/.codex`,
 /// matching the Codex CLI's own resolution order.
 fn resolve_codex_home() -> Option<PathBuf> {
@@ -216,12 +283,13 @@ impl CodingAssistant for Codex {
         ))
     }
 
-    fn detect_session_id(&self, _project_dir: &str) -> Option<String> {
-        // Codex records sessions globally under `$CODEX_HOME/sessions`, not in
-        // a per-project directory. Ouija resumes via `codex resume --last`
-        // rather than threading an opaque backend session id, so there is
-        // nothing to auto-detect for v1.
-        None
+    fn detect_session_id(&self, project_dir: &str) -> Option<String> {
+        // Codex records sessions globally under `$CODEX_HOME/sessions/YYYY/MM/DD`.
+        // Resolve the most recent session whose recorded cwd matches this project
+        // so resume can target it explicitly (`codex resume <id>`); `None` falls
+        // back to `codex resume --last`.
+        let sessions_root = resolve_codex_home()?.join("sessions");
+        latest_session_id_for_cwd(&sessions_root, project_dir)
     }
 
     fn tui_ready_pattern(&self) -> Option<&str> {
@@ -408,9 +476,52 @@ mod tests {
         assert_eq!(format_model_flag(Some("gpt-5.5")), " --model 'gpt-5.5'");
     }
 
+    fn write_session_meta(path: &Path, cwd: &str, timestamp: &str, session_id: &str) {
+        // First line mirrors the real Codex rollout `session_meta` record; a
+        // second line ensures only the first is read.
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": { "session_id": session_id, "cwd": cwd, "timestamp": timestamp }
+        });
+        std::fs::write(path, format!("{meta}\n{{\"type\":\"event\"}}\n")).unwrap();
+    }
+
     #[test]
-    fn detect_session_id_always_none() {
-        assert_eq!(backend().detect_session_id("/home/user/myproject"), None);
+    fn latest_session_id_for_cwd_picks_most_recent_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let day = tmp.path().join("2026/07/05");
+        std::fs::create_dir_all(&day).unwrap();
+        write_session_meta(&day.join("a.jsonl"), "/proj", "2026-07-05T14:44:15.000Z", "uuid-old");
+        write_session_meta(&day.join("b.jsonl"), "/proj", "2026-07-05T15:00:00.000Z", "uuid-new");
+        write_session_meta(&day.join("c.jsonl"), "/other", "2026-07-05T16:00:00.000Z", "uuid-other");
+        assert_eq!(
+            latest_session_id_for_cwd(tmp.path(), "/proj"),
+            Some("uuid-new".to_string())
+        );
+        // No session recorded for this cwd → None (caller falls back to --last).
+        assert_eq!(latest_session_id_for_cwd(tmp.path(), "/nope"), None);
+    }
+
+    #[test]
+    fn latest_session_id_for_cwd_none_for_missing_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            latest_session_id_for_cwd(&tmp.path().join("sessions"), "/proj"),
+            None
+        );
+    }
+
+    #[test]
+    fn latest_session_id_for_cwd_skips_malformed_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let day = tmp.path().join("2026/07/05");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("bad.jsonl"), "not json at all\n").unwrap();
+        write_session_meta(&day.join("good.jsonl"), "/proj", "2026-07-05T15:00:00.000Z", "uuid-good");
+        assert_eq!(
+            latest_session_id_for_cwd(tmp.path(), "/proj"),
+            Some("uuid-good".to_string())
+        );
     }
 
     #[test]
