@@ -3170,6 +3170,29 @@ fn opencode_client_version() -> Option<String> {
     (!version.is_empty()).then_some(version)
 }
 
+/// Build the shell command that prints the version-skew notice in a pane.
+///
+/// `serve_version` and `client_version` are attacker-influenced free text (the
+/// serve's `/global/health` body and `opencode --version` stdout), so both are
+/// wrapped with [`crate::scheduler::shell_escape`] and spliced in at unquoted
+/// positions — the same pattern as [`opencode_attach_command`] — to keep a
+/// stray quote from breaking out of the notice and injecting shell.
+fn opencode_attach_skew_notice_command(
+    serve_version: &str,
+    client_version: &str,
+    port: u16,
+) -> String {
+    let serve = crate::scheduler::shell_escape(serve_version);
+    let client = crate::scheduler::shell_escape(client_version);
+    format!(
+        "clear; printf '%s\\n' \
+'ouija: opencode attach skipped — version skew (serve '{serve}' vs attach client '{client}').' \
+'The attach TUI would crash, so this pane is API-only. Message delivery still works.' \
+'View this session'\\''s transcript: curl http://127.0.0.1:{port}/session/<id>/message' \
+'Fix: align the opencode serve and attach client versions, then restart this session.'"
+    )
+}
+
 /// Replace a crashing `opencode attach` with a persistent, informative notice
 /// in the pane, so an operator sees the version skew instead of a Bun stack
 /// trace. The session stays functional via the HTTP API.
@@ -3179,13 +3202,7 @@ async fn notify_pane_opencode_attach_skew(
     client_version: &str,
     port: u16,
 ) {
-    let notice = format!(
-        "clear; printf '%s\\n' \
-'ouija: opencode attach skipped — version skew (serve {serve_version} vs attach client {client_version}).' \
-'The attach TUI would crash, so this pane is API-only. Message delivery still works.' \
-'View this session'\\''s transcript: curl http://127.0.0.1:{port}/session/<id>/message' \
-'Fix: align the opencode serve and attach client versions, then restart this session.'"
-    );
+    let notice = opencode_attach_skew_notice_command(serve_version, client_version, port);
     let pane = pane_id.to_string();
     let _ = tokio::task::spawn_blocking(move || {
         let _ = std::process::Command::new("tmux")
@@ -4490,6 +4507,28 @@ mod tests {
         assert_eq!(
             cmd,
             "opencode attach http://127.0.0.1:8200 --session 'ses_test' --dir '/tmp/project with spaces'"
+        );
+    }
+
+    #[test]
+    fn opencode_attach_skew_notice_command_shell_escapes_versions() {
+        // Version strings flow in from the serve's /global/health body and
+        // `opencode --version` stdout; a stray quote must not break out of the
+        // notice command and inject shell (matches opencode_attach_command).
+        let cmd =
+            opencode_attach_skew_notice_command("1.14.31'; touch PWNED; #", "1.17.7", 7880);
+        // The malicious serve version is single-quoted as one escaped token, so
+        // the injected `; touch PWNED` stays inside a quoted string.
+        assert!(
+            cmd.contains("'1.14.31'\\''; touch PWNED; #'"),
+            "serve version not shell-escaped: {cmd}"
+        );
+        assert!(cmd.contains("'1.17.7'"), "client version not quoted: {cmd}");
+        // No unescaped injection: the only `touch PWNED` occurrence sits inside
+        // the escaped token above, never as a bare command.
+        assert!(
+            !cmd.contains("31; touch"),
+            "injection escaped the quoting: {cmd}"
         );
     }
 
