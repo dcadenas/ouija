@@ -2,7 +2,58 @@ pub mod claude_code;
 pub mod opencode;
 
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Default hard timeout for a backend availability probe (`cli --version`).
+const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Run `command` to completion, killing it if it outlives `timeout`.
+///
+/// Returns `Some(status)` if the process exited on its own within the deadline,
+/// or `None` if it could not be spawned or was killed for exceeding `timeout`.
+///
+/// Some backend CLIs are npx/npm wrappers whose `--version` can hang while a
+/// wrapper resolves packages online. A blocking `Command::output()` would then
+/// stall daemon startup and every session-start registration (which probes
+/// availability per backend). Bounding the wait keeps those paths responsive.
+fn run_with_timeout(command: &mut Command, timeout: Duration) -> Option<std::process::ExitStatus> {
+    let mut child = command.spawn().ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// Whether `cli_name --version` exits successfully within `AVAILABILITY_TIMEOUT`.
+///
+/// Shared by every backend's default `is_available`. Output is discarded; only
+/// the exit status within the timeout matters.
+fn cli_reports_version(cli_name: &str) -> bool {
+    let mut command = Command::new(cli_name);
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    matches!(run_with_timeout(&mut command, AVAILABILITY_TIMEOUT), Some(status) if status.success())
+}
 
 /// Pre-trust mise config files in `dir` so spawned shells don't block on an
 /// interactive "Trust them? [Yes/No/All]" prompt.
@@ -183,11 +234,7 @@ pub trait CodingAssistant: Send + Sync + std::fmt::Debug + 'static {
     fn exit_command(&self) -> Option<&str>;
     fn install(&self) -> anyhow::Result<()>;
     fn is_available(&self) -> bool {
-        std::process::Command::new(self.cli_name())
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        cli_reports_version(self.cli_name())
     }
     fn description_file_priority(&self) -> &[&str] {
         &["README.md"]
@@ -203,6 +250,55 @@ mod tests {
         let registry = BackendRegistry::default_registry();
         let available = registry.available();
         assert!(available.iter().all(|name| !name.is_empty()));
+    }
+
+    #[test]
+    fn run_with_timeout_returns_status_for_fast_success() {
+        let status = run_with_timeout(&mut Command::new("true"), Duration::from_secs(3));
+        assert!(status.is_some_and(|s| s.success()));
+    }
+
+    #[test]
+    fn run_with_timeout_returns_status_for_fast_failure() {
+        let status = run_with_timeout(&mut Command::new("false"), Duration::from_secs(3));
+        assert!(status.is_some_and(|s| !s.success()));
+    }
+
+    #[test]
+    fn run_with_timeout_kills_and_returns_none_when_deadline_exceeded() {
+        // `sleep 5` would never finish inside a 200ms budget. The helper must
+        // give up promptly rather than block — this is the guarantee that keeps
+        // a hanging `codex --version` wrapper from stalling daemon startup.
+        let start = Instant::now();
+        let status = run_with_timeout(
+            Command::new("sleep").arg("5"),
+            Duration::from_millis(200),
+        );
+        assert!(status.is_none(), "timed-out process must return None");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "helper must return near the deadline, not wait for the process"
+        );
+    }
+
+    #[test]
+    fn run_with_timeout_returns_none_for_missing_binary() {
+        let status = run_with_timeout(
+            &mut Command::new("ouija-nonexistent-binary-xyz"),
+            Duration::from_secs(3),
+        );
+        assert!(status.is_none());
+    }
+
+    #[test]
+    fn cli_reports_version_true_for_command_that_exits_zero() {
+        // `true` ignores `--version` and exits 0, so the probe reports available.
+        assert!(cli_reports_version("true"));
+    }
+
+    #[test]
+    fn cli_reports_version_false_for_missing_binary() {
+        assert!(!cli_reports_version("ouija-nonexistent-binary-xyz"));
     }
 
     #[test]
