@@ -12,6 +12,11 @@ pub struct DaemonState {
     pub daemon_name: String,
     pub sessions: BTreeMap<String, SessionEntry>,
     pub aliases: BTreeMap<String, String>,
+    /// Rename aliases this daemon created for its own local sessions
+    /// (`old_id -> new_id`). Provenance-tracked: only [`Self::apply_rename`]
+    /// writes here, so remote-ingested aliases can never be exported as ours.
+    /// This is the sole source for [`Self::exportable_local_aliases`].
+    pub local_rename_aliases: BTreeMap<String, String>,
     pub wire_seq: u64,
     pub last_seen_seq: BTreeMap<String, u64>,
     /// Pending replies: session_id → list of pending msg_ids
@@ -909,6 +914,15 @@ impl DaemonState {
 
     /// Core state machine. Apply an event, return effects.
     pub fn apply(&mut self, event: Event) -> Vec<Effect> {
+        let effects = self.dispatch(event);
+        // Any event may have removed the session a local rename alias points
+        // at; drop dead entries so the exportable set (and thus gossip) stays
+        // bounded regardless of which removal path ran (followup 666).
+        self.prune_local_rename_aliases();
+        effects
+    }
+
+    fn dispatch(&mut self, event: Event) -> Vec<Effect> {
         match event {
             Event::Register { id, pane, metadata } => self.apply_register(id, pane, metadata),
             Event::RegisterIfPaneUnbound {
@@ -1237,6 +1251,43 @@ impl DaemonState {
         self.aliases.retain(|k, v| k != v);
     }
 
+    /// Record a rename this daemon performed on one of its own local sessions.
+    /// Kept separate from [`Self::add_alias`] so provenance is explicit: this
+    /// map is the only thing [`Self::exportable_local_aliases`] gossips.
+    fn add_local_rename_alias(&mut self, old_id: &str, new_id: &str) {
+        if old_id == new_id {
+            return;
+        }
+        // Repoint existing chains (A→old becomes A→new) so a chain of renames
+        // collapses instead of accumulating.
+        for target in self.local_rename_aliases.values_mut() {
+            if *target == old_id {
+                *target = new_id.to_string();
+            }
+        }
+        self.local_rename_aliases
+            .insert(old_id.to_string(), new_id.to_string());
+        self.local_rename_aliases.retain(|k, v| k != v);
+    }
+
+    /// Drop local rename aliases whose target session no longer exists as a
+    /// local session. Bounds the map (and thus SessionList gossip) so a
+    /// long-lived, frequently-renaming daemon cannot grow it without limit.
+    fn prune_local_rename_aliases(&mut self) {
+        self.local_rename_aliases.retain(|_, target| {
+            self.sessions
+                .get(target.as_str())
+                .is_some_and(|s| matches!(s.origin, Origin::Local))
+        });
+    }
+
+    /// Whether `id` currently names a local session.
+    fn local_session_named(&self, id: &str) -> bool {
+        self.sessions
+            .get(id)
+            .is_some_and(|s| matches!(s.origin, Origin::Local))
+    }
+
     pub fn resolve_alias(&self, id: &str) -> Option<&str> {
         let target = self.aliases.get(id)?;
         if self.sessions.contains_key(target.as_str()) {
@@ -1248,10 +1299,10 @@ impl DaemonState {
 
     /// Rename aliases whose target is a local networked session — the subset
     /// this daemon owns and may gossip in its [`crate::protocol::WireMessage::SessionList`].
-    /// Aliases for remote sessions (learned from other daemons), non-networked
-    /// targets, and dangling targets are excluded.
+    /// Reads the provenance-tracked [`Self::local_rename_aliases`]; entries
+    /// with non-networked, non-local, or dangling targets are excluded.
     pub fn exportable_local_aliases(&self) -> std::collections::BTreeMap<String, String> {
-        self.aliases
+        self.local_rename_aliases
             .iter()
             .filter(|(_, target)| {
                 self.sessions
@@ -1313,6 +1364,8 @@ impl DaemonState {
         }
 
         self.add_alias(old_id, new_id);
+        // Provenance: this is a local rename, so it is exportable.
+        self.add_local_rename_alias(old_id, new_id);
 
         effects.push(Effect::RenameAgent {
             old_id: old_id.to_string(),
@@ -2147,7 +2200,12 @@ impl DaemonState {
             let old_key = remote_session_key(daemon_name, old_id);
             let new_key = remote_session_key(daemon_name, new_id);
             self.add_alias(&old_key, &new_key);
-            self.add_alias(old_id, new_id);
+            // Guard: never let a remote rename alias a bare id onto our local
+            // namespace. If the bare new_id names a local session, the bare
+            // alias would misroute a send to old_id into our own session.
+            if !self.local_session_named(new_id) {
+                self.add_alias(old_id, new_id);
+            }
         }
 
         // Remove stale entries
@@ -2244,7 +2302,11 @@ impl DaemonState {
         self.sessions.insert(new_key.clone(), new_entry);
 
         self.add_alias(&old_key, &new_key);
-        self.add_alias(old_id, new_id);
+        // Guard: see apply_incoming_session_list — a remote rename must not
+        // alias a bare id onto a local session of the same name.
+        if !self.local_session_named(new_id) {
+            self.add_alias(old_id, new_id);
+        }
 
         vec![Effect::Log {
             level: LogLevel::Info,
@@ -4861,12 +4923,21 @@ mod tests {
                 ..Default::default()
             },
         );
-        state.aliases.insert("src".into(), "dst".into());
-        state.aliases.insert("old-hidden".into(), "hidden".into());
+        // Export reads the provenance-tracked local rename map, not the
+        // general alias table. Remote-session aliases are never recorded here,
+        // so a remote entry with a local-networked target still cannot leak.
         state
-            .aliases
+            .local_rename_aliases
+            .insert("src".into(), "dst".into());
+        state
+            .local_rename_aliases
+            .insert("old-hidden".into(), "hidden".into());
+        state
+            .local_rename_aliases
             .insert("remote-host/old".into(), "remote-host/new".into());
-        state.aliases.insert("dangling".into(), "gone".into());
+        state
+            .local_rename_aliases
+            .insert("dangling".into(), "gone".into());
 
         let exported = state.exportable_local_aliases();
         assert_eq!(exported.get("src"), Some(&"dst".to_string()));
@@ -4879,6 +4950,88 @@ mod tests {
             "remote-session aliases are the owning daemon's to gossip"
         );
         assert!(!exported.contains_key("dangling"));
+    }
+
+    // A remote daemon renaming one of its sessions to an id that happens to
+    // collide with a local session id must never (a) alias that bare id onto
+    // our local namespace, nor (b) leak into the aliases we gossip as ours.
+    // Provenance is tracked explicitly (local_rename_aliases), not inferred
+    // from a target-name lookup (arch-1).
+    #[test]
+    fn remote_rename_onto_local_id_does_not_alias_or_export_local_namespace() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.sessions.insert(
+            "shared".into(),
+            SessionEntry {
+                id: "shared".into(),
+                origin: Origin::Local,
+                metadata: SessionMeta {
+                    networked: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        // Remote rename: gone -> shared (bare new_id collides with our local id).
+        state.apply(Event::IncomingWire {
+            msg: crate::protocol::WireMessage::SessionRenamed {
+                old_id: "gone".into(),
+                new_id: "shared".into(),
+                daemon_id: "npub1remote".into(),
+                daemon_name: "remote-host".into(),
+                metadata: None,
+                seq: 1,
+            },
+            sender_npub: Some("npub1remote".into()),
+        });
+        assert_eq!(
+            state.resolve_alias("gone"),
+            None,
+            "a remote rename must not alias a bare id onto the local namespace"
+        );
+        assert!(
+            !state.exportable_local_aliases().contains_key("gone"),
+            "a remote-ingested alias must never be exported as our own"
+        );
+    }
+
+    // local_rename_aliases must not grow unboundedly: once the session an
+    // alias points at is gone, the entry is dead and is pruned so it can no
+    // longer ride SessionList gossip (followup 666).
+    #[test]
+    fn local_rename_alias_pruned_when_target_session_removed() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.sessions.insert(
+            "old".into(),
+            SessionEntry {
+                id: "old".into(),
+                origin: Origin::Local,
+                metadata: SessionMeta {
+                    networked: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        state.apply(Event::Rename {
+            old_id: "old".into(),
+            new_id: "new".into(),
+        });
+        assert!(
+            state.exportable_local_aliases().contains_key("old"),
+            "rename alias should export while its target session lives"
+        );
+        assert_eq!(state.local_rename_aliases.get("old"), Some(&"new".into()));
+
+        state.apply(Event::Remove {
+            id: "new".into(),
+            keep_worktree: false,
+        });
+        assert!(
+            !state.local_rename_aliases.contains_key("old"),
+            "dead rename alias must be pruned from the stored map"
+        );
+        assert!(!state.exportable_local_aliases().contains_key("old"));
     }
 
     #[test]
