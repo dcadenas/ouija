@@ -148,6 +148,26 @@ impl BackendRegistry {
             .collect()
     }
 
+    /// Every registered backend paired with its process names, regardless of
+    /// availability.
+    ///
+    /// Process-tree detection (`detect_backend_in_pane`) matches a running pane's
+    /// process names against this set. It must NOT be filtered by `available()`:
+    /// that runs each backend's `is_available()` CLI probe (e.g. a slow npx
+    /// `codex --version`), which both blocks the caller and would drop a live
+    /// pane whenever its backend CLI is slow to answer.
+    pub fn all_backend_process_names(&self) -> Vec<(String, Vec<String>)> {
+        self.backends
+            .iter()
+            .map(|b| {
+                (
+                    b.name().to_string(),
+                    b.process_names().iter().map(|s| s.to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
     /// Whether `backend_name` delivers messages over HTTP rather than the tmux TUI.
     ///
     /// HTTP-delivered sessions (e.g. opencode on a shared serve) reach the
@@ -330,5 +350,81 @@ mod tests {
                 .iter()
                 .any(|n| n == "codex")
         );
+    }
+
+    /// A backend whose CLI binary does not exist, so `is_available()` is false.
+    /// Used to prove process-tree detection does not gate on availability.
+    #[derive(Debug)]
+    struct UnavailableBackend;
+    impl CodingAssistant for UnavailableBackend {
+        fn name(&self) -> &str {
+            "ghost"
+        }
+        fn cli_name(&self) -> &str {
+            "ouija-nonexistent-binary-xyz"
+        }
+        fn process_names(&self) -> &[&str] {
+            &["ghostproc"]
+        }
+        fn delivery_mode(&self) -> DeliveryMode {
+            DeliveryMode::TuiInjection
+        }
+        fn build_start_command(&self, _: &StartOpts) -> String {
+            String::new()
+        }
+        fn build_resume_command(&self, _: &ResumeOpts) -> Option<String> {
+            None
+        }
+        fn detect_session_id(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn tui_ready_pattern(&self) -> Option<&str> {
+            None
+        }
+        fn inject_config(&self) -> InjectConfig {
+            InjectConfig {
+                paste_settle_ms: 0,
+                use_inner_bracketed_paste: false,
+                startup_inject_delay_secs: 0,
+            }
+        }
+        fn config_dir_name(&self) -> &str {
+            ".ghost"
+        }
+        fn has_project_history(&self, _: &Path) -> bool {
+            false
+        }
+        fn exit_command(&self) -> Option<&str> {
+            None
+        }
+        fn install(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn all_backend_process_names_ignores_availability() {
+        let registry = BackendRegistry::new(vec![Arc::new(UnavailableBackend) as _], "ghost");
+        // The CLI binary is absent, so availability-based listing excludes it.
+        assert!(registry.available().is_empty());
+        // But process-tree detection must still know its process names, so a
+        // live pane running that backend is never dropped just because its CLI
+        // is slow or absent when asked for --version (the codex npx-wrapper bug).
+        let names = registry.all_backend_process_names();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].0, "ghost");
+        assert_eq!(names[0].1, vec!["ghostproc".to_string()]);
+    }
+
+    #[test]
+    fn all_backend_process_names_covers_every_default_backend() {
+        let registry = BackendRegistry::default_registry();
+        let names = registry.all_backend_process_names();
+        for backend in ["claude-code", "opencode", "codex-cli"] {
+            assert!(
+                names.iter().any(|(n, _)| n == backend),
+                "{backend} missing from detection candidate set: {names:?}"
+            );
+        }
     }
 }
