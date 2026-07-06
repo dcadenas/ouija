@@ -242,11 +242,12 @@ pub async fn session_start(
 /// Mesh onboarding text surfaced to a freshly-registered session, or empty.
 ///
 /// Claude Code and OpenCode auto-load the `ouija` skill, so they need nothing
-/// here (returning empty keeps their SessionStart output unchanged). Codex has
-/// no equivalent skill-discovery path, so its register hook wraps this text into
-/// SessionStart `additionalContext`. `public_id` is the session's resolved public
-/// Ouija id, taught as `--from` because Codex's bash tool cannot be relied on to
-/// carry `TMUX_PANE` for sender resolution.
+/// here (returning empty keeps their SessionStart output unchanged). Codex also
+/// gets the skill installed under `$CODEX_HOME/skills/ouija` (#1445), but the
+/// static skill cannot know the session's live public id, so its register hook
+/// still wraps this text into SessionStart `additionalContext`. `public_id` is
+/// the session's resolved public Ouija id, taught as `--from` because Codex's
+/// bash tool cannot be relied on to carry `TMUX_PANE` for sender resolution.
 fn mesh_instructions_for_backend(backend: Option<&str>, public_id: &str) -> String {
     if backend != Some("codex-cli") {
         return String::new();
@@ -556,8 +557,8 @@ mod tests {
 
     #[test]
     fn mesh_instructions_only_for_codex() {
-        // Codex has no auto-loaded ouija skill, so session-start must teach it the
-        // mesh CLI, with its own public id as --from.
+        // The static skill can't know Codex's live public id, so session-start
+        // still teaches the mesh CLI with the resolved id as --from.
         let codex = mesh_instructions_for_backend(Some("codex-cli"), "feat/123-worker");
         assert!(codex.contains("ouija ls"), "{codex}");
         assert!(codex.contains("ouija ask"), "{codex}");
