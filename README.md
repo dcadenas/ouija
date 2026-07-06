@@ -8,13 +8,13 @@ You're deep in a coding session when you realize another session has the underst
 
 Ad hoc by design. Sessions don't need to be started any special way. Run ouija, open coding sessions as you normally would, and they discover each other. For same-machine messaging that's all you need. For cross-machine, pair two ouija daemons once over Nostr and any session on either machine becomes reachable.
 
-ouija is plumbing, not a harness. It delivers messages between sessions and manages their lifecycle. The protocol is open, the transport is end-to-end encrypted, and sessions keep their own memory, tools, and context. Today ouija supports Claude Code (primary, well-tested) and opencode (integrated, less battle-tested). Additional backends would plug in through the same hook and API surface the existing ones use.
+ouija is plumbing, not a harness. It delivers messages between sessions and manages their lifecycle. The protocol is open, the transport is end-to-end encrypted, and sessions keep their own memory, tools, and context. Today ouija supports Claude Code (primary, well-tested), opencode (integrated, less battle-tested), and the [Codex CLI](https://developers.openai.com/codex) (TUI-injection backend — see [docs/codex-cli.md](docs/codex-cli.md)). Additional backends would plug in through the same hook and API surface the existing ones use.
 
 The session lifecycle primitives (spawn, kill, health checks, worktree isolation) may also be useful beneath a higher-level harness or orchestrator, but ouija itself stays small: discover sessions, deliver messages, and keep sessions reachable.
 
 ## Prerequisites
 
-[tmux](https://github.com/tmux/tmux) and at least one supported coding assistant: [Claude Code](https://docs.anthropic.com/en/docs/claude-code) or [opencode](https://opencode.ai).
+[tmux](https://github.com/tmux/tmux) and at least one supported coding assistant: [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [opencode](https://opencode.ai), or the [Codex CLI](https://developers.openai.com/codex).
 
 ## Quick start
 
@@ -30,7 +30,7 @@ If a matching prebuilt release artifact is available for your platform, `cargo b
 The daemon auto-configures your coding assistant (hooks, skills). In another terminal, open a session inside tmux:
 
 ```bash
-tmux new-session && claude    # or: opencode
+tmux new-session && claude    # or: opencode, codex
 ```
 
 Sessions auto-register using the working directory name (e.g. `/code/api` becomes `api`). Start talking:
@@ -43,7 +43,7 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 
 **Share state through the filesystem, not just the wire.** A message can be small and point to shared state: "see `docs/api.md`" or "check the worktree at `~/code/foo`". The receiver loads the full content from disk, bypassing the compression that any fixed-size message would impose. Messages as pointers to shared state scale better than messages as state.
 
-**Spawn sessions on the fly.** Ask the assistant to start a new session (e.g. "use ouija to start a gateway-debug session"). The daemon creates a tmux window, launches a coding session, and registers it. You can specify a prompt to seed the session with context and a backend (`claude-code` or `opencode`).
+**Spawn sessions on the fly.** Ask the assistant to start a new session (e.g. "use ouija to start a gateway-debug session"). The daemon creates a tmux window, launches a coding session, and registers it. You can specify a prompt to seed the session with context and a backend (`claude-code`, `opencode`, or `codex-cli`).
 
 **Long-running work.** Two mechanisms for recurring work:
 
