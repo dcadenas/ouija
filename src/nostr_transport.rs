@@ -2326,25 +2326,49 @@ pub async fn restart_session(
                             .await
                         {
                             Ok(r) if r.status().is_success() => {
-                                match launch_opencode_attach_for_session(
-                                    &pane_id, &dir, prev_sid, port,
-                                )
-                                .await
-                                .and_then(|attach_ready| {
-                                    previous_backend_session_after_attach(
-                                        prev_sid.clone(),
-                                        attach_ready,
-                                        &pane_id,
+                                // Guard reuse against serve/attach-client version
+                                // skew: a mismatched attach TUI crashes to a bare
+                                // pane. Show the notice and keep the reused session
+                                // registered API-only instead (mirrors the
+                                // fresh-create guard in setup_shared_serve_session).
+                                if let Some((serve_v, client_v)) =
+                                    opencode_attach_skew(&state.http_client, port).await
+                                {
+                                    tracing::warn!(
+                                        port,
+                                        pane = %pane_id,
+                                        backend_session_id = %prev_sid,
+                                        serve_version = %serve_v,
+                                        attach_client_version = %client_v,
+                                        "opencode attach client/serve version skew on reuse; skipping attach TUI (would crash). Session remains functional via HTTP API."
+                                    );
+                                    notify_pane_opencode_attach_skew(
+                                        &pane_id, &serve_v, &client_v, port,
                                     )
-                                }) {
-                                    Ok(sid) => {
-                                        backend_session_id = Some(sid);
-                                        reused_previous_backend_session = true;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "previous backend_session_id {prev_sid} is reachable but attach failed: {e}"
-                                        );
+                                    .await;
+                                    backend_session_id = Some(prev_sid.clone());
+                                    reused_previous_backend_session = true;
+                                } else {
+                                    match launch_opencode_attach_for_session(
+                                        &pane_id, &dir, prev_sid, port,
+                                    )
+                                    .await
+                                    .and_then(|attach_ready| {
+                                        previous_backend_session_after_attach(
+                                            prev_sid.clone(),
+                                            attach_ready,
+                                            &pane_id,
+                                        )
+                                    }) {
+                                        Ok(sid) => {
+                                            backend_session_id = Some(sid);
+                                            reused_previous_backend_session = true;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "previous backend_session_id {prev_sid} is reachable but attach failed: {e}"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -2618,8 +2642,15 @@ async fn soft_restart_session(
 
     // 3. Respawn the TUI attach to point at the new session.
     if let Some(pane) = pane {
-        match respawn_opencode_attach_for_session(pane, project_dir, &new_session_id, port, name)
-            .await
+        match respawn_opencode_attach_for_session(
+            pane,
+            project_dir,
+            &new_session_id,
+            port,
+            name,
+            &state.http_client,
+        )
+        .await
         {
             Ok(true) => {
                 if should_commit_soft_restart_metadata_before_prompt(Some(pane), prompt)
@@ -2764,6 +2795,7 @@ async fn soft_restart_session(
                                 previous_session_id,
                                 port,
                                 name,
+                                &state.http_client,
                             )
                             .await
                             {
@@ -2802,6 +2834,7 @@ async fn soft_restart_session(
                         previous_session_id,
                         port,
                         name,
+                        &state.http_client,
                     )
                     .await
                     {
@@ -2835,6 +2868,7 @@ async fn soft_restart_session(
                         previous_session_id,
                         port,
                         name,
+                        &state.http_client,
                     )
                     .await
                     {
@@ -3001,8 +3035,15 @@ async fn rollback_pane_after_failed_soft_restart_commit(
         return;
     };
 
-    match respawn_opencode_attach_for_session(pane, project_dir, &target_session_id, port, name)
-        .await
+    match respawn_opencode_attach_for_session(
+        pane,
+        project_dir,
+        &target_session_id,
+        port,
+        name,
+        &state.http_client,
+    )
+    .await
     {
         Ok(true) => {}
         Ok(false) => tracing::warn!(
@@ -3170,6 +3211,68 @@ fn opencode_client_version() -> Option<String> {
     (!version.is_empty()).then_some(version)
 }
 
+/// Read the shared opencode serve's self-reported version via `/global/health`.
+///
+/// Returns `None` on any failure (unreachable, non-success, or missing
+/// `version` field) so the skew guard fails open — a probe failure must never
+/// block an attach. Mirrors the health parse in [`setup_shared_serve_session`],
+/// which keeps its own copy because it must instead bail when the serve is down.
+async fn opencode_serve_version(client: &reqwest::Client, port: u16) -> Option<String> {
+    let resp = client
+        .get(format!("http://127.0.0.1:{port}/global/health"))
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    body.get("version")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// Detect serve/attach-client version skew for the shared opencode serve.
+///
+/// Returns `Some((serve_version, client_version))` only when both versions are
+/// known and incompatible; `None` otherwise (compatible, or either version
+/// unreadable — fail open so the attach still runs). Used to guard the reuse
+/// and respawn attach paths, matching the fresh-create guard in
+/// [`setup_shared_serve_session`].
+async fn opencode_attach_skew(client: &reqwest::Client, port: u16) -> Option<(String, String)> {
+    let client_version = opencode_client_version()?;
+    let serve_version = opencode_serve_version(client, port).await?;
+    if opencode_attach_versions_compatible(&serve_version, &client_version) {
+        None
+    } else {
+        Some((serve_version, client_version))
+    }
+}
+
+/// Build the shell command that prints the version-skew notice in a pane.
+///
+/// `serve_version` and `client_version` are attacker-influenced free text (the
+/// serve's `/global/health` body and `opencode --version` stdout), so both are
+/// wrapped with [`crate::scheduler::shell_escape`] and spliced in at unquoted
+/// positions — the same pattern as [`opencode_attach_command`] — to keep a
+/// stray quote from breaking out of the notice and injecting shell.
+fn opencode_attach_skew_notice_command(
+    serve_version: &str,
+    client_version: &str,
+    port: u16,
+) -> String {
+    let serve = crate::scheduler::shell_escape(serve_version);
+    let client = crate::scheduler::shell_escape(client_version);
+    format!(
+        "clear; printf '%s\\n' \
+'ouija: opencode attach skipped — version skew (serve '{serve}' vs attach client '{client}').' \
+'The attach TUI would crash, so this pane is API-only. Message delivery still works.' \
+'View this session'\\''s transcript: curl http://127.0.0.1:{port}/session/<id>/message' \
+'Fix: align the opencode serve and attach client versions, then restart this session.'"
+    )
+}
+
 /// Replace a crashing `opencode attach` with a persistent, informative notice
 /// in the pane, so an operator sees the version skew instead of a Bun stack
 /// trace. The session stays functional via the HTTP API.
@@ -3179,13 +3282,7 @@ async fn notify_pane_opencode_attach_skew(
     client_version: &str,
     port: u16,
 ) {
-    let notice = format!(
-        "clear; printf '%s\\n' \
-'ouija: opencode attach skipped — version skew (serve {serve_version} vs attach client {client_version}).' \
-'The attach TUI would crash, so this pane is API-only. Message delivery still works.' \
-'View this session'\\''s transcript: curl http://127.0.0.1:{port}/session/<id>/message' \
-'Fix: align the opencode serve and attach client versions, then restart this session.'"
-    );
+    let notice = opencode_attach_skew_notice_command(serve_version, client_version, port);
     let pane = pane_id.to_string();
     let _ = tokio::task::spawn_blocking(move || {
         let _ = std::process::Command::new("tmux")
@@ -3195,13 +3292,71 @@ async fn notify_pane_opencode_attach_skew(
     .await;
 }
 
+/// Respawn a pane to a persistent skew notice instead of a crashing `opencode
+/// attach`.
+///
+/// The respawn paths replace the pane process with `respawn-pane -k`, so — unlike
+/// [`notify_pane_opencode_attach_skew`], which sends keys into a live shell — the
+/// notice command must exec a shell afterwards to keep the pane open for reading.
+/// Returns `Ok(true)` so callers treat the pane as handled and keep the
+/// HTTP-API session registered.
+async fn respawn_pane_opencode_attach_skew_notice(
+    pane_id: &str,
+    serve_version: &str,
+    client_version: &str,
+    port: u16,
+    ouija_session_id: &str,
+) -> anyhow::Result<bool> {
+    let notice = opencode_attach_skew_notice_command(serve_version, client_version, port);
+    // Keep the pane alive after the notice prints so the operator can read it.
+    let command = format!("{notice}; exec \"${{SHELL:-/bin/sh}}\"");
+    let pane = pane_id.to_string();
+    let env_args = crate::tmux::pane_env_args(ouija_session_id);
+    tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
+        args.extend(env_args.iter().map(String::as_str));
+        args.extend_from_slice(&["-t", &pane, &command]);
+        let status = std::process::Command::new("tmux").args(&args).status()?;
+        if !status.success() {
+            anyhow::bail!("tmux respawn-pane (skew notice) failed for {pane}");
+        }
+        Ok(true)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("opencode attach skew-notice respawn task failed: {e}"))?
+}
+
 async fn respawn_opencode_attach_for_session(
     pane_id: &str,
     project_dir: &str,
     session_id: &str,
     port: u16,
     ouija_session_id: &str,
+    http_client: &reqwest::Client,
 ) -> anyhow::Result<bool> {
+    // Guard against serve/attach-client version skew before respawning: a
+    // mismatched attach TUI crashes to a bare Bun stack trace. Show the notice
+    // instead and keep the session functional over HTTP (mirrors the
+    // fresh-create guard in setup_shared_serve_session).
+    if let Some((serve_v, client_v)) = opencode_attach_skew(http_client, port).await {
+        tracing::warn!(
+            port,
+            pane = %pane_id,
+            backend_session_id = %session_id,
+            serve_version = %serve_v,
+            attach_client_version = %client_v,
+            "opencode attach client/serve version skew on respawn; showing notice instead of attach TUI (would crash). Session remains functional via HTTP API."
+        );
+        return respawn_pane_opencode_attach_skew_notice(
+            pane_id,
+            &serve_v,
+            &client_v,
+            port,
+            ouija_session_id,
+        )
+        .await;
+    }
+
     let attach_cmd = opencode_attach_command(port, session_id, project_dir);
     let pane = pane_id.to_string();
     let wait_pane = pane_id.to_string();
@@ -4494,6 +4649,27 @@ mod tests {
     }
 
     #[test]
+    fn opencode_attach_skew_notice_command_shell_escapes_versions() {
+        // Version strings flow in from the serve's /global/health body and
+        // `opencode --version` stdout; a stray quote must not break out of the
+        // notice command and inject shell (matches opencode_attach_command).
+        let cmd = opencode_attach_skew_notice_command("1.14.31'; touch PWNED; #", "1.17.7", 7880);
+        // The malicious serve version is single-quoted as one escaped token, so
+        // the injected `; touch PWNED` stays inside a quoted string.
+        assert!(
+            cmd.contains("'1.14.31'\\''; touch PWNED; #'"),
+            "serve version not shell-escaped: {cmd}"
+        );
+        assert!(cmd.contains("'1.17.7'"), "client version not quoted: {cmd}");
+        // No unescaped injection: the only `touch PWNED` occurrence sits inside
+        // the escaped token above, never as a bare command.
+        assert!(
+            !cmd.contains("31; touch"),
+            "injection escaped the quoting: {cmd}"
+        );
+    }
+
+    #[test]
     fn opencode_attach_versions_compatible_matches_exact_version() {
         assert!(opencode_attach_versions_compatible("1.14.31", "1.14.31"));
         // Surrounding whitespace from `--version` output is ignored.
@@ -4951,6 +5127,37 @@ mod tests {
         assert!(cleaned);
         assert!(deleted.load(Ordering::SeqCst));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn opencode_serve_version_reads_health_body() {
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::get;
+        use tokio::net::TcpListener;
+
+        async fn health() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "version": "1.14.31" }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route("/global/health", get(health));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let version = opencode_serve_version(&reqwest::Client::new(), port).await;
+        assert_eq!(version.as_deref(), Some("1.14.31"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn opencode_serve_version_fails_open_on_non_success() {
+        // A serve that is up but returns an error must yield None so the skew
+        // guard fails open rather than blocking the attach.
+        let version = opencode_serve_version(&reqwest::Client::new(), 1).await;
+        assert!(version.is_none());
     }
 
     #[tokio::test]
