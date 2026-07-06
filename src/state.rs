@@ -703,14 +703,14 @@ impl AppState {
     /// Returns the backend name (e.g. `"opencode"`, `"claude-code"`) if a known
     /// backend process is found, or `None` if detection fails.
     pub async fn detect_backend_in_pane(&self, pane: &str) -> Option<String> {
-        // Collect process names for each backend
-        let mut backend_process_names: Vec<(String, Vec<String>)> = Vec::new();
-        for name in self.backends.available() {
-            if let Some(b) = self.backends.get(name) {
-                let pnames: Vec<String> = b.process_names().iter().map(|s| s.to_string()).collect();
-                backend_process_names.push((name.to_string(), pnames));
-            }
-        }
+        // Candidate process names for every registered backend. Deliberately not
+        // filtered by `available()`: that runs each backend's `is_available()` CLI
+        // probe (e.g. a slow/hanging npx `codex --version`) on the caller — which
+        // both blocks this tokio worker and would drop a live codex pane whenever
+        // the probe is slow. Detection is pure process-tree matching and needs no
+        // availability check.
+        let backend_process_names: Vec<(String, Vec<String>)> =
+            self.backends.all_backend_process_names();
 
         let pane = pane.to_string();
         tokio::task::spawn_blocking(move || {

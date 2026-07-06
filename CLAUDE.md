@@ -53,6 +53,7 @@ When spawning or respawning tmux panes for Ouija-managed sessions, route environ
 - **`scheduler.rs`** — Cron tasks with `OnFire` modes (ContinueSession, NewSession, PersistentWorktree, DisposableWorktree).
 - **`backend/claude_code.rs`** — Claude Code integration: CLI command building, plugin bootstrap, workspace trust.
 - **`backend/opencode.rs`** — OpenCode integration: HTTP API delivery mode.
+- **`backend/codex.rs`** — Codex CLI integration: TUI-injection delivery, `~/.codex/hooks.json` bootstrap. See `docs/codex-cli.md`.
 - **`tmux.rs`** — Pane discovery, message injection with bracketed paste, vim-mode detection.
 
 ### Message delivery
@@ -75,6 +76,16 @@ Remote: Same flow but wrapped in NIP-17 encrypted DMs via Nostr relays.
 ### Workspace trust
 
 `pre_trust_workspace()` in `backend/claude_code.rs` writes `hasTrustDialogAccepted: true` to `~/.claude.json` before spawning sessions, bypassing the interactive trust dialog.
+
+### Codex CLI backend
+
+`backend/codex.rs` adds a TUI-injection backend (`name = "codex-cli"`) that launches `codex --ask-for-approval never --sandbox workspace-write --no-alt-screen` inside an **Ouija-managed** cwd/worktree. Key differences from Claude Code, all deliberate (#1442):
+
+- **No Codex `--worktree`.** Codex CLI has no such flag; Ouija/Hub set up the worktree and Codex starts inside it via `cd <dir>`. Codex *app*-managed worktrees (`$CODEX_HOME/worktrees`, detached HEAD) are a separate feature and out of scope.
+- **No `--effort` flag.** Codex exposes no verified CLI effort flag, so Ouija `effort` is dropped rather than guessed onto the command line. Model/provider selection is **user-owned Codex config** (`-m/--model`, `--oss`, `--local-provider`); Ouija only passes `-m <model>` through when set.
+- **Turn-scoped `Stop`, no hook-driven unregister.** Codex fires `Stop` after *every* turn and has no `SessionEnd` event, so the Codex Stop hook only does turn bookkeeping and returns `{"continue":true}` — it must never unregister. Session cleanup relies on pane/process liveness (`pane_alive` tree walk), which already handles the `node -> codex` npx wrapper. `scheduler::wait_for_process` is process-tree-aware for the same reason.
+- **Mesh instructions via hook context.** Codex has no auto-loaded ouija skill, so `session_start_inner` returns mesh-CLI instructions (with the public id as `--from`) in `output` for codex-cli only; the register hook wraps them into Codex SessionStart `additionalContext`.
+- **Hook trust.** `install()` writes/merges `~/.codex/hooks.json` idempotently. Normal installs may require Codex's hook trust-review; tests use `--dangerously-bypass-hook-trust`. See `docs/codex-cli.md`.
 
 ## Testing patterns
 

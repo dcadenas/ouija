@@ -351,6 +351,7 @@ async fn main() -> anyhow::Result<()> {
             preflight_checks();
             let _ = backend::claude_code::ClaudeCode.install();
             let _ = backend::opencode::OpenCode.install();
+            let _ = backend::codex::Codex.install();
 
             let name = name.unwrap_or_else(|| {
                 hostname::get()
@@ -378,9 +379,10 @@ async fn main() -> anyhow::Result<()> {
                 let available = registry.available();
                 if available.is_empty() {
                     eprintln!(
-                        "error: no coding backend found in PATH. Install claude-code or opencode.\n\
+                        "error: no coding backend found in PATH. Install claude-code, opencode, or codex.\n\
                          See: https://docs.anthropic.com/en/docs/claude-code\n\
-                         See: https://opencode.ai"
+                         See: https://opencode.ai\n\
+                         See: https://developers.openai.com/codex"
                     );
                     std::process::exit(1);
                 }

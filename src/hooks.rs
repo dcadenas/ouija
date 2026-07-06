@@ -239,6 +239,33 @@ pub async fn session_start(
     (StatusCode::OK, Json(result))
 }
 
+/// Mesh onboarding text surfaced to a freshly-registered session, or empty.
+///
+/// Claude Code and OpenCode auto-load the `ouija` skill, so they need nothing
+/// here (returning empty keeps their SessionStart output unchanged). Codex has
+/// no equivalent skill-discovery path, so its register hook wraps this text into
+/// SessionStart `additionalContext`. `public_id` is the session's resolved public
+/// Ouija id, taught as `--from` because Codex's bash tool cannot be relied on to
+/// carry `TMUX_PANE` for sender resolution.
+fn mesh_instructions_for_backend(backend: Option<&str>, public_id: &str) -> String {
+    if backend != Some("codex-cli") {
+        return String::new();
+    }
+    format!(
+        "You are on the Ouija mesh. Message other sessions with the `ouija` CLI \
+         (NOT your own messaging tools — they cannot reach the mesh).\n\
+         Your public Ouija id is `{public_id}`. Pass it as `--from {public_id}` on \
+         every command so the mesh knows who is sending.\n\n\
+         - `ouija ls` — list reachable sessions (targets for messages).\n\
+         - `ouija ask <target> \"question\" --from {public_id}` — ask and wait for a reply.\n\
+         - `ouija tell <target> \"note\" --from {public_id}` — fire-and-forget message.\n\
+         - `ouija reply <target> <msg-id> \"answer\" --from {public_id}` — answer a \
+         `<msg ... reply=\"true\">` you received (the sender is blocked until you reply).\n\n\
+         Incoming messages arrive as `<msg from=\"...\" id=\"N\" reply=\"true\">text</msg>`; \
+         reply to those with `reply=\"true\"` using their `id`."
+    )
+}
+
 async fn session_start_inner(
     state: &std::sync::Arc<crate::state::AppState>,
     body: SessionStartBody,
@@ -248,11 +275,23 @@ async fn session_start_inner(
         return json!({ "skipped": "auto_register disabled", "output": "" });
     }
 
-    // Skip if pane already registered (API-started sessions hit this path)
+    // Skip if pane already registered (Ouija-launched / API-started sessions hit
+    // this path — they are pane-registered with their backend before the hook
+    // fires). Still surface mesh onboarding for codex-cli here, keyed off the
+    // session's authoritative stored backend + id, so the primary launch path
+    // gets it (claude-code/opencode carry the skill and stay empty).
     if let Some(existing_id) = state.find_session_by_pane(&body.pane).await {
+        let existing_backend = {
+            let proto = state.protocol.read().await;
+            proto
+                .sessions
+                .get(&existing_id)
+                .and_then(|s| s.metadata.backend.clone())
+        };
+        let output = mesh_instructions_for_backend(existing_backend.as_deref(), &existing_id);
         return json!({
             "registered": existing_id,
-            "output": "",
+            "output": output,
         });
     }
 
@@ -290,6 +329,10 @@ async fn session_start_inner(
         None
     };
 
+    // Compute mesh onboarding text before `detected_backend` is moved into the
+    // metadata. Non-empty only for codex-cli (Claude/opencode carry the skill).
+    let output = mesh_instructions_for_backend(detected_backend.as_deref(), &id);
+
     // Register
     let role = format!("working on {basename}");
     let proto_meta = crate::daemon_protocol::SessionMeta {
@@ -309,7 +352,7 @@ async fn session_start_inner(
 
     json!({
         "registered": id,
-        "output": "",
+        "output": output,
     })
 }
 
@@ -509,6 +552,80 @@ mod tests {
         };
         let result = pre_tool_use_inner(&state, body).await;
         assert_eq!(result["block"], false);
+    }
+
+    #[test]
+    fn mesh_instructions_only_for_codex() {
+        // Codex has no auto-loaded ouija skill, so session-start must teach it the
+        // mesh CLI, with its own public id as --from.
+        let codex = mesh_instructions_for_backend(Some("codex-cli"), "feat/123-worker");
+        assert!(codex.contains("ouija ls"), "{codex}");
+        assert!(codex.contains("ouija ask"), "{codex}");
+        assert!(codex.contains("ouija tell"), "{codex}");
+        assert!(codex.contains("ouija reply"), "{codex}");
+        assert!(
+            codex.contains("--from feat/123-worker"),
+            "must teach the resolved public id as --from: {codex}"
+        );
+
+        // Claude/opencode already carry the skill — their output stays empty.
+        assert_eq!(mesh_instructions_for_backend(Some("claude-code"), "x"), "");
+        assert_eq!(mesh_instructions_for_backend(Some("opencode"), "x"), "");
+        assert_eq!(mesh_instructions_for_backend(None, "x"), "");
+    }
+
+    #[tokio::test]
+    async fn session_start_onboards_already_registered_codex_session() {
+        // Ouija-launched sessions are pane-registered (with their backend) before
+        // the SessionStart hook fires, so the hook hits the already-registered
+        // branch. A codex-cli session must still receive mesh onboarding there —
+        // otherwise the primary launch path never gets it.
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "feat/worker".into(),
+                pane: Some("%70".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let body = SessionStartBody {
+            pane: "%70".into(),
+            cwd: "/home/user/code/proj".into(),
+        };
+        let result = session_start_inner(&state, body).await;
+        assert_eq!(result["registered"], "feat/worker");
+        let output = result["output"].as_str().unwrap();
+        assert!(output.contains("ouija ls"), "codex must be onboarded: {output}");
+        assert!(
+            output.contains("--from feat/worker"),
+            "must use the authoritative registered id: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_already_registered_non_codex_stays_empty() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "claude-worker".into(),
+                pane: Some("%71".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let body = SessionStartBody {
+            pane: "%71".into(),
+            cwd: "/home/user/code/proj".into(),
+        };
+        let result = session_start_inner(&state, body).await;
+        assert_eq!(result["registered"], "claude-worker");
+        // Claude carries the skill; its output stays empty.
+        assert_eq!(result["output"], "");
     }
 
     #[tokio::test]

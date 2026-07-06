@@ -1,8 +1,60 @@
 pub mod claude_code;
+pub mod codex;
 pub mod opencode;
 
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Default hard timeout for a backend availability probe (`cli --version`).
+const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Run `command` to completion, killing it if it outlives `timeout`.
+///
+/// Returns `Some(status)` if the process exited on its own within the deadline,
+/// or `None` if it could not be spawned or was killed for exceeding `timeout`.
+///
+/// Some backend CLIs are npx/npm wrappers whose `--version` can hang while a
+/// wrapper resolves packages online. A blocking `Command::output()` would then
+/// stall daemon startup and every session-start registration (which probes
+/// availability per backend). Bounding the wait keeps those paths responsive.
+fn run_with_timeout(command: &mut Command, timeout: Duration) -> Option<std::process::ExitStatus> {
+    let mut child = command.spawn().ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// Whether `cli_name --version` exits successfully within `AVAILABILITY_TIMEOUT`.
+///
+/// Shared by every backend's default `is_available`. Output is discarded; only
+/// the exit status within the timeout matters.
+fn cli_reports_version(cli_name: &str) -> bool {
+    let mut command = Command::new(cli_name);
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    matches!(run_with_timeout(&mut command, AVAILABILITY_TIMEOUT), Some(status) if status.success())
+}
 
 /// Pre-trust mise config files in `dir` so spawned shells don't block on an
 /// interactive "Trust them? [Yes/No/All]" prompt.
@@ -65,6 +117,7 @@ impl BackendRegistry {
             vec![
                 Arc::new(claude_code::ClaudeCode) as _,
                 Arc::new(opencode::OpenCode) as _,
+                Arc::new(codex::Codex) as _,
             ],
             "claude-code",
         )
@@ -92,6 +145,26 @@ impl BackendRegistry {
         self.backends
             .iter()
             .flat_map(|b| b.process_names().iter().map(|s| s.to_string()))
+            .collect()
+    }
+
+    /// Every registered backend paired with its process names, regardless of
+    /// availability.
+    ///
+    /// Process-tree detection (`detect_backend_in_pane`) matches a running pane's
+    /// process names against this set. It must NOT be filtered by `available()`:
+    /// that runs each backend's `is_available()` CLI probe (e.g. a slow npx
+    /// `codex --version`), which both blocks the caller and would drop a live
+    /// pane whenever its backend CLI is slow to answer.
+    pub fn all_backend_process_names(&self) -> Vec<(String, Vec<String>)> {
+        self.backends
+            .iter()
+            .map(|b| {
+                (
+                    b.name().to_string(),
+                    b.process_names().iter().map(|s| s.to_string()).collect(),
+                )
+            })
             .collect()
     }
 
@@ -183,11 +256,7 @@ pub trait CodingAssistant: Send + Sync + std::fmt::Debug + 'static {
     fn exit_command(&self) -> Option<&str>;
     fn install(&self) -> anyhow::Result<()>;
     fn is_available(&self) -> bool {
-        std::process::Command::new(self.cli_name())
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        cli_reports_version(self.cli_name())
     }
     fn description_file_priority(&self) -> &[&str] {
         &["README.md"]
@@ -206,13 +275,156 @@ mod tests {
     }
 
     #[test]
+    fn run_with_timeout_returns_status_for_fast_success() {
+        let status = run_with_timeout(&mut Command::new("true"), Duration::from_secs(3));
+        assert!(status.is_some_and(|s| s.success()));
+    }
+
+    #[test]
+    fn run_with_timeout_returns_status_for_fast_failure() {
+        let status = run_with_timeout(&mut Command::new("false"), Duration::from_secs(3));
+        assert!(status.is_some_and(|s| !s.success()));
+    }
+
+    #[test]
+    fn run_with_timeout_kills_and_returns_none_when_deadline_exceeded() {
+        // `sleep 5` would never finish inside a 200ms budget. The helper must
+        // give up promptly rather than block — this is the guarantee that keeps
+        // a hanging `codex --version` wrapper from stalling daemon startup.
+        let start = Instant::now();
+        let status = run_with_timeout(
+            Command::new("sleep").arg("5"),
+            Duration::from_millis(200),
+        );
+        assert!(status.is_none(), "timed-out process must return None");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "helper must return near the deadline, not wait for the process"
+        );
+    }
+
+    #[test]
+    fn run_with_timeout_returns_none_for_missing_binary() {
+        let status = run_with_timeout(
+            &mut Command::new("ouija-nonexistent-binary-xyz"),
+            Duration::from_secs(3),
+        );
+        assert!(status.is_none());
+    }
+
+    #[test]
+    fn cli_reports_version_true_for_command_that_exits_zero() {
+        // `true` ignores `--version` and exits 0, so the probe reports available.
+        assert!(cli_reports_version("true"));
+    }
+
+    #[test]
+    fn cli_reports_version_false_for_missing_binary() {
+        assert!(!cli_reports_version("ouija-nonexistent-binary-xyz"));
+    }
+
+    #[test]
     fn uses_http_delivery_distinguishes_backends() {
         let registry = BackendRegistry::default_registry();
         // opencode runs on a shared serve and is reached over HTTP.
         assert!(registry.uses_http_delivery("opencode"));
         // claude-code is driven through the tmux TUI.
         assert!(!registry.uses_http_delivery("claude-code"));
+        // codex-cli is driven through the tmux TUI, not HTTP.
+        assert!(!registry.uses_http_delivery("codex-cli"));
         // Unknown backends default to false.
         assert!(!registry.uses_http_delivery("nonexistent"));
+    }
+
+    #[test]
+    fn registry_includes_codex_backend() {
+        let registry = BackendRegistry::default_registry();
+        let codex = registry
+            .get("codex-cli")
+            .expect("codex-cli backend must be registered");
+        assert_eq!(codex.cli_name(), "codex");
+        // Its process name participates in the global process-name sweep.
+        assert!(
+            registry
+                .all_process_names()
+                .iter()
+                .any(|n| n == "codex")
+        );
+    }
+
+    /// A backend whose CLI binary does not exist, so `is_available()` is false.
+    /// Used to prove process-tree detection does not gate on availability.
+    #[derive(Debug)]
+    struct UnavailableBackend;
+    impl CodingAssistant for UnavailableBackend {
+        fn name(&self) -> &str {
+            "ghost"
+        }
+        fn cli_name(&self) -> &str {
+            "ouija-nonexistent-binary-xyz"
+        }
+        fn process_names(&self) -> &[&str] {
+            &["ghostproc"]
+        }
+        fn delivery_mode(&self) -> DeliveryMode {
+            DeliveryMode::TuiInjection
+        }
+        fn build_start_command(&self, _: &StartOpts) -> String {
+            String::new()
+        }
+        fn build_resume_command(&self, _: &ResumeOpts) -> Option<String> {
+            None
+        }
+        fn detect_session_id(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn tui_ready_pattern(&self) -> Option<&str> {
+            None
+        }
+        fn inject_config(&self) -> InjectConfig {
+            InjectConfig {
+                paste_settle_ms: 0,
+                use_inner_bracketed_paste: false,
+                startup_inject_delay_secs: 0,
+            }
+        }
+        fn config_dir_name(&self) -> &str {
+            ".ghost"
+        }
+        fn has_project_history(&self, _: &Path) -> bool {
+            false
+        }
+        fn exit_command(&self) -> Option<&str> {
+            None
+        }
+        fn install(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn all_backend_process_names_ignores_availability() {
+        let registry = BackendRegistry::new(vec![Arc::new(UnavailableBackend) as _], "ghost");
+        // The CLI binary is absent, so availability-based listing excludes it.
+        assert!(registry.available().is_empty());
+        // But process-tree detection must still know its process names, so a
+        // live pane running that backend is never dropped just because its CLI
+        // is slow or absent when asked for --version (the codex npx-wrapper bug).
+        let names = registry.all_backend_process_names();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].0, "ghost");
+        assert_eq!(names[0].1, vec!["ghostproc".to_string()]);
+    }
+
+    #[test]
+    fn all_backend_process_names_covers_every_default_backend() {
+        let registry = BackendRegistry::default_registry();
+        let names = registry.all_backend_process_names();
+        for backend in ["claude-code", "opencode", "codex-cli"] {
+            assert!(
+                names.iter().any(|(n, _)| n == backend),
+                "{backend} missing from detection candidate set: {names:?}"
+            );
+        }
     }
 }
