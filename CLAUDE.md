@@ -79,13 +79,13 @@ Remote: Same flow but wrapped in NIP-17 encrypted DMs via Nostr relays.
 
 ### Codex CLI backend
 
-`backend/codex.rs` adds a TUI-injection backend (`name = "codex-cli"`) that launches `codex --ask-for-approval never --sandbox workspace-write --no-alt-screen` inside an **Ouija-managed** cwd/worktree. Key differences from Claude Code, all deliberate (#1442):
+`backend/codex.rs` adds a TUI-injection backend (`name = "codex-cli"`) that launches `codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen` inside an **Ouija-managed** cwd/worktree. Key differences from Claude Code, all deliberate (#1442):
 
 - **No Codex `--worktree`.** Codex CLI has no such flag; Ouija/Hub set up the worktree and Codex starts inside it via `cd <dir>`. Codex *app*-managed worktrees (`$CODEX_HOME/worktrees`, detached HEAD) are a separate feature and out of scope.
 - **No `--effort` flag.** Codex exposes no verified CLI effort flag, so Ouija `effort` is dropped rather than guessed onto the command line. Model/provider selection is **user-owned Codex config** (`-m/--model`, `--oss`, `--local-provider`); Ouija only passes `-m <model>` through when set.
 - **Turn-scoped `Stop`, no hook-driven unregister.** Codex fires `Stop` after *every* turn and has no `SessionEnd` event, so the Codex Stop hook only does turn bookkeeping and returns `{"continue":true}` — it must never unregister. Session cleanup relies on pane/process liveness (`pane_alive` tree walk), which already handles the `node -> codex` npx wrapper. `scheduler::wait_for_process` is process-tree-aware for the same reason.
 - **Mesh instructions: installed skill + hook context.** Codex loads skills from `~/.codex/skills`, so `install()` writes the shared `skills/ouija/SKILL.md` there (idempotent, non-clobbering) — the stock skill is safe because Codex inherits `OUIJA_SESSION_ID` via `pane_env_args`, so `ouija whoami`/auto-resolution work. Because the static skill cannot know the session's live public id, `session_start_inner` also returns mesh-CLI instructions (with the public id as `--from`) in `output` for codex-cli only; the register hook wraps them into Codex SessionStart `additionalContext` (#1445).
-- **Local daemon reachability.** Codex launches with `-c sandbox_workspace_write.network_access=true` so tool-shell POSTs to the local daemon at `localhost:7880` are not blocked by the `workspace-write` sandbox; filesystem stays workspace-confined. Full `danger-full-access` is left to user-owned Codex config, never a silent default (#1445).
+- **Full-power worker mode.** Codex launches with `--dangerously-bypass-approvals-and-sandbox`, matching Claude Code's `bypassPermissions` posture for Ouija-managed workers. The selected Ouija/Hub worktree is cwd/scoping, not isolation; the real boundary is trust in local automation today and an external runner sandbox such as Docker in future deployments (#1445).
 - **Hook trust.** `install()` writes/merges `~/.codex/hooks.json` idempotently. Normal installs may require Codex's hook trust-review; tests use `--dangerously-bypass-hook-trust`. See `docs/codex-cli.md`.
 
 ## Testing patterns

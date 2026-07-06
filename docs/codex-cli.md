@@ -17,26 +17,16 @@ which:
 When Ouija starts a Codex session it launches:
 
 ```
-cd <project-dir> && codex --ask-for-approval never --sandbox workspace-write --no-alt-screen -c sandbox_workspace_write.network_access=true [--model <model>]
+cd <project-dir> && codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen [--model <model>]
 ```
 
-- `--ask-for-approval never --sandbox workspace-write` — bounded autonomy: no
-  per-command approval prompts (which would stall tmux injection), writes confined
-  to the workspace.
-- `-c sandbox_workspace_write.network_access=true` — **required for the mesh.**
-  A bare `workspace-write` sandbox blocks *all* network from model-executed shell
-  commands, so `ouija reply`/`ouija ask` POSTs to the local daemon at
-  `localhost:7880` fail with `Operation not permitted`. This override re-enables
-  network egress while keeping the filesystem confined to the workspace.
-
-  **Tradeoff:** Codex has no stable localhost-only allowlist for the
-  `workspace-write` sandbox (only the experimental `experimental_network.domains`),
-  so this flag also allows other outbound network from tool shells — it is the
-  narrowest *stable* default that makes the mesh work. If you want stricter or
-  looser behavior, set it yourself in `~/.codex/config.toml`. For a fully
-  unrestricted, trusted local setup, launch Codex with
-  `--sandbox danger-full-access` / `--dangerously-bypass-approvals-and-sandbox`
-  via your own Codex config; Ouija never makes full access the default.
+- `--dangerously-bypass-approvals-and-sandbox` — full-power worker mode: no
+  per-command approval prompts and no Codex sandbox boundary. Ouija still
+  launches Codex inside the selected Ouija/Hub worktree, but that worktree is
+  cwd/scoping, not isolation. This matches Claude Code's `bypassPermissions`
+  worker posture. It is intended for trusted local automation now and for
+  deployments where Ouija itself runs inside an external sandbox boundary, such
+  as Docker.
 - `--no-alt-screen` — preserves scrollback so pane capture/debugging works.
 
 Resuming continues the latest thread in the cwd via `codex resume --last`, or a

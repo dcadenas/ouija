@@ -232,25 +232,16 @@ fn resolve_codex_home() -> Option<PathBuf> {
 
 /// Autonomy flags for Ouija-launched Codex sessions.
 ///
-/// `--ask-for-approval never` + `--sandbox workspace-write` gives a bounded,
-/// non-interactive session (writes confined to the workspace, no per-command
-/// approval prompts that would stall tmux injection). `--no-alt-screen` keeps
-/// terminal scrollback so pane capture and debugging work. All three are
-/// verified present on both `codex` and `codex resume` (#1442).
-///
-/// `-c sandbox_workspace_write.network_access=true` is required so the mesh
-/// works: under a bare `workspace-write` sandbox Codex blocks *all* network from
-/// model-executed shell commands, so `ouija reply`/`ouija ask` POSTs to the local
-/// daemon at `localhost:7880` fail with "Operation not permitted" (#1445). This
-/// override keeps the filesystem confined to the workspace but re-enables network
-/// egress. Codex has no stable localhost-only allowlist for the workspace-write
-/// sandbox (only the experimental `experimental_network.domains`), so this is the
-/// narrowest viable *stable* default; it does allow other outbound network too.
-/// Fully unrestricted runs (`--dangerously-bypass-approvals-and-sandbox` /
-/// `--sandbox danger-full-access`) are left to user-owned Codex config for
-/// trusted local setups and are not emitted here.
-const AUTONOMY_FLAGS: &str = "--ask-for-approval never --sandbox workspace-write --no-alt-screen \
-                              -c sandbox_workspace_write.network_access=true";
+/// `--dangerously-bypass-approvals-and-sandbox` gives Ouija-managed Codex
+/// sessions the same full-power local-worker posture as Claude Code's
+/// `bypassPermissions`: no per-command approval prompts and no Codex sandbox
+/// boundary. Ouija still launches inside the selected Ouija/Hub worktree, but
+/// that worktree is cwd/scoping, not isolation. This is intended for trusted
+/// local automation now and for an external sandbox boundary (for example
+/// Docker) later. `--no-alt-screen` keeps terminal scrollback so pane capture
+/// and debugging work. Both flags are verified present on `codex` and
+/// `codex resume` (#1442, #1445).
+const AUTONOMY_FLAGS: &str = "--dangerously-bypass-approvals-and-sandbox --no-alt-screen";
 
 /// Render a ` --model <X>` fragment for the codex CLI, or an empty string.
 ///
@@ -427,7 +418,7 @@ mod tests {
         let cmd = backend().build_start_command(&start_opts("/home/user/myproject"));
         assert_eq!(
             cmd,
-            "cd '/home/user/myproject' && codex --ask-for-approval never --sandbox workspace-write --no-alt-screen -c sandbox_workspace_write.network_access=true"
+            "cd '/home/user/myproject' && codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen"
         );
     }
 
@@ -439,7 +430,7 @@ mod tests {
         });
         assert_eq!(
             cmd,
-            "cd '/home/user/myproject' && codex --ask-for-approval never --sandbox workspace-write --no-alt-screen -c sandbox_workspace_write.network_access=true --model 'gpt-5.5'"
+            "cd '/home/user/myproject' && codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen --model 'gpt-5.5'"
         );
     }
 
@@ -459,21 +450,23 @@ mod tests {
     }
 
     #[test]
-    fn start_and_resume_enable_local_daemon_network_access() {
-        // Under a bare workspace-write sandbox Codex blocks all network from
-        // model-executed shell commands, so `ouija reply` POSTs to the local
-        // daemon fail. Both launch and resume must re-enable network egress so
-        // the mesh works (#1445). Filesystem stays confined to the workspace.
-        let net = "-c sandbox_workspace_write.network_access=true";
+    fn start_and_resume_use_full_power_worker_mode() {
+        // Ouija runs Codex as a full-power local worker, matching Claude Code's
+        // bypassPermissions posture. The chosen Ouija/Hub worktree is cwd/scope,
+        // not isolation; future deployments can supply an external runner sandbox
+        // around the process (#1445).
+        let yolo = "--dangerously-bypass-approvals-and-sandbox";
         let start = backend().build_start_command(&start_opts("/home/user/myproject"));
-        assert!(start.contains(net), "start must enable daemon network: {start}");
+        assert!(start.contains(yolo), "start must bypass approvals/sandbox: {start}");
         let resume = backend()
             .build_resume_command(&resume_opts("/home/user/myproject", None))
             .unwrap();
-        assert!(resume.contains(net), "resume must enable daemon network: {resume}");
-        // Sandbox stays workspace-write (not danger-full-access) by default.
-        assert!(start.contains("--sandbox workspace-write"), "{start}");
-        assert!(!start.contains("danger-full-access"), "{start}");
+        assert!(
+            resume.contains(yolo),
+            "resume must bypass approvals/sandbox: {resume}"
+        );
+        assert!(!start.contains("--sandbox workspace-write"), "{start}");
+        assert!(!start.contains("sandbox_workspace_write.network_access"), "{start}");
     }
 
     #[test]
@@ -482,7 +475,7 @@ mod tests {
         assert_eq!(
             cmd,
             Some(
-                "cd '/home/user/myproject' && codex resume --last --ask-for-approval never --sandbox workspace-write --no-alt-screen -c sandbox_workspace_write.network_access=true"
+                "cd '/home/user/myproject' && codex resume --last --dangerously-bypass-approvals-and-sandbox --no-alt-screen"
                     .to_string()
             )
         );
@@ -495,7 +488,7 @@ mod tests {
         assert_eq!(
             cmd,
             Some(
-                "cd '/home/user/myproject' && codex resume 'abc-123' --ask-for-approval never --sandbox workspace-write --no-alt-screen -c sandbox_workspace_write.network_access=true"
+                "cd '/home/user/myproject' && codex resume 'abc-123' --dangerously-bypass-approvals-and-sandbox --no-alt-screen"
                     .to_string()
             )
         );
@@ -510,7 +503,7 @@ mod tests {
         assert_eq!(
             cmd,
             Some(
-                "cd '/home/user/myproject' && codex resume --last --ask-for-approval never --sandbox workspace-write --no-alt-screen -c sandbox_workspace_write.network_access=true --model 'gpt-5.5'"
+                "cd '/home/user/myproject' && codex resume --last --dangerously-bypass-approvals-and-sandbox --no-alt-screen --model 'gpt-5.5'"
                     .to_string()
             )
         );
