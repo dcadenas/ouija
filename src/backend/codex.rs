@@ -230,6 +230,69 @@ fn resolve_codex_home() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".codex"))
 }
 
+/// Resolve the Codex project trust root for a launch cwd.
+///
+/// Codex's trust gate keys linked worktrees to the common repository root, not
+/// the linked worktree path. For normal and linked worktrees, `git rev-parse
+/// --git-common-dir` resolves to `<repo>/.git`; its parent is the root Codex
+/// asks the user to trust. Non-git directories fall back to the launch cwd.
+fn codex_trust_root(project_dir: &str) -> PathBuf {
+    let project = Path::new(project_dir);
+    git_common_dir(project)
+        .map(|common_dir| trust_root_from_common_dir(&common_dir, project))
+        .unwrap_or_else(|| project.to_path_buf())
+}
+
+fn git_common_dir(project_dir: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_dir)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let path = stdout.trim();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+fn trust_root_from_common_dir(common_dir: &Path, fallback: &Path) -> PathBuf {
+    if common_dir.file_name().and_then(|s| s.to_str()) == Some(".git") {
+        if let Some(parent) = common_dir.parent() {
+            return parent.to_path_buf();
+        }
+    }
+    fallback.to_path_buf()
+}
+
+fn toml_basic_string_escape(value: &str) -> String {
+    let mut escaped = String::new();
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            c if c.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(escaped, "\\u{:04X}", c as u32);
+            }
+            c => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+fn format_trust_config_flag(project_dir: &str) -> String {
+    let trust_root = codex_trust_root(project_dir);
+    let root = toml_basic_string_escape(&trust_root.to_string_lossy());
+    let config = format!("projects={{\"{root}\"={{trust_level=\"trusted\"}}}}");
+    format!(" -c {}", crate::scheduler::shell_escape(&config))
+}
+
 /// Autonomy flags for Ouija-launched Codex sessions.
 ///
 /// `--dangerously-bypass-approvals-and-sandbox` gives Ouija-managed Codex
@@ -285,16 +348,18 @@ impl CodingAssistant for Codex {
     fn build_start_command(&self, opts: &StartOpts) -> String {
         let escaped_dir = crate::scheduler::shell_escape(&opts.project_dir);
         let model = format_model_flag(opts.model.as_deref());
+        let trust = format_trust_config_flag(&opts.project_dir);
         // WorktreeMode is intentionally ignored: Codex CLI has no verified
         // `--worktree` flag. Ouija sets up the worktree/cwd before launch and
         // Codex is started inside it. `effort` is intentionally ignored too:
         // Codex CLI exposes no verified `--effort` flag (#1442).
-        format!("cd {escaped_dir} && codex {AUTONOMY_FLAGS}{model}")
+        format!("cd {escaped_dir} && codex {AUTONOMY_FLAGS}{trust}{model}")
     }
 
     fn build_resume_command(&self, opts: &ResumeOpts) -> Option<String> {
         let escaped_dir = crate::scheduler::shell_escape(&opts.project_dir);
         let model = format_model_flag(opts.model.as_deref());
+        let trust = format_trust_config_flag(&opts.project_dir);
         // `codex resume --last` is the documented non-picker path for
         // continuing the most recent session in this cwd; an explicit
         // SESSION_ID targets a specific thread. WorktreeMode/effort ignored as
@@ -304,7 +369,7 @@ impl CodingAssistant for Codex {
             None => "--last".to_string(),
         };
         Some(format!(
-            "cd {escaped_dir} && codex resume {target} {AUTONOMY_FLAGS}{model}"
+            "cd {escaped_dir} && codex resume {target} {AUTONOMY_FLAGS}{trust}{model}"
         ))
     }
 
@@ -418,7 +483,7 @@ mod tests {
         let cmd = backend().build_start_command(&start_opts("/home/user/myproject"));
         assert_eq!(
             cmd,
-            "cd '/home/user/myproject' && codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen"
+            "cd '/home/user/myproject' && codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen -c 'projects={\"/home/user/myproject\"={trust_level=\"trusted\"}}'"
         );
     }
 
@@ -430,7 +495,7 @@ mod tests {
         });
         assert_eq!(
             cmd,
-            "cd '/home/user/myproject' && codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen --model 'gpt-5.5'"
+            "cd '/home/user/myproject' && codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen -c 'projects={\"/home/user/myproject\"={trust_level=\"trusted\"}}' --model 'gpt-5.5'"
         );
     }
 
@@ -458,12 +523,20 @@ mod tests {
         let yolo = "--dangerously-bypass-approvals-and-sandbox";
         let start = backend().build_start_command(&start_opts("/home/user/myproject"));
         assert!(start.contains(yolo), "start must bypass approvals/sandbox: {start}");
+        assert!(
+            start.contains("-c 'projects={\"/home/user/myproject\"={trust_level=\"trusted\"}}'"),
+            "start must pre-trust the Codex trust root: {start}"
+        );
         let resume = backend()
             .build_resume_command(&resume_opts("/home/user/myproject", None))
             .unwrap();
         assert!(
             resume.contains(yolo),
             "resume must bypass approvals/sandbox: {resume}"
+        );
+        assert!(
+            resume.contains("-c 'projects={\"/home/user/myproject\"={trust_level=\"trusted\"}}'"),
+            "resume must pre-trust the Codex trust root: {resume}"
         );
         assert!(!start.contains("--sandbox workspace-write"), "{start}");
         assert!(!start.contains("sandbox_workspace_write.network_access"), "{start}");
@@ -475,7 +548,7 @@ mod tests {
         assert_eq!(
             cmd,
             Some(
-                "cd '/home/user/myproject' && codex resume --last --dangerously-bypass-approvals-and-sandbox --no-alt-screen"
+                "cd '/home/user/myproject' && codex resume --last --dangerously-bypass-approvals-and-sandbox --no-alt-screen -c 'projects={\"/home/user/myproject\"={trust_level=\"trusted\"}}'"
                     .to_string()
             )
         );
@@ -488,7 +561,7 @@ mod tests {
         assert_eq!(
             cmd,
             Some(
-                "cd '/home/user/myproject' && codex resume 'abc-123' --dangerously-bypass-approvals-and-sandbox --no-alt-screen"
+                "cd '/home/user/myproject' && codex resume 'abc-123' --dangerously-bypass-approvals-and-sandbox --no-alt-screen -c 'projects={\"/home/user/myproject\"={trust_level=\"trusted\"}}'"
                     .to_string()
             )
         );
@@ -503,7 +576,7 @@ mod tests {
         assert_eq!(
             cmd,
             Some(
-                "cd '/home/user/myproject' && codex resume --last --dangerously-bypass-approvals-and-sandbox --no-alt-screen --model 'gpt-5.5'"
+                "cd '/home/user/myproject' && codex resume --last --dangerously-bypass-approvals-and-sandbox --no-alt-screen -c 'projects={\"/home/user/myproject\"={trust_level=\"trusted\"}}' --model 'gpt-5.5'"
                     .to_string()
             )
         );
@@ -525,6 +598,84 @@ mod tests {
         assert_eq!(format_model_flag(Some("")), "");
         assert_eq!(format_model_flag(Some("   ")), "");
         assert_eq!(format_model_flag(Some("gpt-5.5")), " --model 'gpt-5.5'");
+    }
+
+    #[test]
+    fn trust_config_flag_uses_projects_table_form() {
+        assert_eq!(
+            format_trust_config_flag("/tmp/codex-trust-test-main"),
+            " -c 'projects={\"/tmp/codex-trust-test-main\"={trust_level=\"trusted\"}}'"
+        );
+    }
+
+    #[test]
+    fn trust_config_flag_escapes_toml_and_shell() {
+        assert_eq!(
+            format_trust_config_flag("/tmp/quote'and\"back\\slash"),
+            " -c 'projects={\"/tmp/quote'\\''and\\\"back\\\\slash\"={trust_level=\"trusted\"}}'"
+        );
+    }
+
+    #[test]
+    fn trust_root_uses_common_repo_parent_for_linked_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        let linked = tmp.path().join("linked");
+
+        let output = std::process::Command::new("git")
+            .args(["init"])
+            .arg(&main)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::write(main.join("README.md"), "root\n").unwrap();
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["add", "README.md"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["commit", "-m", "init"])
+            .env("GIT_AUTHOR_NAME", "Ouija Test")
+            .env("GIT_AUTHOR_EMAIL", "ouija@example.test")
+            .env("GIT_COMMITTER_NAME", "Ouija Test")
+            .env("GIT_COMMITTER_EMAIL", "ouija@example.test")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["worktree", "add", "-b", "linked-test"])
+            .arg(&linked)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert_eq!(
+            codex_trust_root(linked.to_str().unwrap()),
+            main.canonicalize().unwrap()
+        );
     }
 
     fn write_session_meta(path: &Path, cwd: &str, timestamp: &str, session_id: &str) {

@@ -17,7 +17,7 @@ which:
 When Ouija starts a Codex session it launches:
 
 ```
-cd <project-dir> && codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen [--model <model>]
+cd <project-dir> && codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen -c 'projects={"<trust-root>"={trust_level="trusted"}}' [--model <model>]
 ```
 
 - `--dangerously-bypass-approvals-and-sandbox` — full-power worker mode: no
@@ -28,6 +28,13 @@ cd <project-dir> && codex --dangerously-bypass-approvals-and-sandbox --no-alt-sc
   deployments where Ouija itself runs inside an external sandbox boundary, such
   as Docker.
 - `--no-alt-screen` — preserves scrollback so pane capture/debugging works.
+- `-c 'projects={"<trust-root>"={trust_level="trusted"}}'` — skips Codex's
+  project trust prompt for this invocation without mutating `~/.codex/config.toml`.
+  Codex expects the whole `projects` table override here; dotted `-c
+  'projects."/path".trust_level="trusted"'` forms did not bypass the prompt in
+  live testing. For linked Git worktrees, Codex keys trust to the common
+  repository root, so Ouija derives `<trust-root>` from `git rev-parse
+  --git-common-dir` and uses the parent when that common dir ends in `.git`.
 
 Resuming continues the latest thread in the cwd via `codex resume --last`, or a
 specific one via `codex resume <session-id>`.
