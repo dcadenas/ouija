@@ -12,6 +12,13 @@ mod embedded {
     pub const SCRIPT_PROMPT_SUBMIT: &str =
         include_str!("../../scripts/codex/codex-prompt-submit.sh");
     pub const SCRIPT_STOP: &str = include_str!("../../scripts/codex/codex-stop.sh");
+    /// The shared ouija skill, installed into Codex's skill-discovery path so a
+    /// Codex session can activate it on incoming `<msg>` tags, exactly as Claude
+    /// Code and OpenCode do. The stock skill is safe for Codex because its bash
+    /// tool inherits `OUIJA_SESSION_ID` (exported via `tmux::pane_env_args`), so
+    /// `ouija whoami` and sender auto-resolution work; section 7 already teaches
+    /// `ouija whoami`/`OUIJA_SESSION_ID` and forbids guessing a `--from` (#1445).
+    pub const SKILL_MD: &str = include_str!("../../skills/ouija/SKILL.md");
 }
 
 /// Codex hook events wired by Ouija, paired with the script that handles each.
@@ -98,8 +105,20 @@ fn merge_hooks_json(existing: Option<&str>, hooks_dir: &Path) -> Option<serde_js
     Some(root)
 }
 
-/// Write Ouija's Codex hook scripts and merged `hooks.json` under `codex_home`.
-/// Idempotent (see [`merge_hooks_json`]); scripts are made executable on unix.
+/// Write the shared ouija skill into Codex's skill-discovery path
+/// (`$CODEX_HOME/skills/ouija/SKILL.md`). Idempotent: only the `ouija` subdir is
+/// created/overwritten, so unrelated user skills under `skills/` are untouched.
+fn install_skill_to(codex_home: &Path) -> anyhow::Result<()> {
+    let skill_dir = codex_home.join("skills/ouija");
+    std::fs::create_dir_all(&skill_dir)?;
+    std::fs::write(skill_dir.join("SKILL.md"), embedded::SKILL_MD)?;
+    Ok(())
+}
+
+/// Write Ouija's Codex hook scripts and merged `hooks.json` under `codex_home`,
+/// plus the shared ouija skill under `skills/ouija/`. Idempotent (see
+/// [`merge_hooks_json`] and [`install_skill_to`]); scripts are made executable on
+/// unix.
 fn install_to(codex_home: &Path) -> anyhow::Result<()> {
     let dir = hooks_dir(codex_home);
     std::fs::create_dir_all(&dir)?;
@@ -126,6 +145,10 @@ fn install_to(codex_home: &Path) -> anyhow::Result<()> {
             hooks_path.display()
         ),
     }
+
+    // Install the ouija skill so Codex can activate it on incoming `<msg>` tags,
+    // matching Claude/OpenCode. Independent of the hooks.json merge above.
+    install_skill_to(codex_home)?;
     Ok(())
 }
 
@@ -759,6 +782,38 @@ mod tests {
         assert!(merge_hooks_json(Some(""), hooks_dir).is_none());
         // No existing file still installs fresh.
         assert!(merge_hooks_json(None, hooks_dir).is_some());
+    }
+
+    #[test]
+    fn install_to_writes_ouija_skill() {
+        let home = tempfile::tempdir().unwrap();
+        install_to(home.path()).unwrap();
+        let skill = home.path().join("skills/ouija/SKILL.md");
+        assert!(skill.is_file(), "ouija SKILL.md must be installed");
+        assert_eq!(std::fs::read_to_string(&skill).unwrap(), embedded::SKILL_MD);
+    }
+
+    #[test]
+    fn install_skill_is_idempotent_and_preserves_unrelated_skills() {
+        let home = tempfile::tempdir().unwrap();
+        // A pre-existing unrelated user skill must survive install.
+        let other = home.path().join("skills/my-skill");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("SKILL.md"), "user skill body").unwrap();
+
+        install_skill_to(home.path()).unwrap();
+        install_skill_to(home.path()).unwrap(); // re-install must not error or duplicate
+
+        // Ouija skill present with expected content.
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("skills/ouija/SKILL.md")).unwrap(),
+            embedded::SKILL_MD
+        );
+        // Unrelated skill untouched.
+        assert_eq!(
+            std::fs::read_to_string(other.join("SKILL.md")).unwrap(),
+            "user skill body"
+        );
     }
 
     #[test]
