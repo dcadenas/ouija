@@ -137,6 +137,28 @@ To return to Claude Code's own default behavior:
 ouija config set claude_permission_mode default
 ```
 
+### Codex model routes
+
+Ouija-launched Codex sessions normally use Codex's own default home resolution
+(`$CODEX_HOME` or `~/.codex`). You can add a Codex-specific route so a
+user-facing model alias selects a provider-specific Codex home without exposing
+that detail on every session:
+
+```bash
+ouija config set-codex-model-route gemini \
+  --model gemini-2.5-pro \
+  --codex-home ~/.cache/codex-gemini
+
+ouija spawn-session worker --backend codex-cli --model gemini
+```
+
+The alternate Codex home owns its own `config.toml` and provider setup. For
+Gemini, run a local Responses-compatible sidecar such as LiteLLM on localhost
+and point that Codex home at the proxy; the Gemini API key stays in the sidecar
+environment. Sessions without `--model gemini` continue using the normal Codex
+default, for example `gpt-5.5` with whatever reasoning effort is configured in
+`~/.codex/config.toml`.
+
 ## CLI
 
 ```bash

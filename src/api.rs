@@ -1857,6 +1857,8 @@ pub async fn get_settings(State(state): State<SharedState>) -> Json<serde_json::
     Json(json!({
         "auto_register": settings.auto_register,
         "claude_permission_mode": settings.claude_permission_mode,
+        "codex_home": settings.codex_home,
+        "codex_model_routes": settings.codex_model_routes,
     }))
 }
 
@@ -1868,6 +1870,9 @@ pub struct SettingsUpdateBody {
     reaper_interval_secs: Option<u64>,
     max_local_sessions: Option<u64>,
     claude_permission_mode: Option<String>,
+    codex_home: Option<String>,
+    codex_model_routes:
+        Option<std::collections::HashMap<String, crate::persistence::CodexModelRoute>>,
 }
 
 /// Patch daemon settings and persist to disk.
@@ -1900,6 +1905,27 @@ pub async fn update_settings(
             Some(trimmed.to_string())
         };
     }
+    let codex_home_to_install = if let Some(v) = body.codex_home {
+        let trimmed = v.trim();
+        settings.codex_home = if trimmed.is_empty() || trimmed == "default" {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+        settings.codex_home.clone()
+    } else {
+        None
+    };
+    let mut codex_route_homes_to_install = Vec::new();
+    if let Some(routes) = body.codex_model_routes {
+        settings.codex_model_routes = routes;
+        codex_route_homes_to_install.extend(
+            settings
+                .codex_model_routes
+                .values()
+                .filter_map(|route| route.codex_home.clone()),
+        );
+    }
     if let Err(e) = crate::persistence::save_settings(&state.config.config_dir, &settings) {
         tracing::warn!("failed to save settings: {e}");
         return (
@@ -1916,6 +1942,12 @@ pub async fn update_settings(
             crate::project_index::refresh_index(&s).await;
         });
     }
+    if let Some(home) = codex_home_to_install {
+        crate::backend::codex::install_configured_home(Some(&home));
+    }
+    for home in codex_route_homes_to_install {
+        crate::backend::codex::install_configured_home(Some(&home));
+    }
     let settings = state.settings.read().await;
     (
         StatusCode::OK,
@@ -1925,6 +1957,8 @@ pub async fn update_settings(
                 "auto_register": settings.auto_register,
                 "projects_dir": settings.projects_dir,
                 "claude_permission_mode": settings.claude_permission_mode,
+                "codex_home": settings.codex_home,
+                "codex_model_routes": settings.codex_model_routes,
             }
         })),
     )
@@ -2017,6 +2051,9 @@ pub async fn list_tasks(State(state): State<SharedState>) -> Json<serde_json::Va
                 "last_status": t.last_status,
                 "run_count": t.run_count,
                 "project_dir": t.project_dir,
+                "backend": t.backend,
+                "model": t.model,
+                "effort": t.effort,
                 "once": t.once,
                 "backend_session_id": t.backend_session_id,
                 "on_fire": t.on_fire,
@@ -2031,9 +2068,13 @@ pub struct CreateTaskBody {
     name: String,
     cron: String,
     target_session: Option<String>,
+    message: Option<String>,
     prompt: Option<String>,
     reminder: Option<String>,
     project_dir: Option<String>,
+    backend: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
     #[serde(default)]
     once: Option<bool>,
     #[serde(alias = "claude_session_id")]
@@ -2058,13 +2099,16 @@ pub async fn create_task(
         body.name,
         body.cron,
         body.target_session,
-        body.prompt,
+        body.prompt.or(body.message),
         body.reminder,
         body.once.unwrap_or(false),
         body.backend_session_id,
         body.on_fire.unwrap_or_default(),
     );
     task.project_dir = body.project_dir;
+    task.backend = normalize_optional_string(body.backend);
+    task.model = normalize_optional_string(body.model);
+    task.effort = normalize_optional_string(body.effort);
 
     let id = task.id.clone();
     state.add_task(task).await;

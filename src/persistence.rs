@@ -195,6 +195,24 @@ pub struct OuijaSettings {
     /// When unset, Claude Code uses its own settings/defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_permission_mode: Option<String>,
+    /// Optional CODEX_HOME override for Ouija-launched Codex sessions.
+    /// When unset, Codex uses its own default (`$CODEX_HOME` or `~/.codex`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_home: Option<String>,
+    /// Optional Codex model aliases. Keys are the model names users pass to
+    /// Ouija (for example `gemini`); values describe how Codex should launch.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub codex_model_routes: HashMap<String, CodexModelRoute>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexModelRoute {
+    /// Model name passed to Codex. If unset, the user's alias is passed through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// CODEX_HOME used for this route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_home: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -225,6 +243,8 @@ impl Default for OuijaSettings {
             reaper_interval_secs: DEFAULT_REAPER_INTERVAL_SECS,
             max_local_sessions: 0,
             claude_permission_mode: None,
+            codex_home: None,
+            codex_model_routes: HashMap::new(),
         }
     }
 }
@@ -581,6 +601,9 @@ mod tests {
             last_status: None,
             run_count: 0,
             project_dir: None,
+            backend: None,
+            model: None,
+            effort: None,
             once: false,
             backend_session_id: None,
             on_fire: crate::scheduler::OnFire::ContinueSession,

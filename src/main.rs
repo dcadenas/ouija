@@ -231,6 +231,22 @@ enum Command {
 enum ConfigAction {
     /// Set a config value (e.g. ouija config set auto_register false)
     Set { key: String, value: String },
+    /// Route a Codex model alias to backend-specific launch config
+    SetCodexModelRoute {
+        /// User-facing model alias, e.g. gemini
+        alias: String,
+        /// Actual model passed to Codex for this alias
+        #[arg(long)]
+        model: Option<String>,
+        /// Codex home containing the provider configuration for this alias
+        #[arg(long)]
+        codex_home: Option<String>,
+    },
+    /// Remove a Codex model alias route
+    RemoveCodexModelRoute {
+        /// User-facing model alias to remove
+        alias: String,
+    },
     /// Add a Nostr DM user (human who can control the daemon via DMs)
     AddHuman {
         /// The user's Nostr public key (npub1...)
@@ -284,6 +300,15 @@ enum TaskAction {
         /// Override project dir for session revival
         #[arg(long)]
         project_dir: Option<String>,
+        /// Backend used when creating/reviving the task session
+        #[arg(long)]
+        backend: Option<String>,
+        /// LLM model override used when creating/reviving the task session
+        #[arg(long)]
+        model: Option<String>,
+        /// Reasoning effort / variant used when creating/reviving the task session
+        #[arg(long)]
+        effort: Option<String>,
         /// Fire once then auto-delete
         #[arg(long)]
         once: bool,
@@ -391,6 +416,22 @@ async fn main() -> anyhow::Result<()> {
 
             let config = config::OuijaConfig::new(name, port, data, npub)?;
             let state = state::AppState::new(config);
+            if let Some(home) = state.settings.read().await.codex_home.clone() {
+                backend::codex::install_configured_home(Some(&home));
+            }
+            {
+                let route_homes: Vec<String> = state
+                    .settings
+                    .read()
+                    .await
+                    .codex_model_routes
+                    .values()
+                    .filter_map(|route| route.codex_home.clone())
+                    .collect();
+                for home in route_homes {
+                    backend::codex::install_configured_home(Some(&home));
+                }
+            }
 
             // Build project index in background
             let index_state = state.clone();
@@ -949,6 +990,55 @@ async fn main() -> anyhow::Result<()> {
                 let body = serde_json::json!({ key: parsed });
                 cli_post("/api/settings", &body).await?;
             }
+            Some(ConfigAction::SetCodexModelRoute {
+                alias,
+                model,
+                codex_home,
+            }) => {
+                if alias.trim().is_empty() {
+                    anyhow::bail!("alias cannot be empty");
+                }
+                let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
+                let url = format!("http://localhost:{port}/api/settings");
+                let current: serde_json::Value = reqwest::get(&url).await?.json().await?;
+                let mut routes = current
+                    .get("codex_model_routes")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                if !routes.is_object() {
+                    routes = serde_json::json!({});
+                }
+                routes[alias.trim()] = serde_json::json!({
+                    "model": model,
+                    "codex_home": codex_home,
+                });
+                cli_post(
+                    "/api/settings",
+                    &serde_json::json!({
+                        "codex_model_routes": routes,
+                    }),
+                )
+                .await?;
+            }
+            Some(ConfigAction::RemoveCodexModelRoute { alias }) => {
+                let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
+                let url = format!("http://localhost:{port}/api/settings");
+                let current: serde_json::Value = reqwest::get(&url).await?.json().await?;
+                let mut routes = current
+                    .get("codex_model_routes")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                if let Some(map) = routes.as_object_mut() {
+                    map.remove(alias.trim());
+                }
+                cli_post(
+                    "/api/settings",
+                    &serde_json::json!({
+                        "codex_model_routes": routes,
+                    }),
+                )
+                .await?;
+            }
             Some(ConfigAction::AddHuman {
                 npub,
                 name,
@@ -1036,20 +1126,29 @@ async fn main() -> anyhow::Result<()> {
                 match tasks {
                     Some(list) if !list.is_empty() => {
                         println!(
-                            "{:<10} {:<16} {:<16} {:<10} {:<8} {:<20} RUNS",
-                            "ID", "NAME", "CRON", "TARGET", "ENABLED", "NEXT RUN"
+                            "{:<10} {:<16} {:<16} {:<10} {:<10} {:<12} {:<8} {:<20} RUNS",
+                            "ID",
+                            "NAME",
+                            "CRON",
+                            "TARGET",
+                            "BACKEND",
+                            "MODEL",
+                            "ENABLED",
+                            "NEXT RUN"
                         );
                         for t in list {
                             let id = t["id"].as_str().unwrap_or("-");
                             let name = t["name"].as_str().unwrap_or("-");
                             let cron = t["cron"].as_str().unwrap_or("-");
                             let target = t["target_session"].as_str().unwrap_or("—");
+                            let backend = t["backend"].as_str().unwrap_or("—");
+                            let model = t["model"].as_str().unwrap_or("—");
                             let enabled = t["enabled"].as_bool().unwrap_or(false);
                             let next = t["next_run"].as_str().unwrap_or("-");
                             let runs = t["run_count"].as_u64().unwrap_or(0);
                             println!(
-                                "{:<10} {:<16} {:<16} {:<10} {:<8} {:<20} {}",
-                                id, name, cron, target, enabled, next, runs
+                                "{:<10} {:<16} {:<16} {:<10} {:<10} {:<12} {:<8} {:<20} {}",
+                                id, name, cron, target, backend, model, enabled, next, runs
                             );
                         }
                     }
@@ -1062,6 +1161,9 @@ async fn main() -> anyhow::Result<()> {
                 target,
                 message,
                 project_dir,
+                backend,
+                model,
+                effort,
                 once,
             } => {
                 let body = serde_json::json!({
@@ -1070,6 +1172,9 @@ async fn main() -> anyhow::Result<()> {
                     "target_session": target,
                     "message": message,
                     "project_dir": project_dir,
+                    "backend": backend,
+                    "model": model,
+                    "effort": effort,
                     "once": once,
                 });
                 cli_post("/api/tasks", &body).await?;
@@ -2549,6 +2654,7 @@ mod tests {
             last_metadata_update: chrono::DateTime::from_timestamp(1_700_000_001, 0),
             model: Some("openrouter/sonnet".into()),
             effort: Some("high".into()),
+            codex_home: None,
             reminder: Some("keep going".into()),
             prompt: Some("initial prompt".into()),
             iteration: 4,

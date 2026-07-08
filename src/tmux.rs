@@ -1040,13 +1040,9 @@ mod tests {
         // binary. Detection must walk to the descendant (#1442).
         let tree = ProcessTree {
             children: [(1, vec![2]), (2, vec![3])].into_iter().collect(),
-            names: [
-                (1, "bash".into()),
-                (2, "node".into()),
-                (3, "codex".into()),
-            ]
-            .into_iter()
-            .collect(),
+            names: [(1, "bash".into()), (2, "node".into()), (3, "codex".into())]
+                .into_iter()
+                .collect(),
         };
         assert!(tree.has_descendant_named(1, &["codex"]));
     }

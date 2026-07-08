@@ -184,6 +184,7 @@ mod tests {
             model: None,
             effort: None,
             permission_mode: None,
+            codex_home: None,
         });
         // HttpApi backends use shared serve; start command is a placeholder
         assert!(cmd.contains("/home/user/myproject"));
@@ -198,6 +199,7 @@ mod tests {
             model: None,
             effort: None,
             permission_mode: None,
+            codex_home: None,
         });
         assert!(cmd.is_some());
         assert!(cmd.unwrap().contains("/home/user/myproject"));

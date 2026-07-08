@@ -14,10 +14,22 @@ which:
 - installs the shared ouija skill to `~/.codex/skills/ouija/SKILL.md` (idempotent;
   unrelated skills under `~/.codex/skills/` are left untouched).
 
+If Codex model routes are configured, `start-server` also installs the same
+Codex hooks and skill into each routed Codex home.
+
 When Ouija starts a Codex session it launches:
 
 ```
 cd <project-dir> && codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen -c 'projects={"<trust-root>"={trust_level="trusted"}}' [--model <model>]
+```
+
+With a Codex model route, the public session input stays `--model <alias>`, but
+Ouija resolves that alias to the configured Codex launch details. For example,
+`--model gemini` can resolve to `--model gemini-2.5-pro` plus an isolated
+`CODEX_HOME`:
+
+```
+cd <project-dir> && CODEX_HOME=<path> codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen -c 'projects={"<trust-root>"={trust_level="trusted"}}' [--model <model>]
 ```
 
 - `--dangerously-bypass-approvals-and-sandbox` — full-power worker mode: no
@@ -39,13 +51,63 @@ cd <project-dir> && codex --dangerously-bypass-approvals-and-sandbox --no-alt-sc
 Resuming continues the latest thread in the cwd via `codex resume --last`, or a
 specific one via `codex resume <session-id>`.
 
-## Model and provider selection is yours
+## Model routes and provider selection
 
-Ouija does **not** pick a model or provider for Codex. It only passes `-m <model>`
-through when a session explicitly sets one. Everything else — default model,
-`--oss`, `--local-provider <lmstudio|ollama>`, provider API keys — is **user-owned
-Codex configuration** (`~/.codex/config.toml` and Codex CLI flags). Configure Codex
-the way you normally would; Ouija launches it inside the chosen project directory.
+By default, Ouija does **not** pick a model or provider for Codex. If a session
+does not set `--model`, Codex uses its own default configuration, usually
+`~/.codex/config.toml`.
+
+For provider-specific setups, configure a Codex model route. The route maps the
+user-facing Ouija model alias to the actual Codex model and optional Codex home:
+
+```bash
+ouija config set-codex-model-route gemini \
+  --model gemini-2.5-pro \
+  --codex-home ~/.cache/codex-gemini
+
+ouija spawn-session worker --backend codex-cli --model gemini
+```
+
+Codex requires a Responses-compatible endpoint. Google's OpenAI-compatible
+Gemini endpoint currently documents Chat Completions, so use a local sidecar
+that exposes `/v1/responses` and routes to Gemini. One verified option is a
+self-hosted LiteLLM proxy:
+
+```yaml
+model_list:
+  - model_name: gemini-2.5-pro
+    litellm_params:
+      model: gemini/gemini-2.5-pro
+      api_key: os.environ/GEMINI_API_KEY
+litellm_settings:
+  drop_params: true
+```
+
+Then create the Codex home's `config.toml`:
+
+```toml
+model = "gemini-2.5-pro"
+model_provider = "local-litellm-gemini"
+
+[model_providers.local-litellm-gemini]
+name = "Local LiteLLM Gemini"
+base_url = "http://127.0.0.1:4000/v1"
+env_key = "LITELLM_API_KEY"
+wire_api = "responses"
+```
+
+The Gemini API key stays in the sidecar environment (`GEMINI_API_KEY`). Codex
+only sees the local proxy key named by `env_key`; for a private localhost proxy
+that can be a dummy value such as `sk-local`. Ouija stores only the route alias,
+actual Codex model, and Codex home path. To remove the route:
+
+```bash
+ouija config remove-codex-model-route gemini
+```
+
+There is also an advanced global `codex_home` setting for deployments that want
+all Ouija-launched Codex sessions to use the same alternate home. Do not use it
+for selective Gemini routing; use a model route instead.
 
 There is **no Codex `--effort` flag**, so Ouija's `effort` setting is ignored for
 Codex rather than guessed onto the command line. If you want reasoning-effort

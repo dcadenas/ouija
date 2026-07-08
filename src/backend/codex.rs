@@ -26,7 +26,11 @@ mod embedded {
 /// turn-scoped bookkeeping. There is deliberately no SessionEnd/unregister hook —
 /// Codex has no such event and cleanup relies on pane/process liveness (#1442).
 const HOOKS: &[(&str, &str, &str)] = &[
-    ("SessionStart", "codex-register.sh", embedded::SCRIPT_REGISTER),
+    (
+        "SessionStart",
+        "codex-register.sh",
+        embedded::SCRIPT_REGISTER,
+    ),
     (
         "UserPromptSubmit",
         "codex-prompt-submit.sh",
@@ -152,6 +156,29 @@ fn install_to(codex_home: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Install Ouija's Codex hooks and skill into an explicit Codex home.
+///
+/// This is used when the daemon is configured to launch Codex sessions with an
+/// isolated `CODEX_HOME` for custom model providers.
+pub(crate) fn install_to_home(codex_home: &Path) -> anyhow::Result<()> {
+    install_to(codex_home)
+}
+
+/// Best-effort install of Ouija's Codex hooks/skill for a configured home.
+///
+/// Session-specific Codex homes are useful for provider configs (for example a
+/// Gemini sidecar). They also need the same hooks and skill as the default home
+/// so SessionStart can register the pane on the mesh.
+pub(crate) fn install_configured_home(codex_home: Option<&str>) {
+    let Some(home) = codex_home.map(str::trim).filter(|h| !h.is_empty()) else {
+        return;
+    };
+    let expanded = crate::state::expand_tilde(home);
+    if let Err(e) = install_to_home(Path::new(&expanded)) {
+        tracing::warn!("failed to install Codex hooks into configured codex_home: {e}");
+    }
+}
+
 /// Recursively collect `*.jsonl` rollout files under `dir` (Codex nests session
 /// logs as `sessions/YYYY/MM/DD/rollout-*.jsonl`). Missing/unreadable dirs are
 /// skipped silently.
@@ -212,7 +239,10 @@ fn latest_session_id_for_cwd(sessions_root: &Path, project_dir: &str) -> Option<
         ) else {
             continue;
         };
-        if best.as_ref().is_none_or(|(best_ts, _)| ts > best_ts.as_str()) {
+        if best
+            .as_ref()
+            .is_none_or(|(best_ts, _)| ts > best_ts.as_str())
+        {
             best = Some((ts.to_string(), sid.to_string()));
         }
     }
@@ -227,7 +257,9 @@ fn resolve_codex_home() -> Option<PathBuf> {
             return Some(PathBuf::from(h));
         }
     }
-    std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".codex"))
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".codex"))
 }
 
 /// Resolve the Codex project trust root for a launch cwd.
@@ -320,6 +352,16 @@ fn format_model_flag(model: Option<&str>) -> String {
     }
 }
 
+fn format_codex_home_prefix(codex_home: Option<&str>) -> String {
+    match codex_home.map(str::trim).filter(|h| !h.is_empty()) {
+        Some(home) => {
+            let expanded = crate::state::expand_tilde(home);
+            format!("CODEX_HOME={} ", crate::scheduler::shell_escape(&expanded))
+        }
+        None => String::new(),
+    }
+}
+
 #[derive(Debug)]
 pub struct Codex;
 
@@ -348,17 +390,19 @@ impl CodingAssistant for Codex {
     fn build_start_command(&self, opts: &StartOpts) -> String {
         let escaped_dir = crate::scheduler::shell_escape(&opts.project_dir);
         let model = format_model_flag(opts.model.as_deref());
+        let codex_home = format_codex_home_prefix(opts.codex_home.as_deref());
         let trust = format_trust_config_flag(&opts.project_dir);
         // WorktreeMode is intentionally ignored: Codex CLI has no verified
         // `--worktree` flag. Ouija sets up the worktree/cwd before launch and
         // Codex is started inside it. `effort` is intentionally ignored too:
         // Codex CLI exposes no verified `--effort` flag (#1442).
-        format!("cd {escaped_dir} && codex {AUTONOMY_FLAGS}{trust}{model}")
+        format!("cd {escaped_dir} && {codex_home}codex {AUTONOMY_FLAGS}{trust}{model}")
     }
 
     fn build_resume_command(&self, opts: &ResumeOpts) -> Option<String> {
         let escaped_dir = crate::scheduler::shell_escape(&opts.project_dir);
         let model = format_model_flag(opts.model.as_deref());
+        let codex_home = format_codex_home_prefix(opts.codex_home.as_deref());
         let trust = format_trust_config_flag(&opts.project_dir);
         // `codex resume --last` is the documented non-picker path for
         // continuing the most recent session in this cwd; an explicit
@@ -369,7 +413,7 @@ impl CodingAssistant for Codex {
             None => "--last".to_string(),
         };
         Some(format!(
-            "cd {escaped_dir} && codex resume {target} {AUTONOMY_FLAGS}{trust}{model}"
+            "cd {escaped_dir} && {codex_home}codex resume {target} {AUTONOMY_FLAGS}{trust}{model}"
         ))
     }
 
@@ -454,6 +498,7 @@ mod tests {
             model: None,
             effort: None,
             permission_mode: None,
+            codex_home: None,
         }
     }
 
@@ -465,6 +510,7 @@ mod tests {
             model: None,
             effort: None,
             permission_mode: None,
+            codex_home: None,
         }
     }
 
@@ -500,6 +546,19 @@ mod tests {
     }
 
     #[test]
+    fn start_command_with_codex_home() {
+        let cmd = backend().build_start_command(&StartOpts {
+            model: Some("gemini-2.5-pro".into()),
+            codex_home: Some("/home/user/.cache/codex-gemini".into()),
+            ..start_opts("/home/user/myproject")
+        });
+        assert_eq!(
+            cmd,
+            "cd '/home/user/myproject' && CODEX_HOME='/home/user/.cache/codex-gemini' codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen -c 'projects={\"/home/user/myproject\"={trust_level=\"trusted\"}}' --model 'gemini-2.5-pro'"
+        );
+    }
+
+    #[test]
     fn start_command_ignores_worktree_and_effort() {
         // Codex has no verified --worktree or --effort flag; both must be
         // dropped rather than guessed onto the command line (#1442).
@@ -508,9 +567,15 @@ mod tests {
             effort: Some("high".into()),
             ..start_opts("/home/user/myproject")
         });
-        assert!(!cmd.contains("--worktree"), "must not emit --worktree: {cmd}");
+        assert!(
+            !cmd.contains("--worktree"),
+            "must not emit --worktree: {cmd}"
+        );
         assert!(!cmd.contains("--effort"), "must not emit --effort: {cmd}");
-        assert!(!cmd.contains("feature-x"), "must not emit worktree name: {cmd}");
+        assert!(
+            !cmd.contains("feature-x"),
+            "must not emit worktree name: {cmd}"
+        );
         assert!(!cmd.contains("high"), "must not emit effort value: {cmd}");
     }
 
@@ -522,7 +587,10 @@ mod tests {
         // around the process (#1445).
         let yolo = "--dangerously-bypass-approvals-and-sandbox";
         let start = backend().build_start_command(&start_opts("/home/user/myproject"));
-        assert!(start.contains(yolo), "start must bypass approvals/sandbox: {start}");
+        assert!(
+            start.contains(yolo),
+            "start must bypass approvals/sandbox: {start}"
+        );
         assert!(
             start.contains("-c 'projects={\"/home/user/myproject\"={trust_level=\"trusted\"}}'"),
             "start must pre-trust the Codex trust root: {start}"
@@ -539,7 +607,10 @@ mod tests {
             "resume must pre-trust the Codex trust root: {resume}"
         );
         assert!(!start.contains("--sandbox workspace-write"), "{start}");
-        assert!(!start.contains("sandbox_workspace_write.network_access"), "{start}");
+        assert!(
+            !start.contains("sandbox_workspace_write.network_access"),
+            "{start}"
+        );
     }
 
     #[test]
@@ -583,13 +654,31 @@ mod tests {
     }
 
     #[test]
+    fn resume_command_with_codex_home() {
+        let cmd = backend().build_resume_command(&ResumeOpts {
+            codex_home: Some("/home/user/.cache/codex-gemini".into()),
+            ..resume_opts("/home/user/myproject", Some("abc-123"))
+        });
+        assert_eq!(
+            cmd,
+            Some(
+                "cd '/home/user/myproject' && CODEX_HOME='/home/user/.cache/codex-gemini' codex resume 'abc-123' --dangerously-bypass-approvals-and-sandbox --no-alt-screen -c 'projects={\"/home/user/myproject\"={trust_level=\"trusted\"}}'"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
     fn resume_command_ignores_worktree() {
         let cmd = backend().build_resume_command(&ResumeOpts {
             worktree: Some(WorktreeMode::Disposable),
             ..resume_opts("/home/user/myproject", Some("abc-123"))
         });
         let cmd = cmd.unwrap();
-        assert!(!cmd.contains("--worktree"), "must not emit --worktree: {cmd}");
+        assert!(
+            !cmd.contains("--worktree"),
+            "must not emit --worktree: {cmd}"
+        );
     }
 
     #[test]
@@ -598,6 +687,13 @@ mod tests {
         assert_eq!(format_model_flag(Some("")), "");
         assert_eq!(format_model_flag(Some("   ")), "");
         assert_eq!(format_model_flag(Some("gpt-5.5")), " --model 'gpt-5.5'");
+    }
+
+    #[test]
+    fn codex_home_prefix_drops_empty() {
+        assert_eq!(format_codex_home_prefix(None), "");
+        assert_eq!(format_codex_home_prefix(Some("")), "");
+        assert_eq!(format_codex_home_prefix(Some("   ")), "");
     }
 
     #[test]
@@ -693,9 +789,24 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let day = tmp.path().join("2026/07/05");
         std::fs::create_dir_all(&day).unwrap();
-        write_session_meta(&day.join("a.jsonl"), "/proj", "2026-07-05T14:44:15.000Z", "uuid-old");
-        write_session_meta(&day.join("b.jsonl"), "/proj", "2026-07-05T15:00:00.000Z", "uuid-new");
-        write_session_meta(&day.join("c.jsonl"), "/other", "2026-07-05T16:00:00.000Z", "uuid-other");
+        write_session_meta(
+            &day.join("a.jsonl"),
+            "/proj",
+            "2026-07-05T14:44:15.000Z",
+            "uuid-old",
+        );
+        write_session_meta(
+            &day.join("b.jsonl"),
+            "/proj",
+            "2026-07-05T15:00:00.000Z",
+            "uuid-new",
+        );
+        write_session_meta(
+            &day.join("c.jsonl"),
+            "/other",
+            "2026-07-05T16:00:00.000Z",
+            "uuid-other",
+        );
         assert_eq!(
             latest_session_id_for_cwd(tmp.path(), "/proj"),
             Some("uuid-new".to_string())
@@ -719,7 +830,12 @@ mod tests {
         let day = tmp.path().join("2026/07/05");
         std::fs::create_dir_all(&day).unwrap();
         std::fs::write(day.join("bad.jsonl"), "not json at all\n").unwrap();
-        write_session_meta(&day.join("good.jsonl"), "/proj", "2026-07-05T15:00:00.000Z", "uuid-good");
+        write_session_meta(
+            &day.join("good.jsonl"),
+            "/proj",
+            "2026-07-05T15:00:00.000Z",
+            "uuid-good",
+        );
         assert_eq!(
             latest_session_id_for_cwd(tmp.path(), "/proj"),
             Some("uuid-good".to_string())
@@ -846,8 +962,10 @@ mod tests {
             "user SessionStart hook must be preserved: {merged}"
         );
         assert!(
-            starts.iter().any(|g| g["hooks"][0]["command"]
-                == "/home/user/.codex/ouija-hooks/codex-register.sh"),
+            starts
+                .iter()
+                .any(|g| g["hooks"][0]["command"]
+                    == "/home/user/.codex/ouija-hooks/codex-register.sh"),
             "ouija SessionStart hook must be present: {merged}"
         );
     }
@@ -870,7 +988,11 @@ mod tests {
         .to_string();
         let merged = merge_hooks_json(Some(&stale), hooks_dir).unwrap();
         let stops = merged["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(stops.len(), 1, "stale ouija group must be replaced: {merged}");
+        assert_eq!(
+            stops.len(),
+            1,
+            "stale ouija group must be replaced: {merged}"
+        );
         assert_eq!(
             stops[0]["hooks"][0]["command"],
             "/home/user/.codex/ouija-hooks/codex-stop.sh"
@@ -883,7 +1005,11 @@ mod tests {
         install_to(home.path()).unwrap();
 
         let hooks_dir = home.path().join("ouija-hooks");
-        for script in ["codex-register.sh", "codex-prompt-submit.sh", "codex-stop.sh"] {
+        for script in [
+            "codex-register.sh",
+            "codex-prompt-submit.sh",
+            "codex-stop.sh",
+        ] {
             let p = hooks_dir.join(script);
             assert!(p.is_file(), "missing script {script}");
             #[cfg(unix)]
@@ -898,7 +1024,10 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&hooks_json).unwrap();
         assert_eq!(
             parsed["hooks"]["SessionStart"][0]["hooks"][0]["command"],
-            hooks_dir.join("codex-register.sh").to_string_lossy().as_ref()
+            hooks_dir
+                .join("codex-register.sh")
+                .to_string_lossy()
+                .as_ref()
         );
     }
 

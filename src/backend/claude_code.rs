@@ -600,6 +600,7 @@ mod tests {
             model: None,
             effort: None,
             permission_mode: None,
+            codex_home: None,
         }
     }
 
@@ -611,6 +612,7 @@ mod tests {
             model: None,
             effort: None,
             permission_mode: None,
+            codex_home: None,
         }
     }
 

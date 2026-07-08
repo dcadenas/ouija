@@ -205,6 +205,8 @@ pub struct StartOpts {
     pub effort: Option<String>,
     /// Claude Code permission mode override. Other backends ignore this.
     pub permission_mode: Option<String>,
+    /// CODEX_HOME override. Only the Codex backend uses this.
+    pub codex_home: Option<String>,
 }
 
 #[derive(Debug)]
@@ -218,6 +220,49 @@ pub struct ResumeOpts {
     pub effort: Option<String>,
     /// Claude Code permission mode override. Other backends ignore this.
     pub permission_mode: Option<String>,
+    /// CODEX_HOME override. Only the Codex backend uses this.
+    pub codex_home: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchModelConfig {
+    pub model: Option<String>,
+    pub codex_home: Option<String>,
+}
+
+/// Resolve user-facing model aliases into backend-specific launch config.
+///
+/// The public session interface stays backend-agnostic (`--backend` +
+/// `--model`). Codex-specific provider homes live in settings as model routes,
+/// so callers can pass `--model gemini` without knowing that Codex needs a
+/// separate `CODEX_HOME` for the Gemini sidecar setup.
+pub(crate) fn resolve_launch_model_config(
+    backend_name: &str,
+    model: Option<String>,
+    settings: &crate::persistence::OuijaSettings,
+) -> LaunchModelConfig {
+    if backend_name == "codex-cli" {
+        if let Some(alias) = model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            if let Some(route) = settings.codex_model_routes.get(alias) {
+                return LaunchModelConfig {
+                    model: route.model.clone().or_else(|| Some(alias.to_string())),
+                    codex_home: route
+                        .codex_home
+                        .clone()
+                        .or_else(|| settings.codex_home.clone()),
+                };
+            }
+        }
+        return LaunchModelConfig {
+            model,
+            codex_home: settings.codex_home.clone(),
+        };
+    }
+
+    LaunchModelConfig {
+        model,
+        codex_home: None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -275,6 +320,40 @@ mod tests {
     }
 
     #[test]
+    fn codex_without_model_uses_default_home_resolution() {
+        let settings = crate::persistence::OuijaSettings::default();
+        let launch = resolve_launch_model_config("codex-cli", None, &settings);
+        assert_eq!(
+            launch,
+            LaunchModelConfig {
+                model: None,
+                codex_home: None,
+            }
+        );
+    }
+
+    #[test]
+    fn codex_model_alias_resolves_route() {
+        let mut settings = crate::persistence::OuijaSettings::default();
+        settings.codex_model_routes.insert(
+            "gemini".into(),
+            crate::persistence::CodexModelRoute {
+                model: Some("gemini-2.5-pro".into()),
+                codex_home: Some("~/.cache/codex-gemini".into()),
+            },
+        );
+
+        let launch = resolve_launch_model_config("codex-cli", Some("gemini".into()), &settings);
+        assert_eq!(
+            launch,
+            LaunchModelConfig {
+                model: Some("gemini-2.5-pro".into()),
+                codex_home: Some("~/.cache/codex-gemini".into()),
+            }
+        );
+    }
+
+    #[test]
     fn run_with_timeout_returns_status_for_fast_success() {
         let status = run_with_timeout(&mut Command::new("true"), Duration::from_secs(3));
         assert!(status.is_some_and(|s| s.success()));
@@ -292,10 +371,7 @@ mod tests {
         // give up promptly rather than block — this is the guarantee that keeps
         // a hanging `codex --version` wrapper from stalling daemon startup.
         let start = Instant::now();
-        let status = run_with_timeout(
-            Command::new("sleep").arg("5"),
-            Duration::from_millis(200),
-        );
+        let status = run_with_timeout(Command::new("sleep").arg("5"), Duration::from_millis(200));
         assert!(status.is_none(), "timed-out process must return None");
         assert!(
             start.elapsed() < Duration::from_secs(2),
@@ -344,12 +420,7 @@ mod tests {
             .expect("codex-cli backend must be registered");
         assert_eq!(codex.cli_name(), "codex");
         // Its process name participates in the global process-name sweep.
-        assert!(
-            registry
-                .all_process_names()
-                .iter()
-                .any(|n| n == "codex")
-        );
+        assert!(registry.all_process_names().iter().any(|n| n == "codex"));
     }
 
     /// A backend whose CLI binary does not exist, so `is_available()` is false.

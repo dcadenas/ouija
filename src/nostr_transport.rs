@@ -1595,13 +1595,22 @@ pub async fn start_session(
         None => state.backends.default(),
     };
     let backend_name = backend.name().to_string();
-    let claude_permission_mode = state.settings.read().await.claude_permission_mode.clone();
+    let settings = state.settings.read().await;
+    let claude_permission_mode = settings.claude_permission_mode.clone();
+    let launch_model = crate::backend::resolve_launch_model_config(
+        &backend_name,
+        model.map(String::from),
+        &settings,
+    );
+    drop(settings);
+    crate::backend::codex::install_configured_home(launch_model.codex_home.as_deref());
     let backend_cmd = backend.build_start_command(&crate::backend::StartOpts {
         project_dir: dir.clone(),
         worktree: None, // ouija manages worktrees, not the backend
-        model: model.map(String::from),
+        model: launch_model.model.clone(),
         effort: effort.map(String::from),
         permission_mode: claude_permission_mode,
+        codex_home: launch_model.codex_home.clone(),
     });
 
     // Pre-compute the prompt text and sender envelope before launching, so we
@@ -1784,6 +1793,7 @@ pub async fn start_session(
                 opencode_binding,
                 model: model.map(String::from),
                 effort: effort.map(String::from),
+                codex_home: launch_model.codex_home.clone(),
                 reminder: reminder.map(String::from),
                 prompt: prompt.map(String::from),
                 ..Default::default()
@@ -1996,12 +2006,10 @@ pub async fn restart_session(
     // instead of flowing through to `claude --model '  sonnet  '`. Covers
     // both caller-supplied values and persisted SessionMeta.model/effort
     // from older builds that predate the boundary normalization.
-    let effective_model =
-        crate::api::normalize_optional_string(model.map(String::from)).or_else(|| {
-            crate::api::normalize_optional_string(
-                prev_metadata.as_ref().and_then(|m| m.model.clone()),
-            )
-        });
+    let caller_model = crate::api::normalize_optional_string(model.map(String::from));
+    let effective_model = caller_model.clone().or_else(|| {
+        crate::api::normalize_optional_string(prev_metadata.as_ref().and_then(|m| m.model.clone()))
+    });
     let effective_effort =
         crate::api::normalize_optional_string(effort.map(String::from)).or_else(|| {
             crate::api::normalize_optional_string(
@@ -2090,33 +2098,52 @@ pub async fn restart_session(
     crate::backend::claude_code::pre_trust_workspace(&dir);
     crate::backend::pre_trust_mise(&dir);
 
+    let settings = state.settings.read().await;
+    let claude_permission_mode = settings.claude_permission_mode.clone();
+    let launch_model = crate::backend::resolve_launch_model_config(
+        &backend_name,
+        effective_model.clone(),
+        &settings,
+    );
+    drop(settings);
+    let launch_codex_home = if caller_model.is_some() {
+        launch_model.codex_home.clone()
+    } else {
+        launch_model
+            .codex_home
+            .clone()
+            .or_else(|| prev_metadata.as_ref().and_then(|m| m.codex_home.clone()))
+    };
+    crate::backend::codex::install_configured_home(launch_codex_home.as_deref());
+
     let claude_cmd = if fresh {
-        let claude_permission_mode = state.settings.read().await.claude_permission_mode.clone();
         backend.build_start_command(&crate::backend::StartOpts {
             project_dir: dir.clone(),
             worktree: None, // ouija manages worktrees, not the backend
-            model: effective_model.clone(),
+            model: launch_model.model.clone(),
             effort: effective_effort.clone(),
             permission_mode: claude_permission_mode,
+            codex_home: launch_codex_home.clone(),
         })
     } else {
-        let claude_permission_mode = state.settings.read().await.claude_permission_mode.clone();
         backend
             .build_resume_command(&crate::backend::ResumeOpts {
                 project_dir: dir.clone(),
                 session_id: resume_id,
                 worktree: None, // ouija manages worktrees
-                model: effective_model.clone(),
+                model: launch_model.model.clone(),
                 effort: effective_effort.clone(),
                 permission_mode: claude_permission_mode.clone(),
+                codex_home: launch_codex_home.clone(),
             })
             .unwrap_or_else(|| {
                 backend.build_start_command(&crate::backend::StartOpts {
                     project_dir: dir.clone(),
                     worktree: None,
-                    model: effective_model.clone(),
+                    model: launch_model.model.clone(),
                     effort: effective_effort.clone(),
                     permission_mode: claude_permission_mode.clone(),
+                    codex_home: launch_codex_home.clone(),
                 })
             })
     };
@@ -2438,6 +2465,7 @@ pub async fn restart_session(
                     last_metadata_update: None,
                     model: effective_model.clone(),
                     effort: effective_effort.clone(),
+                    codex_home: launch_codex_home.clone(),
                     reminder: effective_reminder.clone(),
                     prompt: effective_prompt.clone(),
                     iteration: m.iteration,
@@ -2457,6 +2485,7 @@ pub async fn restart_session(
                     opencode_binding,
                     model: effective_model.clone(),
                     effort: effective_effort.clone(),
+                    codex_home: launch_codex_home.clone(),
                     reminder: effective_reminder.clone(),
                     prompt: effective_prompt.clone(),
                     ..Default::default()

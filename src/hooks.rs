@@ -599,7 +599,10 @@ mod tests {
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "feat/worker");
         let output = result["output"].as_str().unwrap();
-        assert!(output.contains("ouija ls"), "codex must be onboarded: {output}");
+        assert!(
+            output.contains("ouija ls"),
+            "codex must be onboarded: {output}"
+        );
         assert!(
             output.contains("--from feat/worker"),
             "must use the authoritative registered id: {output}"

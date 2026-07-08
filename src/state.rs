@@ -440,6 +440,9 @@ pub struct SessionMetadata {
     /// For opencode: sent as `variant` on each `prompt_async` body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Optional Codex home override for this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_home: Option<String>,
     /// Reminder text re-injected on idle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reminder: Option<String>,
@@ -499,6 +502,7 @@ impl Default for SessionMetadata {
             worktree: false,
             model: None,
             effort: None,
+            codex_home: None,
             reminder: None,
             prompt: None,
             iteration: 0,
@@ -1376,6 +1380,7 @@ impl AppState {
                         worktree: m.worktree,
                         model: m.model.clone(),
                         effort: m.effort.clone(),
+                        codex_home: m.codex_home.clone(),
                         reminder: m.reminder.clone(),
                         prompt: m.prompt.clone(),
                         iteration: m.iteration,
@@ -3881,6 +3886,7 @@ pub(crate) mod tests {
             worktree: true,
             model: Some("openrouter/sonnet".into()),
             effort: Some("max".into()),
+            codex_home: None,
             reminder: Some("remember to...".into()),
             prompt: Some("do the thing".into()),
             iteration: 3,

@@ -129,6 +129,12 @@ pub struct SessionMeta {
     /// string — opencode's variant ladder per provider is not interpreted here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Optional Codex home override for this session.
+    ///
+    /// Only the Codex backend uses this; when absent, Codex uses its normal
+    /// home resolution (`$CODEX_HOME` or `~/.codex`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_home: Option<String>,
     /// Reminder text re-injected on idle. Also appended to prompt at session start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reminder: Option<String>,
@@ -289,6 +295,7 @@ impl Default for SessionMeta {
             last_metadata_update: None,
             model: None,
             effort: None,
+            codex_home: None,
             reminder: None,
             prompt: None,
             iteration: 0,
@@ -692,6 +699,7 @@ pub(crate) fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>
             last_metadata_update: m.last_metadata_update.map(|ts| ts.timestamp()),
             model: m.model.clone(),
             effort: m.effort.clone(),
+            codex_home: m.codex_home.clone(),
             reminder: m.reminder.clone(),
             prompt: m.prompt.clone(),
             iteration: m.iteration,

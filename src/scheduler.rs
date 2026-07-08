@@ -112,6 +112,17 @@ pub struct ScheduledTask {
     pub run_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_dir: Option<String>,
+    /// Backend used when this task creates, revives, or respawns its session.
+    /// When unset, the scheduler preserves existing session metadata or falls
+    /// back to the daemon default backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// Model override used with `backend`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Effort/variant override used with `backend`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     #[serde(default)]
     pub once: bool,
     #[serde(
@@ -163,6 +174,12 @@ impl<'de> serde::Deserialize<'de> for ScheduledTask {
             #[serde(default)]
             project_dir: Option<String>,
             #[serde(default)]
+            backend: Option<String>,
+            #[serde(default)]
+            model: Option<String>,
+            #[serde(default)]
+            effort: Option<String>,
+            #[serde(default)]
             once: bool,
             #[serde(default, alias = "claude_session_id")]
             backend_session_id: Option<String>,
@@ -208,6 +225,9 @@ impl<'de> serde::Deserialize<'de> for ScheduledTask {
             last_status: raw.last_status,
             run_count: raw.run_count,
             project_dir: raw.project_dir,
+            backend: raw.backend,
+            model: raw.model,
+            effort: raw.effort,
             once: raw.once,
             backend_session_id: raw.backend_session_id,
             on_fire,
@@ -375,7 +395,16 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
     let Some(session) = session else {
         if task.project_dir.is_some() || task.prompt.is_some() {
             tracing::info!("session '{session_name}' not found, creating from task project_dir",);
-            return revive_from_task(state, task, None, None, None, None).await;
+            return revive_from_task(
+                state,
+                task,
+                None,
+                task.model.clone(),
+                task.effort.clone(),
+                None,
+                task.backend.clone(),
+            )
+            .await;
         }
         return TaskRun::failed(
             task,
@@ -391,13 +420,25 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
     let Some(pane) = &session.pane else {
         // Session exists but has no pane — revive it, carrying model/effort
         // from the snapshot we already have in scope.
+        let task_backend = task.backend.clone();
         return revive_from_task(
             state,
             task,
             None,
-            session.metadata.model.clone(),
-            session.metadata.effort.clone(),
-            session.metadata.backend.clone(),
+            task.model.clone().or_else(|| {
+                task_backend
+                    .is_none()
+                    .then(|| session.metadata.model.clone())
+                    .flatten()
+            }),
+            task.effort.clone().or_else(|| {
+                task_backend
+                    .is_none()
+                    .then(|| session.metadata.effort.clone())
+                    .flatten()
+            }),
+            session.metadata.codex_home.clone(),
+            task_backend.or_else(|| session.metadata.backend.clone()),
         )
         .await;
     };
@@ -419,7 +460,25 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
     // the same atomic read above at line 368-371.
     let snapshot_model = session.metadata.model.clone();
     let snapshot_effort = session.metadata.effort.clone();
+    let snapshot_codex_home = session.metadata.codex_home.clone();
     let snapshot_backend = session.metadata.backend.clone();
+    let task_backend = task.backend.clone();
+    let launch = TaskLaunchSelection {
+        model: task.model.clone().or_else(|| {
+            task_backend
+                .is_none()
+                .then(|| snapshot_model.clone())
+                .flatten()
+        }),
+        effort: task.effort.clone().or_else(|| {
+            task_backend
+                .is_none()
+                .then(|| snapshot_effort.clone())
+                .flatten()
+        }),
+        codex_home: snapshot_codex_home,
+        backend_name: task_backend.or(snapshot_backend),
+    };
 
     if alive {
         if task.on_fire.kills_alive() {
@@ -428,8 +487,7 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
                 .as_deref()
                 .or(session.metadata.project_dir.as_deref())
                 .unwrap_or("/tmp");
-            return respawn_and_inject(state, task, pane, dir, snapshot_model, snapshot_effort)
-                .await;
+            return respawn_and_inject(state, task, pane, dir, launch).await;
         }
         // Verify session still exists — a concurrent kill may have removed it
         // while we were checking pane liveness. If gone, fall through to revival.
@@ -454,11 +512,20 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
         state,
         task,
         project_dir,
-        snapshot_model,
-        snapshot_effort,
-        snapshot_backend,
+        launch.model,
+        launch.effort,
+        launch.codex_home,
+        launch.backend_name,
     )
     .await
+}
+
+#[derive(Debug, Clone)]
+struct TaskLaunchSelection {
+    model: Option<String>,
+    effort: Option<String>,
+    codex_home: Option<String>,
+    backend_name: Option<String>,
 }
 
 /// Respawn the backend in an existing pane (for clears_context on a live session).
@@ -472,8 +539,7 @@ async fn respawn_and_inject(
     task: &ScheduledTask,
     pane: &str,
     dir: &str,
-    model: Option<String>,
-    effort: Option<String>,
+    launch: TaskLaunchSelection,
 ) -> TaskRun {
     let pane_id = pane.to_string();
     let dir = dir.to_string();
@@ -481,8 +547,22 @@ async fn respawn_and_inject(
     let is_disposable = task.on_fire.is_disposable_worktree();
     let task_name = task.name.clone();
 
-    let backend = state.backend_for_session(task.session_name()).await;
-    let claude_permission_mode = state.settings.read().await.claude_permission_mode.clone();
+    let backend = if let Some(name) = launch.backend_name.as_deref() {
+        state
+            .backends
+            .get(name)
+            .unwrap_or_else(|| state.backends.default())
+    } else {
+        state.backend_for_session(task.session_name()).await
+    };
+    let backend_name = backend.name().to_string();
+    let settings = state.settings.read().await;
+    let claude_permission_mode = settings.claude_permission_mode.clone();
+    let launch_model =
+        crate::backend::resolve_launch_model_config(&backend_name, launch.model.clone(), &settings);
+    drop(settings);
+    let launch_codex_home = launch_model.codex_home.clone().or(launch.codex_home);
+    crate::backend::codex::install_configured_home(launch_codex_home.as_deref());
     let claude_cmd = backend.build_start_command(&crate::backend::StartOpts {
         project_dir: dir.to_string(),
         worktree: if uses_worktree {
@@ -494,9 +574,10 @@ async fn respawn_and_inject(
         } else {
             None
         },
-        model,
-        effort,
+        model: launch_model.model,
+        effort: launch.effort,
         permission_mode: claude_permission_mode,
+        codex_home: launch_codex_home.clone(),
     });
 
     // Pass prompt as CLI arg (same as start_session) so Claude loads
@@ -591,10 +672,21 @@ async fn revive_from_task(
     project_dir_override: Option<&str>,
     model: Option<String>,
     effort: Option<String>,
+    codex_home: Option<String>,
     backend_name: Option<String>,
 ) -> TaskRun {
     let project_dir = project_dir_override.or(task.project_dir.as_deref());
-    match revive_and_inject(state, task, project_dir, model, effort, backend_name).await {
+    match revive_and_inject(
+        state,
+        task,
+        project_dir,
+        model,
+        effort,
+        codex_home,
+        backend_name,
+    )
+    .await
+    {
         Ok(new_pane) => {
             if task.on_fire.clears_context() {
                 let mut proto = state.protocol.write().await;
@@ -622,6 +714,7 @@ async fn revive_and_inject(
     project_dir: Option<&str>,
     model: Option<String>,
     effort: Option<String>,
+    codex_home: Option<String>,
     backend_name: Option<String>,
 ) -> anyhow::Result<String> {
     let dir = project_dir
@@ -654,7 +747,14 @@ async fn revive_and_inject(
         backend.delivery_mode(),
         crate::backend::DeliveryMode::TuiInjection
     );
-    let claude_permission_mode = state.settings.read().await.claude_permission_mode.clone();
+    let backend_name = backend.name().to_string();
+    let settings = state.settings.read().await;
+    let claude_permission_mode = settings.claude_permission_mode.clone();
+    let launch_model =
+        crate::backend::resolve_launch_model_config(&backend_name, model.clone(), &settings);
+    drop(settings);
+    let launch_codex_home = launch_model.codex_home.clone().or(codex_home);
+    crate::backend::codex::install_configured_home(launch_codex_home.as_deref());
     let detected_backend_session_id = if task.backend_session_id.is_none() {
         backend.detect_session_id(&dir)
     } else {
@@ -668,9 +768,10 @@ async fn revive_and_inject(
         backend.build_start_command(&crate::backend::StartOpts {
             project_dir: dir.clone(),
             worktree,
-            model: model.clone(),
+            model: launch_model.model.clone(),
             effort: effort.clone(),
             permission_mode: claude_permission_mode.clone(),
+            codex_home: launch_codex_home.clone(),
         })
     } else {
         backend
@@ -678,17 +779,19 @@ async fn revive_and_inject(
                 project_dir: dir.clone(),
                 session_id: resume_backend_session_id.clone(),
                 worktree,
-                model: model.clone(),
+                model: launch_model.model.clone(),
                 effort: effort.clone(),
                 permission_mode: claude_permission_mode.clone(),
+                codex_home: launch_codex_home.clone(),
             })
             .unwrap_or_else(|| {
                 backend.build_start_command(&crate::backend::StartOpts {
                     project_dir: dir.clone(),
                     worktree: None,
-                    model: model.clone(),
+                    model: launch_model.model.clone(),
                     effort: effort.clone(),
                     permission_mode: claude_permission_mode.clone(),
+                    codex_home: launch_codex_home.clone(),
                 })
             })
     };
@@ -838,6 +941,7 @@ async fn revive_and_inject(
         RevivedSessionSnapshot {
             model: model.clone(),
             effort: effort.clone(),
+            codex_home: launch_codex_home.clone(),
             backend_name: backend.name(),
             is_tui,
             clears_context,
@@ -887,6 +991,7 @@ async fn revive_and_inject(
 struct RevivedSessionSnapshot<'a> {
     model: Option<String>,
     effort: Option<String>,
+    codex_home: Option<String>,
     backend_name: &'a str,
     is_tui: bool,
     clears_context: bool,
@@ -912,6 +1017,7 @@ fn revived_session_metadata(
         reminder: task.reminder.clone(),
         model: snapshot.model,
         effort: snapshot.effort,
+        codex_home: snapshot.codex_home,
         on_fire: Some(task.on_fire.clone()),
         backend_session_id,
         backend: Some(snapshot.backend_name.to_string()),
@@ -1019,6 +1125,9 @@ pub fn new_task(
         last_status: None,
         run_count: 0,
         project_dir: None,
+        backend: None,
+        model: None,
+        effort: None,
         once,
         backend_session_id,
         on_fire,
@@ -1081,6 +1190,9 @@ mod tests {
             last_status: None,
             run_count: 0,
             project_dir: Some("/tmp".into()),
+            backend: Some("codex-cli".into()),
+            model: Some("gpt-5.5".into()),
+            effort: None,
             once: false,
             backend_session_id: None,
             on_fire: OnFire::ContinueSession,
@@ -1090,6 +1202,8 @@ mod tests {
         assert_eq!(decoded.id, task.id);
         assert_eq!(decoded.name, task.name);
         assert_eq!(decoded.project_dir, task.project_dir);
+        assert_eq!(decoded.backend.as_deref(), Some("codex-cli"));
+        assert_eq!(decoded.model.as_deref(), Some("gpt-5.5"));
     }
 
     #[test]
@@ -1135,6 +1249,9 @@ mod tests {
             last_status: None,
             run_count: 0,
             project_dir: Some("/tmp/project".into()),
+            backend: None,
+            model: None,
+            effort: None,
             once: false,
             backend_session_id: None,
             on_fire: OnFire::DisposableWorktree,
@@ -1298,6 +1415,7 @@ mod tests {
             RevivedSessionSnapshot {
                 model: Some("anthropic/claude-sonnet-4".into()),
                 effort: Some("high".into()),
+                codex_home: None,
                 backend_name: "opencode",
                 is_tui: false,
                 clears_context: false,
@@ -1312,5 +1430,38 @@ mod tests {
             metadata.opencode_binding,
             Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
         );
+    }
+
+    #[test]
+    fn revived_codex_task_metadata_records_backend_without_model_override() {
+        let mut task = new_task(
+            "daily-report".into(),
+            "0 10 * * *".into(),
+            None,
+            Some("prompt".into()),
+            None,
+            false,
+            None,
+            OnFire::NewSession,
+        );
+        task.backend = Some("codex-cli".into());
+
+        let metadata = revived_session_metadata(
+            &task,
+            Some("/tmp/project"),
+            None,
+            RevivedSessionSnapshot {
+                model: None,
+                effort: None,
+                codex_home: None,
+                backend_name: "codex-cli",
+                is_tui: true,
+                clears_context: true,
+            },
+        );
+
+        assert_eq!(metadata.backend.as_deref(), Some("codex-cli"));
+        assert_eq!(metadata.model, None);
+        assert_eq!(metadata.codex_home, None);
     }
 }
