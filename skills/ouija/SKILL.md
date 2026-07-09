@@ -60,6 +60,12 @@ ouija ask target-id "question"
 ouija tell target-id "fyi: deploy done"
 ```
 
+`ouija ask` sends the question and returns after delivery. The reply is pushed
+into this session later as `<msg ... re="N">...</msg>`. If that reply is your only
+remaining blocker, end your turn and wait for the pushed message. Do not poll the
+message log, status, or pane output for normal replies; use those only when
+debugging suspected delivery failure.
+
 ## 4. Starting and managing sessions
 
 ```bash

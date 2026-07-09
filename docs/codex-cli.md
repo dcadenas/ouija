@@ -159,6 +159,10 @@ Codex learns the mesh two complementary ways:
    `--from <your-public-id>` is included because Codex's bash tool cannot be relied
    on to carry `TMUX_PANE` for sender resolution — but since `OUIJA_SESSION_ID` is
    inherited, commands without `--from` also resolve correctly via `ouija whoami`.
+   `ouija ask` is not a synchronous wait operation: it returns after delivery, and
+   the eventual reply is pushed into the asking session later as a `<msg ... re>`
+   message. A Codex session with no other work should end its turn after asking,
+   not poll the message log or pane output.
 
 ## Hook trust
 

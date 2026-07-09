@@ -258,12 +258,16 @@ fn mesh_instructions_for_backend(backend: Option<&str>, public_id: &str) -> Stri
          Your public Ouija id is `{public_id}`. Pass it as `--from {public_id}` on \
          every command so the mesh knows who is sending.\n\n\
          - `ouija ls` — list reachable sessions (targets for messages).\n\
-         - `ouija ask <target> \"question\" --from {public_id}` — ask and wait for a reply.\n\
+         - `ouija ask <target> \"question\" --from {public_id}` — send a question that \
+         expects a reply; the command returns after delivery.\n\
          - `ouija tell <target> \"note\" --from {public_id}` — fire-and-forget message.\n\
          - `ouija reply <target> <msg-id> \"answer\" --from {public_id}` — answer a \
          `<msg ... reply=\"true\">` you received (the sender is blocked until you reply).\n\n\
          Incoming messages arrive as `<msg from=\"...\" id=\"N\" reply=\"true\">text</msg>`; \
-         reply to those with `reply=\"true\"` using their `id`."
+         reply to those with `reply=\"true\"` using their `id`. Replies to your asks are pushed \
+         into this session later as `<msg ... re=\"N\">...</msg>`. If that reply is your only \
+         remaining blocker, end your turn and wait for the pushed message; do not poll the \
+         message log, status, or pane output unless you are debugging suspected delivery failure."
     )
 }
 
@@ -564,6 +568,8 @@ mod tests {
         assert!(codex.contains("ouija ask"), "{codex}");
         assert!(codex.contains("ouija tell"), "{codex}");
         assert!(codex.contains("ouija reply"), "{codex}");
+        assert!(codex.contains("returns after delivery"), "{codex}");
+        assert!(codex.contains("do not poll"), "{codex}");
         assert!(
             codex.contains("--from feat/123-worker"),
             "must teach the resolved public id as --from: {codex}"
