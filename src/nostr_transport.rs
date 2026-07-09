@@ -1588,10 +1588,10 @@ pub async fn start_session(
     let tmux_session = crate::tmux::tmux_session_name(&dir);
     let window_name = name.to_string();
     let backend = match backend {
-        Some(b) => state
-            .backends
-            .get(b)
-            .unwrap_or_else(|| state.backends.default()),
+        Some(b) => match state.backends.get_required(b) {
+            Ok(backend) => backend,
+            Err(message) => return (message, None),
+        },
         None => state.backends.default(),
     };
     let backend_name = backend.name().to_string();
@@ -1976,10 +1976,10 @@ pub async fn restart_session(
     let existing_pane = session.as_ref().and_then(|s| s.pane.clone());
 
     let backend = match backend {
-        Some(b) => state
-            .backends
-            .get(b)
-            .unwrap_or_else(|| state.backends.default()),
+        Some(b) => match state.backends.get_required(b) {
+            Ok(backend) => backend,
+            Err(message) => return (message, None),
+        },
         None => {
             // Fall back to the existing session's backend
             let prev_backend = prev_metadata.as_ref().and_then(|m| m.backend.as_deref());

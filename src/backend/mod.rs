@@ -127,6 +127,26 @@ impl BackendRegistry {
         self.backends.iter().find(|b| b.name() == name).cloned()
     }
 
+    pub fn names(&self) -> Vec<&str> {
+        self.backends.iter().map(|b| b.name()).collect()
+    }
+
+    pub fn valid_names_csv(&self) -> String {
+        self.names().join(", ")
+    }
+
+    pub fn unknown_backend_message(&self, name: &str) -> String {
+        format!(
+            "unknown backend '{name}'. Valid backends: {}",
+            self.valid_names_csv()
+        )
+    }
+
+    pub fn get_required(&self, name: &str) -> Result<Arc<dyn CodingAssistant>, String> {
+        self.get(name)
+            .ok_or_else(|| self.unknown_backend_message(name))
+    }
+
     pub fn default(&self) -> Arc<dyn CodingAssistant> {
         self.get(&self.default_name)
             .expect("default backend must exist")

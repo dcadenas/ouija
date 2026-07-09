@@ -548,10 +548,10 @@ async fn respawn_and_inject(
     let task_name = task.name.clone();
 
     let backend = if let Some(name) = launch.backend_name.as_deref() {
-        state
-            .backends
-            .get(name)
-            .unwrap_or_else(|| state.backends.default())
+        match state.backends.get_required(name) {
+            Ok(backend) => backend,
+            Err(message) => return TaskRun::failed(task, message),
+        }
     } else {
         state.backend_for_session(task.session_name()).await
     };
@@ -738,8 +738,8 @@ async fn revive_and_inject(
     let backend = if let Some(name) = backend_name.as_deref() {
         state
             .backends
-            .get(name)
-            .unwrap_or_else(|| state.backends.default())
+            .get_required(name)
+            .map_err(anyhow::Error::msg)?
     } else {
         state.backend_for_session(task.session_name()).await
     };

@@ -35,6 +35,25 @@ pub(crate) fn normalize_optional_string(input: Option<String>) -> Option<String>
         .filter(|s| !s.is_empty())
 }
 
+fn validate_backend_name(
+    state: &SharedState,
+    backend: Option<&str>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let Some(name) = backend else {
+        return Ok(());
+    };
+    if state.backends.get(name).is_some() {
+        return Ok(());
+    }
+    Err((
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": state.backends.unknown_backend_message(name),
+            "valid_backends": state.backends.names(),
+        })),
+    ))
+}
+
 /// Extract a short project description from a project directory.
 ///
 /// Tries in order: `Cargo.toml` description field, `package.json` description,
@@ -483,7 +502,7 @@ pub struct RegisterBody {
     networked: Option<bool>,
     #[serde(alias = "claude_session_id")]
     backend_session_id: Option<String>,
-    /// Which coding assistant backend to use (e.g. "claude-code", "codex").
+    /// Which coding assistant backend to use (e.g. "claude-code", "codex-cli").
     #[serde(default)]
     backend: Option<String>,
     /// Reminder text re-injected on idle.
@@ -2107,6 +2126,9 @@ pub async fn create_task(
     );
     task.project_dir = body.project_dir;
     task.backend = normalize_optional_string(body.backend);
+    if let Err(response) = validate_backend_name(&state, task.backend.as_deref()) {
+        return response;
+    }
     task.model = normalize_optional_string(body.model);
     task.effort = normalize_optional_string(body.effort);
 
@@ -2385,7 +2407,7 @@ pub struct SessionNameBody {
     prompt: Option<String>,
     #[serde(default)]
     from: Option<String>,
-    /// Which coding assistant backend to use (e.g. "claude-code", "codex").
+    /// Which coding assistant backend to use (e.g. "claude-code", "codex-cli").
     #[serde(default)]
     backend: Option<String>,
     /// Which LLM model to use.
@@ -2607,6 +2629,10 @@ pub async fn start_session(
     let mut body = body;
     body.model = normalize_optional_string(body.model);
     body.effort = normalize_optional_string(body.effort);
+    body.backend = normalize_optional_string(body.backend);
+    if let Err(response) = validate_backend_name(&state, body.backend.as_deref()) {
+        return response;
+    }
 
     // Return 202 immediately — all work (registration + boot) happens in background.
     let name = body.name.clone();
@@ -2684,6 +2710,10 @@ pub async fn restart_session(
     let mut body = body;
     body.model = normalize_optional_string(body.model);
     body.effort = normalize_optional_string(body.effort);
+    body.backend = normalize_optional_string(body.backend);
+    if let Err(response) = validate_backend_name(&state, body.backend.as_deref()) {
+        return response;
+    }
 
     // restart_session shares SessionNameBody with start_session, so
     // `force_reset` and `base_branch` deserialize here too — but the
@@ -4021,6 +4051,106 @@ mod tests {
             normalize_optional_string(Some("  opus  ".into())),
             Some("opus".into())
         );
+    }
+
+    fn assert_unknown_backend_response(status: StatusCode, body: &serde_json::Value) {
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("unknown backend 'codex'"),
+            "error must name the rejected backend, got: {error}"
+        );
+        assert!(
+            error.contains("codex-cli"),
+            "error must list the valid Codex backend name, got: {error}"
+        );
+        let valid_backends = body["valid_backends"]
+            .as_array()
+            .expect("valid_backends must be an array");
+        assert!(
+            valid_backends.iter().any(|name| name == "codex-cli"),
+            "valid_backends must include codex-cli, got: {valid_backends:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_session_rejects_unknown_backend_before_spawn() {
+        let state = crate::state::AppState::new_for_test();
+        let (status, Json(body)) = start_session(
+            State(state),
+            Json(SessionNameBody {
+                name: "wrong-codex".into(),
+                fresh: None,
+                worktree: None,
+                project_dir: None,
+                prompt: None,
+                from: None,
+                backend: Some("codex".into()),
+                model: None,
+                effort: None,
+                reminder: None,
+                branch: None,
+                base_branch: None,
+                keep_worktree: None,
+                force_reset: None,
+            }),
+        )
+        .await;
+
+        assert_unknown_backend_response(status, &body);
+    }
+
+    #[tokio::test]
+    async fn restart_session_rejects_unknown_backend() {
+        let state = crate::state::AppState::new_for_test();
+        let (status, Json(body)) = restart_session(
+            State(state),
+            Json(SessionNameBody {
+                name: "wrong-codex".into(),
+                fresh: Some(true),
+                worktree: None,
+                project_dir: None,
+                prompt: None,
+                from: None,
+                backend: Some("codex".into()),
+                model: None,
+                effort: None,
+                reminder: None,
+                branch: None,
+                base_branch: None,
+                keep_worktree: None,
+                force_reset: None,
+            }),
+        )
+        .await;
+
+        assert_unknown_backend_response(status, &body);
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_unknown_backend() {
+        let state = crate::state::AppState::new_for_test();
+        let (status, Json(body)) = create_task(
+            State(state),
+            Json(CreateTaskBody {
+                name: "wrong-codex-task".into(),
+                cron: "0 0 * * *".into(),
+                target_session: None,
+                message: Some("run".into()),
+                prompt: None,
+                reminder: None,
+                project_dir: None,
+                backend: Some("codex".into()),
+                model: None,
+                effort: None,
+                once: None,
+                backend_session_id: None,
+                on_fire: None,
+            }),
+        )
+        .await;
+
+        assert_unknown_backend_response(status, &body);
     }
 
     #[test]
