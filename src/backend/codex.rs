@@ -646,6 +646,48 @@ mod tests {
     }
 
     #[test]
+    fn trust_override_survives_spawned_worker_options() {
+        // This mirrors the command shape Ouija uses for unattended Codex workers:
+        // an isolated CODEX_HOME/model route, reasoning effort override, and a
+        // prompt appended by the caller. The trust override must remain present
+        // so the TUI never blocks on Codex's first-run project trust dialog.
+        let expected_trust = " -c 'projects={\"/home/user/myproject\"={trust_level=\"trusted\"}}'";
+        let start = backend().build_start_command(&StartOpts {
+            model: Some("gemini-2.5-pro".into()),
+            effort: Some("low".into()),
+            codex_home: Some("/home/user/.cache/codex-gemini".into()),
+            ..start_opts("/home/user/myproject")
+        });
+        assert!(
+            start.contains(expected_trust),
+            "spawn start must pre-trust the Codex project root: {start}"
+        );
+        assert_eq!(
+            start.matches("trust_level=\"trusted\"").count(),
+            1,
+            "spawn start must carry one trust override: {start}"
+        );
+
+        let resume = backend()
+            .build_resume_command(&ResumeOpts {
+                model: Some("gemini-2.5-pro".into()),
+                effort: Some("low".into()),
+                codex_home: Some("/home/user/.cache/codex-gemini".into()),
+                ..resume_opts("/home/user/myproject", Some("abc-123"))
+            })
+            .unwrap();
+        assert!(
+            resume.contains(expected_trust),
+            "spawn resume must pre-trust the Codex project root: {resume}"
+        );
+        assert_eq!(
+            resume.matches("trust_level=\"trusted\"").count(),
+            1,
+            "spawn resume must carry one trust override: {resume}"
+        );
+    }
+
+    #[test]
     fn resume_command_without_session_id_uses_last() {
         let cmd = backend().build_resume_command(&resume_opts("/home/user/myproject", None));
         assert_eq!(
