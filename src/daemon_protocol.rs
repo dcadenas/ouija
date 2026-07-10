@@ -125,6 +125,9 @@ pub struct SessionMeta {
     /// Reasoning effort / variant for the model.
     ///
     /// For claude-code: passed as `--effort <X>` on the CLI (`low|medium|high|xhigh|max`).
+    /// For codex-cli: passed as `-c model_reasoning_effort="<X>"` on the CLI
+    /// (`ultra|max|xhigh|high|medium|low|minimal|none`, with some levels
+    /// model-dependent).
     /// For opencode: sent as `variant` on each `prompt_async` body. Opaque passthrough
     /// string — opencode's variant ladder per provider is not interpreted here.
     #[serde(default, skip_serializing_if = "Option::is_none")]

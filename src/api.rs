@@ -2420,6 +2420,7 @@ pub struct SessionNameBody {
     /// Reasoning effort / variant for the model.
     ///
     /// For claude-code: passed as `claude --effort <X>`.
+    /// For codex-cli: passed as `codex -c model_reasoning_effort="<X>"`.
     /// For opencode: sent as `variant` on each `prompt_async` body.
     #[serde(default)]
     effort: Option<String>,

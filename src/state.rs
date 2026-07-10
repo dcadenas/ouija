@@ -437,6 +437,7 @@ pub struct SessionMetadata {
     /// Reasoning effort / variant for the model.
     ///
     /// For claude-code: passed as `--effort <X>` on the CLI.
+    /// For codex-cli: passed as `-c model_reasoning_effort="<X>"`.
     /// For opencode: sent as `variant` on each `prompt_async` body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,

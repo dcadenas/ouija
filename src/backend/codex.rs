@@ -343,11 +343,26 @@ const AUTONOMY_FLAGS: &str = "--dangerously-bypass-approvals-and-sandbox --no-al
 /// The value is shell-escaped so it embeds safely in the surrounding
 /// `format!`-built command. Empty / whitespace-only values are treated as
 /// absent — emitting `codex --model ''` would just fail at the CLI, so omitting
-/// the flag is the safer default. Codex has no verified `--effort` flag, so
-/// reasoning effort is intentionally not mapped here.
+/// the flag is the safer default.
 fn format_model_flag(model: Option<&str>) -> String {
     match model.map(str::trim).filter(|m| !m.is_empty()) {
         Some(m) => format!(" --model {}", crate::scheduler::shell_escape(m)),
+        None => String::new(),
+    }
+}
+
+/// Render a Codex config override for reasoning effort.
+///
+/// Codex CLI has no `--effort` flag. Reasoning effort is a config key, so Ouija
+/// maps its existing `effort` field to `-c model_reasoning_effort="<value>"`.
+/// Values are left as a normalized passthrough because Codex documents some
+/// levels as model-dependent; Codex owns final validation for the selected model.
+fn format_reasoning_effort_config_flag(effort: Option<&str>) -> String {
+    match effort.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(e) => {
+            let config = format!("model_reasoning_effort=\"{}\"", toml_basic_string_escape(e));
+            format!(" -c {}", crate::scheduler::shell_escape(&config))
+        }
         None => String::new(),
     }
 }
@@ -390,30 +405,31 @@ impl CodingAssistant for Codex {
     fn build_start_command(&self, opts: &StartOpts) -> String {
         let escaped_dir = crate::scheduler::shell_escape(&opts.project_dir);
         let model = format_model_flag(opts.model.as_deref());
+        let effort = format_reasoning_effort_config_flag(opts.effort.as_deref());
         let codex_home = format_codex_home_prefix(opts.codex_home.as_deref());
         let trust = format_trust_config_flag(&opts.project_dir);
         // WorktreeMode is intentionally ignored: Codex CLI has no verified
         // `--worktree` flag. Ouija sets up the worktree/cwd before launch and
-        // Codex is started inside it. `effort` is intentionally ignored too:
-        // Codex CLI exposes no verified `--effort` flag (#1442).
-        format!("cd {escaped_dir} && {codex_home}codex {AUTONOMY_FLAGS}{trust}{model}")
+        // Codex is started inside it.
+        format!("cd {escaped_dir} && {codex_home}codex {AUTONOMY_FLAGS}{trust}{effort}{model}")
     }
 
     fn build_resume_command(&self, opts: &ResumeOpts) -> Option<String> {
         let escaped_dir = crate::scheduler::shell_escape(&opts.project_dir);
         let model = format_model_flag(opts.model.as_deref());
+        let effort = format_reasoning_effort_config_flag(opts.effort.as_deref());
         let codex_home = format_codex_home_prefix(opts.codex_home.as_deref());
         let trust = format_trust_config_flag(&opts.project_dir);
         // `codex resume --last` is the documented non-picker path for
         // continuing the most recent session in this cwd; an explicit
-        // SESSION_ID targets a specific thread. WorktreeMode/effort ignored as
-        // in `build_start_command`.
+        // SESSION_ID targets a specific thread. WorktreeMode is ignored as in
+        // `build_start_command`.
         let target = match &opts.session_id {
             Some(sid) => crate::scheduler::shell_escape(sid),
             None => "--last".to_string(),
         };
         Some(format!(
-            "cd {escaped_dir} && {codex_home}codex resume {target} {AUTONOMY_FLAGS}{trust}{model}"
+            "cd {escaped_dir} && {codex_home}codex resume {target} {AUTONOMY_FLAGS}{trust}{effort}{model}"
         ))
     }
 
@@ -559,9 +575,9 @@ mod tests {
     }
 
     #[test]
-    fn start_command_ignores_worktree_and_effort() {
-        // Codex has no verified --worktree or --effort flag; both must be
-        // dropped rather than guessed onto the command line (#1442).
+    fn start_command_ignores_worktree_and_maps_effort_to_config() {
+        // Codex has no verified --worktree or --effort flag. Ouija still maps
+        // effort through Codex config instead of dropping it.
         let cmd = backend().build_start_command(&StartOpts {
             worktree: Some(WorktreeMode::Named("feature-x".to_string())),
             effort: Some("high".into()),
@@ -576,7 +592,23 @@ mod tests {
             !cmd.contains("feature-x"),
             "must not emit worktree name: {cmd}"
         );
-        assert!(!cmd.contains("high"), "must not emit effort value: {cmd}");
+        assert!(
+            cmd.contains("-c 'model_reasoning_effort=\"high\"'"),
+            "must emit effort as Codex config: {cmd}"
+        );
+    }
+
+    #[test]
+    fn start_command_with_model_and_effort() {
+        let cmd = backend().build_start_command(&StartOpts {
+            model: Some("gpt-5.5".into()),
+            effort: Some("low".into()),
+            ..start_opts("/home/user/myproject")
+        });
+        assert_eq!(
+            cmd,
+            "cd '/home/user/myproject' && codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen -c 'projects={\"/home/user/myproject\"={trust_level=\"trusted\"}}' -c 'model_reasoning_effort=\"low\"' --model 'gpt-5.5'"
+        );
     }
 
     #[test]
@@ -654,6 +686,21 @@ mod tests {
     }
 
     #[test]
+    fn resume_command_with_effort() {
+        let cmd = backend().build_resume_command(&ResumeOpts {
+            effort: Some("xhigh".into()),
+            ..resume_opts("/home/user/myproject", Some("abc-123"))
+        });
+        assert_eq!(
+            cmd,
+            Some(
+                "cd '/home/user/myproject' && codex resume 'abc-123' --dangerously-bypass-approvals-and-sandbox --no-alt-screen -c 'projects={\"/home/user/myproject\"={trust_level=\"trusted\"}}' -c 'model_reasoning_effort=\"xhigh\"'"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
     fn resume_command_with_codex_home() {
         let cmd = backend().build_resume_command(&ResumeOpts {
             codex_home: Some("/home/user/.cache/codex-gemini".into()),
@@ -687,6 +734,21 @@ mod tests {
         assert_eq!(format_model_flag(Some("")), "");
         assert_eq!(format_model_flag(Some("   ")), "");
         assert_eq!(format_model_flag(Some("gpt-5.5")), " --model 'gpt-5.5'");
+    }
+
+    #[test]
+    fn format_reasoning_effort_config_flag_drops_empty_and_escapes() {
+        assert_eq!(format_reasoning_effort_config_flag(None), "");
+        assert_eq!(format_reasoning_effort_config_flag(Some("")), "");
+        assert_eq!(format_reasoning_effort_config_flag(Some("   ")), "");
+        assert_eq!(
+            format_reasoning_effort_config_flag(Some("medium")),
+            " -c 'model_reasoning_effort=\"medium\"'"
+        );
+        assert_eq!(
+            format_reasoning_effort_config_flag(Some("hi\"there")),
+            " -c 'model_reasoning_effort=\"hi\\\"there\"'"
+        );
     }
 
     #[test]
