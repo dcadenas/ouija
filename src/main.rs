@@ -156,7 +156,7 @@ enum Command {
         /// LLM model (claude: alias/full id; opencode: providerID/modelID).
         #[arg(long)]
         model: Option<String>,
-        /// Reasoning effort / variant (claude: --effort; opencode: prompt variant).
+        /// Reasoning effort / variant (claude: --effort; codex: model_reasoning_effort; opencode: prompt variant).
         #[arg(long)]
         effort: Option<String>,
         #[arg(long)]

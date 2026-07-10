@@ -157,7 +157,8 @@ Gemini, run a local Responses-compatible sidecar such as LiteLLM on localhost
 and point that Codex home at the proxy; the Gemini API key stays in the sidecar
 environment. Sessions without `--model gemini` continue using the normal Codex
 default, for example `gpt-5.5` with whatever reasoning effort is configured in
-`~/.codex/config.toml`.
+`~/.codex/config.toml`. Passing Ouija `--effort low` to a Codex session overrides
+that for the launched session with `-c 'model_reasoning_effort="low"'`.
 
 ## CLI
 

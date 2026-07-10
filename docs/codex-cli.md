@@ -109,9 +109,16 @@ There is also an advanced global `codex_home` setting for deployments that want
 all Ouija-launched Codex sessions to use the same alternate home. Do not use it
 for selective Gemini routing; use a model route instead.
 
-There is **no Codex `--effort` flag**, so Ouija's `effort` setting is ignored for
-Codex rather than guessed onto the command line. If you want reasoning-effort
-control, set it through Codex's own config.
+There is **no Codex `--effort` flag**. Ouija maps its existing `effort` setting
+to Codex config instead:
+
+```bash
+codex -c 'model_reasoning_effort="low"'
+```
+
+The Codex manual documents `model_reasoning_effort` levels including `ultra`,
+`max`, `xhigh`, `high`, `medium`, `low`, `minimal`, and `none`; some lower or
+higher levels are model-dependent.
 
 ## Worktrees are Ouija-managed, not Codex-managed
 
