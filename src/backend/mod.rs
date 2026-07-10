@@ -634,6 +634,69 @@ mod tests {
     }
 
     #[test]
+    fn actual_mise_trust_suppresses_untrusted_config_check_when_available() {
+        if !cli_reports_version("mise") {
+            eprintln!("skipping actual mise trust test because mise is not on PATH");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let mise_data = tmp.path().join("mise-data");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&mise_data).unwrap();
+        let config = project.join("mise.toml");
+        std::fs::write(
+            &config,
+            "[env]\nOUIJA_MISE_TRUST_TEST = \"trusted-after-command\"\n",
+        )
+        .unwrap();
+
+        let before = std::process::Command::new("mise")
+            .arg("env")
+            .arg("-C")
+            .arg(&project)
+            .env("MISE_DATA_DIR", &mise_data)
+            .output()
+            .unwrap();
+        assert!(
+            !before.status.success(),
+            "untrusted mise config should fail before trust"
+        );
+        assert!(
+            String::from_utf8_lossy(&before.stderr).contains("not trusted"),
+            "expected untrusted-config error, got stderr: {}",
+            String::from_utf8_lossy(&before.stderr)
+        );
+
+        let trust = std::process::Command::new("mise")
+            .arg("trust")
+            .arg(&config)
+            .env("MISE_DATA_DIR", &mise_data)
+            .output()
+            .unwrap();
+        assert!(
+            trust.status.success(),
+            "mise trust failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&trust.stdout),
+            String::from_utf8_lossy(&trust.stderr)
+        );
+
+        let after = std::process::Command::new("mise")
+            .arg("env")
+            .arg("-C")
+            .arg(&project)
+            .env("MISE_DATA_DIR", &mise_data)
+            .output()
+            .unwrap();
+        assert!(
+            after.status.success(),
+            "trusted mise config should load without prompt: stderr={}",
+            String::from_utf8_lossy(&after.stderr)
+        );
+    }
+
+    #[test]
     fn uses_http_delivery_distinguishes_backends() {
         let registry = BackendRegistry::default_registry();
         // opencode runs on a shared serve and is reached over HTTP.
