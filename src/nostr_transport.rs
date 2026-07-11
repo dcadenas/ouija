@@ -1216,7 +1216,8 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         let name = rest.trim();
         // /start chat-command never resets — no base_branch supplied anyway.
         start_session(
-            state, name, None, None, None, None, None, None, None, None, None, None, None, false,
+            state, name, None, None, None, None, None, None, None, None, None, None, None, None,
+            None, false,
         )
         .await
         .0
@@ -1229,9 +1230,11 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         } else {
             (rest, false)
         };
-        restart_session(state, name, fresh, None, None, None, None, None, None, None)
-            .await
-            .0
+        restart_session(
+            state, name, fresh, None, None, None, None, None, None, None, None, None,
+        )
+        .await
+        .0
     } else {
         "unknown command".to_string()
     }
@@ -1512,6 +1515,8 @@ pub async fn start_session(
     model: Option<&str>,
     effort: Option<&str>,
     reminder: Option<&str>,
+    parent_session: Option<&str>,
+    idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
     branch: Option<&str>,
     base_branch: Option<&str>,
     force_reset: bool,
@@ -1613,10 +1618,18 @@ pub async fn start_session(
         codex_home: launch_model.codex_home.clone(),
     });
 
+    let reminder_meta = crate::daemon_protocol::SessionMeta {
+        reminder: reminder.map(String::from),
+        parent_session: parent_session.map(String::from),
+        idle_policy: idle_policy.clone(),
+        ..Default::default()
+    };
+    let effective_reminder = reminder_meta.effective_reminder(name, None);
+
     // Pre-compute the prompt text and sender envelope before launching, so we
     // can write it to a temp file for CLI arg delivery.
     let pre_queued_prompt = if let Some(text) = prompt {
-        let full_text = match reminder {
+        let full_text = match effective_reminder.as_deref() {
             Some(r) => format!("{text}\n\n{r}"),
             None => text.to_string(),
         };
@@ -1791,6 +1804,8 @@ pub async fn start_session(
                 effort: effort.map(String::from),
                 codex_home: launch_model.codex_home.clone(),
                 reminder: reminder.map(String::from),
+                parent_session: parent_session.map(String::from),
+                idle_policy,
                 prompt: prompt.map(String::from),
                 ..Default::default()
             };
@@ -1963,6 +1978,8 @@ pub async fn restart_session(
     model: Option<&str>,
     effort: Option<&str>,
     reminder: Option<&str>,
+    parent_session: Option<&str>,
+    idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
 ) -> (String, Option<u64>) {
     // Snapshot full metadata before killing so we can carry it forward
     let session = state.protocol.read().await.sessions.get(name).cloned();
@@ -2149,10 +2166,27 @@ pub async fn restart_session(
         Some(m) => m.prompt.clone().or_else(|| prompt.map(String::from)),
         None => prompt.map(String::from),
     };
-    let effective_reminder = match &prev_metadata {
+    let effective_manual_reminder = match &prev_metadata {
         Some(m) => reminder.map(String::from).or_else(|| m.reminder.clone()),
         None => reminder.map(String::from),
     };
+    let effective_parent_session = match &prev_metadata {
+        Some(m) => parent_session
+            .map(String::from)
+            .or_else(|| m.parent_session.clone()),
+        None => parent_session.map(String::from),
+    };
+    let effective_idle_policy = match &prev_metadata {
+        Some(m) => idle_policy.clone().or_else(|| m.idle_policy.clone()),
+        None => idle_policy.clone(),
+    };
+    let reminder_meta = crate::daemon_protocol::SessionMeta {
+        reminder: effective_manual_reminder.clone(),
+        parent_session: effective_parent_session.clone(),
+        idle_policy: effective_idle_policy.clone(),
+        ..Default::default()
+    };
+    let effective_reminder = reminder_meta.effective_reminder(name, None);
 
     // Format prompt text with sender envelope if needed
     let (formatted_prompt, prompt_msg_id) = if let Some(ref text) = effective_prompt {
@@ -2459,9 +2493,9 @@ pub async fn restart_session(
                     model: effective_model.clone(),
                     effort: effective_effort.clone(),
                     codex_home: launch_codex_home.clone(),
-                    reminder: effective_reminder.clone(),
-                    parent_session: m.parent_session.clone(),
-                    idle_policy: m.idle_policy.clone(),
+                    reminder: effective_manual_reminder.clone(),
+                    parent_session: effective_parent_session.clone(),
+                    idle_policy: effective_idle_policy.clone(),
                     prompt: effective_prompt.clone(),
                     iteration: m.iteration,
                     iteration_log: m.iteration_log.clone(),
@@ -2481,7 +2515,9 @@ pub async fn restart_session(
                     model: effective_model.clone(),
                     effort: effective_effort.clone(),
                     codex_home: launch_codex_home.clone(),
-                    reminder: effective_reminder.clone(),
+                    reminder: effective_manual_reminder.clone(),
+                    parent_session: effective_parent_session.clone(),
+                    idle_policy: effective_idle_policy.clone(),
                     prompt: effective_prompt.clone(),
                     ..Default::default()
                 },

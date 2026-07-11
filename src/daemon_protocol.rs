@@ -208,6 +208,62 @@ impl IdlePolicy {
     }
 }
 
+impl std::str::FromStr for IdlePolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "keep-open" => Ok(IdlePolicy::KeepOpen),
+            "ask-parent-when-done" => Ok(IdlePolicy::AskParentWhenDone),
+            "close-when-done" => Ok(IdlePolicy::CloseWhenDone),
+            other => Err(format!(
+                "invalid idle policy '{other}'; valid choices: {IDLE_POLICY_CHOICES}"
+            )),
+        }
+    }
+}
+
+pub const IDLE_POLICY_CHOICES: &str = "keep-open|ask-parent-when-done|close-when-done";
+
+pub fn validate_spawn_lifecycle(
+    parent_session: Option<&str>,
+    no_parent_session: bool,
+    idle_policy: Option<&IdlePolicy>,
+) -> Result<(), String> {
+    let parent_session = parent_session
+        .map(str::trim)
+        .filter(|session| !session.is_empty());
+
+    if parent_session.is_some() && no_parent_session {
+        return Err(
+            "choose exactly one parent ownership flag: --parent-session <SESSION_ID> or --no-parent-session"
+                .to_string(),
+        );
+    }
+
+    if parent_session.is_none() && !no_parent_session {
+        return Err(
+            "spawn-session requires explicit parent ownership: pass --parent-session <SESSION_ID> or --no-parent-session"
+                .to_string(),
+        );
+    }
+
+    let Some(idle_policy) = idle_policy else {
+        return Err(format!(
+            "spawn-session requires --idle-policy <{IDLE_POLICY_CHOICES}>"
+        ));
+    };
+
+    if *idle_policy == IdlePolicy::AskParentWhenDone && parent_session.is_none() {
+        return Err(
+            "idle policy ask-parent-when-done requires --parent-session <SESSION_ID>; use keep-open or close-when-done with --no-parent-session"
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OpenCodeBinding {
@@ -3295,7 +3351,10 @@ mod tests {
 
         assert_eq!(decoded.parent_session, None);
         assert_eq!(decoded.idle_policy, None);
-        assert_eq!(decoded.effective_reminder("legacy", Some(1)).as_deref(), Some("old"));
+        assert_eq!(
+            decoded.effective_reminder("legacy", Some(1)).as_deref(),
+            Some("old")
+        );
     }
 
     #[test]

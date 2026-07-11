@@ -20,6 +20,7 @@ mod transport;
 use anyhow::{Context, bail};
 use backend::CodingAssistant;
 use clap::{Parser, Subcommand};
+use daemon_protocol::IdlePolicy;
 use nostr_sdk::ToBech32;
 use std::path::PathBuf;
 
@@ -166,6 +167,12 @@ enum Command {
         prompt: Option<String>,
         #[arg(long)]
         reminder: Option<String>,
+        #[arg(long)]
+        parent_session: Option<String>,
+        #[arg(long)]
+        no_parent_session: bool,
+        #[arg(long, value_parser = parse_idle_policy)]
+        idle_policy: Option<IdlePolicy>,
         #[arg(long)]
         worktree: bool,
         #[arg(long)]
@@ -351,6 +358,39 @@ enum TaskAction {
     },
     /// Manually trigger a task now
     Trigger { id: String },
+}
+
+fn parse_idle_policy(value: &str) -> Result<IdlePolicy, String> {
+    value.parse()
+}
+
+fn resolve_cli_message(
+    command: &str,
+    message: Option<String>,
+    stdin: bool,
+) -> anyhow::Result<String> {
+    match (message, stdin) {
+        (Some(_), true) => {
+            anyhow::bail!("{command}: pass either a message argument or --stdin, not both")
+        }
+        (Some(message), false) => Ok(message),
+        (None, true) => {
+            let mut message = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut message)?;
+            Ok(message)
+        }
+        (None, false) => {
+            anyhow::bail!("{command}: missing message; pass a message argument or --stdin")
+        }
+    }
+}
+
+fn validate_spawn_lifecycle(
+    parent_session: Option<&str>,
+    no_parent_session: bool,
+    idle_policy: Option<&IdlePolicy>,
+) -> Result<(), String> {
+    daemon_protocol::validate_spawn_lifecycle(parent_session, no_parent_session, idle_policy)
 }
 
 #[tokio::main]
@@ -823,6 +863,9 @@ async fn main() -> anyhow::Result<()> {
             project_dir,
             prompt,
             reminder,
+            parent_session,
+            no_parent_session,
+            idle_policy,
             worktree,
             branch,
             base_branch,
@@ -831,11 +874,21 @@ async fn main() -> anyhow::Result<()> {
             backend,
             from,
         } => {
+            if let Err(err) = validate_spawn_lifecycle(
+                parent_session.as_deref(),
+                no_parent_session,
+                idle_policy.as_ref(),
+            ) {
+                anyhow::bail!("{err}");
+            }
             let body = serde_json::json!({
                 "name": name,
                 "project_dir": project_dir,
                 "prompt": prompt,
                 "reminder": reminder,
+                "parent_session": parent_session,
+                "no_parent_session": no_parent_session,
+                "idle_policy": idle_policy,
                 "worktree": worktree,
                 "branch": branch,
                 "base_branch": base_branch,
@@ -2450,6 +2503,97 @@ mod tests {
     #[test]
     fn pane_wire_suffix_handles_empty_string() {
         assert_eq!(pane_wire_suffix(""), "");
+    }
+
+    #[test]
+    fn spawn_session_cli_parses_lifecycle_policy_flags() {
+        let cli = Cli::try_parse_from([
+            "ouija",
+            "spawn-session",
+            "worker",
+            "--parent-session",
+            "parent",
+            "--idle-policy",
+            "ask-parent-when-done",
+        ])
+        .expect("spawn-session lifecycle args parse");
+
+        match cli.command {
+            Command::SpawnSession {
+                parent_session,
+                no_parent_session,
+                idle_policy,
+                ..
+            } => {
+                assert_eq!(parent_session.as_deref(), Some("parent"));
+                assert!(!no_parent_session);
+                assert_eq!(
+                    idle_policy,
+                    Some(crate::daemon_protocol::IdlePolicy::AskParentWhenDone)
+                );
+            }
+            _ => panic!("expected spawn-session command"),
+        }
+    }
+
+    #[test]
+    fn ask_cli_accepts_stdin_without_message_argument() {
+        let cli = Cli::try_parse_from(["ouija", "ask", "parent", "--stdin", "--from", "worker"])
+            .expect("ask --stdin parses without positional message");
+
+        match cli.command {
+            Command::Ask {
+                to,
+                message,
+                stdin,
+                from,
+            } => {
+                assert_eq!(to, "parent");
+                assert_eq!(message, None);
+                assert!(stdin);
+                assert_eq!(from.as_deref(), Some("worker"));
+            }
+            _ => panic!("expected ask command"),
+        }
+    }
+
+    #[test]
+    fn ask_message_resolution_rejects_message_and_stdin_together() {
+        let err = resolve_cli_message("ask", Some("body".into()), true).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("either a message argument or --stdin"),
+            "error must explain the exclusive choices, got: {err}"
+        );
+    }
+
+    #[test]
+    fn spawn_lifecycle_validation_teaches_missing_parent_choice() {
+        let err = validate_spawn_lifecycle(
+            None,
+            false,
+            Some(&crate::daemon_protocol::IdlePolicy::KeepOpen),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.contains("--parent-session <SESSION_ID>"),
+            "error must teach parent-session choice, got: {err}"
+        );
+        assert!(
+            err.contains("--no-parent-session"),
+            "error must teach no-parent-session choice, got: {err}"
+        );
+    }
+
+    #[test]
+    fn spawn_lifecycle_validation_teaches_missing_idle_policy() {
+        let err = validate_spawn_lifecycle(None, true, None).unwrap_err();
+
+        assert!(
+            err.contains("--idle-policy <keep-open|ask-parent-when-done|close-when-done>"),
+            "error must teach idle-policy choices, got: {err}"
+        );
     }
 
     // --- encode_path_segment (issue #646 review follow-up) ---

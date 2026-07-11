@@ -1098,6 +1098,8 @@ impl AppState {
                             None, // model
                             None, // effort
                             reminder.as_deref(),
+                            None,  // parent_session
+                            None,  // idle_policy
                             None,  // branch
                             None,  // base_branch
                             false, // force_reset — remote /start never resets (hub#528 guard)
@@ -1140,6 +1142,8 @@ impl AppState {
                             None, // model
                             None, // effort
                             reminder.as_deref(),
+                            None, // parent_session
+                            None, // idle_policy
                         )
                         .await;
                         let reply = crate::protocol::WireMessage::CommandResult {

@@ -346,19 +346,24 @@ impl Actor for SessionAgent {
                     // here too — a defensive echo of the Stopped-handler gate
                     // above, so this site is safe even if the Stopped check
                     // is ever bypassed (watchdog, future caller).
-                    let (reminder, vim_mode, pending) = {
+                    let (reminder, has_lifecycle_policy, vim_mode, pending) = {
                         let proto = self.app_state.protocol.read().await;
                         let session = proto.sessions.get(&state.session_id);
                         let reminder = session
                             .filter(|s| s.metadata.has_active_reminder())
-                            .and_then(|s| s.metadata.reminder.clone());
+                            .and_then(|s| {
+                                s.metadata
+                                    .effective_reminder(&state.session_id, Some(clearing_id))
+                            });
+                        let has_lifecycle_policy =
+                            session.is_some_and(|s| s.metadata.idle_policy.is_some());
                         let vim_mode = session.map(|s| s.metadata.vim_mode).unwrap_or(false);
                         let pending = proto
                             .pending_replies
                             .get(&state.session_id)
                             .cloned()
                             .unwrap_or_default();
-                        (reminder, vim_mode, pending)
+                        (reminder, has_lifecycle_policy, vim_mode, pending)
                     };
 
                     tracing::debug!(
@@ -373,8 +378,15 @@ impl Actor for SessionAgent {
                     // without a configured reminder get no default nudge —
                     // the transport is not a nag service.
                     if let Some(ref reminder_text) = reminder {
+                        let reminder_body = if has_lifecycle_policy {
+                            reminder_text.clone()
+                        } else {
+                            format!(
+                                "{reminder_text}\n\nIf you have completed all pending work, run: ouija clear-reminder {clearing_id}"
+                            )
+                        };
                         let wrapped = format!(
-                            "<ouija-status type=\"reminder\" clearing_id=\"{clearing_id}\">{reminder_text}\n\nIf you have completed all pending work, run: ouija clear-reminder {clearing_id}</ouija-status>"
+                            "<ouija-status type=\"reminder\" clearing_id=\"{clearing_id}\">{reminder_body}</ouija-status>"
                         );
                         let _ = crate::tmux::locked_inject(
                             &self.app_state,
@@ -490,6 +502,8 @@ impl SessionAgent {
                 None, // model (fallback to prev_metadata.model inside restart)
                 None, // effort (fallback to prev_metadata.effort inside restart)
                 reminder.as_deref(),
+                None, // parent_session (fallback to prev_metadata.parent_session)
+                None, // idle_policy (fallback to prev_metadata.idle_policy)
             )
             .await;
 
