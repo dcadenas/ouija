@@ -2029,6 +2029,20 @@ pub async fn restart_session(
                 prev_metadata.as_ref().and_then(|m| m.effort.clone()),
             )
         });
+    let effective_manual_reminder = match &prev_metadata {
+        Some(m) => reminder.map(String::from).or_else(|| m.reminder.clone()),
+        None => reminder.map(String::from),
+    };
+    let effective_parent_session = match &prev_metadata {
+        Some(m) => parent_session
+            .map(String::from)
+            .or_else(|| m.parent_session.clone()),
+        None => parent_session.map(String::from),
+    };
+    let effective_idle_policy = match &prev_metadata {
+        Some(m) => idle_policy.clone().or_else(|| m.idle_policy.clone()),
+        None => idle_policy.clone(),
+    };
 
     // --- Soft restart for HttpApi backends ---
     // Create a new session on the serve via HTTP API and deliver the prompt directly.
@@ -2051,7 +2065,9 @@ pub async fn restart_session(
                 prompt,
                 from,
                 expects_reply,
-                reminder,
+                effective_manual_reminder.as_deref(),
+                effective_parent_session.as_deref(),
+                effective_idle_policy.clone(),
                 effective_model.as_deref(),
                 effective_effort.as_deref(),
             )
@@ -2165,20 +2181,6 @@ pub async fn restart_session(
     let effective_prompt = match &prev_metadata {
         Some(m) => m.prompt.clone().or_else(|| prompt.map(String::from)),
         None => prompt.map(String::from),
-    };
-    let effective_manual_reminder = match &prev_metadata {
-        Some(m) => reminder.map(String::from).or_else(|| m.reminder.clone()),
-        None => reminder.map(String::from),
-    };
-    let effective_parent_session = match &prev_metadata {
-        Some(m) => parent_session
-            .map(String::from)
-            .or_else(|| m.parent_session.clone()),
-        None => parent_session.map(String::from),
-    };
-    let effective_idle_policy = match &prev_metadata {
-        Some(m) => idle_policy.clone().or_else(|| m.idle_policy.clone()),
-        None => idle_policy.clone(),
     };
     let reminder_meta = crate::daemon_protocol::SessionMeta {
         reminder: effective_manual_reminder.clone(),
@@ -2601,6 +2603,8 @@ async fn soft_restart_session(
     from: Option<&str>,
     expects_reply: Option<bool>,
     reminder: Option<&str>,
+    parent_session: Option<&str>,
+    idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
     model: Option<&str>,
     effort: Option<&str>,
 ) -> Result<(String, Option<u64>), ()> {
@@ -2697,11 +2701,9 @@ async fn soft_restart_session(
     };
     let restart_generation = previous_metadata.restart_generation;
     let reminder_meta = crate::daemon_protocol::SessionMeta {
-        reminder: reminder
-            .map(String::from)
-            .or_else(|| previous_metadata.reminder.clone()),
-        parent_session: previous_metadata.parent_session.clone(),
-        idle_policy: previous_metadata.idle_policy.clone(),
+        reminder: reminder.map(String::from),
+        parent_session: parent_session.map(String::from),
+        idle_policy: idle_policy.clone(),
         ..Default::default()
     };
     let effective_reminder = reminder_meta.effective_reminder(name, None);
@@ -2728,8 +2730,13 @@ async fn soft_restart_session(
                         &owner_snapshot,
                         &new_session_id,
                         restart_generation,
-                        model,
-                        effort,
+                        SoftRestartMetadataUpdate {
+                            reminder,
+                            parent_session,
+                            idle_policy: idle_policy.clone(),
+                            model,
+                            effort,
+                        },
                     )
                     .await
                     .is_err()
@@ -2791,8 +2798,13 @@ async fn soft_restart_session(
                 &owner_snapshot,
                 &new_session_id,
                 restart_generation,
-                model,
-                effort,
+                SoftRestartMetadataUpdate {
+                    reminder,
+                    parent_session,
+                    idle_policy: idle_policy.clone(),
+                    model,
+                    effort,
+                },
             )
             .await
             .is_err()
@@ -2845,8 +2857,13 @@ async fn soft_restart_session(
                         &owner_snapshot,
                         &new_session_id,
                         restart_generation,
-                        model,
-                        effort,
+                        SoftRestartMetadataUpdate {
+                            reminder,
+                            parent_session,
+                            idle_policy: idle_policy.clone(),
+                            model,
+                            effort,
+                        },
                     )
                     .await
                     .is_err()
@@ -2970,8 +2987,13 @@ async fn soft_restart_session(
             &owner_snapshot,
             &new_session_id,
             restart_generation,
-            model,
-            effort,
+            SoftRestartMetadataUpdate {
+                reminder,
+                parent_session,
+                idle_policy,
+                model,
+                effort,
+            },
         )
         .await
         .is_err()
@@ -3004,8 +3026,7 @@ async fn apply_soft_restart_metadata(
     owner: &SoftRestartOwnerSnapshot,
     new_session_id: &str,
     expected_restart_generation: u64,
-    model: Option<&str>,
-    effort: Option<&str>,
+    update: SoftRestartMetadataUpdate<'_>,
 ) -> Result<(), ()> {
     let mut proto = state.protocol.write().await;
     let Some(session) = proto.sessions.get_mut(&owner.session_id) else {
@@ -3022,14 +3043,32 @@ async fn apply_soft_restart_metadata(
     session.metadata.opencode_binding =
         Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged);
     session.metadata.restart_generation = session.metadata.restart_generation.saturating_add(1);
-    if let Some(m) = model {
+    if let Some(r) = update.reminder {
+        session.metadata.reminder = Some(r.to_string());
+    }
+    if let Some(p) = update.parent_session {
+        session.metadata.parent_session = Some(p.to_string());
+    }
+    if let Some(policy) = update.idle_policy {
+        session.metadata.idle_policy = Some(policy);
+    }
+    if let Some(m) = update.model {
         session.metadata.model = Some(m.to_string());
     }
-    if let Some(e) = effort {
+    if let Some(e) = update.effort {
         session.metadata.effort = Some(e.to_string());
     }
     state.persist_protocol_state(&proto);
     Ok(())
+}
+
+#[derive(Default)]
+struct SoftRestartMetadataUpdate<'a> {
+    reminder: Option<&'a str>,
+    parent_session: Option<&'a str>,
+    idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
+    model: Option<&'a str>,
+    effort: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5330,6 +5369,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -5399,6 +5440,8 @@ mod tests {
             "oc",
             Some("%missing"),
             dir.path().to_str().unwrap(),
+            None,
+            None,
             None,
             None,
             None,
@@ -5493,6 +5536,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .await;
 
@@ -5577,7 +5622,9 @@ mod tests {
             Some("queued prompt"),
             None,
             None,
-            None,
+            Some("check the deployment"),
+            Some("parent-session"),
+            Some(crate::daemon_protocol::IdlePolicy::AskParentWhenDone),
             None,
             None,
         )
@@ -5591,6 +5638,109 @@ mod tests {
         assert!(text.contains("ouija ask parent-session --stdin --from oc"));
         assert!(!text.contains("ouija clear-reminder"));
         assert!(!text.contains("<clearing_id>"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn soft_restart_applies_lifecycle_overrides_to_prompt_and_metadata() {
+        use axum::Json;
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use tokio::net::TcpListener;
+        use tokio::sync::Mutex;
+
+        async fn create_session() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "id": "ses_new" }))
+        }
+
+        async fn prompt_async(
+            AxumState(captured): AxumState<StdArc<Mutex<Option<String>>>>,
+            Json(body): Json<serde_json::Value>,
+        ) -> StatusCode {
+            let text = body["parts"][0]["text"].as_str().unwrap().to_string();
+            *captured.lock().await = Some(text);
+            StatusCode::NO_CONTENT
+        }
+
+        let captured = StdArc::new(Mutex::new(None));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session", post(create_session))
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(captured.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: None,
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_old".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::WeakAdopted,
+                        ),
+                        reminder: Some("old manual reminder".into()),
+                        parent_session: Some("old-parent".into()),
+                        idle_policy: Some(crate::daemon_protocol::IdlePolicy::AskParentWhenDone),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let result = restart_session(
+            &state,
+            "oc",
+            true,
+            Some("queued prompt"),
+            None,
+            None,
+            Some("opencode"),
+            None,
+            None,
+            Some("new manual reminder"),
+            Some("new-parent"),
+            Some(crate::daemon_protocol::IdlePolicy::CloseWhenDone),
+        )
+        .await;
+
+        assert!(result.0.starts_with("soft-restarted 'oc'"));
+        let text = captured.lock().await.clone().unwrap();
+        assert!(text.starts_with("queued prompt\n\nnew manual reminder\n\n"));
+        assert!(text.contains("Lifecycle policy: close-when-done"));
+        assert!(text.contains("Close command: ouija kill-session oc --keep-worktree"));
+        assert!(!text.contains("old-parent"));
+        assert!(!text.contains("ask-parent-when-done"));
+
+        let proto = state.protocol.read().await;
+        let metadata = &proto.sessions["oc"].metadata;
+        assert_eq!(metadata.reminder.as_deref(), Some("new manual reminder"));
+        assert_eq!(metadata.parent_session.as_deref(), Some("new-parent"));
+        assert_eq!(
+            metadata.idle_policy,
+            Some(crate::daemon_protocol::IdlePolicy::CloseWhenDone)
+        );
         server.abort();
     }
 
@@ -5807,6 +5957,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             Some("new-model"),
             Some("new-effort"),
         )
@@ -5904,6 +6056,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             Some("new-model"),
             Some("new-effort"),
         )
@@ -5987,7 +6141,14 @@ mod tests {
             session_id: "oc".into(),
             incarnation: 1,
         };
-        let result = apply_soft_restart_metadata(&state, &owner, "ses_stale", 0, None, None).await;
+        let result = apply_soft_restart_metadata(
+            &state,
+            &owner,
+            "ses_stale",
+            0,
+            SoftRestartMetadataUpdate::default(),
+        )
+        .await;
 
         assert!(result.is_err());
         let proto = state.protocol.read().await;
@@ -6026,7 +6187,14 @@ mod tests {
             );
         }
 
-        let result = apply_soft_restart_metadata(&state, &owner, "ses_stale", 0, None, None).await;
+        let result = apply_soft_restart_metadata(
+            &state,
+            &owner,
+            "ses_stale",
+            0,
+            SoftRestartMetadataUpdate::default(),
+        )
+        .await;
 
         assert!(result.is_err());
         let proto = state.protocol.read().await;
@@ -6062,9 +6230,15 @@ mod tests {
             incarnation: 1,
         };
 
-        apply_soft_restart_metadata(&state, &owner, "ses_new", 0, None, None)
-            .await
-            .expect("metadata commit should succeed");
+        apply_soft_restart_metadata(
+            &state,
+            &owner,
+            "ses_new",
+            0,
+            SoftRestartMetadataUpdate::default(),
+        )
+        .await
+        .expect("metadata commit should succeed");
 
         let proto = state.protocol.read().await;
         let metadata = &proto.sessions["oc"].metadata;
@@ -6143,9 +6317,18 @@ mod tests {
             session_id: "oc".into(),
             incarnation: 1,
         };
-        apply_soft_restart_metadata(&state, &owner, "ses_new", 7, Some("new-model"), None)
-            .await
-            .expect("metadata commit should succeed before simulated prompt failure");
+        apply_soft_restart_metadata(
+            &state,
+            &owner,
+            "ses_new",
+            7,
+            SoftRestartMetadataUpdate {
+                model: Some("new-model"),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("metadata commit should succeed before simulated prompt failure");
         restore_soft_restart_metadata(&state, "oc", "ses_new", &previous_metadata).await;
 
         let proto = state.protocol.read().await;
@@ -6188,9 +6371,15 @@ mod tests {
             session_id: "oc".into(),
             incarnation: 1,
         };
-        apply_soft_restart_metadata(&state, &owner, "ses_new", 3, None, None)
-            .await
-            .expect("metadata commit should succeed before simulated prompt failure");
+        apply_soft_restart_metadata(
+            &state,
+            &owner,
+            "ses_new",
+            3,
+            SoftRestartMetadataUpdate::default(),
+        )
+        .await
+        .expect("metadata commit should succeed before simulated prompt failure");
 
         restore_soft_restart_metadata(&state, "oc", "ses_new", &previous_metadata).await;
 
