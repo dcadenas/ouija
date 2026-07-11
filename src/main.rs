@@ -197,7 +197,12 @@ enum Command {
     },
     /// Clear an idle reminder
     #[command(name = "clear-reminder")]
-    ClearReminder { clearing_id: u64 },
+    ClearReminder {
+        clearing_id: u64,
+        /// Sender session ID: the exact output of `ouija whoami` (never a guessed id)
+        #[arg(long)]
+        from: Option<String>,
+    },
     /// Clear a pending reply from a disconnected sender
     #[command(name = "clear-reply")]
     ClearReply { sender_id: String },
@@ -935,8 +940,11 @@ async fn main() -> anyhow::Result<()> {
             });
             cli_post("/api/sessions/restart", &body).await?;
         }
-        Command::ClearReminder { clearing_id } => {
-            let from = require_my_session_id().await?;
+        Command::ClearReminder { clearing_id, from } => {
+            let from = match from {
+                Some(id) => id,
+                None => require_my_session_id().await?,
+            };
             let body = serde_json::json!({
                 "from": from,
                 "clearing_id": clearing_id,
@@ -2419,6 +2427,51 @@ mod tests {
         // Control chars and `#` / `?` would terminate the path segment or
         // start a query string / fragment on the wire; encode them.
         assert_eq!(encode_path_segment("a b#c?d"), "a%20b%23c%3Fd");
+    }
+
+    #[test]
+    fn clear_reminder_help_mentions_from_option() {
+        use clap::CommandFactory;
+
+        let mut cmd = Cli::command();
+        let clear_reminder = cmd
+            .find_subcommand_mut("clear-reminder")
+            .expect("clear-reminder subcommand exists");
+        let mut help = Vec::new();
+        clear_reminder.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+
+        assert!(
+            help.contains("Usage: clear-reminder [OPTIONS] <CLEARING_ID>"),
+            "clear-reminder usage must advertise options, got:\n{help}"
+        );
+        assert!(
+            help.contains("--from <FROM>"),
+            "clear-reminder help must advertise explicit sender support, got:\n{help}"
+        );
+    }
+
+    #[test]
+    fn clear_reminder_parses_explicit_from_option() {
+        let cli = Cli::try_parse_from([
+            "ouija",
+            "clear-reminder",
+            "42",
+            "--from",
+            "feat/62-add-from-support-to-ouija-clear-reminder",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::ClearReminder { clearing_id, from } => {
+                assert_eq!(clearing_id, 42);
+                assert_eq!(
+                    from.as_deref(),
+                    Some("feat/62-add-from-support-to-ouija-clear-reminder")
+                );
+            }
+            _ => panic!("expected clear-reminder command"),
+        }
     }
 
     // --- classify_http_response (issue #646 review follow-up) ---
