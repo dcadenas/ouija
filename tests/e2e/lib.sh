@@ -48,8 +48,26 @@ wait_for() {
 api() {
     local base="$1" method="$2" path="$3"
     shift 3
+    local args=("$@")
+    if [ "$method" = "POST" ] && [ "$path" = "/api/sessions/start" ]; then
+        local i
+        for i in "${!args[@]}"; do
+            if [ "${args[$i]}" = "-d" ] && [ $((i + 1)) -lt "${#args[@]}" ]; then
+                args[$((i + 1))]=$(echo "${args[$((i + 1))]}" | jq -c '
+                    if type == "object"
+                       and (.parent_session == null)
+                       and (.no_parent_session == null)
+                       and (.idle_policy == null)
+                    then . + {"no_parent_session": true, "idle_policy": "keep-open"}
+                    else .
+                    end
+                ')
+                break
+            fi
+        done
+    fi
     curl -sf -X "$method" "${base}${path}" \
-        -H 'Content-Type: application/json' "$@" 2>/dev/null || echo '{"error":"curl failed"}'
+        -H 'Content-Type: application/json' "${args[@]}" 2>/dev/null || echo '{"error":"curl failed"}'
 }
 
 # ── Session query helpers (all take a base URL) ─────────────────────
