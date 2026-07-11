@@ -7,12 +7,13 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::thread::JoinHandle;
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 /// Default hard timeout for a backend availability probe (`cli --version`).
 const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(3);
 const MISE_TRUST_TIMEOUT: Duration = Duration::from_secs(3);
+const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 const MISE_CONFIGS: &[&str] = &[
     "mise.toml",
     ".mise.toml",
@@ -186,21 +187,32 @@ fn run_mise_trust_command(command: &mut Command, timeout: Duration) -> MiseTrust
     }
 }
 
-fn read_child_pipe<T>(mut pipe: T) -> JoinHandle<Vec<u8>>
+fn read_child_pipe<T>(mut pipe: T) -> Receiver<Vec<u8>>
 where
     T: Read + Send + 'static,
 {
+    let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = pipe.read_to_end(&mut buf);
-        buf
-    })
+        let mut buf = [0; 8192];
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    rx
 }
 
 fn collect_output(
     status: std::process::ExitStatus,
-    stdout: Option<JoinHandle<Vec<u8>>>,
-    stderr: Option<JoinHandle<Vec<u8>>>,
+    stdout: Option<Receiver<Vec<u8>>>,
+    stderr: Option<Receiver<Vec<u8>>>,
 ) -> Output {
     Output {
         status,
@@ -209,8 +221,15 @@ fn collect_output(
     }
 }
 
-fn join_pipe(handle: Option<JoinHandle<Vec<u8>>>) -> Vec<u8> {
-    handle.and_then(|h| h.join().ok()).unwrap_or_default()
+fn join_pipe(receiver: Option<Receiver<Vec<u8>>>) -> Vec<u8> {
+    let Some(receiver) = receiver else {
+        return Vec::new();
+    };
+    let mut output = Vec::new();
+    while let Ok(chunk) = receiver.recv_timeout(PIPE_DRAIN_TIMEOUT) {
+        output.extend(chunk);
+    }
+    output
 }
 
 fn log_mise_trust_failure(path: &Path, attempt: &MiseTrustAttempt) {
@@ -631,6 +650,36 @@ mod tests {
         assert_eq!(attempt.status_code(), Some(42));
         assert_eq!(attempt.stdout(), "out line\n");
         assert_eq!(attempt.stderr(), "err line\n");
+    }
+
+    #[test]
+    fn mise_trust_timeout_does_not_wait_for_pipe_holding_descendant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_mise = tmp.path().join("mise");
+        std::fs::write(
+            &fake_mise,
+            "#!/bin/sh\n(sleep 3) &\nprintf 'before timeout\\n'\nsleep 3\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_mise, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let config = tmp.path().join("mise.toml");
+        std::fs::write(&config, "[tools]\n").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fake_mise = fake_mise.clone();
+        std::thread::spawn(move || {
+            let attempt = run_mise_trust(&fake_mise, &config, Duration::from_millis(100));
+            let _ = tx.send(attempt.stdout());
+        });
+
+        let stdout = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("timeout path must not wait for descendant-held stdout pipe");
+        assert_eq!(stdout, "before timeout\n");
     }
 
     #[test]
