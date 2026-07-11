@@ -1142,7 +1142,7 @@ impl AppState {
                             None, // model
                             None, // effort
                             reminder.as_deref(),
-                            None, // parent_session
+                            crate::nostr_transport::ParentSessionOverride::PreservePrevious,
                             None, // idle_policy
                         )
                         .await;

@@ -502,7 +502,7 @@ impl SessionAgent {
                 None, // model (fallback to prev_metadata.model inside restart)
                 None, // effort (fallback to prev_metadata.effort inside restart)
                 reminder.as_deref(),
-                None, // parent_session (fallback to prev_metadata.parent_session)
+                crate::nostr_transport::ParentSessionOverride::PreservePrevious,
                 None, // idle_policy (fallback to prev_metadata.idle_policy)
             )
             .await;

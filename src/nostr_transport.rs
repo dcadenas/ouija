@@ -38,6 +38,37 @@ fn opencode_binding_for_restart_session(
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ParentSessionOverride {
+    #[default]
+    PreservePrevious,
+    SetParent(String),
+    NoParent,
+}
+
+impl ParentSessionOverride {
+    pub fn from_request(parent_session: Option<&str>, no_parent_session: bool) -> Self {
+        if no_parent_session {
+            Self::NoParent
+        } else if let Some(parent) = parent_session.map(str::trim).filter(|s| !s.is_empty()) {
+            Self::SetParent(parent.to_string())
+        } else {
+            Self::PreservePrevious
+        }
+    }
+
+    fn resolve(
+        &self,
+        previous_metadata: Option<&crate::daemon_protocol::SessionMeta>,
+    ) -> Option<String> {
+        match self {
+            Self::PreservePrevious => previous_metadata.and_then(|m| m.parent_session.clone()),
+            Self::SetParent(parent) => Some(parent.clone()),
+            Self::NoParent => None,
+        }
+    }
+}
+
 fn start_registration_metadata(
     is_http_api: bool,
     pane_id: &str,
@@ -1231,7 +1262,18 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
             (rest, false)
         };
         restart_session(
-            state, name, fresh, None, None, None, None, None, None, None, None, None,
+            state,
+            name,
+            fresh,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ParentSessionOverride::PreservePrevious,
+            None,
         )
         .await
         .0
@@ -1978,7 +2020,7 @@ pub async fn restart_session(
     model: Option<&str>,
     effort: Option<&str>,
     reminder: Option<&str>,
-    parent_session: Option<&str>,
+    parent_session_override: ParentSessionOverride,
     idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
 ) -> (String, Option<u64>) {
     // Snapshot full metadata before killing so we can carry it forward
@@ -2033,12 +2075,7 @@ pub async fn restart_session(
         Some(m) => reminder.map(String::from).or_else(|| m.reminder.clone()),
         None => reminder.map(String::from),
     };
-    let effective_parent_session = match &prev_metadata {
-        Some(m) => parent_session
-            .map(String::from)
-            .or_else(|| m.parent_session.clone()),
-        None => parent_session.map(String::from),
-    };
+    let effective_parent_session = parent_session_override.resolve(prev_metadata.as_ref());
     let effective_idle_policy = match &prev_metadata {
         Some(m) => idle_policy.clone().or_else(|| m.idle_policy.clone()),
         None => idle_policy.clone(),
@@ -2066,7 +2103,7 @@ pub async fn restart_session(
                 from,
                 expects_reply,
                 effective_manual_reminder.as_deref(),
-                effective_parent_session.as_deref(),
+                parent_session_override.clone(),
                 effective_idle_policy.clone(),
                 effective_model.as_deref(),
                 effective_effort.as_deref(),
@@ -2603,7 +2640,7 @@ async fn soft_restart_session(
     from: Option<&str>,
     expects_reply: Option<bool>,
     reminder: Option<&str>,
-    parent_session: Option<&str>,
+    parent_session_override: ParentSessionOverride,
     idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
     model: Option<&str>,
     effort: Option<&str>,
@@ -2700,9 +2737,10 @@ async fn soft_restart_session(
         }
     };
     let restart_generation = previous_metadata.restart_generation;
+    let effective_parent_session = parent_session_override.resolve(Some(&previous_metadata));
     let reminder_meta = crate::daemon_protocol::SessionMeta {
         reminder: reminder.map(String::from),
-        parent_session: parent_session.map(String::from),
+        parent_session: effective_parent_session.clone(),
         idle_policy: idle_policy.clone(),
         ..Default::default()
     };
@@ -2732,7 +2770,7 @@ async fn soft_restart_session(
                         restart_generation,
                         SoftRestartMetadataUpdate {
                             reminder,
-                            parent_session,
+                            parent_session: parent_session_override.clone(),
                             idle_policy: idle_policy.clone(),
                             model,
                             effort,
@@ -2800,7 +2838,7 @@ async fn soft_restart_session(
                 restart_generation,
                 SoftRestartMetadataUpdate {
                     reminder,
-                    parent_session,
+                    parent_session: parent_session_override.clone(),
                     idle_policy: idle_policy.clone(),
                     model,
                     effort,
@@ -2859,7 +2897,7 @@ async fn soft_restart_session(
                         restart_generation,
                         SoftRestartMetadataUpdate {
                             reminder,
-                            parent_session,
+                            parent_session: parent_session_override.clone(),
                             idle_policy: idle_policy.clone(),
                             model,
                             effort,
@@ -2989,7 +3027,7 @@ async fn soft_restart_session(
             restart_generation,
             SoftRestartMetadataUpdate {
                 reminder,
-                parent_session,
+                parent_session: parent_session_override,
                 idle_policy,
                 model,
                 effort,
@@ -3046,8 +3084,14 @@ async fn apply_soft_restart_metadata(
     if let Some(r) = update.reminder {
         session.metadata.reminder = Some(r.to_string());
     }
-    if let Some(p) = update.parent_session {
-        session.metadata.parent_session = Some(p.to_string());
+    match update.parent_session {
+        ParentSessionOverride::PreservePrevious => {}
+        ParentSessionOverride::SetParent(parent) => {
+            session.metadata.parent_session = Some(parent);
+        }
+        ParentSessionOverride::NoParent => {
+            session.metadata.parent_session = None;
+        }
     }
     if let Some(policy) = update.idle_policy {
         session.metadata.idle_policy = Some(policy);
@@ -3065,7 +3109,7 @@ async fn apply_soft_restart_metadata(
 #[derive(Default)]
 struct SoftRestartMetadataUpdate<'a> {
     reminder: Option<&'a str>,
-    parent_session: Option<&'a str>,
+    parent_session: ParentSessionOverride,
     idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
     model: Option<&'a str>,
     effort: Option<&'a str>,
@@ -5153,6 +5197,27 @@ mod tests {
     }
 
     #[test]
+    fn parent_session_override_no_parent_clears_previous_parent() {
+        let previous = crate::daemon_protocol::SessionMeta {
+            parent_session: Some("old-parent".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            ParentSessionOverride::PreservePrevious.resolve(Some(&previous)),
+            Some("old-parent".into())
+        );
+        assert_eq!(
+            ParentSessionOverride::SetParent("new-parent".into()).resolve(Some(&previous)),
+            Some("new-parent".into())
+        );
+        assert_eq!(
+            ParentSessionOverride::NoParent.resolve(Some(&previous)),
+            None
+        );
+    }
+
+    #[test]
     fn restart_reusing_previous_backend_session_preserves_weak_opencode_binding() {
         assert_eq!(
             opencode_binding_for_restart_session(
@@ -5367,7 +5432,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            ParentSessionOverride::PreservePrevious,
             None,
             None,
             None,
@@ -5444,7 +5509,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            ParentSessionOverride::PreservePrevious,
             None,
             Some("new-model"),
             Some("new-effort"),
@@ -5534,7 +5599,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            ParentSessionOverride::PreservePrevious,
             None,
             None,
             None,
@@ -5623,7 +5688,7 @@ mod tests {
             None,
             None,
             Some("check the deployment"),
-            Some("parent-session"),
+            ParentSessionOverride::SetParent("parent-session".into()),
             Some(crate::daemon_protocol::IdlePolicy::AskParentWhenDone),
             None,
             None,
@@ -5720,7 +5785,7 @@ mod tests {
             None,
             None,
             Some("new manual reminder"),
-            Some("new-parent"),
+            ParentSessionOverride::SetParent("new-parent".into()),
             Some(crate::daemon_protocol::IdlePolicy::CloseWhenDone),
         )
         .await;
@@ -5957,7 +6022,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            ParentSessionOverride::PreservePrevious,
             None,
             Some("new-model"),
             Some("new-effort"),
@@ -6056,7 +6121,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            ParentSessionOverride::PreservePrevious,
             None,
             Some("new-model"),
             Some("new-effort"),
@@ -6204,6 +6269,53 @@ mod tests {
             Some("ses_recreated")
         );
         assert_eq!(metadata.restart_generation, 0);
+    }
+
+    #[tokio::test]
+    async fn soft_restart_metadata_commit_no_parent_clears_previous_parent() {
+        let state = AppState::new_for_test();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: None,
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend_session_id: Some("ses_old".into()),
+                        parent_session: Some("old-parent".into()),
+                        restart_generation: 0,
+                        session_incarnation: 1,
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let owner = SoftRestartOwnerSnapshot {
+            session_id: "oc".into(),
+            incarnation: 1,
+        };
+        apply_soft_restart_metadata(
+            &state,
+            &owner,
+            "ses_new",
+            0,
+            SoftRestartMetadataUpdate {
+                parent_session: ParentSessionOverride::NoParent,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("metadata commit should succeed");
+
+        let proto = state.protocol.read().await;
+        let metadata = &proto.sessions["oc"].metadata;
+        assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_new"));
+        assert_eq!(metadata.parent_session, None);
+        assert_eq!(metadata.restart_generation, 1);
     }
 
     #[tokio::test]
