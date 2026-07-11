@@ -2803,6 +2803,8 @@ mod tests {
             effort: Some("high".into()),
             codex_home: None,
             reminder: Some("keep going".into()),
+            parent_session: Some("parent".into()),
+            idle_policy: Some(crate::daemon_protocol::IdlePolicy::CloseWhenDone),
             prompt: Some("initial prompt".into()),
             iteration: 4,
             iteration_log: vec![],
@@ -2829,6 +2831,8 @@ mod tests {
         assert_eq!(restored.model, metadata.model);
         assert_eq!(restored.effort, metadata.effort);
         assert_eq!(restored.reminder, metadata.reminder);
+        assert_eq!(restored.parent_session, metadata.parent_session);
+        assert_eq!(restored.idle_policy, metadata.idle_policy);
         assert_eq!(restored.prompt, metadata.prompt);
         assert_eq!(restored.iteration, metadata.iteration);
         assert_eq!(restored.iteration_log, metadata.iteration_log);

@@ -2460,6 +2460,8 @@ pub async fn restart_session(
                     effort: effective_effort.clone(),
                     codex_home: launch_codex_home.clone(),
                     reminder: effective_reminder.clone(),
+                    parent_session: m.parent_session.clone(),
+                    idle_policy: m.idle_policy.clone(),
                     prompt: effective_prompt.clone(),
                     iteration: m.iteration,
                     iteration_log: m.iteration_log.clone(),

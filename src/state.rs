@@ -447,6 +447,12 @@ pub struct SessionMetadata {
     /// Reminder text re-injected on idle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reminder: Option<String>,
+    /// Explicit parent session that owns lifecycle decisions for this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session: Option<String>,
+    /// Explicit behavior to follow when this session is idle or done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
     /// Original prompt from session_start, stored for re-injection on iteration.
     #[serde(
         default,
@@ -505,6 +511,8 @@ impl Default for SessionMetadata {
             effort: None,
             codex_home: None,
             reminder: None,
+            parent_session: None,
+            idle_policy: None,
             prompt: None,
             iteration: 0,
             iteration_log: Vec::new(),
@@ -1383,6 +1391,8 @@ impl AppState {
                         effort: m.effort.clone(),
                         codex_home: m.codex_home.clone(),
                         reminder: m.reminder.clone(),
+                        parent_session: m.parent_session.clone(),
+                        idle_policy: m.idle_policy.clone(),
                         prompt: m.prompt.clone(),
                         iteration: m.iteration,
                         iteration_log: m.iteration_log.clone(),
@@ -3889,6 +3899,8 @@ pub(crate) mod tests {
             effort: Some("max".into()),
             codex_home: None,
             reminder: Some("remember to...".into()),
+            parent_session: Some("parent".into()),
+            idle_policy: Some(crate::daemon_protocol::IdlePolicy::AskParentWhenDone),
             prompt: Some("do the thing".into()),
             iteration: 3,
             iteration_log: vec![],
