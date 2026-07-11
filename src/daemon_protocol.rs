@@ -342,9 +342,6 @@ impl SessionMeta {
 
     pub fn lifecycle_reminder(&self, session_id: &str, clearing_id: Option<u64>) -> Option<String> {
         let policy = self.idle_policy.as_ref()?;
-        let clear_cmd = clearing_id
-            .map(|id| format!("ouija clear-reminder {id}"))
-            .unwrap_or_else(|| "ouija clear-reminder <clearing_id>".to_string());
         let mut lines = vec![
             format!("Lifecycle policy: {}", policy.as_str()),
             format!("Current session id: {session_id}"),
@@ -355,9 +352,12 @@ impl SessionMeta {
 
         match policy {
             IdlePolicy::KeepOpen => {
-                lines.push(format!(
-                    "When work is complete or intentionally paused, run `{clear_cmd}` and stay open."
-                ));
+                lines.push("When work is complete or intentionally paused, stay open.".to_string());
+                if let Some(clearing_id) = clearing_id {
+                    lines.push(format!(
+                        "Run `ouija clear-reminder {clearing_id}` if this idle reminder should stop."
+                    ));
+                }
                 lines.push(
                     "Do not close this session unless a human or parent explicitly asks you to."
                         .to_string(),
@@ -375,9 +375,11 @@ impl SessionMeta {
                 lines.push(format!(
                     "Example: printf '%s\\n' 'done: <summary>' | ouija ask {parent} --stdin --from {session_id}"
                 ));
-                lines.push(format!(
-                    "After the parent has been asked, run `{clear_cmd}` if this idle reminder should stop while you wait."
-                ));
+                if let Some(clearing_id) = clearing_id {
+                    lines.push(format!(
+                        "After the parent has been asked, run `ouija clear-reminder {clearing_id}` if this idle reminder should stop while you wait."
+                    ));
+                }
             }
             IdlePolicy::CloseWhenDone => {
                 lines.push(
@@ -387,9 +389,11 @@ impl SessionMeta {
                 lines.push(format!(
                     "Close command: ouija kill-session {session_id} --keep-worktree"
                 ));
-                lines.push(format!(
-                    "If work is not complete but this idle reminder is handled, run `{clear_cmd}`."
-                ));
+                if let Some(clearing_id) = clearing_id {
+                    lines.push(format!(
+                        "If work is not complete but this idle reminder is handled, run `ouija clear-reminder {clearing_id}`."
+                    ));
+                }
             }
         }
 
@@ -3342,6 +3346,23 @@ mod tests {
         assert!(reminder.contains("Current session id: worker-3"));
         assert!(reminder.contains("ouija kill-session worker-3 --keep-worktree"));
         assert!(reminder.contains("ouija clear-reminder 9"));
+    }
+
+    #[test]
+    fn launch_time_lifecycle_reminder_omits_clear_command_without_clearing_id() {
+        let meta = SessionMeta {
+            parent_session: Some("parent-session".into()),
+            idle_policy: Some(IdlePolicy::AskParentWhenDone),
+            ..Default::default()
+        };
+        let reminder = meta.effective_reminder("worker-4", None).unwrap();
+
+        assert!(reminder.contains("Lifecycle policy: ask-parent-when-done"));
+        assert!(reminder.contains("Current session id: worker-4"));
+        assert!(reminder.contains("Parent session id: parent-session"));
+        assert!(reminder.contains("ouija ask parent-session --stdin --from worker-4"));
+        assert!(!reminder.contains("ouija clear-reminder"));
+        assert!(!reminder.contains("<clearing_id>"));
     }
 
     #[test]

@@ -2696,6 +2696,15 @@ async fn soft_restart_session(
         }
     };
     let restart_generation = previous_metadata.restart_generation;
+    let reminder_meta = crate::daemon_protocol::SessionMeta {
+        reminder: reminder
+            .map(String::from)
+            .or_else(|| previous_metadata.reminder.clone()),
+        parent_session: previous_metadata.parent_session.clone(),
+        idle_policy: previous_metadata.idle_policy.clone(),
+        ..Default::default()
+    };
+    let effective_reminder = reminder_meta.effective_reminder(name, None);
 
     let mut prompt_msg_id = None;
     let mut metadata_committed = false;
@@ -2800,7 +2809,7 @@ async fn soft_restart_session(
             metadata_committed = true;
         }
 
-        let full_text = match reminder {
+        let full_text = match effective_reminder.as_deref() {
             Some(r) => format!("{text}\n\n{r}"),
             None => text.to_string(),
         };
@@ -5489,6 +5498,99 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn soft_restart_prompt_includes_effective_lifecycle_reminder() {
+        use axum::Json;
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use tokio::net::TcpListener;
+        use tokio::sync::Mutex;
+
+        async fn create_session() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "id": "ses_new" }))
+        }
+
+        async fn prompt_async(
+            AxumState(captured): AxumState<StdArc<Mutex<Option<String>>>>,
+            Json(body): Json<serde_json::Value>,
+        ) -> StatusCode {
+            let text = body["parts"][0]["text"].as_str().unwrap().to_string();
+            *captured.lock().await = Some(text);
+            StatusCode::NO_CONTENT
+        }
+
+        let captured = StdArc::new(Mutex::new(None));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session", post(create_session))
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(captured.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: None,
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_old".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::WeakAdopted,
+                        ),
+                        reminder: Some("check the deployment".into()),
+                        parent_session: Some("parent-session".into()),
+                        idle_policy: Some(crate::daemon_protocol::IdlePolicy::AskParentWhenDone),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let result = soft_restart_session(
+            &state,
+            "oc",
+            None,
+            dir.path().to_str().unwrap(),
+            Some("queued prompt"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let text = captured.lock().await.clone().unwrap();
+        assert!(text.starts_with("queued prompt\n\ncheck the deployment\n\n"));
+        assert!(text.contains("Lifecycle policy: ask-parent-when-done"));
+        assert!(text.contains("Parent session id: parent-session"));
+        assert!(text.contains("ouija ask parent-session --stdin --from oc"));
+        assert!(!text.contains("ouija clear-reminder"));
+        assert!(!text.contains("<clearing_id>"));
         server.abort();
     }
 
