@@ -3670,6 +3670,19 @@ fn run_reset(wt_dir: &str, branch_name: &str, base: &str) -> anyhow::Result<()> 
     }
 }
 
+fn add_existing_branch_worktree(repo_dir: &str, wt_dir: &str, branch: &str) -> anyhow::Result<()> {
+    let output = std::process::Command::new("git")
+        .args(["-C", repo_dir, "worktree", "add", wt_dir, branch])
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Return a warning message when a legacy-layout worktree short-circuit
 /// will silently drop a caller's destructive intent.
 ///
@@ -3839,6 +3852,33 @@ fn create_ouija_worktree(
     std::fs::create_dir_all(&parent)?;
     // Create worktree with a new branch
     let branch = branch.map(String::from).unwrap_or_else(|| name.to_string());
+    if let Some(base) = base_branch {
+        if !force_reset && git_rev_parse(repo_dir, &branch).is_some() {
+            let ahead = git_rev_count(repo_dir, base, &branch);
+            match ahead {
+                Some(n) if n > 0 => {
+                    let tip = git_rev_parse(repo_dir, &branch).unwrap_or_else(|| "?".into());
+                    tracing::warn!(
+                        "worktree {name}: creating missing worktree from existing branch {branch} \
+                         without reset because it is {n} commits ahead of {base} (tip {tip}); \
+                         pass force_reset=true to override"
+                    );
+                    add_existing_branch_worktree(repo_dir, &wt_dir, &branch)?;
+                    return Ok(wt_dir);
+                }
+                None => {
+                    tracing::warn!(
+                        "worktree {name}: cannot compute {base}..{branch} commit count \
+                         before creating missing worktree; checking out existing branch without \
+                         reset to avoid data loss. Pass force_reset=true to override."
+                    );
+                    add_existing_branch_worktree(repo_dir, &wt_dir, &branch)?;
+                    return Ok(wt_dir);
+                }
+                _ => {}
+            }
+        }
+    }
     let flag = if base_branch.is_some() { "-B" } else { "-b" };
     let mut args = vec!["-C", repo_dir, "worktree", "add", flag, &branch, &wt_dir];
     if let Some(base) = base_branch {
@@ -3847,15 +3887,7 @@ fn create_ouija_worktree(
     let output = std::process::Command::new("git").args(&args).output()?;
     if !output.status.success() {
         // Branch might already exist — check it out in the worktree
-        let output2 = std::process::Command::new("git")
-            .args(["-C", repo_dir, "worktree", "add", &wt_dir, &branch])
-            .output()?;
-        if !output2.status.success() {
-            anyhow::bail!(
-                "git worktree add failed: {}",
-                String::from_utf8_lossy(&output2.stderr).trim()
-            );
-        }
+        add_existing_branch_worktree(repo_dir, &wt_dir, &branch)?;
     }
     Ok(wt_dir)
 }
@@ -6686,6 +6718,92 @@ mod tests {
             result.is_ok(),
             "force_reset=false + alignment failure must return Ok(wt_dir); got Err({:?})",
             result.err()
+        );
+    }
+
+    #[test]
+    fn missing_worktree_with_ahead_branch_not_reset_by_default() {
+        let home = tempfile::tempdir().unwrap();
+        let (_repo, repo_dir, wt_dir, base) = repo_and_worktree(home.path(), "s9", "feat-missing");
+        commit_in(&wt_dir, "a", "a");
+        let tip_before = commit_in(&wt_dir, "b", "b");
+
+        let out = std::process::Command::new("git")
+            .args(["-C", &repo_dir, "worktree", "remove", &wt_dir])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git worktree remove {wt_dir}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !std::path::Path::new(&wt_dir).exists(),
+            "test setup: worktree directory must be absent"
+        );
+
+        let out = create_ouija_worktree(
+            &repo_dir,
+            "s9",
+            Some("feat-missing"),
+            Some(&base),
+            /* force_reset = */ false,
+            home.path(),
+        )
+        .expect("missing worktree should be recreated without resetting ahead branch");
+        assert_eq!(out, wt_dir);
+
+        assert_eq!(
+            tip_before,
+            branch_tip(&wt_dir, "feat-missing"),
+            "missing worktree creation must not reset an ahead branch when force_reset=false"
+        );
+        assert_eq!(
+            tip_before,
+            branch_tip(&wt_dir, "HEAD"),
+            "recreated worktree must check out the preserved branch tip"
+        );
+    }
+
+    #[test]
+    fn missing_worktree_with_ahead_branch_resets_when_forced() {
+        let home = tempfile::tempdir().unwrap();
+        let (_repo, repo_dir, wt_dir, base) =
+            repo_and_worktree(home.path(), "s10", "feat-missing-forced");
+        let base_tip = branch_tip(&wt_dir, &base);
+        commit_in(&wt_dir, "a", "a");
+        commit_in(&wt_dir, "b", "b");
+
+        let out = std::process::Command::new("git")
+            .args(["-C", &repo_dir, "worktree", "remove", &wt_dir])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git worktree remove {wt_dir}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let out = create_ouija_worktree(
+            &repo_dir,
+            "s10",
+            Some("feat-missing-forced"),
+            Some(&base),
+            /* force_reset = */ true,
+            home.path(),
+        )
+        .expect("force_reset=true should recreate worktree by resetting branch to base");
+        assert_eq!(out, wt_dir);
+
+        assert_eq!(
+            base_tip,
+            branch_tip(&wt_dir, "feat-missing-forced"),
+            "force_reset=true must keep the explicit destructive reset behavior"
+        );
+        assert_eq!(
+            base_tip,
+            branch_tip(&wt_dir, "HEAD"),
+            "recreated worktree HEAD must match the forced reset target"
         );
     }
 
