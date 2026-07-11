@@ -417,7 +417,11 @@ impl SessionMeta {
         if self.reminder.is_none() {
             self.reminder = source.reminder.clone();
         }
-        if self.parent_session.is_none() {
+        // `parent_session: None` plus an explicit idle policy means the
+        // register intentionally cleared its parent; blank startup hooks have
+        // both fields absent and still inherit lifecycle metadata.
+        let has_explicit_lifecycle_policy = self.idle_policy.is_some();
+        if self.parent_session.is_none() && !has_explicit_lifecycle_policy {
             self.parent_session = source.parent_session.clone();
         }
         if self.idle_policy.is_none() {
@@ -3476,6 +3480,66 @@ mod tests {
         target.inherit_recurrence_from(&source);
         assert_eq!(target.model.as_deref(), Some("opus"));
         assert_eq!(target.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn register_hard_restart_no_parent_does_not_inherit_old_parent() {
+        let mut state = DaemonState::new_for_model("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                parent_session: Some("old-parent".into()),
+                idle_policy: Some(IdlePolicy::AskParentWhenDone),
+                ..Default::default()
+            },
+        });
+
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                parent_session: None,
+                idle_policy: Some(IdlePolicy::KeepOpen),
+                ..Default::default()
+            },
+        });
+
+        let meta = &state
+            .sessions
+            .get("worker")
+            .expect("session registered")
+            .metadata;
+        assert_eq!(meta.parent_session, None);
+        assert_eq!(meta.idle_policy, Some(IdlePolicy::KeepOpen));
+    }
+
+    #[test]
+    fn register_blank_reregister_preserves_lifecycle_metadata() {
+        let mut state = DaemonState::new_for_model("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                parent_session: Some("parent".into()),
+                idle_policy: Some(IdlePolicy::AskParentWhenDone),
+                ..Default::default()
+            },
+        });
+
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta::default(),
+        });
+
+        let meta = &state
+            .sessions
+            .get("worker")
+            .expect("session registered")
+            .metadata;
+        assert_eq!(meta.parent_session.as_deref(), Some("parent"));
+        assert_eq!(meta.idle_policy, Some(IdlePolicy::AskParentWhenDone));
     }
 
     #[test]
