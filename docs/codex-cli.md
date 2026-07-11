@@ -65,7 +65,8 @@ ouija config set-codex-model-route gemini \
   --model gemini-2.5-pro \
   --codex-home ~/.cache/codex-gemini
 
-ouija spawn-session worker --backend codex-cli --model gemini
+ouija spawn-session worker --backend codex-cli --model gemini \
+  --no-parent-session --idle-policy keep-open
 ```
 
 Codex requires a Responses-compatible endpoint. Google's OpenAI-compatible
@@ -126,7 +127,9 @@ Codex CLI has no `--worktree` flag. Ouija (or Hub) sets up the worktree/branch
 before launch and starts Codex inside it with `cd`. Codex's own app-managed
 worktrees (under `$CODEX_HOME/worktrees`, detached HEAD by default) are a separate
 feature and are **not** used by the Ouija backend. Use Ouija's `--worktree` /
-`--branch` options on `spawn-session` as usual.
+`--branch` options on `spawn-session` as usual, along with explicit lifecycle
+flags such as `--parent-session hub --idle-policy ask-parent-when-done` or
+`--no-parent-session --idle-policy close-when-done`.
 
 ## Lifecycle: turn-scoped Stop, liveness-based cleanup
 
