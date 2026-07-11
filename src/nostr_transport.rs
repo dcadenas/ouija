@@ -3886,6 +3886,12 @@ fn create_ouija_worktree(
     }
     let output = std::process::Command::new("git").args(&args).output()?;
     if !output.status.success() {
+        if base_branch.is_some() && force_reset {
+            anyhow::bail!(
+                "git worktree add -B failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
         // Branch might already exist — check it out in the worktree
         add_existing_branch_worktree(repo_dir, &wt_dir, &branch)?;
     }
@@ -6804,6 +6810,60 @@ mod tests {
             base_tip,
             branch_tip(&wt_dir, "HEAD"),
             "recreated worktree HEAD must match the forced reset target"
+        );
+    }
+
+    #[test]
+    fn missing_worktree_force_reset_propagates_unresolvable_base_failure() {
+        let home = tempfile::tempdir().unwrap();
+        let (_repo, repo_dir, wt_dir, base) =
+            repo_and_worktree(home.path(), "s11", "feat-missing-lost-base");
+        commit_in(&wt_dir, "a", "a");
+        let tip_before = commit_in(&wt_dir, "b", "b");
+
+        let run_in = |dir: &str, args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .args(["-C", dir])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "git -C {dir} {args:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        run_in(&repo_dir, &["worktree", "remove", &wt_dir]);
+        run_in(&repo_dir, &["checkout", "--detach", "-q"]);
+        run_in(&repo_dir, &["branch", "-D", &base]);
+
+        assert!(
+            !std::path::Path::new(&wt_dir).exists(),
+            "test setup: worktree directory must be absent"
+        );
+        assert!(
+            git_rev_parse(&repo_dir, &base).is_none(),
+            "test setup: base ref must be absent"
+        );
+
+        let result = create_ouija_worktree(
+            &repo_dir,
+            "s11",
+            Some("feat-missing-lost-base"),
+            Some(&base),
+            /* force_reset = */ true,
+            home.path(),
+        );
+
+        assert!(
+            result.is_err(),
+            "force_reset=true must return Err when missing-worktree reset fails; got Ok({:?})",
+            result.ok()
+        );
+        assert_eq!(
+            tip_before,
+            branch_tip(&repo_dir, "feat-missing-lost-base"),
+            "failed forced reset must not move the existing branch tip"
         );
     }
 
