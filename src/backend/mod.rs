@@ -2,13 +2,24 @@ pub mod claude_code;
 pub mod codex;
 pub mod opencode;
 
-use std::path::Path;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::Output;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 /// Default hard timeout for a backend availability probe (`cli --version`).
 const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(3);
+const MISE_TRUST_TIMEOUT: Duration = Duration::from_secs(3);
+const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+const MISE_CONFIGS: &[&str] = &[
+    "mise.toml",
+    ".mise.toml",
+    "mise/config.toml",
+    ".tool-versions",
+];
 
 /// Run `command` to completion, killing it if it outlives `timeout`.
 ///
@@ -69,26 +80,208 @@ fn cli_reports_version(cli_name: &str) -> bool {
 /// Best-effort: no-op when mise isn't installed, when the dir has no mise
 /// config, or when `mise trust` fails for any reason.
 pub fn pre_trust_mise(dir: &str) {
-    if cfg!(test) {
-        return;
-    }
-    const CONFIGS: &[&str] = &[
-        "mise.toml",
-        ".mise.toml",
-        "mise/config.toml",
-        ".tool-versions",
-    ];
-    for name in CONFIGS {
-        let path = format!("{dir}/{name}");
-        if !std::path::Path::new(&path).exists() {
-            continue;
+    for path in mise_config_paths(Path::new(dir)) {
+        let attempt = run_mise_trust(Path::new("mise"), &path, MISE_TRUST_TIMEOUT);
+        if attempt.success() {
+            tracing::debug!(config = %path.display(), "mise config pre-trusted");
+        } else {
+            log_mise_trust_failure(&path, &attempt);
         }
-        let _ = std::process::Command::new("mise")
-            .args(["trust", &path])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+    }
+}
+
+fn mise_config_paths(dir: &Path) -> Vec<PathBuf> {
+    MISE_CONFIGS
+        .iter()
+        .map(|name| dir.join(name))
+        .filter(|path| path.exists())
+        .collect()
+}
+
+#[derive(Debug)]
+enum MiseTrustAttempt {
+    Completed(Output),
+    SpawnFailed(String),
+    WaitFailed(String),
+    TimedOut(Option<Output>),
+}
+
+impl MiseTrustAttempt {
+    fn success(&self) -> bool {
+        matches!(self, Self::Completed(output) if output.status.success())
+    }
+
+    fn status_code(&self) -> Option<i32> {
+        match self {
+            Self::Completed(output) | Self::TimedOut(Some(output)) => output.status.code(),
+            Self::SpawnFailed(_) | Self::WaitFailed(_) | Self::TimedOut(None) => None,
+        }
+    }
+
+    fn stdout(&self) -> String {
+        match self {
+            Self::Completed(output) | Self::TimedOut(Some(output)) => {
+                String::from_utf8_lossy(&output.stdout).into_owned()
+            }
+            Self::SpawnFailed(_) | Self::WaitFailed(_) | Self::TimedOut(None) => String::new(),
+        }
+    }
+
+    fn stderr(&self) -> String {
+        match self {
+            Self::Completed(output) | Self::TimedOut(Some(output)) => {
+                String::from_utf8_lossy(&output.stderr).into_owned()
+            }
+            Self::SpawnFailed(_) | Self::WaitFailed(_) | Self::TimedOut(None) => String::new(),
+        }
+    }
+}
+
+fn run_mise_trust(mise_bin: &Path, config_path: &Path, timeout: Duration) -> MiseTrustAttempt {
+    let mut command = Command::new(mise_bin);
+    command
+        .arg("trust")
+        .arg(config_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    run_mise_trust_command(&mut command, timeout)
+}
+
+fn run_mise_trust_command(command: &mut Command, timeout: Duration) -> MiseTrustAttempt {
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return MiseTrustAttempt::SpawnFailed(error.to_string()),
+    };
+    let stdout = child.stdout.take().map(read_child_pipe);
+    let stderr = child.stderr.take().map(read_child_pipe);
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                return child
+                    .wait()
+                    .map(|status| {
+                        MiseTrustAttempt::Completed(collect_output(status, stdout, stderr))
+                    })
+                    .unwrap_or_else(|error| MiseTrustAttempt::WaitFailed(error.to_string()));
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    return MiseTrustAttempt::TimedOut(
+                        child
+                            .wait()
+                            .ok()
+                            .map(|status| collect_output(status, stdout, stderr)),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return MiseTrustAttempt::WaitFailed(error.to_string());
+            }
+        }
+    }
+}
+
+fn read_child_pipe<T>(mut pipe: T) -> Receiver<Vec<u8>>
+where
+    T: Read + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0; 8192];
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    rx
+}
+
+fn collect_output(
+    status: std::process::ExitStatus,
+    stdout: Option<Receiver<Vec<u8>>>,
+    stderr: Option<Receiver<Vec<u8>>>,
+) -> Output {
+    Output {
+        status,
+        stdout: join_pipe(stdout),
+        stderr: join_pipe(stderr),
+    }
+}
+
+fn join_pipe(receiver: Option<Receiver<Vec<u8>>>) -> Vec<u8> {
+    let Some(receiver) = receiver else {
+        return Vec::new();
+    };
+    let mut output = Vec::new();
+    while let Ok(chunk) = receiver.recv_timeout(PIPE_DRAIN_TIMEOUT) {
+        output.extend(chunk);
+    }
+    output
+}
+
+fn log_mise_trust_failure(path: &Path, attempt: &MiseTrustAttempt) {
+    let stdout = truncate_for_log(&attempt.stdout());
+    let stderr = truncate_for_log(&attempt.stderr());
+    match attempt {
+        MiseTrustAttempt::Completed(output) => {
+            tracing::warn!(
+                config = %path.display(),
+                status = ?output.status,
+                stdout = %stdout,
+                stderr = %stderr,
+                "mise trust exited unsuccessfully; spawned shells may prompt for trust"
+            );
+        }
+        MiseTrustAttempt::SpawnFailed(error) => {
+            tracing::warn!(
+                config = %path.display(),
+                error = %error,
+                "mise trust could not be started; spawned shells may prompt for trust"
+            );
+        }
+        MiseTrustAttempt::WaitFailed(error) => {
+            tracing::warn!(
+                config = %path.display(),
+                error = %error,
+                stdout = %stdout,
+                stderr = %stderr,
+                "mise trust wait failed; spawned shells may prompt for trust"
+            );
+        }
+        MiseTrustAttempt::TimedOut(_) => {
+            tracing::warn!(
+                config = %path.display(),
+                timeout_ms = MISE_TRUST_TIMEOUT.as_millis(),
+                status_code = ?attempt.status_code(),
+                stdout = %stdout,
+                stderr = %stderr,
+                "mise trust timed out; spawned shells may prompt for trust"
+            );
+        }
+    }
+}
+
+fn truncate_for_log(value: &str) -> String {
+    const MAX_CHARS: usize = 1000;
+    let mut chars = value.trim().chars();
+    let truncated: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
     }
 }
 
@@ -417,6 +610,139 @@ mod tests {
     #[test]
     fn cli_reports_version_false_for_missing_binary() {
         assert!(!cli_reports_version("ouija-nonexistent-binary-xyz"));
+    }
+
+    #[test]
+    fn mise_config_paths_only_include_existing_configs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("mise.toml"), "[tools]\n").unwrap();
+        std::fs::create_dir(root.join("mise")).unwrap();
+        std::fs::write(root.join("mise/config.toml"), "[env]\n").unwrap();
+
+        let paths = mise_config_paths(root);
+
+        assert_eq!(
+            paths,
+            vec![root.join("mise.toml"), root.join("mise/config.toml")]
+        );
+    }
+
+    #[test]
+    fn mise_trust_attempt_captures_nonzero_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_mise = tmp.path().join("mise");
+        std::fs::write(
+            &fake_mise,
+            "#!/bin/sh\nprintf 'out line\\n'\nprintf 'err line\\n' >&2\nexit 42\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_mise, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let config = tmp.path().join("mise.toml");
+        std::fs::write(&config, "[tools]\n").unwrap();
+
+        let attempt = run_mise_trust(&fake_mise, &config, Duration::from_secs(1));
+
+        assert_eq!(attempt.status_code(), Some(42));
+        assert_eq!(attempt.stdout(), "out line\n");
+        assert_eq!(attempt.stderr(), "err line\n");
+    }
+
+    #[test]
+    fn mise_trust_timeout_does_not_wait_for_pipe_holding_descendant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_mise = tmp.path().join("mise");
+        std::fs::write(
+            &fake_mise,
+            "#!/bin/sh\n(sleep 3) &\nprintf 'before timeout\\n'\nsleep 3\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_mise, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let config = tmp.path().join("mise.toml");
+        std::fs::write(&config, "[tools]\n").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fake_mise = fake_mise.clone();
+        std::thread::spawn(move || {
+            let attempt = run_mise_trust(&fake_mise, &config, Duration::from_millis(100));
+            let _ = tx.send(attempt.stdout());
+        });
+
+        let stdout = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("timeout path must not wait for descendant-held stdout pipe");
+        assert_eq!(stdout, "before timeout\n");
+    }
+
+    #[test]
+    fn actual_mise_trust_suppresses_untrusted_config_check_when_available() {
+        if !cli_reports_version("mise") {
+            eprintln!("skipping actual mise trust test because mise is not on PATH");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let mise_data = tmp.path().join("mise-data");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&mise_data).unwrap();
+        let config = project.join("mise.toml");
+        std::fs::write(
+            &config,
+            "[env]\nOUIJA_MISE_TRUST_TEST = \"trusted-after-command\"\n",
+        )
+        .unwrap();
+
+        let before = std::process::Command::new("mise")
+            .arg("env")
+            .arg("-C")
+            .arg(&project)
+            .env("MISE_DATA_DIR", &mise_data)
+            .output()
+            .unwrap();
+        assert!(
+            !before.status.success(),
+            "untrusted mise config should fail before trust"
+        );
+        assert!(
+            String::from_utf8_lossy(&before.stderr).contains("not trusted"),
+            "expected untrusted-config error, got stderr: {}",
+            String::from_utf8_lossy(&before.stderr)
+        );
+
+        let trust = std::process::Command::new("mise")
+            .arg("trust")
+            .arg(&config)
+            .env("MISE_DATA_DIR", &mise_data)
+            .output()
+            .unwrap();
+        assert!(
+            trust.status.success(),
+            "mise trust failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&trust.stdout),
+            String::from_utf8_lossy(&trust.stderr)
+        );
+
+        let after = std::process::Command::new("mise")
+            .arg("env")
+            .arg("-C")
+            .arg(&project)
+            .env("MISE_DATA_DIR", &mise_data)
+            .output()
+            .unwrap();
+        assert!(
+            after.status.success(),
+            "trusted mise config should load without prompt: stderr={}",
+            String::from_utf8_lossy(&after.stderr)
+        );
     }
 
     #[test]
