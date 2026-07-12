@@ -1725,20 +1725,16 @@ pub async fn start_session(
                 String::from_utf8_lossy(&output.stdout).trim().to_string()
             };
 
-            // Prevent tmux from overriding the window name
-            let _ = Command::new("tmux")
-                .args([
-                    "set-window-option",
-                    "-t",
-                    &pane_id,
-                    "automatic-rename",
-                    "off",
-                ])
-                .status();
+            crate::tmux::configure_managed_pane(&pane_id);
 
             // Leading space keeps the command out of shell history (fallback
             // for shells that ignore HISTFILE but honour HIST_IGNORE_SPACE).
-            let hidden_cmd = format!(" {full_cmd}");
+            let command = if is_http_api {
+                full_cmd.clone()
+            } else {
+                crate::tmux::close_shell_after(&full_cmd)
+            };
+            let hidden_cmd = format!(" {command}");
             Command::new("tmux")
                 .args(["send-keys", "-t", &pane_id, &hidden_cmd, "Enter"])
                 .status()?;
@@ -2228,6 +2224,7 @@ pub async fn restart_session(
                 if !is_http_api {
                     respawn_args.push(&full_cmd);
                 }
+                crate::tmux::configure_managed_pane(pane);
                 let output = Command::new("tmux").args(&respawn_args).output();
                 match output {
                     Ok(o) if o.status.success() => {
@@ -2297,18 +2294,14 @@ pub async fn restart_session(
             }
             let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-            // Prevent tmux from overriding the window name
-            let _ = Command::new("tmux")
-                .args([
-                    "set-window-option",
-                    "-t",
-                    &pane_id,
-                    "automatic-rename",
-                    "off",
-                ])
-                .status();
+            crate::tmux::configure_managed_pane(&pane_id);
 
-            let hidden_cmd = format!(" {full_cmd}");
+            let command = if is_http_api {
+                full_cmd.clone()
+            } else {
+                crate::tmux::close_shell_after(&full_cmd)
+            };
+            let hidden_cmd = format!(" {command}");
             Command::new("tmux")
                 .args(["send-keys", "-t", &pane_id, &hidden_cmd, "Enter"])
                 .status()?;
@@ -3345,6 +3338,7 @@ async fn respawn_pane_opencode_attach_skew_notice(
         let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
         args.extend(env_args.iter().map(String::as_str));
         args.extend_from_slice(&["-t", &pane, &command]);
+        crate::tmux::configure_managed_pane(&pane);
         let status = std::process::Command::new("tmux").args(&args).status()?;
         if !status.success() {
             anyhow::bail!("tmux respawn-pane (skew notice) failed for {pane}");
@@ -3394,6 +3388,7 @@ async fn respawn_opencode_attach_for_session(
         let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
         args.extend(env_args.iter().map(String::as_str));
         args.extend_from_slice(&["-t", &pane, &attach_cmd]);
+        crate::tmux::configure_managed_pane(&pane);
         let status = std::process::Command::new("tmux").args(&args).status()?;
         if !status.success() {
             anyhow::bail!("tmux respawn-pane failed for {pane}");
@@ -3418,7 +3413,8 @@ async fn launch_opencode_attach_for_session(
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         // Small delay so the pane shell is ready
         std::thread::sleep(std::time::Duration::from_millis(300));
-        let hidden = format!(" {attach_cmd}");
+        let attach_then_exit = crate::tmux::close_shell_after(&attach_cmd);
+        let hidden = format!(" {attach_then_exit}");
         let status = std::process::Command::new("tmux")
             .args(["send-keys", "-t", &pane, &hidden, "Enter"])
             .status()?;

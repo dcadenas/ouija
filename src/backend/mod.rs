@@ -10,6 +10,13 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
+/// Identifies one session inside a coding-assistant backend.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct BackendSessionIdentity {
+    pub backend: String,
+    pub session_id: String,
+}
+
 /// Default hard timeout for a backend availability probe (`cli --version`).
 const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(3);
 const MISE_TRUST_TIMEOUT: Duration = Duration::from_secs(3);
@@ -361,6 +368,23 @@ impl BackendRegistry {
             .collect()
     }
 
+    /// Resolve the current tool shell's backend-native identity.
+    ///
+    /// Returns `None` when no backend exposes an identity or when more than
+    /// one backend claims the shell. Ambiguous identity must fail closed.
+    pub fn caller_session_identity(&self) -> Option<BackendSessionIdentity> {
+        let mut identities = self.backends.iter().filter_map(|backend| {
+            backend
+                .caller_session_id()
+                .map(|session_id| BackendSessionIdentity {
+                    backend: backend.name().to_string(),
+                    session_id,
+                })
+        });
+        let identity = identities.next()?;
+        identities.next().is_none().then_some(identity)
+    }
+
     /// Every registered backend paired with its process names, regardless of
     /// availability.
     ///
@@ -501,6 +525,10 @@ pub trait CodingAssistant: Send + Sync + std::fmt::Debug + 'static {
     fn build_start_command(&self, opts: &StartOpts) -> String;
     fn build_resume_command(&self, opts: &ResumeOpts) -> Option<String>;
     fn detect_session_id(&self, project_dir: &str) -> Option<String>;
+    /// Resolve this backend's session ID from the current tool environment.
+    fn caller_session_id(&self) -> Option<String> {
+        None
+    }
     fn tui_ready_pattern(&self) -> Option<&str>;
     fn inject_config(&self) -> InjectConfig;
     fn config_dir_name(&self) -> &str;

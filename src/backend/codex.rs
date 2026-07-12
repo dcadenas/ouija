@@ -14,10 +14,8 @@ mod embedded {
     pub const SCRIPT_STOP: &str = include_str!("../../scripts/codex/codex-stop.sh");
     /// The shared ouija skill, installed into Codex's skill-discovery path so a
     /// Codex session can activate it on incoming `<msg>` tags, exactly as Claude
-    /// Code and OpenCode do. The stock skill is safe for Codex because its bash
-    /// tool inherits `OUIJA_SESSION_ID` (exported via `tmux::pane_env_args`), so
-    /// `ouija whoami` and sender auto-resolution work; section 7 already teaches
-    /// `ouija whoami`/`OUIJA_SESSION_ID` and forbids guessing a `--from` (#1445).
+    /// Code and OpenCode do. Codex tool shells may lose Ouija's tmux environment;
+    /// sender validation therefore uses the generic backend-identity contract.
     pub const SKILL_MD: &str = include_str!("../../skills/ouija/SKILL.md");
 }
 
@@ -440,6 +438,12 @@ impl CodingAssistant for Codex {
         // back to `codex resume --last`.
         let sessions_root = resolve_codex_home()?.join("sessions");
         latest_session_id_for_cwd(&sessions_root, project_dir)
+    }
+
+    fn caller_session_id(&self) -> Option<String> {
+        std::env::var("CODEX_THREAD_ID")
+            .ok()
+            .filter(|session_id| !session_id.is_empty())
     }
 
     fn tui_ready_pattern(&self) -> Option<&str> {
@@ -977,6 +981,9 @@ mod tests {
         let s = embedded::SCRIPT_REGISTER;
         // Registers via the shared session-start endpoint.
         assert!(s.contains("/api/hooks/session-start"), "{s}");
+        // Supplies the backend-native identity through the generic hook field.
+        assert!(s.contains(".session_id"), "{s}");
+        assert!(s.contains("backend_session_id"), "{s}");
         // Wraps the daemon's `.output` into Codex additionalContext, keyed to the
         // SessionStart event so the TUI surfaces mesh instructions.
         assert!(s.contains("hookSpecificOutput"), "{s}");

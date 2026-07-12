@@ -171,11 +171,16 @@ ouija whoami         # print this session's own id (fails loudly if unresolvable
 ouija ask <to> "msg" # send a message expecting a reply
 ouija tell <to> "msg" # fire-and-forget message
 ouija reply <to> <id> "msg" # reply to a message
+ouija reply <to> <id> --stdin < reply.txt # safer for generated/multiline text
 ouija announce --role "..." --bulletin "..." # update your metadata
 ouija spawn-session <name> --prompt "..." # start a new session
 ouija nodes          # list connected nodes
 ouija config ...     # manage settings, Nostr DM users, router
 ```
+
+For generated or multi-line message bodies, prefer `--stdin` or
+`--message-file` on `ask`, `tell`, and `reply`. That avoids shell expansion of
+backticks, `$()`, quotes, and JSON before `ouija` receives the message.
 
 Outside tmux, such as an OpenCode HTTP/API tool process, run `ouija whoami` to resolve your own session id and pass its exact output as the sender: `ouija ask <to> "msg" --from <public-ouija-id>`. Never guess a sender id (project directory name, branch name, or an `ouija ls` entry) — the daemon rejects sender claims it can disprove. Do not use backend labels like `opencode` or opaque OpenCode `backend_session_id` values as `--from`.
 

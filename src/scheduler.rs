@@ -25,7 +25,7 @@ pub enum OnFire {
     /// Inject into live session; revive with --continue if dead.
     #[default]
     ContinueSession,
-    /// Start fresh when dead/missing; no-op when alive (reminder handles nudging).
+    /// Start fresh when dead/missing; no-op when alive unless a prompt is set.
     NewSession,
     /// Named worktree that persists across fires.
     /// `clear_context: true` starts a new conversation each fire.
@@ -65,7 +65,7 @@ impl OnFire {
 
     /// Whether this mode kills an alive session's process on each fire.
     /// Only worktree modes with context clearing need to kill alive sessions.
-    /// ContinueSession and NewSession are no-ops when alive (reminder handles nudging).
+    /// Non-clearing modes keep the alive process and inject any configured prompt.
     pub fn kills_alive(&self) -> bool {
         match self {
             Self::ContinueSession | Self::NewSession => false,
@@ -444,14 +444,7 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
     };
 
     // Check if pane is alive
-    let pane_id = pane.clone();
-    let names: Vec<String> = state.backends.all_process_names();
-    let alive = tokio::task::spawn_blocking(move || {
-        let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-        tmux::pane_alive(&pane_id, &name_refs)
-    })
-    .await
-    .unwrap_or(false);
+    let alive = task_pane_alive(state, pane).await;
 
     // Capture model/effort from the session snapshot we already have, so a
     // subsequent Unregister race cannot silently downgrade the respawn to
@@ -498,6 +491,17 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
             .sessions
             .contains_key(session_name)
         {
+            if let Err(error) = inject_alive_session_prompt(
+                state,
+                task,
+                session_name,
+                pane,
+                session.metadata.vim_mode,
+            )
+            .await
+            {
+                return TaskRun::failed(task, error);
+            }
             return TaskRun::ok(task, None);
         }
         tracing::info!("session '{session_name}' disappeared during alive check, reviving");
@@ -518,6 +522,64 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
         launch.backend_name,
     )
     .await
+}
+
+async fn task_pane_alive(state: &SharedState, pane: &str) -> bool {
+    if cfg!(test) {
+        return state
+            .list_assistant_panes()
+            .await
+            .iter()
+            .any(|p| p.pane_id == pane);
+    }
+
+    let pane_id = pane.to_string();
+    let names: Vec<String> = state.backends.all_process_names();
+    tokio::task::spawn_blocking(move || {
+        let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        tmux::pane_alive(&pane_id, &name_refs)
+    })
+    .await
+    .unwrap_or(false)
+}
+
+fn task_prompt_text(task: &ScheduledTask) -> Option<String> {
+    task.prompt.as_ref().map(|prompt| match &task.reminder {
+        Some(reminder) => format!("{prompt}\n\n{reminder}"),
+        None => prompt.clone(),
+    })
+}
+
+async fn inject_alive_session_prompt(
+    state: &SharedState,
+    task: &ScheduledTask,
+    session_name: &str,
+    pane: &str,
+    vim_mode: bool,
+) -> Result<(), String> {
+    let Some(message) = task_prompt_text(task) else {
+        return Ok(());
+    };
+
+    match crate::state::deliver_inject_message_effect(
+        state,
+        crate::state::InjectDeliveryRequest {
+            session_id: session_name,
+            pane,
+            message: &message,
+            vim_mode,
+            delivery_method: None,
+            recorded_method: None,
+        },
+    )
+    .await
+    {
+        crate::state::DeliveryOutcome::Accepted => Ok(()),
+        crate::state::DeliveryOutcome::Rejected(reason) => Err(reason),
+        crate::state::DeliveryOutcome::Ambiguous(reason) => {
+            Err(format!("prompt delivery ambiguous: {reason}"))
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -582,11 +644,7 @@ async fn respawn_and_inject(
 
     // Pass prompt as CLI arg (same as start_session) so Claude loads
     // CLAUDE.md and rules before processing the prompt.
-    let full_cmd = if let Some(ref prompt) = task.prompt {
-        let full_text = match &task.reminder {
-            Some(r) => format!("{prompt}\n\n{r}"),
-            None => prompt.clone(),
-        };
+    let full_cmd = if let Some(full_text) = task_prompt_text(task) {
         let prompt_path = format!("/tmp/ouija-prompt-{}.txt", task_name.replace('/', "-"));
         let _ = std::fs::write(&prompt_path, &full_text);
         let escaped_pf = shell_escape(&prompt_path);
@@ -604,6 +662,7 @@ async fn respawn_and_inject(
             let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
             args.extend(env_args.iter().map(String::as_str));
             args.extend_from_slice(&["-t", &pane_id, &full_cmd]);
+            crate::tmux::configure_managed_pane(&pane_id);
             let output = std::process::Command::new("tmux").args(&args).output()?;
             if !output.status.success() {
                 anyhow::bail!(
@@ -799,11 +858,7 @@ async fn revive_and_inject(
     // Pass prompt as CLI arg so Claude loads CLAUDE.md before processing it.
     // TuiInjection always uses CLI arg; HttpApi only when starting fresh.
     let full_launch_cmd = if clears_context || is_tui {
-        if let Some(ref prompt) = task.prompt {
-            let full_text = match &task.reminder {
-                Some(r) => format!("{prompt}\n\n{r}"),
-                None => prompt.clone(),
-            };
+        if let Some(full_text) = task_prompt_text(task) {
             let prompt_path = format!("/tmp/ouija-prompt-{}.txt", task.name.replace('/', "-"));
             let _ = std::fs::write(&prompt_path, &full_text);
             let escaped_pf = shell_escape(&prompt_path);
@@ -871,21 +926,13 @@ async fn revive_and_inject(
             }
             let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-            // Prevent tmux from overriding the window name
-            let _ = std::process::Command::new("tmux")
-                .args([
-                    "set-window-option",
-                    "-t",
-                    &pane_id,
-                    "automatic-rename",
-                    "off",
-                ])
-                .status();
+            crate::tmux::configure_managed_pane(&pane_id);
 
             // Launch the backend in the project dir (prompt as CLI arg if available).
             // Leading space prevents the command from being recorded in shell
             // history (zsh HIST_IGNORE_SPACE / bash HISTCONTROL=ignorespace).
-            let hidden_cmd = format!(" {full_launch_cmd}");
+            let launch_then_exit = crate::tmux::close_shell_after(&full_launch_cmd);
+            let hidden_cmd = format!(" {launch_then_exit}");
             std::process::Command::new("tmux")
                 .args(["send-keys", "-t", &pane_id, &hidden_cmd, "Enter"])
                 .status()?;

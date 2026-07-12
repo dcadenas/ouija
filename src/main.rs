@@ -17,10 +17,11 @@ mod tmux;
 mod tmux_var;
 mod transport;
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use backend::CodingAssistant;
 use clap::{Parser, Subcommand};
 use nostr_sdk::ToBech32;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "ouija", about = "Cross-machine AI session daemon")]
@@ -89,7 +90,13 @@ enum Command {
     /// Send a message expecting a reply
     Ask {
         to: String,
-        message: String,
+        message: Option<String>,
+        /// Read message body from stdin.
+        #[arg(long)]
+        stdin: bool,
+        /// Read message body from a file.
+        #[arg(long)]
+        message_file: Option<PathBuf>,
         /// Sender session ID: the exact output of `ouija whoami` (never a guessed id)
         #[arg(long)]
         from: Option<String>,
@@ -97,7 +104,13 @@ enum Command {
     /// Send a message (fire-and-forget)
     Tell {
         to: String,
-        message: String,
+        message: Option<String>,
+        /// Read message body from stdin.
+        #[arg(long)]
+        stdin: bool,
+        /// Read message body from a file.
+        #[arg(long)]
+        message_file: Option<PathBuf>,
         /// Thread as progress update for a pending reply
         #[arg(long)]
         reply_to: Option<u64>,
@@ -109,7 +122,13 @@ enum Command {
     Reply {
         to: String,
         msg_id: u64,
-        message: String,
+        message: Option<String>,
+        /// Read message body from stdin.
+        #[arg(long)]
+        stdin: bool,
+        /// Read message body from a file.
+        #[arg(long)]
+        message_file: Option<PathBuf>,
         /// Don't mark as done (progress update)
         #[arg(long)]
         no_done: bool,
@@ -698,7 +717,14 @@ async fn main() -> anyhow::Result<()> {
             });
             cli_post("/api/register", &body).await?;
         }
-        Command::Ask { to, message, from } => {
+        Command::Ask {
+            to,
+            message,
+            stdin,
+            message_file,
+            from,
+        } => {
+            let message = resolve_message(message, stdin, message_file)?;
             let from = match from {
                 Some(id) => id,
                 None => require_my_session_id().await?,
@@ -715,9 +741,12 @@ async fn main() -> anyhow::Result<()> {
         Command::Tell {
             to,
             message,
+            stdin,
+            message_file,
             reply_to,
             from,
         } => {
+            let message = resolve_message(message, stdin, message_file)?;
             let from = match from {
                 Some(id) => id,
                 None => require_my_session_id().await?,
@@ -736,10 +765,13 @@ async fn main() -> anyhow::Result<()> {
             to,
             msg_id,
             message,
+            stdin,
+            message_file,
             no_done,
             expect_reply,
             from,
         } => {
+            let message = resolve_message(message, stdin, message_file)?;
             let from = match from {
                 Some(id) => id,
                 None => require_my_session_id().await?,
@@ -2000,6 +2032,34 @@ fn unresolved_sender_error() -> String {
     )
 }
 
+fn resolve_message(
+    positional: Option<String>,
+    read_stdin: bool,
+    message_file: Option<PathBuf>,
+) -> anyhow::Result<String> {
+    let source_count = usize::from(positional.is_some())
+        + usize::from(read_stdin)
+        + usize::from(message_file.is_some());
+    match source_count {
+        0 => bail!("provide a message argument, --stdin, or --message-file <path>"),
+        1 => {}
+        _ => bail!("provide only one message source: argument, --stdin, or --message-file"),
+    }
+
+    if let Some(message) = positional {
+        return Ok(message);
+    }
+    if let Some(path) = message_file {
+        return std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read message file {}", path.display()));
+    }
+
+    let mut message = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut message)
+        .context("failed to read message from stdin")?;
+    Ok(message)
+}
+
 /// Pick the caller's session id from the three available signals.
 ///
 /// Priority when in tmux (`tmux_pane` is `Some`):
@@ -2042,14 +2102,16 @@ fn pick_session_id(
 ///
 /// `self_id` is the caller's own resolved id from the local (network-free)
 /// signals: the pane var when in tmux, else `$OUIJA_SESSION_ID`. A paneless
-/// opencode session resolves it via `$OUIJA_SESSION_ID`, which is how the
-/// daemon verifies a paneless self-send. The remaining `LookupByPane` case
-/// only occurs when `$TMUX_PANE` is set, and the daemon then validates by
-/// pane match, so leaving `self_id` unset there is harmless.
+/// backend can resolve it via `$OUIJA_SESSION_ID`. Backends may also
+/// expose an opaque native identity through their adapter; the daemon compares
+/// that identity with the one recorded at session start. The remaining
+/// `LookupByPane` case only occurs when `$TMUX_PANE` is set, and the daemon then
+/// validates by pane match, so leaving `self_id` unset there is harmless.
 fn sender_context() -> serde_json::Value {
     let tmux_pane = std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty());
     let pane_var = tmux_pane.as_deref().and_then(tmux_var::get);
     let env_var = std::env::var("OUIJA_SESSION_ID").ok();
+    let backend_identity = backend::BackendRegistry::default_registry().caller_session_identity();
     let self_id = match pick_session_id(tmux_pane.as_deref(), pane_var, env_var) {
         SessionIdResolution::Found(id, _) => Some(id),
         SessionIdResolution::LookupByPane(_) | SessionIdResolution::None => None,
@@ -2057,6 +2119,7 @@ fn sender_context() -> serde_json::Value {
     serde_json::json!({
         "pane": tmux_pane,
         "self_id": self_id,
+        "backend_identity": backend_identity,
     })
 }
 
@@ -2584,6 +2647,37 @@ mod tests {
             res,
             SessionIdResolution::Found("real".into(), IdentitySource::EnvVar)
         );
+    }
+
+    #[test]
+    fn resolve_message_accepts_positional_text() {
+        let message = resolve_message(Some("hello `literal`".into()), false, None).unwrap();
+        assert_eq!(message, "hello `literal`");
+    }
+
+    #[test]
+    fn resolve_message_accepts_file_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("message.txt");
+        std::fs::write(&path, "hello $(literal)\n").unwrap();
+
+        let message = resolve_message(None, false, Some(path)).unwrap();
+
+        assert_eq!(message, "hello $(literal)\n");
+    }
+
+    #[test]
+    fn resolve_message_rejects_missing_source() {
+        let err = resolve_message(None, false, None).unwrap_err();
+
+        assert!(err.to_string().contains("provide a message argument"));
+    }
+
+    #[test]
+    fn resolve_message_rejects_multiple_sources() {
+        let err = resolve_message(Some("hello".into()), true, None).unwrap_err();
+
+        assert!(err.to_string().contains("provide only one message source"));
     }
 
     #[test]

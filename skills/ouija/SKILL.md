@@ -33,13 +33,25 @@ Quick task — reply immediately:
 ouija reply session-id 47 "result"
 ```
 
+Use `--stdin` for generated or multi-line message text so shells cannot expand
+backticks, `$()`, quotes, or JSON before `ouija` receives the content:
+```bash
+ouija reply session-id 47 --stdin <<'EOF'
+done: here is the result
+EOF
+```
+
 Long task — send progress first, then final result:
 ```bash
 # Progress (resets nudge timer, doesn't clear pending reply):
-ouija tell session-id "working on it" --reply-to 47
+ouija tell session-id --reply-to 47 --stdin <<'EOF'
+working on it
+EOF
 
 # Final result (clears pending reply):
-ouija reply session-id 47 "done: here is the result"
+ouija reply session-id 47 --stdin <<'EOF'
+done: here is the result
+EOF
 ```
 
 ## 2. Discovering sessions
@@ -58,6 +70,11 @@ ouija ask target-id "question"
 
 # Inform (fire-and-forget):
 ouija tell target-id "fyi: deploy done"
+
+# Safer for generated or multi-line text:
+ouija ask target-id --stdin <<'EOF'
+question with `literal shell syntax`
+EOF
 ```
 
 `ouija ask` sends the question and returns after delivery. The reply is pushed

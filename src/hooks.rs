@@ -228,6 +228,8 @@ async fn post_compact_inner(
 pub struct SessionStartBody {
     pub pane: String,
     pub cwd: String,
+    #[serde(default)]
+    pub backend_session_id: Option<String>,
 }
 
 /// POST /api/hooks/session-start
@@ -263,6 +265,8 @@ fn mesh_instructions_for_backend(backend: Option<&str>, public_id: &str) -> Stri
          - `ouija tell <target> \"note\" --from {public_id}` — fire-and-forget message.\n\
          - `ouija reply <target> <msg-id> \"answer\" --from {public_id}` — answer a \
          `<msg ... reply=\"true\">` you received (the sender is blocked until you reply).\n\n\
+         For generated or multi-line message text, use `--stdin` instead of putting the \
+         message in shell quotes.\n\n\
          Incoming messages arrive as `<msg from=\"...\" id=\"N\" reply=\"true\">text</msg>`; \
          reply to those with `reply=\"true\"` using their `id`. Replies to your asks are pushed \
          into this session later as `<msg ... re=\"N\">...</msg>`. If that reply is your only \
@@ -293,6 +297,31 @@ async fn session_start_inner(
                 .get(&existing_id)
                 .and_then(|s| s.metadata.backend.clone())
         };
+        if let Some(backend_session_id) =
+            normalize_backend_session_id(body.backend_session_id.as_deref())
+        {
+            let updated = {
+                let proto = state.protocol.read().await;
+                proto.sessions.get(&existing_id).and_then(|session| {
+                    let needs_binding = session.metadata.backend_session_id.as_deref()
+                        != Some(backend_session_id.as_str());
+                    needs_binding.then(|| {
+                        let mut metadata = session.metadata.clone();
+                        metadata.backend_session_id = Some(backend_session_id.clone());
+                        metadata
+                    })
+                })
+            };
+            if let Some(metadata) = updated {
+                state
+                    .apply_and_execute(crate::daemon_protocol::Event::Register {
+                        id: existing_id.clone(),
+                        pane: Some(body.pane.clone()),
+                        metadata,
+                    })
+                    .await;
+            }
+        }
         let output = mesh_instructions_for_backend(existing_backend.as_deref(), &existing_id);
         return json!({
             "registered": existing_id,
@@ -326,12 +355,15 @@ async fn session_start_inner(
     // Detect backend from the process running in the pane
     let detected_backend = state.detect_backend_in_pane(&body.pane).await;
 
-    // For opencode sessions, resolve the backend_session_id from the shared
-    // serve so we can deliver messages via HTTP instead of tmux injection.
-    let backend_session_id = if detected_backend.as_deref() == Some("opencode") {
-        resolve_opencode_session_id(state, project_root).await
-    } else {
-        None
+    // Prefer the identity supplied by the backend's SessionStart adapter.
+    // OpenCode has no such hook, so retain its shared-serve lookup fallback.
+    let backend_session_id = match normalize_backend_session_id(body.backend_session_id.as_deref())
+    {
+        Some(session_id) => Some(session_id),
+        None if detected_backend.as_deref() == Some("opencode") => {
+            resolve_opencode_session_id(state, project_root).await
+        }
+        None => None,
     };
 
     // Compute mesh onboarding text before `detected_backend` is moved into the
@@ -359,6 +391,13 @@ async fn session_start_inner(
         "registered": id,
         "output": output,
     })
+}
+
+fn normalize_backend_session_id(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(String::from)
 }
 
 /// Query the opencode serve to find the most recently updated session for a
@@ -601,6 +640,7 @@ mod tests {
         let body = SessionStartBody {
             pane: "%70".into(),
             cwd: "/home/user/code/proj".into(),
+            backend_session_id: Some("codex-thread-1".into()),
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "feat/worker");
@@ -613,10 +653,16 @@ mod tests {
             output.contains("--from feat/worker"),
             "must use the authoritative registered id: {output}"
         );
+        let proto = state.protocol.read().await;
+        let session = proto.sessions.get("feat/worker").unwrap();
+        assert_eq!(
+            session.metadata.backend_session_id.as_deref(),
+            Some("codex-thread-1")
+        );
     }
 
     #[tokio::test]
-    async fn session_start_already_registered_non_codex_stays_empty() {
+    async fn session_start_binds_identity_for_any_registered_backend() {
         let state = crate::state::AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -631,11 +677,18 @@ mod tests {
         let body = SessionStartBody {
             pane: "%71".into(),
             cwd: "/home/user/code/proj".into(),
+            backend_session_id: Some("claude-session-1".into()),
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "claude-worker");
         // Claude carries the skill; its output stays empty.
         assert_eq!(result["output"], "");
+        let proto = state.protocol.read().await;
+        let session = proto.sessions.get("claude-worker").unwrap();
+        assert_eq!(
+            session.metadata.backend_session_id.as_deref(),
+            Some("claude-session-1")
+        );
     }
 
     #[tokio::test]
@@ -644,6 +697,7 @@ mod tests {
         let body = SessionStartBody {
             pane: "%50".into(),
             cwd: "/home/user/code/myproject".into(),
+            backend_session_id: None,
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "myproject");
@@ -665,6 +719,7 @@ mod tests {
         let body = SessionStartBody {
             pane: "%50".into(),
             cwd: "/home/user/code/existing".into(),
+            backend_session_id: None,
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "existing");
@@ -680,6 +735,7 @@ mod tests {
         let body = SessionStartBody {
             pane: "%50".into(),
             cwd: "/home/user/code/ouija/.ouija/worktrees/feature-x".into(),
+            backend_session_id: None,
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "ouija");

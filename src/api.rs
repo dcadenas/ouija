@@ -4433,6 +4433,7 @@ mod tests {
                 sender_ctx: Some(crate::daemon_protocol::SenderContext {
                     pane: None,
                     self_id: None,
+                    ..Default::default()
                 }),
             }),
         )
@@ -4546,6 +4547,7 @@ mod tests {
                 sender_ctx: Some(crate::daemon_protocol::SenderContext {
                     pane: None,
                     self_id: Some("oc-b".into()),
+                    ..Default::default()
                 }),
             }),
         )
@@ -4600,6 +4602,7 @@ mod tests {
                 sender_ctx: Some(crate::daemon_protocol::SenderContext {
                     pane: None,
                     self_id: Some("oc-a".into()),
+                    ..Default::default()
                 }),
             }),
         )

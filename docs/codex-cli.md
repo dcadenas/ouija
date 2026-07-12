@@ -145,11 +145,11 @@ Codex learns the mesh two complementary ways:
 
 1. **Installed skill.** `~/.codex/skills/ouija/SKILL.md` (the same skill Claude
    Code and OpenCode use) is installed into Codex's skill-discovery path, so Codex
-   can activate it on incoming `<msg from="…">` tags. The stock skill is safe for
-   Codex: its bash tool inherits `OUIJA_SESSION_ID` (Ouija exports it at pane fork
-   via `tmux::pane_env_args`), so `ouija whoami` and sender auto-resolution work,
-   and the skill's section 7 already teaches `ouija whoami` / `$OUIJA_SESSION_ID`
-   as the only valid identity source and forbids guessing a `--from`.
+   can activate it on incoming `<msg from="…">` tags. Codex tool shells may run
+   without `TMUX_PANE` or `OUIJA_SESSION_ID`, so the Codex adapter reads its
+   native `CODEX_THREAD_ID` and presents it through Ouija's generic backend
+   identity contract. The daemon accepts it only when the backend name and
+   opaque session id match the values recorded by the SessionStart hook.
 
 2. **Dynamic `SessionStart` `additionalContext`.** The static skill cannot know a
    session's *live* public Ouija id, so on session start Ouija still returns short
@@ -162,6 +162,9 @@ Codex learns the mesh two complementary ways:
    ouija tell <target> "note" --from <your-public-id>
    ouija reply <target> <msg-id> "answer" --from <your-public-id>
    ```
+
+   For generated or multi-line text, use `--stdin` or `--message-file` instead
+   of putting the message body in shell quotes.
 
    `--from <your-public-id>` is included because Codex's bash tool cannot be relied
    on to carry `TMUX_PANE` for sender resolution — but since `OUIJA_SESSION_ID` is

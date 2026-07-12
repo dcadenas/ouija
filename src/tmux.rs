@@ -781,6 +781,32 @@ pub fn enable_automatic_rename(pane_id: &str) {
         .status();
 }
 
+/// Configure tmux options for panes/windows managed by ouija.
+pub fn configure_managed_pane(pane_id: &str) {
+    if cfg!(test) {
+        return;
+    }
+
+    // Keep ouija's window name stable, but do not preserve dead panes.
+    let _ = Command::new("tmux")
+        .args([
+            "set-window-option",
+            "-t",
+            pane_id,
+            "automatic-rename",
+            "off",
+        ])
+        .status();
+    let _ = Command::new("tmux")
+        .args(["set-window-option", "-t", pane_id, "remain-on-exit", "off"])
+        .status();
+}
+
+/// Wrap a command pasted into an interactive shell so the shell exits after it.
+pub fn close_shell_after(command: &str) -> String {
+    format!("{command}; exit")
+}
+
 /// Build the `-e KEY=VALUE` argument list handed to `tmux new-window`,
 /// `tmux new-session`, and `tmux respawn-pane` when ouija spawns a pane.
 ///
@@ -892,6 +918,14 @@ mod tests {
             );
             i += 2;
         }
+    }
+
+    #[test]
+    fn close_shell_after_appends_exit() {
+        assert_eq!(
+            close_shell_after("claude --danger"),
+            "claude --danger; exit"
+        );
     }
 
     #[test]

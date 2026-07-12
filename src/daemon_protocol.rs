@@ -746,6 +746,12 @@ pub struct SenderContext {
     /// claim of a *sibling* session cannot.
     #[serde(default)]
     pub self_id: Option<String>,
+    /// Backend-native identity for paneless tool shells.
+    ///
+    /// Each backend adapter discovers its own opaque session ID. The protocol
+    /// compares both the backend name and ID with SessionStart metadata.
+    #[serde(default)]
+    pub backend_identity: Option<crate::backend::BackendSessionIdentity>,
 }
 
 /// Boundary validation for `/api/send` sender claims (task #1395).
@@ -762,17 +768,12 @@ pub struct SenderContext {
 /// - the claimed session is bound to a tmux pane and the caller reports a
 ///   *different* pane;
 /// - the claimed session is bound to a tmux pane and the caller reports no
-///   pane at all. A tmux-native session cannot be claimed this way. For a
-///   backend whose shell provably drops `$TMUX_PANE` (opencode), the claim is
-///   allowed only when the caller's own resolved id (`ctx.self_id`, from
-///   `$OUIJA_SESSION_ID`) equals `from` — i.e. it is sending as *itself*. A
-///   paneless claim of a *sibling* opencode session, whose `self_id` differs,
-///   is rejected (task #1395 review);
-/// - the claimed session is opencode-backed with no pane binding (unmanaged
-///   `opencode serve` adoption). No pane exists to compare, but the claim is
-///   still verifiable: the only honest claimant is the session itself, so
-///   the same `self_id == from` binding applies. Non-opencode paneless
-///   sessions remain genuinely unverifiable and pass (task #1395 review f0).
+///   pane at all. The claim is allowed only when the caller presents a generic
+///   self-proof that matches the claimed session. A paneless claim of a sibling
+///   session remains rejected (task #1395 review);
+/// - the claimed session has no pane binding but has a self-proof recorded.
+///   The same proof is required. Sessions with neither proof remain genuinely
+///   unverifiable and pass (task #1395 review f0).
 ///
 /// Unregistered `from` ids pass: ghost senders (already-removed sessions)
 /// are legitimate in reply-cleanup flows, and existence is not what this
@@ -793,14 +794,14 @@ pub fn validate_sender_claim(
             session.origin.label()
         ));
     }
-    let is_opencode = session.metadata.backend.as_deref() == Some("opencode");
     let Some(session_pane) = session.pane.as_deref() else {
-        // No pane to compare, but an opencode-backed session is still
-        // verifiable: only itself can honestly claim it, and it resolves its
-        // own id via `$OUIJA_SESSION_ID` (#1395 review f0). Other paneless
-        // sessions offer no signal at all and pass.
-        return if is_opencode {
-            verify_opencode_self_claim(from, ctx)
+        // No pane to compare. Require a proof when the session has one recorded
+        // or the caller presents one; otherwise preserve legacy paneless behavior.
+        return if session.metadata.backend_session_id.is_some()
+            || ctx.self_id.as_deref().is_some_and(|id| !id.is_empty())
+            || ctx.backend_identity.is_some()
+        {
+            verify_session_self_claim(from, session, ctx)
         } else {
             Ok(())
         };
@@ -813,42 +814,49 @@ pub fn validate_sender_claim(
              session id. Never guess a sender id."
         )),
         None => {
-            if is_opencode {
-                // A paneless opencode caller cannot offer pane proof, but it
-                // resolves its OWN id via `$OUIJA_SESSION_ID`. Bind the claim
-                // to that self-report: sending as itself is allowed; claiming
-                // a sibling opencode session (self_id != from) is not.
-                verify_opencode_self_claim(from, ctx)
-            } else {
-                Err(format!(
-                    "sender claim rejected: session '{from}' is bound to tmux pane \
-                     {session_pane}, but this command ran outside tmux so the claim cannot be \
-                     verified. Your own session id is in your injected system prompt; run \
-                     `ouija whoami` for diagnostics. Never guess a sender id."
-                ))
-            }
+            // Any backend may prove a paneless self-send. Discovery belongs to
+            // the adapter; this validator only compares opaque identities.
+            verify_session_self_claim(from, session, ctx)
         }
     }
 }
 
-/// Bind a claim of an opencode-backed session to the caller's own resolved
-/// id: only `self_id == from` (a self-send) passes. Unresolved or mismatched
-/// self-reports fail closed — an unmanaged shell without `$OUIJA_SESSION_ID`
-/// has no provable identity (task #1395 review f0).
-fn verify_opencode_self_claim(from: &str, ctx: &SenderContext) -> Result<(), String> {
-    match ctx.self_id.as_deref().filter(|s| !s.is_empty()) {
-        Some(self_id) if self_id == from => Ok(()),
-        _ => Err(format!(
-            "sender claim rejected: '{from}' is an opencode session, and only itself may send \
-             as it, but this command's own resolved id is {}. Run `ouija whoami` for your own \
-             id. Never guess a sender id.",
-            ctx.self_id
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map(|s| format!("'{s}'"))
-                .unwrap_or_else(|| "unresolved".into())
-        )),
+/// Bind a paneless backend claim to the caller's own stable identity.
+///
+/// A public Ouija ID or matching backend-native identity proves the claim.
+fn verify_session_self_claim(
+    from: &str,
+    session: &SessionEntry,
+    ctx: &SenderContext,
+) -> Result<(), String> {
+    if ctx.self_id.as_deref().filter(|s| !s.is_empty()) == Some(from) {
+        return Ok(());
     }
+    if let (Some(expected_backend), Some(expected_session_id), Some(actual)) = (
+        session.metadata.backend.as_deref(),
+        session.metadata.backend_session_id.as_deref(),
+        ctx.backend_identity.as_ref(),
+    ) {
+        if actual.backend == expected_backend && actual.session_id == expected_session_id {
+            return Ok(());
+        }
+    }
+
+    let backend = session.metadata.backend.as_deref().unwrap_or("unknown");
+    Err(format!(
+        "sender claim rejected: '{from}' is a {backend} session, and only itself may send \
+         as it. This command's own resolved id is {}, backend identity is {}. Run \
+         `ouija whoami` for your own id. Never guess a sender id.",
+        ctx.self_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("'{s}'"))
+            .unwrap_or_else(|| "unresolved".into()),
+        ctx.backend_identity
+            .as_ref()
+            .map(|identity| format!("'{}/{}'", identity.backend, identity.session_id))
+            .unwrap_or_else(|| "unresolved".into())
+    ))
 }
 
 // --- Implementation ---
@@ -2651,6 +2659,7 @@ mod tests {
         let ctx = SenderContext {
             pane: None,
             self_id: None,
+            ..Default::default()
         };
         let err = validate_sender_claim(&state, "tmux-native", &ctx).unwrap_err();
         assert!(
@@ -2672,6 +2681,7 @@ mod tests {
         let ctx = SenderContext {
             pane: None,
             self_id: Some("oc-session".into()),
+            ..Default::default()
         };
         assert_eq!(validate_sender_claim(&state, "oc-session", &ctx), Ok(()));
     }
@@ -2695,6 +2705,7 @@ mod tests {
         let ctx = SenderContext {
             pane: None,
             self_id: Some("oc-sibling".into()),
+            ..Default::default()
         };
         let err = validate_sender_claim(&state, "oc-session", &ctx).unwrap_err();
         assert!(
@@ -2715,6 +2726,7 @@ mod tests {
         let ctx = SenderContext {
             pane: None,
             self_id: None,
+            ..Default::default()
         };
         let err = validate_sender_claim(&state, "oc-session", &ctx).unwrap_err();
         assert!(
@@ -2737,6 +2749,100 @@ mod tests {
         });
     }
 
+    fn register_codex(state: &mut DaemonState, id: &str, pane: Option<&str>, thread_id: &str) {
+        state.apply(Event::Register {
+            id: id.into(),
+            pane: pane.map(String::from),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                backend_session_id: Some(thread_id.into()),
+                ..Default::default()
+            },
+        });
+    }
+
+    #[test]
+    fn paneless_codex_caller_may_claim_itself_by_thread_id() {
+        // Codex exec tools in the hosted shell can lose TMUX_PANE, but they
+        // carry CODEX_THREAD_ID. Bind that to the SessionStart-recorded
+        // backend_session_id so an honest self-send can still use --from.
+        let mut state = claim_state();
+        register_codex(&mut state, "codex-worker", Some("%10"), "thread-a");
+        let ctx = SenderContext {
+            pane: None,
+            backend_identity: Some(crate::backend::BackendSessionIdentity {
+                backend: "codex-cli".into(),
+                session_id: "thread-a".into(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(validate_sender_claim(&state, "codex-worker", &ctx), Ok(()));
+    }
+
+    #[test]
+    fn paneless_codex_caller_cannot_claim_sibling_by_thread_id() {
+        let mut state = claim_state();
+        register_codex(&mut state, "codex-worker", Some("%10"), "thread-a");
+        register_codex(&mut state, "codex-sibling", Some("%11"), "thread-b");
+        let ctx = SenderContext {
+            pane: None,
+            backend_identity: Some(crate::backend::BackendSessionIdentity {
+                backend: "codex-cli".into(),
+                session_id: "thread-b".into(),
+            }),
+            ..Default::default()
+        };
+        let err = validate_sender_claim(&state, "codex-worker", &ctx).unwrap_err();
+        assert!(
+            err.contains("thread-b") && err.contains("codex-worker"),
+            "rejection must name the presented backend id and claimed session, got: {err}"
+        );
+        assert!(
+            err.contains("ouija whoami") && err.contains("Never guess"),
+            "rejection must steer to whoami and forbid guessing, got: {err}"
+        );
+    }
+
+    #[test]
+    fn paneless_future_backend_uses_the_same_identity_contract() {
+        let mut state = claim_state();
+        state.apply(Event::Register {
+            id: "future-worker".into(),
+            pane: Some("%12".into()),
+            metadata: SessionMeta {
+                backend: Some("future-engine".into()),
+                backend_session_id: Some("native-42".into()),
+                ..Default::default()
+            },
+        });
+        let ctx = SenderContext {
+            pane: None,
+            backend_identity: Some(crate::backend::BackendSessionIdentity {
+                backend: "future-engine".into(),
+                session_id: "native-42".into(),
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(validate_sender_claim(&state, "future-worker", &ctx), Ok(()));
+    }
+
+    #[test]
+    fn backend_identity_must_match_both_backend_and_session() {
+        let mut state = claim_state();
+        register_codex(&mut state, "codex-worker", Some("%10"), "shared-id");
+        let ctx = SenderContext {
+            pane: None,
+            backend_identity: Some(crate::backend::BackendSessionIdentity {
+                backend: "different-engine".into(),
+                session_id: "shared-id".into(),
+            }),
+            ..Default::default()
+        };
+
+        assert!(validate_sender_claim(&state, "codex-worker", &ctx).is_err());
+    }
+
     #[test]
     fn paneless_caller_cannot_claim_paneless_opencode_session_of_sibling() {
         // The paneless-victim gap (#1395 review f0): an OpenCode session with
@@ -2748,6 +2854,7 @@ mod tests {
         let ctx = SenderContext {
             pane: None,
             self_id: Some("oc-sibling".into()),
+            ..Default::default()
         };
         let err = validate_sender_claim(&state, "oc-serve", &ctx).unwrap_err();
         assert!(
@@ -2770,6 +2877,7 @@ mod tests {
         let ctx = SenderContext {
             pane: Some("%3".into()),
             self_id: Some("tmux-native".into()),
+            ..Default::default()
         };
         let err = validate_sender_claim(&state, "oc-serve", &ctx).unwrap_err();
         assert!(
@@ -2787,6 +2895,7 @@ mod tests {
         let ctx = SenderContext {
             pane: None,
             self_id: Some("oc-serve".into()),
+            ..Default::default()
         };
         assert_eq!(validate_sender_claim(&state, "oc-serve", &ctx), Ok(()));
     }
@@ -2805,6 +2914,7 @@ mod tests {
         let ctx = SenderContext {
             pane: None,
             self_id: None,
+            ..Default::default()
         };
         let err = validate_sender_claim(&state, "oc-serve", &ctx).unwrap_err();
         assert!(
@@ -2828,6 +2938,7 @@ mod tests {
         let ctx = SenderContext {
             pane: None,
             self_id: None,
+            ..Default::default()
         };
         assert_eq!(validate_sender_claim(&state, "headless", &ctx), Ok(()));
     }
@@ -2840,6 +2951,7 @@ mod tests {
         let ctx = SenderContext {
             pane: None,
             self_id: None,
+            ..Default::default()
         };
         assert_eq!(validate_sender_claim(&state, "not-a-session", &ctx), Ok(()));
     }

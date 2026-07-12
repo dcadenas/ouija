@@ -411,6 +411,21 @@ assert_contains "T3: trigger task returns id" "$T3" "$T1_ID"
 T4=$(api "$BASE" GET /api/task-runs)
 assert_contains "T4: task runs has entry" "$T4" "$T1_ID"
 
+# T4b: Triggering a task for an alive ContinueSession target injects the prompt
+api "$BASE" POST /api/register -d "{\"id\":\"sched-live\",\"pane\":\"$PANE_A\"}" >/dev/null
+SCHED_PROMPT="scheduled live prompt $(date +%s)"
+T4B=$(api "$BASE" POST /api/tasks -d "{\"name\":\"live-inject-task\",\"cron\":\"0 0 * * *\",\"target_session\":\"sched-live\",\"prompt\":\"$SCHED_PROMPT\"}")
+T4B_ID=$(echo "$T4B" | jq -r '.created // ""')
+assert_contains "T4b: create live inject task returns id" "$T4B" "created"
+api "$BASE" POST /api/tasks/trigger -d "{\"id\":\"$T4B_ID\"}" >/dev/null
+wait_for 5 bash -c "tmux capture-pane -t '$PANE_A' -p -S -20 | grep -qF '$SCHED_PROMPT'"
+pane_content=$(tmux capture-pane -t "$PANE_A" -p -S -20)
+assert_contains "T4b: scheduled prompt appears in live pane" "$pane_content" "$SCHED_PROMPT"
+T4B_RUNS=$(api "$BASE" GET /api/task-runs)
+assert_contains "T4b: live inject task run logged" "$T4B_RUNS" "$T4B_ID"
+api "$BASE" DELETE /api/tasks -d "{\"id\":\"$T4B_ID\"}" >/dev/null
+api "$BASE" POST /api/remove -d '{"id":"sched-live"}' >/dev/null 2>&1 || true
+
 # T5: Disable task
 T5=$(api "$BASE" POST /api/tasks/disable -d "{\"id\":\"$T1_ID\"}")
 assert_contains "T5: disable task" "$T5" "$T1_ID"

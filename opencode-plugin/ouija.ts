@@ -81,6 +81,7 @@ Your text output is NOT visible to other sessions. Use the \`ouija\` CLI to comm
 - Send a fire-and-forget message: \`ouija tell TARGET "info" --from ${publicSessionId}\`
 - Reply to <msg id="N">: \`ouija reply TARGET N "result" --from ${publicSessionId}\`
 - Progress update (does not clear pending reply): \`ouija tell TARGET "working on it" --reply-to N --from ${publicSessionId}\`
+- For generated or multi-line text, use \`--stdin\` instead of putting the message in shell quotes.
 
 ${senderGuidance} Do not use the backend label \`opencode\` or an OpenCode backend_session_id as \`--from\`.
 
