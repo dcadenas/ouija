@@ -141,6 +141,17 @@ pub struct SessionMeta {
     /// Reminder text re-injected on idle. Also appended to prompt at session start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reminder: Option<String>,
+    /// Explicit parent session that owns lifecycle decisions for this session.
+    ///
+    /// `None` means either this session was spawned with no parent, or it is
+    /// legacy metadata written before lifecycle policy existed. The companion
+    /// `idle_policy` field distinguishes new lifecycle-aware sessions from
+    /// legacy sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session: Option<String>,
+    /// Explicit behavior to follow when this session is idle or done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_policy: Option<IdlePolicy>,
     /// Original prompt from session_start, stored for re-injection on iteration.
     #[serde(
         default,
@@ -177,6 +188,80 @@ pub struct SessionMeta {
     /// `project_dir` lives on another machine and is not locally checkable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_present: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IdlePolicy {
+    KeepOpen,
+    AskParentWhenDone,
+    CloseWhenDone,
+}
+
+impl IdlePolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IdlePolicy::KeepOpen => "keep-open",
+            IdlePolicy::AskParentWhenDone => "ask-parent-when-done",
+            IdlePolicy::CloseWhenDone => "close-when-done",
+        }
+    }
+}
+
+impl std::str::FromStr for IdlePolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "keep-open" => Ok(IdlePolicy::KeepOpen),
+            "ask-parent-when-done" => Ok(IdlePolicy::AskParentWhenDone),
+            "close-when-done" => Ok(IdlePolicy::CloseWhenDone),
+            other => Err(format!(
+                "invalid idle policy '{other}'; valid choices: {IDLE_POLICY_CHOICES}"
+            )),
+        }
+    }
+}
+
+pub const IDLE_POLICY_CHOICES: &str = "keep-open|ask-parent-when-done|close-when-done";
+
+pub fn validate_spawn_lifecycle(
+    parent_session: Option<&str>,
+    no_parent_session: bool,
+    idle_policy: Option<&IdlePolicy>,
+) -> Result<(), String> {
+    let parent_session = parent_session
+        .map(str::trim)
+        .filter(|session| !session.is_empty());
+
+    if parent_session.is_some() && no_parent_session {
+        return Err(
+            "choose exactly one parent ownership flag: --parent-session <SESSION_ID> or --no-parent-session"
+                .to_string(),
+        );
+    }
+
+    if parent_session.is_none() && !no_parent_session {
+        return Err(
+            "spawn-session requires explicit parent ownership: pass --parent-session <SESSION_ID> or --no-parent-session"
+                .to_string(),
+        );
+    }
+
+    let Some(idle_policy) = idle_policy else {
+        return Err(format!(
+            "spawn-session requires --idle-policy <{IDLE_POLICY_CHOICES}>"
+        ));
+    };
+
+    if *idle_policy == IdlePolicy::AskParentWhenDone && parent_session.is_none() {
+        return Err(
+            "idle policy ask-parent-when-done requires --parent-session <SESSION_ID>; use keep-open or close-when-done with --no-parent-session"
+                .to_string(),
+        );
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -237,6 +322,82 @@ impl SessionMeta {
         self.reminder
             .as_deref()
             .is_some_and(|r| !r.trim().is_empty())
+            || self.idle_policy.is_some()
+    }
+
+    pub fn effective_reminder(&self, session_id: &str, clearing_id: Option<u64>) -> Option<String> {
+        let manual = self
+            .reminder
+            .as_deref()
+            .filter(|reminder| !reminder.trim().is_empty());
+        let lifecycle = self.lifecycle_reminder(session_id, clearing_id);
+
+        match (manual, lifecycle) {
+            (Some(manual), Some(lifecycle)) => Some(format!("{manual}\n\n{lifecycle}")),
+            (Some(manual), None) => Some(manual.to_string()),
+            (None, Some(lifecycle)) => Some(lifecycle),
+            (None, None) => None,
+        }
+    }
+
+    pub fn lifecycle_reminder(&self, session_id: &str, clearing_id: Option<u64>) -> Option<String> {
+        let policy = self.idle_policy.as_ref()?;
+        let mut lines = vec![
+            format!("Lifecycle policy: {}", policy.as_str()),
+            format!("Current session id: {session_id}"),
+        ];
+        if let Some(parent) = self.parent_session.as_deref() {
+            lines.push(format!("Parent session id: {parent}"));
+        }
+
+        match policy {
+            IdlePolicy::KeepOpen => {
+                lines.push("When work is complete or intentionally paused, stay open.".to_string());
+                if let Some(clearing_id) = clearing_id {
+                    lines.push(format!(
+                        "Run `ouija clear-reminder {clearing_id}` if this idle reminder should stop."
+                    ));
+                }
+                lines.push(
+                    "Do not close this session unless a human or parent explicitly asks you to."
+                        .to_string(),
+                );
+            }
+            IdlePolicy::AskParentWhenDone => {
+                let parent = self
+                    .parent_session
+                    .as_deref()
+                    .unwrap_or("<missing-parent-session>");
+                lines.push(
+                    "When work is complete, ask the parent what to do next using stdin, then wait for the reply."
+                        .to_string(),
+                );
+                lines.push(format!(
+                    "Example: printf '%s\\n' 'done: <summary>' | ouija ask {parent} --stdin --from {session_id}"
+                ));
+                if let Some(clearing_id) = clearing_id {
+                    lines.push(format!(
+                        "After the parent has been asked, run `ouija clear-reminder {clearing_id}` if this idle reminder should stop while you wait."
+                    ));
+                }
+            }
+            IdlePolicy::CloseWhenDone => {
+                lines.push(
+                    "When work is complete and no pending reply is owed, close this session while preserving its worktree."
+                        .to_string(),
+                );
+                lines.push(format!(
+                    "Close command: ouija kill-session {session_id} --keep-worktree"
+                ));
+                if let Some(clearing_id) = clearing_id {
+                    lines.push(format!(
+                        "If work is not complete but this idle reminder is handled, run `ouija clear-reminder {clearing_id}`."
+                    ));
+                }
+            }
+        }
+
+        Some(lines.join("\n"))
     }
 
     /// Fill recurrence fields from `source` for any field still at its default value.
@@ -255,6 +416,16 @@ impl SessionMeta {
         }
         if self.reminder.is_none() {
             self.reminder = source.reminder.clone();
+        }
+        // `parent_session: None` plus an explicit idle policy means the
+        // register intentionally cleared its parent; blank startup hooks have
+        // both fields absent and still inherit lifecycle metadata.
+        let has_explicit_lifecycle_policy = self.idle_policy.is_some();
+        if self.parent_session.is_none() && !has_explicit_lifecycle_policy {
+            self.parent_session = source.parent_session.clone();
+        }
+        if self.idle_policy.is_none() {
+            self.idle_policy = source.idle_policy.clone();
         }
         if self.iteration == 0 && source.iteration > 0 {
             self.iteration = source.iteration;
@@ -300,6 +471,8 @@ impl Default for SessionMeta {
             effort: None,
             codex_home: None,
             reminder: None,
+            parent_session: None,
+            idle_policy: None,
             prompt: None,
             iteration: 0,
             iteration_log: Vec::new(),
@@ -704,6 +877,8 @@ pub(crate) fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>
             effort: m.effort.clone(),
             codex_home: m.codex_home.clone(),
             reminder: m.reminder.clone(),
+            parent_session: m.parent_session.clone(),
+            idle_policy: m.idle_policy.clone(),
             prompt: m.prompt.clone(),
             iteration: m.iteration,
             iteration_log: m.iteration_log.clone(),
@@ -3131,6 +3306,83 @@ mod tests {
     }
 
     #[test]
+    fn effective_reminder_appends_keep_open_lifecycle_text() {
+        let meta = SessionMeta {
+            reminder: Some("check the build status".into()),
+            idle_policy: Some(IdlePolicy::KeepOpen),
+            ..Default::default()
+        };
+        let reminder = meta.effective_reminder("worker-1", Some(42)).unwrap();
+
+        assert!(reminder.starts_with("check the build status\n\n"));
+        assert!(reminder.contains("Lifecycle policy: keep-open"));
+        assert!(reminder.contains("Current session id: worker-1"));
+        assert!(reminder.contains("ouija clear-reminder 42"));
+        assert!(reminder.contains("stay open"));
+        assert!(!reminder.contains("kill-session"));
+    }
+
+    #[test]
+    fn effective_reminder_appends_ask_parent_lifecycle_text() {
+        let meta = SessionMeta {
+            parent_session: Some("parent-session".into()),
+            idle_policy: Some(IdlePolicy::AskParentWhenDone),
+            ..Default::default()
+        };
+        let reminder = meta.effective_reminder("worker-2", Some(7)).unwrap();
+
+        assert!(reminder.contains("Lifecycle policy: ask-parent-when-done"));
+        assert!(reminder.contains("Current session id: worker-2"));
+        assert!(reminder.contains("Parent session id: parent-session"));
+        assert!(reminder.contains("ouija ask parent-session --stdin --from worker-2"));
+        assert!(reminder.contains("ouija clear-reminder 7"));
+    }
+
+    #[test]
+    fn effective_reminder_appends_close_when_done_lifecycle_text() {
+        let meta = SessionMeta {
+            idle_policy: Some(IdlePolicy::CloseWhenDone),
+            ..Default::default()
+        };
+        let reminder = meta.effective_reminder("worker-3", Some(9)).unwrap();
+
+        assert!(reminder.contains("Lifecycle policy: close-when-done"));
+        assert!(reminder.contains("Current session id: worker-3"));
+        assert!(reminder.contains("ouija kill-session worker-3 --keep-worktree"));
+        assert!(reminder.contains("ouija clear-reminder 9"));
+    }
+
+    #[test]
+    fn launch_time_lifecycle_reminder_omits_clear_command_without_clearing_id() {
+        let meta = SessionMeta {
+            parent_session: Some("parent-session".into()),
+            idle_policy: Some(IdlePolicy::AskParentWhenDone),
+            ..Default::default()
+        };
+        let reminder = meta.effective_reminder("worker-4", None).unwrap();
+
+        assert!(reminder.contains("Lifecycle policy: ask-parent-when-done"));
+        assert!(reminder.contains("Current session id: worker-4"));
+        assert!(reminder.contains("Parent session id: parent-session"));
+        assert!(reminder.contains("ouija ask parent-session --stdin --from worker-4"));
+        assert!(!reminder.contains("ouija clear-reminder"));
+        assert!(!reminder.contains("<clearing_id>"));
+    }
+
+    #[test]
+    fn lifecycle_metadata_is_backward_compatible() {
+        let decoded: SessionMeta =
+            serde_json::from_str(r#"{"project_dir":"/tmp/wt","reminder":"old"}"#).unwrap();
+
+        assert_eq!(decoded.parent_session, None);
+        assert_eq!(decoded.idle_policy, None);
+        assert_eq!(
+            decoded.effective_reminder("legacy", Some(1)).as_deref(),
+            Some("old")
+        );
+    }
+
+    #[test]
     fn inherit_recurrence_carries_last_iteration_at() {
         let source = SessionMeta {
             last_iteration_at: Some(1711100000),
@@ -3228,6 +3480,66 @@ mod tests {
         target.inherit_recurrence_from(&source);
         assert_eq!(target.model.as_deref(), Some("opus"));
         assert_eq!(target.effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn register_hard_restart_no_parent_does_not_inherit_old_parent() {
+        let mut state = DaemonState::new_for_model("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                parent_session: Some("old-parent".into()),
+                idle_policy: Some(IdlePolicy::AskParentWhenDone),
+                ..Default::default()
+            },
+        });
+
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                parent_session: None,
+                idle_policy: Some(IdlePolicy::KeepOpen),
+                ..Default::default()
+            },
+        });
+
+        let meta = &state
+            .sessions
+            .get("worker")
+            .expect("session registered")
+            .metadata;
+        assert_eq!(meta.parent_session, None);
+        assert_eq!(meta.idle_policy, Some(IdlePolicy::KeepOpen));
+    }
+
+    #[test]
+    fn register_blank_reregister_preserves_lifecycle_metadata() {
+        let mut state = DaemonState::new_for_model("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                parent_session: Some("parent".into()),
+                idle_policy: Some(IdlePolicy::AskParentWhenDone),
+                ..Default::default()
+            },
+        });
+
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta::default(),
+        });
+
+        let meta = &state
+            .sessions
+            .get("worker")
+            .expect("session registered")
+            .metadata;
+        assert_eq!(meta.parent_session.as_deref(), Some("parent"));
+        assert_eq!(meta.idle_policy, Some(IdlePolicy::AskParentWhenDone));
     }
 
     #[test]

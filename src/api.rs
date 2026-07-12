@@ -2426,6 +2426,12 @@ pub struct SessionNameBody {
     effort: Option<String>,
     #[serde(default)]
     reminder: Option<String>,
+    #[serde(default)]
+    parent_session: Option<String>,
+    #[serde(default)]
+    no_parent_session: Option<bool>,
+    #[serde(default)]
+    idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
     /// Git branch name for worktree sessions. If omitted, defaults to the session name.
     #[serde(default)]
     branch: Option<String>,
@@ -2484,6 +2490,15 @@ fn restart_drops_destructive_intent(body: &SessionNameBody) -> Option<String> {
         body.name,
         dropped.join(", ")
     ))
+}
+
+fn validate_start_lifecycle(body: &mut SessionNameBody) -> Result<(), String> {
+    body.parent_session = normalize_optional_string(body.parent_session.take());
+    crate::daemon_protocol::validate_spawn_lifecycle(
+        body.parent_session.as_deref(),
+        body.no_parent_session.unwrap_or(false),
+        body.idle_policy.as_ref(),
+    )
 }
 
 /// Kill the coding assistant process in a session's tmux pane.
@@ -2631,6 +2646,9 @@ pub async fn start_session(
     body.model = normalize_optional_string(body.model);
     body.effort = normalize_optional_string(body.effort);
     body.backend = normalize_optional_string(body.backend);
+    if let Err(error) = validate_start_lifecycle(&mut body) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
+    }
     if let Err(response) = validate_backend_name(&state, body.backend.as_deref()) {
         return response;
     }
@@ -2665,6 +2683,11 @@ pub async fn start_session(
                 body.model.as_deref(),
                 body.effort.as_deref(),
                 body.reminder.as_deref(),
+                crate::nostr_transport::ParentSessionOverride::from_request(
+                    body.parent_session.as_deref(),
+                    body.no_parent_session.unwrap_or(false),
+                ),
+                body.idle_policy.clone(),
             )
             .await;
 
@@ -2684,6 +2707,8 @@ pub async fn start_session(
             body.model.as_deref(),
             body.effort.as_deref(),
             body.reminder.as_deref(),
+            body.parent_session.as_deref(),
+            body.idle_policy.clone(),
             body.branch.as_deref(),
             body.base_branch.as_deref(),
             body.force_reset.unwrap_or(false),
@@ -2740,6 +2765,8 @@ pub async fn restart_session(
         body.model.as_deref(),
         body.effort.as_deref(),
         body.reminder.as_deref(),
+        crate::nostr_transport::ParentSessionOverride::PreservePrevious,
+        None, // idle_policy: restart-session preserves previous lifecycle metadata
     )
     .await;
 
@@ -4054,6 +4081,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn start_lifecycle_validation_requires_parent_choice() {
+        let mut body: SessionNameBody =
+            serde_json::from_str(r#"{"name":"s","idle_policy":"keep-open"}"#).unwrap();
+        let err = validate_start_lifecycle(&mut body).unwrap_err();
+
+        assert!(
+            err.contains("--parent-session <SESSION_ID>"),
+            "error must teach parent-session choice, got: {err}"
+        );
+        assert!(
+            err.contains("--no-parent-session"),
+            "error must teach no-parent-session choice, got: {err}"
+        );
+    }
+
+    #[test]
+    fn start_lifecycle_validation_requires_idle_policy() {
+        let mut body: SessionNameBody =
+            serde_json::from_str(r#"{"name":"s","no_parent_session":true}"#).unwrap();
+        let err = validate_start_lifecycle(&mut body).unwrap_err();
+
+        assert!(
+            err.contains("--idle-policy <keep-open|ask-parent-when-done|close-when-done>"),
+            "error must teach idle-policy choices, got: {err}"
+        );
+    }
+
+    #[test]
+    fn start_lifecycle_validation_rejects_ask_parent_without_parent() {
+        let mut body: SessionNameBody = serde_json::from_str(
+            r#"{"name":"s","no_parent_session":true,"idle_policy":"ask-parent-when-done"}"#,
+        )
+        .unwrap();
+        let err = validate_start_lifecycle(&mut body).unwrap_err();
+
+        assert!(
+            err.contains("ask-parent-when-done"),
+            "error must name the incompatible policy, got: {err}"
+        );
+        assert!(
+            err.contains("--parent-session <SESSION_ID>"),
+            "error must teach the fix, got: {err}"
+        );
+    }
+
+    #[test]
+    fn start_lifecycle_validation_accepts_parent_with_ask_parent() {
+        let mut body: SessionNameBody = serde_json::from_str(
+            r#"{"name":"s","parent_session":"parent","idle_policy":"ask-parent-when-done"}"#,
+        )
+        .unwrap();
+
+        validate_start_lifecycle(&mut body).expect("valid lifecycle policy");
+        assert_eq!(body.parent_session.as_deref(), Some("parent"));
+    }
+
     fn assert_unknown_backend_response(status: StatusCode, body: &serde_json::Value) {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let error = body["error"].as_str().unwrap_or_default();
@@ -4090,6 +4174,9 @@ mod tests {
                 model: None,
                 effort: None,
                 reminder: None,
+                parent_session: None,
+                no_parent_session: Some(true),
+                idle_policy: Some(crate::daemon_protocol::IdlePolicy::KeepOpen),
                 branch: None,
                 base_branch: None,
                 keep_worktree: None,
@@ -4117,6 +4204,9 @@ mod tests {
                 model: None,
                 effort: None,
                 reminder: None,
+                parent_session: None,
+                no_parent_session: None,
+                idle_policy: None,
                 branch: None,
                 base_branch: None,
                 keep_worktree: None,
@@ -4126,6 +4216,120 @@ mod tests {
         .await;
 
         assert_unknown_backend_response(status, &body);
+    }
+
+    #[tokio::test]
+    async fn start_existing_session_no_parent_clears_previous_parent() {
+        use axum::Json;
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use tokio::net::TcpListener;
+        use tokio::sync::Mutex;
+
+        async fn create_session() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "id": "ses_new" }))
+        }
+
+        async fn prompt_async(
+            AxumState(captured): AxumState<StdArc<Mutex<Option<String>>>>,
+            Json(body): Json<serde_json::Value>,
+        ) -> StatusCode {
+            *captured.lock().await = body["parts"][0]["text"].as_str().map(String::from);
+            StatusCode::NO_CONTENT
+        }
+
+        let captured = StdArc::new(Mutex::new(None));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session", post(create_session))
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(captured.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = crate::state::AppState::new(config);
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: None,
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_old".into()),
+                        parent_session: Some("old-parent".into()),
+                        idle_policy: Some(crate::daemon_protocol::IdlePolicy::AskParentWhenDone),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+        }
+
+        let (status, Json(body)) = start_session(
+            State(state.clone()),
+            Json(SessionNameBody {
+                name: "oc".into(),
+                fresh: None,
+                worktree: None,
+                project_dir: Some(dir.path().to_string_lossy().into_owned()),
+                prompt: Some("queued prompt".into()),
+                from: None,
+                backend: Some("opencode".into()),
+                model: None,
+                effort: None,
+                reminder: Some("new manual reminder".into()),
+                parent_session: None,
+                no_parent_session: Some(true),
+                idle_policy: Some(crate::daemon_protocol::IdlePolicy::KeepOpen),
+                branch: None,
+                base_branch: None,
+                keep_worktree: None,
+                force_reset: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED, "response: {body}");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if captured.lock().await.is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("restart prompt should be delivered");
+
+        let proto = state.protocol.read().await;
+        let metadata = &proto.sessions["oc"].metadata;
+        assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_new"));
+        assert_eq!(metadata.parent_session, None);
+        assert_eq!(
+            metadata.idle_policy,
+            Some(crate::daemon_protocol::IdlePolicy::KeepOpen)
+        );
+        let prompt = captured.lock().await.clone().unwrap();
+        assert!(prompt.contains("Lifecycle policy: keep-open"));
+        assert!(!prompt.contains("old-parent"));
+        server.abort();
     }
 
     #[tokio::test]

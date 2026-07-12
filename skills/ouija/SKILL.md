@@ -87,10 +87,15 @@ debugging suspected delivery failure.
 
 ```bash
 # Start a session:
-ouija spawn-session worker --project-dir /path/to/project --prompt "implement the feature" --reminder "When done: ouija tell hub \"done: summary\""
+ouija spawn-session worker --project-dir /path/to/project \
+  --parent-session hub --idle-policy ask-parent-when-done \
+  --prompt "implement the feature" \
+  --reminder "When finished, summarize changed files and tests for the parent."
 
 # With worktree isolation:
-ouija spawn-session worker --project-dir /path --prompt "task" --worktree --branch feature --base-branch main
+ouija spawn-session worker --project-dir /path --worktree --branch feature --base-branch main \
+  --parent-session hub --idle-policy ask-parent-when-done \
+  --prompt "task"
 
 # Restart with fresh context:
 ouija restart-session worker --fresh --prompt "new task" --reminder "when done, report back"
@@ -101,7 +106,9 @@ ouija kill-session worker
 ```
 
 Key fields:
-- `--reminder` — re-injected every time the session goes idle. Use it for report-back, self-terminate, periodic checks, or escalation
+- `--parent-session <SESSION_ID>` / `--no-parent-session` — required lifecycle ownership choice for spawned sessions
+- `--idle-policy keep-open|ask-parent-when-done|close-when-done` — required idle behavior. Ouija generates the clear/ask/kill instructions from this policy
+- `--reminder` — optional task-specific recovery text re-injected every time the session goes idle. Do not hand-write generic clear/ask/kill lifecycle prose here
 - `--worktree` — isolate in a git worktree at `~/.ouija/worktrees/<repo>/<session>`
 - `--branch` / `--base-branch` — git branch control for worktrees
 
@@ -165,7 +172,7 @@ If you see an error about being unable to resolve the current session ID, run `o
 
 ## 8. Patterns
 
-The reminder is re-injected every idle cycle and is the main knob for session control flow. Write it as code a fresh-context session can execute, not as a one-shot instruction.
+The reminder is re-injected every idle cycle and should carry task-specific recovery context. Lifecycle control flow comes from `--parent-session` / `--no-parent-session` plus `--idle-policy`, which Ouija renders into consistent clear, ask-parent, or close commands.
 
 ### Loop with termination
 
@@ -173,20 +180,22 @@ Two nested loops: the reminder re-injection is the inner loop (same context); `o
 
 ```bash
 ouija spawn-session counter \
+  --no-parent-session --idle-policy keep-open \
   --prompt "read value.txt, add 1 to the number, write it back" \
-  --reminder "if the number is < 10, call 'ouija restart-session counter --fresh'. Otherwise: ouija tell hub 'done: counter reached 10' then ouija clear-reminder N."
+  --reminder "If the number is below 10, call 'ouija restart-session counter --fresh'. If it reached 10, record that state in value.txt."
 ```
 
-The reminder is the control flow — a continue branch and a terminate branch. State lives in the world (files, git, APIs), not in the session's memory, so every iteration is re-enterable from scratch.
+The reminder is the task loop's recovery context. State lives in the world (files, git, APIs), not in the session's memory, so every iteration is re-enterable from scratch. The `keep-open` lifecycle policy tells idle sessions how to clear the idle nudge and remain available.
 
 ### Report-back when done
 
 ```bash
 ouija spawn-session worker --project-dir /path --prompt "implement feature X" \
-  --reminder "When finished: ouija tell hub \"done: <summary>\", then ouija clear-reminder N."
+  --parent-session hub --idle-policy ask-parent-when-done \
+  --reminder "When finished, include summary, tests, and changed files in the parent handoff."
 ```
 
-Without `clear-reminder N`, the worker keeps getting nudged forever after it signals done. The `N` comes from the `clearing_id` the daemon stamps on each re-injection.
+The generated lifecycle reminder includes the parent id, an `ouija ask <parent> --stdin --from <self>` handoff pattern, and the current `ouija clear-reminder N` command. The manual reminder only adds task-specific detail.
 
 ### State-check (not state-assume) reminders
 
