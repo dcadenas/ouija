@@ -364,27 +364,6 @@ fn parse_idle_policy(value: &str) -> Result<IdlePolicy, String> {
     value.parse()
 }
 
-fn resolve_cli_message(
-    command: &str,
-    message: Option<String>,
-    stdin: bool,
-) -> anyhow::Result<String> {
-    match (message, stdin) {
-        (Some(_), true) => {
-            anyhow::bail!("{command}: pass either a message argument or --stdin, not both")
-        }
-        (Some(message), false) => Ok(message),
-        (None, true) => {
-            let mut message = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut message)?;
-            Ok(message)
-        }
-        (None, false) => {
-            anyhow::bail!("{command}: missing message; pass a message argument or --stdin")
-        }
-    }
-}
-
 fn validate_spawn_lifecycle(
     parent_session: Option<&str>,
     no_parent_session: bool,
@@ -2546,25 +2525,17 @@ mod tests {
                 to,
                 message,
                 stdin,
+                message_file,
                 from,
             } => {
                 assert_eq!(to, "parent");
                 assert_eq!(message, None);
                 assert!(stdin);
+                assert_eq!(message_file, None);
                 assert_eq!(from.as_deref(), Some("worker"));
             }
             _ => panic!("expected ask command"),
         }
-    }
-
-    #[test]
-    fn ask_message_resolution_rejects_message_and_stdin_together() {
-        let err = resolve_cli_message("ask", Some("body".into()), true).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("either a message argument or --stdin"),
-            "error must explain the exclusive choices, got: {err}"
-        );
     }
 
     #[test]
