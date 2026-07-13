@@ -525,6 +525,14 @@ pub enum Event {
         id: String,
         keep_worktree: bool,
     },
+    /// Atomically undo a scheduler's provisional registration only if the
+    /// session still owns the staged pane and launch credential.
+    RollbackProvisionalRegistration {
+        id: String,
+        pane: String,
+        credential: Option<String>,
+        previous: Option<SessionEntry>,
+    },
     /// Remove a local session ONLY if its `worktree_present` is `Some(false)`.
     ///
     /// Atomic variant used by the prune-stale-sessions flow: the check and the
@@ -785,6 +793,9 @@ pub enum Effect {
         /// classify outcomes; `reason` is human-readable diagnostic only.
         kind: RemoveFailureKind,
         reason: String,
+    },
+    ProvisionalRollbackOk {
+        pane: String,
     },
     CleanupWorktree {
         project_dir: String,
@@ -1157,6 +1168,17 @@ impl DaemonState {
             }
             Event::Rename { old_id, new_id } => self.apply_rename(&old_id, &new_id),
             Event::Remove { id, keep_worktree } => self.apply_remove(&id, keep_worktree),
+            Event::RollbackProvisionalRegistration {
+                id,
+                pane,
+                credential,
+                previous,
+            } => self.apply_rollback_provisional_registration(
+                &id,
+                &pane,
+                credential.as_deref(),
+                previous,
+            ),
             Event::RemoveIfStale {
                 id,
                 expected_project_dir,
@@ -1709,6 +1731,33 @@ impl DaemonState {
 
         effects.push(Effect::RemoveOk { id: id.to_string() });
 
+        effects
+    }
+
+    fn apply_rollback_provisional_registration(
+        &mut self,
+        id: &str,
+        pane: &str,
+        credential: Option<&str>,
+        previous: Option<SessionEntry>,
+    ) -> Vec<Effect> {
+        let still_staged = self.sessions.get(id).is_some_and(|session| {
+            matches!(session.origin, Origin::Local)
+                && session.pane.as_deref() == Some(pane)
+                && session.metadata.session_start_credential.as_deref() == credential
+        });
+        if !still_staged {
+            return vec![];
+        }
+
+        let mut effects = if let Some(previous) = previous {
+            self.apply_register(previous.id, previous.pane, previous.metadata)
+        } else {
+            self.apply_remove(id, true)
+        };
+        effects.push(Effect::ProvisionalRollbackOk {
+            pane: pane.to_string(),
+        });
         effects
     }
 

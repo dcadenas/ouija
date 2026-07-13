@@ -1019,6 +1019,16 @@ impl AppState {
                                 + std::time::Duration::from_secs(AUTOREGISTER_REMOVE_GRACE_SECS),
                         );
                 }
+                Effect::ProvisionalRollbackOk { pane } => {
+                    if !cfg!(test) {
+                        let pane = pane.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let _ = std::process::Command::new("tmux")
+                                .args(["kill-pane", "-t", &pane])
+                                .status();
+                        });
+                    }
+                }
                 Effect::RenameWindow { pane, name } => {
                     let p = pane.clone();
                     let n = name.clone();

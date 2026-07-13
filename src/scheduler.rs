@@ -620,6 +620,13 @@ async fn respawn_and_inject(
     let backend_name = backend.name().to_string();
     let session_start_credential =
         (backend_name == "codex-cli").then(crate::daemon_protocol::new_session_start_credential);
+    let prior_session = state
+        .protocol
+        .read()
+        .await
+        .sessions
+        .get(task.session_name())
+        .cloned();
 
     // Codex reports its new thread ID only after the pane starts. Publish the
     // pending one-time credential before respawning so its SessionStart hook
@@ -704,8 +711,32 @@ async fn respawn_and_inject(
 
     match respawn_result {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => return TaskRun::failed(task, e.to_string()),
-        Err(e) => return TaskRun::failed(task, e.to_string()),
+        Ok(Err(e)) => {
+            if session_start_credential.is_some() {
+                rollback_provisional_revival(
+                    state,
+                    task.session_name(),
+                    &pane_id,
+                    session_start_credential.as_deref(),
+                    prior_session.as_ref(),
+                )
+                .await;
+            }
+            return TaskRun::failed(task, e.to_string());
+        }
+        Err(e) => {
+            if session_start_credential.is_some() {
+                rollback_provisional_revival(
+                    state,
+                    task.session_name(),
+                    &pane_id,
+                    session_start_credential.as_deref(),
+                    prior_session.as_ref(),
+                )
+                .await;
+            }
+            return TaskRun::failed(task, e.to_string());
+        }
     }
 
     // Stamp bootstrap metadata and clear backend_session_id since we started fresh
@@ -1114,46 +1145,16 @@ async fn rollback_provisional_revival(
     credential: Option<&str>,
     prior_session: Option<&crate::daemon_protocol::SessionEntry>,
 ) {
-    let still_staged = state
-        .protocol
-        .read()
-        .await
-        .sessions
-        .get(session_id)
-        .is_some_and(|session| {
-            session.pane.as_deref() == Some(pane_id)
-                && session.metadata.session_start_credential.as_deref() == credential
-        });
-    if !still_staged {
-        return;
-    }
-
-    if let Some(previous) = prior_session {
-        state
-            .apply_and_execute(crate::daemon_protocol::Event::Register {
-                id: previous.id.clone(),
-                pane: previous.pane.clone(),
-                metadata: previous.metadata.clone(),
-            })
-            .await;
-    } else {
-        state
-            .apply_and_execute(crate::daemon_protocol::Event::Remove {
+    state
+        .apply_and_execute(
+            crate::daemon_protocol::Event::RollbackProvisionalRegistration {
                 id: session_id.to_string(),
-                keep_worktree: true,
-            })
-            .await;
-    }
-
-    if !cfg!(test) {
-        let pane = pane_id.to_string();
-        let _ = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("tmux")
-                .args(["kill-pane", "-t", &pane])
-                .status()
-        })
+                pane: pane_id.to_string(),
+                credential: credential.map(str::to_string),
+                previous: prior_session.cloned(),
+            },
+        )
         .await;
-    }
 }
 
 struct RevivedSessionSnapshot<'a> {
@@ -1747,6 +1748,50 @@ mod tests {
         assert_eq!(
             session.metadata.backend_session_id.as_deref(),
             Some("thread-winner")
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_provisional_revival_restores_existing_pane_after_respawn_failure() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "scheduled".into(),
+                pane: Some("%existing".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    backend_session_id: Some("thread-old".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let previous = state.protocol.read().await.sessions["scheduled"].clone();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "scheduled".into(),
+                pane: Some("%staged".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    session_start_credential: Some("credential".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        rollback_provisional_revival(
+            &state,
+            "scheduled",
+            "%staged",
+            Some("credential"),
+            Some(&previous),
+        )
+        .await;
+
+        let restored = state.protocol.read().await.sessions["scheduled"].clone();
+        assert_eq!(restored.pane.as_deref(), Some("%existing"));
+        assert_eq!(
+            restored.metadata.backend_session_id.as_deref(),
+            Some("thread-old")
         );
     }
 }
