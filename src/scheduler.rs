@@ -675,12 +675,20 @@ async fn respawn_and_inject(
         codex_home: launch_codex_home.clone(),
     });
     let claude_cmd = match session_start_credential.as_deref() {
-        Some(credential) => crate::backend::codex::with_session_start_hook(
+        Some(credential) => match crate::backend::codex::with_session_start_hook(
             claude_cmd,
             launch_codex_home.as_deref(),
             task.session_name(),
             credential,
-        ),
+        ) {
+            Ok(command) => command,
+            Err(error) => {
+                return TaskRun::failed(
+                    task,
+                    format!("could not stage Codex launch credential: {error}"),
+                );
+            }
+        },
         None => claude_cmd,
     };
 
@@ -904,7 +912,7 @@ async fn revive_and_inject(
                 launch_codex_home.as_deref(),
                 task.session_name(),
                 credential,
-            ),
+            )?,
             None => command,
         }
     } else {

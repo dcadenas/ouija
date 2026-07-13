@@ -1723,12 +1723,20 @@ pub async fn start_session(
         codex_home: launch_model.codex_home.clone(),
     });
     let backend_cmd = match session_start_credential.as_deref() {
-        Some(credential) => crate::backend::codex::with_session_start_hook(
+        Some(credential) => match crate::backend::codex::with_session_start_hook(
             backend_cmd,
             launch_model.codex_home.as_deref(),
             name,
             credential,
-        ),
+        ) {
+            Ok(command) => command,
+            Err(error) => {
+                return (
+                    format!("could not stage Codex launch credential: {error}"),
+                    None,
+                );
+            }
+        },
         None => backend_cmd,
     };
 
@@ -2334,12 +2342,20 @@ pub async fn restart_session(
             codex_home: launch_codex_home.clone(),
         });
         match session_start_credential.as_deref() {
-            Some(credential) => crate::backend::codex::with_session_start_hook(
+            Some(credential) => match crate::backend::codex::with_session_start_hook(
                 command,
                 launch_codex_home.as_deref(),
                 name,
                 credential,
-            ),
+            ) {
+                Ok(command) => command,
+                Err(error) => {
+                    return (
+                        format!("could not stage Codex launch credential: {error}"),
+                        None,
+                    );
+                }
+            },
             None => command,
         }
     } else {
