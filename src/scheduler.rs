@@ -1090,6 +1090,7 @@ fn revived_session_metadata(
     let backend_session_id = scheduled_prompt_backend_session_id(
         task.backend_session_id.as_deref(),
         detected_backend_session_id,
+        snapshot.backend_name,
         snapshot.is_tui,
         snapshot.clears_context,
     );
@@ -1121,10 +1122,11 @@ fn revived_opencode_binding(backend_name: &str) -> Option<crate::daemon_protocol
 fn scheduled_prompt_backend_session_id(
     task_backend_session_id: Option<&str>,
     detected_backend_session_id: Option<String>,
+    backend_name: &str,
     is_tui: bool,
     clears_context: bool,
 ) -> Option<String> {
-    if is_tui || clears_context {
+    if clears_context || (is_tui && backend_name != "codex-cli") {
         None
     } else {
         task_backend_session_id
@@ -1454,6 +1456,7 @@ mod tests {
             scheduled_prompt_backend_session_id(
                 Some("ses_task"),
                 Some("ses_detected".to_string()),
+                "opencode",
                 false,
                 false,
             )
@@ -1464,6 +1467,7 @@ mod tests {
             scheduled_prompt_backend_session_id(
                 None,
                 Some("ses_detected".to_string()),
+                "opencode",
                 false,
                 false,
             )
@@ -1471,11 +1475,11 @@ mod tests {
             Some("ses_detected")
         );
         assert_eq!(
-            scheduled_prompt_backend_session_id(Some("ses_task"), None, true, false),
+            scheduled_prompt_backend_session_id(Some("ses_task"), None, "claude-code", true, false),
             None
         );
         assert_eq!(
-            scheduled_prompt_backend_session_id(Some("ses_task"), None, false, true),
+            scheduled_prompt_backend_session_id(Some("ses_task"), None, "opencode", false, true),
             None
         );
     }
@@ -1558,5 +1562,41 @@ mod tests {
             metadata.session_start_credential.as_deref(),
             Some("launch-secret")
         );
+    }
+
+    #[test]
+    fn revived_codex_resume_metadata_keeps_selected_thread_id() {
+        let mut task = new_task(
+            "daily-report".into(),
+            "0 10 * * *".into(),
+            None,
+            Some("prompt".into()),
+            None,
+            false,
+            Some("thread-resumed".into()),
+            OnFire::ContinueSession,
+        );
+        task.backend = Some("codex-cli".into());
+
+        let metadata = revived_session_metadata(
+            &task,
+            Some("/tmp/project"),
+            Some("thread-detected".into()),
+            RevivedSessionSnapshot {
+                model: None,
+                effort: None,
+                codex_home: None,
+                backend_name: "codex-cli",
+                is_tui: true,
+                clears_context: false,
+                session_start_credential: None,
+            },
+        );
+
+        assert_eq!(
+            metadata.backend_session_id.as_deref(),
+            Some("thread-resumed")
+        );
+        assert_eq!(metadata.session_start_credential, None);
     }
 }

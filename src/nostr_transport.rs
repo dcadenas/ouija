@@ -38,6 +38,31 @@ fn opencode_binding_for_restart_session(
     }
 }
 
+/// Select the backend identity written by the final restart registration.
+///
+/// A fresh Codex launch has to read the state again because its SessionStart
+/// hook can consume the one-time credential before this refresh. A resumed
+/// Codex launch already has an authoritative thread ID: the exact ID passed to
+/// `codex resume`, so the refresh must retain it even though TUI backends do
+/// not otherwise discover a backend session ID here.
+fn final_restart_backend_binding(
+    backend_name: &str,
+    resume_id: Option<String>,
+    session_start_credential: Option<String>,
+    discovered_backend_session_id: Option<String>,
+    session_start_result: Option<(Option<String>, Option<String>)>,
+) -> (Option<String>, Option<String>) {
+    if let Some(credential) = session_start_credential {
+        return session_start_result.unwrap_or((None, Some(credential)));
+    }
+
+    if backend_name == "codex-cli" {
+        return (resume_id, None);
+    }
+
+    (discovered_backend_session_id, None)
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum ParentSessionOverride {
     #[default]
@@ -2304,7 +2329,7 @@ pub async fn restart_session(
         backend
             .build_resume_command(&crate::backend::ResumeOpts {
                 project_dir: dir.clone(),
-                session_id: resume_id,
+                session_id: resume_id.clone(),
                 worktree: None, // ouija manages worktrees
                 model: launch_model.model.clone(),
                 effort: effective_effort.clone(),
@@ -2691,22 +2716,25 @@ pub async fn restart_session(
             // thread ID while the pane was starting. Preserve that atomic
             // result instead of overwriting it with this restart's initial
             // `None` placeholder during the metadata refresh below.
+            let session_start_result = if session_start_credential.is_some() {
+                let proto = state.protocol.read().await;
+                proto.sessions.get(name).map(|session| {
+                    (
+                        session.metadata.backend_session_id.clone(),
+                        session.metadata.session_start_credential.clone(),
+                    )
+                })
+            } else {
+                None
+            };
             let (backend_session_id, pending_session_start_credential) =
-                if session_start_credential.is_some() {
-                    let proto = state.protocol.read().await;
-                    proto
-                        .sessions
-                        .get(name)
-                        .map(|session| {
-                            (
-                                session.metadata.backend_session_id.clone(),
-                                session.metadata.session_start_credential.clone(),
-                            )
-                        })
-                        .unwrap_or((None, session_start_credential.clone()))
-                } else {
-                    (backend_session_id, None)
-                };
+                final_restart_backend_binding(
+                    &backend_name,
+                    resume_id.clone(),
+                    session_start_credential.clone(),
+                    backend_session_id,
+                    session_start_result,
+                );
             let restart_backend_session_id = backend_session_id.clone();
 
             let opencode_binding = opencode_binding_for_restart_session(
@@ -5473,6 +5501,51 @@ mod tests {
         assert_eq!(
             opencode_binding_for_restart_session(true, Some("previous-session"), true, None),
             Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
+        );
+    }
+
+    #[test]
+    fn restart_final_refresh_preserves_selected_codex_resume_id() {
+        assert_eq!(
+            final_restart_backend_binding(
+                "codex-cli",
+                Some("thread-resumed".into()),
+                None,
+                None,
+                None,
+            ),
+            (Some("thread-resumed".into()), None),
+            "the thread ID used by `codex resume` must survive the TUI metadata refresh"
+        );
+    }
+
+    #[test]
+    fn restart_final_refresh_preserves_session_start_that_arrived_before_refresh() {
+        assert_eq!(
+            final_restart_backend_binding(
+                "codex-cli",
+                None,
+                Some("launch-credential".into()),
+                None,
+                Some((Some("thread-bound-early".into()), None)),
+            ),
+            (Some("thread-bound-early".into()), None),
+            "a SessionStart that consumes the credential before the final refresh remains bound"
+        );
+    }
+
+    #[test]
+    fn restart_final_refresh_leaves_credential_for_session_start_after_refresh() {
+        assert_eq!(
+            final_restart_backend_binding(
+                "codex-cli",
+                None,
+                Some("launch-credential".into()),
+                None,
+                None,
+            ),
+            (None, Some("launch-credential".into())),
+            "a SessionStart that arrives after the final refresh still receives its pending credential"
         );
     }
 
