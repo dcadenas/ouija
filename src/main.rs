@@ -744,10 +744,7 @@ async fn main() -> anyhow::Result<()> {
             from,
         } => {
             let message = resolve_message(message, stdin, message_file)?;
-            let from = match from {
-                Some(id) => id,
-                None => require_my_session_id().await?,
-            };
+            let from = resolve_sender_id(from).await?;
             let body = serde_json::json!({
                 "from": from,
                 "to": to,
@@ -766,10 +763,7 @@ async fn main() -> anyhow::Result<()> {
             from,
         } => {
             let message = resolve_message(message, stdin, message_file)?;
-            let from = match from {
-                Some(id) => id,
-                None => require_my_session_id().await?,
-            };
+            let from = resolve_sender_id(from).await?;
             let body = serde_json::json!({
                 "from": from,
                 "to": to,
@@ -791,10 +785,7 @@ async fn main() -> anyhow::Result<()> {
             from,
         } => {
             let message = resolve_message(message, stdin, message_file)?;
-            let from = match from {
-                Some(id) => id,
-                None => require_my_session_id().await?,
-            };
+            let from = resolve_sender_id(from).await?;
             let body = serde_json::json!({
                 "from": from,
                 "to": to,
@@ -1950,6 +1941,7 @@ enum IdentitySource {
     PaneVar,
     EnvVar,
     PaneLookup,
+    BackendIdentity,
 }
 
 impl std::fmt::Display for IdentitySource {
@@ -1958,6 +1950,7 @@ impl std::fmt::Display for IdentitySource {
             Self::PaneVar => write!(f, "the @ouija_session tmux pane var"),
             Self::EnvVar => write!(f, "$OUIJA_SESSION_ID"),
             Self::PaneLookup => write!(f, "daemon lookup by $TMUX_PANE"),
+            Self::BackendIdentity => write!(f, "daemon resolution of this backend identity"),
         }
     }
 }
@@ -2174,6 +2167,7 @@ async fn whoami_outcome() -> WhoamiOutcome {
     let tmux_pane = std::env::var("TMUX_PANE").ok();
     let pane_var = tmux_pane.as_deref().and_then(tmux_var::get);
     let env_var = std::env::var("OUIJA_SESSION_ID").ok();
+    let backend_identity = backend::BackendRegistry::default_registry().caller_session_identity();
 
     match pick_session_id(tmux_pane.as_deref(), pane_var.clone(), env_var.clone()) {
         SessionIdResolution::Found(id, source) => WhoamiOutcome::Resolved { id, source },
@@ -2206,16 +2200,96 @@ async fn whoami_outcome() -> WhoamiOutcome {
                     id,
                     source: IdentitySource::PaneLookup,
                 },
-                None => failure(PaneLookupFailure::NoSessionForPane),
+                None => match backend_identity {
+                    Some(identity) => match resolve_backend_identity_from_daemon(&identity).await {
+                        Ok(id) => WhoamiOutcome::Resolved {
+                            id,
+                            source: IdentitySource::BackendIdentity,
+                        },
+                        Err(_) => failure(PaneLookupFailure::NoSessionForPane),
+                    },
+                    None => failure(PaneLookupFailure::NoSessionForPane),
+                },
             }
         }
-        SessionIdResolution::None => WhoamiOutcome::Unresolved(WhoamiFailure {
-            tmux_pane,
-            pane_var,
-            env_var,
-            lookup: None,
-        }),
+        SessionIdResolution::None => match backend_identity {
+            Some(identity) => match resolve_backend_identity_from_daemon(&identity).await {
+                Ok(id) => WhoamiOutcome::Resolved {
+                    id,
+                    source: IdentitySource::BackendIdentity,
+                },
+                Err(_) => WhoamiOutcome::Unresolved(WhoamiFailure {
+                    tmux_pane,
+                    pane_var,
+                    env_var,
+                    lookup: None,
+                }),
+            },
+            None => WhoamiOutcome::Unresolved(WhoamiFailure {
+                tmux_pane,
+                pane_var,
+                env_var,
+                lookup: None,
+            }),
+        },
     }
+}
+
+/// Resolve an adapter-owned opaque identity to the daemon's canonical Local
+/// public id. The raw backend ID never reaches a send envelope as `from`.
+async fn resolve_backend_identity_from_daemon(
+    identity: &backend::BackendSessionIdentity,
+) -> anyhow::Result<String> {
+    let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
+    let url = format!("http://localhost:{port}/api/backend-identities/resolve");
+    let response = reqwest::Client::new()
+        .post(&url)
+        .json(&serde_json::json!({
+            "backend": identity.backend,
+            "session_id": identity.session_id,
+        }))
+        .send()
+        .await
+        .with_context(|| format!("could not resolve backend identity via {url}"))?;
+    let status = response.status();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .context("daemon returned invalid backend identity response")?;
+    if !status.is_success() {
+        anyhow::bail!(
+            "backend identity resolution failed ({}) : {}",
+            body["outcome"].as_str().unwrap_or("unknown"),
+            body["error"].as_str().unwrap_or("no daemon detail")
+        );
+    }
+    body["session_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(String::from)
+        .ok_or_else(|| anyhow::anyhow!("daemon resolved backend identity without a session_id"))
+}
+
+fn enforce_explicit_sender_match(explicit: &str, canonical: &str) -> anyhow::Result<String> {
+    if explicit == canonical {
+        Ok(explicit.into())
+    } else {
+        anyhow::bail!(
+            "--from '{explicit}' does not match this backend identity's canonical session '{canonical}'; never stamp a raw or sibling sender id"
+        )
+    }
+}
+
+async fn resolve_sender_id(explicit: Option<String>) -> anyhow::Result<String> {
+    let Some(explicit) = explicit else {
+        return require_my_session_id().await;
+    };
+    let Some(identity) = backend::BackendRegistry::default_registry().caller_session_identity()
+    else {
+        return Ok(explicit);
+    };
+    let canonical = resolve_backend_identity_from_daemon(&identity).await?;
+    enforce_explicit_sender_match(&explicit, &canonical)
 }
 
 /// Verify a resolved id is a registered *local* session, leniently.
@@ -2762,6 +2836,18 @@ mod tests {
             res,
             SessionIdResolution::Found("real".into(), IdentitySource::EnvVar)
         );
+    }
+
+    #[test]
+    fn explicit_sender_must_match_canonical_backend_identity() {
+        assert_eq!(
+            enforce_explicit_sender_match("canonical", "canonical").unwrap(),
+            "canonical"
+        );
+        let err = enforce_explicit_sender_match("sibling", "canonical").unwrap_err();
+        assert!(err.to_string().contains("does not match"));
+        assert!(err.to_string().contains("sibling"));
+        assert!(err.to_string().contains("canonical"));
     }
 
     #[test]
