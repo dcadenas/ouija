@@ -4646,6 +4646,117 @@ mod tests {
     }
 
     #[test]
+    fn rollback_provisional_same_pane_restoration_does_not_kill_the_pane() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "scheduled".into(),
+            pane: Some("%same".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                backend_session_id: Some("thread-old".into()),
+                ..Default::default()
+            },
+        });
+        let previous = state.sessions["scheduled"].clone();
+        state.apply(Event::Register {
+            id: "scheduled".into(),
+            pane: Some("%same".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                session_start_credential: Some("credential".into()),
+                ..Default::default()
+            },
+        });
+
+        let effects = state.apply(Event::RollbackProvisionalRegistration {
+            id: "scheduled".into(),
+            pane: "%same".into(),
+            credential: Some("credential".into()),
+            previous: Some(previous),
+        });
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ProvisionalRollbackOk { .. })),
+            "restoring the same pane must not kill it: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn rollback_provisional_distinct_pane_kills_only_the_staged_pane() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "scheduled".into(),
+            pane: Some("%existing".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                backend_session_id: Some("thread-old".into()),
+                ..Default::default()
+            },
+        });
+        let previous = state.sessions["scheduled"].clone();
+        state.apply(Event::Register {
+            id: "scheduled".into(),
+            pane: Some("%staged".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                session_start_credential: Some("credential".into()),
+                ..Default::default()
+            },
+        });
+
+        let effects = state.apply(Event::RollbackProvisionalRegistration {
+            id: "scheduled".into(),
+            pane: "%staged".into(),
+            credential: Some("credential".into()),
+            previous: Some(previous),
+        });
+
+        let kills: Vec<_> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::ProvisionalRollbackOk { pane } => Some(pane.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kills, vec!["%staged"]);
+    }
+
+    #[test]
+    fn rollback_provisional_after_credential_adoption_emits_no_effects() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "scheduled".into(),
+            pane: Some("%staged".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                session_start_credential: Some("credential".into()),
+                ..Default::default()
+            },
+        });
+        state.apply(Event::AdoptBackend {
+            id: "scheduled".into(),
+            backend: "codex-cli".into(),
+            backend_session_id: "thread-winner".into(),
+            expected_backend_session_id: None,
+            expected_session_start_credential: Some("credential".into()),
+        });
+
+        let effects = state.apply(Event::RollbackProvisionalRegistration {
+            id: "scheduled".into(),
+            pane: "%staged".into(),
+            credential: Some("credential".into()),
+            previous: None,
+        });
+
+        assert!(
+            effects.is_empty(),
+            "a credential-adopted session must not be rolled back: {effects:?}"
+        );
+    }
+
+    #[test]
     fn remove_if_stale_removes_when_worktree_present_false() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
         state.apply(Event::Register {
