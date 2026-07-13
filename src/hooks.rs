@@ -375,26 +375,42 @@ async fn session_start_inner(
         if let Some(backend_session_id) =
             normalize_backend_session_id(body.backend_session_id.as_deref())
         {
-            let updated = {
+            let binding = {
                 let proto = state.protocol.read().await;
                 proto.sessions.get(&existing_id).and_then(|session| {
-                    let needs_binding = session.metadata.backend_session_id.as_deref()
-                        != Some(backend_session_id.as_str());
-                    needs_binding.then(|| {
-                        let mut metadata = session.metadata.clone();
-                        metadata.backend_session_id = Some(backend_session_id.clone());
-                        metadata
-                    })
+                    match session.metadata.backend_session_id.as_deref() {
+                        None => {
+                            let mut metadata = session.metadata.clone();
+                            metadata.backend_session_id = Some(backend_session_id.clone());
+                            Some(Ok(metadata))
+                        }
+                        Some(existing) if existing == backend_session_id => None,
+                        Some(_) => Some(Err(())),
+                    }
                 })
             };
-            if let Some(metadata) = updated {
-                state
-                    .apply_and_execute(crate::daemon_protocol::Event::Register {
-                        id: existing_id.clone(),
-                        pane: Some(body.pane.clone()),
-                        metadata,
-                    })
-                    .await;
+            match binding {
+                Some(Ok(metadata)) => {
+                    state
+                        .apply_and_execute(crate::daemon_protocol::Event::Register {
+                            id: existing_id.clone(),
+                            pane: Some(body.pane.clone()),
+                            metadata,
+                        })
+                        .await;
+                }
+                Some(Err(())) => {
+                    tracing::warn!(
+                        pane = body.pane,
+                        session = existing_id,
+                        "session-start rejected: existing pane backend session ID mismatch"
+                    );
+                    return json!({
+                        "skipped": "existing pane backend session ID mismatch",
+                        "output": "",
+                    });
+                }
+                None => {}
             }
         }
         let output = mesh_instructions_for_backend(existing_backend.as_deref(), &existing_id);
@@ -780,6 +796,98 @@ mod tests {
         assert_eq!(
             session.metadata.backend_session_id.as_deref(),
             Some("claude-session-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_accepts_existing_matching_backend_session_id() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "feat/worker".into(),
+                pane: Some("%72".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    backend_session_id: Some("codex-thread-1".into()),
+                    project_dir: Some("/home/user/code/proj".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        *state.cached_assistant_panes.write().await =
+            vec![assistant_pane("%72", "/home/user/code/proj")];
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: "%72".into(),
+                cwd: "/home/user/code/proj".into(),
+                backend_session_id: Some("codex-thread-1".into()),
+            },
+        )
+        .await;
+
+        assert_eq!(result["registered"], "feat/worker");
+        assert!(
+            result["output"]
+                .as_str()
+                .is_some_and(|output| !output.is_empty())
+        );
+        let proto = state.protocol.read().await;
+        assert_eq!(
+            proto.sessions["feat/worker"]
+                .metadata
+                .backend_session_id
+                .as_deref(),
+            Some("codex-thread-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_rejects_different_thread_for_existing_same_project_pane() {
+        // A pane can receive a second SessionStart from a different Codex
+        // thread in the same project. Matching project identity proves the
+        // pane belongs to this session, but must not authorize replacing its
+        // established backend-thread binding.
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "feat/worker".into(),
+                pane: Some("%72".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    backend_session_id: Some("codex-thread-1".into()),
+                    project_dir: Some("/home/user/code/proj".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        *state.cached_assistant_panes.write().await =
+            vec![assistant_pane("%72", "/home/user/code/proj")];
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: "%72".into(),
+                cwd: "/home/user/code/proj".into(),
+                backend_session_id: Some("codex-thread-2".into()),
+            },
+        )
+        .await;
+
+        assert_eq!(result["output"], "");
+        assert_eq!(
+            result["skipped"],
+            "existing pane backend session ID mismatch"
+        );
+        let proto = state.protocol.read().await;
+        assert_eq!(
+            proto.sessions["feat/worker"]
+                .metadata
+                .backend_session_id
+                .as_deref(),
+            Some("codex-thread-1"),
+            "a second same-project thread must not replace the established binding"
         );
     }
 
