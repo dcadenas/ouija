@@ -618,6 +618,32 @@ async fn respawn_and_inject(
         state.backend_for_session(task.session_name()).await
     };
     let backend_name = backend.name().to_string();
+    let session_start_credential =
+        (backend_name == "codex-cli").then(crate::daemon_protocol::new_session_start_credential);
+
+    // Codex reports its new thread ID only after the pane starts. Publish the
+    // pending one-time credential before respawning so its SessionStart hook
+    // can atomically consume it while binding that first thread ID.
+    if let Some(session_start_credential) = session_start_credential.clone() {
+        let metadata = {
+            let proto = state.protocol.read().await;
+            proto.sessions.get(task.session_name()).map(|session| {
+                let mut metadata = session.metadata.clone();
+                metadata.backend_session_id = None;
+                metadata.session_start_credential = Some(session_start_credential);
+                metadata
+            })
+        };
+        if let Some(metadata) = metadata {
+            state
+                .apply_and_execute(crate::daemon_protocol::Event::Register {
+                    id: task.session_name().to_string(),
+                    pane: Some(pane_id.clone()),
+                    metadata,
+                })
+                .await;
+        }
+    }
     let settings = state.settings.read().await;
     let claude_permission_mode = settings.claude_permission_mode.clone();
     let launch_model =
@@ -656,9 +682,10 @@ async fn respawn_and_inject(
     let session_name = task.session_name().to_string();
     let respawn_result = tokio::task::spawn_blocking({
         let pane_id = pane_id.clone();
+        let pane_credential = session_start_credential.clone();
         move || -> anyhow::Result<()> {
             // See `pane_env_args` for why OUIJA_SESSION_ID must ride along.
-            let env_args = crate::tmux::pane_env_args(&session_name, None);
+            let env_args = crate::tmux::pane_env_args(&session_name, pane_credential.as_deref());
             let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
             args.extend(env_args.iter().map(String::as_str));
             args.extend_from_slice(&["-t", &pane_id, &full_cmd]);
@@ -694,7 +721,12 @@ async fn respawn_and_inject(
             if s.metadata.on_fire.is_none() {
                 s.metadata.on_fire = Some(task.on_fire.clone());
             }
-            s.metadata.backend_session_id = None;
+            // Codex cleared and credentialed this slot before respawn. Its
+            // SessionStart hook may already have atomically bound the new
+            // thread ID, so do not clobber that result here.
+            if session_start_credential.is_none() {
+                s.metadata.backend_session_id = None;
+            }
         }
     }
 
@@ -823,6 +855,8 @@ async fn revive_and_inject(
         .backend_session_id
         .clone()
         .or_else(|| detected_backend_session_id.clone());
+    let session_start_credential =
+        (backend_name == "codex-cli").then(crate::daemon_protocol::new_session_start_credential);
     let launch_cmd = if clears_context {
         backend.build_start_command(&crate::backend::StartOpts {
             project_dir: dir.clone(),
@@ -873,6 +907,22 @@ async fn revive_and_inject(
     crate::backend::claude_code::pre_trust_workspace(&dir);
     crate::backend::pre_trust_mise(&dir);
 
+    let proto_meta = revived_session_metadata(
+        task,
+        project_dir,
+        detected_backend_session_id.clone(),
+        RevivedSessionSnapshot {
+            model: model.clone(),
+            effort: effort.clone(),
+            codex_home: launch_codex_home.clone(),
+            backend_name: backend.name(),
+            is_tui,
+            clears_context,
+            session_start_credential: session_start_credential.clone(),
+        },
+    );
+    let scheduled_prompt_backend_session_id = proto_meta.backend_session_id.clone();
+
     // Create named tmux session/window for the revived session.
     // If a tmux session with the target name exists, add a window to it;
     // otherwise create a new tmux session. Both get the ouija session name.
@@ -880,6 +930,7 @@ async fn revive_and_inject(
         let dir = dir.clone();
         let window_name = task.session_name().to_string();
         let tmux_session = crate::tmux::tmux_session_name(&dir);
+        let pane_credential = session_start_credential.clone();
         move || -> anyhow::Result<String> {
             let tmux_session_exists = std::process::Command::new("tmux")
                 .args(["has-session", "-t", &tmux_session])
@@ -890,7 +941,7 @@ async fn revive_and_inject(
             // `pane_env_args` exports OUIJA_SESSION_ID (so the ouija CLI
             // can resolve the caller's identity) and suppresses shell
             // history (HISTFILE/fish_history).
-            let env_args = crate::tmux::pane_env_args(&window_name, None);
+            let env_args = crate::tmux::pane_env_args(&window_name, pane_credential.as_deref());
             let output = if tmux_session_exists {
                 let mut args: Vec<&str> = vec!["new-window", "-d"];
                 args.extend(env_args.iter().map(String::as_str));
@@ -925,20 +976,36 @@ async fn revive_and_inject(
                 );
             }
             let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-            crate::tmux::configure_managed_pane(&pane_id);
-
-            // Launch the backend in the project dir (prompt as CLI arg if available).
-            // Leading space prevents the command from being recorded in shell
-            // history (zsh HIST_IGNORE_SPACE / bash HISTCONTROL=ignorespace).
-            let launch_then_exit = crate::tmux::close_shell_after(&full_launch_cmd);
-            let hidden_cmd = format!(" {launch_then_exit}");
-            std::process::Command::new("tmux")
-                .args(["send-keys", "-t", &pane_id, &hidden_cmd, "Enter"])
-                .status()?;
-
             Ok(pane_id)
         }
+    })
+    .await??;
+
+    // The pane exists but has not started the backend yet. Register its
+    // launch credential first so Codex's SessionStart hook can find and
+    // authenticate the exact pane before it reports its initial thread ID.
+    state
+        .apply_and_execute(crate::daemon_protocol::Event::Register {
+            id: task.session_name().to_string(),
+            pane: Some(new_pane.clone()),
+            metadata: proto_meta,
+        })
+        .await;
+
+    let pane_for_launch = new_pane.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        crate::tmux::configure_managed_pane(&pane_for_launch);
+        // Leading space prevents the command from being recorded in shell
+        // history (zsh HIST_IGNORE_SPACE / bash HISTCONTROL=ignorespace).
+        let launch_then_exit = crate::tmux::close_shell_after(&full_launch_cmd);
+        let hidden_cmd = format!(" {launch_then_exit}");
+        let status = std::process::Command::new("tmux")
+            .args(["send-keys", "-t", &pane_for_launch, &hidden_cmd, "Enter"])
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("tmux send-keys failed for pane {pane_for_launch}");
+        }
+        Ok(())
     })
     .await??;
 
@@ -980,29 +1047,6 @@ async fn revive_and_inject(
         }
     }
 
-    // Re-register session with new pane (same ID, so dedup check won't fire)
-    let proto_meta = revived_session_metadata(
-        task,
-        project_dir,
-        detected_backend_session_id.clone(),
-        RevivedSessionSnapshot {
-            model: model.clone(),
-            effort: effort.clone(),
-            codex_home: launch_codex_home.clone(),
-            backend_name: backend.name(),
-            is_tui,
-            clears_context,
-        },
-    );
-    let scheduled_prompt_backend_session_id = proto_meta.backend_session_id.clone();
-    state
-        .apply_and_execute(crate::daemon_protocol::Event::Register {
-            id: task.session_name().to_string(),
-            pane: Some(new_pane.clone()),
-            metadata: proto_meta,
-        })
-        .await;
-
     // Track disposable worktree panes for reaper cleanup
     if task.on_fire.is_disposable_worktree() {
         if let Some(ref dir) = project_dir {
@@ -1042,6 +1086,7 @@ struct RevivedSessionSnapshot<'a> {
     backend_name: &'a str,
     is_tui: bool,
     clears_context: bool,
+    session_start_credential: Option<String>,
 }
 
 fn revived_session_metadata(
@@ -1068,6 +1113,7 @@ fn revived_session_metadata(
         on_fire: Some(task.on_fire.clone()),
         backend_session_id,
         backend: Some(snapshot.backend_name.to_string()),
+        session_start_credential: snapshot.session_start_credential,
         opencode_binding,
         ..Default::default()
     }
@@ -1466,6 +1512,7 @@ mod tests {
                 backend_name: "opencode",
                 is_tui: false,
                 clears_context: false,
+                session_start_credential: None,
             },
         );
 
@@ -1504,11 +1551,16 @@ mod tests {
                 backend_name: "codex-cli",
                 is_tui: true,
                 clears_context: true,
+                session_start_credential: Some("launch-secret".into()),
             },
         );
 
         assert_eq!(metadata.backend.as_deref(), Some("codex-cli"));
         assert_eq!(metadata.model, None);
         assert_eq!(metadata.codex_home, None);
+        assert_eq!(
+            metadata.session_start_credential.as_deref(),
+            Some("launch-secret")
+        );
     }
 }
