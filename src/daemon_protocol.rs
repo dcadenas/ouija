@@ -1750,14 +1750,19 @@ impl DaemonState {
             return vec![];
         }
 
+        let kill_provisional_pane = previous
+            .as_ref()
+            .is_none_or(|session| session.pane.as_deref() != Some(pane));
         let mut effects = if let Some(previous) = previous {
             self.apply_register(previous.id, previous.pane, previous.metadata)
         } else {
             self.apply_remove(id, true)
         };
-        effects.push(Effect::ProvisionalRollbackOk {
-            pane: pane.to_string(),
-        });
+        if kill_provisional_pane {
+            effects.push(Effect::ProvisionalRollbackOk {
+                pane: pane.to_string(),
+            });
+        }
         effects
     }
 
