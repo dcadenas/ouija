@@ -2829,13 +2829,19 @@ pub async fn restart_session(
                     ..Default::default()
                 },
             };
-            state
-                .apply_and_execute(crate::daemon_protocol::Event::Register {
+            let refresh = match prev_metadata.as_ref() {
+                Some(previous) => crate::daemon_protocol::Event::RefreshRestartMetadata {
+                    id: name.to_string(),
+                    expected_incarnation: previous.session_incarnation,
+                    metadata: proto_meta,
+                },
+                None => crate::daemon_protocol::Event::Register {
                     id: name.to_string(),
                     pane: Some(pane_id.clone()),
                     metadata: proto_meta,
-                })
-                .await;
+                },
+            };
+            state.apply_and_execute(refresh).await;
             // Strong HttpApi bindings can use readiness delivery; weak reused
             // panes must stay on raw tmux to preserve the visible-pane boundary.
             if should_schedule_restart_prompt_injection(

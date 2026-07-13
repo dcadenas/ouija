@@ -525,6 +525,15 @@ pub enum Event {
         expected_backend_session_id: Option<String>,
         metadata: SessionMeta,
     },
+    /// Refresh a restarted session only when the caller still owns the same
+    /// registration incarnation. This prevents a delayed final refresh from
+    /// overwriting a SessionStart backend bind that has already consumed its
+    /// launch credential.
+    RefreshRestartMetadata {
+        id: String,
+        expected_incarnation: i64,
+        metadata: SessionMeta,
+    },
     Rename {
         old_id: String,
         new_id: String,
@@ -1240,6 +1249,11 @@ impl DaemonState {
             } => {
                 self.apply_register_if_pane_unbound(id, pane, expected_backend_session_id, metadata)
             }
+            Event::RefreshRestartMetadata {
+                id,
+                expected_incarnation,
+                metadata,
+            } => self.apply_refresh_restart_metadata(id, expected_incarnation, metadata),
             Event::Rename { old_id, new_id } => self.apply_rename(&old_id, &new_id),
             Event::Remove { id, keep_worktree } => self.apply_remove(&id, keep_worktree),
             Event::RollbackProvisionalRegistration {
@@ -1478,6 +1492,33 @@ impl DaemonState {
         });
 
         effects
+    }
+
+    fn apply_refresh_restart_metadata(
+        &mut self,
+        id: String,
+        expected_incarnation: i64,
+        mut metadata: SessionMeta,
+    ) -> Vec<Effect> {
+        let Some(existing) = self.sessions.get(&id) else {
+            return vec![];
+        };
+        if !matches!(existing.origin, Origin::Local)
+            || existing.metadata.session_incarnation != expected_incarnation
+        {
+            return vec![];
+        }
+        // A completed SessionStart binding is authoritative. A still-pending
+        // credential is authoritative too, because the hook may arrive after
+        // this refresh. Preserve both values under this same write lock.
+        if existing.metadata.backend.is_some() && existing.metadata.backend_session_id.is_some() {
+            metadata.backend = existing.metadata.backend.clone();
+            metadata.backend_session_id = existing.metadata.backend_session_id.clone();
+            metadata.session_start_credential = existing.metadata.session_start_credential.clone();
+        } else if existing.metadata.session_start_credential.is_some() {
+            metadata.session_start_credential = existing.metadata.session_start_credential.clone();
+        }
+        self.apply_register(id, existing.pane.clone(), metadata)
     }
 
     fn apply_register_if_pane_unbound(
