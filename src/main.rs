@@ -2193,6 +2193,10 @@ enum WhoamiOutcome {
     },
     Unresolved(WhoamiFailure),
     Conflict(IdentityConflict),
+    /// An adapter identified this caller but the daemon could not prove one
+    /// canonical public session. This is terminal, including transport errors:
+    /// falling back to a pane/env hint would reintroduce misattribution.
+    BackendResolutionFailed(String),
 }
 
 /// Run the full identity resolution path with diagnostics.
@@ -2242,7 +2246,10 @@ async fn whoami_outcome() -> WhoamiOutcome {
     // A successful binding is canonical and must therefore arbitrate (or
     // reject) the local hint rather than merely act as a fallback.
     let backend_canonical = match backend_identity.as_ref() {
-        Some(identity) => resolve_backend_identity_from_daemon(identity).await.ok(),
+        Some(identity) => match resolve_backend_identity_from_daemon(identity).await {
+            Ok(id) => Some(id),
+            Err(error) => return WhoamiOutcome::BackendResolutionFailed(error.to_string()),
+        },
         None => None,
     };
     match arbitrate_backend_identity(local, backend_canonical) {
@@ -2333,6 +2340,9 @@ async fn resolve_sender(explicit: Option<String>) -> anyhow::Result<ResolvedSend
             Ok(ResolvedSender { id, context })
         }
         WhoamiOutcome::Conflict(conflict) => anyhow::bail!(format_identity_conflict(&conflict)),
+        WhoamiOutcome::BackendResolutionFailed(error) => anyhow::bail!(
+            "backend identity was discovered but could not be resolved safely: {error}"
+        ),
         WhoamiOutcome::Unresolved(_) => {
             let Some(explicit) = explicit else {
                 return Err(anyhow::anyhow!(unresolved_sender_error()));
@@ -2415,6 +2425,9 @@ async fn require_my_session_id() -> anyhow::Result<String> {
         }
         WhoamiOutcome::Unresolved(_) => Err(anyhow::anyhow!(unresolved_sender_error())),
         WhoamiOutcome::Conflict(conflict) => anyhow::bail!(format_identity_conflict(&conflict)),
+        WhoamiOutcome::BackendResolutionFailed(error) => anyhow::bail!(
+            "backend identity was discovered but could not be resolved safely: {error}"
+        ),
     }
 }
 
@@ -2435,6 +2448,9 @@ async fn cli_whoami() -> anyhow::Result<()> {
         }
         WhoamiOutcome::Unresolved(failure) => anyhow::bail!(format_whoami_failure(&failure)),
         WhoamiOutcome::Conflict(conflict) => anyhow::bail!(format_identity_conflict(&conflict)),
+        WhoamiOutcome::BackendResolutionFailed(error) => anyhow::bail!(
+            "backend identity was discovered but could not be resolved safely: {error}"
+        ),
     }
 }
 
