@@ -9,6 +9,12 @@ PANE="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}' 2>/dev/null)}"
 [ -z "$PANE" ] && exit 0
 CWD=$(printf '%s' "$PAYLOAD" | jq -r '.cwd // empty' 2>/dev/null)
 [ -z "$CWD" ] && CWD="$PWD"
+# Codex's shared app-server can inherit TMUX_PANE from the terminal that
+# started it. Do not let that unrelated pane claim this SessionStart payload.
+# The daemon repeats this check with project-root normalization; this raw path
+# comparison is an early defense that avoids POSTing the obvious mismatch.
+PANE_CWD=$(tmux display-message -p -t "$PANE" '#{pane_current_path}' 2>/dev/null)
+[ -n "$PANE_CWD" ] && [ "$PANE_CWD" != "$CWD" ] && exit 0
 BACKEND_SESSION_ID=$(printf '%s' "$PAYLOAD" | jq -r '.session_id // empty' 2>/dev/null)
 [ -z "$BACKEND_SESSION_ID" ] && BACKEND_SESSION_ID="${CODEX_THREAD_ID:-}"
 RESP=$(curl -sf -X POST "http://localhost:${OUIJA_PORT:-7880}/api/hooks/session-start" \

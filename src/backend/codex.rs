@@ -979,6 +979,17 @@ mod tests {
     #[test]
     fn register_script_wraps_output_as_session_start_context() {
         let s = embedded::SCRIPT_REGISTER;
+        // TMUX_PANE can be inherited from Codex's shared app-server process.
+        // Confirm the targeted pane is actually in the payload's project before
+        // the hook sends a claim that could mutate another Ouija session.
+        assert!(
+            s.contains("tmux display-message -p -t \"$PANE\" '#{pane_current_path}'"),
+            "register script must query the targeted pane cwd: {s}"
+        );
+        assert!(
+            s.contains("[ \"$PANE_CWD\" != \"$CWD\" ] && exit 0"),
+            "register script must skip a mismatched pane claim: {s}"
+        );
         // Registers via the shared session-start endpoint.
         assert!(s.contains("/api/hooks/session-start"), "{s}");
         // Supplies the backend-native identity through the generic hook field.
@@ -1130,6 +1141,11 @@ mod tests {
                 assert_eq!(mode & 0o111, 0o111, "{script} must be executable");
             }
         }
+        assert_eq!(
+            std::fs::read_to_string(hooks_dir.join("codex-register.sh")).unwrap(),
+            embedded::SCRIPT_REGISTER,
+            "the installed register hook must retain its pane-cwd safety check"
+        );
 
         let hooks_json = std::fs::read_to_string(home.path().join("hooks.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&hooks_json).unwrap();
