@@ -1446,6 +1446,28 @@ assert_contains "35a: error explains rename/removal cause" "$err" "renamed"
 result=$(curl -s "${BASE}/api/status")
 assert_not_contains "35a: stale-id send left no pending reply" "$result" "ghost-stale-send"
 
+log "Test 35b: paneless Codex identity resolves whoami and implicit send"
+# This models a Codex tool/app-server process: it has the adapter-owned native
+# thread id but neither TMUX_PANE nor the public OUIJA_SESSION_ID. The daemon
+# must map the typed pair back to its canonical public session id.
+api "$BASE" POST /api/register \
+    -d '{"id":"paneless-codex","backend":"codex-cli","backend_session_id":"thread-paneless"}' >/dev/null
+whoami=$(env -u TMUX_PANE -u OUIJA_SESSION_ID CODEX_THREAD_ID=thread-paneless \
+    OUIJA_PORT=$PORT ouija whoami 2>/dev/null)
+assert_eq "35b: paneless whoami resolves canonical id" "$whoami" "paneless-codex"
+out=$(env -u TMUX_PANE -u OUIJA_SESSION_ID CODEX_THREAD_ID=thread-paneless \
+    OUIJA_PORT=$PORT ouija tell sess-b "paneless implicit sender" 2>&1)
+assert_contains "35b: implicit paneless tell delivered" "$out" "delivered"
+
+set +e
+err=$(env -u TMUX_PANE -u OUIJA_SESSION_ID CODEX_THREAD_ID=thread-paneless \
+    OUIJA_PORT=$PORT ouija tell sess-b "wrong explicit sender" --from sess-a2 2>&1)
+rc=$?
+set -e
+assert_eq "35b: mismatched explicit sender exits non-zero" "$rc" "1"
+assert_contains "35b: mismatch names canonical sender" "$err" "paneless-codex"
+api "$BASE" POST /api/remove -d '{"id":"paneless-codex"}' >/dev/null
+
 # ── Daemon logs ──────────────────────────────────────────────────────
 log "Daemon logs:"
 cat /tmp/ouija-test/daemon.log 2>/dev/null || true
