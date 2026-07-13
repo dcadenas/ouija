@@ -3932,6 +3932,8 @@ async fn adopt_backend_session_id(
                 matches!(s.origin, crate::daemon_protocol::Origin::Local)
                     && s.metadata.project_dir.as_deref() == Some(dir.as_str())
                     && s.metadata.backend_session_id.is_none()
+                    && s.metadata.session_start_credential.is_none()
+                    && matches!(s.metadata.backend.as_deref(), None | Some("opencode"))
             })
             .map(|s| s.id.clone())
             .collect()
@@ -3959,8 +3961,17 @@ async fn adopt_backend_session_id(
             expected_session_start_credential: None,
         })
         .await;
-
-    Some(session_id)
+    let committed = state
+        .protocol
+        .read()
+        .await
+        .sessions
+        .get(&session_id)
+        .is_some_and(|session| {
+            session.metadata.backend.as_deref() == Some("opencode")
+                && session.metadata.backend_session_id.as_deref() == Some(backend_sid)
+        });
+    committed.then_some(session_id)
 }
 
 /// List indexed projects from the configured projects directory.

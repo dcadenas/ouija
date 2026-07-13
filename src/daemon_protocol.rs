@@ -1885,9 +1885,10 @@ impl DaemonState {
             return vec![];
         }
 
-        if let Some(expected_credential) = expected_session_start_credential.as_deref()
-            && current_session_start_credential.as_deref() != Some(expected_credential)
-        {
+        // A pending launch credential makes this slot credentialed: every
+        // adoption path must present the exact value, including generic
+        // backend adopters that otherwise omit credentials.
+        if current_session_start_credential != expected_session_start_credential {
             return vec![];
         }
 
@@ -6390,6 +6391,43 @@ mod tests {
         let metadata = &state.sessions["codex"].metadata;
         assert_eq!(metadata.backend_session_id.as_deref(), Some("thread-1"));
         assert!(metadata.session_start_credential.is_none());
+    }
+
+    #[test]
+    fn adopt_backend_rejects_omitted_credential_for_credentialed_slot() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "codex".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                session_start_credential: Some("credential".into()),
+                ..Default::default()
+            },
+        });
+
+        let effects = state.apply(Event::AdoptBackend {
+            id: "codex".into(),
+            backend: "opencode".into(),
+            backend_session_id: "ses_untrusted".into(),
+            expected_backend_session_id: None,
+            expected_session_start_credential: None,
+        });
+
+        assert!(effects.is_empty());
+        assert!(
+            state.sessions["codex"]
+                .metadata
+                .backend_session_id
+                .is_none()
+        );
+        assert_eq!(
+            state.sessions["codex"]
+                .metadata
+                .session_start_credential
+                .as_deref(),
+            Some("credential")
+        );
     }
 
     #[test]
