@@ -674,6 +674,15 @@ async fn respawn_and_inject(
         permission_mode: claude_permission_mode,
         codex_home: launch_codex_home.clone(),
     });
+    let claude_cmd = match session_start_credential.as_deref() {
+        Some(credential) => crate::backend::codex::with_session_start_hook(
+            claude_cmd,
+            launch_codex_home.as_deref(),
+            task.session_name(),
+            credential,
+        ),
+        None => claude_cmd,
+    };
 
     // Pass prompt as CLI arg (same as start_session) so Claude loads
     // CLAUDE.md and rules before processing the prompt.
@@ -878,17 +887,26 @@ async fn revive_and_inject(
         .backend_session_id
         .clone()
         .or_else(|| detected_backend_session_id.clone());
-    let session_start_credential =
-        (backend_name == "codex-cli").then(crate::daemon_protocol::new_session_start_credential);
+    let session_start_credential = (backend_name == "codex-cli" && clears_context)
+        .then(crate::daemon_protocol::new_session_start_credential);
     let launch_cmd = if clears_context {
-        backend.build_start_command(&crate::backend::StartOpts {
+        let command = backend.build_start_command(&crate::backend::StartOpts {
             project_dir: dir.clone(),
             worktree,
             model: launch_model.model.clone(),
             effort: effort.clone(),
             permission_mode: claude_permission_mode.clone(),
             codex_home: launch_codex_home.clone(),
-        })
+        });
+        match session_start_credential.as_deref() {
+            Some(credential) => crate::backend::codex::with_session_start_hook(
+                command,
+                launch_codex_home.as_deref(),
+                task.session_name(),
+                credential,
+            ),
+            None => command,
+        }
     } else {
         backend
             .build_resume_command(&crate::backend::ResumeOpts {

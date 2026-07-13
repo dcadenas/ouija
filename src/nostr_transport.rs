@@ -1709,6 +1709,11 @@ pub async fn start_session(
     );
     drop(settings);
     crate::backend::codex::install_configured_home(launch_model.codex_home.as_deref());
+    // Mint the proof before rendering the command: a shared Codex app-server
+    // cannot rely on pane-local env, so fresh launches receive it as a trusted
+    // session-flags hook instead.
+    let session_start_credential =
+        (backend_name == "codex-cli").then(crate::daemon_protocol::new_session_start_credential);
     let backend_cmd = backend.build_start_command(&crate::backend::StartOpts {
         project_dir: dir.clone(),
         worktree: None, // ouija manages worktrees, not the backend
@@ -1717,6 +1722,15 @@ pub async fn start_session(
         permission_mode: claude_permission_mode,
         codex_home: launch_model.codex_home.clone(),
     });
+    let backend_cmd = match session_start_credential.as_deref() {
+        Some(credential) => crate::backend::codex::with_session_start_hook(
+            backend_cmd,
+            launch_model.codex_home.as_deref(),
+            name,
+            credential,
+        ),
+        None => backend_cmd,
+    };
 
     let reminder_meta = crate::daemon_protocol::SessionMeta {
         reminder: reminder.map(String::from),
@@ -1777,12 +1791,6 @@ pub async fn start_session(
     } else {
         backend_cmd.clone()
     };
-
-    // Codex reports its thread ID only after it starts. Give this managed
-    // launch an unguessable one-time credential so the hook can authorize that
-    // first binding without trusting the pane/session ID alone.
-    let session_start_credential =
-        (backend_name == "codex-cli").then(crate::daemon_protocol::new_session_start_credential);
 
     let start_result = tokio::task::spawn_blocking({
         let tmux_session = tmux_session.clone();
@@ -2317,14 +2325,23 @@ pub async fn restart_session(
     crate::backend::codex::install_configured_home(launch_codex_home.as_deref());
 
     let claude_cmd = if fresh {
-        backend.build_start_command(&crate::backend::StartOpts {
+        let command = backend.build_start_command(&crate::backend::StartOpts {
             project_dir: dir.clone(),
             worktree: None, // ouija manages worktrees, not the backend
             model: launch_model.model.clone(),
             effort: effective_effort.clone(),
             permission_mode: claude_permission_mode,
             codex_home: launch_codex_home.clone(),
-        })
+        });
+        match session_start_credential.as_deref() {
+            Some(credential) => crate::backend::codex::with_session_start_hook(
+                command,
+                launch_codex_home.as_deref(),
+                name,
+                credential,
+            ),
+            None => command,
+        }
     } else {
         backend
             .build_resume_command(&crate::backend::ResumeOpts {
