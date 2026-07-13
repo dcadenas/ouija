@@ -3422,9 +3422,9 @@ pub async fn repair_backend_identity(
         return response;
     }
 
-    let eligibility = {
-        let protocol = state.protocol.read().await;
-        match protocol.sessions.get(&body.session_id) {
+    let reservation = {
+        let mut protocol = state.protocol.write().await;
+        match protocol.sessions.get_mut(&body.session_id) {
             None => Err(("target_not_found", "named Local session no longer exists")),
             Some(session) if !matches!(session.origin, crate::daemon_protocol::Origin::Local) => {
                 Err(("target_not_local", "only a Local session can be repaired"))
@@ -3450,17 +3450,28 @@ pub async fn repair_backend_identity(
                     "requested backend does not match the legacy session metadata",
                 ))
             }
-            Some(_) => Ok(()),
+            Some(session) if session.metadata.backend_repair_reservation.is_some() => Err((
+                "repair_in_progress",
+                "a fresh managed repair is already in progress for this session",
+            )),
+            Some(session) => {
+                let reservation = session.metadata.restart_generation.saturating_add(1);
+                session.metadata.backend_repair_reservation = Some(reservation);
+                Ok(reservation)
+            }
         }
     };
-    if let Err((outcome, error)) = eligibility {
-        let status = match outcome {
-            "target_not_found" => StatusCode::NOT_FOUND,
-            "target_not_local" => StatusCode::FORBIDDEN,
-            _ => StatusCode::CONFLICT,
-        };
-        return (status, Json(json!({ "outcome": outcome, "error": error })));
-    }
+    let reservation = match reservation {
+        Ok(reservation) => reservation,
+        Err((outcome, error)) => {
+            let status = match outcome {
+                "target_not_found" => StatusCode::NOT_FOUND,
+                "target_not_local" => StatusCode::FORBIDDEN,
+                _ => StatusCode::CONFLICT,
+            };
+            return (status, Json(json!({ "outcome": outcome, "error": error })));
+        }
+    };
 
     let state_for_restart = state.clone();
     let session_id = body.session_id.clone();
@@ -3481,6 +3492,19 @@ pub async fn repair_backend_identity(
             None,
         )
         .await;
+        let mut protocol = state_for_restart.protocol.write().await;
+        if protocol
+            .sessions
+            .get(&session_id)
+            .is_some_and(|session| session.metadata.backend_repair_reservation == Some(reservation))
+        {
+            protocol
+                .sessions
+                .get_mut(&session_id)
+                .expect("session checked above")
+                .metadata
+                .backend_repair_reservation = None;
+        }
         tracing::info!(session = %session_id, backend = %backend_for_restart, %result, "legacy backend repair fresh relaunch completed");
     });
     (
@@ -3488,7 +3512,8 @@ pub async fn repair_backend_identity(
         Json(json!({
             "outcome": "fresh_relaunch_started",
             "session_id": body.session_id,
-            "backend": backend
+            "backend": backend,
+            "repair_reservation": reservation
         })),
     )
 }
@@ -4478,6 +4503,31 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["outcome"], "target_not_found");
+    }
+
+    #[tokio::test]
+    async fn backend_identity_repair_rejects_duplicate_in_progress_request() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "legacy".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let request = BackendIdentityRepairRequest {
+            session_id: "legacy".into(),
+            backend: "codex-cli".into(),
+        };
+        let (status, _) =
+            repair_backend_identity(State(state.clone()), Json(request.clone())).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let (status, Json(body)) = repair_backend_identity(State(state), Json(request)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["outcome"], "repair_in_progress");
     }
 
     fn pending_prompt(pane_id: &str, prompt: &str) -> crate::state::PendingPrompt {

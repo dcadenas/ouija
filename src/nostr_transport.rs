@@ -2790,6 +2790,7 @@ pub async fn restart_session(
                     backend_session_id,
                     backend: Some(backend_name.clone()),
                     session_start_credential: pending_session_start_credential.clone(),
+                    backend_repair_reservation: m.backend_repair_reservation,
                     opencode_binding: opencode_binding.clone(),
                     restart_generation: m.restart_generation.saturating_add(1),
                     session_incarnation: m.session_incarnation,

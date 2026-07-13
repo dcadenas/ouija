@@ -3096,6 +3096,7 @@ mod tests {
             backend: Some("opencode".into()),
             opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
             restart_generation: 9,
+            backend_repair_reservation: None,
             session_incarnation: 13,
             project_description: Some("project".into()),
             last_metadata_update: chrono::DateTime::from_timestamp(1_700_000_001, 0),

@@ -106,6 +106,13 @@ pub struct SessionMeta {
     /// closed instead of reviving its authority from disk.
     #[serde(default, skip_serializing, skip_deserializing)]
     pub session_start_credential: Option<String>,
+    /// In-memory token for an explicit legacy backend repair. It prevents two
+    /// asynchronous repair requests from staging competing credentials and
+    /// respawning the same session concurrently. Like the launch credential it
+    /// is deliberately lost on daemon restart, which fails unfinished repair
+    /// closed rather than reviving authority from persisted state.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub backend_repair_reservation: Option<u64>,
     /// Strength of an OpenCode backend-session binding.
     ///
     /// `None` is treated as weak for backward compatibility with adopted
@@ -480,6 +487,7 @@ impl Default for SessionMeta {
             backend_session_id: None,
             backend: None,
             session_start_credential: None,
+            backend_repair_reservation: None,
             opencode_binding: None,
             restart_generation: 0,
             session_incarnation: 0,
@@ -907,6 +915,7 @@ pub(crate) fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>
             backend_session_id: m.backend_session_id.clone(),
             backend: m.backend.clone(),
             session_start_credential: None,
+            backend_repair_reservation: m.backend_repair_reservation,
             opencode_binding: m.opencode_binding.clone(),
             restart_generation: m.restart_generation,
             session_incarnation: m.session_incarnation,

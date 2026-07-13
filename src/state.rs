@@ -418,6 +418,9 @@ pub struct SessionMetadata {
     /// Monotonic token used to reject stale async restart commits.
     #[serde(default)]
     pub restart_generation: u64,
+    /// In-memory legacy-repair reservation mirrored from protocol metadata.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub backend_repair_reservation: Option<u64>,
     /// Per-registration token used to reject stale async commits.
     #[serde(default)]
     pub session_incarnation: i64,
@@ -507,6 +510,7 @@ impl Default for SessionMetadata {
             backend: None,
             opencode_binding: None,
             restart_generation: 0,
+            backend_repair_reservation: None,
             session_incarnation: 0,
             project_description: None,
             bulletin: None,
@@ -1414,6 +1418,7 @@ impl AppState {
                         backend: m.backend.clone(),
                         opencode_binding: m.opencode_binding.clone(),
                         restart_generation: m.restart_generation,
+                        backend_repair_reservation: m.backend_repair_reservation,
                         session_incarnation: m.session_incarnation,
                         project_description: m.project_description.clone(),
                         bulletin: m.bulletin.clone(),
@@ -3910,6 +3915,7 @@ pub(crate) mod tests {
             backend_session_id: Some("oc_abc123".into()),
             backend: Some("opencode".into()),
             session_start_credential: None,
+            backend_repair_reservation: None,
             opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
             restart_generation: 7,
             session_incarnation: 11,
