@@ -1,0 +1,214 @@
+{
+  "findings": [
+    {
+      "id": "f1",
+      "kind": "raw",
+      "file": "src/hooks.rs",
+      "line": 404,
+      "severity": "high",
+      "confidence": 99,
+      "title": "Use managed launch proof even when Codex inherits a pane",
+      "summary": "A same-checkout pane inherited by Codex diverts a credentialed SessionStart away from the launch-ID binder after the one-shot proof file has been deleted.",
+      "body": "The hook claims and deletes its one-shot credential file before deriving `TMUX_PANE` (`scripts/codex/codex-register.sh:30-41`), but the daemon selects the launch-ID-targeted atomic bind only when `body.pane` is empty (`src/hooks.rs:404`). A shared Codex app-server can report a same-checkout sibling pane that passes the script's cwd filter; the server then enters the pane path and rejects the sibling provenance after the only file copy of the proof is gone (`src/hooks.rs:460-514`). Route any SessionStart carrying a launch ID, credential, and backend identity through `bind_backend_identity` regardless of pane, treating pane/cwd only as consistency evidence.",
+      "worker_instruction": "Make the presence of complete managed launch proof—not pane emptiness—select the atomic backend-identity bind. Preserve pane/cwd only as optional corroboration and add a same-checkout inherited-sibling-pane test proving the intended launch binds once and duplicate delivery remains idempotent.",
+      "reviewer_check": "Run the hook with a valid launch ID/credential/backend identity plus a nonempty same-checkout sibling pane; confirm the named launch binds, the sibling does not, and a replay is harmless.",
+      "trigger_path": "Fresh managed Codex launch -> per-launch SessionStart hook consumes credential file -> shared app-server supplies inherited same-checkout TMUX_PANE -> `/api/hooks/session-start` enters the pane branch instead of the credentialed launch-ID bind",
+      "required_conditions": [
+        "Codex's shared app-server inherits a nonempty pane",
+        "The pane belongs to a same-checkout sibling or otherwise does not match the named launch",
+        "The hook carries valid managed launch proof"
+      ],
+      "likelihood": "likely",
+      "impact": "high",
+      "speculation_level": "confirmed",
+      "importance_rationale": "The shared-app-server pane inheritance is the production scenario this feature targets; the branch consumes the only hook-side proof and leaves the intended live launch without a canonical backend binding.",
+      "context": "A managed Codex launch uses a one-time credential to bind Codex's native thread ID to the public Ouija session. The hook may run in a shared app-server whose pane environment belongs to another session.",
+      "what": "The server chooses the strong launch-ID binding path only when no pane is reported. A stale same-checkout pane sends the request down the pane path after the credential file has already been removed.",
+      "so_what": "The intended Codex session starts successfully but never acquires its canonical public identity, so paneless `whoami`, `ask`, `tell`, and `reply` cannot identify it without another managed relaunch.",
+      "decision": "Change the branch selector to managed proof presence and add the inherited-pane regression test. Recommendation: accept; both advocates agreed the ordering defect is reachable and material, while the earlier malformed-ID limb has been removed.",
+      "why_keep": "The hook explicitly deletes the staged proof before deriving an inherited pane (`scripts/codex/codex-register.sh:30-41`). Same-checkout panes pass the early filter, but the atomic launch-ID binder is gated on empty pane (`src/hooks.rs:404`); sibling provenance then rejects in the pane path (`src/hooks.rs:387-389,460-514`). The daemon may retain the expected credential, but normal hook replay cannot present the deleted file, so the exact-pair resolver remains incomplete (`src/daemon_protocol.rs:2015-2061`).",
+      "why_reject": "The pane path fails closed for integrity and does not consume the daemon-side credential on rejection (`src/hooks.rs:475-552`; `src/daemon_protocol.rs:2125-2163`). The discarded malformed-ID limb also lacked evidence that Codex emits reserved characters. Those points narrow the finding, but they do not restore the deleted hook-side proof or make the intended launch resolvable.",
+      "auto_verdict": "keep",
+      "auto_reason": "The keep case wins on a normal shared-app-server path: the diff deletes one-shot proof before using an untrusted pane to select a different authorization branch, producing a live but unbound session. The fix is localized and the speculative malformed-ID claim was removed."
+    },
+    {
+      "id": "f2",
+      "kind": "raw",
+      "file": "src/main.rs",
+      "line": 2245,
+      "severity": "high",
+      "confidence": 98,
+      "title": "Do not turn backend-resolution failures into local fallback",
+      "summary": "Semantic backend resolver failures are erased with `.ok()`, allowing a stale registered pane or environment ID to become the sender.",
+      "body": "`whoami_outcome` converts every backend-resolution error into `None` with `.await.ok()` (`src/main.rs:2245`). `not_found`, `ambiguous`, and `incomplete_legacy` therefore look like the absence of an adapter identity, so arbitration keeps a pane or `OUIJA_SESSION_ID` value (`src/main.rs:1963-1969`). `resolve_sender` stamps that local ID into both `from` and `sender_ctx.self_id`, and daemon validation accepts the matching local claim before the unresolved backend pair (`src/main.rs:2327-2333`; `src/daemon_protocol.rs:1115-1131`). Preserve semantic resolver failures and fail closed whenever a backend identity is present; local-only fallback is valid only when no adapter identity exists.",
+      "worker_instruction": "Represent backend identity discovery and daemon resolution as a typed success/failure signal. Make not-found, ambiguous, incomplete-legacy, and malformed-success results terminal when an adapter identity exists; only the true absence of an adapter identity may use local-only arbitration. Decide explicitly whether transient transport failure follows the same fail-closed rule and test that policy separately.",
+      "reviewer_check": "With a registered stale local ID present, exercise not-found, ambiguous, incomplete-legacy, malformed success, and the chosen transport-error policy; no semantic resolver failure may stamp the local ID, while a successful canonical resolution must reject disagreement.",
+      "trigger_path": "Paneless or shared-app-server CLI command -> Codex adapter exposes CODEX_THREAD_ID -> daemon backend resolver returns a non-success outcome -> `.ok()` erases it -> registered stale pane/environment ID is stamped and accepted",
+      "required_conditions": [
+        "A backend adapter exposes a native identity",
+        "Canonical resolution returns not-found, ambiguous, incomplete-legacy, or another error",
+        "A local pane or environment signal names a registered session"
+      ],
+      "likelihood": "likely",
+      "impact": "high",
+      "speculation_level": "confirmed",
+      "importance_rationale": "Zero, multiple, and incomplete matches are explicit fail-closed cases; accepting a stale local sender on those outcomes can misattribute real messages to another live session.",
+      "context": "The CLI arbitrates between a backend-native identity, such as Codex's thread ID, and older pane/environment hints. The backend pair is supposed to be authoritative because shared app-server hints can be stale.",
+      "what": "The code discards every resolver failure and treats it as if no backend identity existed, re-enabling the weaker local hints.",
+      "so_what": "A Codex tool shell can send a message under a sibling public session even though its actual backend identity is missing, ambiguous, or attached to incomplete legacy state.",
+      "decision": "Preserve semantic resolution errors through arbitration and define transport-outage behavior explicitly. Recommendation: accept; the reject advocate found no defensible case against the semantic-failure bug, only a scope question for transient outages.",
+      "why_keep": "A nonempty `CODEX_THREAD_ID` creates a backend identity (`src/backend/codex.rs:586-590`), but `.ok()` erases the API's concrete 404/409 outcomes (`src/main.rs:2241-2248`; `src/api.rs:3265-3284`). Registration verification checks only that the selected local ID exists (`src/main.rs:2374-2387`), and sender validation accepts `self_id == from` before examining the backend pair (`src/daemon_protocol.rs:1115-1129`).",
+      "why_reject": "Propagating every resolver error would also alter the existing lenient daemon-outage posture (`src/main.rs:2363-2399`), so the remediation should distinguish semantic identity failures from any deliberately tolerated transport failure. This caveat does not rebut the demonstrated not-found/ambiguous/incomplete-legacy path.",
+      "auto_verdict": "keep",
+      "auto_reason": "The finding is diff-caused, directly reachable through first-class resolver outcomes, materially misattributes senders, and has a practical typed-error fix. The decision text preserves the narrow transport-policy subdecision."
+    },
+    {
+      "id": "f3",
+      "kind": "raw",
+      "file": "src/nostr_transport.rs",
+      "line": 1965,
+      "severity": "high",
+      "confidence": 96,
+      "title": "Make final Codex registration preserve a concurrent SessionStart bind",
+      "summary": "Start and restart snapshot pending identity state, release the lock, and later replace the whole session, so a bind in between is overwritten.",
+      "body": "The start finalizer snapshots `backend_session_id` and `session_start_credential` under a read lock, releases it, and later submits whole-entry `Event::Register` (`src/nostr_transport.rs:1965-2004`). Restart repeats the separated snapshot and registration (`src/nostr_transport.rs:2752-2837`). If SessionStart binds in that gap, it records the native pair and consumes the credential, but the stale registration restores `backend_session_id = None` and resurrects the pending credential; same-ID registration does not detect the change and replaces the entry (`src/daemon_protocol.rs:1353-1360,1403-1411`). Finalize identity-sensitive metadata with one binding-aware compare-and-set transition under the protocol write lock.",
+      "worker_instruction": "Add a binding-aware atomic final-refresh/CAS transition used by both start and restart. It must preserve a complete pair and consumed credential if SessionStart already won, preserve the pending credential if it has not, and reject/no-op on a different launch incarnation. Add a deterministic interleaving test: snapshot pending state, bind and consume, then finalize.",
+      "reviewer_check": "Force SessionStart binding between the finalizer's observation and commit in both start and restart tests; confirm the complete pair remains, the credential stays absent, and a stale incarnation cannot commit.",
+      "trigger_path": "Managed Codex start or restart -> finalizer reads pending binding state -> asynchronous SessionStart atomically binds -> finalizer issues same-ID whole-entry Register from stale snapshot",
+      "required_conditions": [
+        "SessionStart binds after the finalizer's read snapshot",
+        "The bind completes before the subsequent Event::Register"
+      ],
+      "likelihood": "rare",
+      "impact": "high",
+      "speculation_level": "confirmed",
+      "importance_rationale": "Both participants are normal startup actors, and losing the only successful hook delivery leaves the live session without canonical backend resolution while also resurrecting one-time proof state.",
+      "context": "Codex reports its native thread ID asynchronously after launch. Ouija first registers a pending credential, then refreshes normal session metadata once the pane is started.",
+      "what": "The refresh reads identity state and commits it in separate lock acquisitions. A successful SessionStart bind between those operations is overwritten by the stale full registration.",
+      "so_what": "A healthy launch can briefly bind correctly and then become incomplete again, so later paneless commands cannot resolve it and the supposedly consumed credential reappears.",
+      "decision": "Use one atomic binding-aware final refresh rather than broad mutation redesign. Recommendation: accept; both advocates agreed the narrow start/restart race passes the gate and rejected only the earlier over-broad umbrella.",
+      "why_keep": "Start and restart each separate identity observation from whole-entry Register (`src/nostr_transport.rs:1965-2004,2752-2837`). `bind_backend_identity` commits and consumes proof under one write lock (`src/daemon_protocol.rs:2144-2164`), but the later Register excludes the same ID from duplicate detection and replaces the entry (`src/daemon_protocol.rs:1353-1360,1403-1411`). Exact resolution then fails on the incomplete row (`src/daemon_protocol.rs:2015-2061`).",
+      "why_reject": "The original architecture umbrella also included generic Register and legacy OpenCode adoption behaviors that predate this diff and already have their own guards. That breadth should be rejected. It does not rebut the narrow stale-snapshot race shared by the changed start and restart finalizers.",
+      "auto_verdict": "keep",
+      "auto_reason": "The narrowed finding is a concrete diff-caused interleaving between normal startup actors with high identity-integrity impact and a focused atomic-refresh remedy."
+    },
+    {
+      "id": "f4",
+      "kind": "raw",
+      "file": "src/api.rs",
+      "line": 3480,
+      "severity": "high",
+      "confidence": 99,
+      "title": "Keep the repair reservation until identity binding finishes",
+      "summary": "The repair reservation is cleared when process restart returns, before the asynchronous SessionStart identity bind that defines repair success.",
+      "body": "The repair endpoint reserves the session under the protocol lock, but calls `restart_session` without a reservation token and clears the reservation immediately when restart returns (`src/api.rs:3425-3507`). A fresh Codex restart can return with a pending credential and no backend ID while SessionStart binds later (`src/nostr_transport.rs:2752-2795`; `src/hooks.rs:404-430`). A retry in that window passes eligibility, replaces the proof, and performs another destructive respawn, after which the first delayed hook fails the current-credential check. Carry the reservation/generation through the repair lifecycle and release it only on matching bind or terminal rollback.",
+      "worker_instruction": "Retain `backend_repair_reservation` through successful credential-matched SessionStart binding or confirmed launch failure. Validate the generation before staging proof, before destructive respawn, and before final registration/bind. Any timeout-based release must atomically invalidate that generation's pending credential. Add delayed-hook, duplicate-retry, and stale-generation tests.",
+      "reviewer_check": "Delay SessionStart until after restart returns; confirm a second repair remains `repair_in_progress`, only one generation can respawn/register/bind, and failure or timeout cleanup cannot let an old hook mutate a newer generation.",
+      "trigger_path": "POST backend identity repair -> reservation stored -> restart returns with pending credential -> reservation cleared -> delayed SessionStart has not bound -> duplicate repair or lifecycle action begins another generation",
+      "required_conditions": [
+        "SessionStart binding completes after restart_session returns",
+        "The repair is retried or another lifecycle action affects the session in that interval"
+      ],
+      "likelihood": "rare",
+      "impact": "high",
+      "speculation_level": "confirmed",
+      "importance_rationale": "The current-cycle human requirement explicitly requires the reservation/generation through credential staging, respawn, SessionStart binding, and final registration; the present code guards only API admission and permits redundant destructive relaunches.",
+      "context": "Repair handles legacy sessions with only half of a backend identity by performing a fresh managed relaunch and waiting for the new backend to prove its native ID.",
+      "what": "The reservation ends when the process restart function returns, not when the later proof-bearing SessionStart has committed the repaired identity.",
+      "so_what": "A normal retry can kill the first repaired process, replace its credential, and make its eventual valid hook fail, causing repeated churn and preventing the session from becoming resolvable.",
+      "decision": "Extend the reservation through the credential-matched bind and guard every destructive/committing step by generation. Recommendation: accept; this is also an explicit unresolved item from the current human review feedback.",
+      "why_keep": "Reservation presence blocks duplicates only until `restart_session` returns (`src/api.rs:3453-3506`). Fresh restart may legitimately finish with `backend_session_id=None` and a pending proof (`src/nostr_transport.rs:2752-2795`), while SessionStart binds later (`src/hooks.rs:404-430`). A second accepted repair can execute `respawn-pane -k` and replace the credential, making the old hook fail exact-current-credential validation (`src/daemon_protocol.rs:2125-2142`).",
+      "why_reject": "The restart preserves the reservation in its refreshed metadata and a later retry is sequential, not a simultaneous API admission. The public endpoint documentation only promises that a fresh relaunch was started. However, the current human requirement defines completion through SessionStart binding, and sequential retry in the unbound window still performs a redundant destructive relaunch and invalidates the first proof.",
+      "auto_verdict": "keep",
+      "auto_reason": "The keep case clearly wins against the task's explicit repair-lifecycle contract: the diff releases ownership before repair success and exposes a concrete destructive retry window."
+    },
+    {
+      "id": "f5",
+      "kind": "raw",
+      "file": "src/scheduler.rs",
+      "line": 678,
+      "severity": "medium",
+      "confidence": 99,
+      "title": "Roll back provisional binding changes when credential staging fails",
+      "summary": "Scheduled Codex respawn clears the live binding before credential-file staging; an early staging error returns without the rollback used by later failures.",
+      "body": "`respawn_and_inject` clears the existing Codex `backend_session_id` and publishes a new credential before calling the fallible credential-file staging helper (`src/scheduler.rs:631-690`). If directory creation, chmod, file creation, or write fails, the function returns before respawn and without `rollback_provisional_revival`, leaving the old process alive but its stored backend pair erased. Stage before mutation or invoke the existing guarded rollback on this error.",
+      "worker_instruction": "On `with_session_start_hook` failure, call the existing guarded `rollback_provisional_revival` before returning, or stage the credential file before changing protocol state. Add a staging-failure test asserting the old binding remains intact.",
+      "reviewer_check": "Inject each credential-staging failure class and confirm the prior backend pair, pane, and credential state are restored without disturbing a concurrently successful bind.",
+      "trigger_path": "Scheduled clear-context task for an existing Codex session -> provisional registration clears native binding -> credential-file staging fails -> early return bypasses rollback",
+      "required_conditions": [
+        "A scheduled task respawns an existing Codex session",
+        "Credential directory creation, permission change, file creation, or write fails",
+        "A later paneless command lacks usable pane/environment identity"
+      ],
+      "likelihood": "rare",
+      "impact": "high",
+      "speculation_level": "confirmed",
+      "importance_rationale": "The error path is a real asymmetric mutation that can make a live Codex thread selectively unresolvable, but its full user-visible impact requires both a local filesystem failure and loss of pane-local signals.",
+      "context": "A scheduled clear-context task prepares a fresh Codex launch by replacing the old native binding with a pending one-time credential before respawning the pane.",
+      "what": "Credential-file staging happens after the metadata mutation. Its early error path does not call the rollback already used for later respawn failures.",
+      "so_what": "The old process remains alive, but paneless tool shells can no longer resolve its canonical identity until another successful relaunch or explicit repair.",
+      "decision": "Decide whether to fix this narrow rollback asymmetry now. Recommendation: auto-drop from the default review because the material failure requires a compound rare and recoverable path, while preserving the evidence for human override.",
+      "why_keep": "The provisional Register persists `(codex-cli, None)` before fallible staging (`src/scheduler.rs:634-690`; `src/backend/codex.rs:57-90`). Failure returns before respawn with no rollback (`src/scheduler.rs:678-707`), so paneless identity resolution for the still-live thread is lost. The existing guarded rollback is a small, safe remedy (`src/scheduler.rs:1164`; `src/daemon_protocol.rs:1813`).",
+      "why_reject": "The failure occurs before `respawn-pane`, so the old process and pane remain usable (`src/scheduler.rs:707-717`). Incoming delivery and same-pane sender claims still work, while full mesh unavailability additionally requires loss of pane/environment signals. Recovery is available through the next task run or managed repair, making this a rare, recoverable degradation rather than severe harm.",
+      "auto_verdict": "drop",
+      "auto_reason": "The reject case wins the keep-gate: although the rollback defect is confirmed and actionable, its material user impact requires a compound rare filesystem failure plus absent pane-local identity, and recovery is available."
+    }
+  ],
+  "completeness": [
+    "Generic BackendSessionIdentity resolver and credentialed binder: addressed; focused backend_identity tests pass (11 passed).",
+    "Single authoritative CLI arbitration for whoami and sends: missing because semantic resolver failures are swallowed at src/main.rs:2245.",
+    "Credential secrecy in generated Codex argv/TOML: addressed with a private one-shot credential file; focused paneless SessionStart tests pass (3 passed).",
+    "Paneless SessionStart under inherited shared-app-server pane state: missing because strong binding is gated on pane emptiness at src/hooks.rs:404.",
+    "Atomic/idempotent bind transition: addressed in the binder, but final start/restart registration can overwrite a concurrent successful bind.",
+    "Repair reservation across credential staging, respawn, SessionStart binding, and final registration: missing; reservation currently ends when restart_session returns.",
+    "Legacy incomplete metadata: resolver and explicit repair endpoint fail closed, but the existing OpenCode directory-adoption path can still complete backend-only rows; this path predates the reviewed diff and is not promoted as a diff-caused finding.",
+    "Focused tests cover the typed resolver, binder, proof rejection, same-checkout sibling credential claim, and duplicate repair admission; they do not cover the inherited-nonempty-pane, stale-finalizer, or delayed-repair-bind interleavings above."
+  ],
+  "posture_outputs": [
+    {
+      "agent": "hub-review-input",
+      "status": "ok",
+      "mode": "native",
+      "output": [
+        {
+          "file": "src/hooks.rs",
+          "line": 415,
+          "severity": "medium",
+          "confidence": 96,
+          "title": "Validate paneless backend IDs before consuming launch proof",
+          "body": "The paneless SessionStart path only trims and checks the backend identity for emptiness, then binds it without calling validate_backend_session_id_boundary. The installed Codex hook forwards .session_id directly, so a malformed value containing /, ?, #, or whitespace can consume the one-time launch credential and persist a binding that /api/backend-identities/resolve later rejects at src/api.rs:3230.",
+          "trigger_path": "Codex SessionStart payload -> hook -> paneless bind -> later CLI resolver",
+          "required_conditions": ["backend emits malformed native session ID", "valid launch credential"],
+          "likelihood": "rare",
+          "impact": "medium",
+          "speculation_level": "confirmed",
+          "importance_rationale": "Malformed adapter input can consume one-shot proof and leave the managed session unresolved."
+        }
+      ]
+    },
+    {
+      "agent": "hub-review-flow",
+      "status": "ok",
+      "mode": "native",
+      "output": [
+        {"file":"src/main.rs","line":2245,"severity":"high","confidence":98,"body":"whoami_outcome erases every backend-resolution failure with .await.ok(), allowing fallback to stale pane/environment identity and sender misattribution.","trigger_path":"CLI -> backend resolution failure -> local fallback -> send","required_conditions":["backend identity present","resolver non-success","registered local hint"],"likelihood":"likely","impact":"high","speculation_level":"confirmed","importance_rationale":"Reopens sender misattribution on the shared-app-server path."},
+        {"file":"src/nostr_transport.rs","line":1965,"severity":"high","confidence":96,"body":"Final Codex registration snapshots pending metadata and later Register can overwrite a successful SessionStart bind; restart repeats the race.","trigger_path":"launch -> snapshot -> SessionStart bind -> stale Register","required_conditions":["bind lands between snapshot and Register"],"likelihood":"rare","impact":"high","speculation_level":"confirmed","importance_rationale":"Loses the only successful hook delivery and canonical identity."},
+        {"file":"src/api.rs","line":3495,"severity":"medium","confidence":98,"body":"Repair reservation clears when restart returns before asynchronous SessionStart binding, allowing a destructive duplicate repair.","trigger_path":"repair -> restart returns -> clear -> retry before bind","required_conditions":["delayed SessionStart","retry"],"likelihood":"likely","impact":"high","speculation_level":"confirmed","importance_rationale":"Ordinary retry can respawn again and invalidate proof."},
+        {"file":"src/scheduler.rs","line":678,"severity":"medium","confidence":99,"body":"Provisional respawn clears the binding before credential-file staging; staging failure returns without rollback.","trigger_path":"scheduled respawn -> provisional mutation -> staging failure","required_conditions":["filesystem staging error"],"likelihood":"rare","impact":"high","speculation_level":"confirmed","importance_rationale":"Corrupts identity metadata of an otherwise live session."}
+      ]
+    },
+    {
+      "agent": "hub-review-boundary",
+      "status": "ok",
+      "mode": "native",
+      "output": [
+        {"file":"src/hooks.rs","line":404,"severity":"high","confidence":99,"body":"Credentialed binding is selected only when pane is empty; an inherited same-checkout pane bypasses strong launch proof after the proof file is consumed.","trigger_path":"managed hook -> inherited pane -> pane branch","required_conditions":["shared app-server inherits nonempty same-checkout pane"],"likelihood":"likely","impact":"high","speculation_level":"confirmed","importance_rationale":"Makes strong proof ineffective on the target production path."},
+        {"file":"src/main.rs","line":2245,"severity":"high","confidence":98,"body":"Resolver failures are erased, so not-found, ambiguous, and incomplete-legacy outcomes allow local fallback.","trigger_path":"backend identity -> resolver failure -> local sender","required_conditions":["backend identity present","registered local hint"],"likelihood":"likely","impact":"high","speculation_level":"confirmed","importance_rationale":"Violates explicit fail-closed acceptance cases."},
+        {"file":"src/api.rs","line":3480,"severity":"high","confidence":99,"body":"Repair reservation is not carried into restart, destructive steps, SessionStart binding, or final registration.","trigger_path":"repair -> detached unguarded restart -> concurrent lifecycle change","required_conditions":["concurrent repair or lifecycle action"],"likelihood":"rare","impact":"high","speculation_level":"inferred","importance_rationale":"Stale destructive work can supersede session ownership."},
+        {"file":"src/daemon_protocol.rs","line":2208,"severity":"high","confidence":97,"body":"Incomplete backend-only OpenCode rows can still be completed through uncredentialed cwd adoption.","trigger_path":"readiness -> directory lookup -> AdoptBackend","required_conditions":["unique backend-only legacy row in directory"],"likelihood":"likely","impact":"high","speculation_level":"confirmed","importance_rationale":"Bypasses explicit legacy repair."},
+        {"file":"src/daemon_protocol.rs","line":1357,"severity":"medium","confidence":98,"body":"Generic same-ID Register can erase or overwrite a complete backend pair.","trigger_path":"same-ID registration -> whole-entry replacement","required_conditions":["existing complete pair","re-registration"],"likelihood":"rare","impact":"medium","speculation_level":"confirmed","importance_rationale":"Can destroy canonical resolution."}
+      ]
+    }
+  ],
+  "followup_recommendations": []
+}

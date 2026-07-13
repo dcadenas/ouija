@@ -224,7 +224,7 @@ async fn post_compact_inner(
     json!({ "ok": true, "continuation_injected": true })
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct SessionStartBody {
     /// Empty for a paneless hook running under a shared app-server.
     #[serde(default)]
@@ -398,20 +398,14 @@ async fn session_start_inner(
         return json!({ "skipped": "auto_register disabled", "output": "" });
     }
 
-    // A shared app-server hook has no trustworthy tmux pane. It may bind only
-    // the named managed launch, using the claimant-presented one-time proof;
-    // cwd and pane discovery are never authorization substitutes here.
-    if body.pane.trim().is_empty() {
-        let (Some(identity), Some(launch_id), Some(credential)) = (
-            body.backend_identity.as_ref(),
-            body.launch_session_id.as_deref(),
-            body.launch_credential.as_deref(),
-        ) else {
-            return json!({
-                "skipped": "paneless SessionStart requires backend identity, launch session id, and launch credential",
-                "output": "",
-            });
-        };
+    // A complete managed proof is sufficient to select the atomic bind path.
+    // An app-server can inherit an unrelated pane, so pane/cwd may corroborate
+    // ordinary registration but must never decide ownership of this launch.
+    if let (Some(identity), Some(launch_id), Some(credential)) = (
+        body.backend_identity.as_ref(),
+        body.launch_session_id.as_deref(),
+        body.launch_credential.as_deref(),
+    ) {
         let identity = crate::backend::BackendSessionIdentity {
             backend: identity.backend.trim().to_string(),
             session_id: identity.session_id.trim().to_string(),
@@ -450,6 +444,13 @@ async fn session_start_inner(
                 "output": "",
             }),
         };
+    }
+
+    if body.pane.trim().is_empty() {
+        return json!({
+            "skipped": "paneless SessionStart requires backend identity, launch session id, and launch credential",
+            "output": "",
+        });
     }
 
     // Skip if pane already registered (Ouija-launched / API-started sessions hit
@@ -766,6 +767,68 @@ mod tests {
         assert_eq!(
             replay["registered"], "managed",
             "duplicate delivery is idempotent"
+        );
+    }
+
+    #[tokio::test]
+    async fn proven_launch_ignores_an_inherited_sibling_pane_and_replay_is_idempotent() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sibling".into(),
+                pane: Some("%sibling".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/same-checkout".into()),
+                    backend: Some("codex-cli".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "intended".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/same-checkout".into()),
+                    backend: Some("codex-cli".into()),
+                    session_start_credential: Some("proof".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let body = SessionStartBody {
+            pane: "%sibling".into(),
+            cwd: "/same-checkout".into(),
+            backend_session_id: Some("thread-intended".into()),
+            backend_identity: Some(crate::backend::BackendSessionIdentity {
+                backend: "codex-cli".into(),
+                session_id: "thread-intended".into(),
+            }),
+            adapter: Some("codex-cli".into()),
+            launch_session_id: Some("intended".into()),
+            launch_credential: Some("proof".into()),
+        };
+        assert_eq!(
+            session_start_inner(&state, body.clone()).await["registered"],
+            "intended"
+        );
+        assert_eq!(
+            session_start_inner(&state, body).await["registered"],
+            "intended"
+        );
+        let protocol = state.protocol.read().await;
+        assert_eq!(
+            protocol.sessions["intended"]
+                .metadata
+                .backend_session_id
+                .as_deref(),
+            Some("thread-intended")
+        );
+        assert!(
+            protocol.sessions["sibling"]
+                .metadata
+                .backend_session_id
+                .is_none()
         );
     }
 
