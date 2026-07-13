@@ -824,17 +824,26 @@ pub fn close_shell_after(command: &str) -> String {
 ///   3. Sessions launched outside tmux (future non-tmux backends) have no
 ///      pane var to read at all.
 ///
-/// `HISTFILE=/dev/null` and `fish_history=` suppress history writes so
-/// ouija commands don't pollute the user's shell history.
-pub fn pane_env_args(session_id: &str) -> Vec<String> {
-    vec![
+/// `OUIJA_SESSION_START_CREDENTIAL`, when supplied for a managed Codex launch,
+/// authorizes only its first backend-thread binding. `HISTFILE=/dev/null` and
+/// `fish_history=` suppress history writes so ouija commands don't pollute the
+/// user's shell history.
+pub fn pane_env_args(session_id: &str, session_start_credential: Option<&str>) -> Vec<String> {
+    let mut args = vec![
         "-e".into(),
         format!("OUIJA_SESSION_ID={session_id}"),
         "-e".into(),
         "HISTFILE=/dev/null".into(),
         "-e".into(),
         "fish_history=".into(),
-    ]
+    ];
+    if let Some(credential) = session_start_credential {
+        args.extend([
+            "-e".into(),
+            format!("OUIJA_SESSION_START_CREDENTIAL={credential}"),
+        ]);
+    }
+    args
 }
 
 /// Derive a tmux session name from a project directory path.
@@ -877,7 +886,7 @@ mod tests {
 
     #[test]
     fn pane_env_args_includes_ouija_session_id() {
-        let args = pane_env_args("feat/442-chunk-4");
+        let args = pane_env_args("feat/442-chunk-4", None);
         // Flat -e KEY=VALUE pairs, in order, suitable for splatting into tmux argv
         assert!(
             args.windows(2)
@@ -887,8 +896,18 @@ mod tests {
     }
 
     #[test]
+    fn pane_env_args_includes_managed_launch_credential_when_supplied() {
+        let args = pane_env_args("feat/442", Some("credential"));
+        assert!(
+            args.windows(2)
+                .any(|w| { w[0] == "-e" && w[1] == "OUIJA_SESSION_START_CREDENTIAL=credential" }),
+            "expected launch credential in pane env, got {args:?}"
+        );
+    }
+
+    #[test]
     fn pane_env_args_preserves_history_suppression() {
-        let args = pane_env_args("x");
+        let args = pane_env_args("x", None);
         assert!(
             args.windows(2)
                 .any(|w| w[0] == "-e" && w[1] == "HISTFILE=/dev/null"),
@@ -906,7 +925,7 @@ mod tests {
         // Every VALUE must be immediately preceded by a "-e" flag — no
         // bare values sneaking in that would otherwise be interpreted as
         // the shell-command positional arg to new-window/new-session.
-        let args = pane_env_args("abc");
+        let args = pane_env_args("abc", None);
         let mut i = 0;
         while i < args.len() {
             assert_eq!(args[i], "-e", "arg {i} should be -e, got {args:?}");

@@ -294,6 +294,10 @@ pub struct AppState {
     pending_commands: std::sync::Mutex<Vec<(String, tokio::sync::oneshot::Sender<String>)>>,
     /// Cached tmux panes running the coding assistant, refreshed by the reaper loop.
     pub(crate) cached_assistant_panes: RwLock<Vec<crate::tmux::TmuxPane>>,
+    /// Short-lived suppression after explicit removal. This replaces an
+    /// indefinite `@ouija_id` marker as the protection against the scanner
+    /// re-registering a pane before kill-session finishes.
+    autoregister_suppressed_panes: std::sync::Mutex<HashMap<String, std::time::Instant>>,
     /// Per-fire worktree panes: pane_id → project_dir.
     /// Reaper runs `git worktree prune` when these panes die.
     pub perfire_worktree_panes: RwLock<HashMap<String, String>>,
@@ -569,6 +573,7 @@ const MAX_TASK_RUNS: usize = 200;
 const MAX_NAME_SUFFIX: u32 = 100;
 /// Reciprocation debounce interval to prevent session list ping-pong.
 const RECIPROCATE_DEBOUNCE_SECS: u64 = 30;
+const AUTOREGISTER_REMOVE_GRACE_SECS: u64 = 10;
 
 impl AppState {
     #[cfg(test)]
@@ -601,6 +606,7 @@ impl AppState {
             project_index: RwLock::new(HashMap::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
             cached_assistant_panes: RwLock::new(Vec::new()),
+            autoregister_suppressed_panes: std::sync::Mutex::new(HashMap::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
             sweep_in_progress: std::sync::atomic::AtomicBool::new(false),
             sweep_backoff_until: std::sync::Mutex::new(None),
@@ -637,6 +643,7 @@ impl AppState {
             project_index: RwLock::new(HashMap::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
             cached_assistant_panes: RwLock::new(Vec::new()),
+            autoregister_suppressed_panes: std::sync::Mutex::new(HashMap::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
             sweep_in_progress: std::sync::atomic::AtomicBool::new(false),
             sweep_backoff_until: std::sync::Mutex::new(None),
@@ -1001,6 +1008,26 @@ impl AppState {
                     let p = pane.clone();
                     let n = name.clone();
                     tokio::task::spawn_blocking(move || crate::tmux_var::clear(&p, &n));
+                }
+                Effect::HoldAutoregister { pane } => {
+                    self.autoregister_suppressed_panes
+                        .lock()
+                        .expect("autoregister suppression mutex poisoned")
+                        .insert(
+                            pane.clone(),
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(AUTOREGISTER_REMOVE_GRACE_SECS),
+                        );
+                }
+                Effect::ProvisionalRollbackOk { pane } => {
+                    if !cfg!(test) {
+                        let pane = pane.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let _ = std::process::Command::new("tmux")
+                                .args(["kill-pane", "-t", &pane])
+                                .status();
+                        });
+                    }
                 }
                 Effect::RenameWindow { pane, name } => {
                     let p = pane.clone();
@@ -1865,20 +1892,7 @@ impl AppState {
 
     /// Scan tmux for assistant panes, update cache, and auto-register unregistered ones.
     pub async fn scan_and_autoregister_panes(self: &Arc<Self>) {
-        let names: Vec<String> = self.backends.all_process_names();
-        let panes = match tokio::task::spawn_blocking(move || {
-            let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-            crate::tmux::find_assistant_panes(&name_refs)
-        })
-        .await
-        .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking join error: {e}")))
-        {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("tmux scan failed: {e}");
-                return;
-            }
-        };
+        let panes = self.list_assistant_panes().await;
 
         // Update cache
         *self.cached_assistant_panes.write().await = panes.clone();
@@ -1911,21 +1925,23 @@ impl AppState {
                 continue;
             }
 
-            // Skip if the pane has an @ouija_id tmux variable — it was claimed
-            // by session_start or the registration hook and may be mid-restart.
-            let pane_id_check = pane.pane_id.clone();
-            let has_ouija_id = tokio::task::spawn_blocking(move || {
-                std::process::Command::new("tmux")
-                    .args(["show-options", "-pv", "-t", &pane_id_check, "@ouija_id"])
-                    .output()
-                    .map(|o| o.status.success() && !o.stdout.is_empty())
-                    .unwrap_or(false)
-            })
-            .await
-            .unwrap_or(false);
-            if has_ouija_id {
+            let now = std::time::Instant::now();
+            let is_explicitly_removing = {
+                let mut suppressed = self
+                    .autoregister_suppressed_panes
+                    .lock()
+                    .expect("autoregister suppression mutex poisoned");
+                suppressed.retain(|_, until| *until > now);
+                suppressed.contains_key(&pane.pane_id)
+            };
+            if is_explicitly_removing {
                 continue;
             }
+
+            // An @ouija_id marker is not durable ownership evidence. A live
+            // daemon session is already covered by registered_panes above;
+            // otherwise this is a legacy orphan and must be allowed to claim
+            // a normal ID again.
 
             let Some(ref path) = pane.pane_current_path else {
                 continue;
@@ -3893,6 +3909,7 @@ pub(crate) mod tests {
             last_metadata_update: Some(1_700_000_100),
             backend_session_id: Some("oc_abc123".into()),
             backend: Some("opencode".into()),
+            session_start_credential: None,
             opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
             restart_generation: 7,
             session_incarnation: 11,
@@ -4684,5 +4701,51 @@ pub(crate) mod tests {
                 "symlink to existing dir should show as present"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn scan_recovers_orphaned_pane_claim_with_normal_base_id() {
+        let state = AppState::new_for_test();
+        *state.cached_assistant_panes.write().await = vec![crate::tmux::TmuxPane {
+            pane_id: "%orphan".into(),
+            session_name: "ouija".into(),
+            pane_current_path: Some("/tmp/ouija".into()),
+            process_name: Some("codex".into()),
+        }];
+
+        // This models a surviving shell pane that still carries a legacy
+        // @ouija_id=ouija-2 claim after the daemon lost its session record.
+        // The scanner must allocate the free base ID again so `ouija whoami`
+        // resolves through the newly registered pane.
+        state.scan_and_autoregister_panes().await;
+
+        let proto = state.protocol.read().await;
+        let recovered = proto
+            .sessions
+            .get("ouija")
+            .expect("base ID should be reusable");
+        assert_eq!(recovered.pane.as_deref(), Some("%orphan"));
+    }
+
+    #[tokio::test]
+    async fn scan_respects_explicit_kill_suppression_window() {
+        let state = AppState::new_for_test();
+        *state.cached_assistant_panes.write().await = vec![crate::tmux::TmuxPane {
+            pane_id: "%removing".into(),
+            session_name: "ouija".into(),
+            pane_current_path: Some("/tmp/ouija".into()),
+            process_name: Some("codex".into()),
+        }];
+        state.autoregister_suppressed_panes.lock().unwrap().insert(
+            "%removing".into(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+
+        state.scan_and_autoregister_panes().await;
+
+        assert!(
+            state.protocol.read().await.sessions.is_empty(),
+            "the scanner must not resurrect a pane while explicit kill-session is in progress"
+        );
     }
 }

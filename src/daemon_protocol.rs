@@ -98,6 +98,14 @@ pub struct SessionMeta {
     pub backend_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
+    /// One-time daemon-issued credential authorizing Codex to record its first
+    /// backend thread ID for this managed launch.
+    ///
+    /// This deliberately never reaches persisted metadata or session-list
+    /// serialization. A daemon restart therefore fails an unclaimed launch
+    /// closed instead of reviving its authority from disk.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub session_start_credential: Option<String>,
     /// Strength of an OpenCode backend-session binding.
     ///
     /// `None` is treated as weak for backward compatibility with adopted
@@ -224,6 +232,15 @@ impl std::str::FromStr for IdlePolicy {
 }
 
 pub const IDLE_POLICY_CHOICES: &str = "keep-open|ask-parent-when-done|close-when-done";
+
+/// Generate an unguessable one-time credential for a managed backend launch.
+///
+/// The value is passed only through the spawned pane's environment and is
+/// consumed by `Event::AdoptBackend` when Codex first reports its thread ID.
+pub fn new_session_start_credential() -> String {
+    let bytes: [u8; 16] = ::rand::random();
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 
 pub fn validate_spawn_lifecycle(
     parent_session: Option<&str>,
@@ -462,6 +479,7 @@ impl Default for SessionMeta {
             vim_mode: false,
             backend_session_id: None,
             backend: None,
+            session_start_credential: None,
             opencode_binding: None,
             restart_generation: 0,
             session_incarnation: 0,
@@ -507,6 +525,14 @@ pub enum Event {
         id: String,
         keep_worktree: bool,
     },
+    /// Atomically undo a scheduler's provisional registration only if the
+    /// session still owns the staged pane and launch credential.
+    RollbackProvisionalRegistration {
+        id: String,
+        pane: String,
+        credential: Option<String>,
+        previous: Option<SessionEntry>,
+    },
     /// Remove a local session ONLY if its `worktree_present` is `Some(false)`.
     ///
     /// Atomic variant used by the prune-stale-sessions flow: the check and the
@@ -538,6 +564,10 @@ pub enum Event {
         backend: String,
         backend_session_id: String,
         expected_backend_session_id: Option<String>,
+        /// Optional one-time managed-launch credential. When supplied it must
+        /// match the session's pending credential and is consumed atomically
+        /// with the backend-session binding.
+        expected_session_start_credential: Option<String>,
     },
     ReapDead {
         dead_ids: Vec<String>,
@@ -612,6 +642,11 @@ pub enum Effect {
     ClearTmuxVar {
         pane: String,
         name: String,
+    },
+    /// Keep a just-removed pane out of auto-registration until its explicit
+    /// kill has had time to complete.
+    HoldAutoregister {
+        pane: String,
     },
     RenameWindow {
         pane: String,
@@ -759,6 +794,9 @@ pub enum Effect {
         kind: RemoveFailureKind,
         reason: String,
     },
+    ProvisionalRollbackOk {
+        pane: String,
+    },
     CleanupWorktree {
         project_dir: String,
     },
@@ -868,6 +906,7 @@ pub(crate) fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>
             vim_mode: m.vim_mode,
             backend_session_id: m.backend_session_id.clone(),
             backend: m.backend.clone(),
+            session_start_credential: None,
             opencode_binding: m.opencode_binding.clone(),
             restart_generation: m.restart_generation,
             session_incarnation: m.session_incarnation,
@@ -1129,6 +1168,17 @@ impl DaemonState {
             }
             Event::Rename { old_id, new_id } => self.apply_rename(&old_id, &new_id),
             Event::Remove { id, keep_worktree } => self.apply_remove(&id, keep_worktree),
+            Event::RollbackProvisionalRegistration {
+                id,
+                pane,
+                credential,
+                previous,
+            } => self.apply_rollback_provisional_registration(
+                &id,
+                &pane,
+                credential.as_deref(),
+                previous,
+            ),
             Event::RemoveIfStale {
                 id,
                 expected_project_dir,
@@ -1145,11 +1195,13 @@ impl DaemonState {
                 backend,
                 backend_session_id,
                 expected_backend_session_id,
+                expected_session_start_credential,
             } => self.apply_adopt_backend(
                 &id,
                 backend,
                 backend_session_id,
                 expected_backend_session_id,
+                expected_session_start_credential,
             ),
             Event::ReapDead { dead_ids } => self.apply_reap(dead_ids),
             Event::IncomingWire { msg, sender_npub } => self.apply_incoming_wire(msg, sender_npub),
@@ -1622,6 +1674,9 @@ impl DaemonState {
         effects.push(Effect::Persist);
 
         if let Some(ref pane_id) = session.pane {
+            effects.push(Effect::HoldAutoregister {
+                pane: pane_id.clone(),
+            });
             effects.push(Effect::ClearTmuxVar {
                 pane: pane_id.clone(),
                 name: "@ouija_session".into(),
@@ -1676,6 +1731,38 @@ impl DaemonState {
 
         effects.push(Effect::RemoveOk { id: id.to_string() });
 
+        effects
+    }
+
+    fn apply_rollback_provisional_registration(
+        &mut self,
+        id: &str,
+        pane: &str,
+        credential: Option<&str>,
+        previous: Option<SessionEntry>,
+    ) -> Vec<Effect> {
+        let still_staged = self.sessions.get(id).is_some_and(|session| {
+            matches!(session.origin, Origin::Local)
+                && session.pane.as_deref() == Some(pane)
+                && session.metadata.session_start_credential.as_deref() == credential
+        });
+        if !still_staged {
+            return vec![];
+        }
+
+        let kill_provisional_pane = previous
+            .as_ref()
+            .is_none_or(|session| session.pane.as_deref() != Some(pane));
+        let mut effects = if let Some(previous) = previous {
+            self.apply_register(previous.id, previous.pane, previous.metadata)
+        } else {
+            self.apply_remove(id, true)
+        };
+        if kill_provisional_pane {
+            effects.push(Effect::ProvisionalRollbackOk {
+                pane: pane.to_string(),
+            });
+        }
         effects
     }
 
@@ -1845,13 +1932,25 @@ impl DaemonState {
         backend: String,
         backend_session_id: String,
         expected_backend_session_id: Option<String>,
+        expected_session_start_credential: Option<String>,
     ) -> Vec<Effect> {
-        let current_backend_session_id = match self.sessions.get(id) {
-            Some(s) if matches!(s.origin, Origin::Local) => s.metadata.backend_session_id.clone(),
-            _ => return vec![],
-        };
+        let (current_backend_session_id, current_session_start_credential) =
+            match self.sessions.get(id) {
+                Some(s) if matches!(s.origin, Origin::Local) => (
+                    s.metadata.backend_session_id.clone(),
+                    s.metadata.session_start_credential.clone(),
+                ),
+                _ => return vec![],
+            };
 
         if expected_backend_session_id.as_deref() != current_backend_session_id.as_deref() {
+            return vec![];
+        }
+
+        // A pending launch credential makes this slot credentialed: every
+        // adoption path must present the exact value, including generic
+        // backend adopters that otherwise omit credentials.
+        if current_session_start_credential != expected_session_start_credential {
             return vec![];
         }
 
@@ -1869,6 +1968,9 @@ impl DaemonState {
             .expect("local session checked above");
         session.metadata.backend = Some(backend);
         session.metadata.backend_session_id = Some(backend_session_id);
+        if expected_session_start_credential.is_some() {
+            session.metadata.session_start_credential = None;
+        }
         let mut effects = vec![Effect::Persist];
         if session.metadata.networked {
             effects.push(Effect::BroadcastSessionList);
@@ -1898,6 +2000,10 @@ impl DaemonState {
                 effects.push(Effect::ClearTmuxVar {
                     pane: pane_id.clone(),
                     name: "@ouija_session".into(),
+                });
+                effects.push(Effect::ClearTmuxVar {
+                    pane: pane_id.clone(),
+                    name: "@ouija_id".into(),
                 });
                 effects.push(Effect::EnableAutoRename {
                     pane: pane_id.clone(),
@@ -4283,6 +4389,13 @@ mod tests {
             )),
             "Remove must NOT clear @ouija_id, got: {effects:?}"
         );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::HoldAutoregister { pane } if pane == "%1"
+            )),
+            "Remove must hold auto-registration while kill-session finishes, got: {effects:?}"
+        );
         // @ouija_session is still cleared — that's the daemon-driven marker.
         assert!(
             effects.iter().any(|e| matches!(
@@ -4533,6 +4646,117 @@ mod tests {
     }
 
     #[test]
+    fn rollback_provisional_same_pane_restoration_does_not_kill_the_pane() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "scheduled".into(),
+            pane: Some("%same".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                backend_session_id: Some("thread-old".into()),
+                ..Default::default()
+            },
+        });
+        let previous = state.sessions["scheduled"].clone();
+        state.apply(Event::Register {
+            id: "scheduled".into(),
+            pane: Some("%same".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                session_start_credential: Some("credential".into()),
+                ..Default::default()
+            },
+        });
+
+        let effects = state.apply(Event::RollbackProvisionalRegistration {
+            id: "scheduled".into(),
+            pane: "%same".into(),
+            credential: Some("credential".into()),
+            previous: Some(previous),
+        });
+
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ProvisionalRollbackOk { .. })),
+            "restoring the same pane must not kill it: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn rollback_provisional_distinct_pane_kills_only_the_staged_pane() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "scheduled".into(),
+            pane: Some("%existing".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                backend_session_id: Some("thread-old".into()),
+                ..Default::default()
+            },
+        });
+        let previous = state.sessions["scheduled"].clone();
+        state.apply(Event::Register {
+            id: "scheduled".into(),
+            pane: Some("%staged".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                session_start_credential: Some("credential".into()),
+                ..Default::default()
+            },
+        });
+
+        let effects = state.apply(Event::RollbackProvisionalRegistration {
+            id: "scheduled".into(),
+            pane: "%staged".into(),
+            credential: Some("credential".into()),
+            previous: Some(previous),
+        });
+
+        let kills: Vec<_> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::ProvisionalRollbackOk { pane } => Some(pane.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kills, vec!["%staged"]);
+    }
+
+    #[test]
+    fn rollback_provisional_after_credential_adoption_emits_no_effects() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "scheduled".into(),
+            pane: Some("%staged".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                session_start_credential: Some("credential".into()),
+                ..Default::default()
+            },
+        });
+        state.apply(Event::AdoptBackend {
+            id: "scheduled".into(),
+            backend: "codex-cli".into(),
+            backend_session_id: "thread-winner".into(),
+            expected_backend_session_id: None,
+            expected_session_start_credential: Some("credential".into()),
+        });
+
+        let effects = state.apply(Event::RollbackProvisionalRegistration {
+            id: "scheduled".into(),
+            pane: "%staged".into(),
+            credential: Some("credential".into()),
+            previous: None,
+        });
+
+        assert!(
+            effects.is_empty(),
+            "a credential-adopted session must not be rolled back: {effects:?}"
+        );
+    }
+
+    #[test]
     fn remove_if_stale_removes_when_worktree_present_false() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
         state.apply(Event::Register {
@@ -4653,6 +4877,14 @@ mod tests {
             !effects
                 .iter()
                 .any(|e| matches!(e, Effect::CleanupWorktree { .. }))
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::ClearTmuxVar { pane, name }
+                    if pane == "%2" && name == "@ouija_id"
+            )),
+            "the reaper has proved this pane dead, so its stale autoregister marker must be released"
         );
     }
 
@@ -6197,6 +6429,7 @@ mod tests {
             backend: "opencode".into(),
             backend_session_id: "ses_abc123".into(),
             expected_backend_session_id: None,
+            expected_session_start_credential: None,
         });
         let meta = &state.sessions["s1"].metadata;
         assert_eq!(meta.backend.as_deref(), Some("opencode"));
@@ -6231,6 +6464,7 @@ mod tests {
             backend: "opencode".into(),
             backend_session_id: "ses_abc".into(),
             expected_backend_session_id: None,
+            expected_session_start_credential: None,
         });
         assert!(effects.iter().any(|e| matches!(e, Effect::Persist)));
         assert!(
@@ -6256,6 +6490,7 @@ mod tests {
             backend: "opencode".into(),
             backend_session_id: "ses_abc".into(),
             expected_backend_session_id: None,
+            expected_session_start_credential: None,
         });
         assert!(effects.is_empty());
         assert!(
@@ -6274,6 +6509,7 @@ mod tests {
             backend: "opencode".into(),
             backend_session_id: "ses_abc".into(),
             expected_backend_session_id: None,
+            expected_session_start_credential: None,
         });
         assert!(effects.is_empty());
     }
@@ -6296,11 +6532,94 @@ mod tests {
             backend: "opencode".into(),
             backend_session_id: "ses_new".into(),
             expected_backend_session_id: Some("ses_old".into()),
+            expected_session_start_credential: None,
         });
 
         assert!(effects.is_empty());
         let meta = &state.sessions["s1"].metadata;
         assert_eq!(meta.backend_session_id.as_deref(), Some("ses_current"));
+    }
+
+    #[test]
+    fn adopt_backend_consumes_matching_session_start_credential() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "codex".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                session_start_credential: Some("credential".into()),
+                ..Default::default()
+            },
+        });
+
+        let rejected = state.apply(Event::AdoptBackend {
+            id: "codex".into(),
+            backend: "codex-cli".into(),
+            backend_session_id: "thread-1".into(),
+            expected_backend_session_id: None,
+            expected_session_start_credential: Some("wrong".into()),
+        });
+        assert!(rejected.is_empty());
+        assert!(
+            state.sessions["codex"]
+                .metadata
+                .backend_session_id
+                .is_none()
+        );
+
+        let accepted = state.apply(Event::AdoptBackend {
+            id: "codex".into(),
+            backend: "codex-cli".into(),
+            backend_session_id: "thread-1".into(),
+            expected_backend_session_id: None,
+            expected_session_start_credential: Some("credential".into()),
+        });
+        assert!(
+            accepted
+                .iter()
+                .any(|effect| matches!(effect, Effect::Persist))
+        );
+        let metadata = &state.sessions["codex"].metadata;
+        assert_eq!(metadata.backend_session_id.as_deref(), Some("thread-1"));
+        assert!(metadata.session_start_credential.is_none());
+    }
+
+    #[test]
+    fn adopt_backend_rejects_omitted_credential_for_credentialed_slot() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "codex".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                session_start_credential: Some("credential".into()),
+                ..Default::default()
+            },
+        });
+
+        let effects = state.apply(Event::AdoptBackend {
+            id: "codex".into(),
+            backend: "opencode".into(),
+            backend_session_id: "ses_untrusted".into(),
+            expected_backend_session_id: None,
+            expected_session_start_credential: None,
+        });
+
+        assert!(effects.is_empty());
+        assert!(
+            state.sessions["codex"]
+                .metadata
+                .backend_session_id
+                .is_none()
+        );
+        assert_eq!(
+            state.sessions["codex"]
+                .metadata
+                .session_start_credential
+                .as_deref(),
+            Some("credential")
+        );
     }
 
     #[test]
@@ -6326,6 +6645,7 @@ mod tests {
             backend: "opencode".into(),
             backend_session_id: "ses_taken".into(),
             expected_backend_session_id: None,
+            expected_session_start_credential: None,
         });
 
         assert!(effects.is_empty());

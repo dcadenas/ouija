@@ -617,6 +617,14 @@ mod tests {
     }
 
     #[test]
+    fn register_script_reports_claude_adapter_and_managed_launch_identity() {
+        let script = embedded::SCRIPT_REGISTER;
+        assert!(script.contains("--arg adapter \"claude-code\""), "{script}");
+        assert!(script.contains("launch_session_id"), "{script}");
+        assert!(script.contains("${OUIJA_SESSION_ID:-}"), "{script}");
+    }
+
+    #[test]
     fn start_command_no_worktree() {
         let cmd = backend().build_start_command(&start_opts("/home/user/myproject"));
         assert_eq!(cmd, "cd '/home/user/myproject' && claude");
