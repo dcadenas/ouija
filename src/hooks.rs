@@ -346,7 +346,7 @@ async fn session_start_inner(
     // session's authoritative stored backend + id, so the primary launch path
     // gets it (claude-code/opencode carry the skill and stay empty).
     if let Some(existing_id) = state.find_session_by_pane(&body.pane).await {
-        let (existing_backend, registered_project_dir) = {
+        let (existing_backend, registered_project_dir, existing_backend_session_id) = {
             let proto = state.protocol.read().await;
             proto
                 .sessions
@@ -355,6 +355,7 @@ async fn session_start_inner(
                     (
                         session.metadata.backend.clone(),
                         session.metadata.project_dir.clone(),
+                        session.metadata.backend_session_id.clone(),
                     )
                 })
                 .unwrap_or_default()
@@ -369,6 +370,26 @@ async fn session_start_inner(
         {
             return json!({
                 "skipped": "existing pane identity mismatch",
+                "output": "",
+            });
+        }
+        // Codex exposes the thread id in its SessionStart payload, but not a
+        // launch-scoped credential that proves this newly-created thread owns
+        // the already-registered Ouija pane. Repository and pane-path equality
+        // only establish project ownership; any second Codex thread in that
+        // pane can make the same claim. Until the managed launch path can
+        // pre-bind an authoritative Codex thread ID, do not let this hook bind
+        // the empty-to-bound transition or receive mesh onboarding.
+        if existing_backend.as_deref() == Some("codex-cli")
+            && normalize_backend_session_id(existing_backend_session_id.as_deref()).is_none()
+        {
+            tracing::warn!(
+                pane = body.pane,
+                session = existing_id,
+                "session-start rejected: existing Codex pane has no authoritative thread binding"
+            );
+            return json!({
+                "skipped": "existing Codex pane has no authoritative thread binding",
                 "output": "",
             });
         }
@@ -722,10 +743,8 @@ mod tests {
 
     #[tokio::test]
     async fn session_start_onboards_already_registered_codex_session() {
-        // Ouija-launched sessions are pane-registered (with their backend) before
-        // the SessionStart hook fires, so the hook hits the already-registered
-        // branch. A codex-cli session must still receive mesh onboarding there —
-        // otherwise the primary launch path never gets it.
+        // A pane-registered Codex session with an authoritative pre-bound
+        // thread ID still receives onboarding on an idempotent SessionStart.
         let state = crate::state::AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -733,6 +752,7 @@ mod tests {
                 pane: Some("%70".into()),
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("codex-cli".into()),
+                    backend_session_id: Some("codex-thread-1".into()),
                     project_dir: Some("/home/user/code/proj".into()),
                     ..Default::default()
                 },
@@ -840,6 +860,52 @@ mod tests {
                 .backend_session_id
                 .as_deref(),
             Some("codex-thread-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_rejects_first_codex_thread_claim_for_existing_unbound_pane() {
+        // A managed Codex launch registers the pane before Codex creates its
+        // thread. Codex's SessionStart payload supplies a thread ID, but it
+        // carries no launch-scoped credential proving that the new thread owns
+        // this particular Ouija pane. A second Codex thread in the same project
+        // would make the identical claim, so accepting the first one is a
+        // confused-deputy binding. Fail closed until the launch path can
+        // pre-bind an authoritative thread ID.
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "feat/worker".into(),
+                pane: Some("%72".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    project_dir: Some("/home/user/code/proj".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        *state.cached_assistant_panes.write().await =
+            vec![assistant_pane("%72", "/home/user/code/proj")];
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: "%72".into(),
+                cwd: "/home/user/code/proj".into(),
+                backend_session_id: Some("codex-thread-1".into()),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            result["skipped"],
+            "existing Codex pane has no authoritative thread binding"
+        );
+        assert_eq!(result["output"], "");
+        let proto = state.protocol.read().await;
+        assert_eq!(
+            proto.sessions["feat/worker"].metadata.backend_session_id, None,
+            "an unauthenticated first Codex thread claim must not bind the pane"
         );
     }
 
