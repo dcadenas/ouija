@@ -1379,7 +1379,10 @@ mod tests {
     async fn session_start_registers_new_session() {
         let state = crate::state::AppState::new_for_test();
         let body = SessionStartBody {
-            pane: "%50".into(),
+            // Use a pane that cannot resolve in the live tmux server.  This
+            // test covers the backend-unknown registration path, and a low
+            // pane id can otherwise accidentally detect a real Codex pane.
+            pane: "%999999999".into(),
             cwd: "/home/user/code/myproject".into(),
             backend_session_id: None,
             adapter: None,
