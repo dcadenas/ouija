@@ -995,6 +995,11 @@ mod tests {
         // Supplies the backend-native identity through the generic hook field.
         assert!(s.contains(".session_id"), "{s}");
         assert!(s.contains("backend_session_id"), "{s}");
+        // The installed adapter identifies itself and forwards the managed
+        // launch identity stamped into the pane by Ouija.
+        assert!(s.contains("--arg adapter \"codex-cli\""), "{s}");
+        assert!(s.contains("launch_session_id"), "{s}");
+        assert!(s.contains("${OUIJA_SESSION_ID:-}"), "{s}");
         // Wraps the daemon's `.output` into Codex additionalContext, keyed to the
         // SessionStart event so the TUI surfaces mesh instructions.
         assert!(s.contains("hookSpecificOutput"), "{s}");

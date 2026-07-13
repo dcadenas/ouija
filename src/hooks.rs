@@ -230,6 +230,15 @@ pub struct SessionStartBody {
     pub cwd: String,
     #[serde(default)]
     pub backend_session_id: Option<String>,
+    /// Backend adapter that emitted this hook. Installed adapters use a
+    /// constant value rather than deriving it from the untrusted payload.
+    #[serde(default)]
+    pub adapter: Option<String>,
+    /// The Ouija session id injected into a pane at managed launch time.
+    /// It proves that the adapter belongs to this pane's registered launch,
+    /// rather than merely sharing the same project directory.
+    #[serde(default)]
+    pub launch_session_id: Option<String>,
 }
 
 /// POST /api/hooks/session-start
@@ -331,6 +340,46 @@ async fn existing_pane_identity_matches(
     true
 }
 
+/// A first backend-thread binding changes durable session ownership, so an
+/// existing pane needs more than matching project paths. The installed adapter
+/// reports its fixed backend name and the daemon injects the launch session id
+/// into managed panes. Both must agree with the registered session before an
+/// empty backend-session slot can be adopted.
+async fn existing_pane_binding_provenance_matches(
+    state: &std::sync::Arc<crate::state::AppState>,
+    pane: &str,
+    existing_id: &str,
+    existing_backend: Option<&str>,
+    adapter: Option<&str>,
+    launch_session_id: Option<&str>,
+) -> bool {
+    let Some(adapter) = adapter else {
+        return false;
+    };
+    let live_backend = state
+        .list_assistant_panes()
+        .await
+        .iter()
+        .find(|candidate| candidate.pane_id == pane)
+        .and_then(|candidate| candidate.process_name.as_deref())
+        .and_then(|process_name| {
+            state
+                .backends
+                .all_backend_process_names()
+                .into_iter()
+                .find(|(_, names)| {
+                    names.iter().any(|name| {
+                        process_name == name || process_name.strip_prefix('.') == Some(name)
+                    })
+                })
+                .map(|(backend, _)| backend)
+        });
+
+    existing_backend == Some(adapter)
+        && live_backend.as_deref() == Some(adapter)
+        && launch_session_id == Some(existing_id)
+}
+
 async fn session_start_inner(
     state: &std::sync::Arc<crate::state::AppState>,
     body: SessionStartBody,
@@ -373,29 +422,52 @@ async fn session_start_inner(
                 "output": "",
             });
         }
-        // Codex exposes the thread id in its SessionStart payload, but not a
-        // launch-scoped credential that proves this newly-created thread owns
-        // the already-registered Ouija pane. Repository and pane-path equality
-        // only establish project ownership; any second Codex thread in that
-        // pane can make the same claim. Until the managed launch path can
-        // pre-bind an authoritative Codex thread ID, do not let this hook bind
-        // the empty-to-bound transition or receive mesh onboarding.
-        if existing_backend.as_deref() == Some("codex-cli")
-            && normalize_backend_session_id(existing_backend_session_id.as_deref()).is_none()
-        {
-            tracing::warn!(
-                pane = body.pane,
-                session = existing_id,
-                "session-start rejected: existing Codex pane has no authoritative thread binding"
-            );
-            return json!({
-                "skipped": "existing Codex pane has no authoritative thread binding",
-                "output": "",
-            });
-        }
         if let Some(backend_session_id) =
             normalize_backend_session_id(body.backend_session_id.as_deref())
         {
+            if normalize_backend_session_id(existing_backend_session_id.as_deref()).is_none()
+                && !existing_pane_binding_provenance_matches(
+                    state,
+                    &body.pane,
+                    &existing_id,
+                    existing_backend.as_deref(),
+                    body.adapter.as_deref(),
+                    body.launch_session_id.as_deref(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    pane = body.pane,
+                    session = existing_id,
+                    stored_backend = ?existing_backend,
+                    reported_adapter = ?body.adapter,
+                    reported_launch_session = ?body.launch_session_id,
+                    "session-start rejected: existing pane adapter provenance mismatch"
+                );
+                return json!({
+                    "skipped": "existing pane adapter provenance mismatch",
+                    "output": "",
+                });
+            }
+            // Codex exposes the thread id in its SessionStart payload, but not
+            // a per-thread credential. Launch and adapter provenance prove the
+            // pane belongs to this managed Codex launch, but a second Codex
+            // thread in that same pane can still make the same first-bind
+            // claim. Until the launch path pre-binds the authoritative thread,
+            // fail closed instead of adopting it.
+            if existing_backend.as_deref() == Some("codex-cli")
+                && normalize_backend_session_id(existing_backend_session_id.as_deref()).is_none()
+            {
+                tracing::warn!(
+                    pane = body.pane,
+                    session = existing_id,
+                    "session-start rejected: existing Codex pane has no authoritative thread binding"
+                );
+                return json!({
+                    "skipped": "existing Codex pane has no authoritative thread binding",
+                    "output": "",
+                });
+            }
             let binding = {
                 let proto = state.protocol.read().await;
                 proto.sessions.get(&existing_id).and_then(|session| {
@@ -549,11 +621,19 @@ mod tests {
     use super::*;
 
     fn assistant_pane(pane_id: &str, cwd: &str) -> crate::tmux::TmuxPane {
+        assistant_pane_with_process(pane_id, cwd, "codex")
+    }
+
+    fn assistant_pane_with_process(
+        pane_id: &str,
+        cwd: &str,
+        process_name: &str,
+    ) -> crate::tmux::TmuxPane {
         crate::tmux::TmuxPane {
             pane_id: pane_id.into(),
             session_name: "test".into(),
             pane_current_path: Some(cwd.into()),
-            process_name: Some("codex".into()),
+            process_name: Some(process_name.into()),
         }
     }
 
@@ -766,6 +846,8 @@ mod tests {
             pane: "%70".into(),
             cwd: "/home/user/code/proj/.ouija/worktrees/feat-worker".into(),
             backend_session_id: Some("codex-thread-1".into()),
+            adapter: Some("codex-cli".into()),
+            launch_session_id: Some("feat/worker".into()),
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "feat/worker");
@@ -787,7 +869,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_start_binds_identity_for_any_registered_backend() {
+    async fn session_start_binds_identity_for_matching_non_codex_adapter_launch() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "claude-worker".into(),
+                pane: Some("%71".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    project_dir: Some("/home/user/code/proj".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        *state.cached_assistant_panes.write().await = vec![assistant_pane_with_process(
+            "%71",
+            "/home/user/code/proj",
+            "claude",
+        )];
+        let body = SessionStartBody {
+            pane: "%71".into(),
+            cwd: "/home/user/code/proj".into(),
+            backend_session_id: Some("claude-session-1".into()),
+            adapter: Some("claude-code".into()),
+            launch_session_id: Some("claude-worker".into()),
+        };
+        let result = session_start_inner(&state, body).await;
+        assert_eq!(result["registered"], "claude-worker");
+        // Claude carries the skill; its output stays empty.
+        assert_eq!(result["output"], "");
+        let proto = state.protocol.read().await;
+        let session = proto.sessions.get("claude-worker").unwrap();
+        assert_eq!(
+            session.metadata.backend_session_id.as_deref(),
+            Some("claude-session-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_rejects_codex_pane_spoofing_claude_adapter() {
+        // Project and pane identity are necessary but not sufficient: a Codex
+        // pane must not adopt the empty thread slot of a same-project Claude
+        // session by claiming a different adapter. The daemon checks the live
+        // pane process rather than trusting the request field.
         let state = crate::state::AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -802,20 +926,117 @@ mod tests {
             .await;
         *state.cached_assistant_panes.write().await =
             vec![assistant_pane("%71", "/home/user/code/proj")];
-        let body = SessionStartBody {
-            pane: "%71".into(),
-            cwd: "/home/user/code/proj".into(),
-            backend_session_id: Some("claude-session-1".into()),
-        };
-        let result = session_start_inner(&state, body).await;
-        assert_eq!(result["registered"], "claude-worker");
-        // Claude carries the skill; its output stays empty.
-        assert_eq!(result["output"], "");
-        let proto = state.protocol.read().await;
-        let session = proto.sessions.get("claude-worker").unwrap();
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: "%71".into(),
+                cwd: "/home/user/code/proj".into(),
+                backend_session_id: Some("codex-thread-1".into()),
+                adapter: Some("claude-code".into()),
+                launch_session_id: Some("claude-worker".into()),
+            },
+        )
+        .await;
+
         assert_eq!(
-            session.metadata.backend_session_id.as_deref(),
-            Some("claude-session-1")
+            result["skipped"],
+            "existing pane adapter provenance mismatch"
+        );
+        assert_eq!(result["output"], "");
+        assert!(
+            state.protocol.read().await.sessions["claude-worker"]
+                .metadata
+                .backend_session_id
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_rejects_non_codex_binding_without_managed_launch_identity() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "claude-worker".into(),
+                pane: Some("%75".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    project_dir: Some("/home/user/code/proj".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        *state.cached_assistant_panes.write().await = vec![assistant_pane_with_process(
+            "%75",
+            "/home/user/code/proj",
+            "claude",
+        )];
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: "%75".into(),
+                cwd: "/home/user/code/proj".into(),
+                backend_session_id: Some("claude-session-1".into()),
+                adapter: Some("claude-code".into()),
+                launch_session_id: None,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            result["skipped"],
+            "existing pane adapter provenance mismatch"
+        );
+        assert!(
+            state.protocol.read().await.sessions["claude-worker"]
+                .metadata
+                .backend_session_id
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_rejects_unproven_first_binding_for_backend_unset_pane() {
+        // An existing pane with no recorded backend cannot authenticate any
+        // adapter claim. It must stay unbound even when the cwd and managed
+        // session id happen to match.
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "unknown-worker".into(),
+                pane: Some("%74".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/home/user/code/proj".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        *state.cached_assistant_panes.write().await =
+            vec![assistant_pane("%74", "/home/user/code/proj")];
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: "%74".into(),
+                cwd: "/home/user/code/proj".into(),
+                backend_session_id: Some("codex-thread-1".into()),
+                adapter: Some("codex-cli".into()),
+                launch_session_id: Some("unknown-worker".into()),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            result["skipped"],
+            "existing pane adapter provenance mismatch"
+        );
+        assert_eq!(result["output"], "");
+        assert!(
+            state.protocol.read().await.sessions["unknown-worker"]
+                .metadata
+                .backend_session_id
+                .is_none()
         );
     }
 
@@ -843,6 +1064,8 @@ mod tests {
                 pane: "%72".into(),
                 cwd: "/home/user/code/proj".into(),
                 backend_session_id: Some("codex-thread-1".into()),
+                adapter: Some("codex-cli".into()),
+                launch_session_id: Some("feat/worker".into()),
             },
         )
         .await;
@@ -893,6 +1116,8 @@ mod tests {
                 pane: "%72".into(),
                 cwd: "/home/user/code/proj".into(),
                 backend_session_id: Some("codex-thread-1".into()),
+                adapter: Some("codex-cli".into()),
+                launch_session_id: Some("feat/worker".into()),
             },
         )
         .await;
@@ -937,6 +1162,8 @@ mod tests {
                 pane: "%72".into(),
                 cwd: "/home/user/code/proj".into(),
                 backend_session_id: Some("codex-thread-2".into()),
+                adapter: Some("codex-cli".into()),
+                launch_session_id: Some("feat/worker".into()),
             },
         )
         .await;
@@ -981,6 +1208,8 @@ mod tests {
                 pane: "%0".into(),
                 cwd: "/home/daniel/code/ouija".into(),
                 backend_session_id: Some("codex-ouija-thread".into()),
+                adapter: Some("codex-cli".into()),
+                launch_session_id: Some("hub-worker".into()),
             },
         )
         .await;
@@ -1020,6 +1249,8 @@ mod tests {
                 pane: "%73".into(),
                 cwd: "/home/daniel/code/ouija".into(),
                 backend_session_id: Some("claude-replacement".into()),
+                adapter: Some("claude-code".into()),
+                launch_session_id: Some("worker".into()),
             },
         )
         .await;
@@ -1043,6 +1274,8 @@ mod tests {
             pane: "%50".into(),
             cwd: "/home/user/code/myproject".into(),
             backend_session_id: None,
+            adapter: None,
+            launch_session_id: None,
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "myproject");
@@ -1070,6 +1303,8 @@ mod tests {
             pane: "%50".into(),
             cwd: "/home/user/code/existing".into(),
             backend_session_id: None,
+            adapter: None,
+            launch_session_id: None,
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "existing");
@@ -1086,6 +1321,8 @@ mod tests {
             pane: "%50".into(),
             cwd: "/home/user/code/ouija/.ouija/worktrees/feature-x".into(),
             backend_session_id: None,
+            adapter: None,
+            launch_session_id: None,
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "ouija");
