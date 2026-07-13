@@ -73,6 +73,18 @@ pub async fn run(state: SharedState) -> anyhow::Result<()> {
             "/api/backend-session/{id}/ready",
             post(api::backend_session_ready),
         )
+        .route(
+            "/api/backend-identities/resolve",
+            post(api::resolve_backend_identity),
+        )
+        .route(
+            "/api/backend-identities/bind",
+            post(api::bind_backend_identity),
+        )
+        .route(
+            "/api/backend-identities/repair",
+            post(api::repair_backend_identity),
+        )
         .route("/api/clear-reminder", post(api::clear_reminder))
         .route("/api/projects", get(api::list_projects))
         .route("/api/hooks/session-start", post(hooks::session_start))

@@ -3213,6 +3213,286 @@ pub async fn session_ready(
     Json(json!({"delivered": delivered}))
 }
 
+/// Opaque backend-native identity submitted by a local caller. This is never
+/// itself a public Ouija session ID.
+#[derive(Clone, Debug, Deserialize)]
+pub struct BackendIdentityRequest {
+    pub backend: String,
+    pub session_id: String,
+}
+
+impl BackendIdentityRequest {
+    fn into_identity(self) -> Result<crate::backend::BackendSessionIdentity, String> {
+        let backend = self.backend.trim();
+        if backend.is_empty() {
+            return Err("backend identity requires a non-empty backend".into());
+        }
+        if let Some(error) =
+            crate::daemon_protocol::validate_backend_session_id_boundary(&self.session_id)
+        {
+            return Err(error);
+        }
+        if self.session_id.is_empty() {
+            return Err("backend identity requires a non-empty session_id".into());
+        }
+        Ok(crate::backend::BackendSessionIdentity {
+            backend: backend.into(),
+            session_id: self.session_id,
+        })
+    }
+}
+
+/// Resolve a backend-native identity to exactly one canonical Local session.
+/// The result deliberately never falls back to a raw native ID.
+pub async fn resolve_backend_identity(
+    State(state): State<SharedState>,
+    Json(body): Json<BackendIdentityRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let identity = match body.into_identity() {
+        Ok(identity) => identity,
+        Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))),
+    };
+    let resolution = state
+        .protocol
+        .read()
+        .await
+        .resolve_backend_identity(&identity);
+    match resolution {
+        crate::daemon_protocol::BackendIdentityResolution::Resolved { session_id } => (
+            StatusCode::OK,
+            Json(json!({ "outcome": "resolved", "session_id": session_id })),
+        ),
+        crate::daemon_protocol::BackendIdentityResolution::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "outcome": "not_found",
+                "error": "no Local session has this complete backend identity"
+            })),
+        ),
+        crate::daemon_protocol::BackendIdentityResolution::Ambiguous { .. } => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "outcome": "ambiguous",
+                "error": "multiple Local sessions have this backend identity; repair state before retrying"
+            })),
+        ),
+        crate::daemon_protocol::BackendIdentityResolution::IncompleteLegacy { .. } => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "outcome": "incomplete_legacy",
+                "error": "legacy backend metadata is incomplete; request an explicit fresh managed repair"
+            })),
+        ),
+    }
+}
+
+/// Credentialed claim for a known public session. No cwd, pane, or inferred
+/// launch information is accepted as authority here.
+#[derive(Clone, Debug, Deserialize)]
+pub struct BackendIdentityBindRequest {
+    pub target_session_id: String,
+    pub identity: BackendIdentityRequest,
+    #[serde(default)]
+    pub launch_credential: Option<String>,
+}
+
+/// Atomically bind a fresh managed launch's backend identity to its named
+/// canonical session. Repeated delivery of the same pair is successful.
+pub async fn bind_backend_identity(
+    State(state): State<SharedState>,
+    Json(body): Json<BackendIdentityBindRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let identity = match body.identity.into_identity() {
+        Ok(identity) => identity,
+        Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))),
+    };
+    let launch_credential = body
+        .launch_credential
+        .as_deref()
+        .map(str::trim)
+        .filter(|credential| !credential.is_empty());
+    let Some(launch_credential) = launch_credential else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "outcome": "missing_launch_proof",
+                "error": "binding a backend identity requires the managed launch credential"
+            })),
+        );
+    };
+
+    let result = {
+        let mut protocol = state.protocol.write().await;
+        protocol.bind_backend_identity(&body.target_session_id, &identity, Some(launch_credential))
+    };
+    // Bind mutates only under the protocol lock. Persistence/broadcast effects
+    // run afterward, matching AppState::apply_and_execute's lock discipline.
+    if !result.effects.is_empty() {
+        state.execute_effects(&result.effects).await;
+    }
+    match result.outcome {
+        crate::daemon_protocol::BackendIdentityBindOutcome::Bound { session_id } => (
+            StatusCode::OK,
+            Json(json!({ "outcome": "bound", "session_id": session_id })),
+        ),
+        crate::daemon_protocol::BackendIdentityBindOutcome::AlreadyBound { session_id } => (
+            StatusCode::OK,
+            Json(json!({ "outcome": "already_bound", "session_id": session_id })),
+        ),
+        crate::daemon_protocol::BackendIdentityBindOutcome::TargetNotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "outcome": "target_not_found",
+                "error": "named Local session no longer exists; start a fresh managed session"
+            })),
+        ),
+        crate::daemon_protocol::BackendIdentityBindOutcome::TargetNotLocal => (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "outcome": "target_not_local",
+                "error": "only a Local session can accept a backend identity"
+            })),
+        ),
+        crate::daemon_protocol::BackendIdentityBindOutcome::TargetIncompleteLegacy { .. } => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "outcome": "target_incomplete_legacy",
+                "error": "target has incomplete legacy backend metadata; request a fresh managed repair"
+            })),
+        ),
+        crate::daemon_protocol::BackendIdentityBindOutcome::TargetBackendMismatch { .. } => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "outcome": "target_backend_mismatch",
+                "error": "managed launch backend does not match the named session"
+            })),
+        ),
+        crate::daemon_protocol::BackendIdentityBindOutcome::TargetAlreadyBound { .. } => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "outcome": "target_already_bound",
+                "error": "target is already bound to a different backend identity; use an explicit fresh managed repair"
+            })),
+        ),
+        crate::daemon_protocol::BackendIdentityBindOutcome::CredentialExpired => (
+            StatusCode::GONE,
+            Json(json!({
+                "outcome": "credential_expired",
+                "error": "managed launch credential expired; request a fresh managed repair"
+            })),
+        ),
+        crate::daemon_protocol::BackendIdentityBindOutcome::InvalidCredential => (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "outcome": "invalid_launch_proof",
+                "error": "managed launch credential was rejected"
+            })),
+        ),
+        crate::daemon_protocol::BackendIdentityBindOutcome::IdentityBoundToOther { .. } => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "outcome": "identity_bound_to_other",
+                "error": "backend identity is already bound to another Local session"
+            })),
+        ),
+    }
+}
+
+/// Explicitly request repair of an incomplete legacy binding. Repair always
+/// performs a fresh managed relaunch; it never writes a caller-supplied native
+/// ID into the legacy row.
+#[derive(Clone, Debug, Deserialize)]
+pub struct BackendIdentityRepairRequest {
+    pub session_id: String,
+    pub backend: String,
+}
+
+pub async fn repair_backend_identity(
+    State(state): State<SharedState>,
+    Json(body): Json<BackendIdentityRepairRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let backend = body.backend.trim().to_string();
+    if backend.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "repair requires a backend name" })),
+        );
+    }
+    if let Err(response) = validate_backend_name(&state, Some(&backend)) {
+        return response;
+    }
+
+    let eligibility = {
+        let protocol = state.protocol.read().await;
+        match protocol.sessions.get(&body.session_id) {
+            None => Err(("target_not_found", "named Local session no longer exists")),
+            Some(session) if !matches!(session.origin, crate::daemon_protocol::Origin::Local) => {
+                Err(("target_not_local", "only a Local session can be repaired"))
+            }
+            Some(session)
+                if session.metadata.backend.is_some()
+                    == session.metadata.backend_session_id.is_some() =>
+            {
+                Err((
+                    "target_not_incomplete_legacy",
+                    "repair is only for incomplete legacy backend metadata",
+                ))
+            }
+            Some(session)
+                if session
+                    .metadata
+                    .backend
+                    .as_deref()
+                    .is_some_and(|recorded| recorded != backend) =>
+            {
+                Err((
+                    "target_backend_mismatch",
+                    "requested backend does not match the legacy session metadata",
+                ))
+            }
+            Some(_) => Ok(()),
+        }
+    };
+    if let Err((outcome, error)) = eligibility {
+        let status = match outcome {
+            "target_not_found" => StatusCode::NOT_FOUND,
+            "target_not_local" => StatusCode::FORBIDDEN,
+            _ => StatusCode::CONFLICT,
+        };
+        return (status, Json(json!({ "outcome": outcome, "error": error })));
+    }
+
+    let state_for_restart = state.clone();
+    let session_id = body.session_id.clone();
+    let backend_for_restart = backend.clone();
+    tokio::spawn(async move {
+        let (result, _) = crate::nostr_transport::restart_session(
+            &state_for_restart,
+            &session_id,
+            true,
+            None,
+            None,
+            None,
+            Some(&backend_for_restart),
+            None,
+            None,
+            None,
+            crate::nostr_transport::ParentSessionOverride::PreservePrevious,
+            None,
+        )
+        .await;
+        tracing::info!(session = %session_id, backend = %backend_for_restart, %result, "legacy backend repair fresh relaunch completed");
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "outcome": "fresh_relaunch_started",
+            "session_id": body.session_id,
+            "backend": backend
+        })),
+    )
+}
+
 /// Handle a readiness signal keyed by opencode backend session ID.
 /// Resolves the ouija session name internally, avoiding plugin-side race conditions.
 ///
@@ -4017,6 +4297,188 @@ pub async fn clear_reminder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn backend_identity_request(backend: &str, session_id: &str) -> BackendIdentityRequest {
+        BackendIdentityRequest {
+            backend: backend.into(),
+            session_id: session_id.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_identity_resolve_maps_zero_legacy_and_ambiguous_outcomes() {
+        let state = crate::state::AppState::new_for_test();
+        let request = backend_identity_request("future", "native-1");
+
+        let (status, Json(body)) =
+            resolve_backend_identity(State(state.clone()), Json(request.clone())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["outcome"], "not_found");
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "resolved".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("future".into()),
+                    backend_session_id: Some("native-1".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let (status, Json(body)) =
+            resolve_backend_identity(State(state.clone()), Json(request.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["outcome"], "resolved");
+        assert_eq!(body["session_id"], "resolved");
+        state.protocol.write().await.sessions.clear();
+
+        state.protocol.write().await.sessions.insert(
+            "legacy".into(),
+            crate::daemon_protocol::SessionEntry {
+                id: "legacy".into(),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend_session_id: Some("native-1".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let (status, Json(body)) =
+            resolve_backend_identity(State(state.clone()), Json(request.clone())).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["outcome"], "incomplete_legacy");
+
+        let mut proto = state.protocol.write().await;
+        proto.sessions.clear();
+        for id in ["first", "second"] {
+            proto.sessions.insert(
+                id.into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: id.into(),
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("future".into()),
+                        backend_session_id: Some("native-1".into()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+        }
+        drop(proto);
+        let (status, Json(body)) = resolve_backend_identity(State(state), Json(request)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["outcome"], "ambiguous");
+    }
+
+    #[tokio::test]
+    async fn backend_identity_bind_requires_proof_and_maps_terminal_outcomes() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "target".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    session_start_credential: Some("launch-proof".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let identity = backend_identity_request("future", "native-1");
+
+        let (status, Json(body)) = bind_backend_identity(
+            State(state.clone()),
+            Json(BackendIdentityBindRequest {
+                target_session_id: "target".into(),
+                identity: identity.clone(),
+                launch_credential: None,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["outcome"], "missing_launch_proof");
+
+        let request = BackendIdentityBindRequest {
+            target_session_id: "target".into(),
+            identity: identity.clone(),
+            launch_credential: Some("launch-proof".into()),
+        };
+        let (status, Json(body)) =
+            bind_backend_identity(State(state.clone()), Json(request.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["outcome"], "bound");
+        let (status, Json(body)) = bind_backend_identity(State(state.clone()), Json(request)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["outcome"], "already_bound");
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "conflict".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    session_start_credential: Some("conflict-proof".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let (status, Json(body)) = bind_backend_identity(
+            State(state.clone()),
+            Json(BackendIdentityBindRequest {
+                target_session_id: "conflict".into(),
+                identity: identity.clone(),
+                launch_credential: Some("conflict-proof".into()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["outcome"], "identity_bound_to_other");
+
+        let (status, Json(body)) = bind_backend_identity(
+            State(state.clone()),
+            Json(BackendIdentityBindRequest {
+                target_session_id: "dead".into(),
+                identity: identity.clone(),
+                launch_credential: Some("proof".into()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["outcome"], "target_not_found");
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "stale".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        let (status, Json(body)) = bind_backend_identity(
+            State(state),
+            Json(BackendIdentityBindRequest {
+                target_session_id: "stale".into(),
+                identity,
+                launch_credential: Some("expired-proof".into()),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(body["outcome"], "credential_expired");
+    }
+
+    #[tokio::test]
+    async fn backend_identity_repair_requires_named_legacy_local_session() {
+        let state = crate::state::AppState::new_for_test();
+        let (status, Json(body)) = repair_backend_identity(
+            State(state),
+            Json(BackendIdentityRepairRequest {
+                session_id: "missing".into(),
+                backend: "codex-cli".into(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["outcome"], "target_not_found");
+    }
 
     fn pending_prompt(pane_id: &str, prompt: &str) -> crate::state::PendingPrompt {
         crate::state::PendingPrompt::new(pane_id.into(), prompt.into(), None)
