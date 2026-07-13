@@ -3956,6 +3956,7 @@ async fn adopt_backend_session_id(
             backend: "opencode".into(),
             backend_session_id: backend_sid.to_string(),
             expected_backend_session_id: None,
+            expected_session_start_credential: None,
         })
         .await;
 

@@ -1720,9 +1720,16 @@ pub async fn start_session(
         backend_cmd.clone()
     };
 
+    // Codex reports its thread ID only after it starts. Give this managed
+    // launch an unguessable one-time credential so the hook can authorize that
+    // first binding without trusting the pane/session ID alone.
+    let session_start_credential =
+        (backend_name == "codex-cli").then(crate::daemon_protocol::new_session_start_credential);
+
     let start_result = tokio::task::spawn_blocking({
         let tmux_session = tmux_session.clone();
         let window_name = window_name.clone();
+        let pane_credential = session_start_credential.clone();
         move || -> anyhow::Result<String> {
             use std::process::Command;
 
@@ -1736,7 +1743,7 @@ pub async fn start_session(
             // `pane_env_args` sets OUIJA_SESSION_ID (primary session-id
             // signal for the ouija CLI) plus HISTFILE/fish_history to
             // suppress shell history writes.
-            let env_args = crate::tmux::pane_env_args(&window_name);
+            let env_args = crate::tmux::pane_env_args(&window_name, pane_credential.as_deref());
             let pane_id = if tmux_session_exists {
                 let target = format!("{tmux_session}:");
                 let mut args: Vec<&str> = vec!["new-window", "-d"];
@@ -1840,6 +1847,7 @@ pub async fn start_session(
                 project_dir: Some(dir.clone()),
                 worktree,
                 backend: Some(backend_name.clone()),
+                session_start_credential: session_start_credential.clone(),
                 backend_session_id,
                 opencode_binding,
                 model: model.map(String::from),
@@ -2290,7 +2298,7 @@ pub async fn restart_session(
             if let Some(ref pane) = existing_pane {
                 // See `pane_env_args` docs for why OUIJA_SESSION_ID must
                 // be set on every pane spawn (including respawn-pane).
-                let env_args = crate::tmux::pane_env_args(&window_name);
+                let env_args = crate::tmux::pane_env_args(&window_name, None);
                 let mut respawn_args: Vec<&str> = vec!["respawn-pane", "-k"];
                 respawn_args.extend(env_args.iter().map(String::as_str));
                 respawn_args.extend_from_slice(&["-t", pane]);
@@ -2331,7 +2339,7 @@ pub async fn restart_session(
                 .is_ok_and(|o| o.status.success());
 
             let target = format!("{tmux_session}:");
-            let env_args = crate::tmux::pane_env_args(&window_name);
+            let env_args = crate::tmux::pane_env_args(&window_name, None);
             let output = if tmux_session_exists {
                 let mut args: Vec<&str> = vec!["new-window", "-d"];
                 args.extend(env_args.iter().map(String::as_str));
@@ -2524,6 +2532,7 @@ pub async fn restart_session(
                     vim_mode: m.vim_mode,
                     backend_session_id,
                     backend: Some(backend_name.clone()),
+                    session_start_credential: None,
                     opencode_binding: opencode_binding.clone(),
                     restart_generation: m.restart_generation.saturating_add(1),
                     session_incarnation: m.session_incarnation,
@@ -3463,7 +3472,7 @@ async fn respawn_pane_opencode_attach_skew_notice(
     // Keep the pane alive after the notice prints so the operator can read it.
     let command = format!("{notice}; exec \"${{SHELL:-/bin/sh}}\"");
     let pane = pane_id.to_string();
-    let env_args = crate::tmux::pane_env_args(ouija_session_id);
+    let env_args = crate::tmux::pane_env_args(ouija_session_id, None);
     tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
         let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
         args.extend(env_args.iter().map(String::as_str));
@@ -3513,7 +3522,7 @@ async fn respawn_opencode_attach_for_session(
     let attach_cmd = opencode_attach_command(port, session_id, project_dir);
     let pane = pane_id.to_string();
     let wait_pane = pane_id.to_string();
-    let env_args = crate::tmux::pane_env_args(ouija_session_id);
+    let env_args = crate::tmux::pane_env_args(ouija_session_id, None);
     tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
         let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
         args.extend(env_args.iter().map(String::as_str));

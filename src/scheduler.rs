@@ -658,7 +658,7 @@ async fn respawn_and_inject(
         let pane_id = pane_id.clone();
         move || -> anyhow::Result<()> {
             // See `pane_env_args` for why OUIJA_SESSION_ID must ride along.
-            let env_args = crate::tmux::pane_env_args(&session_name);
+            let env_args = crate::tmux::pane_env_args(&session_name, None);
             let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
             args.extend(env_args.iter().map(String::as_str));
             args.extend_from_slice(&["-t", &pane_id, &full_cmd]);
@@ -890,7 +890,7 @@ async fn revive_and_inject(
             // `pane_env_args` exports OUIJA_SESSION_ID (so the ouija CLI
             // can resolve the caller's identity) and suppresses shell
             // history (HISTFILE/fish_history).
-            let env_args = crate::tmux::pane_env_args(&window_name);
+            let env_args = crate::tmux::pane_env_args(&window_name, None);
             let output = if tmux_session_exists {
                 let mut args: Vec<&str> = vec!["new-window", "-d"];
                 args.extend(env_args.iter().map(String::as_str));

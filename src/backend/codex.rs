@@ -1000,6 +1000,8 @@ mod tests {
         assert!(s.contains("--arg adapter \"codex-cli\""), "{s}");
         assert!(s.contains("launch_session_id"), "{s}");
         assert!(s.contains("${OUIJA_SESSION_ID:-}"), "{s}");
+        assert!(s.contains("launch_credential"), "{s}");
+        assert!(s.contains("${OUIJA_SESSION_START_CREDENTIAL:-}"), "{s}");
         // Wraps the daemon's `.output` into Codex additionalContext, keyed to the
         // SessionStart event so the TUI surfaces mesh instructions.
         assert!(s.contains("hookSpecificOutput"), "{s}");

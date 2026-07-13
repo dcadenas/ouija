@@ -239,6 +239,8 @@ pub struct SessionStartBody {
     /// rather than merely sharing the same project directory.
     #[serde(default)]
     pub launch_session_id: Option<String>,
+    #[serde(default)]
+    pub launch_credential: Option<String>,
 }
 
 /// POST /api/hooks/session-start
@@ -449,61 +451,82 @@ async fn session_start_inner(
                     "output": "",
                 });
             }
-            // Codex exposes the thread id in its SessionStart payload, but not
-            // a per-thread credential. Launch and adapter provenance prove the
-            // pane belongs to this managed Codex launch, but a second Codex
-            // thread in that same pane can still make the same first-bind
-            // claim. Until the launch path pre-binds the authoritative thread,
-            // fail closed instead of adopting it.
             if existing_backend.as_deref() == Some("codex-cli")
                 && normalize_backend_session_id(existing_backend_session_id.as_deref()).is_none()
             {
-                tracing::warn!(
-                    pane = body.pane,
-                    session = existing_id,
-                    "session-start rejected: existing Codex pane has no authoritative thread binding"
-                );
-                return json!({
-                    "skipped": "existing Codex pane has no authoritative thread binding",
-                    "output": "",
-                });
-            }
-            let binding = {
-                let proto = state.protocol.read().await;
-                proto.sessions.get(&existing_id).and_then(|session| {
-                    match session.metadata.backend_session_id.as_deref() {
-                        None => {
-                            let mut metadata = session.metadata.clone();
-                            metadata.backend_session_id = Some(backend_session_id.clone());
-                            Some(Ok(metadata))
-                        }
-                        Some(existing) if existing == backend_session_id => None,
-                        Some(_) => Some(Err(())),
-                    }
-                })
-            };
-            match binding {
-                Some(Ok(metadata)) => {
-                    state
-                        .apply_and_execute(crate::daemon_protocol::Event::Register {
-                            id: existing_id.clone(),
-                            pane: Some(body.pane.clone()),
-                            metadata,
-                        })
-                        .await;
-                }
-                Some(Err(())) => {
+                let Some(credential) =
+                    normalize_backend_session_id(body.launch_credential.as_deref())
+                else {
+                    return json!({
+                        "skipped": "existing Codex pane launch credential mismatch",
+                        "output": "",
+                    });
+                };
+                state
+                    .apply_and_execute(crate::daemon_protocol::Event::AdoptBackend {
+                        id: existing_id.clone(),
+                        backend: "codex-cli".into(),
+                        backend_session_id: backend_session_id.clone(),
+                        expected_backend_session_id: None,
+                        expected_session_start_credential: Some(credential),
+                    })
+                    .await;
+                let claimed = {
+                    let proto = state.protocol.read().await;
+                    proto.sessions.get(&existing_id).is_some_and(|session| {
+                        session.metadata.backend_session_id.as_deref()
+                            == Some(backend_session_id.as_str())
+                    })
+                };
+                if !claimed {
                     tracing::warn!(
                         pane = body.pane,
                         session = existing_id,
-                        "session-start rejected: existing pane backend session ID mismatch"
+                        "session-start rejected: existing Codex pane launch credential mismatch"
                     );
                     return json!({
-                        "skipped": "existing pane backend session ID mismatch",
+                        "skipped": "existing Codex pane launch credential mismatch",
                         "output": "",
                     });
                 }
-                None => {}
+            } else {
+                let binding = {
+                    let proto = state.protocol.read().await;
+                    proto.sessions.get(&existing_id).and_then(|session| {
+                        match session.metadata.backend_session_id.as_deref() {
+                            None => {
+                                let mut metadata = session.metadata.clone();
+                                metadata.backend_session_id = Some(backend_session_id.clone());
+                                Some(Ok(metadata))
+                            }
+                            Some(existing) if existing == backend_session_id => None,
+                            Some(_) => Some(Err(())),
+                        }
+                    })
+                };
+                match binding {
+                    Some(Ok(metadata)) => {
+                        state
+                            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                                id: existing_id.clone(),
+                                pane: Some(body.pane.clone()),
+                                metadata,
+                            })
+                            .await;
+                    }
+                    Some(Err(())) => {
+                        tracing::warn!(
+                            pane = body.pane,
+                            session = existing_id,
+                            "session-start rejected: existing pane backend session ID mismatch"
+                        );
+                        return json!({
+                            "skipped": "existing pane backend session ID mismatch",
+                            "output": "",
+                        });
+                    }
+                    None => {}
+                }
             }
         }
         let output = mesh_instructions_for_backend(existing_backend.as_deref(), &existing_id);
@@ -848,6 +871,7 @@ mod tests {
             backend_session_id: Some("codex-thread-1".into()),
             adapter: Some("codex-cli".into()),
             launch_session_id: Some("feat/worker".into()),
+            launch_credential: None,
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "feat/worker");
@@ -893,6 +917,7 @@ mod tests {
             backend_session_id: Some("claude-session-1".into()),
             adapter: Some("claude-code".into()),
             launch_session_id: Some("claude-worker".into()),
+            launch_credential: None,
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "claude-worker");
@@ -935,6 +960,7 @@ mod tests {
                 backend_session_id: Some("codex-thread-1".into()),
                 adapter: Some("claude-code".into()),
                 launch_session_id: Some("claude-worker".into()),
+                launch_credential: None,
             },
         )
         .await;
@@ -980,6 +1006,7 @@ mod tests {
                 backend_session_id: Some("claude-session-1".into()),
                 adapter: Some("claude-code".into()),
                 launch_session_id: None,
+                launch_credential: None,
             },
         )
         .await;
@@ -1023,6 +1050,7 @@ mod tests {
                 backend_session_id: Some("codex-thread-1".into()),
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("unknown-worker".into()),
+                launch_credential: None,
             },
         )
         .await;
@@ -1066,6 +1094,7 @@ mod tests {
                 backend_session_id: Some("codex-thread-1".into()),
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("feat/worker".into()),
+                launch_credential: None,
             },
         )
         .await;
@@ -1087,14 +1116,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_start_rejects_first_codex_thread_claim_for_existing_unbound_pane() {
-        // A managed Codex launch registers the pane before Codex creates its
-        // thread. Codex's SessionStart payload supplies a thread ID, but it
-        // carries no launch-scoped credential proving that the new thread owns
-        // this particular Ouija pane. A second Codex thread in the same project
-        // would make the identical claim, so accepting the first one is a
-        // confused-deputy binding. Fail closed until the launch path can
-        // pre-bind an authoritative thread ID.
+    async fn session_start_rejects_missing_credential_for_existing_unbound_codex_pane() {
+        // The initial Codex thread ID is accepted only from the daemon-issued,
+        // launch-scoped credential. Pane, project, adapter, and launch ID alone
+        // are all observable values and must not authorize first binding.
         let state = crate::state::AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -1118,19 +1143,99 @@ mod tests {
                 backend_session_id: Some("codex-thread-1".into()),
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("feat/worker".into()),
+                launch_credential: None,
             },
         )
         .await;
 
         assert_eq!(
             result["skipped"],
-            "existing Codex pane has no authoritative thread binding"
+            "existing Codex pane launch credential mismatch"
         );
         assert_eq!(result["output"], "");
         let proto = state.protocol.read().await;
         assert_eq!(
             proto.sessions["feat/worker"].metadata.backend_session_id, None,
             "an unauthenticated first Codex thread claim must not bind the pane"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_binds_first_codex_thread_with_one_time_launch_credential() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "feat/worker".into(),
+                pane: Some("%72".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    project_dir: Some("/home/user/code/proj".into()),
+                    session_start_credential: Some("launch-secret".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        *state.cached_assistant_panes.write().await =
+            vec![assistant_pane("%72", "/home/user/code/proj")];
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: "%72".into(),
+                cwd: "/home/user/code/proj".into(),
+                backend_session_id: Some("codex-thread-1".into()),
+                adapter: Some("codex-cli".into()),
+                launch_session_id: Some("feat/worker".into()),
+                launch_credential: Some("launch-secret".into()),
+            },
+        )
+        .await;
+
+        assert_eq!(result["registered"], "feat/worker");
+        assert!(
+            result["output"]
+                .as_str()
+                .is_some_and(|output| !output.is_empty())
+        );
+        let proto = state.protocol.read().await;
+        assert_eq!(
+            proto.sessions["feat/worker"]
+                .metadata
+                .backend_session_id
+                .as_deref(),
+            Some("codex-thread-1")
+        );
+        assert!(
+            proto.sessions["feat/worker"]
+                .metadata
+                .session_start_credential
+                .is_none(),
+            "the successful first bind must consume the credential"
+        );
+        drop(proto);
+
+        let replay = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: "%72".into(),
+                cwd: "/home/user/code/proj".into(),
+                backend_session_id: Some("codex-thread-2".into()),
+                adapter: Some("codex-cli".into()),
+                launch_session_id: Some("feat/worker".into()),
+                launch_credential: Some("launch-secret".into()),
+            },
+        )
+        .await;
+        assert_eq!(
+            replay["skipped"],
+            "existing pane backend session ID mismatch"
+        );
+        assert_eq!(
+            state.protocol.read().await.sessions["feat/worker"]
+                .metadata
+                .backend_session_id
+                .as_deref(),
+            Some("codex-thread-1")
         );
     }
 
@@ -1164,6 +1269,7 @@ mod tests {
                 backend_session_id: Some("codex-thread-2".into()),
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("feat/worker".into()),
+                launch_credential: None,
             },
         )
         .await;
@@ -1210,6 +1316,7 @@ mod tests {
                 backend_session_id: Some("codex-ouija-thread".into()),
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("hub-worker".into()),
+                launch_credential: None,
             },
         )
         .await;
@@ -1251,6 +1358,7 @@ mod tests {
                 backend_session_id: Some("claude-replacement".into()),
                 adapter: Some("claude-code".into()),
                 launch_session_id: Some("worker".into()),
+                launch_credential: None,
             },
         )
         .await;
@@ -1276,6 +1384,7 @@ mod tests {
             backend_session_id: None,
             adapter: None,
             launch_session_id: None,
+            launch_credential: None,
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "myproject");
@@ -1305,6 +1414,7 @@ mod tests {
             backend_session_id: None,
             adapter: None,
             launch_session_id: None,
+            launch_credential: None,
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "existing");
@@ -1323,6 +1433,7 @@ mod tests {
             backend_session_id: None,
             adapter: None,
             launch_session_id: None,
+            launch_credential: None,
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "ouija");

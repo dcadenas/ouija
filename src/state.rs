@@ -3893,6 +3893,7 @@ pub(crate) mod tests {
             last_metadata_update: Some(1_700_000_100),
             backend_session_id: Some("oc_abc123".into()),
             backend: Some("opencode".into()),
+            session_start_credential: None,
             opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
             restart_generation: 7,
             session_incarnation: 11,
