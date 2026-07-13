@@ -968,6 +968,71 @@ pub struct SenderContext {
     pub backend_identity: Option<crate::backend::BackendSessionIdentity>,
 }
 
+/// Result of resolving an opaque backend-native session identity to a local
+/// public Ouija session. Callers must handle every variant fail-closed: a raw
+/// backend ID is never a public sender ID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BackendIdentityResolution {
+    Resolved {
+        session_id: String,
+    },
+    NotFound,
+    Ambiguous {
+        session_ids: Vec<String>,
+    },
+    /// A locally recorded backend field is missing its other half. It is not
+    /// safe to infer the missing value from a caller-provided raw ID.
+    IncompleteLegacy {
+        session_ids: Vec<String>,
+    },
+}
+
+/// Typed result of the one-shot managed-launch binding transition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BackendIdentityBindOutcome {
+    Bound {
+        session_id: String,
+    },
+    /// A retry delivered the same backend pair after its one-time credential
+    /// was consumed. This is intentionally successful without re-consuming it.
+    AlreadyBound {
+        session_id: String,
+    },
+    TargetNotFound,
+    TargetNotLocal,
+    TargetIncompleteLegacy {
+        session_id: String,
+    },
+    TargetBackendMismatch {
+        session_id: String,
+    },
+    TargetAlreadyBound {
+        session_id: String,
+    },
+    CredentialExpired,
+    InvalidCredential,
+    IdentityBoundToOther {
+        session_id: String,
+    },
+}
+
+/// The state change and resulting side effects of a backend identity bind.
+/// The caller must execute `effects` only after releasing its protocol lock.
+#[derive(Debug)]
+pub struct BackendIdentityBindResult {
+    pub outcome: BackendIdentityBindOutcome,
+    pub effects: Vec<Effect>,
+}
+
+fn backend_pair_matches(metadata: &SessionMeta, backend: &str, backend_session_id: &str) -> bool {
+    metadata.backend.as_deref() == Some(backend)
+        && metadata.backend_session_id.as_deref() == Some(backend_session_id)
+}
+
+fn metadata_has_incomplete_backend_pair(metadata: &SessionMeta) -> bool {
+    metadata.backend.is_some() != metadata.backend_session_id.is_some()
+}
+
 /// Boundary validation for `/api/send` sender claims (task #1395).
 ///
 /// Pure and called from the API layer BEFORE `apply`, like
@@ -1276,15 +1341,16 @@ impl DaemonState {
             metadata.inherit_recurrence_from(&existing.metadata);
         }
 
-        if let Some(backend_session_id) = metadata.backend_session_id.as_deref()
-            && let Some(owner) = self.sessions.values().find(|s| {
-                s.id != id
-                    && matches!(s.origin, Origin::Local)
-                    && s.metadata.backend_session_id.as_deref() == Some(backend_session_id)
-            })
-        {
+        if let (Some(backend), Some(backend_session_id)) = (
+            metadata.backend.as_deref(),
+            metadata.backend_session_id.as_deref(),
+        ) && let Some(owner) = self.sessions.values().find(|s| {
+            s.id != id
+                && matches!(s.origin, Origin::Local)
+                && backend_pair_matches(&s.metadata, backend, backend_session_id)
+        }) {
             let reason = format!(
-                "backend_session_id {backend_session_id} is already bound to session '{}'",
+                "backend_session_id {backend_session_id} is already bound to session '{}' (backend {backend})",
                 owner.id
             );
             return vec![
@@ -1436,15 +1502,16 @@ impl DaemonState {
             ];
         }
 
-        if let Some(backend_session_id) = metadata.backend_session_id.as_deref()
-            && let Some(owner) = self.sessions.values().find(|s| {
-                s.id != id
-                    && matches!(s.origin, Origin::Local)
-                    && s.metadata.backend_session_id.as_deref() == Some(backend_session_id)
-            })
-        {
+        if let (Some(backend), Some(backend_session_id)) = (
+            metadata.backend.as_deref(),
+            metadata.backend_session_id.as_deref(),
+        ) && let Some(owner) = self.sessions.values().find(|s| {
+            s.id != id
+                && matches!(s.origin, Origin::Local)
+                && backend_pair_matches(&s.metadata, backend, backend_session_id)
+        }) {
             let reason = format!(
-                "backend_session_id {backend_session_id} is already bound to session '{}'",
+                "backend_session_id {backend_session_id} is already bound to session '{}' (backend {backend})",
                 owner.id
             );
             return vec![
@@ -1926,6 +1993,177 @@ impl DaemonState {
         effects
     }
 
+    /// Resolve a caller-reported backend pair to one complete Local session.
+    ///
+    /// Complete exact matches take precedence over partial legacy rows: a
+    /// historical incomplete row cannot make a known-good exact pair unsafe.
+    /// With no complete match, an overlapping partial row is reported so the
+    /// caller can offer explicit repair rather than silently adopting it.
+    pub fn resolve_backend_identity(
+        &self,
+        identity: &crate::backend::BackendSessionIdentity,
+    ) -> BackendIdentityResolution {
+        let complete_matches: Vec<String> = self
+            .sessions
+            .values()
+            .filter(|session| {
+                matches!(session.origin, Origin::Local)
+                    && backend_pair_matches(
+                        &session.metadata,
+                        &identity.backend,
+                        &identity.session_id,
+                    )
+            })
+            .map(|session| session.id.clone())
+            .collect();
+
+        match complete_matches.as_slice() {
+            [session_id] => {
+                return BackendIdentityResolution::Resolved {
+                    session_id: session_id.clone(),
+                };
+            }
+            [] => {}
+            _ => {
+                return BackendIdentityResolution::Ambiguous {
+                    session_ids: complete_matches,
+                };
+            }
+        }
+
+        let incomplete_matches: Vec<String> = self
+            .sessions
+            .values()
+            .filter(|session| {
+                matches!(session.origin, Origin::Local)
+                    && metadata_has_incomplete_backend_pair(&session.metadata)
+                    && (session.metadata.backend_session_id.as_deref()
+                        == Some(identity.session_id.as_str())
+                        || session.metadata.backend.as_deref() == Some(identity.backend.as_str()))
+            })
+            .map(|session| session.id.clone())
+            .collect();
+
+        if incomplete_matches.is_empty() {
+            BackendIdentityResolution::NotFound
+        } else {
+            BackendIdentityResolution::IncompleteLegacy {
+                session_ids: incomplete_matches,
+            }
+        }
+    }
+
+    /// Atomically bind a fresh managed launch's opaque backend pair.
+    ///
+    /// This is deliberately not an [`Event`]: callers need the typed outcome
+    /// while holding the same state lock that guards uniqueness and one-time
+    /// credential consumption. Execute its returned effects after that lock
+    /// has been released.
+    pub fn bind_backend_identity(
+        &mut self,
+        id: &str,
+        identity: &crate::backend::BackendSessionIdentity,
+        launch_credential: Option<&str>,
+    ) -> BackendIdentityBindResult {
+        let Some(target) = self.sessions.get(id) else {
+            return BackendIdentityBindResult {
+                outcome: BackendIdentityBindOutcome::TargetNotFound,
+                effects: vec![],
+            };
+        };
+        if !matches!(target.origin, Origin::Local) {
+            return BackendIdentityBindResult {
+                outcome: BackendIdentityBindOutcome::TargetNotLocal,
+                effects: vec![],
+            };
+        }
+
+        if backend_pair_matches(&target.metadata, &identity.backend, &identity.session_id) {
+            return BackendIdentityBindResult {
+                outcome: BackendIdentityBindOutcome::AlreadyBound {
+                    session_id: id.into(),
+                },
+                effects: vec![],
+            };
+        }
+        if target.metadata.backend.is_some() && target.metadata.backend_session_id.is_some() {
+            return BackendIdentityBindResult {
+                outcome: BackendIdentityBindOutcome::TargetAlreadyBound {
+                    session_id: id.into(),
+                },
+                effects: vec![],
+            };
+        }
+        if target.metadata.backend_session_id.is_some() {
+            return BackendIdentityBindResult {
+                outcome: BackendIdentityBindOutcome::TargetIncompleteLegacy {
+                    session_id: id.into(),
+                },
+                effects: vec![],
+            };
+        }
+        if let Some(expected_backend) = target.metadata.backend.as_deref()
+            && expected_backend != identity.backend
+        {
+            return BackendIdentityBindResult {
+                outcome: BackendIdentityBindOutcome::TargetBackendMismatch {
+                    session_id: id.into(),
+                },
+                effects: vec![],
+            };
+        }
+
+        let Some(expected_credential) = target.metadata.session_start_credential.as_deref() else {
+            return BackendIdentityBindResult {
+                outcome: if target.metadata.backend.is_some() {
+                    BackendIdentityBindOutcome::TargetIncompleteLegacy {
+                        session_id: id.into(),
+                    }
+                } else {
+                    BackendIdentityBindOutcome::CredentialExpired
+                },
+                effects: vec![],
+            };
+        };
+        if launch_credential != Some(expected_credential) {
+            return BackendIdentityBindResult {
+                outcome: BackendIdentityBindOutcome::InvalidCredential,
+                effects: vec![],
+            };
+        }
+
+        if let Some(owner) = self.sessions.values().find(|session| {
+            session.id != id
+                && matches!(session.origin, Origin::Local)
+                && backend_pair_matches(&session.metadata, &identity.backend, &identity.session_id)
+        }) {
+            return BackendIdentityBindResult {
+                outcome: BackendIdentityBindOutcome::IdentityBoundToOther {
+                    session_id: owner.id.clone(),
+                },
+                effects: vec![],
+            };
+        }
+
+        let session = self
+            .sessions
+            .get_mut(id)
+            .expect("local session checked above");
+        session.metadata.backend = Some(identity.backend.clone());
+        session.metadata.backend_session_id = Some(identity.session_id.clone());
+        session.metadata.session_start_credential = None;
+        let mut effects = vec![Effect::Persist];
+        if session.metadata.networked {
+            effects.push(Effect::BroadcastSessionList);
+        }
+        BackendIdentityBindResult {
+            outcome: BackendIdentityBindOutcome::Bound {
+                session_id: id.into(),
+            },
+            effects,
+        }
+    }
+
     fn apply_adopt_backend(
         &mut self,
         id: &str,
@@ -1934,9 +2172,10 @@ impl DaemonState {
         expected_backend_session_id: Option<String>,
         expected_session_start_credential: Option<String>,
     ) -> Vec<Effect> {
-        let (current_backend_session_id, current_session_start_credential) =
+        let (current_backend, current_backend_session_id, current_session_start_credential) =
             match self.sessions.get(id) {
                 Some(s) if matches!(s.origin, Origin::Local) => (
+                    s.metadata.backend.clone(),
                     s.metadata.backend_session_id.clone(),
                     s.metadata.session_start_credential.clone(),
                 ),
@@ -1954,10 +2193,17 @@ impl DaemonState {
             return vec![];
         }
 
+        // Backend bindings are immutable. An exact repeated adoption is a
+        // no-op; changing either side of a complete pair must use an explicit
+        // managed relaunch rather than overwriting provenance.
+        if current_backend.is_some() && current_backend_session_id.is_some() {
+            return vec![];
+        }
+
         if self.sessions.values().any(|s| {
             s.id != id
                 && matches!(s.origin, Origin::Local)
-                && s.metadata.backend_session_id.as_deref() == Some(backend_session_id.as_str())
+                && backend_pair_matches(&s.metadata, &backend, &backend_session_id)
         }) {
             return vec![];
         }
@@ -6410,6 +6656,386 @@ mod tests {
     }
 
     // --- AdoptBackend tests ---
+
+    fn backend_identity(backend: &str, session_id: &str) -> crate::backend::BackendSessionIdentity {
+        crate::backend::BackendSessionIdentity {
+            backend: backend.into(),
+            session_id: session_id.into(),
+        }
+    }
+
+    #[test]
+    fn resolve_backend_identity_requires_one_complete_local_backend_pair() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "codex".into(),
+            pane: None,
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                backend_session_id: Some("shared-native-id".into()),
+                ..Default::default()
+            },
+        });
+        state.apply(Event::Register {
+            id: "opencode".into(),
+            pane: None,
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("shared-native-id".into()),
+                ..Default::default()
+            },
+        });
+        state.sessions.insert(
+            "remote/codex".into(),
+            SessionEntry {
+                id: "remote/codex".into(),
+                origin: Origin::Remote("npub1remote".into()),
+                metadata: SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    backend_session_id: Some("shared-native-id".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            state.resolve_backend_identity(&backend_identity("codex-cli", "shared-native-id")),
+            BackendIdentityResolution::Resolved {
+                session_id: "codex".into()
+            }
+        );
+        assert_eq!(
+            state.resolve_backend_identity(&backend_identity("opencode", "shared-native-id")),
+            BackendIdentityResolution::Resolved {
+                session_id: "opencode".into()
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_backend_identity_fails_closed_for_legacy_and_ambiguous_bindings() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        assert_eq!(
+            state.resolve_backend_identity(&backend_identity("future", "missing")),
+            BackendIdentityResolution::NotFound
+        );
+        state.sessions.insert(
+            "legacy-id-only".into(),
+            SessionEntry {
+                id: "legacy-id-only".into(),
+                metadata: SessionMeta {
+                    backend_session_id: Some("native-1".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            state.resolve_backend_identity(&backend_identity("future", "native-1")),
+            BackendIdentityResolution::IncompleteLegacy {
+                session_ids: vec!["legacy-id-only".into()]
+            }
+        );
+
+        state.sessions.clear();
+        state.sessions.insert(
+            "legacy-backend-only".into(),
+            SessionEntry {
+                id: "legacy-backend-only".into(),
+                metadata: SessionMeta {
+                    backend: Some("future".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            state.resolve_backend_identity(&backend_identity("future", "native-2")),
+            BackendIdentityResolution::IncompleteLegacy {
+                session_ids: vec!["legacy-backend-only".into()]
+            }
+        );
+
+        state.sessions.clear();
+        for id in ["first", "second"] {
+            state.sessions.insert(
+                id.into(),
+                SessionEntry {
+                    id: id.into(),
+                    metadata: SessionMeta {
+                        backend: Some("future".into()),
+                        backend_session_id: Some("native-3".into()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(
+            state.resolve_backend_identity(&backend_identity("future", "native-3")),
+            BackendIdentityResolution::Ambiguous {
+                session_ids: vec!["first".into(), "second".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn bind_backend_identity_is_credentialed_immutable_and_idempotent() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "target".into(),
+            pane: None,
+            metadata: SessionMeta {
+                session_start_credential: Some("launch-proof".into()),
+                ..Default::default()
+            },
+        });
+        let identity = backend_identity("future", "native-1");
+
+        let rejected = state.bind_backend_identity("target", &identity, Some("wrong"));
+        assert_eq!(
+            rejected.outcome,
+            BackendIdentityBindOutcome::InvalidCredential
+        );
+        assert!(rejected.effects.is_empty());
+
+        let bound = state.bind_backend_identity("target", &identity, Some("launch-proof"));
+        assert_eq!(
+            bound.outcome,
+            BackendIdentityBindOutcome::Bound {
+                session_id: "target".into()
+            }
+        );
+        assert!(
+            bound
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Persist))
+        );
+        assert!(
+            state.sessions["target"]
+                .metadata
+                .session_start_credential
+                .is_none()
+        );
+
+        let duplicate = state.bind_backend_identity("target", &identity, Some("launch-proof"));
+        assert_eq!(
+            duplicate.outcome,
+            BackendIdentityBindOutcome::AlreadyBound {
+                session_id: "target".into()
+            }
+        );
+        assert!(duplicate.effects.is_empty());
+
+        let conflicting = state.bind_backend_identity(
+            "target",
+            &backend_identity("future", "native-2"),
+            Some("launch-proof"),
+        );
+        assert_eq!(
+            conflicting.outcome,
+            BackendIdentityBindOutcome::TargetAlreadyBound {
+                session_id: "target".into()
+            }
+        );
+    }
+
+    #[test]
+    fn bind_backend_identity_fails_closed_for_expired_and_incomplete_targets() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "expired".into(),
+            pane: None,
+            metadata: SessionMeta::default(),
+        });
+        state.apply(Event::Register {
+            id: "legacy".into(),
+            pane: None,
+            metadata: SessionMeta {
+                backend: Some("future".into()),
+                ..Default::default()
+            },
+        });
+
+        assert_eq!(
+            state
+                .bind_backend_identity(
+                    "expired",
+                    &backend_identity("future", "native-expired"),
+                    Some("old-proof"),
+                )
+                .outcome,
+            BackendIdentityBindOutcome::CredentialExpired
+        );
+        assert_eq!(
+            state
+                .bind_backend_identity(
+                    "legacy",
+                    &backend_identity("future", "native-legacy"),
+                    Some("proof"),
+                )
+                .outcome,
+            BackendIdentityBindOutcome::TargetIncompleteLegacy {
+                session_id: "legacy".into()
+            }
+        );
+    }
+
+    #[test]
+    fn bind_backend_identity_enforces_pair_uniqueness_not_raw_id_uniqueness() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "owner".into(),
+            pane: None,
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                backend_session_id: Some("shared-native-id".into()),
+                ..Default::default()
+            },
+        });
+        state.apply(Event::Register {
+            id: "opencode-target".into(),
+            pane: None,
+            metadata: SessionMeta {
+                session_start_credential: Some("opencode-proof".into()),
+                ..Default::default()
+            },
+        });
+        state.apply(Event::Register {
+            id: "conflict-target".into(),
+            pane: None,
+            metadata: SessionMeta {
+                session_start_credential: Some("conflict-proof".into()),
+                ..Default::default()
+            },
+        });
+
+        assert_eq!(
+            state
+                .bind_backend_identity(
+                    "opencode-target",
+                    &backend_identity("opencode", "shared-native-id"),
+                    Some("opencode-proof"),
+                )
+                .outcome,
+            BackendIdentityBindOutcome::Bound {
+                session_id: "opencode-target".into()
+            }
+        );
+        assert_eq!(
+            state
+                .bind_backend_identity(
+                    "conflict-target",
+                    &backend_identity("codex-cli", "shared-native-id"),
+                    Some("conflict-proof"),
+                )
+                .outcome,
+            BackendIdentityBindOutcome::IdentityBoundToOther {
+                session_id: "owner".into()
+            }
+        );
+    }
+
+    #[test]
+    fn concurrent_backend_claims_bind_the_pair_once() {
+        use std::sync::{Arc, Barrier, Mutex};
+
+        let mut initial = DaemonState::new("d1".into(), "host1".into());
+        for id in ["first", "second"] {
+            initial.apply(Event::Register {
+                id: id.into(),
+                pane: None,
+                metadata: SessionMeta {
+                    session_start_credential: Some(format!("{id}-proof")),
+                    ..Default::default()
+                },
+            });
+        }
+        let state = Arc::new(Mutex::new(initial));
+        let barrier = Arc::new(Barrier::new(2));
+
+        let (first, second) = std::thread::scope(|scope| {
+            let first_state = Arc::clone(&state);
+            let first_barrier = Arc::clone(&barrier);
+            let first = scope.spawn(move || {
+                first_barrier.wait();
+                first_state
+                    .lock()
+                    .unwrap()
+                    .bind_backend_identity(
+                        "first",
+                        &backend_identity("future", "native-1"),
+                        Some("first-proof"),
+                    )
+                    .outcome
+            });
+            let second_state = Arc::clone(&state);
+            let second_barrier = Arc::clone(&barrier);
+            let second = scope.spawn(move || {
+                second_barrier.wait();
+                second_state
+                    .lock()
+                    .unwrap()
+                    .bind_backend_identity(
+                        "second",
+                        &backend_identity("future", "native-1"),
+                        Some("second-proof"),
+                    )
+                    .outcome
+            });
+            (first.join().unwrap(), second.join().unwrap())
+        });
+
+        assert!(matches!(
+            (&first, &second),
+            (
+                BackendIdentityBindOutcome::Bound { .. },
+                BackendIdentityBindOutcome::IdentityBoundToOther { .. }
+            ) | (
+                BackendIdentityBindOutcome::IdentityBoundToOther { .. },
+                BackendIdentityBindOutcome::Bound { .. }
+            )
+        ));
+        assert!(matches!(
+            state
+                .lock()
+                .unwrap()
+                .resolve_backend_identity(&backend_identity("future", "native-1")),
+            BackendIdentityResolution::Resolved { .. }
+        ));
+    }
+
+    #[test]
+    fn register_allows_equal_raw_ids_for_distinct_backends() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "codex".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                backend_session_id: Some("shared-native-id".into()),
+                ..Default::default()
+            },
+        });
+
+        let effects = state.apply(Event::Register {
+            id: "opencode".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("shared-native-id".into()),
+                ..Default::default()
+            },
+        });
+
+        assert!(effects.iter().any(
+            |effect| matches!(effect, Effect::RegisterOk { session_id, .. } if session_id == "opencode")
+        ));
+        assert!(state.sessions.contains_key("codex"));
+        assert!(state.sessions.contains_key("opencode"));
+    }
 
     #[test]
     fn adopt_backend_sets_fields_and_persists() {
