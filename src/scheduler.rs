@@ -778,15 +778,7 @@ async fn revive_from_task(
     )
     .await
     {
-        Ok(new_pane) => {
-            if task.on_fire.clears_context() {
-                let mut proto = state.protocol.write().await;
-                if let Some(s) = proto.sessions.get_mut(task.session_name()) {
-                    s.metadata.backend_session_id = None;
-                }
-            }
-            TaskRun::ok(task, Some(new_pane))
-        }
+        Ok(new_pane) => TaskRun::ok(task, Some(new_pane)),
         Err(e) => TaskRun::failed(task, e.to_string()),
     }
 }
@@ -1535,7 +1527,7 @@ mod tests {
             Some("prompt".into()),
             None,
             false,
-            None,
+            Some("old-codex-thread".into()),
             OnFire::NewSession,
         );
         task.backend = Some("codex-cli".into());
@@ -1556,6 +1548,10 @@ mod tests {
         );
 
         assert_eq!(metadata.backend.as_deref(), Some("codex-cli"));
+        assert_eq!(
+            metadata.backend_session_id, None,
+            "a fresh Codex revival must clear the old thread before launch"
+        );
         assert_eq!(metadata.model, None);
         assert_eq!(metadata.codex_home, None);
         assert_eq!(
