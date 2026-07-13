@@ -130,6 +130,39 @@ fn cleanup_failed_opencode_attach_pane(pane_id: &str) {
     });
 }
 
+async fn cleanup_provisional_start(
+    state: &std::sync::Arc<AppState>,
+    session_id: &str,
+    pane_id: &str,
+) {
+    let owns_provisional_pane = state
+        .protocol
+        .read()
+        .await
+        .sessions
+        .get(session_id)
+        .is_some_and(|s| s.pane.as_deref() == Some(pane_id));
+    if !owns_provisional_pane {
+        return;
+    }
+
+    state
+        .apply_and_execute(crate::daemon_protocol::Event::Remove {
+            id: session_id.to_string(),
+            keep_worktree: true,
+        })
+        .await;
+    if !cfg!(test) {
+        let pane = pane_id.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("tmux")
+                .args(["kill-pane", "-t", &pane])
+                .status()
+        })
+        .await;
+    }
+}
+
 /// Timeout when waiting for relay connections to establish.
 const RELAY_CONNECT_TIMEOUT_SECS: u64 = 5;
 /// Maximum size of the seen-events dedup cache before clearing.
@@ -1787,20 +1820,6 @@ pub async fn start_session(
                 String::from_utf8_lossy(&output.stdout).trim().to_string()
             };
 
-            crate::tmux::configure_managed_pane(&pane_id);
-
-            // Leading space keeps the command out of shell history (fallback
-            // for shells that ignore HISTFILE but honour HIST_IGNORE_SPACE).
-            let command = if is_http_api {
-                full_cmd.clone()
-            } else {
-                crate::tmux::close_shell_after(&full_cmd)
-            };
-            let hidden_cmd = format!(" {command}");
-            Command::new("tmux")
-                .args(["send-keys", "-t", &pane_id, &hidden_cmd, "Enter"])
-                .status()?;
-
             Ok(pane_id)
         }
     })
@@ -1808,6 +1827,66 @@ pub async fn start_session(
 
     match start_result {
         Ok(Ok(pane_id)) => {
+            // A fresh Codex process can call SessionStart immediately. Make
+            // its complete, credentialed session record visible before the
+            // backend command is sent so that hook cannot auto-register a
+            // competing session or observe an uncredentialed slot.
+            if let Some(session_start_credential) = session_start_credential.clone() {
+                let proto_meta = crate::daemon_protocol::SessionMeta {
+                    project_dir: Some(dir.clone()),
+                    worktree,
+                    backend: Some(backend_name.clone()),
+                    session_start_credential: Some(session_start_credential),
+                    model: model.map(String::from),
+                    effort: effort.map(String::from),
+                    codex_home: launch_model.codex_home.clone(),
+                    reminder: reminder.map(String::from),
+                    parent_session: parent_session.map(String::from),
+                    idle_policy: idle_policy.clone(),
+                    prompt: prompt.map(String::from),
+                    ..Default::default()
+                };
+                state
+                    .apply_and_execute(crate::daemon_protocol::Event::Register {
+                        id: name.to_string(),
+                        pane: Some(pane_id.clone()),
+                        metadata: proto_meta,
+                    })
+                    .await;
+            }
+
+            let pane_for_launch = pane_id.clone();
+            let command = if is_http_api {
+                full_cmd.clone()
+            } else {
+                crate::tmux::close_shell_after(&full_cmd)
+            };
+            let launch_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                crate::tmux::configure_managed_pane(&pane_for_launch);
+                // Leading space keeps the command out of shell history
+                // (fallback for shells that honour HIST_IGNORE_SPACE).
+                let hidden_cmd = format!(" {command}");
+                let status = std::process::Command::new("tmux")
+                    .args(["send-keys", "-t", &pane_for_launch, &hidden_cmd, "Enter"])
+                    .status()?;
+                if !status.success() {
+                    anyhow::bail!("tmux send-keys failed for pane {pane_for_launch}");
+                }
+                Ok(())
+            })
+            .await;
+            match launch_result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    cleanup_provisional_start(state, name, &pane_id).await;
+                    return (format!("start failed: {error}"), None);
+                }
+                Err(error) => {
+                    cleanup_provisional_start(state, name, &pane_id).await;
+                    return (format!("start failed: {error}"), None);
+                }
+            }
+
             // For HttpApi backends, use the shared opencode serve instance
             let is_http_api = matches!(
                 backend.delivery_mode(),
@@ -1842,12 +1921,28 @@ pub async fn start_session(
                 );
             };
 
+            let (backend_session_id, pending_session_start_credential) =
+                if session_start_credential.is_some() {
+                    let proto = state.protocol.read().await;
+                    proto
+                        .sessions
+                        .get(name)
+                        .map(|session| {
+                            (
+                                session.metadata.backend_session_id.clone(),
+                                session.metadata.session_start_credential.clone(),
+                            )
+                        })
+                        .unwrap_or((None, session_start_credential.clone()))
+                } else {
+                    (backend_session_id, None)
+                };
             let oc_session_id = backend_session_id.clone();
             let proto_meta = crate::daemon_protocol::SessionMeta {
                 project_dir: Some(dir.clone()),
                 worktree,
                 backend: Some(backend_name.clone()),
-                session_start_credential: session_start_credential.clone(),
+                session_start_credential: pending_session_start_credential,
                 backend_session_id,
                 opencode_binding,
                 model: model.map(String::from),
@@ -4714,6 +4809,38 @@ pub(crate) fn opencode_prompt_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cleanup_provisional_start_only_removes_its_registered_pane() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "codex-start".into(),
+                pane: Some("%created".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+
+        cleanup_provisional_start(&state, "codex-start", "%other").await;
+        assert!(
+            state
+                .protocol
+                .read()
+                .await
+                .sessions
+                .contains_key("codex-start")
+        );
+
+        cleanup_provisional_start(&state, "codex-start", "%created").await;
+        assert!(
+            !state
+                .protocol
+                .read()
+                .await
+                .sessions
+                .contains_key("codex-start")
+        );
+    }
 
     async fn wait_for_prompt_fallback_timer() {
         tokio::time::sleep(PENDING_PROMPT_FALLBACK_DELAY + std::time::Duration::from_millis(10))
