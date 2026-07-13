@@ -976,6 +976,14 @@ async fn revive_and_inject(
     // The pane exists but has not started the backend yet. Register its
     // launch credential first so Codex's SessionStart hook can find and
     // authenticate the exact pane before it reports its initial thread ID.
+    let prior_session = state
+        .protocol
+        .read()
+        .await
+        .sessions
+        .get(task.session_name())
+        .cloned();
+
     state
         .apply_and_execute(crate::daemon_protocol::Event::Register {
             id: task.session_name().to_string(),
@@ -985,7 +993,7 @@ async fn revive_and_inject(
         .await;
 
     let pane_for_launch = new_pane.clone();
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    let launch_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         crate::tmux::configure_managed_pane(&pane_for_launch);
         // Leading space prevents the command from being recorded in shell
         // history (zsh HIST_IGNORE_SPACE / bash HISTCONTROL=ignorespace).
@@ -999,7 +1007,32 @@ async fn revive_and_inject(
         }
         Ok(())
     })
-    .await??;
+    .await;
+    match launch_result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            rollback_provisional_revival(
+                state,
+                task.session_name(),
+                &new_pane,
+                session_start_credential.as_deref(),
+                prior_session.as_ref(),
+            )
+            .await;
+            return Err(error);
+        }
+        Err(error) => {
+            rollback_provisional_revival(
+                state,
+                task.session_name(),
+                &new_pane,
+                session_start_credential.as_deref(),
+                prior_session.as_ref(),
+            )
+            .await;
+            return Err(anyhow::anyhow!("scheduled launch task failed: {error}"));
+        }
+    }
 
     // Phase 1: Wait for the backend process to appear in the pane
     let poll_pane = new_pane.clone();
@@ -1069,6 +1102,58 @@ async fn revive_and_inject(
     }
 
     Ok(new_pane)
+}
+
+/// Undo a definite post-registration launch failure only while this invocation
+/// still owns the staged pane and credential. A SessionStart hook that already
+/// consumed the credential has committed a newer binding and must win.
+async fn rollback_provisional_revival(
+    state: &SharedState,
+    session_id: &str,
+    pane_id: &str,
+    credential: Option<&str>,
+    prior_session: Option<&crate::daemon_protocol::SessionEntry>,
+) {
+    let still_staged = state
+        .protocol
+        .read()
+        .await
+        .sessions
+        .get(session_id)
+        .is_some_and(|session| {
+            session.pane.as_deref() == Some(pane_id)
+                && session.metadata.session_start_credential.as_deref() == credential
+        });
+    if !still_staged {
+        return;
+    }
+
+    if let Some(previous) = prior_session {
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: previous.id.clone(),
+                pane: previous.pane.clone(),
+                metadata: previous.metadata.clone(),
+            })
+            .await;
+    } else {
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Remove {
+                id: session_id.to_string(),
+                keep_worktree: true,
+            })
+            .await;
+    }
+
+    if !cfg!(test) {
+        let pane = pane_id.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("tmux")
+                .args(["kill-pane", "-t", &pane])
+                .status()
+        })
+        .await;
+    }
 }
 
 struct RevivedSessionSnapshot<'a> {
@@ -1598,5 +1683,70 @@ mod tests {
             Some("thread-resumed")
         );
         assert_eq!(metadata.session_start_credential, None);
+    }
+
+    #[tokio::test]
+    async fn rollback_provisional_revival_removes_unlaunched_new_pane() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "scheduled".into(),
+                pane: Some("%staged".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    session_start_credential: Some("credential".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        rollback_provisional_revival(&state, "scheduled", "%staged", Some("credential"), None)
+            .await;
+
+        assert!(
+            !state
+                .protocol
+                .read()
+                .await
+                .sessions
+                .contains_key("scheduled")
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_provisional_revival_keeps_successful_session_start_adoption() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "scheduled".into(),
+                pane: Some("%staged".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    session_start_credential: Some("credential".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .protocol
+            .write()
+            .await
+            .apply(crate::daemon_protocol::Event::AdoptBackend {
+                id: "scheduled".into(),
+                backend: "codex-cli".into(),
+                backend_session_id: "thread-winner".into(),
+                expected_backend_session_id: None,
+                expected_session_start_credential: Some("credential".into()),
+            });
+
+        rollback_provisional_revival(&state, "scheduled", "%staged", Some("credential"), None)
+            .await;
+
+        let session = state.protocol.read().await.sessions["scheduled"].clone();
+        assert_eq!(session.pane.as_deref(), Some("%staged"));
+        assert_eq!(
+            session.metadata.backend_session_id.as_deref(),
+            Some("thread-winner")
+        );
     }
 }

@@ -635,6 +635,11 @@ pub enum Effect {
         pane: String,
         name: String,
     },
+    /// Keep a just-removed pane out of auto-registration until its explicit
+    /// kill has had time to complete.
+    HoldAutoregister {
+        pane: String,
+    },
     RenameWindow {
         pane: String,
         name: String,
@@ -1647,6 +1652,9 @@ impl DaemonState {
         effects.push(Effect::Persist);
 
         if let Some(ref pane_id) = session.pane {
+            effects.push(Effect::HoldAutoregister {
+                pane: pane_id.clone(),
+            });
             effects.push(Effect::ClearTmuxVar {
                 pane: pane_id.clone(),
                 name: "@ouija_session".into(),
@@ -1938,6 +1946,10 @@ impl DaemonState {
                 effects.push(Effect::ClearTmuxVar {
                     pane: pane_id.clone(),
                     name: "@ouija_session".into(),
+                });
+                effects.push(Effect::ClearTmuxVar {
+                    pane: pane_id.clone(),
+                    name: "@ouija_id".into(),
                 });
                 effects.push(Effect::EnableAutoRename {
                     pane: pane_id.clone(),
@@ -4323,6 +4335,13 @@ mod tests {
             )),
             "Remove must NOT clear @ouija_id, got: {effects:?}"
         );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::HoldAutoregister { pane } if pane == "%1"
+            )),
+            "Remove must hold auto-registration while kill-session finishes, got: {effects:?}"
+        );
         // @ouija_session is still cleared — that's the daemon-driven marker.
         assert!(
             effects.iter().any(|e| matches!(
@@ -4693,6 +4712,14 @@ mod tests {
             !effects
                 .iter()
                 .any(|e| matches!(e, Effect::CleanupWorktree { .. }))
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::ClearTmuxVar { pane, name }
+                    if pane == "%2" && name == "@ouija_id"
+            )),
+            "the reaper has proved this pane dead, so its stale autoregister marker must be released"
         );
     }
 
