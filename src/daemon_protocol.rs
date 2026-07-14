@@ -1377,6 +1377,63 @@ impl DaemonState {
         let mut metadata = metadata;
         if let Some(existing) = self.sessions.get(&id) {
             metadata.inherit_recurrence_from(&existing.metadata);
+
+            if matches!(existing.origin, Origin::Local) {
+                let existing_pair = existing
+                    .metadata
+                    .backend
+                    .as_deref()
+                    .zip(existing.metadata.backend_session_id.as_deref());
+                let supplied_pair = metadata
+                    .backend
+                    .as_deref()
+                    .zip(metadata.backend_session_id.as_deref());
+                match (existing_pair, supplied_pair) {
+                    (
+                        Some((existing_backend, existing_session_id)),
+                        Some((supplied_backend, supplied_session_id)),
+                    ) if (existing_backend, existing_session_id)
+                        != (supplied_backend, supplied_session_id) =>
+                    {
+                        let reason = format!(
+                            "generic registration cannot replace backend identity ({existing_backend}, {existing_session_id}) for existing session '{id}'; use credentialed binding"
+                        );
+                        return vec![
+                            Effect::Log {
+                                level: LogLevel::Warn,
+                                message: format!("refusing registration for '{id}': {reason}"),
+                            },
+                            Effect::RegisterFailed {
+                                session_id: id,
+                                reason,
+                            },
+                        ];
+                    }
+                    (Some(_), _) => {
+                        // Generic re-registration is used by ordinary hooks.
+                        // It may refresh the pane and recurrence metadata, but
+                        // it cannot clear or replace established ownership.
+                        metadata.backend = existing.metadata.backend.clone();
+                        metadata.backend_session_id = existing.metadata.backend_session_id.clone();
+                    }
+                    (None, Some((backend, backend_session_id))) => {
+                        let reason = format!(
+                            "generic registration cannot bind backend identity ({backend}, {backend_session_id}) to existing session '{id}'; use credentialed binding"
+                        );
+                        return vec![
+                            Effect::Log {
+                                level: LogLevel::Warn,
+                                message: format!("refusing registration for '{id}': {reason}"),
+                            },
+                            Effect::RegisterFailed {
+                                session_id: id,
+                                reason,
+                            },
+                        ];
+                    }
+                    (None, None) => {}
+                }
+            }
         }
 
         if let (Some(backend), Some(backend_session_id)) = (
@@ -7526,6 +7583,40 @@ mod tests {
         assert_eq!(metadata.restart_generation, 7);
         assert_eq!(metadata.backend_repair_reservation, Some(7));
         assert_eq!(metadata.session_start_credential.as_deref(), Some("proof"));
+    }
+
+    #[test]
+    fn generic_reregistration_cannot_preempt_an_existing_complete_backend_pair() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                backend_session_id: Some("thread-original".into()),
+                ..Default::default()
+            },
+        });
+
+        let effects = state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                backend_session_id: Some("thread-preempt".into()),
+                ..Default::default()
+            },
+        });
+
+        assert!(effects.iter().any(|effect| {
+            matches!(effect, Effect::RegisterFailed { session_id, .. } if session_id == "worker")
+        }));
+        let metadata = &state.sessions["worker"].metadata;
+        assert_eq!(metadata.backend.as_deref(), Some("codex-cli"));
+        assert_eq!(
+            metadata.backend_session_id.as_deref(),
+            Some("thread-original")
+        );
     }
 
     #[test]

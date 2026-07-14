@@ -4300,7 +4300,7 @@ async fn adopt_backend_session_id(
     // the metadata of unrelated session B when both live in the same dir
     // (hashbrown iteration order is effectively random). Fail closed on
     // ambiguity: adopt only when exactly one candidate exists.
-    let candidates: Vec<String> = {
+    let candidates: Vec<OpenCodeAdoptionCandidate> = {
         let proto = state.protocol.read().await;
         proto
             .sessions
@@ -4312,11 +4312,25 @@ async fn adopt_backend_session_id(
                     && s.metadata.backend_session_id.is_none()
                     && s.metadata.session_start_credential.is_none()
             })
-            .map(|s| s.id.clone())
+            .map(|s| OpenCodeAdoptionCandidate {
+                session_id: s.id.clone(),
+                backend: s.metadata.backend.clone(),
+                backend_session_id: s.metadata.backend_session_id.clone(),
+                session_start_credential: s.metadata.session_start_credential.clone(),
+                incarnation: s.metadata.session_incarnation,
+            })
             .collect()
     };
 
-    let session_id = disambiguate_adoption_candidates(backend_sid, &dir, candidates)?;
+    let candidate_ids = candidates
+        .iter()
+        .map(|candidate| candidate.session_id.clone())
+        .collect();
+    let session_id = disambiguate_adoption_candidates(backend_sid, &dir, candidate_ids)?;
+    let candidate = candidates
+        .into_iter()
+        .find(|candidate| candidate.session_id == session_id)
+        .expect("selected adoption candidate came from this list");
     tracing::info!(
         target: "ouija::api::backend_session_ready",
         backend_session_id = %backend_sid,
@@ -4328,26 +4342,63 @@ async fn adopt_backend_session_id(
         "adopting backend_session_id {backend_sid} for session {session_id} (dir: {dir})"
     );
 
-    // Update the session metadata with backend info
-    state
-        .apply_and_execute(crate::daemon_protocol::Event::AdoptBackend {
-            id: session_id.clone(),
-            backend: "opencode".into(),
-            backend_session_id: backend_sid.to_string(),
-            expected_backend_session_id: None,
-            expected_session_start_credential: None,
-        })
-        .await;
-    let committed = {
-        let proto = state.protocol.read().await;
-        matches!(
-            resolve_opencode_backend_identity(&proto, backend_sid),
-            crate::daemon_protocol::BackendIdentityResolution::Resolved {
-                session_id: ref resolved_id
-            } if resolved_id == &session_id
-        )
+    commit_opencode_adoption_if_unchanged(state, candidate, backend_sid).await
+}
+
+#[derive(Clone, Debug)]
+struct OpenCodeAdoptionCandidate {
+    session_id: String,
+    backend: Option<String>,
+    backend_session_id: Option<String>,
+    session_start_credential: Option<String>,
+    incarnation: i64,
+}
+
+/// Bind an uncredentialed OpenCode identity only if the exact candidate that
+/// discovery observed still exists. Holding the protocol lock across the
+/// comparison and adoption closes the race with StageFreshLaunch.
+async fn commit_opencode_adoption_if_unchanged(
+    state: &std::sync::Arc<crate::state::AppState>,
+    candidate: OpenCodeAdoptionCandidate,
+    backend_sid: &str,
+) -> Option<String> {
+    let effects = {
+        let mut proto = state.protocol.write().await;
+        let unchanged = proto
+            .sessions
+            .get(&candidate.session_id)
+            .is_some_and(|session| {
+                matches!(session.origin, crate::daemon_protocol::Origin::Local)
+                    && session.metadata.backend == candidate.backend
+                    && session.metadata.backend_session_id == candidate.backend_session_id
+                    && session.metadata.session_start_credential
+                        == candidate.session_start_credential
+                    && session.metadata.session_incarnation == candidate.incarnation
+            });
+        if unchanged {
+            proto.apply(crate::daemon_protocol::Event::AdoptBackend {
+                id: candidate.session_id.clone(),
+                backend: "opencode".into(),
+                backend_session_id: backend_sid.to_string(),
+                expected_backend_session_id: candidate.backend_session_id.clone(),
+                expected_session_start_credential: candidate.session_start_credential.clone(),
+            })
+        } else {
+            vec![]
+        }
     };
-    committed.then_some(session_id)
+    if effects.is_empty() {
+        return None;
+    }
+    state.execute_effects(&effects).await;
+    let proto = state.protocol.read().await;
+    matches!(
+        resolve_opencode_backend_identity(&proto, backend_sid),
+        crate::daemon_protocol::BackendIdentityResolution::Resolved {
+            session_id: ref resolved_id
+        } if resolved_id == &candidate.session_id
+    )
+    .then_some(candidate.session_id)
 }
 
 /// List indexed projects from the configured projects directory.
@@ -8827,6 +8878,50 @@ mod tests {
         assert!(
             incumbent.metadata.backend_session_id.is_none(),
             "incumbent metadata must not be overwritten by late auto-provision"
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_adoption_rejects_a_candidate_staged_for_fresh_launch() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "candidate".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/project".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let candidate = {
+            let proto = state.protocol.read().await;
+            let session = &proto.sessions["candidate"];
+            OpenCodeAdoptionCandidate {
+                session_id: "candidate".into(),
+                backend: session.metadata.backend.clone(),
+                backend_session_id: session.metadata.backend_session_id.clone(),
+                session_start_credential: session.metadata.session_start_credential.clone(),
+                incarnation: session.metadata.session_incarnation,
+            }
+        };
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::StageFreshLaunch {
+                id: "candidate".into(),
+                backend: "codex-cli".into(),
+                session_start_credential: Some("fresh-proof".into()),
+            })
+            .await;
+
+        let adopted = commit_opencode_adoption_if_unchanged(&state, candidate, "ses_racing").await;
+
+        assert!(adopted.is_none());
+        let metadata = &state.protocol.read().await.sessions["candidate"].metadata;
+        assert_eq!(metadata.backend.as_deref(), Some("codex-cli"));
+        assert!(metadata.backend_session_id.is_none());
+        assert_eq!(
+            metadata.session_start_credential.as_deref(),
+            Some("fresh-proof")
         );
     }
 
