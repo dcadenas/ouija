@@ -591,6 +591,15 @@ pub enum Event {
         credential: Option<String>,
         previous: Option<SessionEntry>,
     },
+    /// Invert an accepted fresh-launch stage only when the failed launch still
+    /// owns its pane, credential, and exact staged incarnation.
+    RollbackFreshLaunch {
+        id: String,
+        pane: String,
+        credential: String,
+        staged_incarnation: i64,
+        previous: SessionEntry,
+    },
     /// Remove a local session ONLY if its `worktree_present` is `Some(false)`.
     ///
     /// Atomic variant used by the prune-stale-sessions flow: the check and the
@@ -1321,6 +1330,19 @@ impl DaemonState {
                 &id,
                 &pane,
                 credential.as_deref(),
+                previous,
+            ),
+            Event::RollbackFreshLaunch {
+                id,
+                pane,
+                credential,
+                staged_incarnation,
+                previous,
+            } => self.apply_rollback_fresh_launch(
+                &id,
+                &pane,
+                &credential,
+                staged_incarnation,
                 previous,
             ),
             Event::RemoveIfStale {
@@ -2113,6 +2135,33 @@ impl DaemonState {
             effects.push(Effect::ProvisionalRollbackOk {
                 pane: pane.to_string(),
             });
+        }
+        effects
+    }
+
+    fn apply_rollback_fresh_launch(
+        &mut self,
+        id: &str,
+        pane: &str,
+        credential: &str,
+        staged_incarnation: i64,
+        previous: SessionEntry,
+    ) -> Vec<Effect> {
+        let still_staged = self.sessions.get(id).is_some_and(|session| {
+            matches!(session.origin, Origin::Local)
+                && session.pane.as_deref() == Some(pane)
+                && session.metadata.session_start_credential.as_deref() == Some(credential)
+                && session.metadata.session_incarnation == staged_incarnation
+        });
+        if !still_staged || previous.id != id {
+            return vec![];
+        }
+
+        let networked = previous.metadata.networked;
+        self.sessions.insert(id.to_string(), previous);
+        let mut effects = vec![Effect::Persist];
+        if networked {
+            effects.push(Effect::BroadcastSessionList);
         }
         effects
     }

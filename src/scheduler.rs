@@ -662,7 +662,7 @@ async fn respawn_and_inject(
     // Codex reports its new thread ID only after the pane starts. Advance the
     // managed incarnation and clear the old pair before respawning, while
     // retaining the one-time credential for the new SessionStart hook.
-    if let Err(error) = stage_scheduled_codex_launch(
+    let staged_incarnation = match stage_scheduled_codex_launch(
         state,
         task.session_name(),
         &backend_name,
@@ -670,8 +670,9 @@ async fn respawn_and_inject(
     )
     .await
     {
-        return TaskRun::failed(task, error);
-    }
+        Ok(incarnation) => incarnation,
+        Err(error) => return TaskRun::failed(task, error),
+    };
     let settings = state.settings.read().await;
     let claude_permission_mode = settings.claude_permission_mode.clone();
     let launch_model =
@@ -704,14 +705,19 @@ async fn respawn_and_inject(
         ) {
             Ok(command) => command,
             Err(error) => {
-                rollback_credential_staging_failure(
-                    state,
-                    task.session_name(),
-                    &pane_id,
-                    credential,
-                    prior_session.as_ref(),
-                )
-                .await;
+                if let (Some(staged_incarnation), Some(previous)) =
+                    (staged_incarnation, prior_session.as_ref())
+                {
+                    rollback_staged_fresh_launch(
+                        state,
+                        task.session_name(),
+                        &pane_id,
+                        credential,
+                        staged_incarnation,
+                        previous,
+                    )
+                    .await;
+                }
                 return TaskRun::failed(
                     task,
                     format!("could not stage Codex launch credential: {error}"),
@@ -758,26 +764,36 @@ async fn respawn_and_inject(
     match respawn_result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            if session_start_credential.is_some() {
-                rollback_provisional_revival(
+            if let (Some(credential), Some(staged_incarnation), Some(previous)) = (
+                session_start_credential.as_deref(),
+                staged_incarnation,
+                prior_session.as_ref(),
+            ) {
+                rollback_staged_fresh_launch(
                     state,
                     task.session_name(),
                     &pane_id,
-                    session_start_credential.as_deref(),
-                    prior_session.as_ref(),
+                    credential,
+                    staged_incarnation,
+                    previous,
                 )
                 .await;
             }
             return TaskRun::failed(task, e.to_string());
         }
         Err(e) => {
-            if session_start_credential.is_some() {
-                rollback_provisional_revival(
+            if let (Some(credential), Some(staged_incarnation), Some(previous)) = (
+                session_start_credential.as_deref(),
+                staged_incarnation,
+                prior_session.as_ref(),
+            ) {
+                rollback_staged_fresh_launch(
                     state,
                     task.session_name(),
                     &pane_id,
-                    session_start_credential.as_deref(),
-                    prior_session.as_ref(),
+                    credential,
+                    staged_incarnation,
+                    previous,
                 )
                 .await;
             }
@@ -1212,17 +1228,26 @@ async fn rollback_provisional_revival(
         .await;
 }
 
-/// Restore a session when preparing its SessionStart hook fails before the
-/// replacement pane launches. The pending credential was registered first, so
-/// this must use the same guarded rollback as a failed pane respawn.
-async fn rollback_credential_staging_failure(
+/// Invert a StageFreshLaunch only while its exact incarnation remains pending.
+/// A SessionStart hook consumes the credential, so a concurrently bound thread
+/// cannot satisfy this guard and always wins over the failed launch.
+async fn rollback_staged_fresh_launch(
     state: &SharedState,
     session_id: &str,
     pane_id: &str,
     credential: &str,
-    prior_session: Option<&crate::daemon_protocol::SessionEntry>,
+    staged_incarnation: i64,
+    previous: &crate::daemon_protocol::SessionEntry,
 ) {
-    rollback_provisional_revival(state, session_id, pane_id, Some(credential), prior_session).await;
+    state
+        .apply_and_execute(crate::daemon_protocol::Event::RollbackFreshLaunch {
+            id: session_id.to_string(),
+            pane: pane_id.to_string(),
+            credential: credential.to_string(),
+            staged_incarnation,
+            previous: previous.clone(),
+        })
+        .await;
 }
 
 struct RevivedSessionSnapshot<'a> {
@@ -1876,7 +1901,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rollback_provisional_revival_restores_existing_pane_after_respawn_failure() {
+    async fn staged_fresh_launch_rollback_restores_existing_pair_after_credential_hook_failure() {
         let state = crate::state::AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -1890,24 +1915,22 @@ mod tests {
             })
             .await;
         let previous = state.protocol.read().await.sessions["scheduled"].clone();
-        state
-            .apply_and_execute(crate::daemon_protocol::Event::Register {
-                id: "scheduled".into(),
-                pane: Some("%staged".into()),
-                metadata: crate::daemon_protocol::SessionMeta {
-                    backend: Some("codex-cli".into()),
-                    session_start_credential: Some("credential".into()),
-                    ..Default::default()
-                },
-            })
-            .await;
-
-        rollback_provisional_revival(
+        let staged_incarnation = stage_scheduled_codex_launch(
             &state,
             "scheduled",
-            "%staged",
-            Some("credential"),
-            Some(&previous),
+            "codex-cli",
+            Some("credential".into()),
+        )
+        .await;
+        let staged_incarnation = staged_incarnation.unwrap().unwrap();
+
+        rollback_staged_fresh_launch(
+            &state,
+            "scheduled",
+            "%existing",
+            "credential",
+            staged_incarnation,
+            &previous,
         )
         .await;
 
@@ -1916,11 +1939,15 @@ mod tests {
         assert_eq!(
             restored.metadata.backend_session_id.as_deref(),
             Some("thread-old")
+        );
+        assert_eq!(
+            restored.metadata.session_incarnation,
+            previous.metadata.session_incarnation
         );
     }
 
     #[tokio::test]
-    async fn credential_staging_failure_restores_existing_session_binding() {
+    async fn staged_fresh_launch_rollback_preserves_concurrently_consumed_session_start() {
         let state = crate::state::AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -1935,32 +1962,83 @@ mod tests {
             .await;
         let previous = state.protocol.read().await.sessions["scheduled"].clone();
         state
+            .apply_and_execute(crate::daemon_protocol::Event::StageFreshLaunch {
+                id: "scheduled".into(),
+                backend: "codex-cli".into(),
+                session_start_credential: Some("credential".into()),
+                expected_repair_reservation: None,
+            })
+            .await;
+        let staged_incarnation = state.protocol.read().await.sessions["scheduled"]
+            .metadata
+            .session_incarnation;
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::AdoptBackend {
+                id: "scheduled".into(),
+                backend: "codex-cli".into(),
+                backend_session_id: "thread-winner".into(),
+                expected_backend_session_id: None,
+                expected_session_start_credential: Some("credential".into()),
+            })
+            .await;
+
+        rollback_staged_fresh_launch(
+            &state,
+            "scheduled",
+            "%existing",
+            "credential",
+            staged_incarnation,
+            &previous,
+        )
+        .await;
+
+        let retained = state.protocol.read().await.sessions["scheduled"].clone();
+        assert_eq!(retained.pane.as_deref(), Some("%existing"));
+        assert_eq!(
+            retained.metadata.backend_session_id.as_deref(),
+            Some("thread-winner")
+        );
+        assert_eq!(retained.metadata.session_start_credential, None);
+        assert_eq!(retained.metadata.session_incarnation, staged_incarnation);
+    }
+
+    #[tokio::test]
+    async fn staged_fresh_launch_rollback_restores_existing_pair_after_tmux_respawn_failure() {
+        let state = crate::state::AppState::new_for_test();
+        state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
                 id: "scheduled".into(),
-                pane: Some("%staged".into()),
+                pane: Some("%existing".into()),
                 metadata: crate::daemon_protocol::SessionMeta {
                     backend: Some("codex-cli".into()),
-                    session_start_credential: Some("credential".into()),
+                    backend_session_id: Some("thread-old".into()),
                     ..Default::default()
                 },
             })
             .await;
-
-        rollback_credential_staging_failure(
+        let previous = state.protocol.read().await.sessions["scheduled"].clone();
+        let staged_incarnation = stage_scheduled_codex_launch(
             &state,
             "scheduled",
-            "%staged",
+            "codex-cli",
+            Some("credential".into()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        rollback_staged_fresh_launch(
+            &state,
+            "scheduled",
+            "%existing",
             "credential",
-            Some(&previous),
+            staged_incarnation,
+            &previous,
         )
         .await;
 
         let restored = state.protocol.read().await.sessions["scheduled"].clone();
-        assert_eq!(restored.pane.as_deref(), Some("%existing"));
-        assert_eq!(
-            restored.metadata.backend_session_id.as_deref(),
-            Some("thread-old")
-        );
-        assert_eq!(restored.metadata.session_start_credential, None);
+        assert_eq!(restored, previous);
     }
 }
