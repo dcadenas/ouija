@@ -221,6 +221,21 @@ pub enum BackendRepairPhase {
     Staged,
 }
 
+/// The authoritative result of beginning a fresh managed launch. Callers must
+/// observe this before respawning a process or issuing a backend command. A
+/// pane-creation fallback may create an inert shell first so a failed creation
+/// cannot consume repair authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StageFreshLaunchOutcome {
+    Staged { incarnation: i64 },
+    Rejected,
+}
+
+pub struct StageFreshLaunchResult {
+    pub outcome: StageFreshLaunchOutcome,
+    pub effects: Vec<Effect>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum IdlePolicy {
@@ -1280,12 +1295,15 @@ impl DaemonState {
                 backend,
                 session_start_credential,
                 expected_repair_reservation,
-            } => self.apply_stage_fresh_launch(
-                id,
-                backend,
-                session_start_credential,
-                expected_repair_reservation,
-            ),
+            } => {
+                self.stage_fresh_launch(
+                    &id,
+                    backend,
+                    session_start_credential,
+                    expected_repair_reservation,
+                )
+                .effects
+            }
             Event::RefreshLaunchMetadata {
                 id,
                 expected_incarnation,
@@ -1589,21 +1607,30 @@ impl DaemonState {
         effects
     }
 
-    fn apply_stage_fresh_launch(
+    pub fn stage_fresh_launch(
         &mut self,
-        id: String,
+        id: &str,
         backend: String,
         session_start_credential: Option<String>,
         expected_repair_reservation: Option<BackendRepairReservation>,
-    ) -> Vec<Effect> {
-        let Some(session) = self.sessions.get_mut(&id) else {
-            return vec![];
+    ) -> StageFreshLaunchResult {
+        let Some(session) = self.sessions.get_mut(id) else {
+            return StageFreshLaunchResult {
+                outcome: StageFreshLaunchOutcome::Rejected,
+                effects: vec![],
+            };
         };
         if !matches!(session.origin, Origin::Local) {
-            return vec![];
+            return StageFreshLaunchResult {
+                outcome: StageFreshLaunchOutcome::Rejected,
+                effects: vec![],
+            };
         }
         if session.metadata.backend_repair_reservation != expected_repair_reservation {
-            return vec![];
+            return StageFreshLaunchResult {
+                outcome: StageFreshLaunchOutcome::Rejected,
+                effects: vec![],
+            };
         }
         if let Some(reservation) = session.metadata.backend_repair_reservation.as_mut() {
             if reservation.phase != BackendRepairPhase::PreStage
@@ -1611,7 +1638,10 @@ impl DaemonState {
                 || reservation.restart_generation
                     != session.metadata.restart_generation.saturating_add(1)
             {
-                return vec![];
+                return StageFreshLaunchResult {
+                    outcome: StageFreshLaunchOutcome::Rejected,
+                    effects: vec![],
+                };
             }
             reservation.phase = BackendRepairPhase::Staged;
         }
@@ -1628,11 +1658,15 @@ impl DaemonState {
             now.timestamp_nanos_opt().unwrap_or_else(|| now.timestamp());
         session.registered_at = now.timestamp();
 
+        let incarnation = session.metadata.session_incarnation;
         let mut effects = vec![Effect::Persist];
         if session.metadata.networked {
             effects.push(Effect::BroadcastSessionList);
         }
-        effects
+        StageFreshLaunchResult {
+            outcome: StageFreshLaunchOutcome::Staged { incarnation },
+            effects,
+        }
     }
 
     fn apply_refresh_launch_metadata(
@@ -7701,6 +7735,40 @@ mod tests {
 
         assert!(effects.is_empty());
         assert!(state.sessions["legacy"].metadata.backend.is_none());
+    }
+
+    #[test]
+    fn rejected_fresh_launch_stage_reports_rejection_without_mutating_identity() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "legacy".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                backend_session_id: Some("old-thread".into()),
+                ..Default::default()
+            },
+        });
+        let rejected = state.stage_fresh_launch(
+            "legacy",
+            "codex-cli".into(),
+            Some("new-proof".into()),
+            Some(BackendRepairReservation {
+                original_incarnation: -1,
+                restart_generation: 1,
+                phase: BackendRepairPhase::PreStage,
+            }),
+        );
+
+        assert_eq!(rejected.outcome, StageFreshLaunchOutcome::Rejected);
+        assert!(rejected.effects.is_empty());
+        assert_eq!(
+            state.sessions["legacy"]
+                .metadata
+                .backend_session_id
+                .as_deref(),
+            Some("old-thread")
+        );
     }
 
     #[test]

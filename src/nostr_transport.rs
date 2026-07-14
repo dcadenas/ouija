@@ -2462,44 +2462,26 @@ pub async fn restart_session(
     // intended backend plus an optional Codex launch credential for the new
     // process to claim.
     if fresh && prev_metadata.is_some() && existing_pane.is_some() {
-        state
-            .apply_and_execute(crate::daemon_protocol::Event::StageFreshLaunch {
-                id: name.to_string(),
-                backend: backend_name.clone(),
-                session_start_credential: session_start_credential.clone(),
-                expected_repair_reservation: repair_reservation.clone(),
-            })
-            .await;
-        if repair_reservation.is_some()
-            && !state
-                .protocol
-                .read()
-                .await
-                .sessions
-                .get(name)
-                .is_some_and(|session| {
-                    session
-                        .metadata
-                        .backend_repair_reservation
-                        .as_ref()
-                        .is_some_and(|reservation| {
-                            reservation.phase == crate::daemon_protocol::BackendRepairPhase::Staged
-                        })
-                })
-        {
-            return (
-                "restart superseded while staging repair".into(),
-                None,
-                RestartOutcome::Superseded,
-            );
-        }
-        staged_incarnation = state
-            .protocol
-            .read()
+        match state
+            .stage_fresh_launch(
+                name,
+                backend_name.clone(),
+                session_start_credential.clone(),
+                repair_reservation.clone(),
+            )
             .await
-            .sessions
-            .get(name)
-            .map(|session| session.metadata.session_incarnation);
+        {
+            crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
+                staged_incarnation = Some(incarnation);
+            }
+            crate::daemon_protocol::StageFreshLaunchOutcome::Rejected => {
+                return (
+                    "restart superseded before respawn".into(),
+                    None,
+                    RestartOutcome::Superseded,
+                );
+            }
+        }
     }
 
     // For TuiInjection: pass prompt as CLI arg (same as start_session).
@@ -2622,44 +2604,26 @@ pub async fn restart_session(
             // has not received the backend command yet. Stage only at this
             // point so a creation failure cannot consume repair authority.
             if fresh && prev_metadata.is_some() && existing_pane.is_none() {
-                state
-                    .apply_and_execute(crate::daemon_protocol::Event::StageFreshLaunch {
-                        id: name.to_string(),
-                        backend: backend_name.clone(),
-                        session_start_credential: session_start_credential.clone(),
-                        expected_repair_reservation: repair_reservation.clone(),
-                    })
-                    .await;
-                staged_incarnation = state
-                    .protocol
-                    .read()
+                match state
+                    .stage_fresh_launch(
+                        name,
+                        backend_name.clone(),
+                        session_start_credential.clone(),
+                        repair_reservation.clone(),
+                    )
                     .await
-                    .sessions
-                    .get(name)
-                    .map(|session| session.metadata.session_incarnation);
-                if repair_reservation.is_some()
-                    && !state
-                        .protocol
-                        .read()
-                        .await
-                        .sessions
-                        .get(name)
-                        .is_some_and(|session| {
-                            session
-                                .metadata
-                                .backend_repair_reservation
-                                .as_ref()
-                                .is_some_and(|reservation| {
-                                    reservation.phase
-                                        == crate::daemon_protocol::BackendRepairPhase::Staged
-                                })
-                        })
                 {
-                    return (
-                        "restart superseded while staging repair".into(),
-                        None,
-                        RestartOutcome::Superseded,
-                    );
+                    crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
+                        staged_incarnation = Some(incarnation);
+                    }
+                    crate::daemon_protocol::StageFreshLaunchOutcome::Rejected => {
+                        cleanup_provisional_start(state, name, &pane_id).await;
+                        return (
+                            "restart superseded before backend launch".into(),
+                            None,
+                            RestartOutcome::Superseded,
+                        );
+                    }
                 }
             }
             if launch_after_registration {

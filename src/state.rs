@@ -842,6 +842,52 @@ impl AppState {
         Box::pin(self._apply_and_execute(event))
     }
 
+    /// Atomically stage a fresh managed launch and publish its effects.
+    ///
+    /// Unlike the generic event API, this exposes whether the authority
+    /// transition was accepted so a caller can avoid doing external launch
+    /// work after a concurrent restart or repair has taken ownership.
+    pub fn stage_fresh_launch(
+        self: &Arc<Self>,
+        id: &str,
+        backend: String,
+        session_start_credential: Option<String>,
+        expected_repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = crate::daemon_protocol::StageFreshLaunchOutcome>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(self._stage_fresh_launch(
+            id.to_owned(),
+            backend,
+            session_start_credential,
+            expected_repair_reservation,
+        ))
+    }
+
+    async fn _stage_fresh_launch(
+        self: &Arc<Self>,
+        id: String,
+        backend: String,
+        session_start_credential: Option<String>,
+        expected_repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
+    ) -> crate::daemon_protocol::StageFreshLaunchOutcome {
+        let result = {
+            let mut state = self.protocol.write().await;
+            state.stage_fresh_launch(
+                &id,
+                backend,
+                session_start_credential,
+                expected_repair_reservation,
+            )
+        };
+        self.execute_effects(&result.effects).await;
+        result.outcome
+    }
+
     async fn _apply_and_execute(
         self: &Arc<Self>,
         event: crate::daemon_protocol::Event,
