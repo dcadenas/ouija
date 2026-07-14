@@ -1872,29 +1872,39 @@ pub async fn start_session(
             // its complete, credentialed session record visible before the
             // backend command is sent so that hook cannot auto-register a
             // competing session or observe an uncredentialed slot.
-            if let Some(session_start_credential) = session_start_credential.clone() {
-                let proto_meta = crate::daemon_protocol::SessionMeta {
-                    project_dir: Some(dir.clone()),
-                    worktree,
-                    backend: Some(backend_name.clone()),
-                    session_start_credential: Some(session_start_credential),
-                    model: model.map(String::from),
-                    effort: effort.map(String::from),
-                    codex_home: launch_model.codex_home.clone(),
-                    reminder: reminder.map(String::from),
-                    parent_session: parent_session.map(String::from),
-                    idle_policy: idle_policy.clone(),
-                    prompt: prompt.map(String::from),
-                    ..Default::default()
+            let staged_incarnation =
+                if let Some(session_start_credential) = session_start_credential.clone() {
+                    let proto_meta = crate::daemon_protocol::SessionMeta {
+                        project_dir: Some(dir.clone()),
+                        worktree,
+                        backend: Some(backend_name.clone()),
+                        session_start_credential: Some(session_start_credential),
+                        model: model.map(String::from),
+                        effort: effort.map(String::from),
+                        codex_home: launch_model.codex_home.clone(),
+                        reminder: reminder.map(String::from),
+                        parent_session: parent_session.map(String::from),
+                        idle_policy: idle_policy.clone(),
+                        prompt: prompt.map(String::from),
+                        ..Default::default()
+                    };
+                    state
+                        .apply_and_execute(crate::daemon_protocol::Event::Register {
+                            id: name.to_string(),
+                            pane: Some(pane_id.clone()),
+                            metadata: proto_meta,
+                        })
+                        .await;
+                    state
+                        .protocol
+                        .read()
+                        .await
+                        .sessions
+                        .get(name)
+                        .map(|session| session.metadata.session_incarnation)
+                } else {
+                    None
                 };
-                state
-                    .apply_and_execute(crate::daemon_protocol::Event::Register {
-                        id: name.to_string(),
-                        pane: Some(pane_id.clone()),
-                        metadata: proto_meta,
-                    })
-                    .await;
-            }
 
             let pane_for_launch = pane_id.clone();
             let command = if is_http_api {
@@ -1962,22 +1972,7 @@ pub async fn start_session(
                 );
             };
 
-            let (backend_session_id, pending_session_start_credential) =
-                if session_start_credential.is_some() {
-                    let proto = state.protocol.read().await;
-                    proto
-                        .sessions
-                        .get(name)
-                        .map(|session| {
-                            (
-                                session.metadata.backend_session_id.clone(),
-                                session.metadata.session_start_credential.clone(),
-                            )
-                        })
-                        .unwrap_or((None, session_start_credential.clone()))
-                } else {
-                    (backend_session_id, None)
-                };
+            let pending_session_start_credential = session_start_credential.clone();
             let oc_session_id = backend_session_id.clone();
             let proto_meta = crate::daemon_protocol::SessionMeta {
                 project_dir: Some(dir.clone()),
@@ -1995,13 +1990,21 @@ pub async fn start_session(
                 prompt: prompt.map(String::from),
                 ..Default::default()
             };
-            state
-                .apply_and_execute(crate::daemon_protocol::Event::Register {
+            let final_registration = match staged_incarnation {
+                Some(expected_incarnation) => {
+                    crate::daemon_protocol::Event::RefreshLaunchMetadata {
+                        id: name.to_string(),
+                        expected_incarnation,
+                        metadata: proto_meta,
+                    }
+                }
+                None => crate::daemon_protocol::Event::Register {
                     id: name.to_string(),
                     pane: registration_pane,
                     metadata: proto_meta,
-                })
-                .await;
+                },
+            };
+            state.apply_and_execute(final_registration).await;
             let prompt_delivery = pre_queued_prompt
                 .as_ref()
                 .map(|_| start_prompt_delivery(is_http_api, oc_session_id.as_deref()));
@@ -2845,7 +2848,7 @@ pub async fn restart_session(
                 },
             };
             let refresh = match prev_metadata.as_ref() {
-                Some(previous) => crate::daemon_protocol::Event::RefreshRestartMetadata {
+                Some(previous) => crate::daemon_protocol::Event::RefreshLaunchMetadata {
                     id: name.to_string(),
                     expected_incarnation: staged_incarnation
                         .unwrap_or(previous.session_incarnation),

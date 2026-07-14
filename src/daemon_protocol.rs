@@ -525,11 +525,11 @@ pub enum Event {
         expected_backend_session_id: Option<String>,
         metadata: SessionMeta,
     },
-    /// Refresh a restarted session only when the caller still owns the same
+    /// Refresh a launched session only when the caller still owns the same
     /// registration incarnation. This prevents a delayed final refresh from
     /// overwriting a SessionStart backend bind that has already consumed its
     /// launch credential.
-    RefreshRestartMetadata {
+    RefreshLaunchMetadata {
         id: String,
         expected_incarnation: i64,
         metadata: SessionMeta,
@@ -1249,11 +1249,11 @@ impl DaemonState {
             } => {
                 self.apply_register_if_pane_unbound(id, pane, expected_backend_session_id, metadata)
             }
-            Event::RefreshRestartMetadata {
+            Event::RefreshLaunchMetadata {
                 id,
                 expected_incarnation,
                 metadata,
-            } => self.apply_refresh_restart_metadata(id, expected_incarnation, metadata),
+            } => self.apply_refresh_launch_metadata(id, expected_incarnation, metadata),
             Event::Rename { old_id, new_id } => self.apply_rename(&old_id, &new_id),
             Event::Remove { id, keep_worktree } => self.apply_remove(&id, keep_worktree),
             Event::RollbackProvisionalRegistration {
@@ -1494,7 +1494,7 @@ impl DaemonState {
         effects
     }
 
-    fn apply_refresh_restart_metadata(
+    fn apply_refresh_launch_metadata(
         &mut self,
         id: String,
         expected_incarnation: i64,
@@ -7258,6 +7258,47 @@ mod tests {
         );
         let metadata = &state.sessions["codex"].metadata;
         assert_eq!(metadata.backend_session_id.as_deref(), Some("thread-1"));
+        assert!(metadata.session_start_credential.is_none());
+    }
+
+    #[test]
+    fn fresh_start_final_refresh_preserves_concurrent_session_start_binding() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "codex".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                session_start_credential: Some("credential".into()),
+                ..Default::default()
+            },
+        });
+        let staged_incarnation = state.sessions["codex"].metadata.session_incarnation;
+
+        state.apply(Event::AdoptBackend {
+            id: "codex".into(),
+            backend: "codex-cli".into(),
+            backend_session_id: "thread-bound".into(),
+            expected_backend_session_id: None,
+            expected_session_start_credential: Some("credential".into()),
+        });
+
+        state.apply(Event::RefreshLaunchMetadata {
+            id: "codex".into(),
+            expected_incarnation: staged_incarnation,
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                session_start_credential: Some("credential".into()),
+                ..Default::default()
+            },
+        });
+
+        let metadata = &state.sessions["codex"].metadata;
+        assert_eq!(
+            metadata.backend_session_id.as_deref(),
+            Some("thread-bound"),
+            "finalization must not revert a binding that won after staging incarnation {staged_incarnation}"
+        );
         assert!(metadata.session_start_credential.is_none());
     }
 
