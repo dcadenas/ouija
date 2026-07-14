@@ -592,13 +592,18 @@ pub enum Event {
         previous: Option<SessionEntry>,
     },
     /// Invert an accepted fresh-launch stage only when the failed launch still
-    /// owns its pane, credential, and exact staged incarnation.
+    /// owns its exact optional pane, credential, and staged incarnation.
+    ///
+    /// If no prior entry exists, terminalize the exact pending stage instead.
+    /// `provisional_pane` is a distinct inert fallback pane to remove only
+    /// after the guarded state transition succeeds.
     RollbackFreshLaunch {
         id: String,
-        pane: String,
-        credential: String,
+        pane: Option<String>,
+        credential: Option<String>,
         staged_incarnation: i64,
-        previous: SessionEntry,
+        previous: Option<SessionEntry>,
+        provisional_pane: Option<String>,
     },
     /// Remove a local session ONLY if its `worktree_present` is `Some(false)`.
     ///
@@ -1338,12 +1343,14 @@ impl DaemonState {
                 credential,
                 staged_incarnation,
                 previous,
+                provisional_pane,
             } => self.apply_rollback_fresh_launch(
                 &id,
-                &pane,
-                &credential,
+                pane.as_deref(),
+                credential.as_deref(),
                 staged_incarnation,
                 previous,
+                provisional_pane.as_deref(),
             ),
             Event::RemoveIfStale {
                 id,
@@ -2142,26 +2149,41 @@ impl DaemonState {
     fn apply_rollback_fresh_launch(
         &mut self,
         id: &str,
-        pane: &str,
-        credential: &str,
+        pane: Option<&str>,
+        credential: Option<&str>,
         staged_incarnation: i64,
-        previous: SessionEntry,
+        previous: Option<SessionEntry>,
+        provisional_pane: Option<&str>,
     ) -> Vec<Effect> {
         let still_staged = self.sessions.get(id).is_some_and(|session| {
             matches!(session.origin, Origin::Local)
-                && session.pane.as_deref() == Some(pane)
-                && session.metadata.session_start_credential.as_deref() == Some(credential)
+                && session.pane.as_deref() == pane
+                && session.metadata.session_start_credential.as_deref() == credential
                 && session.metadata.session_incarnation == staged_incarnation
         });
-        if !still_staged || previous.id != id {
+        if !still_staged || previous.as_ref().is_some_and(|previous| previous.id != id) {
             return vec![];
         }
 
-        let networked = previous.metadata.networked;
-        self.sessions.insert(id.to_string(), previous);
-        let mut effects = vec![Effect::Persist];
-        if networked {
-            effects.push(Effect::BroadcastSessionList);
+        let restore_pane = previous.as_ref().and_then(|previous| previous.pane.clone());
+        let mut effects = match previous {
+            Some(previous) => {
+                let networked = previous.metadata.networked;
+                self.sessions.insert(id.to_string(), previous);
+                let mut effects = vec![Effect::Persist];
+                if networked {
+                    effects.push(Effect::BroadcastSessionList);
+                }
+                effects
+            }
+            None => self.apply_remove(id, true),
+        };
+        if let Some(provisional_pane) = provisional_pane
+            && restore_pane.as_deref() != Some(provisional_pane)
+        {
+            effects.push(Effect::ProvisionalRollbackOk {
+                pane: provisional_pane.to_string(),
+            });
         }
         effects
     }
@@ -7659,6 +7681,74 @@ mod tests {
             metadata: SessionMeta::default(),
         });
         assert_eq!(state.sessions["codex"].pane.as_deref(), Some("%new"));
+    }
+
+    #[test]
+    fn rollback_fresh_launch_restores_paneless_non_codex_stage_and_cleans_fallback_pane() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "legacy".into(),
+            pane: None,
+            metadata: SessionMeta {
+                backend: Some("claude-code".into()),
+                backend_session_id: Some("old-thread".into()),
+                ..Default::default()
+            },
+        });
+        let previous = state.sessions["legacy"].clone();
+        state.apply(Event::StageFreshLaunch {
+            id: "legacy".into(),
+            backend: "claude-code".into(),
+            session_start_credential: None,
+            expected_repair_reservation: None,
+        });
+        state.apply(Event::Register {
+            id: "legacy".into(),
+            pane: Some("%fallback".into()),
+            metadata: state.sessions["legacy"].metadata.clone(),
+        });
+        let staged_incarnation = state.sessions["legacy"].metadata.session_incarnation;
+
+        let effects = state.apply(Event::RollbackFreshLaunch {
+            id: "legacy".into(),
+            pane: Some("%fallback".into()),
+            credential: None,
+            staged_incarnation,
+            previous: Some(previous.clone()),
+            provisional_pane: Some("%fallback".into()),
+        });
+
+        assert_eq!(state.sessions["legacy"], previous);
+        assert!(effects.iter().any(
+            |effect| matches!(effect, Effect::ProvisionalRollbackOk { pane } if pane == "%fallback")
+        ));
+    }
+
+    #[test]
+    fn rollback_fresh_launch_terminalizes_only_the_exact_pending_stage() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "ephemeral".into(),
+            pane: Some("%fallback".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                session_start_credential: Some("proof".into()),
+                session_incarnation: 42,
+                ..Default::default()
+            },
+        });
+        let staged_incarnation = state.sessions["ephemeral"].metadata.session_incarnation;
+
+        state.apply(Event::RollbackFreshLaunch {
+            id: "ephemeral".into(),
+            pane: Some("%fallback".into()),
+            credential: Some("proof".into()),
+            staged_incarnation,
+            previous: None,
+            provisional_pane: Some("%fallback".into()),
+        });
+
+        assert!(!state.sessions.contains_key("ephemeral"));
     }
 
     #[test]
