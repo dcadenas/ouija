@@ -2170,6 +2170,7 @@ pub async fn restart_session(
     // Snapshot full metadata before killing so we can carry it forward
     let session = state.protocol.read().await.sessions.get(name).cloned();
     let prev_metadata = session.as_ref().map(|s| s.metadata.clone());
+    let mut staged_incarnation = prev_metadata.as_ref().map(|m| m.session_incarnation);
 
     // Capture existing pane before killing
     let existing_pane = session.as_ref().and_then(|s| s.pane.clone());
@@ -2449,6 +2450,13 @@ pub async fn restart_session(
                     metadata,
                 })
                 .await;
+            staged_incarnation = state
+                .protocol
+                .read()
+                .await
+                .sessions
+                .get(name)
+                .map(|session| session.metadata.session_incarnation);
         }
     }
 
@@ -2597,6 +2605,13 @@ pub async fn restart_session(
                             metadata,
                         })
                         .await;
+                    staged_incarnation = state
+                        .protocol
+                        .read()
+                        .await
+                        .sessions
+                        .get(name)
+                        .map(|session| session.metadata.session_incarnation);
                 }
 
                 let pane_for_launch = pane_id.clone();
@@ -2832,7 +2847,8 @@ pub async fn restart_session(
             let refresh = match prev_metadata.as_ref() {
                 Some(previous) => crate::daemon_protocol::Event::RefreshRestartMetadata {
                     id: name.to_string(),
-                    expected_incarnation: previous.session_incarnation,
+                    expected_incarnation: staged_incarnation
+                        .unwrap_or(previous.session_incarnation),
                     metadata: proto_meta,
                 },
                 None => crate::daemon_protocol::Event::Register {
