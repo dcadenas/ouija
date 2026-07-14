@@ -3421,6 +3421,76 @@ enum RepairRestartOutcome {
     Superseded,
 }
 
+/// Release a repair reservation only when this failed launch is the one that
+/// reserved it. A failure can happen before `StageFreshLaunch` advances the
+/// generation, or after staging has changed the reservation's phase, so phase
+/// is intentionally not part of the identity comparison.
+fn terminalize_failed_repair_reservation(
+    session: &mut crate::daemon_protocol::SessionEntry,
+    expected: &crate::daemon_protocol::BackendRepairReservation,
+) -> bool {
+    let matches_failed_launch = session
+        .metadata
+        .backend_repair_reservation
+        .as_ref()
+        .is_some_and(|actual| {
+            actual.original_incarnation == expected.original_incarnation
+                && actual.restart_generation == expected.restart_generation
+                && matches!(
+                    actual.phase,
+                    crate::daemon_protocol::BackendRepairPhase::PreStage
+                        | crate::daemon_protocol::BackendRepairPhase::Staged
+                )
+        });
+    if matches_failed_launch {
+        session.metadata.backend_repair_reservation = None;
+    }
+    matches_failed_launch
+}
+
+fn classify_repair_restart_outcome(
+    session: Option<&mut crate::daemon_protocol::SessionEntry>,
+    reservation: &crate::daemon_protocol::BackendRepairReservation,
+    restart_outcome: crate::nostr_transport::RestartOutcome,
+) -> RepairRestartOutcome {
+    match session {
+        None => RepairRestartOutcome::Superseded,
+        Some(session) if restart_outcome == crate::nostr_transport::RestartOutcome::Failed => {
+            if terminalize_failed_repair_reservation(session, reservation) {
+                // This must happen before generation/phase supersession
+                // checks: a pre-stage failure still has the old generation.
+                RepairRestartOutcome::RestartFailed
+            } else if session.metadata.backend_repair_reservation.is_none()
+                && session.metadata.backend.is_some()
+                && session.metadata.backend_session_id.is_some()
+            {
+                RepairRestartOutcome::Bound
+            } else {
+                RepairRestartOutcome::Superseded
+            }
+        }
+        Some(session) if session.metadata.restart_generation != reservation.restart_generation => {
+            RepairRestartOutcome::Superseded
+        }
+        Some(session)
+            if session.metadata.backend_repair_reservation.is_none()
+                && session.metadata.backend.is_some()
+                && session.metadata.backend_session_id.is_some() =>
+        {
+            RepairRestartOutcome::Bound
+        }
+        Some(session)
+            if session.metadata.backend_repair_reservation.as_ref() != Some(reservation) =>
+        {
+            RepairRestartOutcome::Superseded
+        }
+        Some(session) if session.metadata.session_start_credential.is_some() => {
+            RepairRestartOutcome::SessionStartPending
+        }
+        Some(_) => RepairRestartOutcome::Inconclusive,
+    }
+}
+
 pub async fn repair_backend_identity(
     State(state): State<SharedState>,
     Json(body): Json<BackendIdentityRepairRequest>,
@@ -3513,38 +3583,11 @@ pub async fn repair_backend_identity(
         )
         .await;
         let mut protocol = state_for_restart.protocol.write().await;
-        let repair_outcome = match protocol.sessions.get_mut(&session_id) {
-            None => RepairRestartOutcome::Superseded,
-            Some(session)
-                if session.metadata.restart_generation != reservation.restart_generation =>
-            {
-                RepairRestartOutcome::Superseded
-            }
-            Some(session)
-                if session.metadata.backend_repair_reservation.is_none()
-                    && session.metadata.backend.is_some()
-                    && session.metadata.backend_session_id.is_some() =>
-            {
-                RepairRestartOutcome::Bound
-            }
-            Some(session)
-                if session.metadata.backend_repair_reservation.as_ref()
-                    != Some(&reservation_for_restart) =>
-            {
-                RepairRestartOutcome::Superseded
-            }
-            Some(session) if restart_outcome == crate::nostr_transport::RestartOutcome::Failed => {
-                // This is the only clearing path outside an atomic bind/final
-                // commit: the failure is definite and still belongs to this
-                // reservation's staged generation.
-                session.metadata.backend_repair_reservation = None;
-                RepairRestartOutcome::RestartFailed
-            }
-            Some(session) if session.metadata.session_start_credential.is_some() => {
-                RepairRestartOutcome::SessionStartPending
-            }
-            Some(_) => RepairRestartOutcome::Inconclusive,
-        };
+        let repair_outcome = classify_repair_restart_outcome(
+            protocol.sessions.get_mut(&session_id),
+            &reservation_for_restart,
+            restart_outcome,
+        );
         tracing::info!(session = %session_id, backend = %backend_for_restart, %result, ?restart_outcome, ?repair_outcome, "legacy backend repair fresh relaunch completed");
     });
     (
@@ -4663,6 +4706,124 @@ mod tests {
         let (status, Json(body)) = repair_backend_identity(State(state), Json(request)).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["outcome"], "repair_in_progress");
+    }
+
+    async fn failed_repair_reservation_can_retry(
+        stage_before_failure: bool,
+    ) -> crate::daemon_protocol::BackendRepairPhase {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "legacy".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let first_reservation = {
+            let mut protocol = state.protocol.write().await;
+            let session = protocol.sessions.get_mut("legacy").unwrap();
+            let reservation = crate::daemon_protocol::BackendRepairReservation {
+                original_incarnation: session.metadata.session_incarnation,
+                restart_generation: session.metadata.restart_generation.saturating_add(1),
+                phase: crate::daemon_protocol::BackendRepairPhase::PreStage,
+            };
+            session.metadata.backend_repair_reservation = Some(reservation.clone());
+            reservation
+        };
+        if stage_before_failure {
+            let effects = {
+                let mut protocol = state.protocol.write().await;
+                protocol.apply(crate::daemon_protocol::Event::StageFreshLaunch {
+                    id: "legacy".into(),
+                    backend: "codex-cli".into(),
+                    session_start_credential: Some("failed-proof".into()),
+                    expected_repair_reservation: Some(first_reservation.clone()),
+                })
+            };
+            assert!(!effects.is_empty(), "the first launch must stage");
+        }
+
+        let failed_phase = {
+            let mut protocol = state.protocol.write().await;
+            let session = protocol.sessions.get_mut("legacy").unwrap();
+            let phase = session
+                .metadata
+                .backend_repair_reservation
+                .as_ref()
+                .unwrap()
+                .phase;
+            assert_eq!(
+                classify_repair_restart_outcome(
+                    Some(&mut *session),
+                    &first_reservation,
+                    crate::nostr_transport::RestartOutcome::Failed,
+                ),
+                RepairRestartOutcome::RestartFailed
+            );
+            assert!(session.metadata.backend_repair_reservation.is_none());
+            phase
+        };
+
+        let retry = {
+            let mut protocol = state.protocol.write().await;
+            let session = protocol.sessions.get_mut("legacy").unwrap();
+            let retry = crate::daemon_protocol::BackendRepairReservation {
+                original_incarnation: session.metadata.session_incarnation,
+                restart_generation: session.metadata.restart_generation.saturating_add(1),
+                phase: crate::daemon_protocol::BackendRepairPhase::PreStage,
+            };
+            session.metadata.backend_repair_reservation = Some(retry.clone());
+            retry
+        };
+        let bound = {
+            let mut protocol = state.protocol.write().await;
+            let effects = protocol.apply(crate::daemon_protocol::Event::StageFreshLaunch {
+                id: "legacy".into(),
+                backend: "codex-cli".into(),
+                session_start_credential: Some("retry-proof".into()),
+                expected_repair_reservation: Some(retry),
+            });
+            assert!(!effects.is_empty(), "the retry must stage");
+            protocol.bind_backend_identity(
+                "legacy",
+                &crate::backend::BackendSessionIdentity {
+                    backend: "codex-cli".into(),
+                    session_id: "retry-thread".into(),
+                },
+                Some("retry-proof"),
+            )
+        };
+        assert!(matches!(
+            bound.outcome,
+            crate::daemon_protocol::BackendIdentityBindOutcome::Bound { .. }
+        ));
+        assert!(
+            state.protocol.read().await.sessions["legacy"]
+                .metadata
+                .backend_repair_reservation
+                .is_none()
+        );
+        failed_phase
+    }
+
+    #[tokio::test]
+    async fn pre_stage_failed_repair_clears_its_reservation_and_allows_retry() {
+        assert_eq!(
+            failed_repair_reservation_can_retry(false).await,
+            crate::daemon_protocol::BackendRepairPhase::PreStage
+        );
+    }
+
+    #[tokio::test]
+    async fn post_stage_failed_repair_clears_its_reservation_and_allows_retry() {
+        assert_eq!(
+            failed_repair_reservation_can_retry(true).await,
+            crate::daemon_protocol::BackendRepairPhase::Staged
+        );
     }
 
     fn pending_prompt(pane_id: &str, prompt: &str) -> crate::state::PendingPrompt {
