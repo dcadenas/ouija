@@ -393,11 +393,6 @@ async fn session_start_inner(
     state: &std::sync::Arc<crate::state::AppState>,
     body: SessionStartBody,
 ) -> Value {
-    // Check auto_register
-    if !state.settings.read().await.auto_register {
-        return json!({ "skipped": "auto_register disabled", "output": "" });
-    }
-
     // A complete managed proof is sufficient to select the atomic bind path.
     // An app-server can inherit an unrelated pane, so pane/cwd may corroborate
     // ordinary registration but must never decide ownership of this launch.
@@ -444,6 +439,13 @@ async fn session_start_inner(
                 "output": "",
             }),
         };
+    }
+
+    // Uncredentialed discovery remains subject to the operator's legacy
+    // auto-registration policy. A managed proof above is already sufficient
+    // authorization and must not be blocked by this discovery setting.
+    if !state.settings.read().await.auto_register {
+        return json!({ "skipped": "auto_register disabled", "output": "" });
     }
 
     if body.pane.trim().is_empty() {

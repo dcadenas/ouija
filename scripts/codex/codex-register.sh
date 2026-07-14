@@ -45,10 +45,15 @@ CWD=$(printf '%s' "$PAYLOAD" | jq -r '.cwd // empty' 2>/dev/null)
 # started it. Do not let that unrelated pane claim this SessionStart payload.
 # The daemon repeats this check with project-root normalization; this raw path
 # comparison is an early defense that avoids POSTing the obvious mismatch.
-PANE_CWD=$(tmux display-message -p -t "$PANE" '#{pane_current_path}' 2>/dev/null)
-[ -n "$PANE" ] && [ -n "$PANE_CWD" ] && [ "$PANE_CWD" != "$CWD" ] && exit 0
 BACKEND_SESSION_ID=$(printf '%s' "$PAYLOAD" | jq -r '.session_id // empty' 2>/dev/null)
 [ -z "$BACKEND_SESSION_ID" ] && BACKEND_SESSION_ID="${CODEX_THREAD_ID:-}"
+PANE_CWD=$(tmux display-message -p -t "$PANE" '#{pane_current_path}' 2>/dev/null)
+# A complete managed proof authorizes the named launch; inherited pane/CWD
+# state is not allowed to suppress that claim. Legacy registration still keeps
+# the pane check below.
+if [ -z "$LAUNCH_SESSION_ID" ] || [ -z "$LAUNCH_CREDENTIAL" ] || [ -z "$BACKEND_SESSION_ID" ]; then
+  [ -n "$PANE" ] && [ -n "$PANE_CWD" ] && [ "$PANE_CWD" != "$CWD" ] && exit 0
+fi
 RESP=$(curl -sf -X POST "http://localhost:${OUIJA_PORT:-7880}/api/hooks/session-start" \
   -H "Content-Type: application/json" \
   -d "$(jq -cn --arg pane "$PANE" --arg cwd "$CWD" --arg backend_session_id "$BACKEND_SESSION_ID" --arg adapter "codex-cli" --arg launch_session_id "$LAUNCH_SESSION_ID" --arg launch_credential "$LAUNCH_CREDENTIAL" \
