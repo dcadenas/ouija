@@ -683,6 +683,14 @@ async fn respawn_and_inject(
         ) {
             Ok(command) => command,
             Err(error) => {
+                rollback_credential_staging_failure(
+                    state,
+                    task.session_name(),
+                    &pane_id,
+                    credential,
+                    prior_session.as_ref(),
+                )
+                .await;
                 return TaskRun::failed(
                     task,
                     format!("could not stage Codex launch credential: {error}"),
@@ -1181,6 +1189,19 @@ async fn rollback_provisional_revival(
             },
         )
         .await;
+}
+
+/// Restore a session when preparing its SessionStart hook fails before the
+/// replacement pane launches. The pending credential was registered first, so
+/// this must use the same guarded rollback as a failed pane respawn.
+async fn rollback_credential_staging_failure(
+    state: &SharedState,
+    session_id: &str,
+    pane_id: &str,
+    credential: &str,
+    prior_session: Option<&crate::daemon_protocol::SessionEntry>,
+) {
+    rollback_provisional_revival(state, session_id, pane_id, Some(credential), prior_session).await;
 }
 
 struct RevivedSessionSnapshot<'a> {
@@ -1819,5 +1840,50 @@ mod tests {
             restored.metadata.backend_session_id.as_deref(),
             Some("thread-old")
         );
+    }
+
+    #[tokio::test]
+    async fn credential_staging_failure_restores_existing_session_binding() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "scheduled".into(),
+                pane: Some("%existing".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    backend_session_id: Some("thread-old".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let previous = state.protocol.read().await.sessions["scheduled"].clone();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "scheduled".into(),
+                pane: Some("%staged".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    session_start_credential: Some("credential".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        rollback_credential_staging_failure(
+            &state,
+            "scheduled",
+            "%staged",
+            "credential",
+            Some(&previous),
+        )
+        .await;
+
+        let restored = state.protocol.read().await.sessions["scheduled"].clone();
+        assert_eq!(restored.pane.as_deref(), Some("%existing"));
+        assert_eq!(
+            restored.metadata.backend_session_id.as_deref(),
+            Some("thread-old")
+        );
+        assert_eq!(restored.metadata.session_start_credential, None);
     }
 }
