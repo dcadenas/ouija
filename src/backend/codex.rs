@@ -425,7 +425,9 @@ fn format_codex_home_prefix(codex_home: Option<&str>) -> String {
     }
 }
 
-const SESSION_FLAGS_HOOK_KEY: &str = "<session-flags>/config.toml:session_start:0:0";
+// Codex reports this generated session-flags source with a leading slash. The
+// trusted state key must match it byte-for-byte or the hook is suppressed.
+const SESSION_FLAGS_HOOK_KEY: &str = "/<session-flags>/config.toml:session_start:0:0";
 
 /// Build the two session-flags overrides for a fresh managed Codex launch.
 ///
@@ -752,9 +754,9 @@ mod tests {
         );
         assert!(
             flags.contains(
-                "hooks.state.\"<session-flags>/config.toml:session_start:0:0\".trusted_hash="
+                "hooks.state.\"/<session-flags>/config.toml:session_start:0:0\".trusted_hash="
             ),
-            "session-flags hook needs its exact trusted hash: {flags}"
+            "session-flags hook needs Codex's exact trusted state key: {flags}"
         );
         assert!(
             !flags.contains("CODEX_THREAD_ID"),
@@ -1204,19 +1206,27 @@ mod tests {
         // Supplies the backend-native identity through the generic hook field.
         assert!(s.contains(".session_id"), "{s}");
         assert!(s.contains("backend_session_id"), "{s}");
-        // The installed adapter identifies itself and forwards the managed
-        // launch identity stamped into the pane by Ouija.
+        // A globally installed static hook runs in a shared app-server process.
+        // It must never treat that process's inherited launch variables as
+        // managed proof for the payload thread.
         assert!(s.contains("--arg adapter \"codex-cli\""), "{s}");
         assert!(s.contains("launch_session_id"), "{s}");
-        assert!(s.contains("${OUIJA_SESSION_ID:-}"), "{s}");
         assert!(s.contains("launch_credential"), "{s}");
-        assert!(s.contains("${OUIJA_SESSION_START_CREDENTIAL:-}"), "{s}");
+        assert!(
+            s.contains("LAUNCH_SESSION_ID=\"\"") && s.contains("LAUNCH_CREDENTIAL=\"\""),
+            "static hook must initialize managed proof empty: {s}"
+        );
+        assert!(
+            !s.contains("${OUIJA_SESSION_ID:-}")
+                && !s.contains("${OUIJA_SESSION_START_CREDENTIAL:-}"),
+            "ambient launch variables must never become managed proof: {s}"
+        );
         assert!(
             s.contains("--launch-session-id") && s.contains("--launch-credential-file"),
             "the per-launch SessionFlags hook must receive its proof by private file: {s}"
         );
         assert!(
-            s.contains("mv -- \"$LAUNCH_CREDENTIAL_FILE\"")
+            s.contains("mv -- \"$EXPLICIT_LAUNCH_CREDENTIAL_FILE\"")
                 && s.contains("rm -f -- \"$CLAIMED_CREDENTIAL_FILE\""),
             "the hook must atomically claim then remove the one-shot credential file: {s}"
         );

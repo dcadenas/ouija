@@ -210,12 +210,13 @@ the app server was started for A; ambient variables are not evidence that the
 hook belongs to the payload's thread.
 
 Codex listed the static hook first (source `user`, `hooks.json`) and the
-launch-specific configuration second (source `sessionFlags`). In this direct
-app-server probe, the session-flags hook was not run because Codex reported its
-trust key as `/<session-flags>/config.toml:session_start:0:0`, while this
-branch's generated state key omitted the leading slash. The static executions
-therefore establish the observed ordering; the cross-source execution order
-must be rechecked after the launch-specific trust key is corrected.
+launch-specific configuration second (source `sessionFlags`). The original
+direct app-server probe did not run the session-flags hook because Codex
+reported its trust key as `/<session-flags>/config.toml:session_start:0:0`,
+while the generated state key omitted the leading slash. Ouija now emits that
+exact leading-slash key and locks it with a focused backend test; rerun this
+shared-app-server probe when upgrading Codex because hook source ordering is
+runtime behavior.
 
 The resulting proof boundary is deliberate: the globally installed static hook
 must start with no managed proof and may use only the legacy pane/CWD path.
