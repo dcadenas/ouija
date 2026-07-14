@@ -420,7 +420,7 @@ pub struct SessionMetadata {
     pub restart_generation: u64,
     /// In-memory legacy-repair reservation mirrored from protocol metadata.
     #[serde(default, skip_serializing, skip_deserializing)]
-    pub backend_repair_reservation: Option<u64>,
+    pub backend_repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
     /// Per-registration token used to reject stale async commits.
     #[serde(default)]
     pub session_incarnation: i64,
@@ -1166,6 +1166,7 @@ impl AppState {
                             &state,
                             &name,
                             fresh,
+                            None,
                             prompt.as_deref(),
                             from.as_deref(),
                             expects_reply,
@@ -1418,7 +1419,7 @@ impl AppState {
                         backend: m.backend.clone(),
                         opencode_binding: m.opencode_binding.clone(),
                         restart_generation: m.restart_generation,
-                        backend_repair_reservation: m.backend_repair_reservation,
+                        backend_repair_reservation: m.backend_repair_reservation.clone(),
                         session_incarnation: m.session_incarnation,
                         project_description: m.project_description.clone(),
                         bulletin: m.bulletin.clone(),

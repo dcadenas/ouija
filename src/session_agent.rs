@@ -495,6 +495,7 @@ impl SessionAgent {
                 &app_state,
                 &sid,
                 true,
+                None,
                 Some(prompt.as_str()),
                 None,
                 None,

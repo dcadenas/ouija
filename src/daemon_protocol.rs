@@ -112,7 +112,7 @@ pub struct SessionMeta {
     /// is deliberately lost on daemon restart, which fails unfinished repair
     /// closed rather than reviving authority from persisted state.
     #[serde(default, skip_serializing, skip_deserializing)]
-    pub backend_repair_reservation: Option<u64>,
+    pub backend_repair_reservation: Option<BackendRepairReservation>,
     /// Strength of an OpenCode backend-session binding.
     ///
     /// `None` is treated as weak for backward compatibility with adopted
@@ -203,6 +203,22 @@ pub struct SessionMeta {
     /// `project_dir` lives on another machine and is not locally checkable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_present: Option<bool>,
+}
+
+/// In-memory authority for one explicit legacy-backend repair. The phase
+/// makes a worker's pre-tmux and post-stage rights distinct, while the
+/// original incarnation prevents an old worker from acting on a recreated ID.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BackendRepairReservation {
+    pub original_incarnation: i64,
+    pub restart_generation: u64,
+    pub phase: BackendRepairPhase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BackendRepairPhase {
+    PreStage,
+    Staged,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -532,6 +548,7 @@ pub enum Event {
         id: String,
         backend: String,
         session_start_credential: Option<String>,
+        expected_repair_reservation: Option<BackendRepairReservation>,
     },
     /// Refresh a launched session only when the caller still owns the same
     /// registration incarnation. This prevents a delayed final refresh from
@@ -933,7 +950,7 @@ pub(crate) fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>
             backend_session_id: m.backend_session_id.clone(),
             backend: m.backend.clone(),
             session_start_credential: None,
-            backend_repair_reservation: m.backend_repair_reservation,
+            backend_repair_reservation: m.backend_repair_reservation.clone(),
             opencode_binding: m.opencode_binding.clone(),
             restart_generation: m.restart_generation,
             session_incarnation: m.session_incarnation,
@@ -1262,7 +1279,13 @@ impl DaemonState {
                 id,
                 backend,
                 session_start_credential,
-            } => self.apply_stage_fresh_launch(id, backend, session_start_credential),
+                expected_repair_reservation,
+            } => self.apply_stage_fresh_launch(
+                id,
+                backend,
+                session_start_credential,
+                expected_repair_reservation,
+            ),
             Event::RefreshLaunchMetadata {
                 id,
                 expected_incarnation,
@@ -1571,12 +1594,26 @@ impl DaemonState {
         id: String,
         backend: String,
         session_start_credential: Option<String>,
+        expected_repair_reservation: Option<BackendRepairReservation>,
     ) -> Vec<Effect> {
         let Some(session) = self.sessions.get_mut(&id) else {
             return vec![];
         };
         if !matches!(session.origin, Origin::Local) {
             return vec![];
+        }
+        if session.metadata.backend_repair_reservation != expected_repair_reservation {
+            return vec![];
+        }
+        if let Some(reservation) = session.metadata.backend_repair_reservation.as_mut() {
+            if reservation.phase != BackendRepairPhase::PreStage
+                || reservation.original_incarnation != session.metadata.session_incarnation
+                || reservation.restart_generation
+                    != session.metadata.restart_generation.saturating_add(1)
+            {
+                return vec![];
+            }
+            reservation.phase = BackendRepairPhase::Staged;
         }
 
         // Do this before the backend is respawned: a prior native ID belongs
@@ -1629,10 +1666,15 @@ impl DaemonState {
         // from a pre-stage snapshot, so it must not restore an already
         // completed repair reservation or roll back the generation.
         metadata.restart_generation = existing.metadata.restart_generation;
-        metadata.backend_repair_reservation = existing.metadata.backend_repair_reservation;
+        metadata.backend_repair_reservation = existing.metadata.backend_repair_reservation.clone();
         if metadata.backend.is_some()
             && metadata.backend_session_id.is_some()
-            && metadata.backend_repair_reservation == Some(metadata.restart_generation)
+            && metadata
+                .backend_repair_reservation
+                .as_ref()
+                .is_some_and(|reservation| {
+                    reservation.restart_generation == metadata.restart_generation
+                })
         {
             metadata.backend_repair_reservation = None;
         }
@@ -2360,7 +2402,14 @@ impl DaemonState {
         session.metadata.backend = Some(identity.backend.clone());
         session.metadata.backend_session_id = Some(identity.session_id.clone());
         session.metadata.session_start_credential = None;
-        if session.metadata.backend_repair_reservation == Some(session.metadata.restart_generation)
+        if session
+            .metadata
+            .backend_repair_reservation
+            .as_ref()
+            .is_some_and(|reservation| {
+                reservation.restart_generation == session.metadata.restart_generation
+                    && reservation.phase == BackendRepairPhase::Staged
+            })
         {
             session.metadata.backend_repair_reservation = None;
         }
@@ -7483,6 +7532,7 @@ mod tests {
             id: "codex".into(),
             backend: "codex-cli".into(),
             session_start_credential: Some("fresh-proof".into()),
+            expected_repair_reservation: None,
         });
         let staged_incarnation = state.sessions["codex"].metadata.session_incarnation;
         let staged = &state.sessions["codex"].metadata;
@@ -7537,7 +7587,11 @@ mod tests {
             metadata: SessionMeta {
                 backend: Some("codex-cli".into()),
                 session_start_credential: Some("repair-proof".into()),
-                backend_repair_reservation: Some(7),
+                backend_repair_reservation: Some(BackendRepairReservation {
+                    original_incarnation: 0,
+                    restart_generation: 7,
+                    phase: BackendRepairPhase::Staged,
+                }),
                 restart_generation: 7,
                 ..Default::default()
             },
@@ -7568,21 +7622,85 @@ mod tests {
             metadata: SessionMeta {
                 backend: Some("codex-cli".into()),
                 restart_generation: 6,
-                backend_repair_reservation: Some(7),
+                backend_repair_reservation: Some(BackendRepairReservation {
+                    original_incarnation: 0,
+                    restart_generation: 7,
+                    phase: BackendRepairPhase::PreStage,
+                }),
                 ..Default::default()
             },
         });
 
+        let expected_repair_reservation = {
+            let session = state.sessions.get_mut("legacy").unwrap();
+            let reservation = session
+                .metadata
+                .backend_repair_reservation
+                .as_mut()
+                .unwrap();
+            reservation.original_incarnation = session.metadata.session_incarnation;
+            reservation.clone()
+        };
         state.apply(Event::StageFreshLaunch {
             id: "legacy".into(),
             backend: "codex-cli".into(),
             session_start_credential: Some("proof".into()),
+            expected_repair_reservation: Some(expected_repair_reservation),
         });
 
         let metadata = &state.sessions["legacy"].metadata;
         assert_eq!(metadata.restart_generation, 7);
-        assert_eq!(metadata.backend_repair_reservation, Some(7));
+        assert_eq!(
+            metadata
+                .backend_repair_reservation
+                .as_ref()
+                .map(|r| r.restart_generation),
+            Some(7)
+        );
         assert_eq!(metadata.session_start_credential.as_deref(), Some("proof"));
+    }
+
+    #[test]
+    fn stale_repair_token_cannot_stage_a_recreated_session() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "legacy".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                ..Default::default()
+            },
+        });
+        let token = BackendRepairReservation {
+            original_incarnation: state.sessions["legacy"].metadata.session_incarnation,
+            restart_generation: 1,
+            phase: BackendRepairPhase::PreStage,
+        };
+        state
+            .sessions
+            .get_mut("legacy")
+            .unwrap()
+            .metadata
+            .backend_repair_reservation = Some(token.clone());
+        state.apply(Event::Remove {
+            id: "legacy".into(),
+            keep_worktree: true,
+        });
+        state.apply(Event::Register {
+            id: "legacy".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta::default(),
+        });
+
+        let effects = state.apply(Event::StageFreshLaunch {
+            id: "legacy".into(),
+            backend: "codex-cli".into(),
+            session_start_credential: Some("old-proof".into()),
+            expected_repair_reservation: Some(token),
+        });
+
+        assert!(effects.is_empty());
+        assert!(state.sessions["legacy"].metadata.backend.is_none());
     }
 
     #[test]

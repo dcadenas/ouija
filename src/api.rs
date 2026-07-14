@@ -2676,6 +2676,7 @@ pub async fn start_session(
                 &state2,
                 &body.name,
                 true, // fresh
+                None,
                 body.prompt.as_deref(),
                 body.from.as_deref(),
                 None, // expects_reply not used for session start
@@ -2758,6 +2759,7 @@ pub async fn restart_session(
         &state,
         &body.name,
         fresh,
+        None,
         body.prompt.as_deref(),
         body.from.as_deref(),
         None, // expects_reply not used for session restart
@@ -3467,8 +3469,12 @@ pub async fn repair_backend_identity(
                 "a fresh managed repair is already in progress for this session",
             )),
             Some(session) => {
-                let reservation = session.metadata.restart_generation.saturating_add(1);
-                session.metadata.backend_repair_reservation = Some(reservation);
+                let reservation = crate::daemon_protocol::BackendRepairReservation {
+                    original_incarnation: session.metadata.session_incarnation,
+                    restart_generation: session.metadata.restart_generation.saturating_add(1),
+                    phase: crate::daemon_protocol::BackendRepairPhase::PreStage,
+                };
+                session.metadata.backend_repair_reservation = Some(reservation.clone());
                 Ok(reservation)
             }
         }
@@ -3485,6 +3491,7 @@ pub async fn repair_backend_identity(
         }
     };
 
+    let reservation_for_restart = reservation.clone();
     let state_for_restart = state.clone();
     let session_id = body.session_id.clone();
     let backend_for_restart = backend.clone();
@@ -3493,6 +3500,7 @@ pub async fn repair_backend_identity(
             &state_for_restart,
             &session_id,
             true,
+            Some(reservation_for_restart.clone()),
             None,
             None,
             None,
@@ -3507,7 +3515,11 @@ pub async fn repair_backend_identity(
         let mut protocol = state_for_restart.protocol.write().await;
         let repair_outcome = match protocol.sessions.get_mut(&session_id) {
             None => RepairRestartOutcome::Superseded,
-            Some(session) if session.metadata.restart_generation != reservation => {
+            Some(session)
+                if session.metadata.restart_generation != reservation.restart_generation
+                    || session.metadata.backend_repair_reservation.as_ref()
+                        != Some(&reservation_for_restart) =>
+            {
                 RepairRestartOutcome::Superseded
             }
             Some(session)
@@ -3516,9 +3528,6 @@ pub async fn repair_backend_identity(
                     && session.metadata.backend_session_id.is_some() =>
             {
                 RepairRestartOutcome::Bound
-            }
-            Some(session) if session.metadata.backend_repair_reservation != Some(reservation) => {
-                RepairRestartOutcome::Superseded
             }
             Some(session) if restart_outcome == crate::nostr_transport::RestartOutcome::Failed => {
                 // This is the only clearing path outside an atomic bind/final
@@ -3540,7 +3549,7 @@ pub async fn repair_backend_identity(
             "outcome": "fresh_relaunch_started",
             "session_id": body.session_id,
             "backend": backend,
-            "repair_reservation": reservation
+            "repair_reservation": reservation.restart_generation
         })),
     )
 }
@@ -8910,6 +8919,7 @@ mod tests {
                 id: "candidate".into(),
                 backend: "codex-cli".into(),
                 session_start_credential: Some("fresh-proof".into()),
+                expected_repair_reservation: None,
             })
             .await;
 

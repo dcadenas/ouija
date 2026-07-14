@@ -1330,6 +1330,7 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
             None,
             None,
             None,
+            None,
             ParentSessionOverride::PreservePrevious,
             None,
         )
@@ -2162,6 +2163,7 @@ pub async fn start_session(
 pub enum RestartOutcome {
     Restarted,
     Failed,
+    Superseded,
 }
 
 /// Kill and restart a session, preserving metadata unless `fresh`.
@@ -2170,6 +2172,7 @@ pub async fn restart_session(
     state: &std::sync::Arc<AppState>,
     name: &str,
     fresh: bool,
+    repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
     prompt: Option<&str>,
     from: Option<&str>,
     expects_reply: Option<bool>,
@@ -2183,6 +2186,19 @@ pub async fn restart_session(
     // Snapshot full metadata before killing so we can carry it forward
     let session = state.protocol.read().await.sessions.get(name).cloned();
     let prev_metadata = session.as_ref().map(|s| s.metadata.clone());
+    if let Some(expected) = repair_reservation.as_ref()
+        && !session.as_ref().is_some_and(|session| {
+            session.metadata.backend_repair_reservation.as_ref() == Some(expected)
+                && expected.phase == crate::daemon_protocol::BackendRepairPhase::PreStage
+                && session.metadata.session_incarnation == expected.original_incarnation
+        })
+    {
+        return (
+            "restart superseded before staging repair".into(),
+            None,
+            RestartOutcome::Superseded,
+        );
+    }
     let mut staged_incarnation = prev_metadata.as_ref().map(|m| m.session_incarnation);
 
     // Capture existing pane before killing
@@ -2451,8 +2467,32 @@ pub async fn restart_session(
                 id: name.to_string(),
                 backend: backend_name.clone(),
                 session_start_credential: session_start_credential.clone(),
+                expected_repair_reservation: repair_reservation.clone(),
             })
             .await;
+        if repair_reservation.is_some()
+            && !state
+                .protocol
+                .read()
+                .await
+                .sessions
+                .get(name)
+                .is_some_and(|session| {
+                    session
+                        .metadata
+                        .backend_repair_reservation
+                        .as_ref()
+                        .is_some_and(|reservation| {
+                            reservation.phase == crate::daemon_protocol::BackendRepairPhase::Staged
+                        })
+                })
+        {
+            return (
+                "restart superseded while staging repair".into(),
+                None,
+                RestartOutcome::Superseded,
+            );
+        }
         staged_incarnation = state
             .protocol
             .read()
@@ -2816,7 +2856,7 @@ pub async fn restart_session(
                     backend_session_id,
                     backend: Some(backend_name.clone()),
                     session_start_credential: pending_session_start_credential.clone(),
-                    backend_repair_reservation: m.backend_repair_reservation,
+                    backend_repair_reservation: m.backend_repair_reservation.clone(),
                     opencode_binding: opencode_binding.clone(),
                     restart_generation: m.restart_generation.saturating_add(1),
                     session_incarnation: m.session_incarnation,
@@ -3384,7 +3424,15 @@ async fn apply_soft_restart_metadata(
     session.metadata.opencode_binding =
         Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged);
     session.metadata.restart_generation = session.metadata.restart_generation.saturating_add(1);
-    if session.metadata.backend_repair_reservation == Some(session.metadata.restart_generation) {
+    if session
+        .metadata
+        .backend_repair_reservation
+        .as_ref()
+        .is_some_and(|reservation| {
+            reservation.restart_generation == session.metadata.restart_generation
+                && reservation.phase == crate::daemon_protocol::BackendRepairPhase::Staged
+        })
+    {
         session.metadata.backend_repair_reservation = None;
     }
     if let Some(r) = update.reminder {
@@ -6161,6 +6209,7 @@ mod tests {
             &state,
             "oc",
             true,
+            None,
             Some("queued prompt"),
             None,
             None,
