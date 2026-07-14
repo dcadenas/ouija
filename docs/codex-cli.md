@@ -169,9 +169,13 @@ Codex learns the mesh two complementary ways:
    For generated or multi-line text, use `--stdin` or `--message-file` instead
    of putting the message body in shell quotes.
 
-   `--from <your-public-id>` is included because Codex's bash tool cannot be relied
-   on to carry `TMUX_PANE` for sender resolution — but since `OUIJA_SESSION_ID` is
-   inherited, commands without `--from` also resolve correctly via `ouija whoami`.
+   `--from <your-public-id>` is included as a visible fallback. Normally commands
+   without it resolve through `ouija whoami`: if `TMUX_PANE` and
+   `OUIJA_SESSION_ID` are absent, the Codex adapter presents its native thread
+   identity to the daemon, which returns the canonical public id only for an
+   exact stored `(backend, session_id)` pair. A supplied `--from` must equal that
+   canonical id; a raw Codex thread id or a sibling session id is rejected before
+   sending.
    `ouija ask` is not a synchronous wait operation: it returns after delivery, and
    the eventual reply is pushed into the asking session later as a `<msg ... re>`
    message. A Codex session with no other work should end its turn after asking,
@@ -183,6 +187,53 @@ Codex reviews hooks before running them. On a normal install you may be prompted
 to trust `~/.codex/hooks.json` the first time a Codex session starts — approve it
 so the register/activity/stop hooks can run. Automated tests bypass this with
 `--dangerously-bypass-hook-trust`; do not use that flag for interactive use.
+
+For a fresh managed launch, Ouija also supplies a per-launch `SessionStart` hook
+through Codex's supported `-c` session-flags layer. Its command presents the
+public Ouija launch id and a one-time credential; the matching handler hash is
+provided in the same invocation's `hooks.state` override. This is intentional:
+a shared Codex app-server may have neither the managed pane nor its environment.
+The static installed hook continues to support ordinary and resumed sessions,
+but a paneless first bind without that launch proof fails closed. Resume commands
+do not receive a new credential or replace an established native binding.
+
+## Repairing incomplete legacy bindings
+
+An old record with only one of `backend` or `backend_session_id` cannot safely
+identify a caller. Do not copy a native Codex thread id into it. Request a fresh,
+named managed relaunch instead:
+
+```bash
+curl -sS -X POST "http://localhost:${OUIJA_PORT:-7880}/api/backend-identities/repair" \
+  -H 'Content-Type: application/json' \
+  -d '{"session_id":"<public-ouija-id>","backend":"codex-cli"}'
+```
+
+The endpoint accepts only an incomplete Local record and returns `202` while it
+starts a fresh launch. Its one-time SessionStart proof binds the new native
+thread through the normal path; it never adopts a caller-supplied opaque id.
+
+## Focused verification
+
+The checked-in coverage is deliberately bounded rather than a full state-model
+run:
+
+```bash
+cargo test paneless_session_start_ --bin ouija
+cargo test session_start_ --bin ouija
+cargo test backend::codex::tests --bin ouija
+cargo test scheduler::tests::revived_codex_ --bin ouija
+tests/e2e/run-e2e.sh local
+```
+
+The local e2e suite verifies that a Codex caller with `TMUX_PANE` and
+`OUIJA_SESSION_ID` absent resolves via its backend identity, can send implicitly,
+and cannot override that identity with a mismatched `--from`. It also retains the
+Claude tmux-path regression checks; `tests/e2e/run-e2e.sh opencode` remains the
+focused HTTP-backend regression suite. On 2026-07-13, installed `codex-cli
+0.144.1` accepted the generated `hooks.SessionStart` and matching
+`hooks.state."<session-flags>/config.toml:session_start:0:0".trusted_hash`
+configuration under `--strict-config`.
 
 ## Availability detection
 

@@ -224,12 +224,19 @@ async fn post_compact_inner(
     json!({ "ok": true, "continuation_injected": true })
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct SessionStartBody {
+    /// Empty for a paneless hook running under a shared app-server.
+    #[serde(default)]
     pub pane: String,
     pub cwd: String,
     #[serde(default)]
     pub backend_session_id: Option<String>,
+    /// Generic backend identity supplied by adapters that cannot rely on a
+    /// tmux pane. Kept distinct from the legacy adapter/session fields so a
+    /// paneless claimant must present the same typed contract used by CLI/API.
+    #[serde(default)]
+    pub backend_identity: Option<crate::backend::BackendSessionIdentity>,
     /// Backend adapter that emitted this hook. Installed adapters use a
     /// constant value rather than deriving it from the untrusted payload.
     #[serde(default)]
@@ -386,9 +393,66 @@ async fn session_start_inner(
     state: &std::sync::Arc<crate::state::AppState>,
     body: SessionStartBody,
 ) -> Value {
-    // Check auto_register
+    // A complete managed proof is sufficient to select the atomic bind path.
+    // An app-server can inherit an unrelated pane, so pane/cwd may corroborate
+    // ordinary registration but must never decide ownership of this launch.
+    if let (Some(identity), Some(launch_id), Some(credential)) = (
+        body.backend_identity.as_ref(),
+        body.launch_session_id.as_deref(),
+        body.launch_credential.as_deref(),
+    ) {
+        let identity = crate::backend::BackendSessionIdentity {
+            backend: identity.backend.trim().to_string(),
+            session_id: identity.session_id.trim().to_string(),
+        };
+        if identity.backend.is_empty() || identity.session_id.is_empty() {
+            return json!({
+                "skipped": "paneless SessionStart requires a complete backend identity",
+                "output": "",
+            });
+        }
+        let result = {
+            let mut protocol = state.protocol.write().await;
+            protocol.bind_backend_identity(launch_id, &identity, Some(credential))
+        };
+        if !result.effects.is_empty() {
+            state.execute_effects(&result.effects).await;
+        }
+        return match result.outcome {
+            crate::daemon_protocol::BackendIdentityBindOutcome::Bound { session_id }
+            | crate::daemon_protocol::BackendIdentityBindOutcome::AlreadyBound { session_id } => {
+                let backend = state
+                    .protocol
+                    .read()
+                    .await
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|session| session.metadata.backend.as_deref())
+                    .map(String::from);
+                json!({
+                    "registered": session_id,
+                    "output": mesh_instructions_for_backend(backend.as_deref(), launch_id),
+                })
+            }
+            outcome => json!({
+                "skipped": format!("paneless SessionStart backend identity rejected: {outcome:?}"),
+                "output": "",
+            }),
+        };
+    }
+
+    // Uncredentialed discovery remains subject to the operator's legacy
+    // auto-registration policy. A managed proof above is already sufficient
+    // authorization and must not be blocked by this discovery setting.
     if !state.settings.read().await.auto_register {
         return json!({ "skipped": "auto_register disabled", "output": "" });
+    }
+
+    if body.pane.trim().is_empty() {
+        return json!({
+            "skipped": "paneless SessionStart requires backend identity, launch session id, and launch credential",
+            "output": "",
+        });
     }
 
     // Skip if pane already registered (Ouija-launched / API-started sessions hit
@@ -494,25 +558,40 @@ async fn session_start_inner(
                     let proto = state.protocol.read().await;
                     proto.sessions.get(&existing_id).and_then(|session| {
                         match session.metadata.backend_session_id.as_deref() {
-                            None => {
-                                let mut metadata = session.metadata.clone();
-                                metadata.backend_session_id = Some(backend_session_id.clone());
-                                Some(Ok(metadata))
-                            }
+                            None => Some(Ok(())),
                             Some(existing) if existing == backend_session_id => None,
                             Some(_) => Some(Err(())),
                         }
                     })
                 };
                 match binding {
-                    Some(Ok(metadata)) => {
+                    Some(Ok(())) => {
+                        let backend = existing_backend
+                            .as_deref()
+                            .expect("proven existing-pane binding has a backend")
+                            .to_string();
                         state
-                            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                            .apply_and_execute(crate::daemon_protocol::Event::AdoptBackend {
                                 id: existing_id.clone(),
-                                pane: Some(body.pane.clone()),
-                                metadata,
+                                backend,
+                                backend_session_id: backend_session_id.clone(),
+                                expected_backend_session_id: None,
+                                expected_session_start_credential: None,
                             })
                             .await;
+                        let claimed = {
+                            let proto = state.protocol.read().await;
+                            proto.sessions.get(&existing_id).is_some_and(|session| {
+                                session.metadata.backend_session_id.as_deref()
+                                    == Some(backend_session_id.as_str())
+                            })
+                        };
+                        if !claimed {
+                            return json!({
+                                "skipped": "existing pane backend session ID mismatch",
+                                "output": "",
+                            });
+                        }
                     }
                     Some(Err(())) => {
                         tracing::warn!(
@@ -642,6 +721,223 @@ async fn resolve_opencode_session_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn paneless_session_start_binds_only_credentialed_named_launch() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "managed".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    session_start_credential: Some("proof".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: String::new(),
+                cwd: "/same-checkout".into(),
+                backend_session_id: Some("thread-1".into()),
+                backend_identity: Some(crate::backend::BackendSessionIdentity {
+                    backend: "codex-cli".into(),
+                    session_id: "thread-1".into(),
+                }),
+                adapter: Some("codex-cli".into()),
+                launch_session_id: Some("managed".into()),
+                launch_credential: Some("proof".into()),
+            },
+        )
+        .await;
+
+        assert_eq!(result["registered"], "managed");
+        {
+            let protocol = state.protocol.read().await;
+            let metadata = &protocol.sessions["managed"].metadata;
+            assert_eq!(metadata.backend_session_id.as_deref(), Some("thread-1"));
+            assert!(
+                metadata.session_start_credential.is_none(),
+                "a successful paneless claim consumes its proof"
+            );
+        }
+
+        let replay = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: String::new(),
+                cwd: "/same-checkout".into(),
+                backend_session_id: Some("thread-1".into()),
+                backend_identity: Some(crate::backend::BackendSessionIdentity {
+                    backend: "codex-cli".into(),
+                    session_id: "thread-1".into(),
+                }),
+                adapter: Some("codex-cli".into()),
+                launch_session_id: Some("managed".into()),
+                launch_credential: Some("proof".into()),
+            },
+        )
+        .await;
+        assert_eq!(
+            replay["registered"], "managed",
+            "duplicate delivery is idempotent"
+        );
+    }
+
+    #[tokio::test]
+    async fn proven_launch_ignores_an_inherited_sibling_pane_and_replay_is_idempotent() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "sibling".into(),
+                pane: Some("%sibling".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/same-checkout".into()),
+                    backend: Some("codex-cli".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "intended".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/same-checkout".into()),
+                    backend: Some("codex-cli".into()),
+                    session_start_credential: Some("proof".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let body = SessionStartBody {
+            pane: "%sibling".into(),
+            cwd: "/same-checkout".into(),
+            backend_session_id: Some("thread-intended".into()),
+            backend_identity: Some(crate::backend::BackendSessionIdentity {
+                backend: "codex-cli".into(),
+                session_id: "thread-intended".into(),
+            }),
+            adapter: Some("codex-cli".into()),
+            launch_session_id: Some("intended".into()),
+            launch_credential: Some("proof".into()),
+        };
+        assert_eq!(
+            session_start_inner(&state, body.clone()).await["registered"],
+            "intended"
+        );
+        assert_eq!(
+            session_start_inner(&state, body).await["registered"],
+            "intended"
+        );
+        let protocol = state.protocol.read().await;
+        assert_eq!(
+            protocol.sessions["intended"]
+                .metadata
+                .backend_session_id
+                .as_deref(),
+            Some("thread-intended")
+        );
+        assert!(
+            protocol.sessions["sibling"]
+                .metadata
+                .backend_session_id
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn paneless_session_start_rejects_missing_launch_proof() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "managed".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    session_start_credential: Some("proof".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: String::new(),
+                cwd: "/same-checkout".into(),
+                backend_session_id: Some("thread-1".into()),
+                backend_identity: Some(crate::backend::BackendSessionIdentity {
+                    backend: "codex-cli".into(),
+                    session_id: "thread-1".into(),
+                }),
+                adapter: Some("codex-cli".into()),
+                launch_session_id: Some("managed".into()),
+                launch_credential: None,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            result["skipped"],
+            "paneless SessionStart requires backend identity, launch session id, and launch credential"
+        );
+        assert!(
+            state.protocol.read().await.sessions["managed"]
+                .metadata
+                .backend_session_id
+                .is_none(),
+            "unproven paneless starts must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn paneless_session_start_cannot_claim_a_same_checkout_sibling_launch() {
+        let state = crate::state::AppState::new_for_test();
+        for (id, credential) in [("worker-a", "proof-a"), ("worker-b", "proof-b")] {
+            state
+                .apply_and_execute(crate::daemon_protocol::Event::Register {
+                    id: id.into(),
+                    pane: None,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        project_dir: Some("/same-checkout".into()),
+                        backend: Some("codex-cli".into()),
+                        session_start_credential: Some(credential.into()),
+                        ..Default::default()
+                    },
+                })
+                .await;
+        }
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: String::new(),
+                cwd: "/same-checkout".into(),
+                backend_session_id: Some("thread-a".into()),
+                backend_identity: Some(crate::backend::BackendSessionIdentity {
+                    backend: "codex-cli".into(),
+                    session_id: "thread-a".into(),
+                }),
+                adapter: Some("codex-cli".into()),
+                launch_session_id: Some("worker-a".into()),
+                launch_credential: Some("proof-b".into()),
+            },
+        )
+        .await;
+
+        assert!(result.get("registered").is_none());
+        let protocol = state.protocol.read().await;
+        for id in ["worker-a", "worker-b"] {
+            assert!(
+                protocol.sessions[id].metadata.backend_session_id.is_none(),
+                "same checkout must not substitute the sibling's proof"
+            );
+        }
+    }
 
     fn assistant_pane(pane_id: &str, cwd: &str) -> crate::tmux::TmuxPane {
         assistant_pane_with_process(pane_id, cwd, "codex")
@@ -869,6 +1165,7 @@ mod tests {
             pane: "%70".into(),
             cwd: "/home/user/code/proj/.ouija/worktrees/feat-worker".into(),
             backend_session_id: Some("codex-thread-1".into()),
+            backend_identity: None,
             adapter: Some("codex-cli".into()),
             launch_session_id: Some("feat/worker".into()),
             launch_credential: None,
@@ -915,6 +1212,7 @@ mod tests {
             pane: "%71".into(),
             cwd: "/home/user/code/proj".into(),
             backend_session_id: Some("claude-session-1".into()),
+            backend_identity: None,
             adapter: Some("claude-code".into()),
             launch_session_id: Some("claude-worker".into()),
             launch_credential: None,
@@ -958,6 +1256,7 @@ mod tests {
                 pane: "%71".into(),
                 cwd: "/home/user/code/proj".into(),
                 backend_session_id: Some("codex-thread-1".into()),
+                backend_identity: None,
                 adapter: Some("claude-code".into()),
                 launch_session_id: Some("claude-worker".into()),
                 launch_credential: None,
@@ -1004,6 +1303,7 @@ mod tests {
                 pane: "%75".into(),
                 cwd: "/home/user/code/proj".into(),
                 backend_session_id: Some("claude-session-1".into()),
+                backend_identity: None,
                 adapter: Some("claude-code".into()),
                 launch_session_id: None,
                 launch_credential: None,
@@ -1048,6 +1348,7 @@ mod tests {
                 pane: "%74".into(),
                 cwd: "/home/user/code/proj".into(),
                 backend_session_id: Some("codex-thread-1".into()),
+                backend_identity: None,
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("unknown-worker".into()),
                 launch_credential: None,
@@ -1092,6 +1393,7 @@ mod tests {
                 pane: "%72".into(),
                 cwd: "/home/user/code/proj".into(),
                 backend_session_id: Some("codex-thread-1".into()),
+                backend_identity: None,
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("feat/worker".into()),
                 launch_credential: None,
@@ -1141,6 +1443,7 @@ mod tests {
                 pane: "%72".into(),
                 cwd: "/home/user/code/proj".into(),
                 backend_session_id: Some("codex-thread-1".into()),
+                backend_identity: None,
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("feat/worker".into()),
                 launch_credential: None,
@@ -1184,6 +1487,7 @@ mod tests {
                 pane: "%72".into(),
                 cwd: "/home/user/code/proj".into(),
                 backend_session_id: Some("codex-thread-1".into()),
+                backend_identity: None,
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("feat/worker".into()),
                 launch_credential: Some("launch-secret".into()),
@@ -1220,6 +1524,7 @@ mod tests {
                 pane: "%72".into(),
                 cwd: "/home/user/code/proj".into(),
                 backend_session_id: Some("codex-thread-2".into()),
+                backend_identity: None,
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("feat/worker".into()),
                 launch_credential: Some("launch-secret".into()),
@@ -1267,6 +1572,7 @@ mod tests {
                 pane: "%72".into(),
                 cwd: "/home/user/code/proj".into(),
                 backend_session_id: Some("codex-thread-2".into()),
+                backend_identity: None,
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("feat/worker".into()),
                 launch_credential: None,
@@ -1314,6 +1620,7 @@ mod tests {
                 pane: "%0".into(),
                 cwd: "/home/daniel/code/ouija".into(),
                 backend_session_id: Some("codex-ouija-thread".into()),
+                backend_identity: None,
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("hub-worker".into()),
                 launch_credential: None,
@@ -1356,6 +1663,7 @@ mod tests {
                 pane: "%73".into(),
                 cwd: "/home/daniel/code/ouija".into(),
                 backend_session_id: Some("claude-replacement".into()),
+                backend_identity: None,
                 adapter: Some("claude-code".into()),
                 launch_session_id: Some("worker".into()),
                 launch_credential: None,
@@ -1385,6 +1693,7 @@ mod tests {
             pane: "%999999999".into(),
             cwd: "/home/user/code/myproject".into(),
             backend_session_id: None,
+            backend_identity: None,
             adapter: None,
             launch_session_id: None,
             launch_credential: None,
@@ -1415,6 +1724,7 @@ mod tests {
             pane: "%50".into(),
             cwd: "/home/user/code/existing".into(),
             backend_session_id: None,
+            backend_identity: None,
             adapter: None,
             launch_session_id: None,
             launch_credential: None,
@@ -1434,6 +1744,7 @@ mod tests {
             pane: "%50".into(),
             cwd: "/home/user/code/ouija/.ouija/worktrees/feature-x".into(),
             backend_session_id: None,
+            backend_identity: None,
             adapter: None,
             launch_session_id: None,
             launch_credential: None,

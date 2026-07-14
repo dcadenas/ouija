@@ -1,4 +1,7 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 use super::{CodingAssistant, DeliveryMode, InjectConfig, ResumeOpts, StartOpts};
 
@@ -40,6 +43,53 @@ const HOOKS: &[(&str, &str, &str)] = &[
 /// Directory under CODEX_HOME where Ouija writes its hook scripts.
 fn hooks_dir(codex_home: &Path) -> PathBuf {
     codex_home.join("ouija-hooks")
+}
+
+/// Private, per-user storage for credentials which must cross Codex's shared
+/// app-server boundary without becoming part of its command line or TOML.
+fn launch_credential_dir(codex_home: &Path) -> PathBuf {
+    codex_home.join("ouija-launch-credentials")
+}
+
+/// Stage a one-time launch credential in a private file and return only its
+/// path. The hook atomically claims and deletes this file before it submits the
+/// credential to the daemon.
+fn stage_launch_credential(codex_home: &Path, credential: &str) -> anyhow::Result<PathBuf> {
+    let dir = launch_credential_dir(codex_home);
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    for _ in 0..8 {
+        let bytes: [u8; 16] = ::rand::random();
+        let nonce = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let path = dir.join(format!("launch-{nonce}"));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(credential.as_bytes()) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(error.into());
+                }
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    anyhow::bail!("could not allocate a unique Codex launch credential file")
 }
 
 /// Build the merged `hooks.json` content for Codex, layering Ouija's hook
@@ -375,6 +425,99 @@ fn format_codex_home_prefix(codex_home: Option<&str>) -> String {
     }
 }
 
+const SESSION_FLAGS_HOOK_KEY: &str = "<session-flags>/config.toml:session_start:0:0";
+
+/// Build the two session-flags overrides for a fresh managed Codex launch.
+///
+/// The first declares one extra SessionStart command which presents Ouija's
+/// public launch ID and a private credential-file path. The second pre-trusts
+/// the exact normalized handler identity required by Codex; the static user
+/// hook remains unmodified. This lets a shared Codex app-server prove ownership
+/// without inheriting pane-local environment variables or logging the proof.
+pub(crate) fn format_session_start_hook_flags(
+    codex_home: &str,
+    launch_session_id: &str,
+    launch_credential_file: &Path,
+) -> String {
+    let script = hooks_dir(Path::new(codex_home)).join("codex-register.sh");
+    let command = format!(
+        "{} --launch-session-id {} --launch-credential-file {}",
+        crate::scheduler::shell_escape(&script.to_string_lossy()),
+        crate::scheduler::shell_escape(launch_session_id),
+        crate::scheduler::shell_escape(&launch_credential_file.to_string_lossy()),
+    );
+    // Codex hashes the TOML-normalized command handler. Optional TOML fields
+    // are absent, while the hook engine supplies timeout=600 and async=false.
+    let normalized = serde_json::json!({
+        "event_name": "session_start",
+        "hooks": [{
+            "async": false,
+            "command": command,
+            "timeout": 600,
+            "type": "command",
+        }],
+    });
+    let canonical = canonical_json(&normalized);
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(&canonical).expect("JSON value serializes"));
+    let trusted_hash = format!("sha256:{:x}", hasher.finalize());
+
+    let handler = toml_basic_string_escape(&command);
+    let hook_config =
+        format!("hooks.SessionStart=[{{hooks=[{{type=\"command\",command=\"{handler}\"}}]}}]");
+    let state_config =
+        format!("hooks.state.\"{SESSION_FLAGS_HOOK_KEY}\".trusted_hash=\"{trusted_hash}\"");
+    format!(
+        " -c {} -c {}",
+        crate::scheduler::shell_escape(&hook_config),
+        crate::scheduler::shell_escape(&state_config),
+    )
+}
+
+/// Append a proven paneless SessionStart hook to a fresh Codex command.
+///
+/// Callers must use this only for a freshly credentialed launch. A resume has
+/// an immutable native binding and must not mint or present a new proof.
+pub(crate) fn with_session_start_hook(
+    command: String,
+    codex_home: Option<&str>,
+    launch_session_id: &str,
+    launch_credential: &str,
+) -> anyhow::Result<String> {
+    let home = codex_home
+        .map(crate::state::expand_tilde)
+        .map(PathBuf::from)
+        .or_else(resolve_codex_home)
+        .unwrap_or_else(|| PathBuf::from(".codex"));
+    let credential_file = stage_launch_credential(&home, launch_credential)?;
+    Ok(format!(
+        "{command}{}",
+        format_session_start_hook_flags(
+            &home.to_string_lossy(),
+            launch_session_id,
+            &credential_file
+        )
+    ))
+}
+
+fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut sorted = serde_json::Map::new();
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for key in keys {
+                sorted.insert(key.clone(), canonical_json(&map[key]));
+            }
+            serde_json::Value::Object(sorted)
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(canonical_json).collect())
+        }
+        value => value.clone(),
+    }
+}
+
 #[derive(Debug)]
 pub struct Codex;
 
@@ -550,6 +693,72 @@ mod tests {
         assert_eq!(
             cmd,
             "cd '/home/user/myproject' && codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen -c 'projects={\"/home/user/myproject\"={trust_level=\"trusted\"}}'"
+        );
+    }
+
+    #[test]
+    fn session_start_hook_flags_keep_credential_out_of_argv_and_toml() {
+        let home = tempfile::tempdir().unwrap();
+        let credential_file = stage_launch_credential(home.path(), "one-time-proof").unwrap();
+        let flags = format_session_start_hook_flags(
+            &home.path().to_string_lossy(),
+            "public-launch",
+            &credential_file,
+        );
+
+        assert!(
+            flags.contains("codex-register.sh"),
+            "hook command must invoke the installed Codex registration hook: {flags}"
+        );
+        assert!(
+            flags.contains("public-launch"),
+            "hook command must carry the public launch id: {flags}"
+        );
+        assert!(
+            !flags.contains("one-time-proof"),
+            "the launch credential must never appear in generated Codex argv or TOML: {flags}"
+        );
+        assert!(
+            flags.contains("--launch-credential-file"),
+            "hook command must receive a credential-file path, not a credential value: {flags}"
+        );
+        assert!(
+            flags.contains(credential_file.to_string_lossy().as_ref()),
+            "hook command must carry the private credential-file path: {flags}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(launch_credential_dir(home.path()))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&credential_file)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        assert!(
+            flags.contains("hooks.SessionStart="),
+            "hook must be installed through a session-flags override: {flags}"
+        );
+        assert!(
+            flags.contains(
+                "hooks.state.\"<session-flags>/config.toml:session_start:0:0\".trusted_hash="
+            ),
+            "session-flags hook needs its exact trusted hash: {flags}"
+        );
+        assert!(
+            !flags.contains("CODEX_THREAD_ID"),
+            "native identity must stay inside the Codex adapter/hook payload: {flags}"
         );
     }
 
@@ -1002,6 +1211,19 @@ mod tests {
         assert!(s.contains("${OUIJA_SESSION_ID:-}"), "{s}");
         assert!(s.contains("launch_credential"), "{s}");
         assert!(s.contains("${OUIJA_SESSION_START_CREDENTIAL:-}"), "{s}");
+        assert!(
+            s.contains("--launch-session-id") && s.contains("--launch-credential-file"),
+            "the per-launch SessionFlags hook must receive its proof by private file: {s}"
+        );
+        assert!(
+            s.contains("mv -- \"$LAUNCH_CREDENTIAL_FILE\"")
+                && s.contains("rm -f -- \"$CLAIMED_CREDENTIAL_FILE\""),
+            "the hook must atomically claim then remove the one-shot credential file: {s}"
+        );
+        assert!(
+            !s.contains("[ -z \"$PANE\" ] && exit 0"),
+            "a shared app-server has no pane; the hook must submit a paneless proof claim: {s}"
+        );
         // Wraps the daemon's `.output` into Codex additionalContext, keyed to the
         // SessionStart event so the TUI surfaces mesh instructions.
         assert!(s.contains("hookSpecificOutput"), "{s}");

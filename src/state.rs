@@ -418,6 +418,9 @@ pub struct SessionMetadata {
     /// Monotonic token used to reject stale async restart commits.
     #[serde(default)]
     pub restart_generation: u64,
+    /// In-memory legacy-repair reservation mirrored from protocol metadata.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub backend_repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
     /// Per-registration token used to reject stale async commits.
     #[serde(default)]
     pub session_incarnation: i64,
@@ -507,6 +510,7 @@ impl Default for SessionMetadata {
             backend: None,
             opencode_binding: None,
             restart_generation: 0,
+            backend_repair_reservation: None,
             session_incarnation: 0,
             project_description: None,
             bulletin: None,
@@ -838,6 +842,52 @@ impl AppState {
         Box::pin(self._apply_and_execute(event))
     }
 
+    /// Atomically stage a fresh managed launch and publish its effects.
+    ///
+    /// Unlike the generic event API, this exposes whether the authority
+    /// transition was accepted so a caller can avoid doing external launch
+    /// work after a concurrent restart or repair has taken ownership.
+    pub fn stage_fresh_launch(
+        self: &Arc<Self>,
+        id: &str,
+        backend: String,
+        session_start_credential: Option<String>,
+        expected_repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = crate::daemon_protocol::StageFreshLaunchOutcome>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(self._stage_fresh_launch(
+            id.to_owned(),
+            backend,
+            session_start_credential,
+            expected_repair_reservation,
+        ))
+    }
+
+    async fn _stage_fresh_launch(
+        self: &Arc<Self>,
+        id: String,
+        backend: String,
+        session_start_credential: Option<String>,
+        expected_repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
+    ) -> crate::daemon_protocol::StageFreshLaunchOutcome {
+        let result = {
+            let mut state = self.protocol.write().await;
+            state.stage_fresh_launch(
+                &id,
+                backend,
+                session_start_credential,
+                expected_repair_reservation,
+            )
+        };
+        self.execute_effects(&result.effects).await;
+        result.outcome
+    }
+
     async fn _apply_and_execute(
         self: &Arc<Self>,
         event: crate::daemon_protocol::Event,
@@ -1158,10 +1208,11 @@ impl AppState {
                     let from = from.clone();
                     let expects_reply = *expects_reply;
                     tokio::spawn(async move {
-                        let (result, _prompt_msg_id) = crate::nostr_transport::restart_session(
+                        let (result, _prompt_msg_id, _) = crate::nostr_transport::restart_session(
                             &state,
                             &name,
                             fresh,
+                            None,
                             prompt.as_deref(),
                             from.as_deref(),
                             expects_reply,
@@ -1414,6 +1465,7 @@ impl AppState {
                         backend: m.backend.clone(),
                         opencode_binding: m.opencode_binding.clone(),
                         restart_generation: m.restart_generation,
+                        backend_repair_reservation: m.backend_repair_reservation.clone(),
                         session_incarnation: m.session_incarnation,
                         project_description: m.project_description.clone(),
                         bulletin: m.bulletin.clone(),
@@ -3910,6 +3962,7 @@ pub(crate) mod tests {
             backend_session_id: Some("oc_abc123".into()),
             backend: Some("opencode".into()),
             session_start_credential: None,
+            backend_repair_reservation: None,
             opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
             restart_generation: 7,
             session_incarnation: 11,

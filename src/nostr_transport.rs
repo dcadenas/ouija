@@ -1330,6 +1330,7 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
             None,
             None,
             None,
+            None,
             ParentSessionOverride::PreservePrevious,
             None,
         )
@@ -1709,6 +1710,11 @@ pub async fn start_session(
     );
     drop(settings);
     crate::backend::codex::install_configured_home(launch_model.codex_home.as_deref());
+    // Mint the proof before rendering the command: a shared Codex app-server
+    // cannot rely on pane-local env, so fresh launches receive it as a trusted
+    // session-flags hook instead.
+    let session_start_credential =
+        (backend_name == "codex-cli").then(crate::daemon_protocol::new_session_start_credential);
     let backend_cmd = backend.build_start_command(&crate::backend::StartOpts {
         project_dir: dir.clone(),
         worktree: None, // ouija manages worktrees, not the backend
@@ -1717,6 +1723,23 @@ pub async fn start_session(
         permission_mode: claude_permission_mode,
         codex_home: launch_model.codex_home.clone(),
     });
+    let backend_cmd = match session_start_credential.as_deref() {
+        Some(credential) => match crate::backend::codex::with_session_start_hook(
+            backend_cmd,
+            launch_model.codex_home.as_deref(),
+            name,
+            credential,
+        ) {
+            Ok(command) => command,
+            Err(error) => {
+                return (
+                    format!("could not stage Codex launch credential: {error}"),
+                    None,
+                );
+            }
+        },
+        None => backend_cmd,
+    };
 
     let reminder_meta = crate::daemon_protocol::SessionMeta {
         reminder: reminder.map(String::from),
@@ -1777,12 +1800,6 @@ pub async fn start_session(
     } else {
         backend_cmd.clone()
     };
-
-    // Codex reports its thread ID only after it starts. Give this managed
-    // launch an unguessable one-time credential so the hook can authorize that
-    // first binding without trusting the pane/session ID alone.
-    let session_start_credential =
-        (backend_name == "codex-cli").then(crate::daemon_protocol::new_session_start_credential);
 
     let start_result = tokio::task::spawn_blocking({
         let tmux_session = tmux_session.clone();
@@ -1856,29 +1873,39 @@ pub async fn start_session(
             // its complete, credentialed session record visible before the
             // backend command is sent so that hook cannot auto-register a
             // competing session or observe an uncredentialed slot.
-            if let Some(session_start_credential) = session_start_credential.clone() {
-                let proto_meta = crate::daemon_protocol::SessionMeta {
-                    project_dir: Some(dir.clone()),
-                    worktree,
-                    backend: Some(backend_name.clone()),
-                    session_start_credential: Some(session_start_credential),
-                    model: model.map(String::from),
-                    effort: effort.map(String::from),
-                    codex_home: launch_model.codex_home.clone(),
-                    reminder: reminder.map(String::from),
-                    parent_session: parent_session.map(String::from),
-                    idle_policy: idle_policy.clone(),
-                    prompt: prompt.map(String::from),
-                    ..Default::default()
+            let staged_incarnation =
+                if let Some(session_start_credential) = session_start_credential.clone() {
+                    let proto_meta = crate::daemon_protocol::SessionMeta {
+                        project_dir: Some(dir.clone()),
+                        worktree,
+                        backend: Some(backend_name.clone()),
+                        session_start_credential: Some(session_start_credential),
+                        model: model.map(String::from),
+                        effort: effort.map(String::from),
+                        codex_home: launch_model.codex_home.clone(),
+                        reminder: reminder.map(String::from),
+                        parent_session: parent_session.map(String::from),
+                        idle_policy: idle_policy.clone(),
+                        prompt: prompt.map(String::from),
+                        ..Default::default()
+                    };
+                    state
+                        .apply_and_execute(crate::daemon_protocol::Event::Register {
+                            id: name.to_string(),
+                            pane: Some(pane_id.clone()),
+                            metadata: proto_meta,
+                        })
+                        .await;
+                    state
+                        .protocol
+                        .read()
+                        .await
+                        .sessions
+                        .get(name)
+                        .map(|session| session.metadata.session_incarnation)
+                } else {
+                    None
                 };
-                state
-                    .apply_and_execute(crate::daemon_protocol::Event::Register {
-                        id: name.to_string(),
-                        pane: Some(pane_id.clone()),
-                        metadata: proto_meta,
-                    })
-                    .await;
-            }
 
             let pane_for_launch = pane_id.clone();
             let command = if is_http_api {
@@ -1946,22 +1973,7 @@ pub async fn start_session(
                 );
             };
 
-            let (backend_session_id, pending_session_start_credential) =
-                if session_start_credential.is_some() {
-                    let proto = state.protocol.read().await;
-                    proto
-                        .sessions
-                        .get(name)
-                        .map(|session| {
-                            (
-                                session.metadata.backend_session_id.clone(),
-                                session.metadata.session_start_credential.clone(),
-                            )
-                        })
-                        .unwrap_or((None, session_start_credential.clone()))
-                } else {
-                    (backend_session_id, None)
-                };
+            let pending_session_start_credential = session_start_credential.clone();
             let oc_session_id = backend_session_id.clone();
             let proto_meta = crate::daemon_protocol::SessionMeta {
                 project_dir: Some(dir.clone()),
@@ -1979,13 +1991,22 @@ pub async fn start_session(
                 prompt: prompt.map(String::from),
                 ..Default::default()
             };
-            state
-                .apply_and_execute(crate::daemon_protocol::Event::Register {
+            let final_registration = match staged_incarnation {
+                Some(expected_incarnation) => {
+                    crate::daemon_protocol::Event::RefreshLaunchMetadata {
+                        id: name.to_string(),
+                        expected_incarnation,
+                        pane: registration_pane,
+                        metadata: proto_meta,
+                    }
+                }
+                None => crate::daemon_protocol::Event::Register {
                     id: name.to_string(),
                     pane: registration_pane,
                     metadata: proto_meta,
-                })
-                .await;
+                },
+            };
+            state.apply_and_execute(final_registration).await;
             let prompt_delivery = pre_queued_prompt
                 .as_ref()
                 .map(|_| start_prompt_delivery(is_http_api, oc_session_id.as_deref()));
@@ -2135,12 +2156,23 @@ pub async fn start_session(
     }
 }
 
+/// The terminal result of a restart attempt. Callers that coordinate other
+/// state transitions must use this typed value rather than infer success from
+/// the human-facing status message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestartOutcome {
+    Restarted,
+    Failed,
+    Superseded,
+}
+
 /// Kill and restart a session, preserving metadata unless `fresh`.
 #[allow(clippy::too_many_arguments)]
 pub async fn restart_session(
     state: &std::sync::Arc<AppState>,
     name: &str,
     fresh: bool,
+    repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
     prompt: Option<&str>,
     from: Option<&str>,
     expects_reply: Option<bool>,
@@ -2150,10 +2182,24 @@ pub async fn restart_session(
     reminder: Option<&str>,
     parent_session_override: ParentSessionOverride,
     idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
-) -> (String, Option<u64>) {
+) -> (String, Option<u64>, RestartOutcome) {
     // Snapshot full metadata before killing so we can carry it forward
     let session = state.protocol.read().await.sessions.get(name).cloned();
     let prev_metadata = session.as_ref().map(|s| s.metadata.clone());
+    if let Some(expected) = repair_reservation.as_ref()
+        && !session.as_ref().is_some_and(|session| {
+            session.metadata.backend_repair_reservation.as_ref() == Some(expected)
+                && expected.phase == crate::daemon_protocol::BackendRepairPhase::PreStage
+                && session.metadata.session_incarnation == expected.original_incarnation
+        })
+    {
+        return (
+            "restart superseded before staging repair".into(),
+            None,
+            RestartOutcome::Superseded,
+        );
+    }
+    let mut staged_incarnation = prev_metadata.as_ref().map(|m| m.session_incarnation);
 
     // Capture existing pane before killing
     let existing_pane = session.as_ref().and_then(|s| s.pane.clone());
@@ -2161,7 +2207,7 @@ pub async fn restart_session(
     let backend = match backend {
         Some(b) => match state.backends.get_required(b) {
             Ok(backend) => backend,
-            Err(message) => return (message, None),
+            Err(message) => return (message, None, RestartOutcome::Failed),
         },
         None => {
             // Fall back to the existing session's backend
@@ -2241,7 +2287,7 @@ pub async fn restart_session(
                 // soft_restart_session writes backend_session_id + model +
                 // effort atomically under one lock before delivering, so the
                 // caller does not need a second write here.
-                return result;
+                return (result.0, result.1, RestartOutcome::Restarted);
             }
             tracing::info!("soft restart failed for '{name}', falling back to hard restart");
         }
@@ -2317,14 +2363,32 @@ pub async fn restart_session(
     crate::backend::codex::install_configured_home(launch_codex_home.as_deref());
 
     let claude_cmd = if fresh {
-        backend.build_start_command(&crate::backend::StartOpts {
+        let command = backend.build_start_command(&crate::backend::StartOpts {
             project_dir: dir.clone(),
             worktree: None, // ouija manages worktrees, not the backend
             model: launch_model.model.clone(),
             effort: effective_effort.clone(),
             permission_mode: claude_permission_mode,
             codex_home: launch_codex_home.clone(),
-        })
+        });
+        match session_start_credential.as_deref() {
+            Some(credential) => match crate::backend::codex::with_session_start_hook(
+                command,
+                launch_codex_home.as_deref(),
+                name,
+                credential,
+            ) {
+                Ok(command) => command,
+                Err(error) => {
+                    return (
+                        format!("could not stage Codex launch credential: {error}"),
+                        None,
+                        RestartOutcome::Failed,
+                    );
+                }
+            },
+            None => command,
+        }
     } else {
         backend
             .build_resume_command(&crate::backend::ResumeOpts {
@@ -2393,29 +2457,30 @@ pub async fn restart_session(
         crate::backend::DeliveryMode::HttpApi { .. }
     );
 
-    // Keep the existing pane registered with an empty thread slot and its
-    // pending credential before killing it. Codex can invoke SessionStart as
-    // soon as respawn-pane starts the process, before the later restart
-    // metadata refresh completes.
-    if let Some(session_start_credential) = session_start_credential.clone() {
-        let metadata = {
-            let proto = state.protocol.read().await;
-            proto.sessions.get(name).map(|session| {
-                let mut metadata = session.metadata.clone();
-                metadata.backend = Some("codex-cli".into());
-                metadata.backend_session_id = None;
-                metadata.session_start_credential = Some(session_start_credential);
-                metadata
-            })
-        };
-        if let Some(metadata) = metadata {
-            state
-                .apply_and_execute(crate::daemon_protocol::Event::Register {
-                    id: name.to_string(),
-                    pane: existing_pane.clone(),
-                    metadata,
-                })
-                .await;
+    // Every fresh hard restart gets a new incarnation before tmux respawns
+    // the backend. This clears the old native identity and leaves only the
+    // intended backend plus an optional Codex launch credential for the new
+    // process to claim.
+    if fresh && prev_metadata.is_some() && existing_pane.is_some() {
+        match state
+            .stage_fresh_launch(
+                name,
+                backend_name.clone(),
+                session_start_credential.clone(),
+                repair_reservation.clone(),
+            )
+            .await
+        {
+            crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
+                staged_incarnation = Some(incarnation);
+            }
+            crate::daemon_protocol::StageFreshLaunchOutcome::Rejected => {
+                return (
+                    "restart superseded before respawn".into(),
+                    None,
+                    RestartOutcome::Superseded,
+                );
+            }
         }
     }
 
@@ -2535,6 +2600,32 @@ pub async fn restart_session(
 
     match start_result {
         Ok(Ok((pane_id, launch_after_registration))) => {
+            // With no existing pane, tmux has now created an inert pane but
+            // has not received the backend command yet. Stage only at this
+            // point so a creation failure cannot consume repair authority.
+            if fresh && prev_metadata.is_some() && existing_pane.is_none() {
+                match state
+                    .stage_fresh_launch(
+                        name,
+                        backend_name.clone(),
+                        session_start_credential.clone(),
+                        repair_reservation.clone(),
+                    )
+                    .await
+                {
+                    crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
+                        staged_incarnation = Some(incarnation);
+                    }
+                    crate::daemon_protocol::StageFreshLaunchOutcome::Rejected => {
+                        cleanup_provisional_start(state, name, &pane_id).await;
+                        return (
+                            "restart superseded before backend launch".into(),
+                            None,
+                            RestartOutcome::Superseded,
+                        );
+                    }
+                }
+            }
             if launch_after_registration {
                 // A fallback window has a new pane ID. Register that pane and
                 // its credential before starting Codex so the hook resolves
@@ -2564,6 +2655,13 @@ pub async fn restart_session(
                             metadata,
                         })
                         .await;
+                    staged_incarnation = state
+                        .protocol
+                        .read()
+                        .await
+                        .sessions
+                        .get(name)
+                        .map(|session| session.metadata.session_incarnation);
                 }
 
                 let pane_for_launch = pane_id.clone();
@@ -2587,10 +2685,18 @@ pub async fn restart_session(
                 match launch_result {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        return (format!("restart failed: {error}"), None);
+                        return (
+                            format!("restart failed: {error}"),
+                            None,
+                            RestartOutcome::Failed,
+                        );
                     }
                     Err(error) => {
-                        return (format!("restart failed: {error}"), None);
+                        return (
+                            format!("restart failed: {error}"),
+                            None,
+                            RestartOutcome::Failed,
+                        );
                     }
                 }
             }
@@ -2709,6 +2815,7 @@ pub async fn restart_session(
                         "restart failed: OpenCode attach setup failed for '{name}' (pane {pane_id})"
                     ),
                     None,
+                    RestartOutcome::Failed,
                 );
             }
 
@@ -2757,6 +2864,7 @@ pub async fn restart_session(
                     backend_session_id,
                     backend: Some(backend_name.clone()),
                     session_start_credential: pending_session_start_credential.clone(),
+                    backend_repair_reservation: m.backend_repair_reservation.clone(),
                     opencode_binding: opencode_binding.clone(),
                     restart_generation: m.restart_generation.saturating_add(1),
                     session_incarnation: m.session_incarnation,
@@ -2795,13 +2903,21 @@ pub async fn restart_session(
                     ..Default::default()
                 },
             };
-            state
-                .apply_and_execute(crate::daemon_protocol::Event::Register {
+            let refresh = match prev_metadata.as_ref() {
+                Some(previous) => crate::daemon_protocol::Event::RefreshLaunchMetadata {
+                    id: name.to_string(),
+                    expected_incarnation: staged_incarnation
+                        .unwrap_or(previous.session_incarnation),
+                    pane: Some(pane_id.clone()),
+                    metadata: proto_meta,
+                },
+                None => crate::daemon_protocol::Event::Register {
                     id: name.to_string(),
                     pane: Some(pane_id.clone()),
                     metadata: proto_meta,
-                })
-                .await;
+                },
+            };
+            state.apply_and_execute(refresh).await;
             // Strong HttpApi bindings can use readiness delivery; weak reused
             // panes must stay on raw tmux to preserve the visible-pane boundary.
             if should_schedule_restart_prompt_injection(
@@ -2847,10 +2963,11 @@ pub async fn restart_session(
             (
                 format!("restarted '{name}' in {dir} (pane {pane_id})"),
                 prompt_msg_id,
+                RestartOutcome::Restarted,
             )
         }
-        Ok(Err(e)) => (format!("restart failed: {e}"), None),
-        Err(e) => (format!("restart failed: {e}"), None),
+        Ok(Err(e)) => (format!("restart failed: {e}"), None, RestartOutcome::Failed),
+        Err(e) => (format!("restart failed: {e}"), None, RestartOutcome::Failed),
     }
 }
 
@@ -3315,6 +3432,17 @@ async fn apply_soft_restart_metadata(
     session.metadata.opencode_binding =
         Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged);
     session.metadata.restart_generation = session.metadata.restart_generation.saturating_add(1);
+    if session
+        .metadata
+        .backend_repair_reservation
+        .as_ref()
+        .is_some_and(|reservation| {
+            reservation.restart_generation == session.metadata.restart_generation
+                && reservation.phase == crate::daemon_protocol::BackendRepairPhase::Staged
+        })
+    {
+        session.metadata.backend_repair_reservation = None;
+    }
     if let Some(r) = update.reminder {
         session.metadata.reminder = Some(r.to_string());
     }
@@ -6089,6 +6217,7 @@ mod tests {
             &state,
             "oc",
             true,
+            None,
             Some("queued prompt"),
             None,
             None,
