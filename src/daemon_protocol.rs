@@ -525,6 +525,14 @@ pub enum Event {
         expected_backend_session_id: Option<String>,
         metadata: SessionMeta,
     },
+    /// Establish the next incarnation before a fresh hard launch performs any
+    /// external work. Native identity is deliberately empty until the new
+    /// process presents its launch proof.
+    StageFreshLaunch {
+        id: String,
+        backend: String,
+        session_start_credential: Option<String>,
+    },
     /// Refresh a launched session only when the caller still owns the same
     /// registration incarnation. This prevents a delayed final refresh from
     /// overwriting a SessionStart backend bind that has already consumed its
@@ -532,6 +540,7 @@ pub enum Event {
     RefreshLaunchMetadata {
         id: String,
         expected_incarnation: i64,
+        pane: Option<String>,
         metadata: SessionMeta,
     },
     Rename {
@@ -1249,11 +1258,17 @@ impl DaemonState {
             } => {
                 self.apply_register_if_pane_unbound(id, pane, expected_backend_session_id, metadata)
             }
+            Event::StageFreshLaunch {
+                id,
+                backend,
+                session_start_credential,
+            } => self.apply_stage_fresh_launch(id, backend, session_start_credential),
             Event::RefreshLaunchMetadata {
                 id,
                 expected_incarnation,
+                pane,
                 metadata,
-            } => self.apply_refresh_launch_metadata(id, expected_incarnation, metadata),
+            } => self.apply_refresh_launch_metadata(id, expected_incarnation, pane, metadata),
             Event::Rename { old_id, new_id } => self.apply_rename(&old_id, &new_id),
             Event::Remove { id, keep_worktree } => self.apply_remove(&id, keep_worktree),
             Event::RollbackProvisionalRegistration {
@@ -1494,10 +1509,42 @@ impl DaemonState {
         effects
     }
 
+    fn apply_stage_fresh_launch(
+        &mut self,
+        id: String,
+        backend: String,
+        session_start_credential: Option<String>,
+    ) -> Vec<Effect> {
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return vec![];
+        };
+        if !matches!(session.origin, Origin::Local) {
+            return vec![];
+        }
+
+        // Do this before the backend is respawned: a prior native ID belongs
+        // to the old process and must never be available to the new one.
+        session.metadata.backend = Some(backend);
+        session.metadata.backend_session_id = None;
+        session.metadata.session_start_credential = session_start_credential;
+        session.metadata.opencode_binding = None;
+        let now = chrono::Utc::now();
+        session.metadata.session_incarnation =
+            now.timestamp_nanos_opt().unwrap_or_else(|| now.timestamp());
+        session.registered_at = now.timestamp();
+
+        let mut effects = vec![Effect::Persist];
+        if session.metadata.networked {
+            effects.push(Effect::BroadcastSessionList);
+        }
+        effects
+    }
+
     fn apply_refresh_launch_metadata(
         &mut self,
         id: String,
         expected_incarnation: i64,
+        pane: Option<String>,
         mut metadata: SessionMeta,
     ) -> Vec<Effect> {
         let Some(existing) = self.sessions.get(&id) else {
@@ -1508,9 +1555,11 @@ impl DaemonState {
         {
             return vec![];
         }
-        // A completed SessionStart binding is authoritative. A still-pending
-        // credential is authoritative too, because the hook may arrive after
-        // this refresh. Preserve both values under this same write lock.
+
+        // A completed SessionStart binding is authoritative only when it was
+        // made in this staged incarnation. StageFreshLaunch clears the old
+        // pair first, and the incarnation guard above rejects late finalizers
+        // from an earlier launch.
         if existing.metadata.backend.is_some() && existing.metadata.backend_session_id.is_some() {
             metadata.backend = existing.metadata.backend.clone();
             metadata.backend_session_id = existing.metadata.backend_session_id.clone();
@@ -1518,7 +1567,44 @@ impl DaemonState {
         } else if existing.metadata.session_start_credential.is_some() {
             metadata.session_start_credential = existing.metadata.session_start_credential.clone();
         }
-        self.apply_register(id, existing.pane.clone(), metadata)
+
+        let old_pane = existing.pane.clone();
+        let networked = existing.metadata.networked;
+        metadata.session_incarnation = expected_incarnation;
+        let session = self.sessions.get_mut(&id).expect("session checked above");
+        session.metadata = metadata;
+        session.pane = pane.clone();
+
+        let mut effects = vec![Effect::Persist];
+        if old_pane != pane {
+            if let Some(old_pane) = old_pane {
+                effects.push(Effect::ClearTmuxVar {
+                    pane: old_pane.clone(),
+                    name: "@ouija_session".into(),
+                });
+                effects.push(Effect::EnableAutoRename { pane: old_pane });
+            }
+        }
+        if let Some(pane) = pane {
+            effects.push(Effect::SetTmuxVar {
+                pane: pane.clone(),
+                name: "@ouija_session".into(),
+                value: id.clone(),
+            });
+            effects.push(Effect::SetTmuxVar {
+                pane: pane.clone(),
+                name: "@ouija_id".into(),
+                value: id.clone(),
+            });
+            effects.push(Effect::SpawnAgent {
+                session_id: id.clone(),
+                pane,
+            });
+        }
+        if networked {
+            effects.push(Effect::BroadcastSessionList);
+        }
+        effects
     }
 
     fn apply_register_if_pane_unbound(
@@ -7286,6 +7372,7 @@ mod tests {
         state.apply(Event::RefreshLaunchMetadata {
             id: "codex".into(),
             expected_incarnation: staged_incarnation,
+            pane: Some("%1".into()),
             metadata: SessionMeta {
                 backend: Some("codex-cli".into()),
                 session_start_credential: Some("credential".into()),
@@ -7300,6 +7387,69 @@ mod tests {
             "finalization must not revert a binding that won after staging incarnation {staged_incarnation}"
         );
         assert!(metadata.session_start_credential.is_none());
+    }
+
+    #[test]
+    fn fresh_restart_stages_new_identity_and_finalizes_the_launched_pane() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "codex".into(),
+            pane: Some("%old".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("old-native-id".into()),
+                ..Default::default()
+            },
+        });
+        let old_incarnation = state.sessions["codex"].metadata.session_incarnation;
+
+        state.apply(Event::StageFreshLaunch {
+            id: "codex".into(),
+            backend: "codex-cli".into(),
+            session_start_credential: Some("fresh-proof".into()),
+        });
+        let staged_incarnation = state.sessions["codex"].metadata.session_incarnation;
+        let staged = &state.sessions["codex"].metadata;
+        assert_ne!(staged_incarnation, old_incarnation);
+        assert_eq!(staged.backend.as_deref(), Some("codex-cli"));
+        assert!(staged.backend_session_id.is_none());
+        assert_eq!(
+            staged.session_start_credential.as_deref(),
+            Some("fresh-proof")
+        );
+
+        state.apply(Event::AdoptBackend {
+            id: "codex".into(),
+            backend: "codex-cli".into(),
+            backend_session_id: "fresh-native-id".into(),
+            expected_backend_session_id: None,
+            expected_session_start_credential: Some("fresh-proof".into()),
+        });
+        state.apply(Event::RefreshLaunchMetadata {
+            id: "codex".into(),
+            expected_incarnation: staged_incarnation,
+            pane: Some("%new".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                session_start_credential: Some("fresh-proof".into()),
+                ..Default::default()
+            },
+        });
+        let finalized = &state.sessions["codex"];
+        assert_eq!(finalized.pane.as_deref(), Some("%new"));
+        assert_eq!(
+            finalized.metadata.backend_session_id.as_deref(),
+            Some("fresh-native-id")
+        );
+        assert_eq!(finalized.metadata.session_incarnation, staged_incarnation);
+
+        state.apply(Event::RefreshLaunchMetadata {
+            id: "codex".into(),
+            expected_incarnation: old_incarnation,
+            pane: Some("%stale".into()),
+            metadata: SessionMeta::default(),
+        });
+        assert_eq!(state.sessions["codex"].pane.as_deref(), Some("%new"));
     }
 
     #[test]

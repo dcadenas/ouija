@@ -1995,6 +1995,7 @@ pub async fn start_session(
                     crate::daemon_protocol::Event::RefreshLaunchMetadata {
                         id: name.to_string(),
                         expected_incarnation,
+                        pane: registration_pane,
                         metadata: proto_meta,
                     }
                 }
@@ -2430,37 +2431,25 @@ pub async fn restart_session(
         crate::backend::DeliveryMode::HttpApi { .. }
     );
 
-    // Keep the existing pane registered with an empty thread slot and its
-    // pending credential before killing it. Codex can invoke SessionStart as
-    // soon as respawn-pane starts the process, before the later restart
-    // metadata refresh completes.
-    if let Some(session_start_credential) = session_start_credential.clone() {
-        let metadata = {
-            let proto = state.protocol.read().await;
-            proto.sessions.get(name).map(|session| {
-                let mut metadata = session.metadata.clone();
-                metadata.backend = Some("codex-cli".into());
-                metadata.backend_session_id = None;
-                metadata.session_start_credential = Some(session_start_credential);
-                metadata
+    // Every fresh hard restart gets a new incarnation before tmux respawns
+    // the backend. This clears the old native identity and leaves only the
+    // intended backend plus an optional Codex launch credential for the new
+    // process to claim.
+    if fresh && prev_metadata.is_some() {
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::StageFreshLaunch {
+                id: name.to_string(),
+                backend: backend_name.clone(),
+                session_start_credential: session_start_credential.clone(),
             })
-        };
-        if let Some(metadata) = metadata {
-            state
-                .apply_and_execute(crate::daemon_protocol::Event::Register {
-                    id: name.to_string(),
-                    pane: existing_pane.clone(),
-                    metadata,
-                })
-                .await;
-            staged_incarnation = state
-                .protocol
-                .read()
-                .await
-                .sessions
-                .get(name)
-                .map(|session| session.metadata.session_incarnation);
-        }
+            .await;
+        staged_incarnation = state
+            .protocol
+            .read()
+            .await
+            .sessions
+            .get(name)
+            .map(|session| session.metadata.session_incarnation);
     }
 
     // For TuiInjection: pass prompt as CLI arg (same as start_session).
@@ -2852,6 +2841,7 @@ pub async fn restart_session(
                     id: name.to_string(),
                     expected_incarnation: staged_incarnation
                         .unwrap_or(previous.session_incarnation),
+                    pane: Some(pane_id.clone()),
                     metadata: proto_meta,
                 },
                 None => crate::daemon_protocol::Event::Register {
