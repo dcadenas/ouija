@@ -3493,10 +3493,15 @@ pub async fn repair_backend_identity(
         )
         .await;
         let mut protocol = state_for_restart.protocol.write().await;
-        if protocol
-            .sessions
-            .get(&session_id)
-            .is_some_and(|session| session.metadata.backend_repair_reservation == Some(reservation))
+        let bound_by_this_repair = protocol.sessions.get(&session_id).is_some_and(|session| {
+            session.metadata.backend_repair_reservation == Some(reservation)
+                && session.metadata.backend_session_id.is_some()
+                && session.metadata.session_start_credential.is_none()
+        });
+        if !bound_by_this_repair
+            && protocol.sessions.get(&session_id).is_some_and(|session| {
+                session.metadata.backend_repair_reservation == Some(reservation)
+            })
         {
             protocol
                 .sessions
