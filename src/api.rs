@@ -2672,7 +2672,7 @@ pub async fn start_session(
             if let Some(msg) = restart_drops_destructive_intent(&body) {
                 tracing::warn!("{msg}");
             }
-            let (_result, _msg_id) = crate::nostr_transport::restart_session(
+            let (_result, _msg_id, _) = crate::nostr_transport::restart_session(
                 &state2,
                 &body.name,
                 true, // fresh
@@ -2754,7 +2754,7 @@ pub async fn restart_session(
     }
 
     let fresh = body.fresh.unwrap_or(false);
-    let (result, _prompt_msg_id) = crate::nostr_transport::restart_session(
+    let (result, _prompt_msg_id, _) = crate::nostr_transport::restart_session(
         &state,
         &body.name,
         fresh,
@@ -3407,6 +3407,18 @@ pub struct BackendIdentityRepairRequest {
     pub backend: String,
 }
 
+/// The repair coordinator's post-restart state. This is intentionally
+/// separate from the human-facing restart message: a managed Codex launch is
+/// successful while its SessionStart proof is still pending.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepairRestartOutcome {
+    RestartFailed,
+    SessionStartPending,
+    Bound,
+    Inconclusive,
+    Superseded,
+}
+
 pub async fn repair_backend_identity(
     State(state): State<SharedState>,
     Json(body): Json<BackendIdentityRepairRequest>,
@@ -3477,7 +3489,7 @@ pub async fn repair_backend_identity(
     let session_id = body.session_id.clone();
     let backend_for_restart = backend.clone();
     tokio::spawn(async move {
-        let (result, _) = crate::nostr_transport::restart_session(
+        let (result, _, restart_outcome) = crate::nostr_transport::restart_session(
             &state_for_restart,
             &session_id,
             true,
@@ -3493,24 +3505,34 @@ pub async fn repair_backend_identity(
         )
         .await;
         let mut protocol = state_for_restart.protocol.write().await;
-        let bound_by_this_repair = protocol.sessions.get(&session_id).is_some_and(|session| {
-            session.metadata.backend_repair_reservation == Some(reservation)
-                && session.metadata.backend_session_id.is_some()
-                && session.metadata.session_start_credential.is_none()
-        });
-        if !bound_by_this_repair
-            && protocol.sessions.get(&session_id).is_some_and(|session| {
-                session.metadata.backend_repair_reservation == Some(reservation)
-            })
-        {
-            protocol
-                .sessions
-                .get_mut(&session_id)
-                .expect("session checked above")
-                .metadata
-                .backend_repair_reservation = None;
-        }
-        tracing::info!(session = %session_id, backend = %backend_for_restart, %result, "legacy backend repair fresh relaunch completed");
+        let repair_outcome = match protocol.sessions.get_mut(&session_id) {
+            None => RepairRestartOutcome::Superseded,
+            Some(session) if session.metadata.restart_generation != reservation => {
+                RepairRestartOutcome::Superseded
+            }
+            Some(session)
+                if session.metadata.backend_repair_reservation.is_none()
+                    && session.metadata.backend.is_some()
+                    && session.metadata.backend_session_id.is_some() =>
+            {
+                RepairRestartOutcome::Bound
+            }
+            Some(session) if session.metadata.backend_repair_reservation != Some(reservation) => {
+                RepairRestartOutcome::Superseded
+            }
+            Some(session) if restart_outcome == crate::nostr_transport::RestartOutcome::Failed => {
+                // This is the only clearing path outside an atomic bind/final
+                // commit: the failure is definite and still belongs to this
+                // reservation's staged generation.
+                session.metadata.backend_repair_reservation = None;
+                RepairRestartOutcome::RestartFailed
+            }
+            Some(session) if session.metadata.session_start_credential.is_some() => {
+                RepairRestartOutcome::SessionStartPending
+            }
+            Some(_) => RepairRestartOutcome::Inconclusive,
+        };
+        tracing::info!(session = %session_id, backend = %backend_for_restart, %result, ?restart_outcome, ?repair_outcome, "legacy backend repair fresh relaunch completed");
     });
     (
         StatusCode::ACCEPTED,

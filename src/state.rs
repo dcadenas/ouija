@@ -1162,7 +1162,7 @@ impl AppState {
                     let from = from.clone();
                     let expects_reply = *expects_reply;
                     tokio::spawn(async move {
-                        let (result, _prompt_msg_id) = crate::nostr_transport::restart_session(
+                        let (result, _prompt_msg_id, _) = crate::nostr_transport::restart_session(
                             &state,
                             &name,
                             fresh,

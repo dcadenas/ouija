@@ -2155,6 +2155,15 @@ pub async fn start_session(
     }
 }
 
+/// The terminal result of a restart attempt. Callers that coordinate other
+/// state transitions must use this typed value rather than infer success from
+/// the human-facing status message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestartOutcome {
+    Restarted,
+    Failed,
+}
+
 /// Kill and restart a session, preserving metadata unless `fresh`.
 #[allow(clippy::too_many_arguments)]
 pub async fn restart_session(
@@ -2170,7 +2179,7 @@ pub async fn restart_session(
     reminder: Option<&str>,
     parent_session_override: ParentSessionOverride,
     idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
-) -> (String, Option<u64>) {
+) -> (String, Option<u64>, RestartOutcome) {
     // Snapshot full metadata before killing so we can carry it forward
     let session = state.protocol.read().await.sessions.get(name).cloned();
     let prev_metadata = session.as_ref().map(|s| s.metadata.clone());
@@ -2182,7 +2191,7 @@ pub async fn restart_session(
     let backend = match backend {
         Some(b) => match state.backends.get_required(b) {
             Ok(backend) => backend,
-            Err(message) => return (message, None),
+            Err(message) => return (message, None, RestartOutcome::Failed),
         },
         None => {
             // Fall back to the existing session's backend
@@ -2262,7 +2271,7 @@ pub async fn restart_session(
                 // soft_restart_session writes backend_session_id + model +
                 // effort atomically under one lock before delivering, so the
                 // caller does not need a second write here.
-                return result;
+                return (result.0, result.1, RestartOutcome::Restarted);
             }
             tracing::info!("soft restart failed for '{name}', falling back to hard restart");
         }
@@ -2358,6 +2367,7 @@ pub async fn restart_session(
                     return (
                         format!("could not stage Codex launch credential: {error}"),
                         None,
+                        RestartOutcome::Failed,
                     );
                 }
             },
@@ -2627,10 +2637,18 @@ pub async fn restart_session(
                 match launch_result {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        return (format!("restart failed: {error}"), None);
+                        return (
+                            format!("restart failed: {error}"),
+                            None,
+                            RestartOutcome::Failed,
+                        );
                     }
                     Err(error) => {
-                        return (format!("restart failed: {error}"), None);
+                        return (
+                            format!("restart failed: {error}"),
+                            None,
+                            RestartOutcome::Failed,
+                        );
                     }
                 }
             }
@@ -2749,6 +2767,7 @@ pub async fn restart_session(
                         "restart failed: OpenCode attach setup failed for '{name}' (pane {pane_id})"
                     ),
                     None,
+                    RestartOutcome::Failed,
                 );
             }
 
@@ -2896,10 +2915,11 @@ pub async fn restart_session(
             (
                 format!("restarted '{name}' in {dir} (pane {pane_id})"),
                 prompt_msg_id,
+                RestartOutcome::Restarted,
             )
         }
-        Ok(Err(e)) => (format!("restart failed: {e}"), None),
-        Err(e) => (format!("restart failed: {e}"), None),
+        Ok(Err(e)) => (format!("restart failed: {e}"), None, RestartOutcome::Failed),
+        Err(e) => (format!("restart failed: {e}"), None, RestartOutcome::Failed),
     }
 }
 
@@ -3364,6 +3384,9 @@ async fn apply_soft_restart_metadata(
     session.metadata.opencode_binding =
         Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged);
     session.metadata.restart_generation = session.metadata.restart_generation.saturating_add(1);
+    if session.metadata.backend_repair_reservation == Some(session.metadata.restart_generation) {
+        session.metadata.backend_repair_reservation = None;
+    }
     if let Some(r) = update.reminder {
         session.metadata.reminder = Some(r.to_string());
     }

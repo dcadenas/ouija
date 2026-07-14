@@ -1528,6 +1528,7 @@ impl DaemonState {
         session.metadata.backend_session_id = None;
         session.metadata.session_start_credential = session_start_credential;
         session.metadata.opencode_binding = None;
+        session.metadata.restart_generation = session.metadata.restart_generation.saturating_add(1);
         let now = chrono::Utc::now();
         session.metadata.session_incarnation =
             now.timestamp_nanos_opt().unwrap_or_else(|| now.timestamp());
@@ -1567,6 +1568,17 @@ impl DaemonState {
         } else if existing.metadata.session_start_credential.is_some() {
             metadata.session_start_credential = existing.metadata.session_start_credential.clone();
         }
+        // The staged launch owns both of these values. A finalizer was built
+        // from a pre-stage snapshot, so it must not restore an already
+        // completed repair reservation or roll back the generation.
+        metadata.restart_generation = existing.metadata.restart_generation;
+        metadata.backend_repair_reservation = existing.metadata.backend_repair_reservation;
+        if metadata.backend.is_some()
+            && metadata.backend_session_id.is_some()
+            && metadata.backend_repair_reservation == Some(metadata.restart_generation)
+        {
+            metadata.backend_repair_reservation = None;
+        }
 
         let old_pane = existing.pane.clone();
         let networked = existing.metadata.networked;
@@ -1583,6 +1595,9 @@ impl DaemonState {
                     name: "@ouija_session".into(),
                 });
                 effects.push(Effect::EnableAutoRename { pane: old_pane });
+                effects.push(Effect::StopAgent {
+                    session_id: id.clone(),
+                });
             }
         }
         if let Some(pane) = pane {
@@ -2288,6 +2303,10 @@ impl DaemonState {
         session.metadata.backend = Some(identity.backend.clone());
         session.metadata.backend_session_id = Some(identity.session_id.clone());
         session.metadata.session_start_credential = None;
+        if session.metadata.backend_repair_reservation == Some(session.metadata.restart_generation)
+        {
+            session.metadata.backend_repair_reservation = None;
+        }
         let mut effects = vec![Effect::Persist];
         if session.metadata.networked {
             effects.push(Effect::BroadcastSessionList);
@@ -7450,6 +7469,63 @@ mod tests {
             metadata: SessionMeta::default(),
         });
         assert_eq!(state.sessions["codex"].pane.as_deref(), Some("%new"));
+    }
+
+    #[test]
+    fn credentialed_bind_completes_matching_repair_reservation_atomically() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "codex".into(),
+            pane: None,
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                session_start_credential: Some("repair-proof".into()),
+                backend_repair_reservation: Some(7),
+                restart_generation: 7,
+                ..Default::default()
+            },
+        });
+
+        let result = state.bind_backend_identity(
+            "codex",
+            &backend_identity("codex-cli", "new-thread"),
+            Some("repair-proof"),
+        );
+
+        assert!(matches!(
+            result.outcome,
+            BackendIdentityBindOutcome::Bound { .. }
+        ));
+        let metadata = &state.sessions["codex"].metadata;
+        assert_eq!(metadata.backend_session_id.as_deref(), Some("new-thread"));
+        assert!(metadata.session_start_credential.is_none());
+        assert!(metadata.backend_repair_reservation.is_none());
+    }
+
+    #[test]
+    fn fresh_launch_staging_advances_to_the_reserved_restart_generation() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "legacy".into(),
+            pane: None,
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                restart_generation: 6,
+                backend_repair_reservation: Some(7),
+                ..Default::default()
+            },
+        });
+
+        state.apply(Event::StageFreshLaunch {
+            id: "legacy".into(),
+            backend: "codex-cli".into(),
+            session_start_credential: Some("proof".into()),
+        });
+
+        let metadata = &state.sessions["legacy"].metadata;
+        assert_eq!(metadata.restart_generation, 7);
+        assert_eq!(metadata.backend_repair_reservation, Some(7));
+        assert_eq!(metadata.session_start_credential.as_deref(), Some("proof"));
     }
 
     #[test]
