@@ -3530,9 +3530,9 @@ pub async fn repair_backend_identity(
 /// 1. Direct lookup by `backend_session_id` — hub-spawned sessions and any
 ///    previously-adopted session already have this bound.
 /// 2. Adoption — query opencode serve for the session's directory, then
-///    look for a pre-existing local ouija session in that directory whose
-///    `backend_session_id` is still unset. This handles the case where the
-///    daemon knew about the session before opencode attached a backend ID.
+///    look for a genuinely unbound local ouija session in that directory.
+///    Incomplete legacy metadata is never adopted; it must use explicit
+///    repair instead.
 /// 3. Auto-provision (issue #35) — when the caller is a human/agent starting
 ///    opencode themselves in a fresh directory, there is no pre-existing
 ///    record to adopt. Scan tmux for the opencode pane in that directory and
@@ -3618,110 +3618,128 @@ async fn backend_session_ready_inner_with_hints(
     // Step 1: direct lookup. This runs FIRST regardless of hints — hub-
     // spawned and previously-adopted sessions must win over any hint-derived
     // id, or a stale plugin cwd could shadow the real session.
-    let session_name = {
+    let resolution = {
         let proto = state.protocol.read().await;
-        find_local_session_by_backend_session_id(&proto, &backend_sid).map(|s| s.id.clone())
+        resolve_opencode_backend_identity(&proto, &backend_sid)
     };
-
-    let name = if let Some(n) = session_name {
-        tracing::info!(
-            target: "ouija::api::backend_session_ready",
-            backend_session_id = %backend_sid,
-            session = %n,
-            "ready direct lookup matched existing backend session"
-        );
-        n
-    } else {
-        // Step 2: adoption. Consumes one opencode-serve round-trip internally;
-        // we redo it here in step 3 if adoption misses, since auto-provision
-        // needs the dir too. The double call is intentionally kept to preserve
-        // adoption's existing call signature (and fail-mode coverage) for this
-        // surgical change — dir lookup is a cheap loopback GET.
-        let adopted = adopt_backend_session_id(state, &backend_sid).await;
-
-        if let Some(n) = adopted {
+    let name = match resolution {
+        crate::daemon_protocol::BackendIdentityResolution::Resolved { session_id } => {
+            let n = session_id;
             tracing::info!(
                 target: "ouija::api::backend_session_ready",
                 backend_session_id = %backend_sid,
                 session = %n,
-                "ready adopted backend session into existing ouija session"
+                "ready direct lookup matched existing backend session"
             );
             n
-        } else {
-            // Step 3: auto-provision for ad-hoc opencode sessions (issue #35).
-            let auto_register = state.settings.read().await.auto_register;
-            if !auto_register {
-                tracing::warn!(
-                    target: "ouija::api::backend_session_ready",
-                    "auto_register disabled; declining to auto-provision for backend_session_id {backend_sid}"
-                );
-                return json!({"delivered": false, "error": "no session with this backend_session_id"});
-            }
+        }
+        crate::daemon_protocol::BackendIdentityResolution::IncompleteLegacy { .. } => {
+            return json!({
+                "delivered": false,
+                "outcome": "incomplete_legacy",
+                "error": "legacy backend metadata is incomplete; request an explicit fresh managed repair"
+            });
+        }
+        crate::daemon_protocol::BackendIdentityResolution::Ambiguous { .. } => {
+            return json!({
+                "delivered": false,
+                "outcome": "ambiguous",
+                "error": "multiple Local sessions have this backend identity; repair state before retrying"
+            });
+        }
+        crate::daemon_protocol::BackendIdentityResolution::NotFound => {
+            // Step 2: adoption. Consumes one opencode-serve round-trip internally;
+            // we redo it here in step 3 if adoption misses, since auto-provision
+            // needs the dir too. The double call is intentionally kept to preserve
+            // adoption's existing call signature (and fail-mode coverage) for this
+            // surgical change — dir lookup is a cheap loopback GET.
+            let adopted = adopt_backend_session_id(state, &backend_sid).await;
 
-            // Fast path: plugin sent both pane + cwd. Skip the opencode-serve
-            // round-trip AND the tmux pane scan and use the hints directly.
-            if let (Some(pane), Some(cwd)) = (hints.pane.as_deref(), hints.cwd.as_deref()) {
-                tracing::info!(
-                    target: "ouija::api::backend_session_ready",
-                    backend_session_id = %backend_sid,
-                    pane,
-                    cwd,
-                    "ready trying explicit pane/cwd auto-provision"
-                );
-                if let Some(n) =
-                    auto_provision_with_explicit_pane(state, &backend_sid, pane, cwd).await
-                {
-                    tracing::info!(
-                        target: "ouija::api::backend_session_ready",
-                        backend_session_id = %backend_sid,
-                        session = %n,
-                        "ready explicit auto-provision succeeded"
-                    );
-                    n
-                } else {
-                    tracing::warn!(
-                        target: "ouija::api::backend_session_ready",
-                        backend_session_id = %backend_sid,
-                        pane,
-                        cwd,
-                        "ready explicit auto-provision failed"
-                    );
-                    return json!({"delivered": false, "error": "no session with this backend_session_id"});
-                }
-            } else {
-                // Fallback: resolve dir from opencode serve, then scan tmux.
-                let Some(dir) = lookup_opencode_session_dir(state, &backend_sid).await else {
-                    tracing::warn!(
-                        target: "ouija::api::backend_session_ready",
-                        backend_session_id = %backend_sid,
-                        "ready fallback could not resolve opencode session directory"
-                    );
-                    return json!({"delivered": false, "error": "no session with this backend_session_id"});
-                };
-                tracing::info!(
-                    target: "ouija::api::backend_session_ready",
-                    backend_session_id = %backend_sid,
-                    dir,
-                    "ready trying scan-based auto-provision"
-                );
-
-                let Some(n) = auto_provision_from_backend_session(state, &backend_sid, &dir).await
-                else {
-                    tracing::warn!(
-                        target: "ouija::api::backend_session_ready",
-                        backend_session_id = %backend_sid,
-                        dir,
-                        "ready scan-based auto-provision failed"
-                    );
-                    return json!({"delivered": false, "error": "no session with this backend_session_id"});
-                };
+            if let Some(n) = adopted {
                 tracing::info!(
                     target: "ouija::api::backend_session_ready",
                     backend_session_id = %backend_sid,
                     session = %n,
-                    "ready scan-based auto-provision succeeded"
+                    "ready adopted backend session into existing ouija session"
                 );
                 n
+            } else {
+                // Step 3: auto-provision for ad-hoc opencode sessions (issue #35).
+                let auto_register = state.settings.read().await.auto_register;
+                if !auto_register {
+                    tracing::warn!(
+                        target: "ouija::api::backend_session_ready",
+                        "auto_register disabled; declining to auto-provision for backend_session_id {backend_sid}"
+                    );
+                    return json!({"delivered": false, "error": "no session with this backend_session_id"});
+                }
+
+                // Fast path: plugin sent both pane + cwd. Skip the opencode-serve
+                // round-trip AND the tmux pane scan and use the hints directly.
+                if let (Some(pane), Some(cwd)) = (hints.pane.as_deref(), hints.cwd.as_deref()) {
+                    tracing::info!(
+                        target: "ouija::api::backend_session_ready",
+                        backend_session_id = %backend_sid,
+                        pane,
+                        cwd,
+                        "ready trying explicit pane/cwd auto-provision"
+                    );
+                    if let Some(n) =
+                        auto_provision_with_explicit_pane(state, &backend_sid, pane, cwd).await
+                    {
+                        tracing::info!(
+                            target: "ouija::api::backend_session_ready",
+                            backend_session_id = %backend_sid,
+                            session = %n,
+                            "ready explicit auto-provision succeeded"
+                        );
+                        n
+                    } else {
+                        tracing::warn!(
+                            target: "ouija::api::backend_session_ready",
+                            backend_session_id = %backend_sid,
+                            pane,
+                            cwd,
+                            "ready explicit auto-provision failed"
+                        );
+                        return json!({"delivered": false, "error": "no session with this backend_session_id"});
+                    }
+                } else {
+                    // Fallback: resolve dir from opencode serve, then scan tmux.
+                    let Some(dir) = lookup_opencode_session_dir(state, &backend_sid).await else {
+                        tracing::warn!(
+                            target: "ouija::api::backend_session_ready",
+                            backend_session_id = %backend_sid,
+                            "ready fallback could not resolve opencode session directory"
+                        );
+                        return json!({"delivered": false, "error": "no session with this backend_session_id"});
+                    };
+                    tracing::info!(
+                        target: "ouija::api::backend_session_ready",
+                        backend_session_id = %backend_sid,
+                        dir,
+                        "ready trying scan-based auto-provision"
+                    );
+
+                    let Some(n) =
+                        auto_provision_from_backend_session(state, &backend_sid, &dir).await
+                    else {
+                        tracing::warn!(
+                            target: "ouija::api::backend_session_ready",
+                            backend_session_id = %backend_sid,
+                            dir,
+                            "ready scan-based auto-provision failed"
+                        );
+                        return json!({"delivered": false, "error": "no session with this backend_session_id"});
+                    };
+                    tracing::info!(
+                        target: "ouija::api::backend_session_ready",
+                        backend_session_id = %backend_sid,
+                        session = %n,
+                        "ready scan-based auto-provision succeeded"
+                    );
+                    n
+                }
             }
         }
     };
@@ -3767,8 +3785,15 @@ async fn auto_provision_from_backend_session(
     // the winner's session binds the pane, so the filter would drop it.
     {
         let proto = state.protocol.read().await;
-        if let Some(existing) = find_local_session_by_backend_session_id(&proto, backend_sid) {
-            return Some(existing.id.clone());
+        match resolve_opencode_backend_identity(&proto, backend_sid) {
+            crate::daemon_protocol::BackendIdentityResolution::Resolved { session_id } => {
+                return Some(session_id);
+            }
+            crate::daemon_protocol::BackendIdentityResolution::NotFound => {}
+            crate::daemon_protocol::BackendIdentityResolution::Ambiguous { .. }
+            | crate::daemon_protocol::BackendIdentityResolution::IncompleteLegacy { .. } => {
+                return None;
+            }
         }
     }
 
@@ -3892,8 +3917,15 @@ async fn auto_provision_with_explicit_pane(
     // apply_register's pane-dedup would resolve by evicting them.
     {
         let proto = state.protocol.read().await;
-        if let Some(existing) = find_local_session_by_backend_session_id(&proto, backend_sid) {
-            return Some(existing.id.clone());
+        match resolve_opencode_backend_identity(&proto, backend_sid) {
+            crate::daemon_protocol::BackendIdentityResolution::Resolved { session_id } => {
+                return Some(session_id);
+            }
+            crate::daemon_protocol::BackendIdentityResolution::NotFound => {}
+            crate::daemon_protocol::BackendIdentityResolution::Ambiguous { .. }
+            | crate::daemon_protocol::BackendIdentityResolution::IncompleteLegacy { .. } => {
+                return None;
+            }
         }
     }
 
@@ -4009,8 +4041,15 @@ async fn register_auto_provisioned_session(
     // id, same pane) — stomping their atomic bind.
     let id = {
         let proto = state.protocol.read().await;
-        if let Some(existing) = find_local_session_by_backend_session_id(&proto, backend_sid) {
-            return Some(existing.id.clone());
+        match resolve_opencode_backend_identity(&proto, backend_sid) {
+            crate::daemon_protocol::BackendIdentityResolution::Resolved { session_id } => {
+                return Some(session_id);
+            }
+            crate::daemon_protocol::BackendIdentityResolution::NotFound => {}
+            crate::daemon_protocol::BackendIdentityResolution::Ambiguous { .. }
+            | crate::daemon_protocol::BackendIdentityResolution::IncompleteLegacy { .. } => {
+                return None;
+            }
         }
         let id_to_pane: std::collections::HashMap<String, Option<String>> = proto
             .sessions
@@ -4063,20 +4102,26 @@ fn auto_provision_register_result(
             crate::daemon_protocol::Effect::RegisterFailed { session_id, .. } if session_id == id
         )
     }) {
-        find_local_session_by_backend_session_id(proto, backend_sid)
-            .map(|session| session.id.clone())
+        match resolve_opencode_backend_identity(proto, backend_sid) {
+            crate::daemon_protocol::BackendIdentityResolution::Resolved { session_id } => {
+                Some(session_id)
+            }
+            crate::daemon_protocol::BackendIdentityResolution::NotFound
+            | crate::daemon_protocol::BackendIdentityResolution::Ambiguous { .. }
+            | crate::daemon_protocol::BackendIdentityResolution::IncompleteLegacy { .. } => None,
+        }
     } else {
         None
     }
 }
 
-fn find_local_session_by_backend_session_id<'a>(
-    proto: &'a crate::daemon_protocol::DaemonState,
+fn resolve_opencode_backend_identity(
+    proto: &crate::daemon_protocol::DaemonState,
     backend_sid: &str,
-) -> Option<&'a crate::daemon_protocol::SessionEntry> {
-    proto.sessions.values().find(|s| {
-        matches!(s.origin, crate::daemon_protocol::Origin::Local)
-            && s.metadata.backend_session_id.as_deref() == Some(backend_sid)
+) -> crate::daemon_protocol::BackendIdentityResolution {
+    proto.resolve_backend_identity(&crate::backend::BackendSessionIdentity {
+        backend: "opencode".into(),
+        session_id: backend_sid.into(),
     })
 }
 
@@ -4227,8 +4272,8 @@ async fn adopt_backend_session_id(
         "adoption resolved opencode session directory"
     );
 
-    // Collect ALL local ouija sessions matching this directory that lack a
-    // backend_session_id (issue #15). Silently picking the first match — as
+    // Collect ALL genuinely unbound local ouija sessions matching this
+    // directory (issue #15). Silently picking the first match — as
     // the original implementation did — lets an adopt for session A clobber
     // the metadata of unrelated session B when both live in the same dir
     // (hashbrown iteration order is effectively random). Fail closed on
@@ -4241,9 +4286,9 @@ async fn adopt_backend_session_id(
             .filter(|s| {
                 matches!(s.origin, crate::daemon_protocol::Origin::Local)
                     && s.metadata.project_dir.as_deref() == Some(dir.as_str())
+                    && s.metadata.backend.is_none()
                     && s.metadata.backend_session_id.is_none()
                     && s.metadata.session_start_credential.is_none()
-                    && matches!(s.metadata.backend.as_deref(), None | Some("opencode"))
             })
             .map(|s| s.id.clone())
             .collect()
@@ -4271,16 +4316,15 @@ async fn adopt_backend_session_id(
             expected_session_start_credential: None,
         })
         .await;
-    let committed = state
-        .protocol
-        .read()
-        .await
-        .sessions
-        .get(&session_id)
-        .is_some_and(|session| {
-            session.metadata.backend.as_deref() == Some("opencode")
-                && session.metadata.backend_session_id.as_deref() == Some(backend_sid)
-        });
+    let committed = {
+        let proto = state.protocol.read().await;
+        matches!(
+            resolve_opencode_backend_identity(&proto, backend_sid),
+            crate::daemon_protocol::BackendIdentityResolution::Resolved {
+                session_id: ref resolved_id
+            } if resolved_id == &session_id
+        )
+    };
     committed.then_some(session_id)
 }
 
@@ -8152,6 +8196,62 @@ mod tests {
             Some("prebound"),
             "direct lookup must surface the session id, got: {response}"
         );
+    }
+
+    #[tokio::test]
+    async fn backend_session_ready_does_not_match_a_different_backend_with_same_native_id() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "codex-owner".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    backend_session_id: Some("shared-native-id".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let response = backend_session_ready_inner(&state, "shared-native-id".into()).await;
+
+        assert!(response.get("session").is_none(), "got: {response}");
+        assert_eq!(response["delivered"], false);
+        assert_eq!(
+            state.protocol.read().await.sessions["codex-owner"]
+                .metadata
+                .backend
+                .as_deref(),
+            Some("codex-cli")
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_session_ready_rejects_both_incomplete_legacy_identity_forms() {
+        for metadata in [
+            crate::daemon_protocol::SessionMeta {
+                backend: Some("opencode".into()),
+                ..Default::default()
+            },
+            crate::daemon_protocol::SessionMeta {
+                backend_session_id: Some("legacy-native-id".into()),
+                ..Default::default()
+            },
+        ] {
+            let state = crate::state::AppState::new_for_test();
+            state
+                .apply_and_execute(crate::daemon_protocol::Event::Register {
+                    id: "legacy".into(),
+                    pane: Some("%17".into()),
+                    metadata,
+                })
+                .await;
+
+            let response = backend_session_ready_inner(&state, "legacy-native-id".into()).await;
+
+            assert_eq!(response["outcome"], "incomplete_legacy", "got: {response}");
+            assert!(response.get("session").is_none(), "got: {response}");
+        }
     }
 
     #[tokio::test]
