@@ -5,17 +5,21 @@
 # the environment. This hook does NOT unregister — cleanup relies on pane/process
 # liveness.
 PAYLOAD=$(cat)
-LAUNCH_SESSION_ID="${OUIJA_SESSION_ID:-}"
-LAUNCH_CREDENTIAL="${OUIJA_SESSION_START_CREDENTIAL:-}"
-LAUNCH_CREDENTIAL_FILE=""
+# The globally installed static hook may execute in an app-server that inherited
+# another launch's environment. Managed proof is accepted only from the explicit
+# session-flags arguments below; static hooks start with no managed proof.
+LAUNCH_SESSION_ID=""
+LAUNCH_CREDENTIAL=""
+EXPLICIT_LAUNCH_SESSION_ID=""
+EXPLICIT_LAUNCH_CREDENTIAL_FILE=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --launch-session-id)
-      LAUNCH_SESSION_ID="${2:-}"
+      EXPLICIT_LAUNCH_SESSION_ID="${2:-}"
       shift 2
       ;;
     --launch-credential-file)
-      LAUNCH_CREDENTIAL_FILE="${2:-}"
+      EXPLICIT_LAUNCH_CREDENTIAL_FILE="${2:-}"
       shift 2
       ;;
     *)
@@ -27,15 +31,18 @@ done
 # command arguments and generated TOML may be observable. Claim the private
 # proof file with an atomic rename, then read and remove only that claimed file.
 # A concurrent duplicate hook cannot read the original path after the rename.
-if [ -n "$LAUNCH_CREDENTIAL_FILE" ]; then
-  CLAIMED_CREDENTIAL_FILE="${LAUNCH_CREDENTIAL_FILE}.$$.claimed"
-  if mv -- "$LAUNCH_CREDENTIAL_FILE" "$CLAIMED_CREDENTIAL_FILE" 2>/dev/null; then
+# A partial flag pair or failed/empty claim leaves *all* managed proof empty.
+if [ -n "$EXPLICIT_LAUNCH_SESSION_ID" ] && [ -n "$EXPLICIT_LAUNCH_CREDENTIAL_FILE" ]; then
+  CLAIMED_CREDENTIAL_FILE="${EXPLICIT_LAUNCH_CREDENTIAL_FILE}.$$.claimed"
+  if mv -- "$EXPLICIT_LAUNCH_CREDENTIAL_FILE" "$CLAIMED_CREDENTIAL_FILE" 2>/dev/null; then
     trap 'rm -f -- "$CLAIMED_CREDENTIAL_FILE"' EXIT
-    LAUNCH_CREDENTIAL=$(cat -- "$CLAIMED_CREDENTIAL_FILE" 2>/dev/null)
+    CLAIMED_CREDENTIAL=$(cat -- "$CLAIMED_CREDENTIAL_FILE" 2>/dev/null)
     rm -f -- "$CLAIMED_CREDENTIAL_FILE"
     trap - EXIT
-  else
-    LAUNCH_CREDENTIAL=""
+    if [ -n "$CLAIMED_CREDENTIAL" ]; then
+      LAUNCH_SESSION_ID="$EXPLICIT_LAUNCH_SESSION_ID"
+      LAUNCH_CREDENTIAL="$CLAIMED_CREDENTIAL"
+    fi
   fi
 fi
 PANE="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}' 2>/dev/null)}"

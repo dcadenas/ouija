@@ -895,6 +895,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paneless_session_start_rejects_payload_b_with_incomplete_ambient_a_fields() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "launch-a".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    session_start_credential: Some("proof-a".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        // This represents thread B's payload after the static hook has
+        // discarded inherited launch-A credential material. A launch id alone
+        // cannot select the paneless managed binding path.
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: String::new(),
+                cwd: "/same-checkout".into(),
+                backend_session_id: Some("thread-b".into()),
+                backend_identity: Some(crate::backend::BackendSessionIdentity {
+                    backend: "codex-cli".into(),
+                    session_id: "thread-b".into(),
+                }),
+                adapter: Some("codex-cli".into()),
+                launch_session_id: Some("launch-a".into()),
+                launch_credential: None,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            result["skipped"],
+            "paneless SessionStart requires backend identity, launch session id, and launch credential"
+        );
+        assert!(
+            state.protocol.read().await.sessions["launch-a"]
+                .metadata
+                .backend_session_id
+                .is_none(),
+            "thread B must not bind launch A without an explicit credential"
+        );
+    }
+
+    #[tokio::test]
     async fn paneless_session_start_cannot_claim_a_same_checkout_sibling_launch() {
         let state = crate::state::AppState::new_for_test();
         for (id, credential) in [("worker-a", "proof-a"), ("worker-b", "proof-b")] {

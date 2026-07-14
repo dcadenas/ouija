@@ -150,7 +150,53 @@ assert_contains "register without pane" "$result" '"registered":"no-pane"'
 # Clean up
 api "$BASE" POST /api/remove -d '{"id":"no-pane"}' >/dev/null
 
-log "Test 10d: Register with bulletin"
+log "Test 10d: Codex static hook does not forward ambient managed proof"
+CODEX_REGISTER_SCRIPT=$(find_script "codex/codex-register.sh")
+CODEX_HOOK_PROBE=/tmp/codex-hook-probe
+rm -rf "$CODEX_HOOK_PROBE"
+mkdir -p "$CODEX_HOOK_PROBE/bin"
+cat > "$CODEX_HOOK_PROBE/bin/curl" <<'EOF'
+#!/bin/bash
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -d) printf '%s' "$2" > "$CODEX_HOOK_CAPTURE"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+printf '{"output":""}'
+EOF
+chmod +x "$CODEX_HOOK_PROBE/bin/curl"
+CODEX_PROBE_CWD=$(tmux display-message -p '#{pane_current_path}' 2>/dev/null || pwd)
+CODEX_PROBE_PAYLOAD=$(jq -cn --arg cwd "$CODEX_PROBE_CWD" --arg id "thread-b" \
+    '{cwd:$cwd,session_id:$id}')
+printf '%s' "$CODEX_PROBE_PAYLOAD" | \
+    env -u TMUX_PANE PATH="$CODEX_HOOK_PROBE/bin:$PATH" \
+        CODEX_HOOK_CAPTURE="$CODEX_HOOK_PROBE/static.json" \
+        OUIJA_SESSION_ID=ambient-launch-a \
+        OUIJA_SESSION_START_CREDENTIAL=ambient-proof-a \
+        bash "$CODEX_REGISTER_SCRIPT" >/dev/null
+assert_eq "10d: static hook omits ambient launch id" \
+    "$(jq -r 'has("launch_session_id")' "$CODEX_HOOK_PROBE/static.json")" "false"
+assert_eq "10d: static hook omits ambient credential" \
+    "$(jq -r 'has("launch_credential")' "$CODEX_HOOK_PROBE/static.json")" "false"
+
+printf '%s' synthetic-proof > "$CODEX_HOOK_PROBE/credential"
+printf '%s' "$CODEX_PROBE_PAYLOAD" | \
+    env -u TMUX_PANE PATH="$CODEX_HOOK_PROBE/bin:$PATH" \
+        CODEX_HOOK_CAPTURE="$CODEX_HOOK_PROBE/explicit.json" \
+        OUIJA_SESSION_ID=ambient-launch-a \
+        OUIJA_SESSION_START_CREDENTIAL=ambient-proof-a \
+        bash "$CODEX_REGISTER_SCRIPT" --launch-session-id explicit-launch-b \
+            --launch-credential-file "$CODEX_HOOK_PROBE/credential" >/dev/null
+assert_eq "10d: explicit hook forwards launch id" \
+    "$(jq -r 'has("launch_session_id")' "$CODEX_HOOK_PROBE/explicit.json")" "true"
+assert_eq "10d: explicit hook forwards claimed credential" \
+    "$(jq -r 'has("launch_credential")' "$CODEX_HOOK_PROBE/explicit.json")" "true"
+assert_eq "10d: explicit hook consumes credential file" \
+    "$([ -e "$CODEX_HOOK_PROBE/credential" ] && echo yes || echo no)" "no"
+rm -rf "$CODEX_HOOK_PROBE"
+
+log "Test 10e: Register with bulletin"
 result=$(api "$BASE" POST /api/register -d "{\"id\":\"bull-sess\",\"pane\":\"$PANE_A\",\"role\":\"tester\",\"bulletin\":\"need help with auth\"}")
 assert_contains "register with bulletin" "$result" '"registered":"bull-sess"'
 bull=$(session_field "$BASE" "bull-sess" "bulletin")
@@ -158,13 +204,13 @@ assert_eq "bulletin in status" "$bull" "need help with auth"
 # Rename back for later tests
 api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/dev/null
 
-log "Test 10e: Update bulletin via API"
+log "Test 10f: Update bulletin via API"
 result=$(api "$BASE" POST /api/sessions/update -d '{"id":"sess-a2","bulletin":"offering Rust help"}')
 assert_contains "update returns bulletin" "$result" '"bulletin":"offering Rust help"'
 bull=$(session_field "$BASE" "sess-a2" "bulletin")
 assert_eq "updated bulletin in status" "$bull" "offering Rust help"
 
-log "Test 10f: REST update sets bulletin"
+log "Test 10g: REST update sets bulletin"
 result=$(api "$BASE" POST /api/sessions/update -d '{"id":"sess-b","bulletin":"can review PRs"}')
 bull=$(session_field "$BASE" "sess-b" "bulletin")
 assert_eq "bulletin in status" "$bull" "can review PRs"

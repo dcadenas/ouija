@@ -197,6 +197,34 @@ The static installed hook continues to support ordinary and resumed sessions,
 but a paneless first bind without that launch proof fails closed. Resume commands
 do not receive a new credential or replace an established native binding.
 
+### Shared-app-server isolation probe (2026-07-14)
+
+On Codex CLI 0.144.4, a disposable probe started two synthetic threads through
+one app-server process with a trusted static `SessionStart` hook. Each thread's
+first synthetic turn ran the static hook once. The hook received a native thread
+id in its payload and reported both inherited `OUIJA_SESSION_ID` and
+`OUIJA_SESSION_START_CREDENTIAL` as present. The probe recorded only presence
+and source, never ids or credential values. This confirms that a static hook
+can combine thread B's payload identity with launch-A ambient variables when
+the app server was started for A; ambient variables are not evidence that the
+hook belongs to the payload's thread.
+
+Codex listed the static hook first (source `user`, `hooks.json`) and the
+launch-specific configuration second (source `sessionFlags`). The original
+direct app-server probe did not run the session-flags hook because Codex
+reported its trust key as `/<session-flags>/config.toml:session_start:0:0`,
+while the generated state key omitted the leading slash. Ouija now emits that
+exact leading-slash key and locks it with a focused backend test; rerun this
+shared-app-server probe when upgrading Codex because hook source ordering is
+runtime behavior.
+
+The resulting proof boundary is deliberate: the globally installed static hook
+must start with no managed proof and may use only the legacy pane/CWD path.
+Pane-independent binding is reserved for a launch-specific hook that receives
+an explicit public launch id and successfully claims its one-time credential
+file. Neither ambient managed variables nor a failed file claim may supply that
+proof.
+
 ## Repairing incomplete legacy bindings
 
 An old record with only one of `backend` or `backend_session_id` cannot safely
