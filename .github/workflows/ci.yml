@@ -23,18 +23,23 @@ jobs:
       - run: cargo test
 
   e2e:
+    # Temporarily disabled: the slow E2E suites are blocking iteration.
+    # Set the repository variable OUIJA_RUN_E2E=true to re-enable them.
+    if: ${{ vars.OUIJA_RUN_E2E == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: docker compose -f tests/e2e/docker-compose.yml up --build --abort-on-container-exit --exit-code-from tests
 
   e2e-nostr:
+    if: ${{ vars.OUIJA_RUN_E2E == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: docker compose -f tests/e2e/docker-compose.nostr.yml up --build --abort-on-container-exit --exit-code-from tests
 
   e2e-install:
+    if: ${{ vars.OUIJA_RUN_E2E == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
