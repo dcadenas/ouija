@@ -3516,9 +3516,7 @@ pub async fn repair_backend_identity(
         let repair_outcome = match protocol.sessions.get_mut(&session_id) {
             None => RepairRestartOutcome::Superseded,
             Some(session)
-                if session.metadata.restart_generation != reservation.restart_generation
-                    || session.metadata.backend_repair_reservation.as_ref()
-                        != Some(&reservation_for_restart) =>
+                if session.metadata.restart_generation != reservation.restart_generation =>
             {
                 RepairRestartOutcome::Superseded
             }
@@ -3528,6 +3526,12 @@ pub async fn repair_backend_identity(
                     && session.metadata.backend_session_id.is_some() =>
             {
                 RepairRestartOutcome::Bound
+            }
+            Some(session)
+                if session.metadata.backend_repair_reservation.as_ref()
+                    != Some(&reservation_for_restart) =>
+            {
+                RepairRestartOutcome::Superseded
             }
             Some(session) if restart_outcome == crate::nostr_transport::RestartOutcome::Failed => {
                 // This is the only clearing path outside an atomic bind/final
@@ -7464,13 +7468,9 @@ mod tests {
         *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/project", "%17")];
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(
-            state.pending_prompts.lock().unwrap().get("oc"),
-            Some(&pending_opencode_prompt(
-                "%17",
-                "queued prompt",
-                "ses_ready"
-            ))
+        assert!(
+            !state.pending_prompts.lock().unwrap().contains_key("oc"),
+            "the retry may deliver after the original pane and immutable backend pair return"
         );
         server.abort();
     }
@@ -7763,15 +7763,20 @@ mod tests {
             pending_opencode_prompt("%17", "queued prompt", "ses_old"),
         );
         state
-            .apply_and_execute(crate::daemon_protocol::Event::Register {
+            .apply_and_execute(crate::daemon_protocol::Event::StageFreshLaunch {
                 id: "oc".into(),
-                pane: Some("%17".into()),
-                metadata: crate::daemon_protocol::SessionMeta {
-                    backend: Some("opencode".into()),
-                    backend_session_id: Some("ses_new".into()),
-                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
-                    ..Default::default()
-                },
+                backend: "opencode".into(),
+                session_start_credential: None,
+                expected_repair_reservation: None,
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::AdoptBackend {
+                id: "oc".into(),
+                backend: "opencode".into(),
+                backend_session_id: "ses_new".into(),
+                expected_backend_session_id: None,
+                expected_session_start_credential: None,
             })
             .await;
 
@@ -7853,15 +7858,20 @@ mod tests {
         });
         gate.started.notified().await;
         state
-            .apply_and_execute(crate::daemon_protocol::Event::Register {
+            .apply_and_execute(crate::daemon_protocol::Event::StageFreshLaunch {
                 id: "oc".into(),
-                pane: Some("%17".into()),
-                metadata: crate::daemon_protocol::SessionMeta {
-                    backend: Some("opencode".into()),
-                    backend_session_id: Some("ses_new".into()),
-                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
-                    ..Default::default()
-                },
+                backend: "opencode".into(),
+                session_start_credential: None,
+                expected_repair_reservation: None,
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::AdoptBackend {
+                id: "oc".into(),
+                backend: "opencode".into(),
+                backend_session_id: "ses_new".into(),
+                expected_backend_session_id: None,
+                expected_session_start_credential: None,
             })
             .await;
         gate.release.notify_one();

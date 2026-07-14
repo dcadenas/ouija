@@ -558,25 +558,40 @@ async fn session_start_inner(
                     let proto = state.protocol.read().await;
                     proto.sessions.get(&existing_id).and_then(|session| {
                         match session.metadata.backend_session_id.as_deref() {
-                            None => {
-                                let mut metadata = session.metadata.clone();
-                                metadata.backend_session_id = Some(backend_session_id.clone());
-                                Some(Ok(metadata))
-                            }
+                            None => Some(Ok(())),
                             Some(existing) if existing == backend_session_id => None,
                             Some(_) => Some(Err(())),
                         }
                     })
                 };
                 match binding {
-                    Some(Ok(metadata)) => {
+                    Some(Ok(())) => {
+                        let backend = existing_backend
+                            .as_deref()
+                            .expect("proven existing-pane binding has a backend")
+                            .to_string();
                         state
-                            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                            .apply_and_execute(crate::daemon_protocol::Event::AdoptBackend {
                                 id: existing_id.clone(),
-                                pane: Some(body.pane.clone()),
-                                metadata,
+                                backend,
+                                backend_session_id: backend_session_id.clone(),
+                                expected_backend_session_id: None,
+                                expected_session_start_credential: None,
                             })
                             .await;
+                        let claimed = {
+                            let proto = state.protocol.read().await;
+                            proto.sessions.get(&existing_id).is_some_and(|session| {
+                                session.metadata.backend_session_id.as_deref()
+                                    == Some(backend_session_id.as_str())
+                            })
+                        };
+                        if !claimed {
+                            return json!({
+                                "skipped": "existing pane backend session ID mismatch",
+                                "output": "",
+                            });
+                        }
                     }
                     Some(Err(())) => {
                         tracing::warn!(
