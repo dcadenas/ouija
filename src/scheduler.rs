@@ -1242,10 +1242,11 @@ async fn rollback_staged_fresh_launch(
     state
         .apply_and_execute(crate::daemon_protocol::Event::RollbackFreshLaunch {
             id: session_id.to_string(),
-            pane: pane_id.to_string(),
-            credential: credential.to_string(),
+            pane: Some(pane_id.to_string()),
+            credential: Some(credential.to_string()),
             staged_incarnation,
-            previous: previous.clone(),
+            previous: Some(previous.clone()),
+            provisional_pane: None,
         })
         .await;
 }

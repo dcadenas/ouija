@@ -2166,6 +2166,34 @@ pub enum RestartOutcome {
     Superseded,
 }
 
+/// Recover an interactive fresh launch that definitely failed before the
+/// backend command could start. The protocol guards make this a no-op when a
+/// concurrent SessionStart has already consumed the credential and bound the
+/// new backend identity.
+async fn recover_failed_fresh_launch(
+    state: &std::sync::Arc<AppState>,
+    id: &str,
+    pane: Option<String>,
+    credential: Option<String>,
+    staged_incarnation: Option<i64>,
+    previous: Option<crate::daemon_protocol::SessionEntry>,
+    provisional_pane: Option<String>,
+) {
+    let Some(staged_incarnation) = staged_incarnation else {
+        return;
+    };
+    state
+        .apply_and_execute(crate::daemon_protocol::Event::RollbackFreshLaunch {
+            id: id.to_string(),
+            pane,
+            credential,
+            staged_incarnation,
+            previous,
+            provisional_pane,
+        })
+        .await;
+}
+
 /// Kill and restart a session, preserving metadata unless `fresh`.
 #[allow(clippy::too_many_arguments)]
 pub async fn restart_session(
@@ -2200,6 +2228,7 @@ pub async fn restart_session(
         );
     }
     let mut staged_incarnation = prev_metadata.as_ref().map(|m| m.session_incarnation);
+    let mut fresh_launch_staged_incarnation = None;
 
     // Capture existing pane before killing
     let existing_pane = session.as_ref().and_then(|s| s.pane.clone());
@@ -2473,6 +2502,7 @@ pub async fn restart_session(
         {
             crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
                 staged_incarnation = Some(incarnation);
+                fresh_launch_staged_incarnation = Some(incarnation);
             }
             crate::daemon_protocol::StageFreshLaunchOutcome::Rejected => {
                 return (
@@ -2615,6 +2645,7 @@ pub async fn restart_session(
                 {
                     crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
                         staged_incarnation = Some(incarnation);
+                        fresh_launch_staged_incarnation = Some(incarnation);
                     }
                     crate::daemon_protocol::StageFreshLaunchOutcome::Rejected => {
                         cleanup_provisional_start(state, name, &pane_id).await;
@@ -2662,6 +2693,7 @@ pub async fn restart_session(
                         .sessions
                         .get(name)
                         .map(|session| session.metadata.session_incarnation);
+                    fresh_launch_staged_incarnation = staged_incarnation;
                 }
 
                 let pane_for_launch = pane_id.clone();
@@ -2685,6 +2717,20 @@ pub async fn restart_session(
                 match launch_result {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
+                        let staged_pane = session_start_credential
+                            .as_ref()
+                            .map(|_| pane_id.clone())
+                            .or_else(|| existing_pane.clone());
+                        recover_failed_fresh_launch(
+                            state,
+                            name,
+                            staged_pane,
+                            session_start_credential.clone(),
+                            fresh_launch_staged_incarnation,
+                            session.clone(),
+                            Some(pane_id.clone()),
+                        )
+                        .await;
                         return (
                             format!("restart failed: {error}"),
                             None,
@@ -2692,6 +2738,20 @@ pub async fn restart_session(
                         );
                     }
                     Err(error) => {
+                        let staged_pane = session_start_credential
+                            .as_ref()
+                            .map(|_| pane_id.clone())
+                            .or_else(|| existing_pane.clone());
+                        recover_failed_fresh_launch(
+                            state,
+                            name,
+                            staged_pane,
+                            session_start_credential.clone(),
+                            fresh_launch_staged_incarnation,
+                            session.clone(),
+                            Some(pane_id.clone()),
+                        )
+                        .await;
                         return (
                             format!("restart failed: {error}"),
                             None,
@@ -2966,8 +3026,32 @@ pub async fn restart_session(
                 RestartOutcome::Restarted,
             )
         }
-        Ok(Err(e)) => (format!("restart failed: {e}"), None, RestartOutcome::Failed),
-        Err(e) => (format!("restart failed: {e}"), None, RestartOutcome::Failed),
+        Ok(Err(e)) => {
+            recover_failed_fresh_launch(
+                state,
+                name,
+                existing_pane,
+                session_start_credential,
+                fresh_launch_staged_incarnation,
+                session,
+                None,
+            )
+            .await;
+            (format!("restart failed: {e}"), None, RestartOutcome::Failed)
+        }
+        Err(e) => {
+            recover_failed_fresh_launch(
+                state,
+                name,
+                existing_pane,
+                session_start_credential,
+                fresh_launch_staged_incarnation,
+                session,
+                None,
+            )
+            .await;
+            (format!("restart failed: {e}"), None, RestartOutcome::Failed)
+        }
     }
 }
 
@@ -4965,6 +5049,175 @@ pub(crate) fn opencode_prompt_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_respawn_and_fallback_creation_restore_the_staged_identity() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "restart".into(),
+                pane: Some("%original".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    backend_session_id: Some("thread-old".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let previous = state.protocol.read().await.sessions["restart"].clone();
+        let crate::daemon_protocol::StageFreshLaunchOutcome::Staged {
+            incarnation: staged_incarnation,
+        } = state
+            .stage_fresh_launch("restart", "codex-cli".into(), Some("proof".into()), None)
+            .await
+        else {
+            panic!("stage must be accepted");
+        };
+
+        recover_failed_fresh_launch(
+            &state,
+            "restart",
+            Some("%original".into()),
+            Some("proof".into()),
+            Some(staged_incarnation),
+            Some(previous.clone()),
+            None,
+        )
+        .await;
+
+        assert_eq!(state.protocol.read().await.sessions["restart"], previous);
+    }
+
+    #[tokio::test]
+    async fn failed_fallback_send_keys_restores_paneless_stage_and_cleans_fallback() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "restart".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    backend_session_id: Some("thread-old".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let previous = state.protocol.read().await.sessions["restart"].clone();
+        let crate::daemon_protocol::StageFreshLaunchOutcome::Staged {
+            incarnation: staged_incarnation,
+        } = state
+            .stage_fresh_launch("restart", "claude-code".into(), None, None)
+            .await
+        else {
+            panic!("stage must be accepted");
+        };
+
+        recover_failed_fresh_launch(
+            &state,
+            "restart",
+            None,
+            None,
+            Some(staged_incarnation),
+            Some(previous.clone()),
+            Some("%fallback".into()),
+        )
+        .await;
+
+        assert_eq!(state.protocol.read().await.sessions["restart"], previous);
+    }
+
+    #[tokio::test]
+    async fn fallback_creation_failure_without_a_stage_is_a_noop() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "restart".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend_session_id: Some("thread-old".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let previous = state.protocol.read().await.sessions["restart"].clone();
+
+        recover_failed_fresh_launch(
+            &state,
+            "restart",
+            None,
+            None,
+            None,
+            Some(previous.clone()),
+            None,
+        )
+        .await;
+
+        assert_eq!(state.protocol.read().await.sessions["restart"], previous);
+    }
+
+    #[tokio::test]
+    async fn failed_fallback_launch_preserves_a_concurrent_session_start() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "restart".into(),
+                pane: Some("%original".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    backend_session_id: Some("thread-old".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let previous = state.protocol.read().await.sessions["restart"].clone();
+        let stage_outcome = state
+            .stage_fresh_launch("restart", "codex-cli".into(), Some("proof".into()), None)
+            .await;
+        assert!(matches!(
+            stage_outcome,
+            crate::daemon_protocol::StageFreshLaunchOutcome::Staged { .. }
+        ));
+        let staged_metadata = state.protocol.read().await.sessions["restart"]
+            .metadata
+            .clone();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "restart".into(),
+                pane: Some("%fallback".into()),
+                metadata: staged_metadata,
+            })
+            .await;
+        let staged_incarnation = state.protocol.read().await.sessions["restart"]
+            .metadata
+            .session_incarnation;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::AdoptBackend {
+                id: "restart".into(),
+                backend: "codex-cli".into(),
+                backend_session_id: "thread-winner".into(),
+                expected_backend_session_id: None,
+                expected_session_start_credential: Some("proof".into()),
+            })
+            .await;
+
+        recover_failed_fresh_launch(
+            &state,
+            "restart",
+            Some("%fallback".into()),
+            Some("proof".into()),
+            Some(staged_incarnation),
+            Some(previous),
+            Some("%fallback".into()),
+        )
+        .await;
+
+        let retained = state.protocol.read().await.sessions["restart"].clone();
+        assert_eq!(retained.pane.as_deref(), Some("%fallback"));
+        assert_eq!(
+            retained.metadata.backend_session_id.as_deref(),
+            Some("thread-winner")
+        );
+    }
 
     #[tokio::test]
     async fn cleanup_provisional_start_only_removes_its_registered_pane() {
