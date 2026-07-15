@@ -349,19 +349,24 @@ async fn existing_pane_identity_matches(
     true
 }
 
-/// A first backend-thread binding changes durable session ownership, so an
-/// existing pane needs more than matching project paths. The installed adapter
-/// reports its fixed backend name and the daemon injects the launch session id
-/// into managed panes. Both must agree with the registered session before an
-/// empty backend-session slot can be adopted.
+/// Confirm the backend provenance for an existing pane's first thread binding.
+///
+/// A fully unclaimed local pane trusts its live same-host process for the first
+/// binding. Once registration already names a backend, retain the stricter
+/// managed-launch check so incomplete legacy rows cannot be claimed merely by
+/// observing their pane and project.
 async fn existing_pane_binding_provenance_matches(
     state: &std::sync::Arc<crate::state::AppState>,
     pane: &str,
     existing_id: &str,
+    existing_origin: &crate::daemon_protocol::Origin,
     existing_backend: Option<&str>,
     adapter: Option<&str>,
     launch_session_id: Option<&str>,
 ) -> bool {
+    if !matches!(existing_origin, crate::daemon_protocol::Origin::Local) {
+        return false;
+    }
     let Some(adapter) = adapter else {
         return false;
     };
@@ -384,9 +389,59 @@ async fn existing_pane_binding_provenance_matches(
                 .map(|(backend, _)| backend)
         });
 
-    existing_backend == Some(adapter)
-        && live_backend.as_deref() == Some(adapter)
-        && launch_session_id == Some(existing_id)
+    if live_backend.as_deref() != Some(adapter) {
+        return false;
+    }
+
+    existing_backend.is_none()
+        || (existing_backend == Some(adapter) && launch_session_id == Some(existing_id))
+}
+
+/// Confirm that an uncredentialed SessionStart may rotate a complete binding.
+///
+/// This path is deliberately limited to the same host's verified local pane.
+/// Managed launches carry a credential and keep their immutable first-bind
+/// semantics; paneless and remote sessions never reach this path.
+async fn existing_local_pane_rebinding_provenance_matches(
+    state: &std::sync::Arc<crate::state::AppState>,
+    pane: &str,
+    existing_origin: &crate::daemon_protocol::Origin,
+    existing_backend: Option<&str>,
+    adapter: Option<&str>,
+    launch_session_id: Option<&str>,
+    launch_credential: Option<&str>,
+) -> bool {
+    if !matches!(existing_origin, crate::daemon_protocol::Origin::Local)
+        || launch_session_id.is_some()
+        || launch_credential.is_some()
+    {
+        return false;
+    }
+    let Some(adapter) = adapter else {
+        return false;
+    };
+    if existing_backend != Some(adapter) {
+        return false;
+    }
+
+    state
+        .list_assistant_panes()
+        .await
+        .iter()
+        .find(|candidate| candidate.pane_id == pane)
+        .and_then(|candidate| candidate.process_name.as_deref())
+        .is_some_and(|process_name| {
+            state
+                .backends
+                .all_backend_process_names()
+                .into_iter()
+                .find(|(backend, _)| backend == adapter)
+                .is_some_and(|(_, names)| {
+                    names.iter().any(|name| {
+                        process_name == name || process_name.strip_prefix('.') == Some(name)
+                    })
+                })
+        })
 }
 
 async fn session_start_inner(
@@ -461,13 +516,19 @@ async fn session_start_inner(
     // session's authoritative stored backend + id, so the primary launch path
     // gets it (claude-code/opencode carry the skill and stay empty).
     if let Some(existing_id) = state.find_session_by_pane(&body.pane).await {
-        let (existing_backend, registered_project_dir, existing_backend_session_id) = {
+        let (
+            existing_origin,
+            existing_backend,
+            registered_project_dir,
+            existing_backend_session_id,
+        ) = {
             let proto = state.protocol.read().await;
             proto
                 .sessions
                 .get(&existing_id)
                 .map(|session| {
                     (
+                        session.origin.clone(),
                         session.metadata.backend.clone(),
                         session.metadata.project_dir.clone(),
                         session.metadata.backend_session_id.clone(),
@@ -496,6 +557,7 @@ async fn session_start_inner(
                     state,
                     &body.pane,
                     &existing_id,
+                    &existing_origin,
                     existing_backend.as_deref(),
                     body.adapter.as_deref(),
                     body.launch_session_id.as_deref(),
@@ -568,7 +630,8 @@ async fn session_start_inner(
                     Some(Ok(())) => {
                         let backend = existing_backend
                             .as_deref()
-                            .expect("proven existing-pane binding has a backend")
+                            .or(body.adapter.as_deref())
+                            .expect("proven existing-pane binding has a backend adapter")
                             .to_string();
                         state
                             .apply_and_execute(crate::daemon_protocol::Event::AdoptBackend {
@@ -594,21 +657,68 @@ async fn session_start_inner(
                         }
                     }
                     Some(Err(())) => {
-                        tracing::warn!(
-                            pane = body.pane,
-                            session = existing_id,
-                            "session-start rejected: existing pane backend session ID mismatch"
-                        );
-                        return json!({
-                            "skipped": "existing pane backend session ID mismatch",
-                            "output": "",
-                        });
+                        if !existing_local_pane_rebinding_provenance_matches(
+                            state,
+                            &body.pane,
+                            &existing_origin,
+                            existing_backend.as_deref(),
+                            body.adapter.as_deref(),
+                            body.launch_session_id.as_deref(),
+                            body.launch_credential.as_deref(),
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                pane = body.pane,
+                                session = existing_id,
+                                "session-start rejected: existing pane backend session ID mismatch"
+                            );
+                            return json!({
+                                "skipped": "existing pane backend session ID mismatch",
+                                "output": "",
+                            });
+                        }
+
+                        let expected_backend_session_id = existing_backend_session_id
+                            .clone()
+                            .expect("complete binding mismatch has an existing session ID");
+                        let backend = existing_backend
+                            .clone()
+                            .expect("verified complete binding has a backend adapter");
+                        state
+                            .apply_and_execute(crate::daemon_protocol::Event::RebindBackend {
+                                id: existing_id.clone(),
+                                backend,
+                                backend_session_id: backend_session_id.clone(),
+                                expected_backend_session_id,
+                            })
+                            .await;
+                        let rebound = {
+                            let proto = state.protocol.read().await;
+                            proto.sessions.get(&existing_id).is_some_and(|session| {
+                                session.metadata.backend_session_id.as_deref()
+                                    == Some(backend_session_id.as_str())
+                            })
+                        };
+                        if !rebound {
+                            return json!({
+                                "skipped": "existing pane backend session ID mismatch",
+                                "output": "",
+                            });
+                        }
                     }
                     None => {}
                 }
             }
         }
-        let output = mesh_instructions_for_backend(existing_backend.as_deref(), &existing_id);
+        let bound_backend = {
+            let proto = state.protocol.read().await;
+            proto
+                .sessions
+                .get(&existing_id)
+                .and_then(|session| session.metadata.backend.clone())
+        };
+        let output = mesh_instructions_for_backend(bound_backend.as_deref(), &existing_id);
         return json!({
             "registered": existing_id,
             "output": output,
@@ -1382,10 +1492,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_start_rejects_unproven_first_binding_for_backend_unset_pane() {
-        // An existing pane with no recorded backend cannot authenticate any
-        // adapter claim. It must stay unbound even when the cwd and managed
-        // session id happen to match.
+    async fn session_start_binds_first_local_backend_for_backend_unset_pane() {
+        // A live same-host pane with no recorded backend is locally trusted:
+        // its first hook claim fills both backend identity fields atomically.
         let state = crate::state::AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -1408,6 +1517,54 @@ mod tests {
                 backend_session_id: Some("codex-thread-1".into()),
                 backend_identity: None,
                 adapter: Some("codex-cli".into()),
+                launch_session_id: None,
+                launch_credential: None,
+            },
+        )
+        .await;
+
+        assert_eq!(result["registered"], "unknown-worker");
+        assert!(
+            result["output"]
+                .as_str()
+                .is_some_and(|output| !output.is_empty())
+        );
+        let proto = state.protocol.read().await;
+        let metadata = &proto.sessions["unknown-worker"].metadata;
+        assert_eq!(metadata.backend.as_deref(), Some("codex-cli"));
+        assert_eq!(
+            metadata.backend_session_id.as_deref(),
+            Some("codex-thread-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_rejects_backend_unset_pane_when_live_adapter_mismatches() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "unknown-worker".into(),
+                pane: Some("%74".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/home/user/code/proj".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        *state.cached_assistant_panes.write().await = vec![assistant_pane_with_process(
+            "%74",
+            "/home/user/code/proj",
+            "claude",
+        )];
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: "%74".into(),
+                cwd: "/home/user/code/proj".into(),
+                backend_session_id: Some("codex-thread-1".into()),
+                backend_identity: None,
+                adapter: Some("codex-cli".into()),
                 launch_session_id: Some("unknown-worker".into()),
                 launch_credential: None,
             },
@@ -1418,13 +1575,58 @@ mod tests {
             result["skipped"],
             "existing pane adapter provenance mismatch"
         );
-        assert_eq!(result["output"], "");
-        assert!(
-            state.protocol.read().await.sessions["unknown-worker"]
-                .metadata
-                .backend_session_id
-                .is_none()
+        let proto = state.protocol.read().await;
+        let metadata = &proto.sessions["unknown-worker"].metadata;
+        assert!(metadata.backend.is_none());
+        assert!(metadata.backend_session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn session_start_does_not_bootstrap_backend_for_remote_pane() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "remote-worker".into(),
+                pane: Some("%76".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/home/user/code/proj".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .protocol
+            .write()
+            .await
+            .sessions
+            .get_mut("remote-worker")
+            .expect("registered test session")
+            .origin = crate::daemon_protocol::Origin::Remote("peer-daemon".into());
+        *state.cached_assistant_panes.write().await =
+            vec![assistant_pane("%76", "/home/user/code/proj")];
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: "%76".into(),
+                cwd: "/home/user/code/proj".into(),
+                backend_session_id: Some("codex-thread-1".into()),
+                backend_identity: None,
+                adapter: Some("codex-cli".into()),
+                launch_session_id: Some("remote-worker".into()),
+                launch_credential: None,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            result["skipped"],
+            "existing pane adapter provenance mismatch"
         );
+        let proto = state.protocol.read().await;
+        let metadata = &proto.sessions["remote-worker"].metadata;
+        assert!(metadata.backend.is_none());
+        assert!(metadata.backend_session_id.is_none());
     }
 
     #[tokio::test]
@@ -1603,11 +1805,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_start_rejects_different_thread_for_existing_same_project_pane() {
-        // A pane can receive a second SessionStart from a different Codex
-        // thread in the same project. Matching project identity proves the
-        // pane belongs to this session, but must not authorize replacing its
-        // established backend-thread binding.
+    async fn session_start_rotates_thread_for_verified_existing_local_pane() {
+        // A fresh backend thread in the same verified local pane supersedes
+        // the pane's previous thread binding. This keeps manually started
+        // sessions routable across fresh Codex threads without weakening the
+        // managed-launch or remote identity paths.
         let state = crate::state::AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -1632,25 +1834,69 @@ mod tests {
                 backend_session_id: Some("codex-thread-2".into()),
                 backend_identity: None,
                 adapter: Some("codex-cli".into()),
-                launch_session_id: Some("feat/worker".into()),
+                launch_session_id: None,
                 launch_credential: None,
             },
         )
         .await;
 
-        assert_eq!(result["output"], "");
-        assert_eq!(
-            result["skipped"],
-            "existing pane backend session ID mismatch"
-        );
+        assert_eq!(result["registered"], "feat/worker");
         let proto = state.protocol.read().await;
         assert_eq!(
             proto.sessions["feat/worker"]
                 .metadata
                 .backend_session_id
                 .as_deref(),
-            Some("codex-thread-1"),
-            "a second same-project thread must not replace the established binding"
+            Some("codex-thread-2"),
+            "the verified pane's fresh thread must replace its previous binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_does_not_rotate_when_live_pane_backend_disagrees() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "feat/worker".into(),
+                pane: Some("%72".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    backend_session_id: Some("codex-thread-1".into()),
+                    project_dir: Some("/home/user/code/proj".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        *state.cached_assistant_panes.write().await = vec![assistant_pane_with_process(
+            "%72",
+            "/home/user/code/proj",
+            "claude",
+        )];
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: "%72".into(),
+                cwd: "/home/user/code/proj".into(),
+                backend_session_id: Some("codex-thread-2".into()),
+                backend_identity: None,
+                adapter: Some("codex-cli".into()),
+                launch_session_id: None,
+                launch_credential: None,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            result["skipped"],
+            "existing pane backend session ID mismatch"
+        );
+        assert_eq!(
+            state.protocol.read().await.sessions["feat/worker"]
+                .metadata
+                .backend_session_id
+                .as_deref(),
+            Some("codex-thread-1")
         );
     }
 

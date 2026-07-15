@@ -378,14 +378,28 @@ fn next_inject_buffer_name(pane: &str) -> String {
     format!("ouija-inject-{pane_id}-{seq}")
 }
 
+fn paste_buffer_args<'a>(
+    buffer_name: &'a str,
+    pane: &'a str,
+    use_bracketed_paste: bool,
+) -> Vec<&'a str> {
+    let mut args = vec!["paste-buffer"];
+    if use_bracketed_paste {
+        args.push("-p");
+    }
+    args.extend(["-b", buffer_name, "-t", pane]);
+    args
+}
+
 /// Inject message text via `tmux paste-buffer` then submit with Enter.
 ///
-/// When `config.use_inner_bracketed_paste` is true, wraps the text in
-/// bracketed paste sequences (`ESC[200~...ESC[201~`) inside the buffer,
-/// then uses `paste-buffer` (which adds its own outer bracket layer).
+/// When `config.use_inner_bracketed_paste` is true, `paste-buffer -p` wraps
+/// the text in bracketed paste sequences (`ESC[200~...ESC[201~`) when the TUI
+/// has requested bracketed-paste mode.
 /// This is necessary for TUIs that intercept individual keystrokes from
-/// `send-keys -l`, silently swallowing them. The explicit inner brackets
-/// ensure the TUI receives the text as a paste event.
+/// `send-keys -l`, silently swallowing them. Delegating the framing to tmux
+/// keeps the control bytes out of the paste buffer, where tmux 3.7 would
+/// otherwise sanitize them into visible `^[[200~` and `^[[201~` text.
 ///
 /// When inner bracketed paste is disabled, the raw text is loaded into
 /// the paste buffer without extra escape sequences.
@@ -396,14 +410,7 @@ fn inject_text(
     message: &str,
     config: &crate::backend::InjectConfig,
 ) -> anyhow::Result<()> {
-    let sanitized = sanitize_injection_text(message);
-
-    let paste_content = if config.use_inner_bracketed_paste {
-        // Wrap in bracketed paste sequences so the TUI treats it as pasted text
-        format!("\x1b[200~{sanitized}\x1b[201~")
-    } else {
-        sanitized
-    };
+    let paste_content = sanitize_injection_text(message);
 
     let buffer_name = next_inject_buffer_name(pane);
 
@@ -426,9 +433,13 @@ fn inject_text(
         bail!("tmux load-buffer failed for pane {pane}");
     }
 
-    // Paste buffer into target pane (tmux adds outer bracket wrapping)
+    // Let tmux add real bracketed-paste controls outside the sanitized buffer.
     let status = Command::new("tmux")
-        .args(["paste-buffer", "-b", &buffer_name, "-t", pane])
+        .args(paste_buffer_args(
+            &buffer_name,
+            pane,
+            config.use_inner_bracketed_paste,
+        ))
         .status()
         .context("failed to run tmux paste-buffer")?;
 
@@ -968,6 +979,18 @@ mod tests {
                 .chars()
                 .any(|c| { c <= '\u{1f}' || ('\u{7f}'..='\u{9f}').contains(&c) }),
             "sanitized text still contains C0/C1 controls: {sanitized:?}"
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_delegates_control_framing_to_tmux() {
+        assert_eq!(
+            paste_buffer_args("ouija-buffer", "%12", true),
+            ["paste-buffer", "-p", "-b", "ouija-buffer", "-t", "%12"]
+        );
+        assert_eq!(
+            paste_buffer_args("ouija-buffer", "%12", false),
+            ["paste-buffer", "-b", "ouija-buffer", "-t", "%12"]
         );
     }
 

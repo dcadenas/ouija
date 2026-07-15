@@ -641,6 +641,15 @@ pub enum Event {
         /// with the backend-session binding.
         expected_session_start_credential: Option<String>,
     },
+    /// Atomically replace a complete backend-session binding for a verified
+    /// local pane. The caller must supply the currently stored session ID as
+    /// a compare-and-swap guard. Managed launches use `AdoptBackend` instead.
+    RebindBackend {
+        id: String,
+        backend: String,
+        backend_session_id: String,
+        expected_backend_session_id: String,
+    },
     ReapDead {
         dead_ids: Vec<String>,
     },
@@ -1375,6 +1384,17 @@ impl DaemonState {
                 backend_session_id,
                 expected_backend_session_id,
                 expected_session_start_credential,
+            ),
+            Event::RebindBackend {
+                id,
+                backend,
+                backend_session_id,
+                expected_backend_session_id,
+            } => self.apply_rebind_backend(
+                &id,
+                backend,
+                backend_session_id,
+                expected_backend_session_id,
             ),
             Event::ReapDead { dead_ids } => self.apply_reap(dead_ids),
             Event::IncomingWire { msg, sender_npub } => self.apply_incoming_wire(msg, sender_npub),
@@ -2583,6 +2603,45 @@ impl DaemonState {
         if expected_session_start_credential.is_some() {
             session.metadata.session_start_credential = None;
         }
+        let mut effects = vec![Effect::Persist];
+        if session.metadata.networked {
+            effects.push(Effect::BroadcastSessionList);
+        }
+        effects
+    }
+
+    fn apply_rebind_backend(
+        &mut self,
+        id: &str,
+        backend: String,
+        backend_session_id: String,
+        expected_backend_session_id: String,
+    ) -> Vec<Effect> {
+        let Some(current) = self.sessions.get(id) else {
+            return vec![];
+        };
+        if !matches!(current.origin, Origin::Local)
+            || current.metadata.backend.as_deref() != Some(backend.as_str())
+            || current.metadata.backend_session_id.as_deref()
+                != Some(expected_backend_session_id.as_str())
+            || current.metadata.session_start_credential.is_some()
+        {
+            return vec![];
+        }
+
+        if self.sessions.values().any(|session| {
+            session.id != id
+                && matches!(session.origin, Origin::Local)
+                && backend_pair_matches(&session.metadata, &backend, &backend_session_id)
+        }) {
+            return vec![];
+        }
+
+        let session = self
+            .sessions
+            .get_mut(id)
+            .expect("local session checked above");
+        session.metadata.backend_session_id = Some(backend_session_id);
         let mut effects = vec![Effect::Persist];
         if session.metadata.networked {
             effects.push(Effect::BroadcastSessionList);
@@ -7530,6 +7589,112 @@ mod tests {
         assert!(effects.is_empty());
         let meta = &state.sessions["s1"].metadata;
         assert_eq!(meta.backend_session_id.as_deref(), Some("ses_current"));
+    }
+
+    #[test]
+    fn rebind_backend_replaces_complete_local_binding_with_cas_guard() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "codex".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                backend_session_id: Some("thread-old".into()),
+                networked: true,
+                ..Default::default()
+            },
+        });
+
+        let effects = state.apply(Event::RebindBackend {
+            id: "codex".into(),
+            backend: "codex-cli".into(),
+            backend_session_id: "thread-new".into(),
+            expected_backend_session_id: "thread-old".into(),
+        });
+
+        assert_eq!(
+            state.sessions["codex"]
+                .metadata
+                .backend_session_id
+                .as_deref(),
+            Some("thread-new")
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Persist))
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::BroadcastSessionList))
+        );
+    }
+
+    #[test]
+    fn rebind_backend_rejects_stale_guard_pending_launch_and_duplicate_identity() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "codex".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                backend_session_id: Some("thread-current".into()),
+                ..Default::default()
+            },
+        });
+        state.apply(Event::Register {
+            id: "other".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                backend_session_id: Some("thread-taken".into()),
+                ..Default::default()
+            },
+        });
+
+        let stale = state.apply(Event::RebindBackend {
+            id: "codex".into(),
+            backend: "codex-cli".into(),
+            backend_session_id: "thread-new".into(),
+            expected_backend_session_id: "thread-old".into(),
+        });
+        assert!(stale.is_empty());
+
+        state
+            .sessions
+            .get_mut("codex")
+            .expect("test session")
+            .metadata
+            .session_start_credential = Some("managed-proof".into());
+        let credentialed = state.apply(Event::RebindBackend {
+            id: "codex".into(),
+            backend: "codex-cli".into(),
+            backend_session_id: "thread-new".into(),
+            expected_backend_session_id: "thread-current".into(),
+        });
+        assert!(credentialed.is_empty());
+        state
+            .sessions
+            .get_mut("codex")
+            .expect("test session")
+            .metadata
+            .session_start_credential = None;
+
+        let duplicate = state.apply(Event::RebindBackend {
+            id: "codex".into(),
+            backend: "codex-cli".into(),
+            backend_session_id: "thread-taken".into(),
+            expected_backend_session_id: "thread-current".into(),
+        });
+        assert!(duplicate.is_empty());
+        assert_eq!(
+            state.sessions["codex"]
+                .metadata
+                .backend_session_id
+                .as_deref(),
+            Some("thread-current")
+        );
     }
 
     #[test]

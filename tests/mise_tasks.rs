@@ -20,7 +20,9 @@ fn install_tasks_restart_daemon_with_supported_command() {
         let commands = task_command_lines(task);
 
         assert!(
-            commands.iter().any(|line| line == "ouija restart-server"),
+            commands.iter().any(|line| {
+                line == "ouija restart-server" || line == "\"$CARGO_BIN\" restart-server"
+            }),
             "{task} must restart the daemon through `ouija restart-server`"
         );
         assert!(
@@ -32,4 +34,22 @@ fn install_tasks_restart_daemon_with_supported_command() {
             "{task} must not call the removed `ouija stop` subcommand"
         );
     }
+}
+
+#[test]
+fn use_local_updates_the_user_path_copy_and_restarts_the_fresh_binary() {
+    let commands = task_command_lines("mise/tasks/use-local");
+
+    assert!(
+        commands
+            .iter()
+            .any(|line| line == "LOCAL_BIN=\"$HOME/.local/bin/ouija\""),
+        "use-local must account for ~/.local/bin shadowing ~/.cargo/bin"
+    );
+    assert!(
+        commands
+            .iter()
+            .any(|line| line == "\"$CARGO_BIN\" restart-server"),
+        "use-local must restart through the binary it just built"
+    );
 }

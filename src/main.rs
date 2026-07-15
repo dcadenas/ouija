@@ -1956,6 +1956,53 @@ struct IdentityConflict {
     canonical_id: String,
 }
 
+/// A backend identity lookup failed before producing canonical ownership.
+///
+/// `outcome` is present for a structured daemon rejection and absent for
+/// transport or protocol failures. Only `incomplete_legacy` can yield to an
+/// independently resolved local identity: it describes non-canonical partial
+/// rows, not positive evidence that the local identity belongs elsewhere.
+#[derive(Debug, PartialEq, Eq)]
+struct BackendIdentityLookupError {
+    outcome: Option<String>,
+    detail: String,
+}
+
+impl BackendIdentityLookupError {
+    fn daemon_rejection(outcome: &str, detail: &str) -> Self {
+        Self {
+            outcome: Some(outcome.into()),
+            detail: detail.into(),
+        }
+    }
+
+    fn protocol_failure(detail: impl Into<String>) -> Self {
+        Self {
+            outcome: None,
+            detail: detail.into(),
+        }
+    }
+
+    fn allows_local_fallback(&self) -> bool {
+        self.outcome.as_deref() == Some("incomplete_legacy")
+    }
+}
+
+impl std::fmt::Display for BackendIdentityLookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.outcome.as_deref() {
+            Some(outcome) => write!(
+                f,
+                "backend identity resolution failed ({outcome}) : {}",
+                self.detail
+            ),
+            None => f.write_str(&self.detail),
+        }
+    }
+}
+
+impl std::error::Error for BackendIdentityLookupError {}
+
 /// Give a resolved backend identity precedence over local hints, but only when
 /// those hints agree. This deliberately has no I/O so every caller can apply
 /// the same fail-closed rule and the conflict contract remains directly
@@ -1974,6 +2021,19 @@ fn arbitrate_backend_identity(
             canonical_id,
         }),
         Some(_) | None => Ok(Some((canonical_id, IdentitySource::BackendIdentity))),
+    }
+}
+
+/// Select canonical backend evidence without letting partial rows strand a
+/// separately resolved local identity.
+fn backend_canonical_for_arbitration(
+    local: Option<&(String, IdentitySource)>,
+    backend_lookup: Result<String, BackendIdentityLookupError>,
+) -> Result<Option<String>, BackendIdentityLookupError> {
+    match backend_lookup {
+        Ok(id) => Ok(Some(id)),
+        Err(error) if local.is_some() && error.allows_local_fallback() => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -2244,10 +2304,16 @@ async fn whoami_outcome() -> WhoamiOutcome {
 
     // Resolve a native backend identity even when a local signal was found.
     // A successful binding is canonical and must therefore arbitrate (or
-    // reject) the local hint rather than merely act as a fallback.
+    // reject) the local hint rather than merely act as a fallback. An
+    // incomplete legacy outcome has no canonical owner and may yield to an
+    // independently resolved local identity; all other lookup failures remain
+    // terminal.
     let backend_canonical = match backend_identity.as_ref() {
-        Some(identity) => match resolve_backend_identity_from_daemon(identity).await {
-            Ok(id) => Some(id),
+        Some(identity) => match backend_canonical_for_arbitration(
+            local.as_ref(),
+            resolve_backend_identity_from_daemon(identity).await,
+        ) {
+            Ok(id) => id,
             Err(error) => return WhoamiOutcome::BackendResolutionFailed(error.to_string()),
         },
         None => None,
@@ -2273,7 +2339,7 @@ async fn whoami_outcome() -> WhoamiOutcome {
 /// public id. The raw backend ID never reaches a send envelope as `from`.
 async fn resolve_backend_identity_from_daemon(
     identity: &backend::BackendSessionIdentity,
-) -> anyhow::Result<String> {
+) -> Result<String, BackendIdentityLookupError> {
     let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
     let url = format!("http://localhost:{port}/api/backend-identities/resolve");
     let response = reqwest::Client::new()
@@ -2284,24 +2350,32 @@ async fn resolve_backend_identity_from_daemon(
         }))
         .send()
         .await
-        .with_context(|| format!("could not resolve backend identity via {url}"))?;
+        .map_err(|error| {
+            BackendIdentityLookupError::protocol_failure(format!(
+                "could not resolve backend identity via {url}: {error}"
+            ))
+        })?;
     let status = response.status();
-    let body: serde_json::Value = response
-        .json()
-        .await
-        .context("daemon returned invalid backend identity response")?;
+    let body: serde_json::Value = response.json().await.map_err(|error| {
+        BackendIdentityLookupError::protocol_failure(format!(
+            "daemon returned invalid backend identity response: {error}"
+        ))
+    })?;
     if !status.is_success() {
-        anyhow::bail!(
-            "backend identity resolution failed ({}) : {}",
+        return Err(BackendIdentityLookupError::daemon_rejection(
             body["outcome"].as_str().unwrap_or("unknown"),
-            body["error"].as_str().unwrap_or("no daemon detail")
-        );
+            body["error"].as_str().unwrap_or("no daemon detail"),
+        ));
     }
     body["session_id"]
         .as_str()
         .filter(|id| !id.is_empty())
         .map(String::from)
-        .ok_or_else(|| anyhow::anyhow!("daemon resolved backend identity without a session_id"))
+        .ok_or_else(|| {
+            BackendIdentityLookupError::protocol_failure(
+                "daemon resolved backend identity without a session_id",
+            )
+        })
 }
 
 fn enforce_explicit_sender_match(explicit: &str, canonical: &str) -> anyhow::Result<String> {
@@ -2963,6 +3037,84 @@ mod tests {
                 IdentitySource::BackendIdentity
             ))
         );
+    }
+
+    #[test]
+    fn incomplete_backend_identity_does_not_strand_verified_local_identity() {
+        let local = ("hub".into(), IdentitySource::PaneVar);
+        let backend_canonical = backend_canonical_for_arbitration(
+            Some(&local),
+            Err(BackendIdentityLookupError::daemon_rejection(
+                "incomplete_legacy",
+                "legacy backend metadata is incomplete",
+            )),
+        )
+        .unwrap();
+
+        let resolved = arbitrate_backend_identity(Some(local), backend_canonical).unwrap();
+
+        assert_eq!(
+            resolved,
+            Some(("hub".into(), IdentitySource::PaneVar)),
+            "a non-canonical incomplete row cannot disprove a verified local identity"
+        );
+    }
+
+    #[test]
+    fn incomplete_backend_identity_does_not_strand_registered_env_identity() {
+        let local = ("hub".into(), IdentitySource::EnvVar);
+        let backend_canonical = backend_canonical_for_arbitration(
+            Some(&local),
+            Err(BackendIdentityLookupError::daemon_rejection(
+                "incomplete_legacy",
+                "legacy backend metadata is incomplete",
+            )),
+        )
+        .unwrap();
+
+        let resolved = arbitrate_backend_identity(Some(local), backend_canonical).unwrap();
+
+        assert_eq!(resolved, Some(("hub".into(), IdentitySource::EnvVar)));
+    }
+
+    #[test]
+    fn incomplete_backend_identity_without_local_proof_remains_terminal() {
+        let error = backend_canonical_for_arbitration(
+            None,
+            Err(BackendIdentityLookupError::daemon_rejection(
+                "incomplete_legacy",
+                "legacy backend metadata is incomplete",
+            )),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.outcome.as_deref(), Some("incomplete_legacy"));
+    }
+
+    #[test]
+    fn non_incomplete_backend_failures_remain_terminal_with_local_hint() {
+        let local = ("hub".into(), IdentitySource::PaneLookup);
+        for outcome in ["ambiguous", "not_found"] {
+            let error = backend_canonical_for_arbitration(
+                Some(&local),
+                Err(BackendIdentityLookupError::daemon_rejection(
+                    outcome,
+                    "backend identity has no safe canonical owner",
+                )),
+            )
+            .unwrap_err();
+
+            assert_eq!(error.outcome.as_deref(), Some(outcome));
+        }
+
+        let transport_error = backend_canonical_for_arbitration(
+            Some(&local),
+            Err(BackendIdentityLookupError::protocol_failure(
+                "daemon unreachable",
+            )),
+        )
+        .unwrap_err();
+        assert!(transport_error.outcome.is_none());
     }
 
     #[test]
