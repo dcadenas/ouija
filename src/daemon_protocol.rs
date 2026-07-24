@@ -4026,26 +4026,30 @@ impl DaemonState {
         // Three-tier reply handling — pending is keyed by the session that
         // owes the reply (from), not the recipient of this wire message (to).
         // Resolve bare `from` to daemon-prefixed remote session key.
-        // First try exact match in known remote sessions.
-        // If not found, derive prefix from any remote session sharing the sender's npub.
-        let remote_match = self
-            .sessions
-            .iter()
-            .find(|(_, s)| {
-                matches!(&s.origin, Origin::Remote(_)) && strip_remote_prefix(&s.id) == from
-            })
-            .map(|(key, _)| key.clone());
+        // First try an exact match owned by the verified transport peer.
+        // A duplicate bare id announced by another peer cannot identify this
+        // sender.
+        let remote_match = sender_npub.and_then(|npub| {
+            self.sessions
+                .iter()
+                .find(|(_, session)| {
+                    matches!(&session.origin, Origin::Remote(owner) if owner == npub)
+                        && strip_remote_prefix(&session.id) == from
+                })
+                .map(|(key, _)| key.clone())
+        });
         let display_from = remote_match.unwrap_or_else(|| {
-            // Session not in our list — derive prefix from sender's daemon npub
+            // Session not in our list — reuse the verified peer's known
+            // daemon-name prefix, or fall back to the verified npub itself.
+            // Never expose the unqualified wire value as a Local-looking id.
             if let Some(npub) = sender_npub {
-                if let Some((key, _)) = self
+                let prefix = self
                     .sessions
                     .iter()
                     .find(|(_, s)| matches!(&s.origin, Origin::Remote(d) if d == npub))
-                {
-                    let prefix = key.split('/').next().unwrap_or(from);
-                    return format!("{prefix}/{from}");
-                }
+                    .and_then(|(key, _)| key.split('/').next())
+                    .unwrap_or(npub);
+                return format!("{prefix}/{from}");
             }
             from.to_string()
         });
@@ -6446,11 +6450,12 @@ mod tests {
             "pending should be stored for local target"
         );
         assert_eq!(state.pending_replies["B"][0].msg_id, 42);
+        assert_eq!(state.pending_replies["B"][0].from, "npub1remote/A");
 
-        // B replies locally with done=true
+        // B replies locally with done=true to the verified, displayed sender.
         state.apply(Event::Send {
             from: "B".into(),
-            to: "A".into(),
+            to: "npub1remote/A".into(),
             message: "all done".into(),
             expects_reply: false,
             responds_to: Some(42),
@@ -8819,6 +8824,113 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    fn incoming_sender_provenance_state() -> DaemonState {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "web".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                networked: true,
+                ..Default::default()
+            },
+        });
+        state
+    }
+
+    fn incoming_sender_provenance_effects(
+        state: &mut DaemonState,
+        from: &str,
+        sender_npub: &str,
+    ) -> Vec<Effect> {
+        state.apply(Event::IncomingWire {
+            msg: crate::protocol::WireMessage::SessionSend {
+                from: from.into(),
+                to: "web".into(),
+                message: "hello".into(),
+                expects_reply: true,
+                msg_id: 42,
+                responds_to: None,
+                done: false,
+            },
+            sender_npub: Some(sender_npub.into()),
+        })
+    }
+
+    fn injected_sender_message(effects: &[Effect]) -> &str {
+        effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::InjectMessage { message, .. } => Some(message.as_str()),
+                _ => None,
+            })
+            .expect("incoming send must inject into the Local target")
+    }
+
+    #[test]
+    fn incoming_sender_provenance_namespaces_bare_id_that_matches_local_session() {
+        let mut state = incoming_sender_provenance_state();
+        state.apply(Event::Register {
+            id: "shared".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta::default(),
+        });
+
+        let effects = incoming_sender_provenance_effects(&mut state, "shared", "npub1peer");
+
+        assert!(
+            injected_sender_message(&effects).contains(r#"from="npub1peer/shared""#),
+            "wire sender must display with verified transport provenance"
+        );
+        assert_eq!(state.pending_replies["web"][0].from, "npub1peer/shared");
+    }
+
+    #[test]
+    fn incoming_sender_provenance_ignores_duplicate_bare_id_owned_by_other_peer() {
+        let mut state = incoming_sender_provenance_state();
+        state.sessions.insert(
+            "other-host/worker".into(),
+            SessionEntry {
+                id: "other-host/worker".into(),
+                origin: Origin::Remote("npub1other".into()),
+                ..Default::default()
+            },
+        );
+
+        let effects = incoming_sender_provenance_effects(&mut state, "worker", "npub1actual");
+
+        assert!(
+            injected_sender_message(&effects).contains(r#"from="npub1actual/worker""#),
+            "a different peer's announced session must not win"
+        );
+        assert_eq!(state.pending_replies["web"][0].from, "npub1actual/worker");
+    }
+
+    #[test]
+    fn incoming_sender_provenance_uses_canonical_session_announced_by_verified_peer() {
+        let mut state = incoming_sender_provenance_state();
+        for (key, npub) in [
+            ("a-host/worker", "npub1other"),
+            ("z-host/worker", "npub1actual"),
+        ] {
+            state.sessions.insert(
+                key.into(),
+                SessionEntry {
+                    id: key.into(),
+                    origin: Origin::Remote(npub.into()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let effects = incoming_sender_provenance_effects(&mut state, "worker", "npub1actual");
+
+        assert!(
+            injected_sender_message(&effects).contains(r#"from="z-host/worker""#),
+            "the verified peer's canonical announced key must win"
+        );
+        assert_eq!(state.pending_replies["web"][0].from, "z-host/worker");
     }
 
     #[test]
