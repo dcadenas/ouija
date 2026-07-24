@@ -5,12 +5,103 @@ use std::collections::BTreeMap;
 
 // --- State ---
 
+/// Daemon-issued monotonic identity for one public session incarnation.
+///
+/// This is deliberately a non-secret number: it identifies ownership for
+/// compare-and-mutate operations, while launch credentials continue to prove
+/// backend identity where required.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct SessionIncarnation(pub u64);
+
+impl std::fmt::Display for SessionIncarnation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Exact owner of lifecycle authority for a public session ID.
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct ResourceOwner {
+    pub session_id: String,
+    pub incarnation: SessionIncarnation,
+}
+
+/// Kind of lifecycle operation currently holding exclusive authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecyclePhase {
+    Starting,
+}
+
+/// Durable in-flight lifecycle authority for one public session ID.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct LifecycleLease {
+    pub owner: ResourceOwner,
+    pub phase: LifecyclePhase,
+}
+
+/// Atomic result of trying to reserve a new same-ID start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StartDisposition {
+    Reserved(ResourceOwner),
+    Existing(ResourceOwner),
+    InProgress(ResourceOwner),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IncarnationAllocatorExhausted;
+
+impl std::fmt::Display for IncarnationAllocatorExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("session incarnation allocator exhausted")
+    }
+}
+
+impl std::error::Error for IncarnationAllocatorExhausted {}
+
+/// Result of committing or aborting a lease by exact owner token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecycleMutationOutcome {
+    Applied,
+    NotFound,
+    Superseded,
+    Rejected,
+}
+
+/// Exact-owner start commit and the ordinary registration effects it emitted.
+pub struct LifecycleCommitResult {
+    pub outcome: LifecycleMutationOutcome,
+    pub effects: Vec<Effect>,
+}
+
 /// Pure daemon state. Clone+Hash+Eq for Stateright.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DaemonState {
     pub daemon_id: String,
     pub daemon_name: String,
     pub sessions: BTreeMap<String, SessionEntry>,
+    /// Greatest incarnation ever allocated by this daemon.
+    ///
+    /// It is independent of the live session map so removing the current
+    /// holder can never make an old token reusable.
+    pub incarnation_high_water: SessionIncarnation,
+    /// Lifecycle operations reserved before external work begins.
+    pub lifecycle_leases: BTreeMap<String, LifecycleLease>,
     pub aliases: BTreeMap<String, String>,
     /// Rename aliases this daemon created for its own local sessions
     /// (`old_id -> new_id`). Provenance-tracked: only [`Self::apply_rename`]
@@ -124,7 +215,7 @@ pub struct SessionMeta {
     pub restart_generation: u64,
     /// Per-registration token used to reject stale async commits.
     #[serde(default)]
-    pub session_incarnation: i64,
+    pub session_incarnation: SessionIncarnation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_description: Option<String>,
     /// Unix timestamp; 0 in model tests.
@@ -210,7 +301,7 @@ pub struct SessionMeta {
 /// original incarnation prevents an old worker from acting on a recreated ID.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BackendRepairReservation {
-    pub original_incarnation: i64,
+    pub original_incarnation: SessionIncarnation,
     pub restart_generation: u64,
     pub phase: BackendRepairPhase,
 }
@@ -227,8 +318,9 @@ pub enum BackendRepairPhase {
 /// cannot consume repair authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StageFreshLaunchOutcome {
-    Staged { incarnation: i64 },
+    Staged { incarnation: SessionIncarnation },
     Rejected,
+    PersistenceFailed,
 }
 
 pub struct StageFreshLaunchResult {
@@ -532,7 +624,7 @@ impl Default for SessionMeta {
             backend_repair_reservation: None,
             opencode_binding: None,
             restart_generation: 0,
-            session_incarnation: 0,
+            session_incarnation: SessionIncarnation::default(),
             project_description: None,
             last_metadata_update: None,
             model: None,
@@ -582,7 +674,7 @@ pub enum Event {
     /// launch credential.
     RefreshLaunchMetadata {
         id: String,
-        expected_incarnation: i64,
+        expected_incarnation: SessionIncarnation,
         pane: Option<String>,
         metadata: SessionMeta,
     },
@@ -612,7 +704,7 @@ pub enum Event {
         id: String,
         pane: Option<String>,
         credential: Option<String>,
-        staged_incarnation: i64,
+        staged_incarnation: SessionIncarnation,
         previous: Option<SessionEntry>,
         provisional_pane: Option<String>,
     },
@@ -1262,6 +1354,108 @@ impl DaemonState {
         self.wire_seq
     }
 
+    /// Restore the durable allocator without ever lowering its high-water
+    /// mark. The next successful allocation is strictly greater than `value`.
+    pub fn restore_incarnation_high_water(&mut self, value: SessionIncarnation) {
+        self.incarnation_high_water = self.incarnation_high_water.max(value);
+    }
+
+    fn allocate_incarnation(&mut self) -> Option<SessionIncarnation> {
+        let next = self.incarnation_high_water.0.checked_add(1)?;
+        let incarnation = SessionIncarnation(next);
+        self.incarnation_high_water = incarnation;
+        Some(incarnation)
+    }
+
+    /// Reserve exclusive authority for a new session start before any
+    /// filesystem, tmux, process, or network work begins.
+    pub fn reserve_start(
+        &mut self,
+        session_id: &str,
+    ) -> Result<StartDisposition, IncarnationAllocatorExhausted> {
+        if let Some(lease) = self.lifecycle_leases.get(session_id) {
+            return Ok(StartDisposition::InProgress(lease.owner.clone()));
+        }
+        if let Some(session) = self.sessions.get(session_id) {
+            return Ok(StartDisposition::Existing(ResourceOwner {
+                session_id: session.id.clone(),
+                incarnation: session.metadata.session_incarnation,
+            }));
+        }
+
+        let incarnation = self
+            .allocate_incarnation()
+            .ok_or(IncarnationAllocatorExhausted)?;
+        let owner = ResourceOwner {
+            session_id: session_id.to_string(),
+            incarnation,
+        };
+        self.lifecycle_leases.insert(
+            session_id.to_string(),
+            LifecycleLease {
+                owner: owner.clone(),
+                phase: LifecyclePhase::Starting,
+            },
+        );
+        Ok(StartDisposition::Reserved(owner))
+    }
+
+    /// Commit a reserved start into the active session map with the exact
+    /// incarnation allocated by [`Self::reserve_start`].
+    pub fn commit_reserved_start(
+        &mut self,
+        owner: &ResourceOwner,
+        pane: Option<String>,
+        metadata: SessionMeta,
+    ) -> LifecycleCommitResult {
+        let Some(current) = self.lifecycle_leases.get(&owner.session_id) else {
+            return LifecycleCommitResult {
+                outcome: LifecycleMutationOutcome::NotFound,
+                effects: vec![],
+            };
+        };
+        if current.owner != *owner {
+            return LifecycleCommitResult {
+                outcome: LifecycleMutationOutcome::Superseded,
+                effects: vec![],
+            };
+        }
+        if self.sessions.contains_key(&owner.session_id) {
+            return LifecycleCommitResult {
+                outcome: LifecycleMutationOutcome::Superseded,
+                effects: vec![],
+            };
+        }
+
+        let effects =
+            self.apply_register_with_owner(owner.session_id.clone(), pane, metadata, Some(owner));
+        let outcome = if effects.iter().any(
+            |effect| matches!(effect, Effect::RegisterOk { session_id, .. } if session_id == &owner.session_id),
+        ) {
+            LifecycleMutationOutcome::Applied
+        } else {
+            LifecycleMutationOutcome::Rejected
+        };
+        LifecycleCommitResult { outcome, effects }
+    }
+
+    /// Abort an exact lifecycle lease. Semantics intentionally match commit
+    /// for authority release; callers distinguish the external outcome.
+    pub fn abort_lifecycle(&mut self, owner: &ResourceOwner) -> LifecycleMutationOutcome {
+        self.finish_lifecycle(owner)
+    }
+
+    fn finish_lifecycle(&mut self, owner: &ResourceOwner) -> LifecycleMutationOutcome {
+        let Some(current) = self.lifecycle_leases.get(&owner.session_id) else {
+            return LifecycleMutationOutcome::NotFound;
+        };
+        if current.owner != *owner {
+            return LifecycleMutationOutcome::Superseded;
+        }
+        self.lifecycle_leases.remove(&owner.session_id);
+        LifecycleMutationOutcome::Applied
+    }
+
     /// Accept a peer's sequence number, rejecting stale duplicates.
     pub fn accept_seq(&mut self, daemon_id: &str, seq: u64) -> bool {
         let last = self.last_seen_seq.get(daemon_id).copied().unwrap_or(0);
@@ -1428,7 +1622,36 @@ impl DaemonState {
         pane: Option<String>,
         metadata: SessionMeta,
     ) -> Vec<Effect> {
+        self.apply_register_with_owner(id, pane, metadata, None)
+    }
+
+    fn apply_register_with_owner(
+        &mut self,
+        id: String,
+        pane: Option<String>,
+        metadata: SessionMeta,
+        reserved_owner: Option<&ResourceOwner>,
+    ) -> Vec<Effect> {
         let mut effects = Vec::new();
+
+        match (self.lifecycle_leases.get(&id), reserved_owner) {
+            (Some(lease), Some(owner)) if lease.owner == *owner => {}
+            (Some(_), _) => {
+                let reason = format!("session '{id}' has a lifecycle operation in progress");
+                return vec![Effect::RegisterFailed {
+                    session_id: id,
+                    reason,
+                }];
+            }
+            (None, Some(_)) => {
+                let reason = format!("session '{id}' no longer has the reserved lifecycle owner");
+                return vec![Effect::RegisterFailed {
+                    session_id: id,
+                    reason,
+                }];
+            }
+            (None, None) => {}
+        }
 
         // Invariant guard (issue #14): refuse to wipe the pane of an existing
         // local session. An external caller POSTing /api/register without a
@@ -1561,8 +1784,28 @@ impl DaemonState {
             ];
         }
 
+        let incarnation = if let Some(owner) = reserved_owner {
+            owner.incarnation
+        } else {
+            let Some(incarnation) = self.allocate_incarnation() else {
+                let reason = "session incarnation allocator exhausted".to_string();
+                return vec![
+                    Effect::Log {
+                        level: LogLevel::Warn,
+                        message: format!("refusing registration for '{id}': {reason}"),
+                    },
+                    Effect::RegisterFailed {
+                        session_id: id,
+                        reason,
+                    },
+                ];
+            };
+            incarnation
+        };
+
         // Pane dedup: same pane registered under different ID. This mutates
-        // session ownership, so all registration-level validation must happen first.
+        // session ownership, so all registration-level validation and
+        // fallible allocation must happen first.
         let replaced = if let Some(ref pane_id) = pane {
             let old_key = self
                 .sessions
@@ -1585,7 +1828,7 @@ impl DaemonState {
         };
 
         let now = chrono::Utc::now();
-        metadata.session_incarnation = now.timestamp_nanos_opt().unwrap_or_else(|| now.timestamp());
+        metadata.session_incarnation = incarnation;
 
         // Insert session
         let session = SessionEntry {
@@ -1596,6 +1839,9 @@ impl DaemonState {
             registered_at: now.timestamp(),
         };
         self.sessions.insert(id.clone(), session);
+        if reserved_owner.is_some() {
+            self.lifecycle_leases.remove(&id);
+        }
         effects.push(Effect::Persist);
 
         // Tmux effects
@@ -1674,7 +1920,7 @@ impl DaemonState {
         session_start_credential: Option<String>,
         expected_repair_reservation: Option<BackendRepairReservation>,
     ) -> StageFreshLaunchResult {
-        let Some(session) = self.sessions.get_mut(id) else {
+        let Some(session) = self.sessions.get(id) else {
             return StageFreshLaunchResult {
                 outcome: StageFreshLaunchOutcome::Rejected,
                 effects: vec![],
@@ -1692,7 +1938,7 @@ impl DaemonState {
                 effects: vec![],
             };
         }
-        if let Some(reservation) = session.metadata.backend_repair_reservation.as_mut() {
+        if let Some(reservation) = session.metadata.backend_repair_reservation.as_ref() {
             if reservation.phase != BackendRepairPhase::PreStage
                 || reservation.original_incarnation != session.metadata.session_incarnation
                 || reservation.restart_generation
@@ -1703,6 +1949,19 @@ impl DaemonState {
                     effects: vec![],
                 };
             }
+        }
+
+        let Some(incarnation) = self.allocate_incarnation() else {
+            return StageFreshLaunchResult {
+                outcome: StageFreshLaunchOutcome::Rejected,
+                effects: vec![],
+            };
+        };
+        let session = self
+            .sessions
+            .get_mut(id)
+            .expect("session was validated before incarnation allocation");
+        if let Some(reservation) = session.metadata.backend_repair_reservation.as_mut() {
             reservation.phase = BackendRepairPhase::Staged;
         }
 
@@ -1714,11 +1973,9 @@ impl DaemonState {
         session.metadata.opencode_binding = None;
         session.metadata.restart_generation = session.metadata.restart_generation.saturating_add(1);
         let now = chrono::Utc::now();
-        session.metadata.session_incarnation =
-            now.timestamp_nanos_opt().unwrap_or_else(|| now.timestamp());
+        session.metadata.session_incarnation = incarnation;
         session.registered_at = now.timestamp();
 
-        let incarnation = session.metadata.session_incarnation;
         let mut effects = vec![Effect::Persist];
         if session.metadata.networked {
             effects.push(Effect::BroadcastSessionList);
@@ -1732,7 +1989,7 @@ impl DaemonState {
     fn apply_refresh_launch_metadata(
         &mut self,
         id: String,
-        expected_incarnation: i64,
+        expected_incarnation: SessionIncarnation,
         pane: Option<String>,
         mut metadata: SessionMeta,
     ) -> Vec<Effect> {
@@ -2182,7 +2439,7 @@ impl DaemonState {
         id: &str,
         pane: Option<&str>,
         credential: Option<&str>,
-        staged_incarnation: i64,
+        staged_incarnation: SessionIncarnation,
         previous: Option<SessionEntry>,
         provisional_pane: Option<&str>,
     ) -> Vec<Effect> {
@@ -3557,6 +3814,121 @@ impl DaemonState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registration_allocates_above_restored_high_water_after_removal() {
+        let mut state = DaemonState::new_for_model("d1".into(), "host1".into());
+        state.restore_incarnation_high_water(SessionIncarnation(40));
+
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta::default(),
+        });
+        assert_eq!(
+            state.sessions["worker"].metadata.session_incarnation,
+            SessionIncarnation(41)
+        );
+
+        state.apply(Event::Remove {
+            id: "worker".into(),
+            keep_worktree: true,
+        });
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta::default(),
+        });
+
+        assert_eq!(
+            state.sessions["worker"].metadata.session_incarnation,
+            SessionIncarnation(42)
+        );
+    }
+
+    #[test]
+    fn exhausted_registration_cannot_evict_the_current_pane_owner() {
+        let mut state = DaemonState::new_for_model("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "current".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta::default(),
+        });
+        let current = state.sessions["current"].clone();
+        state.restore_incarnation_high_water(SessionIncarnation(u64::MAX));
+
+        let effects = state.apply(Event::Register {
+            id: "replacement".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta::default(),
+        });
+
+        assert_eq!(state.sessions["current"], current);
+        assert!(!state.sessions.contains_key("replacement"));
+        assert!(effects.iter().any(
+            |effect| matches!(effect, Effect::RegisterFailed { session_id, .. } if session_id == "replacement")
+        ));
+    }
+
+    #[test]
+    fn session_incarnation_serializes_as_a_plain_number() {
+        let encoded = serde_json::to_string(&SessionIncarnation(7)).unwrap();
+        assert_eq!(encoded, "7");
+        assert_eq!(
+            serde_json::from_str::<SessionIncarnation>(&encoded).unwrap(),
+            SessionIncarnation(7)
+        );
+    }
+
+    #[test]
+    fn lifecycle_reservation_rejects_same_id_and_stale_mutations() {
+        let mut state = DaemonState::new_for_model("d1".into(), "host1".into());
+
+        let first = match state.reserve_start("worker").unwrap() {
+            StartDisposition::Reserved(owner) => owner,
+            other => panic!("expected reservation, got {other:?}"),
+        };
+        assert_eq!(
+            state.reserve_start("worker").unwrap(),
+            StartDisposition::InProgress(first.clone())
+        );
+        assert_eq!(
+            state.abort_lifecycle(&first),
+            LifecycleMutationOutcome::Applied
+        );
+
+        let replacement = match state.reserve_start("worker").unwrap() {
+            StartDisposition::Reserved(owner) => owner,
+            other => panic!("expected replacement reservation, got {other:?}"),
+        };
+        assert!(replacement.incarnation > first.incarnation);
+        assert_eq!(
+            state
+                .commit_reserved_start(&first, Some("%stale".into()), SessionMeta::default())
+                .outcome,
+            LifecycleMutationOutcome::Superseded
+        );
+        assert_eq!(
+            state.abort_lifecycle(&first),
+            LifecycleMutationOutcome::Superseded
+        );
+        assert_eq!(state.lifecycle_leases["worker"].owner, replacement.clone());
+        assert_eq!(
+            state
+                .commit_reserved_start(
+                    &replacement,
+                    Some("%replacement".into()),
+                    SessionMeta::default(),
+                )
+                .outcome,
+            LifecycleMutationOutcome::Applied
+        );
+        assert!(!state.lifecycle_leases.contains_key("worker"));
+        assert_eq!(
+            state.sessions["worker"].metadata.session_incarnation,
+            replacement.incarnation
+        );
+    }
 
     // --- validate_sender_claim (task #1395) ---
     //
@@ -7942,7 +8314,7 @@ mod tests {
             metadata: SessionMeta {
                 backend: Some("codex-cli".into()),
                 session_start_credential: Some("proof".into()),
-                session_incarnation: 42,
+                session_incarnation: SessionIncarnation(42),
                 ..Default::default()
             },
         });
@@ -7970,7 +8342,7 @@ mod tests {
                 backend: Some("codex-cli".into()),
                 session_start_credential: Some("repair-proof".into()),
                 backend_repair_reservation: Some(BackendRepairReservation {
-                    original_incarnation: 0,
+                    original_incarnation: SessionIncarnation(0),
                     restart_generation: 7,
                     phase: BackendRepairPhase::Staged,
                 }),
@@ -8005,7 +8377,7 @@ mod tests {
                 backend: Some("codex-cli".into()),
                 restart_generation: 6,
                 backend_repair_reservation: Some(BackendRepairReservation {
-                    original_incarnation: 0,
+                    original_incarnation: SessionIncarnation(0),
                     restart_generation: 7,
                     phase: BackendRepairPhase::PreStage,
                 }),
@@ -8102,7 +8474,7 @@ mod tests {
             "codex-cli".into(),
             Some("new-proof".into()),
             Some(BackendRepairReservation {
-                original_incarnation: -1,
+                original_incarnation: SessionIncarnation(u64::MAX),
                 restart_generation: 1,
                 phase: BackendRepairPhase::PreStage,
             }),

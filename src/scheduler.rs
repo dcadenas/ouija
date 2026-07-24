@@ -598,7 +598,7 @@ async fn stage_scheduled_codex_launch(
     session_id: &str,
     backend_name: &str,
     session_start_credential: Option<String>,
-) -> Result<Option<i64>, String> {
+) -> Result<Option<crate::daemon_protocol::SessionIncarnation>, String> {
     let Some(session_start_credential) = session_start_credential else {
         return Ok(None);
     };
@@ -617,6 +617,9 @@ async fn stage_scheduled_codex_launch(
         }
         crate::daemon_protocol::StageFreshLaunchOutcome::Rejected => Err(format!(
             "scheduled launch for '{session_id}' was superseded before pane respawn"
+        )),
+        crate::daemon_protocol::StageFreshLaunchOutcome::PersistenceFailed => Err(format!(
+            "scheduled launch for '{session_id}' could not persist lifecycle authority"
         )),
     }
 }
@@ -1236,7 +1239,7 @@ async fn rollback_staged_fresh_launch(
     session_id: &str,
     pane_id: &str,
     credential: &str,
-    staged_incarnation: i64,
+    staged_incarnation: crate::daemon_protocol::SessionIncarnation,
     previous: &crate::daemon_protocol::SessionEntry,
 ) {
     state

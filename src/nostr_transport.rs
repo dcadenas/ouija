@@ -2175,7 +2175,7 @@ async fn recover_failed_fresh_launch(
     id: &str,
     pane: Option<String>,
     credential: Option<String>,
-    staged_incarnation: Option<i64>,
+    staged_incarnation: Option<crate::daemon_protocol::SessionIncarnation>,
     previous: Option<crate::daemon_protocol::SessionEntry>,
     provisional_pane: Option<String>,
 ) {
@@ -2511,6 +2511,13 @@ pub async fn restart_session(
                     RestartOutcome::Superseded,
                 );
             }
+            crate::daemon_protocol::StageFreshLaunchOutcome::PersistenceFailed => {
+                return (
+                    "restart failed to persist lifecycle authority".into(),
+                    None,
+                    RestartOutcome::Failed,
+                );
+            }
         }
     }
 
@@ -2653,6 +2660,14 @@ pub async fn restart_session(
                             "restart superseded before backend launch".into(),
                             None,
                             RestartOutcome::Superseded,
+                        );
+                    }
+                    crate::daemon_protocol::StageFreshLaunchOutcome::PersistenceFailed => {
+                        cleanup_provisional_start(state, name, &pane_id).await;
+                        return (
+                            "restart failed to persist lifecycle authority".into(),
+                            None,
+                            RestartOutcome::Failed,
                         );
                     }
                 }
@@ -3548,7 +3563,9 @@ async fn apply_soft_restart_metadata(
     if let Some(e) = update.effort {
         session.metadata.effort = Some(e.to_string());
     }
-    state.persist_protocol_state(&proto);
+    if let Err(error) = state.persist_protocol_state(&proto) {
+        tracing::warn!("failed to persist soft-restart metadata: {error}");
+    }
     Ok(())
 }
 
@@ -3564,7 +3581,7 @@ struct SoftRestartMetadataUpdate<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SoftRestartOwnerSnapshot {
     session_id: String,
-    incarnation: i64,
+    incarnation: crate::daemon_protocol::SessionIncarnation,
 }
 
 impl SoftRestartOwnerSnapshot {
@@ -3595,7 +3612,9 @@ async fn restore_soft_restart_metadata(
     session.metadata.model = previous_metadata.model.clone();
     session.metadata.effort = previous_metadata.effort.clone();
     session.metadata.restart_generation = previous_metadata.restart_generation;
-    state.persist_protocol_state(&proto);
+    if let Err(error) = state.persist_protocol_state(&proto) {
+        tracing::warn!("failed to persist soft-restart rollback metadata: {error}");
+    }
 }
 
 async fn failed_soft_restart_commit_rollback_target(
@@ -6107,7 +6126,7 @@ mod tests {
                         opencode_binding: Some(
                             crate::daemon_protocol::OpenCodeBinding::WeakAdopted,
                         ),
-                        session_incarnation: 1,
+                        session_incarnation: crate::daemon_protocol::SessionIncarnation(1),
                         ..Default::default()
                     },
                     registered_at: 0,
@@ -6887,7 +6906,7 @@ mod tests {
                             crate::daemon_protocol::OpenCodeBinding::StrongManaged,
                         ),
                         restart_generation: 1,
-                        session_incarnation: 1,
+                        session_incarnation: crate::daemon_protocol::SessionIncarnation(1),
                         ..Default::default()
                     },
                     registered_at: 0,
@@ -6897,7 +6916,7 @@ mod tests {
 
         let owner = SoftRestartOwnerSnapshot {
             session_id: "oc".into(),
-            incarnation: 1,
+            incarnation: crate::daemon_protocol::SessionIncarnation(1),
         };
         let result = apply_soft_restart_metadata(
             &state,
@@ -6920,7 +6939,7 @@ mod tests {
         let state = AppState::new_for_test();
         let owner = SoftRestartOwnerSnapshot {
             session_id: "oc".into(),
-            incarnation: 1,
+            incarnation: crate::daemon_protocol::SessionIncarnation(1),
         };
         {
             let mut proto = state.protocol.write().await;
@@ -6937,7 +6956,7 @@ mod tests {
                             crate::daemon_protocol::OpenCodeBinding::StrongManaged,
                         ),
                         restart_generation: 0,
-                        session_incarnation: 2,
+                        session_incarnation: crate::daemon_protocol::SessionIncarnation(2),
                         ..Default::default()
                     },
                     registered_at: 0,
@@ -6979,7 +6998,7 @@ mod tests {
                         backend_session_id: Some("ses_old".into()),
                         parent_session: Some("old-parent".into()),
                         restart_generation: 0,
-                        session_incarnation: 1,
+                        session_incarnation: crate::daemon_protocol::SessionIncarnation(1),
                         ..Default::default()
                     },
                     registered_at: 0,
@@ -6989,7 +7008,7 @@ mod tests {
 
         let owner = SoftRestartOwnerSnapshot {
             session_id: "oc".into(),
-            incarnation: 1,
+            incarnation: crate::daemon_protocol::SessionIncarnation(1),
         };
         apply_soft_restart_metadata(
             &state,
@@ -7023,7 +7042,7 @@ mod tests {
                     pane: None,
                     origin: crate::daemon_protocol::Origin::Local,
                     metadata: crate::daemon_protocol::SessionMeta {
-                        session_incarnation: 1,
+                        session_incarnation: crate::daemon_protocol::SessionIncarnation(1),
                         ..Default::default()
                     },
                     registered_at: 0,
@@ -7032,7 +7051,7 @@ mod tests {
         }
         let owner = SoftRestartOwnerSnapshot {
             session_id: "oc".into(),
-            incarnation: 1,
+            incarnation: crate::daemon_protocol::SessionIncarnation(1),
         };
 
         apply_soft_restart_metadata(
@@ -7073,7 +7092,7 @@ mod tests {
                             crate::daemon_protocol::OpenCodeBinding::StrongManaged,
                         ),
                         restart_generation: 2,
-                        session_incarnation: 1,
+                        session_incarnation: crate::daemon_protocol::SessionIncarnation(1),
                         ..Default::default()
                     },
                     registered_at: 0,
@@ -7101,7 +7120,7 @@ mod tests {
             model: Some("old-model".into()),
             effort: Some("old-effort".into()),
             restart_generation: 7,
-            session_incarnation: 1,
+            session_incarnation: crate::daemon_protocol::SessionIncarnation(1),
             ..Default::default()
         };
         {
@@ -7120,7 +7139,7 @@ mod tests {
 
         let owner = SoftRestartOwnerSnapshot {
             session_id: "oc".into(),
-            incarnation: 1,
+            incarnation: crate::daemon_protocol::SessionIncarnation(1),
         };
         apply_soft_restart_metadata(
             &state,
@@ -7156,7 +7175,7 @@ mod tests {
             backend_session_id: None,
             opencode_binding: None,
             restart_generation: 3,
-            session_incarnation: 1,
+            session_incarnation: crate::daemon_protocol::SessionIncarnation(1),
             ..Default::default()
         };
         {
@@ -7174,7 +7193,7 @@ mod tests {
         }
         let owner = SoftRestartOwnerSnapshot {
             session_id: "oc".into(),
-            incarnation: 1,
+            incarnation: crate::daemon_protocol::SessionIncarnation(1),
         };
         apply_soft_restart_metadata(
             &state,

@@ -516,7 +516,9 @@ impl SessionAgent {
                 }
             }
             let proto = app_state.protocol.read().await;
-            app_state.persist_protocol_state(&proto);
+            if let Err(error) = app_state.persist_protocol_state(&proto) {
+                tracing::warn!("failed to persist session-agent state: {error}");
+            }
         });
     }
 }

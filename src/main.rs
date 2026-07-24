@@ -514,7 +514,7 @@ async fn main() -> anyhow::Result<()> {
 
             // Restore persisted sessions synchronously before the reaper loop
             // starts, so auto-register doesn't overwrite custom names.
-            restore_persisted_sessions(&state).await;
+            restore_persisted_sessions(&state).await?;
             register_human_sessions(&state).await;
 
             // Setup nostr transport in the background so HTTP starts immediately.
@@ -1352,17 +1352,27 @@ async fn setup_nostr_transport(
     transport::broadcast_local_sessions(state).await;
 }
 
-async fn restore_persisted_sessions(state: &state::AppState) {
-    let sessions = match persistence::load_sessions(&state.config.data_dir) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("failed to load persisted sessions: {e}");
-            return;
-        }
-    };
+async fn restore_persisted_sessions(state: &state::AppState) -> anyhow::Result<()> {
+    let persisted = persistence::load_sessions(&state.config.data_dir)
+        .context("failed to restore lifecycle authority from sessions.json")?;
+    let persistence::PersistedLifecycleState {
+        sessions,
+        incarnation_high_water,
+        lifecycle_leases,
+        ..
+    } = persisted;
+
+    // Restore allocator authority even when every persisted session is dead or
+    // has since been removed. Reusing one of those tokens would let delayed
+    // work from the prior daemon incarnation mutate a replacement.
+    {
+        let mut proto = state.protocol.write().await;
+        proto.restore_incarnation_high_water(incarnation_high_water);
+        proto.lifecycle_leases = lifecycle_leases;
+    }
 
     if sessions.is_empty() {
-        return;
+        return Ok(());
     }
 
     // HTTP-delivered sessions (opencode shared serve) are reachable over their
@@ -1394,7 +1404,7 @@ async fn restore_persisted_sessions(state: &state::AppState) {
     alive.extend(http_delivered);
 
     if alive.is_empty() {
-        return;
+        return Ok(());
     }
 
     let mut proto = state.protocol.write().await;
@@ -1409,6 +1419,7 @@ async fn restore_persisted_sessions(state: &state::AppState) {
         proto.sessions.insert(ps.id.clone(), entry);
     }
     tracing::info!("restored {} persisted sessions", alive.len());
+    Ok(())
 }
 
 fn metadata_for_restored_session(
@@ -3423,7 +3434,7 @@ mod tests {
             opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
             restart_generation: 9,
             backend_repair_reservation: None,
-            session_incarnation: 13,
+            session_incarnation: crate::daemon_protocol::SessionIncarnation(13),
             project_description: Some("project".into()),
             last_metadata_update: chrono::DateTime::from_timestamp(1_700_000_001, 0),
             model: Some("openrouter/sonnet".into()),
@@ -3466,6 +3477,72 @@ mod tests {
         assert_eq!(restored.last_iteration_at, metadata.last_iteration_at);
         assert_eq!(restored.on_fire, metadata.on_fire);
         assert_eq!(restored.worktree_present, metadata.worktree_present);
+    }
+
+    #[tokio::test]
+    async fn restore_persisted_sessions_retains_removed_high_water_and_inflight_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "pending".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(49),
+        };
+        let snapshot = crate::persistence::PersistedLifecycleState::new(
+            vec![],
+            crate::daemon_protocol::SessionIncarnation(50),
+            std::collections::BTreeMap::from([(
+                owner.session_id.clone(),
+                crate::daemon_protocol::LifecycleLease {
+                    owner: owner.clone(),
+                    phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                },
+            )]),
+        );
+        crate::persistence::save_sessions(dir.path(), &snapshot).unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: 0,
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+
+        restore_persisted_sessions(&state).await.unwrap();
+
+        let mut proto = state.protocol.write().await;
+        assert_eq!(
+            proto.lifecycle_leases["pending"].owner, owner,
+            "restart must retain in-flight lifecycle authority"
+        );
+        assert_eq!(
+            proto.reserve_start("next").unwrap(),
+            crate::daemon_protocol::StartDisposition::Reserved(
+                crate::daemon_protocol::ResourceOwner {
+                    session_id: "next".into(),
+                    incarnation: crate::daemon_protocol::SessionIncarnation(51),
+                }
+            ),
+            "the first post-restart token must exceed removed persisted owners"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_persisted_sessions_fails_closed_on_corrupt_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sessions.json"), "{not-json").unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: 0,
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+
+        let result = restore_persisted_sessions(&state).await;
+
+        assert!(
+            result.is_err(),
+            "daemon startup must not enable lifecycle allocation after authority load failure"
+        );
     }
 
     #[test]

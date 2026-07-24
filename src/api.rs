@@ -4414,7 +4414,7 @@ struct OpenCodeAdoptionCandidate {
     backend: Option<String>,
     backend_session_id: Option<String>,
     session_start_credential: Option<String>,
-    incarnation: i64,
+    incarnation: crate::daemon_protocol::SessionIncarnation,
 }
 
 /// Bind an uncredentialed OpenCode identity only if the exact candidate that

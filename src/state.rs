@@ -445,7 +445,7 @@ pub struct SessionMetadata {
     pub backend_repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
     /// Per-registration token used to reject stale async commits.
     #[serde(default)]
-    pub session_incarnation: i64,
+    pub session_incarnation: crate::daemon_protocol::SessionIncarnation,
     /// Short project description extracted from Cargo.toml, package.json, or README.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_description: Option<String>,
@@ -533,7 +533,7 @@ impl Default for SessionMetadata {
             opencode_binding: None,
             restart_generation: 0,
             backend_repair_reservation: None,
-            session_incarnation: 0,
+            session_incarnation: crate::daemon_protocol::SessionIncarnation::default(),
             project_description: None,
             bulletin: None,
             worktree: false,
@@ -604,13 +604,16 @@ const AUTOREGISTER_REMOVE_GRACE_SECS: u64 = 10;
 impl AppState {
     #[cfg(test)]
     pub fn new_for_test() -> Arc<Self> {
+        let data_dir = tempfile::tempdir()
+            .expect("create test data directory")
+            .keep();
         Arc::new(Self {
             config: crate::config::OuijaConfig {
                 name: "test".into(),
                 npub: "npub1test".into(),
                 port: 0,
-                data_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
-                config_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+                data_dir: data_dir.clone(),
+                config_dir: data_dir.clone(),
             },
             protocol: RwLock::new(crate::daemon_protocol::DaemonState::new(
                 "npub1test".into(),
@@ -618,7 +621,7 @@ impl AppState {
             )),
             nodes: RwLock::new(HashMap::new()),
             message_log: RwLock::new(VecDeque::with_capacity(MAX_LOG)),
-            log_file: std::path::PathBuf::from("/tmp/ouija-test-agent/messages.jsonl"),
+            log_file: data_dir.join("messages.jsonl"),
             transports: RwLock::new(HashMap::new()),
             settings: RwLock::new(Default::default()),
             scheduled_tasks: RwLock::new(HashMap::new()),
@@ -897,17 +900,107 @@ impl AppState {
         session_start_credential: Option<String>,
         expected_repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
     ) -> crate::daemon_protocol::StageFreshLaunchOutcome {
-        let result = {
+        let (outcome, effects) = {
             let mut state = self.protocol.write().await;
-            state.stage_fresh_launch(
+            let before = state.clone();
+            let result = state.stage_fresh_launch(
                 &id,
                 backend,
                 session_start_credential,
                 expected_repair_reservation,
-            )
+            );
+            if matches!(
+                result.outcome,
+                crate::daemon_protocol::StageFreshLaunchOutcome::Staged { .. }
+            ) && let Err(error) = self.persist_protocol_state(&state)
+            {
+                *state = before;
+                tracing::warn!(
+                    session_id = %id,
+                    "failed to persist fresh launch lifecycle authority: {error}"
+                );
+                return crate::daemon_protocol::StageFreshLaunchOutcome::PersistenceFailed;
+            }
+            let effects: Vec<_> = result
+                .effects
+                .into_iter()
+                .filter(|effect| !matches!(effect, crate::daemon_protocol::Effect::Persist))
+                .collect();
+            (result.outcome, effects)
         };
-        self.execute_effects(&result.effects).await;
-        result.outcome
+        self.execute_effects(&effects).await;
+        outcome
+    }
+
+    /// Reserve a start and durably publish its allocator/lease state before
+    /// returning authority to a caller that may perform external work.
+    #[allow(dead_code)] // Introduced in Chunk 1; launch callers adopt it in Chunk 2.
+    pub async fn reserve_start(
+        self: &Arc<Self>,
+        session_id: &str,
+    ) -> anyhow::Result<crate::daemon_protocol::StartDisposition> {
+        let mut proto = self.protocol.write().await;
+        let before = proto.clone();
+        let disposition = proto
+            .reserve_start(session_id)
+            .map_err(anyhow::Error::from)?;
+        if matches!(
+            disposition,
+            crate::daemon_protocol::StartDisposition::Reserved(_)
+        ) && let Err(error) = self.persist_protocol_state(&proto)
+        {
+            *proto = before;
+            return Err(error);
+        }
+        Ok(disposition)
+    }
+
+    /// Commit a reserved start only after the active owner and released lease
+    /// have been durably written. Non-persistence effects run afterward.
+    #[allow(dead_code)] // Introduced in Chunk 1; launch callers adopt it in Chunk 2.
+    pub async fn commit_reserved_start(
+        self: &Arc<Self>,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        pane: Option<String>,
+        metadata: crate::daemon_protocol::SessionMeta,
+    ) -> anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome> {
+        let (outcome, effects) = {
+            let mut proto = self.protocol.write().await;
+            let before = proto.clone();
+            let result = proto.commit_reserved_start(owner, pane, metadata);
+            if result.outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied
+                && let Err(error) = self.persist_protocol_state(&proto)
+            {
+                *proto = before;
+                return Err(error);
+            }
+            let effects: Vec<_> = result
+                .effects
+                .into_iter()
+                .filter(|effect| !matches!(effect, crate::daemon_protocol::Effect::Persist))
+                .collect();
+            (result.outcome, effects)
+        };
+        self.execute_effects(&effects).await;
+        Ok(outcome)
+    }
+
+    /// Release an exact lifecycle lease only after the removal is durable.
+    #[allow(dead_code)] // Introduced in Chunk 1; launch callers adopt it in Chunk 2.
+    pub async fn abort_lifecycle(
+        self: &Arc<Self>,
+        owner: &crate::daemon_protocol::ResourceOwner,
+    ) -> anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome> {
+        let mut proto = self.protocol.write().await;
+        let before = proto.clone();
+        let outcome = proto.abort_lifecycle(owner);
+        if outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied
+            && let Err(error) = self.persist_protocol_state(&proto)
+        {
+            *proto = before;
+            return Err(error);
+        }
+        Ok(outcome)
     }
 
     async fn _apply_and_execute(
@@ -1137,7 +1230,9 @@ impl AppState {
                 }
                 Effect::Persist => {
                     let proto = self.protocol.read().await;
-                    self.persist_protocol_state(&proto);
+                    if let Err(error) = self.persist_protocol_state(&proto) {
+                        tracing::warn!("failed to persist protocol state: {error}");
+                    }
                 }
                 Effect::CleanupWorktree { project_dir } => {
                     let dir = project_dir.clone();
@@ -1443,7 +1538,10 @@ impl AppState {
     }
 
     /// Persist protocol state sessions to disk.
-    pub(crate) fn persist_protocol_state(&self, proto: &crate::daemon_protocol::DaemonState) {
+    pub(crate) fn persist_protocol_state(
+        &self,
+        proto: &crate::daemon_protocol::DaemonState,
+    ) -> anyhow::Result<()> {
         // Convert DaemonState sessions to the persisted Session format.
         //
         // IMPORTANT: every field on SessionMetadata must be explicitly copied
@@ -1509,7 +1607,11 @@ impl AppState {
                 (k.clone(), session)
             })
             .collect();
-        self.persist_sessions_from(&sessions);
+        self.persist_sessions_from(
+            &sessions,
+            proto.incarnation_high_water,
+            proto.lifecycle_leases.clone(),
+        )
     }
 
     /// Clean up a git worktree directory if it has no uncommitted changes.
@@ -1923,14 +2025,25 @@ impl AppState {
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub fn persist_sessions_from(&self, sessions: &HashMap<String, Session>) {
+    fn persist_sessions_from(
+        &self,
+        sessions: &HashMap<String, Session>,
+        incarnation_high_water: crate::daemon_protocol::SessionIncarnation,
+        lifecycle_leases: std::collections::BTreeMap<
+            String,
+            crate::daemon_protocol::LifecycleLease,
+        >,
+    ) -> anyhow::Result<()> {
         let persisted: Vec<_> = sessions
             .values()
             .filter_map(crate::persistence::PersistedSession::from_session)
             .collect();
-        if let Err(e) = crate::persistence::save_sessions(&self.config.data_dir, &persisted) {
-            tracing::warn!("failed to persist sessions: {e}");
-        }
+        let snapshot = crate::persistence::PersistedLifecycleState::new(
+            persisted,
+            incarnation_high_water,
+            lifecycle_leases,
+        );
+        crate::persistence::save_sessions(&self.config.data_dir, &snapshot)
     }
 
     pub async fn cached_assistant_panes(&self) -> Vec<crate::tmux::TmuxPane> {
@@ -2532,6 +2645,133 @@ pub(crate) mod tests {
             port: 0,
             npub: "npub1test".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn durable_start_reservation_rolls_back_when_snapshot_write_fails() {
+        let config = test_config();
+        std::fs::create_dir(config.data_dir.join("sessions.tmp")).unwrap();
+        let state = AppState::new(config);
+
+        let result = state.reserve_start("worker").await;
+
+        assert!(result.is_err());
+        let proto = state.protocol.read().await;
+        assert!(proto.lifecycle_leases.is_empty());
+        assert_eq!(
+            proto.incarnation_high_water,
+            crate::daemon_protocol::SessionIncarnation::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_start_commit_persists_the_exact_reserved_owner() {
+        let config = test_config();
+        let state = AppState::new(config.clone());
+        let owner = match state.reserve_start("worker").await.unwrap() {
+            crate::daemon_protocol::StartDisposition::Reserved(owner) => owner,
+            other => panic!("expected reservation, got {other:?}"),
+        };
+
+        let outcome = state
+            .commit_reserved_start(
+                &owner,
+                Some("%1".into()),
+                crate::daemon_protocol::SessionMeta::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        let persisted = crate::persistence::load_sessions(&config.data_dir).unwrap();
+        assert!(persisted.lifecycle_leases.is_empty());
+        assert_eq!(
+            persisted.sessions[0].metadata.session_incarnation,
+            owner.incarnation
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_start_commit_rolls_back_when_snapshot_write_fails() {
+        let config = test_config();
+        let state = AppState::new(config.clone());
+        let owner = match state.reserve_start("worker").await.unwrap() {
+            crate::daemon_protocol::StartDisposition::Reserved(owner) => owner,
+            other => panic!("expected reservation, got {other:?}"),
+        };
+        std::fs::create_dir(config.data_dir.join("sessions.tmp")).unwrap();
+
+        let result = state
+            .commit_reserved_start(
+                &owner,
+                Some("%1".into()),
+                crate::daemon_protocol::SessionMeta::default(),
+            )
+            .await;
+
+        assert!(result.is_err());
+        let proto = state.protocol.read().await;
+        assert_eq!(proto.lifecycle_leases["worker"].owner, owner);
+        assert!(!proto.sessions.contains_key("worker"));
+    }
+
+    #[tokio::test]
+    async fn durable_start_abort_persists_lease_release() {
+        let config = test_config();
+        let state = AppState::new(config.clone());
+        let owner = match state.reserve_start("worker").await.unwrap() {
+            crate::daemon_protocol::StartDisposition::Reserved(owner) => owner,
+            other => panic!("expected reservation, got {other:?}"),
+        };
+
+        let outcome = state.abort_lifecycle(&owner).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        let persisted = crate::persistence::load_sessions(&config.data_dir).unwrap();
+        assert!(persisted.lifecycle_leases.is_empty());
+        assert_eq!(persisted.incarnation_high_water, owner.incarnation);
+    }
+
+    #[tokio::test]
+    async fn durable_start_abort_rolls_back_when_snapshot_write_fails() {
+        let config = test_config();
+        let state = AppState::new(config.clone());
+        let owner = match state.reserve_start("worker").await.unwrap() {
+            crate::daemon_protocol::StartDisposition::Reserved(owner) => owner,
+            other => panic!("expected reservation, got {other:?}"),
+        };
+        std::fs::create_dir(config.data_dir.join("sessions.tmp")).unwrap();
+
+        let result = state.abort_lifecycle(&owner).await;
+
+        assert!(result.is_err());
+        let proto = state.protocol.read().await;
+        assert_eq!(proto.lifecycle_leases["worker"].owner, owner);
+    }
+
+    #[tokio::test]
+    async fn fresh_launch_stage_does_not_escape_when_snapshot_write_fails() {
+        let config = test_config();
+        let state = AppState::new(config.clone());
+        proto_register(&state, "worker", Some("%1")).await;
+        let before = state.protocol.read().await.clone();
+        std::fs::create_dir(config.data_dir.join("sessions.tmp")).unwrap();
+
+        let outcome = state
+            .stage_fresh_launch("worker", "codex-cli".into(), Some("proof".into()), None)
+            .await;
+
+        assert_eq!(
+            outcome,
+            crate::daemon_protocol::StageFreshLaunchOutcome::PersistenceFailed
+        );
+        assert_eq!(*state.protocol.read().await, before);
     }
 
     /// Config whose opencode serve port (`config.port + 320` = 320) is
@@ -4024,7 +4264,7 @@ pub(crate) mod tests {
             backend_repair_reservation: None,
             opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
             restart_generation: 7,
-            session_incarnation: 11,
+            session_incarnation: crate::daemon_protocol::SessionIncarnation(11),
             project_description: Some("test project".into()),
             vim_mode: true,
             worktree: true,
@@ -4048,17 +4288,33 @@ pub(crate) mod tests {
                 metadata: meta,
             })
             .await;
+        let pending_owner = {
+            let mut proto = state.protocol.write().await;
+            match proto.reserve_start("pending").unwrap() {
+                crate::daemon_protocol::StartDisposition::Reserved(owner) => owner,
+                other => panic!("expected pending reservation, got {other:?}"),
+            }
+        };
 
         // Trigger the real persist path (same code Effect::Persist dispatches to).
         {
             let proto = state.protocol.read().await;
-            state.persist_protocol_state(&proto);
+            state.persist_protocol_state(&proto).unwrap();
         }
 
         // Read sessions.json back from disk.
         let loaded = crate::persistence::load_sessions(&config.data_dir)
             .expect("load_sessions after persist");
+        assert_eq!(
+            loaded.incarnation_high_water, pending_owner.incarnation,
+            "allocator high-water mark dropped by persist"
+        );
+        assert_eq!(
+            loaded.lifecycle_leases["pending"].owner, pending_owner,
+            "in-flight lifecycle lease dropped by persist"
+        );
         let s = loaded
+            .sessions
             .iter()
             .find(|p| p.id == "s1")
             .expect("session s1 not persisted");
