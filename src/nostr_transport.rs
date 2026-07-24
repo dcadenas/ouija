@@ -2486,7 +2486,7 @@ pub async fn start_session(
                 crate::backend::DeliveryMode::HttpApi { .. }
             );
             let backend_session_id = if is_http_api {
-                match setup_shared_serve_session(state, &owner, &pane_id, &dir).await {
+                match setup_shared_serve_session(state, &owner, None, &pane_id, &dir).await {
                     Ok(sid) => Some(sid),
                     Err(e) => {
                         tracing::warn!("shared serve session setup failed: {e}");
@@ -2615,6 +2615,7 @@ pub async fn start_session(
                                             true,
                                             false,
                                             expected_backend_session_id.as_deref(),
+                                            None,
                                         )
                                         .await
                                         .is_err()
@@ -2649,6 +2650,7 @@ pub async fn start_session(
                                             true,
                                             false,
                                             expected_backend_session_id.as_deref(),
+                                            None,
                                         )
                                         .await
                                         .is_err()
@@ -2721,6 +2723,30 @@ pub enum RestartOutcome {
     Superseded,
 }
 
+async fn claim_restart_for_external_work(
+    state: &std::sync::Arc<AppState>,
+    name: &str,
+) -> Result<crate::daemon_protocol::ResourceOwner, RestartOutcome> {
+    let owner = {
+        let protocol = state.protocol.read().await;
+        let Some(session) = protocol.sessions.get(name) else {
+            return Err(RestartOutcome::Failed);
+        };
+        if !matches!(session.origin, crate::daemon_protocol::Origin::Local) {
+            return Err(RestartOutcome::Failed);
+        }
+        session.owner()
+    };
+    match state.claim_existing_start(&owner).await {
+        Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => Ok(owner),
+        Ok(_) => Err(RestartOutcome::Superseded),
+        Err(error) => {
+            tracing::warn!(session = name, "failed to persist restart claim: {error}");
+            Err(RestartOutcome::Failed)
+        }
+    }
+}
+
 fn restart_recovery_pending(
     proto: &crate::daemon_protocol::DaemonState,
     owner: &crate::daemon_protocol::ResourceOwner,
@@ -2741,10 +2767,36 @@ fn restart_recovery_pending(
         })
 }
 
+fn select_restart_resume_id(
+    fresh: bool,
+    selected_backend: &str,
+    previous_metadata: Option<&crate::daemon_protocol::SessionMeta>,
+    detected_session_id: Option<String>,
+) -> Option<String> {
+    let previous_backend_matches = previous_metadata
+        .and_then(|metadata| metadata.backend.as_deref())
+        == Some(selected_backend);
+    if fresh || !previous_backend_matches {
+        return None;
+    }
+    previous_metadata
+        .and_then(|metadata| metadata.backend_session_id.clone())
+        .or(detected_session_id)
+}
+
+fn previous_http_restart_fallback_id(
+    fresh: bool,
+    selected_backend: &str,
+    previous_metadata: Option<&crate::daemon_protocol::SessionMeta>,
+) -> Option<String> {
+    select_restart_resume_id(fresh, selected_backend, previous_metadata, None)
+}
+
 /// Recover an interactive fresh launch that definitely failed before the
 /// backend command could start. The protocol guards make this a no-op when a
 /// concurrent SessionStart has already consumed the credential and bound the
 /// new backend identity.
+#[cfg(test)]
 async fn recover_failed_fresh_launch(
     state: &std::sync::Arc<AppState>,
     id: &str,
@@ -2772,6 +2824,23 @@ async fn recover_failed_fresh_launch(
             previous,
             provisional_pane.as_deref(),
         )
+        .await
+}
+
+async fn rollback_claimed_restart(
+    state: &std::sync::Arc<AppState>,
+    lease_owner: &crate::daemon_protocol::ResourceOwner,
+    target_owner: &crate::daemon_protocol::ResourceOwner,
+    provisional_pane: Option<&str>,
+) -> anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome> {
+    if restart_backend_cleanup_pending(state, lease_owner, target_owner).await {
+        anyhow::bail!("restart backend cleanup is still pending for target {target_owner:?}");
+    }
+    if let Some(provisional_pane) = provisional_pane {
+        remove_inert_start_pane(state, target_owner, provisional_pane).await?;
+    }
+    state
+        .rollback_restart_launch(lease_owner, target_owner, None)
         .await
 }
 
@@ -2814,8 +2883,9 @@ pub async fn restart_session_for_start(
         );
     }
 
-    let result = restart_session(
+    let result = restart_session_claimed(
         state,
+        owner,
         name,
         fresh,
         repair_reservation,
@@ -2871,8 +2941,82 @@ pub async fn restart_session(
     parent_session_override: ParentSessionOverride,
     idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
 ) -> (String, Option<u64>, RestartOutcome) {
-    // Snapshot full metadata before killing so we can carry it forward
-    let session = state.protocol.read().await.sessions.get(name).cloned();
+    let owner = match claim_restart_for_external_work(state, name).await {
+        Ok(owner) => owner,
+        Err(RestartOutcome::Superseded) => {
+            return (
+                format!("restart already in progress for '{name}'"),
+                None,
+                RestartOutcome::Superseded,
+            );
+        }
+        Err(_) => {
+            return (
+                format!("session '{name}' not found or restart claim failed"),
+                None,
+                RestartOutcome::Failed,
+            );
+        }
+    };
+    restart_session_for_start(
+        state,
+        &owner,
+        name,
+        fresh,
+        repair_reservation,
+        prompt,
+        from,
+        expects_reply,
+        backend,
+        model,
+        effort,
+        reminder,
+        parent_session_override,
+        idle_policy,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn restart_session_claimed(
+    state: &std::sync::Arc<AppState>,
+    lease_owner: &crate::daemon_protocol::ResourceOwner,
+    name: &str,
+    fresh: bool,
+    repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
+    prompt: Option<&str>,
+    from: Option<&str>,
+    expects_reply: Option<bool>,
+    backend: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    reminder: Option<&str>,
+    parent_session_override: ParentSessionOverride,
+    idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
+) -> (String, Option<u64>, RestartOutcome) {
+    // Snapshot only while the exact incumbent and durable restart claim still
+    // agree. Every public caller claims this authority before reaching any
+    // HTTP, tmux, process, attach, readiness, or prompt work.
+    let session = {
+        let protocol = state.protocol.read().await;
+        let lease_matches = protocol.lifecycle_leases.get(name).is_some_and(|lease| {
+            lease.owner == *lease_owner
+                && lease.phase == crate::daemon_protocol::LifecyclePhase::Restarting
+        });
+        protocol
+            .sessions
+            .get(name)
+            .filter(|session| lease_matches && session.owner() == *lease_owner)
+            .cloned()
+    };
+    if session.is_none() {
+        return (
+            "restart superseded before external work".into(),
+            None,
+            RestartOutcome::Superseded,
+        );
+    }
+    // Snapshot full metadata before staging so we can carry it forward.
     let prev_metadata = session.as_ref().map(|s| s.metadata.clone());
     if let Some(expected) = repair_reservation.as_ref()
         && !session.as_ref().is_some_and(|session| {
@@ -2887,9 +3031,6 @@ pub async fn restart_session(
             RestartOutcome::Superseded,
         );
     }
-    let mut staged_incarnation = prev_metadata.as_ref().map(|m| m.session_incarnation);
-    let mut fresh_launch_staged_incarnation = None;
-
     // Capture existing pane before killing
     let existing_pane = session.as_ref().and_then(|s| s.pane.clone());
 
@@ -2943,6 +3084,68 @@ pub async fn restart_session(
         Some(m) => idle_policy.clone().or_else(|| m.idle_policy.clone()),
         None => idle_policy.clone(),
     };
+    let projects_dir = state.settings.read().await.projects_dir.clone();
+    let base = match projects_dir {
+        Some(dir) => crate::state::expand_tilde(&dir),
+        None => crate::state::expand_tilde("~/code"),
+    };
+    let dir = prev_metadata
+        .as_ref()
+        .and_then(|m| m.project_dir.clone())
+        .unwrap_or_else(|| format!("{base}/{name}"));
+    let backend_name = backend.name().to_string();
+    let detected_session_id = (!fresh
+        && prev_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.backend.as_deref())
+            == Some(backend_name.as_str()))
+    .then(|| backend.detect_session_id(&dir))
+    .flatten();
+    let resume_id = select_restart_resume_id(
+        fresh,
+        &backend_name,
+        prev_metadata.as_ref(),
+        detected_session_id,
+    );
+    if let Some(ref sid) = resume_id {
+        tracing::info!("restart '{name}': using --resume {sid}");
+    }
+    let launches_new_backend_identity = fresh || resume_id.is_none();
+    let session_start_credential = (backend_name == "codex-cli" && launches_new_backend_identity)
+        .then(crate::daemon_protocol::new_session_start_credential);
+
+    let staged_incarnation = match state
+        .stage_restart_launch(
+            lease_owner,
+            backend_name.clone(),
+            launches_new_backend_identity,
+            session_start_credential.clone(),
+            repair_reservation.clone(),
+        )
+        .await
+    {
+        crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
+            Some(incarnation)
+        }
+        crate::daemon_protocol::StageFreshLaunchOutcome::Rejected => {
+            return (
+                "restart superseded before external work".into(),
+                None,
+                RestartOutcome::Superseded,
+            );
+        }
+        crate::daemon_protocol::StageFreshLaunchOutcome::PersistenceFailed => {
+            return (
+                "restart failed to persist target lifecycle authority".into(),
+                None,
+                RestartOutcome::Failed,
+            );
+        }
+    };
+    let restart_target_owner = crate::daemon_protocol::ResourceOwner {
+        session_id: name.to_string(),
+        incarnation: staged_incarnation.expect("staged restart must have a target incarnation"),
+    };
 
     // --- Soft restart for HttpApi backends ---
     // Create a new session on the serve via HTTP API and deliver the prompt directly.
@@ -2957,8 +3160,13 @@ pub async fn restart_session(
                 .as_ref()
                 .and_then(|m| m.project_dir.clone())
                 .unwrap_or_default();
-            if let Ok(result) = soft_restart_session(
+            if let Ok(result) = soft_restart_session_claimed(
                 state,
+                lease_owner,
+                &restart_target_owner,
+                prev_metadata
+                    .as_ref()
+                    .expect("claimed restart must retain previous metadata"),
                 name,
                 existing_pane.as_deref(),
                 &dir,
@@ -2978,6 +3186,15 @@ pub async fn restart_session(
                 // caller does not need a second write here.
                 return (result.0, result.1, RestartOutcome::Restarted);
             }
+            if restart_backend_cleanup_pending(state, lease_owner, &restart_target_owner).await {
+                return (
+                    format!(
+                        "soft restart failed for '{name}' with durable backend cleanup pending"
+                    ),
+                    None,
+                    RestartOutcome::Failed,
+                );
+            }
             tracing::info!("soft restart failed for '{name}', falling back to hard restart");
         }
     }
@@ -2996,36 +3213,6 @@ pub async fn restart_session(
             s.registered_at = chrono::Utc::now().timestamp();
         }
     }
-
-    let projects_dir = state.settings.read().await.projects_dir.clone();
-    let base = match projects_dir {
-        Some(dir) => crate::state::expand_tilde(&dir),
-        None => crate::state::expand_tilde("~/code"),
-    };
-
-    // Use previous project_dir if available, otherwise derive from name
-    let dir = prev_metadata
-        .as_ref()
-        .and_then(|m| m.project_dir.clone())
-        .unwrap_or_else(|| format!("{base}/{name}"));
-    let backend_name = backend.name().to_string();
-    let resume_id = if fresh {
-        None
-    } else {
-        prev_metadata
-            .as_ref()
-            .and_then(|m| m.backend_session_id.clone())
-            .or_else(|| backend.detect_session_id(&dir))
-    };
-    if let Some(ref sid) = resume_id {
-        tracing::info!("restart '{name}': using --resume {sid}");
-    }
-
-    // A fresh Codex launch has no backend thread ID until its SessionStart
-    // hook runs. Authorize that first binding with a launch-scoped credential;
-    // resumed threads retain their already-known identity instead.
-    let session_start_credential = (backend_name == "codex-cli" && resume_id.is_none())
-        .then(crate::daemon_protocol::new_session_start_credential);
 
     // Ouija manages worktrees in .ouija/worktrees/ — the backend just gets a dir.
     // On restart, the worktree already exists (project_dir points to it).
@@ -3132,82 +3319,30 @@ pub async fn restart_session(
     // that already export the incumbent incarnation. Refuse legacy/unverified
     // panes before staging a replacement; otherwise a crash before
     // `respawn-pane` could orphan the incumbent after releasing its ID.
-    if fresh && let Some(existing_pane) = existing_pane.as_ref() {
-        let restart_lease_owner = {
-            let proto = state.protocol.read().await;
-            proto.lifecycle_leases.get(name).and_then(|lease| {
-                (lease.phase == crate::daemon_protocol::LifecyclePhase::Restarting)
-                    .then(|| lease.owner.clone())
-            })
+    if let Some(existing_pane) = existing_pane.as_ref() {
+        let pane = existing_pane.clone();
+        let live_owner =
+            tokio::task::spawn_blocking(move || crate::tmux::inspect_pane_owner(&pane)).await;
+        let verification_error = match live_owner {
+            Ok(Ok(Some(live_owner)))
+                if crate::tmux::physical_owner_matches(&live_owner, lease_owner)
+                    || crate::tmux::physical_owner_matches(&live_owner, &restart_target_owner) =>
+            {
+                None
+            }
+            Ok(Ok(live_owner)) => Some(format!(
+                "restart refused unverified incumbent pane {existing_pane}: expected {lease_owner:?} or {restart_target_owner:?}, found {live_owner:?}"
+            )),
+            Ok(Err(error)) => Some(format!(
+                "restart could not verify incumbent pane {existing_pane}: {error}"
+            )),
+            Err(error) => Some(format!(
+                "restart incumbent pane verification task failed for {existing_pane}: {error}"
+            )),
         };
-        if let Some(restart_lease_owner) = restart_lease_owner {
-            let pane = existing_pane.clone();
-            let live_owner =
-                tokio::task::spawn_blocking(move || crate::tmux::inspect_pane_owner(&pane)).await;
-            match live_owner {
-                Ok(Ok(Some(live_owner)))
-                    if crate::tmux::physical_owner_matches(&live_owner, &restart_lease_owner) => {}
-                Ok(Ok(live_owner)) => {
-                    return (
-                        format!(
-                            "restart refused unverified incumbent pane {existing_pane}: expected {restart_lease_owner:?}, found {live_owner:?}"
-                        ),
-                        None,
-                        RestartOutcome::Failed,
-                    );
-                }
-                Ok(Err(error)) => {
-                    return (
-                        format!("restart could not verify incumbent pane {existing_pane}: {error}"),
-                        None,
-                        RestartOutcome::Failed,
-                    );
-                }
-                Err(error) => {
-                    return (
-                        format!(
-                            "restart incumbent pane verification task failed for {existing_pane}: {error}"
-                        ),
-                        None,
-                        RestartOutcome::Failed,
-                    );
-                }
-            }
-        }
-    }
-
-    // Every fresh hard restart gets a new incarnation before tmux respawns
-    // the backend. This clears the old native identity and leaves only the
-    // intended backend plus an optional Codex launch credential for the new
-    // process to claim.
-    if fresh && prev_metadata.is_some() {
-        match state
-            .stage_fresh_launch(
-                name,
-                backend_name.clone(),
-                session_start_credential.clone(),
-                repair_reservation.clone(),
-            )
-            .await
-        {
-            crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
-                staged_incarnation = Some(incarnation);
-                fresh_launch_staged_incarnation = Some(incarnation);
-            }
-            crate::daemon_protocol::StageFreshLaunchOutcome::Rejected => {
-                return (
-                    "restart superseded before respawn".into(),
-                    None,
-                    RestartOutcome::Superseded,
-                );
-            }
-            crate::daemon_protocol::StageFreshLaunchOutcome::PersistenceFailed => {
-                return (
-                    "restart failed to persist lifecycle authority".into(),
-                    None,
-                    RestartOutcome::Failed,
-                );
-            }
+        if let Some(error) = verification_error {
+            let _ = rollback_claimed_restart(state, lease_owner, &restart_target_owner, None).await;
+            return (error, None, RestartOutcome::Failed);
         }
     }
 
@@ -3215,72 +3350,46 @@ pub async fn restart_session(
     // pane and its staged owner before `respawn-pane`; restore accepts either
     // the incumbent (crash before replacement) or staged owner (crash after
     // replacement) and removes only that exact managed pane.
-    let direct_restart_lease_owner = if fresh
-        && let (Some(existing_pane), Some(expected_incarnation)) =
-            (existing_pane.as_ref(), staged_incarnation)
+    let direct_restart_lease_owner = if let (Some(existing_pane), Some(expected_incarnation)) =
+        (existing_pane.as_ref(), staged_incarnation)
     {
-        let restart_lease_owner = {
-            let proto = state.protocol.read().await;
-            proto.lifecycle_leases.get(name).and_then(|lease| {
-                (lease.phase == crate::daemon_protocol::LifecyclePhase::Restarting)
-                    .then(|| lease.owner.clone())
-            })
+        let pane_owner = crate::daemon_protocol::ResourceOwner {
+            session_id: name.to_string(),
+            incarnation: expected_incarnation,
         };
-        if let Some(ref lease_owner) = restart_lease_owner {
-            let pane_owner = crate::daemon_protocol::ResourceOwner {
-                session_id: name.to_string(),
-                incarnation: expected_incarnation,
-            };
-            match state
-                .record_inert_start_pane(lease_owner, pane_owner, existing_pane.clone())
-                .await
-            {
-                Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
-                Ok(outcome) => {
-                    let _ = recover_failed_fresh_launch(
-                        state,
-                        name,
-                        Some(existing_pane.clone()),
-                        session_start_credential.clone(),
-                        fresh_launch_staged_incarnation,
-                        session.clone(),
-                        None,
-                    )
-                    .await;
-                    return (
-                        format!("restart superseded before direct respawn ({outcome:?})"),
-                        None,
-                        RestartOutcome::Superseded,
-                    );
-                }
-                Err(error) => {
-                    let rollback = recover_failed_fresh_launch(
-                        state,
-                        name,
-                        Some(existing_pane.clone()),
-                        session_start_credential.clone(),
-                        fresh_launch_staged_incarnation,
-                        session.clone(),
-                        None,
-                    )
-                    .await;
-                    return (
-                        format!(
-                            "restart failed to persist direct respawn authority: {error}{}",
-                            rollback
-                                .err()
-                                .map(|rollback_error| {
-                                    format!("; durable rollback failed: {rollback_error}")
-                                })
-                                .unwrap_or_default()
-                        ),
-                        None,
-                        RestartOutcome::Failed,
-                    );
-                }
+        match state
+            .record_inert_start_pane(lease_owner, pane_owner, existing_pane.clone())
+            .await
+        {
+            Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
+            Ok(outcome) => {
+                let _ =
+                    rollback_claimed_restart(state, lease_owner, &restart_target_owner, None).await;
+                return (
+                    format!("restart superseded before direct respawn ({outcome:?})"),
+                    None,
+                    RestartOutcome::Superseded,
+                );
+            }
+            Err(error) => {
+                let rollback =
+                    rollback_claimed_restart(state, lease_owner, &restart_target_owner, None).await;
+                return (
+                    format!(
+                        "restart failed to persist direct respawn authority: {error}{}",
+                        rollback
+                            .err()
+                            .map(|rollback_error| {
+                                format!("; durable rollback failed: {rollback_error}")
+                            })
+                            .unwrap_or_default()
+                    ),
+                    None,
+                    RestartOutcome::Failed,
+                );
             }
         }
-        restart_lease_owner
+        Some(lease_owner.clone())
     } else {
         None
     };
@@ -3303,16 +3412,9 @@ pub async fn restart_session(
             ) {
                 Ok(command) => command,
                 Err(error) => {
-                    let rollback = recover_failed_fresh_launch(
-                        state,
-                        name,
-                        existing_pane.clone(),
-                        session_start_credential.clone(),
-                        fresh_launch_staged_incarnation,
-                        session.clone(),
-                        None,
-                    )
-                    .await;
+                    let rollback =
+                        rollback_claimed_restart(state, lease_owner, &restart_target_owner, None)
+                            .await;
                     return (
                         format!(
                             "could not stage Codex launch credential: {error}{}",
@@ -3537,83 +3639,12 @@ pub async fn restart_session(
                 // Register because `/start` existing-session restarts hold a
                 // Restarting lease that intentionally rejects unowned writes.
                 if let Some(expected_incarnation) = staged_incarnation {
-                    let metadata = {
-                        let proto = state.protocol.read().await;
-                        proto.sessions.get(name).map(|session| {
-                            let mut metadata = session.metadata.clone();
-                            metadata.backend = Some(backend_name.clone());
-                            if fresh {
-                                metadata.backend_session_id = None;
-                            }
-                            metadata.session_start_credential = session_start_credential.clone();
-                            metadata
-                        })
-                    }
-                    .unwrap_or(crate::daemon_protocol::SessionMeta {
-                        project_dir: Some(dir.clone()),
-                        backend: Some(backend_name.clone()),
-                        session_start_credential: session_start_credential.clone(),
-                        ..Default::default()
-                    });
                     let pane_owner = crate::daemon_protocol::ResourceOwner {
                         session_id: name.to_string(),
                         incarnation: expected_incarnation,
                     };
-                    let restart_lease_owner = {
-                        let proto = state.protocol.read().await;
-                        proto.lifecycle_leases.get(name).and_then(|lease| {
-                            (lease.phase == crate::daemon_protocol::LifecyclePhase::Restarting)
-                                .then(|| lease.owner.clone())
-                        })
-                    };
-                    if let Some(ref lease_owner) = restart_lease_owner {
-                        match state
-                            .record_inert_start_pane(
-                                lease_owner,
-                                pane_owner.clone(),
-                                pane_id.clone(),
-                            )
-                            .await
-                        {
-                            Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
-                            Ok(outcome) => {
-                                let cleanup =
-                                    remove_inert_start_pane(state, &pane_owner, &pane_id).await;
-                                return (
-                                    format!(
-                                        "restart superseded before fallback pane registration ({outcome:?}){}",
-                                        cleanup
-                                            .err()
-                                            .map(|error| format!(
-                                                "; inert pane cleanup failed: {error}"
-                                            ))
-                                            .unwrap_or_default()
-                                    ),
-                                    None,
-                                    RestartOutcome::Superseded,
-                                );
-                            }
-                            Err(error) => {
-                                let cleanup =
-                                    remove_inert_start_pane(state, &pane_owner, &pane_id).await;
-                                return (
-                                    format!(
-                                        "restart failed to persist inert fallback pane: {error}{}",
-                                        cleanup
-                                            .err()
-                                            .map(|cleanup_error| format!(
-                                                "; inert pane cleanup failed: {cleanup_error}"
-                                            ))
-                                            .unwrap_or_default()
-                                    ),
-                                    None,
-                                    RestartOutcome::Failed,
-                                );
-                            }
-                        }
-                    }
                     match state
-                        .finalize_reserved_start(&pane_owner, Some(pane_id.clone()), metadata)
+                        .record_inert_start_pane(lease_owner, pane_owner.clone(), pane_id.clone())
                         .await
                     {
                         Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
@@ -3622,7 +3653,7 @@ pub async fn restart_session(
                                 remove_inert_start_pane(state, &pane_owner, &pane_id).await;
                             return (
                                 format!(
-                                    "restart superseded before backend launch ({outcome:?}){}",
+                                    "restart superseded before fallback pane registration ({outcome:?}){}",
                                     cleanup
                                         .err()
                                         .map(|error| format!(
@@ -3637,24 +3668,9 @@ pub async fn restart_session(
                         Err(error) => {
                             let cleanup =
                                 remove_inert_start_pane(state, &pane_owner, &pane_id).await;
-                            if let Err(rollback_error) = recover_failed_fresh_launch(
-                                state,
-                                name,
-                                Some(pane_id.clone()),
-                                session_start_credential.clone(),
-                                staged_incarnation,
-                                session.clone(),
-                                Some(pane_id.clone()),
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    "failed to durably roll back restart for {name}: {rollback_error}"
-                                );
-                            }
                             return (
                                 format!(
-                                    "restart failed to persist fallback pane authority: {error}{}",
+                                    "restart failed to persist inert fallback pane: {error}{}",
                                     cleanup
                                         .err()
                                         .map(|cleanup_error| format!(
@@ -3705,70 +3721,13 @@ pub async fn restart_session(
                 })
                 .await;
                 match launch_result {
-                    Ok(Ok(())) => {
-                        let restart_lease_owner = {
-                            let proto = state.protocol.read().await;
-                            proto.lifecycle_leases.get(name).and_then(|lease| {
-                                (lease.phase == crate::daemon_protocol::LifecyclePhase::Restarting)
-                                    .then(|| lease.owner.clone())
-                            })
-                        };
-                        if let Some(lease_owner) = restart_lease_owner
-                            && let Err(error) = state.abort_lifecycle(&lease_owner).await
-                        {
-                            let pane_owner = staged_incarnation.map(|incarnation| {
-                                crate::daemon_protocol::ResourceOwner {
-                                    session_id: name.to_string(),
-                                    incarnation,
-                                }
-                            });
-                            let cleanup = if let Some(ref pane_owner) = pane_owner {
-                                remove_inert_start_pane(state, pane_owner, &pane_id).await
-                            } else {
-                                Ok(())
-                            };
-                            if let Err(rollback_error) = recover_failed_fresh_launch(
-                                state,
-                                name,
-                                Some(pane_id.clone()),
-                                session_start_credential.clone(),
-                                staged_incarnation,
-                                session.clone(),
-                                Some(pane_id.clone()),
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    "failed to durably roll back restart for {name}: {rollback_error}"
-                                );
-                            }
-                            return (
-                                format!(
-                                    "restart failed to persist launch completion: {error}{}",
-                                    cleanup
-                                        .err()
-                                        .map(|cleanup_error| format!(
-                                            "; launched pane cleanup failed: {cleanup_error}"
-                                        ))
-                                        .unwrap_or_default()
-                                ),
-                                None,
-                                RestartOutcome::Failed,
-                            );
-                        }
-                    }
+                    Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        let staged_pane = staged_incarnation
-                            .map(|_| pane_id.clone())
-                            .or_else(|| existing_pane.clone());
-                        if let Err(rollback_error) = recover_failed_fresh_launch(
+                        if let Err(rollback_error) = rollback_claimed_restart(
                             state,
-                            name,
-                            staged_pane,
-                            session_start_credential.clone(),
-                            staged_incarnation,
-                            session.clone(),
-                            Some(pane_id.clone()),
+                            lease_owner,
+                            &restart_target_owner,
+                            Some(&pane_id),
                         )
                         .await
                         {
@@ -3783,17 +3742,11 @@ pub async fn restart_session(
                         );
                     }
                     Err(error) => {
-                        let staged_pane = staged_incarnation
-                            .map(|_| pane_id.clone())
-                            .or_else(|| existing_pane.clone());
-                        if let Err(rollback_error) = recover_failed_fresh_launch(
+                        if let Err(rollback_error) = rollback_claimed_restart(
                             state,
-                            name,
-                            staged_pane,
-                            session_start_credential.clone(),
-                            staged_incarnation,
-                            session.clone(),
-                            Some(pane_id.clone()),
+                            lease_owner,
+                            &restart_target_owner,
+                            Some(&pane_id),
                         )
                         .await
                         {
@@ -3825,7 +3778,10 @@ pub async fn restart_session(
                     .filter(|session| session.pane.as_deref() == Some(pane_id.as_str()))
                     .map(crate::daemon_protocol::SessionEntry::owner);
                 let setup_result = match setup_owner {
-                    Some(owner) => setup_shared_serve_session(state, &owner, &pane_id, &dir).await,
+                    Some(owner) => {
+                        setup_shared_serve_session(state, &owner, Some(lease_owner), &pane_id, &dir)
+                            .await
+                    }
                     None => Err(anyhow::anyhow!(
                         "restart owner changed before OpenCode session setup"
                     )),
@@ -3834,6 +3790,21 @@ pub async fn restart_session(
                     Ok(sid) => Some(sid),
                     Err(e) => {
                         tracing::warn!("shared serve session setup failed: {e}");
+                        if restart_backend_cleanup_pending(
+                            state,
+                            lease_owner,
+                            &restart_target_owner,
+                        )
+                        .await
+                        {
+                            return (
+                                format!(
+                                    "restart failed for '{name}' with durable backend cleanup pending"
+                                ),
+                                None,
+                                RestartOutcome::Failed,
+                            );
+                        }
                         None
                     }
                 }
@@ -3844,70 +3815,70 @@ pub async fn restart_session(
             // Fall back to the previous session ID when not fresh,
             // but only if the serve is reachable (the old ID may be stale
             // if serve was restarted externally).
-            if backend_session_id.is_none() && !fresh {
-                if let Some(ref prev) = prev_metadata {
-                    if let Some(ref prev_sid) = prev.backend_session_id {
-                        let port = state.opencode_serve_port();
-                        let check_url = format!("http://127.0.0.1:{port}/session/{prev_sid}");
-                        match state
-                            .http_client
-                            .get(&check_url)
-                            .timeout(std::time::Duration::from_secs(2))
-                            .send()
-                            .await
-                        {
-                            Ok(r) if r.status().is_success() => {
-                                // Guard reuse against serve/attach-client version
-                                // skew: a mismatched attach TUI crashes to a bare
-                                // pane. Show the notice and keep the reused session
-                                // registered API-only instead (mirrors the
-                                // fresh-create guard in setup_shared_serve_session).
-                                if let Some((serve_v, client_v)) =
-                                    opencode_attach_skew(&state.http_client, port).await
-                                {
-                                    tracing::warn!(
-                                        port,
-                                        pane = %pane_id,
-                                        backend_session_id = %prev_sid,
-                                        serve_version = %serve_v,
-                                        attach_client_version = %client_v,
-                                        "opencode attach client/serve version skew on reuse; skipping attach TUI (would crash). Session remains functional via HTTP API."
-                                    );
-                                    notify_pane_opencode_attach_skew(
-                                        &pane_id, &serve_v, &client_v, port,
+            if backend_session_id.is_none() {
+                if let Some(prev_sid) =
+                    previous_http_restart_fallback_id(fresh, &backend_name, prev_metadata.as_ref())
+                {
+                    let port = state.opencode_serve_port();
+                    let check_url = format!("http://127.0.0.1:{port}/session/{prev_sid}");
+                    match state
+                        .http_client
+                        .get(&check_url)
+                        .timeout(std::time::Duration::from_secs(2))
+                        .send()
+                        .await
+                    {
+                        Ok(r) if r.status().is_success() => {
+                            // Guard reuse against serve/attach-client version
+                            // skew: a mismatched attach TUI crashes to a bare
+                            // pane. Show the notice and keep the reused session
+                            // registered API-only instead (mirrors the
+                            // fresh-create guard in setup_shared_serve_session).
+                            if let Some((serve_v, client_v)) =
+                                opencode_attach_skew(&state.http_client, port).await
+                            {
+                                tracing::warn!(
+                                    port,
+                                    pane = %pane_id,
+                                    backend_session_id = %prev_sid,
+                                    serve_version = %serve_v,
+                                    attach_client_version = %client_v,
+                                    "opencode attach client/serve version skew on reuse; skipping attach TUI (would crash). Session remains functional via HTTP API."
+                                );
+                                notify_pane_opencode_attach_skew(
+                                    &pane_id, &serve_v, &client_v, port,
+                                )
+                                .await;
+                                backend_session_id = Some(prev_sid);
+                                reused_previous_backend_session = true;
+                            } else {
+                                match launch_opencode_attach_for_session(
+                                    &pane_id, &dir, &prev_sid, port,
+                                )
+                                .await
+                                .and_then(|attach_ready| {
+                                    previous_backend_session_after_attach(
+                                        prev_sid.clone(),
+                                        attach_ready,
+                                        &pane_id,
                                     )
-                                    .await;
-                                    backend_session_id = Some(prev_sid.clone());
-                                    reused_previous_backend_session = true;
-                                } else {
-                                    match launch_opencode_attach_for_session(
-                                        &pane_id, &dir, prev_sid, port,
-                                    )
-                                    .await
-                                    .and_then(|attach_ready| {
-                                        previous_backend_session_after_attach(
-                                            prev_sid.clone(),
-                                            attach_ready,
-                                            &pane_id,
-                                        )
-                                    }) {
-                                        Ok(sid) => {
-                                            backend_session_id = Some(sid);
-                                            reused_previous_backend_session = true;
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "previous backend_session_id {prev_sid} is reachable but attach failed: {e}"
-                                            );
-                                        }
+                                }) {
+                                    Ok(sid) => {
+                                        backend_session_id = Some(sid);
+                                        reused_previous_backend_session = true;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "previous backend_session_id {prev_sid} is reachable but attach failed: {e}"
+                                        );
                                     }
                                 }
                             }
-                            _ => {
-                                tracing::warn!(
-                                    "previous backend_session_id {prev_sid} is stale, creating new session"
-                                );
-                            }
+                        }
+                        _ => {
+                            tracing::warn!(
+                                "previous backend_session_id {prev_sid} is stale, creating new session"
+                            );
                         }
                     }
                 }
@@ -4036,21 +4007,31 @@ pub async fn restart_session(
                     ..Default::default()
                 },
             };
-            let refresh = match prev_metadata.as_ref() {
-                Some(previous) => crate::daemon_protocol::Event::RefreshLaunchMetadata {
-                    id: name.to_string(),
-                    expected_incarnation: staged_incarnation
-                        .unwrap_or(previous.session_incarnation),
-                    pane: Some(pane_id.clone()),
-                    metadata: proto_meta,
-                },
-                None => crate::daemon_protocol::Event::Register {
-                    id: name.to_string(),
-                    pane: Some(pane_id.clone()),
-                    metadata: proto_meta,
-                },
-            };
-            state.apply_and_execute(refresh).await;
+            match state
+                .complete_restart_launch(
+                    lease_owner,
+                    &restart_target_owner,
+                    Some(pane_id.clone()),
+                    proto_meta,
+                )
+                .await
+            {
+                Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
+                Ok(_) => {
+                    return (
+                        format!("restart superseded before final metadata for '{name}'"),
+                        None,
+                        RestartOutcome::Superseded,
+                    );
+                }
+                Err(error) => {
+                    return (
+                        format!("restart failed to persist final metadata for '{name}': {error}"),
+                        None,
+                        RestartOutcome::Failed,
+                    );
+                }
+            }
             // Strong HttpApi bindings can use readiness delivery; weak reused
             // panes must stay on raw tmux to preserve the visible-pane boundary.
             if should_schedule_restart_prompt_injection(
@@ -4059,12 +4040,13 @@ pub async fn restart_session(
                 restart_opencode_binding.as_ref(),
             ) {
                 if let Some(ref prompt_text) = formatted_prompt {
-                    schedule_prompt_injection(
+                    schedule_prompt_injection_for_owner(
                         state,
                         name,
                         pane_id.clone(),
                         prompt_text.clone(),
                         restart_backend_session_id.clone(),
+                        Some(restart_target_owner.clone()),
                     );
                 }
             } else if is_http_api && restart_backend_session_id.is_some() {
@@ -4077,6 +4059,7 @@ pub async fn restart_session(
                         true,
                         false,
                         restart_backend_session_id.as_deref(),
+                        Some(&restart_target_owner),
                     )
                     .await
                     {
@@ -4088,7 +4071,8 @@ pub async fn restart_session(
                                 pane_id.clone(),
                                 prompt_text.clone(),
                                 restart_backend_session_id.clone(),
-                            ),
+                            )
+                            .with_owner(restart_target_owner.clone()),
                         );
                     }
                 }
@@ -4100,16 +4084,11 @@ pub async fn restart_session(
             )
         }
         Ok(Err(e)) => {
-            let provisional_pane =
-                fresh_launch_staged_incarnation.and_then(|_| existing_pane.clone());
-            if let Err(rollback_error) = recover_failed_fresh_launch(
+            if let Err(rollback_error) = rollback_claimed_restart(
                 state,
-                name,
-                existing_pane,
-                session_start_credential,
-                fresh_launch_staged_incarnation,
-                session,
-                provisional_pane,
+                lease_owner,
+                &restart_target_owner,
+                existing_pane.as_deref(),
             )
             .await
             {
@@ -4118,16 +4097,11 @@ pub async fn restart_session(
             (format!("restart failed: {e}"), None, RestartOutcome::Failed)
         }
         Err(e) => {
-            let provisional_pane =
-                fresh_launch_staged_incarnation.and_then(|_| existing_pane.clone());
-            if let Err(rollback_error) = recover_failed_fresh_launch(
+            if let Err(rollback_error) = rollback_claimed_restart(
                 state,
-                name,
-                existing_pane,
-                session_start_credential,
-                fresh_launch_staged_incarnation,
-                session,
-                provisional_pane,
+                lease_owner,
+                &restart_target_owner,
+                existing_pane.as_deref(),
             )
             .await
             {
@@ -4136,6 +4110,76 @@ pub async fn restart_session(
             (format!("restart failed: {e}"), None, RestartOutcome::Failed)
         }
     }
+}
+
+async fn restart_target_is_current(
+    state: &AppState,
+    lease_owner: &crate::daemon_protocol::ResourceOwner,
+    target_owner: &crate::daemon_protocol::ResourceOwner,
+) -> bool {
+    let proto = state.protocol.read().await;
+    proto
+        .lifecycle_leases
+        .get(&lease_owner.session_id)
+        .is_some_and(|lease| {
+            lease.owner == *lease_owner
+                && lease.phase == crate::daemon_protocol::LifecyclePhase::Restarting
+                && lease.restart_target_owner.as_ref() == Some(target_owner)
+        })
+        && proto
+            .sessions
+            .get(&target_owner.session_id)
+            .is_some_and(|session| session.owner() == *target_owner)
+}
+
+async fn restart_backend_cleanup_pending(
+    state: &AppState,
+    lease_owner: &crate::daemon_protocol::ResourceOwner,
+    target_owner: &crate::daemon_protocol::ResourceOwner,
+) -> bool {
+    state
+        .protocol
+        .read()
+        .await
+        .lifecycle_leases
+        .get(&lease_owner.session_id)
+        .is_some_and(|lease| {
+            lease.owner == *lease_owner
+                && lease.phase == crate::daemon_protocol::LifecyclePhase::Restarting
+                && lease.restart_target_owner.as_ref() == Some(target_owner)
+                && lease.backend_session_owner.as_ref() == Some(target_owner)
+                && lease.backend_session_id.is_some()
+        })
+}
+
+async fn delete_claimed_restart_backend(
+    state: &std::sync::Arc<AppState>,
+    lease_owner: &crate::daemon_protocol::ResourceOwner,
+    target_owner: &crate::daemon_protocol::ResourceOwner,
+    port: u16,
+    backend_session_id: &str,
+    context: &str,
+) -> bool {
+    if !restart_target_is_current(state, lease_owner, target_owner).await {
+        return false;
+    }
+    let deleted = delete_owned_opencode_session(
+        state,
+        target_owner.clone(),
+        port,
+        backend_session_id,
+        context,
+    )
+    .await;
+    if !deleted {
+        return false;
+    }
+    matches!(
+        state
+            .clear_restart_backend_claim(lease_owner, target_owner, backend_session_id)
+            .await,
+        Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied)
+    )
 }
 
 /// Soft restart for HttpApi backends: create a new session on the opencode serve
@@ -4149,8 +4193,11 @@ pub async fn restart_session(
 /// Returns `Ok((status_message, prompt_msg_id))` on success.
 /// Returns `Err(())` on failure — caller should fall back to hard restart.
 #[allow(clippy::too_many_arguments)]
-async fn soft_restart_session(
+async fn soft_restart_session_claimed(
     state: &std::sync::Arc<AppState>,
+    lease_owner: &crate::daemon_protocol::ResourceOwner,
+    target_owner: &crate::daemon_protocol::ResourceOwner,
+    previous_metadata: &crate::daemon_protocol::SessionMeta,
     name: &str,
     pane: Option<&str>,
     project_dir: &str,
@@ -4164,22 +4211,30 @@ async fn soft_restart_session(
     effort: Option<&str>,
 ) -> Result<(String, Option<u64>), ()> {
     let port = state.opencode_serve_port();
-    let Some(_soft_restart_guard) = state.try_acquire_soft_restart_in_progress(name) else {
-        tracing::warn!("soft restart: restart already in progress for '{name}'");
+    if !restart_target_is_current(state, lease_owner, target_owner).await {
+        tracing::warn!("soft restart: target authority disappeared before backend creation");
         return Err(());
-    };
-    let Some(operation_owner) = state
-        .protocol
-        .read()
-        .await
-        .sessions
-        .get(name)
-        .map(crate::daemon_protocol::SessionEntry::owner)
-    else {
-        tracing::warn!("soft restart: session '{name}' disappeared before backend creation");
-        return Err(());
-    };
-
+    }
+    if let Some(pane) = pane {
+        match state
+            .record_inert_start_pane(lease_owner, target_owner.clone(), pane.to_string())
+            .await
+        {
+            Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
+            Ok(outcome) => {
+                tracing::warn!(
+                    "soft restart: target pane authority was superseded before backend creation ({outcome:?})"
+                );
+                return Err(());
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "soft restart: failed to persist target pane authority before backend creation: {error}"
+                );
+                return Err(());
+            }
+        }
+    }
     // 1. Create a new session on the opencode serve
     let resp = state
         .http_client
@@ -4216,6 +4271,45 @@ async fn soft_restart_session(
             return Err(());
         }
     };
+    match state
+        .record_restart_backend_claim(
+            lease_owner,
+            target_owner,
+            "opencode".into(),
+            new_session_id.clone(),
+        )
+        .await
+    {
+        Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
+        Ok(outcome) => {
+            tracing::warn!(
+                "soft restart: target backend claim was superseded after creation ({outcome:?})"
+            );
+            delete_owned_opencode_session(
+                state,
+                target_owner.clone(),
+                port,
+                &new_session_id,
+                "soft restart unclaimed backend cleanup",
+            )
+            .await;
+            return Err(());
+        }
+        Err(error) => {
+            tracing::warn!(
+                "soft restart: failed to persist target backend claim after creation: {error}"
+            );
+            delete_owned_opencode_session(
+                state,
+                target_owner.clone(),
+                port,
+                &new_session_id,
+                "soft restart unpersisted backend cleanup",
+            )
+            .await;
+            return Err(());
+        }
+    }
 
     tracing::info!(
         "soft restart: created new opencode session {new_session_id} for '{name}' (port {port})"
@@ -4232,48 +4326,31 @@ async fn soft_restart_session(
     //    fallback), but a stale snapshot or a future caller that forgets the
     //    fallback must not silently wipe fields that were set by another
     //    writer between the snapshot and this atomic block.
-    let (owner_snapshot, previous_metadata) = {
-        let mut proto = state.protocol.write().await;
-        match proto.sessions.get_mut(name) {
-            Some(session) => (
-                SoftRestartOwnerSnapshot::from_entry(session),
-                session.metadata.clone(),
-            ),
-            None => {
-                // Session was removed between the pre-flight snapshot and
-                // this write (concurrent Unregister, racing restart, etc.).
-                // Bail so the caller can fall through to the hard-restart
-                // path. Without this we would silently POST prompt_async
-                // against a dangling backend_session_id that no SessionMeta
-                // references.
-                drop(proto);
-                tracing::warn!(
-                    "soft restart: session '{name}' disappeared between pre-flight and atomic write; deleting orphaned opencode session {new_session_id}"
-                );
-                // Fire-and-forget DELETE to clean up the orphaned opencode
-                // serve session. If the DELETE fails, the serve will still
-                // reclaim the session on its own restart; the Err return
-                // below is the important signal to the caller.
-                let port = state.opencode_serve_port();
-                let orphan_id = new_session_id.clone();
-                let cleanup_state = state.clone();
-                let cleanup_owner = operation_owner.clone();
-                tokio::spawn(async move {
-                    delete_owned_opencode_session(
-                        &cleanup_state,
-                        cleanup_owner,
-                        port,
-                        &orphan_id,
-                        "soft restart cleanup",
-                    )
-                    .await;
-                });
-                return Err(());
-            }
-        }
+    if !restart_target_is_current(state, lease_owner, target_owner).await {
+        delete_claimed_restart_backend(
+            state,
+            lease_owner,
+            target_owner,
+            port,
+            &new_session_id,
+            "soft restart stale-target cleanup",
+        )
+        .await;
+        return Err(());
+    }
+    let owner_snapshot = SoftRestartOwnerSnapshot {
+        session_id: target_owner.session_id.clone(),
+        incarnation: target_owner.incarnation,
     };
-    let restart_generation = previous_metadata.restart_generation;
-    let effective_parent_session = parent_session_override.resolve(Some(&previous_metadata));
+    let restart_generation = state
+        .protocol
+        .read()
+        .await
+        .sessions
+        .get(name)
+        .map(|session| session.metadata.restart_generation)
+        .ok_or(())?;
+    let effective_parent_session = parent_session_override.resolve(Some(previous_metadata));
     let reminder_meta = crate::daemon_protocol::SessionMeta {
         reminder: reminder.map(String::from),
         parent_session: effective_parent_session.clone(),
@@ -4290,6 +4367,7 @@ async fn soft_restart_session(
         match respawn_opencode_attach_for_session(
             state,
             &owner_snapshot.resource_owner(),
+            target_owner,
             pane,
             project_dir,
             &new_session_id,
@@ -4300,8 +4378,11 @@ async fn soft_restart_session(
         {
             Ok(true) => {
                 if should_commit_soft_restart_metadata_before_prompt(Some(pane), prompt)
-                    && apply_soft_restart_metadata(
+                    && complete_soft_restart_metadata(
                         state,
+                        lease_owner,
+                        target_owner,
+                        Some(pane),
                         &owner_snapshot,
                         &new_session_id,
                         restart_generation,
@@ -4323,12 +4404,13 @@ async fn soft_restart_session(
                         project_dir,
                         port,
                         name,
-                        &previous_metadata,
+                        previous_metadata,
                     )
                     .await;
-                    delete_owned_opencode_session(
+                    delete_claimed_restart_backend(
                         state,
-                        operation_owner.clone(),
+                        lease_owner,
+                        target_owner,
                         port,
                         &new_session_id,
                         "soft restart cleanup",
@@ -4342,9 +4424,10 @@ async fn soft_restart_session(
             }
             Ok(false) => {
                 tracing::warn!("soft restart: opencode attach did not start in pane {pane}");
-                delete_owned_opencode_session(
+                delete_claimed_restart_backend(
                     state,
-                    operation_owner.clone(),
+                    lease_owner,
+                    target_owner,
                     port,
                     &new_session_id,
                     "soft restart cleanup",
@@ -4354,9 +4437,10 @@ async fn soft_restart_session(
             }
             Err(e) => {
                 tracing::warn!("soft restart: respawn-pane {pane} failed: {e}");
-                delete_owned_opencode_session(
+                delete_claimed_restart_backend(
                     state,
-                    operation_owner.clone(),
+                    lease_owner,
+                    target_owner,
                     port,
                     &new_session_id,
                     "soft restart cleanup",
@@ -4371,34 +4455,17 @@ async fn soft_restart_session(
     //    succeeded. This preserves the Err boundary: attach failure returns
     //    before prompt_async can start work in the throwaway session.
     if let Some(text) = prompt {
-        if pane.is_none() && !metadata_committed {
-            if apply_soft_restart_metadata(
+        if !restart_target_is_current(state, lease_owner, target_owner).await {
+            delete_claimed_restart_backend(
                 state,
-                &owner_snapshot,
+                lease_owner,
+                target_owner,
+                port,
                 &new_session_id,
-                restart_generation,
-                SoftRestartMetadataUpdate {
-                    reminder,
-                    parent_session: parent_session_override.clone(),
-                    idle_policy: idle_policy.clone(),
-                    model,
-                    effort,
-                },
+                "soft restart stale-target cleanup",
             )
-            .await
-            .is_err()
-            {
-                delete_owned_opencode_session(
-                    state,
-                    operation_owner.clone(),
-                    port,
-                    &new_session_id,
-                    "soft restart cleanup",
-                )
-                .await;
-                return Err(());
-            }
-            metadata_committed = true;
+            .await;
+            return Err(());
         }
 
         let full_text = match effective_reminder.as_deref() {
@@ -4430,111 +4497,22 @@ async fn soft_restart_session(
         )
         .await
         {
-            crate::state::DeliveryOutcome::Accepted => {
-                if !metadata_committed {
-                    if apply_soft_restart_metadata(
-                        state,
-                        &owner_snapshot,
-                        &new_session_id,
-                        restart_generation,
-                        SoftRestartMetadataUpdate {
-                            reminder,
-                            parent_session: parent_session_override.clone(),
-                            idle_policy: idle_policy.clone(),
-                            model,
-                            effort,
-                        },
-                    )
-                    .await
-                    .is_err()
-                    {
-                        if let (Some(pane), Some(previous_session_id)) = (
-                            pane,
-                            previous_backend_session_for_prompt_failure_rollback(
-                                pane,
-                                &previous_metadata,
-                            ),
-                        ) {
-                            match respawn_opencode_attach_for_session(
-                                state,
-                                &owner_snapshot.resource_owner(),
-                                pane,
-                                project_dir,
-                                previous_session_id,
-                                port,
-                                name,
-                            )
-                            .await
-                            {
-                                Ok(true) => {}
-                                Ok(false) => tracing::warn!(
-                                    "soft restart: failed to reattach pane {pane} to previous opencode session after metadata commit failure"
-                                ),
-                                Err(error) => tracing::warn!(
-                                    "soft restart: failed to roll back pane {pane} to previous opencode session after metadata commit failure: {error}"
-                                ),
-                            }
-                        }
-                        delete_owned_opencode_session(
-                            state,
-                            operation_owner.clone(),
-                            port,
-                            &new_session_id,
-                            "soft restart cleanup",
-                        )
-                        .await;
-                        return Err(());
-                    }
-                    metadata_committed = true;
-                }
-            }
+            crate::state::DeliveryOutcome::Accepted => {}
             crate::state::DeliveryOutcome::Ambiguous(reason) => {
                 tracing::warn!(
-                    "soft restart: prompt_async outcome ambiguous for {new_session_id}: {reason}"
+                    "soft restart: prompt_async outcome ambiguous for {new_session_id}: {reason}; retaining the target to avoid duplicate work"
                 );
-                if let (Some(pane), Some(previous_session_id)) = (
-                    pane,
-                    previous_backend_session_for_prompt_failure_rollback(pane, &previous_metadata),
-                ) {
-                    match respawn_opencode_attach_for_session(
-                        state,
-                        &owner_snapshot.resource_owner(),
-                        pane,
-                        project_dir,
-                        previous_session_id,
-                        port,
-                        name,
-                    )
-                    .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => tracing::warn!(
-                            "soft restart: failed to reattach pane {pane} to previous opencode session after ambiguous prompt_async outcome"
-                        ),
-                        Err(error) => tracing::warn!(
-                            "soft restart: failed to roll back pane {pane} to previous opencode session after ambiguous prompt_async outcome: {error}"
-                        ),
-                    }
-                    delete_owned_opencode_session(
-                        state,
-                        operation_owner.clone(),
-                        port,
-                        &new_session_id,
-                        "soft restart cleanup",
-                    )
-                    .await;
-                    return Err(());
-                }
             }
             crate::state::DeliveryOutcome::Rejected(reason) => {
                 tracing::warn!("soft restart: prompt_async failed for {new_session_id}: {reason}");
                 if let (Some(pane), Some(previous_session_id)) = (
                     pane,
-                    previous_backend_session_for_prompt_failure_rollback(pane, &previous_metadata),
+                    previous_backend_session_for_prompt_failure_rollback(pane, previous_metadata),
                 ) {
                     match respawn_opencode_attach_for_session(
                         state,
                         &owner_snapshot.resource_owner(),
+                        lease_owner,
                         pane,
                         project_dir,
                         previous_session_id,
@@ -4552,24 +4530,26 @@ async fn soft_restart_session(
                         ),
                     }
                 }
-                delete_owned_opencode_session(
+                delete_claimed_restart_backend(
                     state,
-                    operation_owner.clone(),
+                    lease_owner,
+                    target_owner,
                     port,
                     &new_session_id,
                     "soft restart cleanup",
                 )
                 .await;
-                restore_soft_restart_metadata(state, name, &new_session_id, &previous_metadata)
-                    .await;
                 return Err(());
             }
         }
     }
 
     if !metadata_committed
-        && apply_soft_restart_metadata(
+        && complete_soft_restart_metadata(
             state,
+            lease_owner,
+            target_owner,
+            pane,
             &owner_snapshot,
             &new_session_id,
             restart_generation,
@@ -4584,9 +4564,10 @@ async fn soft_restart_session(
         .await
         .is_err()
     {
-        delete_owned_opencode_session(
+        delete_claimed_restart_backend(
             state,
-            operation_owner,
+            lease_owner,
+            target_owner,
             port,
             &new_session_id,
             "soft restart cleanup",
@@ -4601,13 +4582,177 @@ async fn soft_restart_session(
     ))
 }
 
-fn should_commit_soft_restart_metadata_before_prompt(
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn soft_restart_session(
+    state: &std::sync::Arc<AppState>,
+    name: &str,
     pane: Option<&str>,
+    project_dir: &str,
     prompt: Option<&str>,
-) -> bool {
-    pane.is_none() || prompt.is_none()
+    from: Option<&str>,
+    expects_reply: Option<bool>,
+    reminder: Option<&str>,
+    parent_session_override: ParentSessionOverride,
+    idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<(String, Option<u64>), ()> {
+    let (lease_owner, previous_metadata) = {
+        let proto = state.protocol.read().await;
+        let session = proto.sessions.get(name).ok_or(())?;
+        (session.owner(), session.metadata.clone())
+    };
+    if state
+        .claim_existing_start(&lease_owner)
+        .await
+        .map_err(|_| ())?
+        != crate::daemon_protocol::LifecycleMutationOutcome::Applied
+    {
+        return Err(());
+    }
+    let target_owner = match state
+        .stage_restart_launch(&lease_owner, "opencode".to_string(), true, None, None)
+        .await
+    {
+        crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
+            crate::daemon_protocol::ResourceOwner {
+                session_id: name.to_string(),
+                incarnation,
+            }
+        }
+        _ => {
+            let _ = state.abort_lifecycle(&lease_owner).await;
+            return Err(());
+        }
+    };
+    let result = soft_restart_session_claimed(
+        state,
+        &lease_owner,
+        &target_owner,
+        &previous_metadata,
+        name,
+        pane,
+        project_dir,
+        prompt,
+        from,
+        expects_reply,
+        reminder,
+        parent_session_override,
+        idle_policy,
+        model,
+        effort,
+    )
+    .await;
+    if result.is_err() {
+        let _ = state
+            .rollback_restart_launch(&lease_owner, &target_owner, None)
+            .await;
+    }
+    result
 }
 
+fn should_commit_soft_restart_metadata_before_prompt(
+    _pane: Option<&str>,
+    prompt: Option<&str>,
+) -> bool {
+    prompt.is_none()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn complete_soft_restart_metadata(
+    state: &std::sync::Arc<AppState>,
+    lease_owner: &crate::daemon_protocol::ResourceOwner,
+    target_owner: &crate::daemon_protocol::ResourceOwner,
+    pane: Option<&str>,
+    owner: &SoftRestartOwnerSnapshot,
+    new_session_id: &str,
+    expected_restart_generation: u64,
+    update: SoftRestartMetadataUpdate<'_>,
+) -> Result<(), ()> {
+    if owner.resource_owner() != *target_owner {
+        return Err(());
+    }
+    let mut metadata = {
+        let proto = state.protocol.read().await;
+        let lease_matches = proto
+            .lifecycle_leases
+            .get(&lease_owner.session_id)
+            .is_some_and(|lease| {
+                lease.owner == *lease_owner
+                    && lease.phase == crate::daemon_protocol::LifecyclePhase::Restarting
+                    && lease.restart_target_owner.as_ref() == Some(target_owner)
+            });
+        let Some(session) = proto.sessions.get(&target_owner.session_id) else {
+            return Err(());
+        };
+        if !lease_matches
+            || session.owner() != *target_owner
+            || session.metadata.restart_generation != expected_restart_generation
+        {
+            return Err(());
+        }
+        session.metadata.clone()
+    };
+    metadata.backend = Some("opencode".to_string());
+    metadata.backend_session_id = Some(new_session_id.to_string());
+    metadata.opencode_binding = Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged);
+    if metadata
+        .backend_repair_reservation
+        .as_ref()
+        .is_some_and(|reservation| {
+            reservation.restart_generation == metadata.restart_generation
+                && reservation.phase == crate::daemon_protocol::BackendRepairPhase::Staged
+        })
+    {
+        metadata.backend_repair_reservation = None;
+    }
+    if let Some(reminder) = update.reminder {
+        metadata.reminder = Some(reminder.to_string());
+    }
+    match update.parent_session {
+        ParentSessionOverride::PreservePrevious => {}
+        ParentSessionOverride::SetParent(parent) => {
+            metadata.parent_session = Some(parent);
+        }
+        ParentSessionOverride::NoParent => {
+            metadata.parent_session = None;
+        }
+    }
+    if let Some(policy) = update.idle_policy {
+        metadata.idle_policy = Some(policy);
+    }
+    if let Some(model) = update.model {
+        metadata.model = Some(model.to_string());
+    }
+    if let Some(effort) = update.effort {
+        metadata.effort = Some(effort.to_string());
+    }
+    match state
+        .complete_restart_launch(lease_owner, target_owner, pane.map(str::to_owned), metadata)
+        .await
+    {
+        Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => Ok(()),
+        Ok(outcome) => {
+            tracing::warn!(
+                session = %target_owner.session_id,
+                incarnation = %target_owner.incarnation,
+                "soft restart final metadata was superseded: {outcome:?}"
+            );
+            Err(())
+        }
+        Err(error) => {
+            tracing::warn!(
+                session = %target_owner.session_id,
+                incarnation = %target_owner.incarnation,
+                "failed to persist soft-restart final metadata: {error}"
+            );
+            Err(())
+        }
+    }
+}
+
+#[cfg(test)]
 async fn apply_soft_restart_metadata(
     state: &AppState,
     owner: &SoftRestartOwnerSnapshot,
@@ -4688,13 +4833,6 @@ struct SoftRestartOwnerSnapshot {
 }
 
 impl SoftRestartOwnerSnapshot {
-    fn from_entry(session: &crate::daemon_protocol::SessionEntry) -> Self {
-        Self {
-            session_id: session.id.clone(),
-            incarnation: session.metadata.session_incarnation,
-        }
-    }
-
     fn resource_owner(&self) -> crate::daemon_protocol::ResourceOwner {
         crate::daemon_protocol::ResourceOwner {
             session_id: self.session_id.clone(),
@@ -4703,6 +4841,7 @@ impl SoftRestartOwnerSnapshot {
     }
 }
 
+#[cfg(test)]
 async fn restore_soft_restart_metadata(
     state: &AppState,
     name: &str,
@@ -4772,6 +4911,7 @@ async fn rollback_pane_after_failed_soft_restart_commit(
 
     match respawn_opencode_attach_for_session(
         state,
+        &owner.resource_owner(),
         &owner.resource_owner(),
         pane,
         project_dir,
@@ -5042,12 +5182,13 @@ async fn respawn_pane_opencode_attach_skew_notice(
     client_version: &str,
     port: u16,
     ouija_session_id: &str,
+    process_incarnation: crate::daemon_protocol::SessionIncarnation,
 ) -> anyhow::Result<bool> {
     let notice = opencode_attach_skew_notice_command(serve_version, client_version, port);
     // Keep the pane alive after the notice prints so the operator can read it.
     let command = format!("{notice}; exec \"${{SHELL:-/bin/sh}}\"");
     let pane = pane_id.to_string();
-    let env_args = crate::tmux::pane_env_args(ouija_session_id, None, None);
+    let env_args = crate::tmux::pane_env_args(ouija_session_id, None, Some(process_incarnation));
     tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
         let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
         args.extend(env_args.iter().map(String::as_str));
@@ -5063,9 +5204,11 @@ async fn respawn_pane_opencode_attach_skew_notice(
     .map_err(|e| anyhow::anyhow!("opencode attach skew-notice respawn task failed: {e}"))?
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn respawn_opencode_attach_for_session(
     state: &AppState,
-    owner: &crate::daemon_protocol::ResourceOwner,
+    claim_owner: &crate::daemon_protocol::ResourceOwner,
+    process_owner: &crate::daemon_protocol::ResourceOwner,
     pane_id: &str,
     project_dir: &str,
     session_id: &str,
@@ -5073,13 +5216,14 @@ async fn respawn_opencode_attach_for_session(
     ouija_session_id: &str,
 ) -> anyhow::Result<bool> {
     state
-        .with_owned_pane_claim(owner, pane_id, || async {
+        .with_owned_pane_claim(claim_owner, pane_id, || async {
             respawn_opencode_attach_for_session_unchecked(
                 pane_id,
                 project_dir,
                 session_id,
                 port,
                 ouija_session_id,
+                process_owner.incarnation,
                 &state.http_client,
             )
             .await
@@ -5088,8 +5232,8 @@ async fn respawn_opencode_attach_for_session(
         .unwrap_or_else(|| {
             Err(anyhow::anyhow!(
                 "session '{}' incarnation {} no longer owns pane '{pane_id}'",
-                owner.session_id,
-                owner.incarnation
+                claim_owner.session_id,
+                claim_owner.incarnation
             ))
         })
 }
@@ -5100,6 +5244,7 @@ async fn respawn_opencode_attach_for_session_unchecked(
     session_id: &str,
     port: u16,
     ouija_session_id: &str,
+    process_incarnation: crate::daemon_protocol::SessionIncarnation,
     http_client: &reqwest::Client,
 ) -> anyhow::Result<bool> {
     // Guard against serve/attach-client version skew before respawning: a
@@ -5121,6 +5266,7 @@ async fn respawn_opencode_attach_for_session_unchecked(
             &client_v,
             port,
             ouija_session_id,
+            process_incarnation,
         )
         .await;
     }
@@ -5128,7 +5274,7 @@ async fn respawn_opencode_attach_for_session_unchecked(
     let attach_cmd = opencode_attach_command(port, session_id, project_dir);
     let pane = pane_id.to_string();
     let wait_pane = pane_id.to_string();
-    let env_args = crate::tmux::pane_env_args(ouija_session_id, None, None);
+    let env_args = crate::tmux::pane_env_args(ouija_session_id, None, Some(process_incarnation));
     tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
         let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
         args.extend(env_args.iter().map(String::as_str));
@@ -5232,6 +5378,7 @@ async fn delete_owned_opencode_session(
 async fn setup_shared_serve_session(
     state: &std::sync::Arc<AppState>,
     owner: &crate::daemon_protocol::ResourceOwner,
+    restart_lease_owner: Option<&crate::daemon_protocol::ResourceOwner>,
     pane_id: &str,
     project_dir: &str,
 ) -> anyhow::Result<String> {
@@ -5302,6 +5449,38 @@ async fn setup_shared_serve_session(
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("no session id in opencode response"))
         .and_then(validate_created_opencode_session_id)?;
+    if let Some(lease_owner) = restart_lease_owner {
+        match state
+            .record_restart_backend_claim(lease_owner, owner, "opencode".into(), session_id.clone())
+            .await
+        {
+            Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
+            Ok(outcome) => {
+                delete_owned_opencode_session(
+                    state,
+                    owner.clone(),
+                    port,
+                    &session_id,
+                    "unclaimed shared serve cleanup",
+                )
+                .await;
+                anyhow::bail!(
+                    "restart backend claim was superseded after OpenCode creation ({outcome:?})"
+                );
+            }
+            Err(error) => {
+                delete_owned_opencode_session(
+                    state,
+                    owner.clone(),
+                    port,
+                    &session_id,
+                    "unpersisted shared serve cleanup",
+                )
+                .await;
+                return Err(error.context("failed to persist restart backend claim"));
+            }
+        }
+    }
 
     tracing::info!(
         port,
@@ -5335,9 +5514,10 @@ async fn setup_shared_serve_session(
         match launch_opencode_attach_for_session(pane_id, project_dir, &session_id, port).await {
             Ok(ready) => ready,
             Err(e) => {
-                delete_owned_opencode_session(
+                cleanup_shared_serve_session(
                     state,
-                    owner.clone(),
+                    restart_lease_owner,
+                    owner,
                     port,
                     &session_id,
                     "shared serve attach cleanup",
@@ -5350,15 +5530,49 @@ async fn setup_shared_serve_session(
     match shared_serve_session_after_attach(session_id.clone(), attach_ready, pane_id) {
         Ok(session_id) => Ok(session_id),
         Err(e) => {
-            delete_owned_opencode_session(
+            cleanup_shared_serve_session(
                 state,
-                owner.clone(),
+                restart_lease_owner,
+                owner,
                 port,
                 &session_id,
                 "shared serve attach cleanup",
             )
             .await;
             Err(e)
+        }
+    }
+}
+
+async fn cleanup_shared_serve_session(
+    state: &std::sync::Arc<AppState>,
+    restart_lease_owner: Option<&crate::daemon_protocol::ResourceOwner>,
+    target_owner: &crate::daemon_protocol::ResourceOwner,
+    port: u16,
+    backend_session_id: &str,
+    context: &str,
+) -> bool {
+    match restart_lease_owner {
+        Some(lease_owner) => {
+            delete_claimed_restart_backend(
+                state,
+                lease_owner,
+                target_owner,
+                port,
+                backend_session_id,
+                context,
+            )
+            .await
+        }
+        None => {
+            delete_owned_opencode_session(
+                state,
+                target_owner.clone(),
+                port,
+                backend_session_id,
+                context,
+            )
+            .await
         }
     }
 }
@@ -5704,15 +5918,39 @@ pub(crate) fn schedule_prompt_injection(
     prompt: String,
     backend_session_id: Option<String>,
 ) {
-    // Queue prompt synchronously so the plugin's readiness signal finds it.
-    state.pending_prompts.lock().unwrap().insert(
-        session_name.to_string(),
-        crate::state::PendingPrompt::new(
-            pane_id.clone(),
-            prompt.clone(),
-            backend_session_id.clone(),
-        ),
+    schedule_prompt_injection_for_owner(
+        state,
+        session_name,
+        pane_id,
+        prompt,
+        backend_session_id,
+        None,
     );
+}
+
+fn schedule_prompt_injection_for_owner(
+    state: &std::sync::Arc<AppState>,
+    session_name: &str,
+    pane_id: String,
+    prompt: String,
+    backend_session_id: Option<String>,
+    owner: Option<crate::daemon_protocol::ResourceOwner>,
+) {
+    // Queue prompt synchronously so the plugin's readiness signal finds it.
+    let pending = crate::state::PendingPrompt::new(
+        pane_id.clone(),
+        prompt.clone(),
+        backend_session_id.clone(),
+    );
+    let pending = match owner {
+        Some(owner) => pending.with_owner(owner),
+        None => pending,
+    };
+    state
+        .pending_prompts
+        .lock()
+        .unwrap()
+        .insert(session_name.to_string(), pending);
 
     // Fallback timer: if readiness signal doesn't arrive within 10s,
     // deliver via tmux injection.
@@ -5728,6 +5966,10 @@ pub(crate) fn schedule_prompt_injection(
             backend_session_id.as_deref(),
         );
         if let Some(pending) = pending {
+            if !pending_prompt_owner_is_current(&state, &name, &pending).await {
+                tracing::info!("discarding superseded readiness prompt for {name}");
+                return;
+            }
             tracing::info!("readiness timeout for {name}, delivering prompt via fallback");
             match deliver_prompt_fallback(
                 &state,
@@ -5737,11 +5979,18 @@ pub(crate) fn schedule_prompt_injection(
                 true,
                 false,
                 pending.backend_session_id.as_deref(),
+                pending.owner.as_ref(),
             )
             .await
             {
                 Ok(()) => {}
                 Err(error) => {
+                    if !pending_prompt_owner_is_current(&state, &name, &pending).await {
+                        tracing::info!(
+                            "discarding readiness prompt superseded during fallback for {name}"
+                        );
+                        return;
+                    }
                     restore_pending_prompt_if_absent(&state, &name, pending.clone());
                     schedule_pending_prompt_fallback_retry(&state, &name, pending, true);
                     tracing::warn!("readiness timeout fallback failed for {name}: {error}");
@@ -5793,6 +6042,10 @@ fn schedule_pending_prompt_fallback_retry_attempt(
         let Some(pending) = pending else {
             return;
         };
+        if !pending_prompt_owner_is_current(&state, &session_name, &pending).await {
+            tracing::info!("discarding superseded readiness retry for {session_name}");
+            return;
+        }
 
         match deliver_prompt_fallback(
             &state,
@@ -5802,11 +6055,18 @@ fn schedule_pending_prompt_fallback_retry_attempt(
             is_http_api,
             false,
             pending.backend_session_id.as_deref(),
+            pending.owner.as_ref(),
         )
         .await
         {
             Ok(()) => {}
             Err(error) => {
+                if !pending_prompt_owner_is_current(&state, &session_name, &pending).await {
+                    tracing::info!(
+                        "discarding readiness retry superseded during fallback for {session_name}"
+                    );
+                    return;
+                }
                 restore_pending_prompt_if_absent(&state, &session_name, pending.clone());
                 if attempt < PENDING_PROMPT_MAX_FALLBACK_RETRIES {
                     schedule_pending_prompt_fallback_retry_attempt(
@@ -5841,6 +6101,23 @@ fn reserve_pending_prompt_if_matches(
         return pending.remove(session_name);
     }
     None
+}
+
+async fn pending_prompt_owner_is_current(
+    state: &AppState,
+    session_name: &str,
+    pending: &crate::state::PendingPrompt,
+) -> bool {
+    let Some(owner) = pending.owner.as_ref() else {
+        return true;
+    };
+    state
+        .protocol
+        .read()
+        .await
+        .sessions
+        .get(session_name)
+        .is_some_and(|session| session.owner() == *owner)
 }
 
 fn restore_pending_prompt_if_absent(
@@ -5950,7 +6227,52 @@ pub(crate) fn classify_prompt_async_fallback(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn deliver_prompt_fallback(
+    state: &AppState,
+    session_id: &str,
+    pane: &str,
+    text: &str,
+    is_http_api: bool,
+    vim_mode: bool,
+    expected_backend_session_id: Option<&str>,
+    expected_owner: Option<&crate::daemon_protocol::ResourceOwner>,
+) -> anyhow::Result<()> {
+    if let Some(owner) = expected_owner {
+        return state
+            .with_owned_pane_claim(owner, pane, || async {
+                deliver_prompt_fallback_unchecked(
+                    state,
+                    session_id,
+                    pane,
+                    text,
+                    is_http_api,
+                    vim_mode,
+                    expected_backend_session_id,
+                )
+                .await
+            })
+            .await
+            .unwrap_or_else(|| {
+                Err(anyhow::anyhow!(
+                    "prompt fallback skipped: queued incarnation is no longer current for session {session_id}"
+                ))
+            });
+    }
+    deliver_prompt_fallback_unchecked(
+        state,
+        session_id,
+        pane,
+        text,
+        is_http_api,
+        vim_mode,
+        expected_backend_session_id,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn deliver_prompt_fallback_unchecked(
     state: &AppState,
     session_id: &str,
     pane: &str,
@@ -6356,6 +6678,35 @@ mod tests {
             protocol.lifecycle_leases.is_empty(),
             "an invalid HTTP kill must release its claim because no external work started"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_restart_claim_reaches_no_external_boundary() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%2".into()),
+                metadata: Default::default(),
+            })
+            .await;
+
+        let first = claim_restart_for_external_work(&state, "worker")
+            .await
+            .unwrap();
+        let second = claim_restart_for_external_work(&state, "worker").await;
+
+        assert_eq!(second, Err(RestartOutcome::Superseded));
+        let protocol = state.protocol.read().await;
+        assert_eq!(protocol.lifecycle_leases["worker"].owner, first);
+        assert_eq!(
+            protocol.lifecycle_leases["worker"].phase,
+            crate::daemon_protocol::LifecyclePhase::Restarting
+        );
+        assert!(matches!(
+            protocol.clone().reserve_start("worker").unwrap(),
+            crate::daemon_protocol::StartDisposition::InProgress(owner) if owner == first
+        ));
     }
 
     #[tokio::test]
@@ -7284,9 +7635,10 @@ mod tests {
     async fn prompt_fallback_uses_recorded_http_api_policy_for_missing_session() {
         let state = AppState::new_for_test();
 
-        let result =
-            deliver_prompt_fallback(&state, "missing", "%missing", "hello", true, false, None)
-                .await;
+        let result = deliver_prompt_fallback(
+            &state, "missing", "%missing", "hello", true, false, None, None,
+        )
+        .await;
 
         assert!(result.is_err());
     }
@@ -7303,7 +7655,8 @@ mod tests {
             .await;
 
         let result =
-            deliver_prompt_fallback(&state, "oc", "%stale", "hello", false, false, None).await;
+            deliver_prompt_fallback(&state, "oc", "%stale", "hello", false, false, None, None)
+                .await;
 
         assert!(result.is_err());
     }
@@ -7324,9 +7677,17 @@ mod tests {
             })
             .await;
 
-        let result =
-            deliver_prompt_fallback(&state, "oc", "%17", "hello", false, false, Some("ses_old"))
-                .await;
+        let result = deliver_prompt_fallback(
+            &state,
+            "oc",
+            "%17",
+            "hello",
+            false,
+            false,
+            Some("ses_old"),
+            None,
+        )
+        .await;
 
         assert!(result.is_err());
     }
@@ -7352,6 +7713,44 @@ mod tests {
                 None,
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn readiness_timeout_discards_prompt_for_superseded_restart_target() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%old".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_same".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let old_owner = state.protocol.read().await.sessions["oc"].owner();
+        schedule_prompt_injection_for_owner(
+            &state,
+            "oc",
+            "%old".into(),
+            "stale restart prompt".into(),
+            Some("ses_same".into()),
+            Some(old_owner),
+        );
+        {
+            let mut proto = state.protocol.write().await;
+            proto
+                .sessions
+                .get_mut("oc")
+                .unwrap()
+                .metadata
+                .session_incarnation = crate::daemon_protocol::SessionIncarnation(999);
+        }
+
+        wait_for_prompt_fallback_timer().await;
+
+        assert!(!state.pending_prompts.lock().unwrap().contains_key("oc"));
     }
 
     #[tokio::test]
@@ -7522,6 +7921,45 @@ mod tests {
         assert_eq!(
             opencode_binding_for_restart_session(true, Some("previous-session"), true, None),
             Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted)
+        );
+    }
+
+    #[test]
+    fn non_fresh_backend_switch_never_reuses_previous_native_identity() {
+        let previous = crate::daemon_protocol::SessionMeta {
+            backend: Some("opencode".into()),
+            backend_session_id: Some("ses_opencode".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            select_restart_resume_id(
+                false,
+                "codex-cli",
+                Some(&previous),
+                Some("thread_detected".into()),
+            ),
+            None,
+            "neither the stored OpenCode ID nor a detected Codex thread may cross a backend switch"
+        );
+        assert_eq!(
+            select_restart_resume_id(false, "opencode", Some(&previous), None),
+            Some("ses_opencode".into())
+        );
+    }
+
+    #[test]
+    fn hard_opencode_fallback_never_reuses_cross_backend_native_identity() {
+        let previous = crate::daemon_protocol::SessionMeta {
+            backend: Some("codex-cli".into()),
+            backend_session_id: Some("thread_codex".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            previous_http_restart_fallback_id(false, "opencode", Some(&previous)),
+            None,
+            "a reachable Codex thread ID must never be probed or adopted as an OpenCode session"
         );
     }
 
@@ -7859,6 +8297,76 @@ mod tests {
         assert_eq!(metadata.model.as_deref(), Some("old-model"));
         assert_eq!(metadata.effort.as_deref(), Some("old-effort"));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_soft_restart_target_cannot_attach_or_delete_backend() {
+        let state = AppState::new_for_test();
+        let lease_owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "oc".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(10),
+        };
+        let stale_target = crate::daemon_protocol::ResourceOwner {
+            session_id: "oc".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(11),
+        };
+        {
+            let mut proto = state.protocol.write().await;
+            proto.sessions.insert(
+                "oc".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "oc".into(),
+                    pane: Some("%same".into()),
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        session_incarnation: crate::daemon_protocol::SessionIncarnation(12),
+                        ..Default::default()
+                    },
+                    registered_at: 0,
+                },
+            );
+            proto.lifecycle_leases.insert(
+                "oc".into(),
+                crate::daemon_protocol::LifecycleLease {
+                    owner: lease_owner.clone(),
+                    phase: crate::daemon_protocol::LifecyclePhase::Restarting,
+                    backend: None,
+                    backend_session_id: None,
+                    backend_session_owner: None,
+                    restart_target_owner: Some(stale_target.clone()),
+                    restart_previous: None,
+                    project_dir: None,
+                    project_dir_owner: None,
+                    project_dir_cleanup_on_abandon: false,
+                    inert_pane: None,
+                    inert_pane_owner: None,
+                },
+            );
+        }
+
+        let attach = respawn_opencode_attach_for_session(
+            &state,
+            &stale_target,
+            &stale_target,
+            "%same",
+            "/tmp",
+            "ses_stale",
+            1,
+            "oc",
+        )
+        .await;
+        let deleted = delete_claimed_restart_backend(
+            &state,
+            &lease_owner,
+            &stale_target,
+            1,
+            "ses_stale",
+            "stale cleanup test",
+        )
+        .await;
+
+        assert!(attach.is_err());
+        assert!(!deleted);
     }
 
     #[tokio::test]
@@ -8376,7 +8884,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn headless_soft_restart_commits_metadata_before_prompt_async() {
+    async fn headless_soft_restart_holds_target_lease_through_prompt_async() {
         use axum::Json;
         use axum::Router;
         use axum::extract::State;
@@ -8391,12 +8899,15 @@ mod tests {
 
         async fn prompt_async(State(state): State<Arc<AppState>>) -> StatusCode {
             let proto = state.protocol.read().await;
-            let metadata = &proto.sessions["oc"].metadata;
-            if metadata.backend_session_id.as_deref() == Some("ses_new")
-                && metadata.opencode_binding
-                    == Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged)
-                && metadata.model.as_deref() == Some("new-model")
-                && metadata.effort.as_deref() == Some("new-effort")
+            let session = &proto.sessions["oc"];
+            if session.metadata.backend_session_id.is_none()
+                && proto.lifecycle_leases.get("oc").is_some_and(|lease| {
+                    lease.phase == crate::daemon_protocol::LifecyclePhase::Restarting
+                        && lease.restart_target_owner.as_ref() == Some(&session.owner())
+                        && lease.backend.as_deref() == Some("opencode")
+                        && lease.backend_session_id.as_deref() == Some("ses_new")
+                        && lease.backend_session_owner.as_ref() == Some(&session.owner())
+                })
             {
                 StatusCode::OK
             } else {
@@ -8480,7 +8991,7 @@ mod tests {
             Some("%1"),
             Some("queued prompt")
         ));
-        assert!(should_commit_soft_restart_metadata_before_prompt(
+        assert!(!should_commit_soft_restart_metadata_before_prompt(
             None,
             Some("queued prompt")
         ));

@@ -796,12 +796,17 @@ pub async fn send_msg(
             );
         }
     }
-    if state.is_soft_restart_in_progress(&body.to) {
+    let restart_in_progress = state
+        .protocol
+        .read()
+        .await
+        .lifecycle_leases
+        .get(&body.to)
+        .is_some_and(|lease| lease.phase == crate::daemon_protocol::LifecyclePhase::Restarting);
+    if restart_in_progress {
         return (
             StatusCode::CONFLICT,
-            Json(
-                json!({ "error": format!("soft restart is in progress for session '{}'", body.to) }),
-            ),
+            Json(json!({ "error": format!("restart is in progress for session '{}'", body.to) })),
         );
     }
     let from = body.from.clone();
@@ -3013,10 +3018,14 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
     let pane_id = pending.pane_id.clone();
     let prompt = pending.prompt.clone();
 
-    let (pane_still_registered, backend_session_matches, http_delivery) = {
+    let (owner_matches, pane_still_registered, backend_session_matches, http_delivery) = {
         let proto = state.protocol.read().await;
         match proto.sessions.get(session_name) {
             Some(session) => (
+                pending
+                    .owner
+                    .as_ref()
+                    .is_none_or(|owner| session.owner() == *owner),
                 session.pane.as_deref() == Some(pane_id.as_str()),
                 pending
                     .backend_session_id
@@ -3030,9 +3039,15 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
                     .then(|| session.metadata.http_delivery_snapshot())
                     .flatten(),
             ),
-            None => (false, false, None),
+            None => (false, false, false, None),
         }
     };
+    if !owner_matches {
+        tracing::info!(
+            "readiness prompt delivery discarded for {session_name}: queued incarnation was superseded"
+        );
+        return false;
+    }
     if !pane_still_registered {
         restore_pending_prompt_if_absent(state, session_name, pending);
         tracing::warn!(
@@ -3050,16 +3065,18 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
 
     let used_http_delivery = http_delivery.is_some();
     let result = match http_delivery {
-        Some(delivery) => match deliver_http_message_outcome(state, &delivery, &prompt).await {
-            crate::state::DeliveryOutcome::Accepted => Ok(()),
-            crate::state::DeliveryOutcome::Ambiguous(_) => {
-                tracing::warn!(
-                    "readiness prompt HTTP delivery failed ambiguously for {session_name}; not retrying via raw tmux"
-                );
-                return false;
+        Some(delivery) => {
+            match deliver_pending_prompt_http_outcome(state, &pending, &delivery, &prompt).await {
+                crate::state::DeliveryOutcome::Accepted => Ok(()),
+                crate::state::DeliveryOutcome::Ambiguous(_) => {
+                    tracing::warn!(
+                        "readiness prompt HTTP delivery failed ambiguously for {session_name}; not retrying via raw tmux"
+                    );
+                    return false;
+                }
+                crate::state::DeliveryOutcome::Rejected(reason) => Err(anyhow::anyhow!(reason)),
             }
-            crate::state::DeliveryOutcome::Rejected(reason) => Err(anyhow::anyhow!(reason)),
-        },
+        }
         None => {
             deliver_pending_prompt_via_raw_tmux(
                 state,
@@ -3067,10 +3084,28 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
                 &pane_id,
                 &prompt,
                 pending.backend_session_id.as_deref(),
+                pending.owner.as_ref(),
             )
             .await
         }
     };
+    if result.is_err()
+        && let Some(owner) = pending.owner.as_ref()
+    {
+        let owner_is_current = state
+            .protocol
+            .read()
+            .await
+            .sessions
+            .get(session_name)
+            .is_some_and(|session| session.owner() == *owner);
+        if !owner_is_current {
+            tracing::info!(
+                "readiness prompt delivery discarded for {session_name}: queued incarnation was superseded during delivery"
+            );
+            return false;
+        }
+    }
 
     match result {
         Ok(()) => {
@@ -3087,6 +3122,7 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
                 &pane_id,
                 &prompt,
                 pending.backend_session_id.as_deref(),
+                pending.owner.as_ref(),
             )
             .await
             {
@@ -3113,6 +3149,30 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
             false
         }
     }
+}
+
+async fn deliver_pending_prompt_http_outcome(
+    state: &SharedState,
+    pending: &crate::state::PendingPrompt,
+    delivery: &crate::daemon_protocol::HttpDeliverySnapshot,
+    prompt: &str,
+) -> crate::state::DeliveryOutcome {
+    let (Some(owner), Some(backend_session_id)) = (
+        pending.owner.as_ref(),
+        pending.backend_session_id.as_deref(),
+    ) else {
+        return deliver_http_message_outcome(state, delivery, prompt).await;
+    };
+    state
+        .with_owned_backend_claim(owner, backend_session_id, || async {
+            deliver_http_message_outcome(state, delivery, prompt).await
+        })
+        .await
+        .unwrap_or_else(|| {
+            crate::state::DeliveryOutcome::Rejected(
+                "queued restart incarnation was superseded before readiness delivery".into(),
+            )
+        })
 }
 
 #[cfg(test)]
@@ -3155,6 +3215,7 @@ fn schedule_pending_prompt_retry_attempt(
             &pending.pane_id,
             &pending.prompt,
             pending.backend_session_id.as_deref(),
+            pending.owner.as_ref(),
         )
         .await
         {
@@ -3196,6 +3257,43 @@ fn reserve_pending_prompt_if_matches(
 }
 
 async fn deliver_pending_prompt_via_raw_tmux(
+    state: &SharedState,
+    session_name: &str,
+    pane_id: &str,
+    prompt: &str,
+    expected_backend_session_id: Option<&str>,
+    expected_owner: Option<&crate::daemon_protocol::ResourceOwner>,
+) -> anyhow::Result<()> {
+    if let Some(owner) = expected_owner {
+        return state
+            .with_owned_pane_claim(owner, pane_id, || async {
+                deliver_pending_prompt_via_raw_tmux_unchecked(
+                    state,
+                    session_name,
+                    pane_id,
+                    prompt,
+                    expected_backend_session_id,
+                )
+                .await
+            })
+            .await
+            .unwrap_or_else(|| {
+                Err(anyhow::anyhow!(
+                    "readiness prompt fallback skipped: queued incarnation is no longer current for session {session_name}"
+                ))
+            });
+    }
+    deliver_pending_prompt_via_raw_tmux_unchecked(
+        state,
+        session_name,
+        pane_id,
+        prompt,
+        expected_backend_session_id,
+    )
+    .await
+}
+
+async fn deliver_pending_prompt_via_raw_tmux_unchecked(
     state: &SharedState,
     session_name: &str,
     pane_id: &str,
@@ -6086,7 +6184,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_to_session_with_soft_restart_in_progress_returns_conflict() {
+    async fn send_to_session_with_restart_lease_returns_conflict() {
         let state = crate::state::AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -6107,9 +6205,11 @@ mod tests {
                 },
             })
             .await;
-        let _guard = state
-            .try_acquire_soft_restart_in_progress("oc-managed")
-            .expect("soft restart guard should be acquired");
+        let owner = state.protocol.read().await.sessions["oc-managed"].owner();
+        assert_eq!(
+            state.claim_existing_start(&owner).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
 
         let (status, body) = send_msg(
             State(state.clone()),
@@ -6130,7 +6230,7 @@ mod tests {
             body["error"]
                 .as_str()
                 .unwrap_or("")
-                .contains("soft restart is in progress"),
+                .contains("restart is in progress"),
             "expected in-flight restart error, got {body:?}"
         );
     }

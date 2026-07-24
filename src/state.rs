@@ -412,7 +412,6 @@ pub struct AppState {
     /// Maps session_id -> queued readiness prompt.
     pub pending_prompts: std::sync::Mutex<std::collections::HashMap<String, PendingPrompt>>,
     compact_in_progress: std::sync::Mutex<std::collections::HashSet<String>>,
-    soft_restart_in_progress: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -443,26 +442,12 @@ impl Drop for CompactInProgressGuard<'_> {
     }
 }
 
-pub(crate) struct SoftRestartInProgressGuard<'a> {
-    state: &'a AppState,
-    session_id: String,
-}
-
-impl Drop for SoftRestartInProgressGuard<'_> {
-    fn drop(&mut self) {
-        self.state
-            .soft_restart_in_progress
-            .lock()
-            .expect("soft_restart_in_progress mutex poisoned")
-            .remove(&self.session_id);
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingPrompt {
     pub pane_id: String,
     pub prompt: String,
     pub backend_session_id: Option<String>,
+    pub owner: Option<crate::daemon_protocol::ResourceOwner>,
 }
 
 impl PendingPrompt {
@@ -471,7 +456,13 @@ impl PendingPrompt {
             pane_id,
             prompt,
             backend_session_id,
+            owner: None,
         }
+    }
+
+    pub fn with_owner(mut self, owner: crate::daemon_protocol::ResourceOwner) -> Self {
+        self.owner = Some(owner);
+        self
     }
 }
 
@@ -730,7 +721,6 @@ impl AppState {
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
             compact_in_progress: std::sync::Mutex::new(std::collections::HashSet::new()),
-            soft_restart_in_progress: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -768,7 +758,6 @@ impl AppState {
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
             compact_in_progress: std::sync::Mutex::new(std::collections::HashSet::new()),
-            soft_restart_in_progress: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -1375,30 +1364,6 @@ impl AppState {
         })
     }
 
-    pub(crate) fn try_acquire_soft_restart_in_progress(
-        &self,
-        session_id: &str,
-    ) -> Option<SoftRestartInProgressGuard<'_>> {
-        let mut soft_restart_in_progress = self
-            .soft_restart_in_progress
-            .lock()
-            .expect("soft_restart_in_progress mutex poisoned");
-        if !soft_restart_in_progress.insert(session_id.to_string()) {
-            return None;
-        }
-        Some(SoftRestartInProgressGuard {
-            state: self,
-            session_id: session_id.to_string(),
-        })
-    }
-
-    pub(crate) fn is_soft_restart_in_progress(&self, session_id: &str) -> bool {
-        self.soft_restart_in_progress
-            .lock()
-            .expect("soft_restart_in_progress mutex poisoned")
-            .contains(session_id)
-    }
-
     /// Resolve the backend for a given session by looking up its metadata.
     pub async fn backend_for_session(
         &self,
@@ -1690,6 +1655,249 @@ impl AppState {
         drop(resource_guards);
         self.execute_effects(&effects).await;
         outcome
+    }
+
+    pub fn stage_restart_launch(
+        self: &Arc<Self>,
+        lease_owner: &crate::daemon_protocol::ResourceOwner,
+        backend: String,
+        replace_backend_identity: bool,
+        session_start_credential: Option<String>,
+        expected_repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = crate::daemon_protocol::StageFreshLaunchOutcome>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(self._stage_restart_launch(
+            lease_owner.clone(),
+            backend,
+            replace_backend_identity,
+            session_start_credential,
+            expected_repair_reservation,
+        ))
+    }
+
+    async fn _stage_restart_launch(
+        self: &Arc<Self>,
+        lease_owner: crate::daemon_protocol::ResourceOwner,
+        backend: String,
+        replace_backend_identity: bool,
+        session_start_credential: Option<String>,
+        expected_repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
+    ) -> crate::daemon_protocol::StageFreshLaunchOutcome {
+        let resource_event = crate::daemon_protocol::Event::StageFreshLaunch {
+            id: lease_owner.session_id.clone(),
+            backend: backend.clone(),
+            session_start_credential: session_start_credential.clone(),
+            expected_repair_reservation: expected_repair_reservation.clone(),
+        };
+        let resource_guards = self.lock_event_resources(&resource_event).await;
+        let (outcome, effects) = {
+            let mut state = self.protocol.write().await;
+            let before = state.clone();
+            let result = state.stage_restart_launch(
+                &lease_owner,
+                backend,
+                replace_backend_identity,
+                session_start_credential,
+                expected_repair_reservation,
+            );
+            if matches!(
+                result.outcome,
+                crate::daemon_protocol::StageFreshLaunchOutcome::Staged { .. }
+            ) && let Err(error) = self.persist_protocol_state(&state)
+            {
+                *state = before;
+                tracing::warn!(
+                    session_id = %lease_owner.session_id,
+                    "failed to persist restart target authority: {error}"
+                );
+                return crate::daemon_protocol::StageFreshLaunchOutcome::PersistenceFailed;
+            }
+            let effects = result
+                .effects
+                .into_iter()
+                .filter(|effect| !matches!(effect, crate::daemon_protocol::Effect::Persist))
+                .collect::<Vec<_>>();
+            (result.outcome, effects)
+        };
+        drop(resource_guards);
+        self.execute_effects(&effects).await;
+        outcome
+    }
+
+    pub fn complete_restart_launch(
+        self: &Arc<Self>,
+        lease_owner: &crate::daemon_protocol::ResourceOwner,
+        target_owner: &crate::daemon_protocol::ResourceOwner,
+        pane: Option<String>,
+        metadata: crate::daemon_protocol::SessionMeta,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(self._complete_restart_launch(
+            lease_owner.clone(),
+            target_owner.clone(),
+            pane,
+            metadata,
+        ))
+    }
+
+    async fn _complete_restart_launch(
+        self: &Arc<Self>,
+        lease_owner: crate::daemon_protocol::ResourceOwner,
+        target_owner: crate::daemon_protocol::ResourceOwner,
+        pane: Option<String>,
+        metadata: crate::daemon_protocol::SessionMeta,
+    ) -> anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome> {
+        let resource_event = crate::daemon_protocol::Event::RefreshLaunchMetadata {
+            id: target_owner.session_id.clone(),
+            expected_incarnation: target_owner.incarnation,
+            pane: pane.clone(),
+            metadata: metadata.clone(),
+        };
+        let resource_guards = self.lock_event_resources(&resource_event).await;
+        let (outcome, effects) = {
+            let mut state = self.protocol.write().await;
+            let before = state.clone();
+            let result = state.complete_restart_launch(&lease_owner, &target_owner, pane, metadata);
+            if result.outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied
+                && let Err(error) = self.persist_protocol_state(&state)
+            {
+                *state = before;
+                return Err(error);
+            }
+            let effects = result
+                .effects
+                .into_iter()
+                .filter(|effect| !matches!(effect, crate::daemon_protocol::Effect::Persist))
+                .collect::<Vec<_>>();
+            (result.outcome, effects)
+        };
+        drop(resource_guards);
+        self.execute_effects(&effects).await;
+        Ok(outcome)
+    }
+
+    pub async fn record_restart_backend_claim(
+        &self,
+        lease_owner: &crate::daemon_protocol::ResourceOwner,
+        target_owner: &crate::daemon_protocol::ResourceOwner,
+        backend: String,
+        backend_session_id: String,
+    ) -> anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome> {
+        let gate = self.backend_resource_gate(&backend_session_id);
+        let _resource = gate.lock().await;
+        let mut state = self.protocol.write().await;
+        let before = state.clone();
+        let outcome = state.record_restart_backend_claim(
+            lease_owner,
+            target_owner,
+            backend,
+            backend_session_id,
+        );
+        if outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied
+            && let Err(error) = self.persist_protocol_state(&state)
+        {
+            *state = before;
+            return Err(error);
+        }
+        Ok(outcome)
+    }
+
+    pub async fn clear_restart_backend_claim(
+        &self,
+        lease_owner: &crate::daemon_protocol::ResourceOwner,
+        target_owner: &crate::daemon_protocol::ResourceOwner,
+        backend_session_id: &str,
+    ) -> anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome> {
+        let gate = self.backend_resource_gate(backend_session_id);
+        let _resource = gate.lock().await;
+        let mut state = self.protocol.write().await;
+        let before = state.clone();
+        let outcome =
+            state.clear_restart_backend_claim(lease_owner, target_owner, backend_session_id);
+        if outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied
+            && let Err(error) = self.persist_protocol_state(&state)
+        {
+            *state = before;
+            return Err(error);
+        }
+        Ok(outcome)
+    }
+
+    pub fn rollback_restart_launch(
+        self: &Arc<Self>,
+        lease_owner: &crate::daemon_protocol::ResourceOwner,
+        target_owner: &crate::daemon_protocol::ResourceOwner,
+        provisional_pane: Option<&str>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(self._rollback_restart_launch(
+            lease_owner.clone(),
+            target_owner.clone(),
+            provisional_pane.map(str::to_owned),
+        ))
+    }
+
+    async fn _rollback_restart_launch(
+        self: &Arc<Self>,
+        lease_owner: crate::daemon_protocol::ResourceOwner,
+        target_owner: crate::daemon_protocol::ResourceOwner,
+        provisional_pane: Option<String>,
+    ) -> anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome> {
+        let resource_event = {
+            let state = self.protocol.read().await;
+            let current = state.sessions.get(&target_owner.session_id);
+            let previous = state
+                .lifecycle_leases
+                .get(&lease_owner.session_id)
+                .and_then(|lease| lease.restart_previous.as_deref())
+                .cloned();
+            crate::daemon_protocol::Event::RollbackFreshLaunch {
+                id: target_owner.session_id.clone(),
+                pane: current.and_then(|session| session.pane.clone()),
+                credential: current
+                    .and_then(|session| session.metadata.session_start_credential.clone()),
+                staged_incarnation: target_owner.incarnation,
+                previous,
+                provisional_pane: provisional_pane.clone(),
+            }
+        };
+        let resource_guards = self.lock_event_resources(&resource_event).await;
+        let mut state = self.protocol.write().await;
+        let before = state.clone();
+        let result =
+            state.rollback_restart_launch(&lease_owner, &target_owner, provisional_pane.as_deref());
+        if result.outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied
+            && let Err(error) = self.persist_protocol_state(&state)
+        {
+            *state = before;
+            return Err(error);
+        }
+        let effects = result
+            .effects
+            .into_iter()
+            .filter(|effect| !matches!(effect, crate::daemon_protocol::Effect::Persist))
+            .collect::<Vec<_>>();
+        drop(state);
+        drop(resource_guards);
+        self.execute_effects(&effects).await;
+        Ok(result.outcome)
     }
 
     /// Reserve a start and durably publish its allocator/lease state before

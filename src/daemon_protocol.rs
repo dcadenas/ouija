@@ -92,6 +92,13 @@ pub struct LifecycleLease {
     /// Exact lifecycle owner that claimed the server-side session identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_session_owner: Option<ResourceOwner>,
+    /// Exact target incarnation allocated for a restart before external work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_target_owner: Option<ResourceOwner>,
+    /// Literal incumbent row restored when the exact staged target fails or
+    /// the daemon recovers an abandoned restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_previous: Option<Box<SessionEntry>>,
     /// Directory claimed before launch performs filesystem work. This makes
     /// paneless crashes recoverable and prevents an abandoned lease from
     /// deleting a replacement incarnation's directory.
@@ -188,7 +195,7 @@ pub struct PendingReplyEntry {
 }
 
 /// A registered session with its identity, origin, and metadata.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SessionEntry {
     pub id: String,
     pub pane: Option<String>,
@@ -209,7 +216,7 @@ impl SessionEntry {
 }
 
 /// Where a session originates: local, remote peer, or human operator.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Origin {
     #[default]
     Local,
@@ -1503,6 +1510,8 @@ impl DaemonState {
                 backend: None,
                 backend_session_id: None,
                 backend_session_owner: None,
+                restart_target_owner: None,
+                restart_previous: None,
                 project_dir: None,
                 project_dir_owner: None,
                 project_dir_cleanup_on_abandon: false,
@@ -1587,6 +1596,8 @@ impl DaemonState {
                 backend: None,
                 backend_session_id: None,
                 backend_session_owner: None,
+                restart_target_owner: None,
+                restart_previous: None,
                 project_dir,
                 project_dir_owner,
                 project_dir_cleanup_on_abandon: false,
@@ -1641,6 +1652,8 @@ impl DaemonState {
                 backend,
                 backend_session_id,
                 backend_session_owner,
+                restart_target_owner: None,
+                restart_previous: None,
                 project_dir,
                 project_dir_owner,
                 project_dir_cleanup_on_abandon: cleanup_project_dir_on_abandon,
@@ -2226,6 +2239,97 @@ impl DaemonState {
         effects
     }
 
+    pub fn stage_restart_launch(
+        &mut self,
+        lease_owner: &ResourceOwner,
+        backend: String,
+        replace_backend_identity: bool,
+        session_start_credential: Option<String>,
+        expected_repair_reservation: Option<BackendRepairReservation>,
+    ) -> StageFreshLaunchResult {
+        let id = lease_owner.session_id.as_str();
+        let lease_matches = self.lifecycle_leases.get(id).is_some_and(|lease| {
+            lease.owner == *lease_owner
+                && lease.phase == LifecyclePhase::Restarting
+                && lease.restart_target_owner.is_none()
+                && lease.restart_previous.is_none()
+        });
+        let Some(session) = self.sessions.get(id) else {
+            return StageFreshLaunchResult {
+                outcome: StageFreshLaunchOutcome::Rejected,
+                effects: vec![],
+            };
+        };
+        if !lease_matches
+            || !matches!(session.origin, Origin::Local)
+            || session.owner() != *lease_owner
+            || session.metadata.backend_repair_reservation != expected_repair_reservation
+        {
+            return StageFreshLaunchResult {
+                outcome: StageFreshLaunchOutcome::Rejected,
+                effects: vec![],
+            };
+        }
+        if let Some(reservation) = session.metadata.backend_repair_reservation.as_ref()
+            && (reservation.phase != BackendRepairPhase::PreStage
+                || reservation.original_incarnation != session.metadata.session_incarnation
+                || reservation.restart_generation
+                    != session.metadata.restart_generation.saturating_add(1))
+        {
+            return StageFreshLaunchResult {
+                outcome: StageFreshLaunchOutcome::Rejected,
+                effects: vec![],
+            };
+        }
+
+        let previous = session.clone();
+        let Some(incarnation) = self.allocate_incarnation() else {
+            return StageFreshLaunchResult {
+                outcome: StageFreshLaunchOutcome::Rejected,
+                effects: vec![],
+            };
+        };
+        let target_owner = ResourceOwner {
+            session_id: id.to_string(),
+            incarnation,
+        };
+        let session = self
+            .sessions
+            .get_mut(id)
+            .expect("restart session was validated before incarnation allocation");
+        if let Some(reservation) = session.metadata.backend_repair_reservation.as_mut() {
+            reservation.phase = BackendRepairPhase::Staged;
+        }
+        session.metadata.backend = Some(backend);
+        if replace_backend_identity {
+            session.metadata.backend_session_id = None;
+            session.metadata.session_start_credential = session_start_credential;
+            session.metadata.opencode_binding = None;
+        }
+        session.metadata.restart_generation = session.metadata.restart_generation.saturating_add(1);
+        session.metadata.session_incarnation = incarnation;
+        session.registered_at = chrono::Utc::now().timestamp();
+
+        let lease = self
+            .lifecycle_leases
+            .get_mut(id)
+            .expect("restart lease was validated before target allocation");
+        lease.restart_target_owner = Some(target_owner.clone());
+        lease.restart_previous = Some(Box::new(previous));
+        if lease.project_dir.is_some() {
+            lease.project_dir_owner = Some(target_owner);
+        }
+
+        let mut effects = vec![Effect::Persist];
+        if session.metadata.networked {
+            effects.push(Effect::BroadcastSessionList);
+        }
+        StageFreshLaunchResult {
+            outcome: StageFreshLaunchOutcome::Staged { incarnation },
+            effects,
+        }
+    }
+
     pub fn stage_fresh_launch(
         &mut self,
         id: &str,
@@ -2301,6 +2405,195 @@ impl DaemonState {
         }
         StageFreshLaunchResult {
             outcome: StageFreshLaunchOutcome::Staged { incarnation },
+            effects,
+        }
+    }
+
+    pub fn complete_restart_launch(
+        &mut self,
+        lease_owner: &ResourceOwner,
+        target_owner: &ResourceOwner,
+        pane: Option<String>,
+        metadata: SessionMeta,
+    ) -> LifecycleCommitResult {
+        let Some(lease) = self.lifecycle_leases.get(&lease_owner.session_id) else {
+            return LifecycleCommitResult {
+                outcome: LifecycleMutationOutcome::NotFound,
+                effects: vec![],
+            };
+        };
+        let backend_claim_matches = match (
+            lease.backend.as_deref(),
+            lease.backend_session_id.as_deref(),
+            lease.backend_session_owner.as_ref(),
+        ) {
+            (None, None, None) => true,
+            (Some(backend), Some(backend_session_id), Some(owner)) => {
+                owner == target_owner
+                    && metadata.backend.as_deref() == Some(backend)
+                    && metadata.backend_session_id.as_deref() == Some(backend_session_id)
+            }
+            _ => false,
+        };
+        let lease_matches = lease.owner == *lease_owner
+            && lease.phase == LifecyclePhase::Restarting
+            && lease.restart_target_owner.as_ref() == Some(target_owner)
+            && lease.restart_previous.is_some()
+            && backend_claim_matches;
+        let session_matches = self
+            .sessions
+            .get(&lease_owner.session_id)
+            .is_some_and(|session| {
+                matches!(session.origin, Origin::Local)
+                    && session.owner() == *target_owner
+                    && lease.backend_session_id.as_deref().is_none_or(|claimed| {
+                        session
+                            .metadata
+                            .backend_session_id
+                            .as_deref()
+                            .is_none_or(|bound| bound == claimed)
+                    })
+            });
+        if !lease_matches || !session_matches {
+            return LifecycleCommitResult {
+                outcome: LifecycleMutationOutcome::Superseded,
+                effects: vec![],
+            };
+        }
+
+        let effects = self.apply_refresh_launch_metadata(
+            target_owner.session_id.clone(),
+            target_owner.incarnation,
+            pane,
+            metadata,
+        );
+        if effects.is_empty() {
+            return LifecycleCommitResult {
+                outcome: LifecycleMutationOutcome::Superseded,
+                effects,
+            };
+        }
+        self.lifecycle_leases.remove(&lease_owner.session_id);
+        LifecycleCommitResult {
+            outcome: LifecycleMutationOutcome::Applied,
+            effects,
+        }
+    }
+
+    pub fn record_restart_backend_claim(
+        &mut self,
+        lease_owner: &ResourceOwner,
+        target_owner: &ResourceOwner,
+        backend: String,
+        backend_session_id: String,
+    ) -> LifecycleMutationOutcome {
+        let lease_matches = self
+            .lifecycle_leases
+            .get(&lease_owner.session_id)
+            .is_some_and(|lease| {
+                lease.owner == *lease_owner
+                    && lease.phase == LifecyclePhase::Restarting
+                    && lease.restart_target_owner.as_ref() == Some(target_owner)
+                    && lease.restart_previous.is_some()
+                    && lease
+                        .backend_session_id
+                        .as_deref()
+                        .is_none_or(|current| current == backend_session_id)
+            });
+        let session_matches = self
+            .sessions
+            .get(&target_owner.session_id)
+            .is_some_and(|session| session.owner() == *target_owner);
+        if !lease_matches || !session_matches {
+            return LifecycleMutationOutcome::Superseded;
+        }
+        let lease = self
+            .lifecycle_leases
+            .get_mut(&lease_owner.session_id)
+            .expect("restart lease was validated");
+        lease.backend = Some(backend);
+        lease.backend_session_id = Some(backend_session_id);
+        lease.backend_session_owner = Some(target_owner.clone());
+        LifecycleMutationOutcome::Applied
+    }
+
+    pub fn clear_restart_backend_claim(
+        &mut self,
+        lease_owner: &ResourceOwner,
+        target_owner: &ResourceOwner,
+        backend_session_id: &str,
+    ) -> LifecycleMutationOutcome {
+        let Some(lease) = self.lifecycle_leases.get_mut(&lease_owner.session_id) else {
+            return LifecycleMutationOutcome::NotFound;
+        };
+        if lease.owner != *lease_owner
+            || lease.phase != LifecyclePhase::Restarting
+            || lease.restart_target_owner.as_ref() != Some(target_owner)
+            || lease.backend_session_owner.as_ref() != Some(target_owner)
+            || lease.backend_session_id.as_deref() != Some(backend_session_id)
+        {
+            return LifecycleMutationOutcome::Superseded;
+        }
+        lease.backend = None;
+        lease.backend_session_id = None;
+        lease.backend_session_owner = None;
+        LifecycleMutationOutcome::Applied
+    }
+
+    pub fn rollback_restart_launch(
+        &mut self,
+        lease_owner: &ResourceOwner,
+        target_owner: &ResourceOwner,
+        provisional_pane: Option<&str>,
+    ) -> LifecycleCommitResult {
+        let Some(lease) = self.lifecycle_leases.get(&lease_owner.session_id) else {
+            return LifecycleCommitResult {
+                outcome: LifecycleMutationOutcome::NotFound,
+                effects: vec![],
+            };
+        };
+        let previous = lease.restart_previous.as_deref().cloned();
+        let lease_matches = lease.owner == *lease_owner
+            && lease.phase == LifecyclePhase::Restarting
+            && lease.restart_target_owner.as_ref() == Some(target_owner);
+        let session_matches = self
+            .sessions
+            .get(&lease_owner.session_id)
+            .is_some_and(|session| {
+                matches!(session.origin, Origin::Local) && session.owner() == *target_owner
+            });
+        let Some(previous) = previous else {
+            return LifecycleCommitResult {
+                outcome: LifecycleMutationOutcome::Superseded,
+                effects: vec![],
+            };
+        };
+        if !lease_matches || !session_matches || previous.owner() != *lease_owner {
+            return LifecycleCommitResult {
+                outcome: LifecycleMutationOutcome::Superseded,
+                effects: vec![],
+            };
+        }
+
+        let restore_pane = previous.pane.clone();
+        let networked = previous.metadata.networked;
+        self.sessions
+            .insert(lease_owner.session_id.clone(), previous);
+        self.lifecycle_leases.remove(&lease_owner.session_id);
+        let mut effects = vec![Effect::Persist];
+        if networked {
+            effects.push(Effect::BroadcastSessionList);
+        }
+        if let Some(provisional_pane) = provisional_pane
+            && restore_pane.as_deref() != Some(provisional_pane)
+        {
+            effects.push(Effect::ProvisionalRollbackOk {
+                owner: target_owner.clone(),
+                pane: provisional_pane.to_string(),
+            });
+        }
+        LifecycleCommitResult {
+            outcome: LifecycleMutationOutcome::Applied,
             effects,
         }
     }
@@ -6702,6 +6995,233 @@ mod tests {
             state.reserve_start("worker").unwrap(),
             StartDisposition::Reserved(_)
         ));
+    }
+
+    #[test]
+    fn restart_lease_allocates_one_target_and_retains_incumbent() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_incumbent".into()),
+                project_dir: Some("/tmp/project".into()),
+                ..Default::default()
+            },
+        });
+        let incumbent = state.sessions["worker"].owner();
+        let previous = state.sessions["worker"].clone();
+        assert_eq!(
+            state.claim_existing_start(&incumbent),
+            LifecycleMutationOutcome::Applied
+        );
+
+        let staged = state.stage_restart_launch(&incumbent, "opencode".into(), false, None, None);
+        let StageFreshLaunchOutcome::Staged {
+            incarnation: target_incarnation,
+        } = staged.outcome
+        else {
+            panic!("expected restart target stage, got {:?}", staged.outcome);
+        };
+        let target = ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: target_incarnation,
+        };
+
+        assert!(target.incarnation > incumbent.incarnation);
+        assert_eq!(
+            state.lifecycle_leases["worker"]
+                .restart_target_owner
+                .as_ref(),
+            Some(&target)
+        );
+        assert_eq!(
+            state.lifecycle_leases["worker"].restart_previous.as_deref(),
+            Some(&previous)
+        );
+        assert_eq!(state.sessions["worker"].owner(), target);
+        assert_eq!(
+            state.sessions["worker"]
+                .metadata
+                .backend_session_id
+                .as_deref(),
+            Some("ses_incumbent"),
+            "resume staging must preserve the incumbent native session"
+        );
+        assert!(matches!(
+            state.reserve_start("worker").unwrap(),
+            StartDisposition::InProgress(owner) if owner == incumbent
+        ));
+        assert!(matches!(
+            state
+                .stage_restart_launch(&incumbent, "opencode".into(), false, None, None)
+                .outcome,
+            StageFreshLaunchOutcome::Rejected
+        ));
+    }
+
+    #[test]
+    fn non_fresh_codex_restart_without_resume_stages_bind_credential() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                backend_session_id: None,
+                ..Default::default()
+            },
+        });
+        let incumbent = state.sessions["worker"].owner();
+        assert_eq!(
+            state.claim_existing_start(&incumbent),
+            LifecycleMutationOutcome::Applied
+        );
+
+        let staged = state.stage_restart_launch(
+            &incumbent,
+            "codex-cli".into(),
+            true,
+            Some("restart-proof".into()),
+            None,
+        );
+        assert!(matches!(
+            staged.outcome,
+            StageFreshLaunchOutcome::Staged { .. }
+        ));
+        assert_eq!(
+            state.sessions["worker"]
+                .metadata
+                .session_start_credential
+                .as_deref(),
+            Some("restart-proof")
+        );
+        assert!(
+            state.sessions["worker"]
+                .metadata
+                .backend_session_id
+                .is_none()
+        );
+
+        let bound = state.bind_backend_identity(
+            "worker",
+            &backend_identity("codex-cli", "thread-new"),
+            Some("restart-proof"),
+        );
+        assert!(matches!(
+            bound.outcome,
+            BackendIdentityBindOutcome::Bound { .. }
+        ));
+        assert_eq!(
+            state.sessions["worker"]
+                .metadata
+                .backend_session_id
+                .as_deref(),
+            Some("thread-new")
+        );
+    }
+
+    #[test]
+    fn restart_target_completion_requires_lease_and_exact_target() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                backend: Some("claude-code".into()),
+                project_dir: Some("/tmp/project".into()),
+                ..Default::default()
+            },
+        });
+        let incumbent = state.sessions["worker"].owner();
+        assert_eq!(
+            state.claim_existing_start(&incumbent),
+            LifecycleMutationOutcome::Applied
+        );
+        let staged = state.stage_restart_launch(&incumbent, "claude-code".into(), true, None, None);
+        let StageFreshLaunchOutcome::Staged { incarnation } = staged.outcome else {
+            panic!("restart target was not staged");
+        };
+        let target = ResourceOwner {
+            session_id: "worker".into(),
+            incarnation,
+        };
+        let replacement = ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: SessionIncarnation(incarnation.0 + 1),
+        };
+        state
+            .sessions
+            .get_mut("worker")
+            .unwrap()
+            .metadata
+            .session_incarnation = replacement.incarnation;
+        let before = state.sessions["worker"].clone();
+
+        let stale = state.complete_restart_launch(
+            &incumbent,
+            &target,
+            Some("%3".into()),
+            SessionMeta {
+                backend: Some("claude-code".into()),
+                model: Some("stale-model".into()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(stale.outcome, LifecycleMutationOutcome::Superseded);
+        assert!(stale.effects.is_empty());
+        assert_eq!(state.sessions["worker"], before);
+        assert_eq!(
+            state.lifecycle_leases["worker"]
+                .restart_target_owner
+                .as_ref(),
+            Some(&target)
+        );
+    }
+
+    #[test]
+    fn restart_target_rollback_restores_literal_incumbent() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_incumbent".into()),
+                project_dir: Some("/tmp/project".into()),
+                model: Some("incumbent-model".into()),
+                ..Default::default()
+            },
+        });
+        let incumbent = state.sessions["worker"].owner();
+        let previous = state.sessions["worker"].clone();
+        assert_eq!(
+            state.claim_existing_start(&incumbent),
+            LifecycleMutationOutcome::Applied
+        );
+        let staged = state.stage_restart_launch(&incumbent, "opencode".into(), true, None, None);
+        let StageFreshLaunchOutcome::Staged { incarnation } = staged.outcome else {
+            panic!("restart target was not staged");
+        };
+        let target = ResourceOwner {
+            session_id: "worker".into(),
+            incarnation,
+        };
+
+        let rollback = state.rollback_restart_launch(&incumbent, &target, Some("%3"));
+
+        assert_eq!(rollback.outcome, LifecycleMutationOutcome::Applied);
+        assert_eq!(state.sessions["worker"], previous);
+        assert!(!state.lifecycle_leases.contains_key("worker"));
+        assert!(rollback.effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::ProvisionalRollbackOk { owner, pane }
+                    if *owner == target && pane == "%3"
+            )
+        }));
     }
 
     #[test]

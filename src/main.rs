@@ -1369,8 +1369,14 @@ fn abandoned_lease_owns_staged_row(
                     owner.session_id == session.id
                         && owner.incarnation == session.metadata.session_incarnation
                 });
-            owns_recorded_inert_pane
-                || session.metadata.session_incarnation != lease.owner.incarnation
+            let owns_staged_target = lease.restart_target_owner.as_ref().map_or_else(
+                || session.metadata.session_incarnation != lease.owner.incarnation,
+                |owner| {
+                    owner.session_id == session.id
+                        && owner.incarnation == session.metadata.session_incarnation
+                },
+            );
+            owns_recorded_inert_pane || owns_staged_target
         }
         crate::daemon_protocol::LifecyclePhase::Stopping => {
             session.metadata.session_incarnation == lease.owner.incarnation
@@ -1384,12 +1390,64 @@ fn lifecycle_lease_pane_owners(
     lease: &crate::daemon_protocol::LifecycleLease,
 ) -> Vec<crate::daemon_protocol::ResourceOwner> {
     let mut owners = vec![lease.owner.clone()];
+    if let Some(owner) = &lease.restart_target_owner
+        && !owners.contains(owner)
+    {
+        owners.push(owner.clone());
+    }
     if let Some(owner) = &lease.inert_pane_owner
         && !owners.contains(owner)
     {
         owners.push(owner.clone());
     }
     owners
+}
+
+fn persisted_session_from_entry(
+    entry: &crate::daemon_protocol::SessionEntry,
+) -> Option<persistence::PersistedSession> {
+    if !matches!(entry.origin, crate::daemon_protocol::Origin::Local) {
+        return None;
+    }
+    let metadata = &entry.metadata;
+    let timestamp =
+        chrono::DateTime::from_timestamp(entry.registered_at, 0).unwrap_or_else(chrono::Utc::now);
+    Some(persistence::PersistedSession {
+        id: entry.id.clone(),
+        pane: entry.pane.clone(),
+        registered_at: timestamp,
+        last_activity_at: timestamp,
+        metadata: state::SessionMetadata {
+            vim_mode: metadata.vim_mode,
+            project_dir: metadata.project_dir.clone(),
+            role: metadata.role.clone(),
+            networked: metadata.networked,
+            last_metadata_update: metadata
+                .last_metadata_update
+                .and_then(|value| chrono::DateTime::from_timestamp(value, 0)),
+            backend_session_id: metadata.backend_session_id.clone(),
+            backend: metadata.backend.clone(),
+            opencode_binding: metadata.opencode_binding.clone(),
+            restart_generation: metadata.restart_generation,
+            backend_repair_reservation: metadata.backend_repair_reservation.clone(),
+            session_incarnation: metadata.session_incarnation,
+            project_description: metadata.project_description.clone(),
+            bulletin: metadata.bulletin.clone(),
+            worktree: metadata.worktree,
+            model: metadata.model.clone(),
+            effort: metadata.effort.clone(),
+            codex_home: metadata.codex_home.clone(),
+            reminder: metadata.reminder.clone(),
+            parent_session: metadata.parent_session.clone(),
+            idle_policy: metadata.idle_policy.clone(),
+            prompt: metadata.prompt.clone(),
+            iteration: metadata.iteration,
+            iteration_log: metadata.iteration_log.clone(),
+            last_iteration_at: metadata.last_iteration_at,
+            on_fire: metadata.on_fire.clone(),
+            worktree_present: metadata.worktree_present,
+        },
+    })
 }
 
 async fn restore_persisted_sessions(state: &state::AppState) -> anyhow::Result<()> {
@@ -1418,6 +1476,66 @@ async fn restore_persisted_sessions(state: &state::AppState) -> anyhow::Result<(
     // release the public ID. A Restarting lease whose row still has the
     // incumbent incarnation stopped before staging and therefore preserves it.
     if !abandoned_leases.is_empty() {
+        // A Restarting lease records every newly-created HTTP backend before
+        // attach or prompt work. Delete that exact target-owned resource
+        // before restoring the incumbent and releasing the public ID.
+        for lease in &abandoned_leases {
+            let (Some(backend), Some(backend_session_id), Some(backend_session_owner)) = (
+                lease.backend.as_deref(),
+                lease.backend_session_id.as_deref(),
+                lease.backend_session_owner.as_ref(),
+            ) else {
+                continue;
+            };
+            if lease.phase != crate::daemon_protocol::LifecyclePhase::Restarting
+                || !state.backends.uses_http_delivery(backend)
+            {
+                continue;
+            }
+            if lease.restart_target_owner.as_ref() != Some(backend_session_owner) {
+                anyhow::bail!(
+                    "abandoned restart backend owner does not match target for '{}'",
+                    lease.owner.session_id
+                );
+            }
+            let persisted_sharer = sessions.iter().any(|session| {
+                session.metadata.backend.as_deref() == Some(backend)
+                    && session.metadata.backend_session_id.as_deref() == Some(backend_session_id)
+                    && session.metadata.session_incarnation != backend_session_owner.incarnation
+            });
+            if persisted_sharer {
+                tracing::info!(
+                    backend,
+                    backend_session_id,
+                    "skipping abandoned restart backend cleanup: replacement session owns it"
+                );
+                continue;
+            }
+            let port = state.opencode_serve_port();
+            let backend_session_id_segment = encode_path_segment(backend_session_id);
+            let url = format!("http://127.0.0.1:{port}/session/{backend_session_id_segment}");
+            let response = state
+                .http_client
+                .delete(&url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to delete abandoned restart backend session {backend_session_id} for lifecycle owner {backend_session_owner:?}"
+                    )
+                })?;
+            if !response.status().is_success()
+                && response.status() != reqwest::StatusCode::NOT_FOUND
+            {
+                anyhow::bail!(
+                    "backend cleanup for abandoned restart session '{}' returned {}",
+                    backend_session_id,
+                    response.status()
+                );
+            }
+        }
+
         // A durable Stopping lease can outlive its registry row. Finish the
         // exact HTTP-backend abort obligation before releasing any pane,
         // worktree, row, or public-ID authority. A different persisted owner
@@ -1534,11 +1652,16 @@ async fn restore_persisted_sessions(state: &state::AppState) -> anyhow::Result<(
                 continue;
             }
             let project_dir_identity = crate::state::project_dir_identity(project_dir);
-            let persisted_sharer = sessions.iter().any(|session| {
-                session.metadata.project_dir.as_deref().is_some_and(|dir| {
-                    crate::state::project_dir_identity(dir) == project_dir_identity
-                }) && !abandoned_lease_owns_staged_row(session, lease)
-            });
+            let persisted_sharer =
+                sessions.iter().any(|session| {
+                    session.metadata.project_dir.as_deref().is_some_and(|dir| {
+                        crate::state::project_dir_identity(dir) == project_dir_identity
+                    }) && !abandoned_lease_owns_staged_row(session, lease)
+                }) || lease.restart_previous.as_deref().is_some_and(|previous| {
+                    previous.metadata.project_dir.as_deref().is_some_and(|dir| {
+                        crate::state::project_dir_identity(dir) == project_dir_identity
+                    })
+                });
             if persisted_sharer {
                 tracing::info!(
                     "skipping abandoned worktree cleanup for {project_dir}: persisted session still uses it"
@@ -1548,6 +1671,34 @@ async fn restore_persisted_sessions(state: &state::AppState) -> anyhow::Result<(
             state
                 .cleanup_worktree_dir_if_unused(project_dir_owner, project_dir)
                 .await;
+        }
+
+        for lease in &abandoned_leases {
+            let (
+                crate::daemon_protocol::LifecyclePhase::Restarting,
+                Some(target_owner),
+                Some(previous),
+            ) = (
+                lease.phase,
+                lease.restart_target_owner.as_ref(),
+                lease.restart_previous.as_deref(),
+            )
+            else {
+                continue;
+            };
+            let Some(position) = sessions.iter().position(|session| {
+                session.id == target_owner.session_id
+                    && session.metadata.session_incarnation == target_owner.incarnation
+            }) else {
+                continue;
+            };
+            let previous = persisted_session_from_entry(previous).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "restart recovery for '{}' recorded a non-local incumbent",
+                    lease.owner.session_id
+                )
+            })?;
+            sessions[position] = previous;
         }
 
         sessions.retain(|session| {
@@ -3712,6 +3863,8 @@ mod tests {
                     backend: None,
                     backend_session_id: None,
                     backend_session_owner: None,
+                    restart_target_owner: None,
+                    restart_previous: None,
                     project_dir: Some("/tmp/.ouija/worktrees/project/shared-replacement".into()),
                     project_dir_owner: Some(owner.clone()),
                     project_dir_cleanup_on_abandon: true,
@@ -3824,6 +3977,8 @@ mod tests {
                     backend: None,
                     backend_session_id: None,
                     backend_session_owner: None,
+                    restart_target_owner: None,
+                    restart_previous: None,
                     project_dir: Some(worktree.to_string_lossy().into_owned()),
                     project_dir_owner: Some(incumbent),
                     project_dir_cleanup_on_abandon: false,
@@ -3923,6 +4078,8 @@ mod tests {
                     backend: None,
                     backend_session_id: None,
                     backend_session_owner: None,
+                    restart_target_owner: None,
+                    restart_previous: None,
                     project_dir: Some(canonical_worktree),
                     project_dir_owner: Some(owner),
                     project_dir_cleanup_on_abandon: true,
@@ -4010,6 +4167,8 @@ mod tests {
                     backend: None,
                     backend_session_id: None,
                     backend_session_owner: None,
+                    restart_target_owner: None,
+                    restart_previous: None,
                     project_dir: Some(crate::state::project_dir_identity(
                         worktree.to_str().unwrap(),
                     )),
@@ -4112,6 +4271,8 @@ mod tests {
                         backend: Some("opencode".into()),
                         backend_session_id: Some("ses_worker".into()),
                         backend_session_owner: Some(owner.clone()),
+                        restart_target_owner: None,
+                        restart_previous: None,
                         project_dir: None,
                         project_dir_owner: None,
                         project_dir_cleanup_on_abandon: false,
@@ -4175,6 +4336,8 @@ mod tests {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_worker".into()),
                     backend_session_owner: Some(stale_owner),
+                    restart_target_owner: None,
+                    restart_previous: None,
                     project_dir: None,
                     project_dir_owner: None,
                     project_dir_cleanup_on_abandon: false,
@@ -4244,6 +4407,8 @@ mod tests {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_worker".into()),
                     backend_session_owner: Some(owner),
+                    restart_target_owner: None,
+                    restart_previous: None,
                     project_dir: None,
                     project_dir_owner: None,
                     project_dir_cleanup_on_abandon: false,
@@ -4462,6 +4627,8 @@ mod tests {
                     backend: None,
                     backend_session_id: None,
                     backend_session_owner: None,
+                    restart_target_owner: None,
+                    restart_previous: None,
                     project_dir: None,
                     project_dir_owner: None,
                     project_dir_cleanup_on_abandon: false,
@@ -4538,6 +4705,8 @@ mod tests {
                         backend: None,
                         backend_session_id: None,
                         backend_session_owner: None,
+                        restart_target_owner: None,
+                        restart_previous: None,
                         project_dir: None,
                         project_dir_owner: None,
                         project_dir_cleanup_on_abandon: false,
@@ -4553,6 +4722,8 @@ mod tests {
                         backend: None,
                         backend_session_id: None,
                         backend_session_owner: None,
+                        restart_target_owner: None,
+                        restart_previous: None,
                         project_dir: None,
                         project_dir_owner: None,
                         project_dir_cleanup_on_abandon: false,
@@ -4582,6 +4753,116 @@ mod tests {
         assert!(proto.lifecycle_leases.is_empty());
     }
 
+    #[tokio::test]
+    async fn restore_persisted_sessions_rolls_pending_restart_back_to_literal_incumbent() {
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::delete;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        async fn delete_session(AxumState(calls): AxumState<Arc<AtomicUsize>>) -> StatusCode {
+            calls.fetch_add(1, Ordering::SeqCst);
+            StatusCode::NO_CONTENT
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session/{session_id}", delete(delete_session))
+            .with_state(calls.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = crate::state::AppState::new(config.clone());
+        let incumbent_owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "pending-restart".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(40),
+        };
+        {
+            let mut proto = state.protocol.write().await;
+            proto.restore_incarnation_high_water(incumbent_owner.incarnation);
+            proto.sessions.insert(
+                incumbent_owner.session_id.clone(),
+                crate::daemon_protocol::SessionEntry {
+                    id: incumbent_owner.session_id.clone(),
+                    pane: None,
+                    origin: crate::daemon_protocol::Origin::Local,
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_incumbent".into()),
+                        opencode_binding: Some(
+                            crate::daemon_protocol::OpenCodeBinding::StrongManaged,
+                        ),
+                        model: Some("incumbent-model".into()),
+                        session_incarnation: incumbent_owner.incarnation,
+                        ..Default::default()
+                    },
+                    registered_at: 123,
+                },
+            );
+            state.persist_protocol_state(&proto).unwrap();
+        }
+        assert_eq!(
+            state.claim_existing_start(&incumbent_owner).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        let target_incarnation = match state
+            .stage_restart_launch(&incumbent_owner, "opencode".into(), true, None, None)
+            .await
+        {
+            crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => incarnation,
+            outcome => panic!("expected staged restart target, got {outcome:?}"),
+        };
+        assert_ne!(target_incarnation, incumbent_owner.incarnation);
+        let target_owner = crate::daemon_protocol::ResourceOwner {
+            session_id: incumbent_owner.session_id.clone(),
+            incarnation: target_incarnation,
+        };
+        assert_eq!(
+            state
+                .record_restart_backend_claim(
+                    &incumbent_owner,
+                    &target_owner,
+                    "opencode".into(),
+                    "ses_target".into(),
+                )
+                .await
+                .unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+
+        let recovery = crate::state::AppState::new(config);
+        restore_persisted_sessions(&recovery).await.unwrap();
+
+        let restored_snapshot = crate::persistence::load_sessions(dir.path()).unwrap();
+        assert!(restored_snapshot.lifecycle_leases.is_empty());
+        assert_eq!(restored_snapshot.sessions.len(), 1);
+        let restored = &restored_snapshot.sessions[0];
+        assert_eq!(restored.id, incumbent_owner.session_id);
+        assert_eq!(
+            restored.metadata.session_incarnation,
+            incumbent_owner.incarnation
+        );
+        assert_eq!(
+            restored.metadata.backend_session_id.as_deref(),
+            Some("ses_incumbent")
+        );
+        assert_eq!(restored.metadata.model.as_deref(), Some("incumbent-model"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
     #[test]
     fn restart_reconciliation_removes_same_incarnation_inert_fallback_row() {
         let owner = crate::daemon_protocol::ResourceOwner {
@@ -4604,6 +4885,8 @@ mod tests {
             backend: None,
             backend_session_id: None,
             backend_session_owner: None,
+            restart_target_owner: None,
+            restart_previous: None,
             project_dir: None,
             project_dir_owner: None,
             project_dir_cleanup_on_abandon: false,
@@ -4630,6 +4913,8 @@ mod tests {
             backend: None,
             backend_session_id: None,
             backend_session_owner: None,
+            restart_target_owner: None,
+            restart_previous: None,
             project_dir: None,
             project_dir_owner: None,
             project_dir_cleanup_on_abandon: false,

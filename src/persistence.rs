@@ -109,6 +109,18 @@ impl PersistedLifecycleState {
                             .as_ref()
                             .map(|owner| owner.incarnation),
                     )
+                    .chain(
+                        lease
+                            .restart_target_owner
+                            .as_ref()
+                            .map(|owner| owner.incarnation),
+                    )
+                    .chain(
+                        lease
+                            .restart_previous
+                            .as_ref()
+                            .map(|session| session.metadata.session_incarnation),
+                    )
             })
             .max()
             .unwrap_or_default();
@@ -218,13 +230,20 @@ pub fn load_sessions(data_dir: &Path) -> Result<PersistedLifecycleState> {
                 backend_session_owner.session_id
             );
         }
-        if let Some(backend_session_owner) = &lease.backend_session_owner
-            && backend_session_owner != &lease.owner
-        {
-            anyhow::bail!(
-                "lifecycle lease '{}' backend abort owner does not match lease owner",
-                session_id
-            );
+        if let Some(backend_session_owner) = &lease.backend_session_owner {
+            let expected_owner = match lease.phase {
+                crate::daemon_protocol::LifecyclePhase::Stopping => Some(&lease.owner),
+                crate::daemon_protocol::LifecyclePhase::Restarting => {
+                    lease.restart_target_owner.as_ref()
+                }
+                crate::daemon_protocol::LifecyclePhase::Starting => None,
+            };
+            if expected_owner != Some(backend_session_owner) {
+                anyhow::bail!(
+                    "lifecycle lease '{}' backend cleanup owner does not match its lifecycle phase",
+                    session_id
+                );
+            }
         }
         let backend_claim_fields = [
             lease.backend.is_some(),
@@ -240,12 +259,43 @@ pub fn load_sessions(data_dir: &Path) -> Result<PersistedLifecycleState> {
             );
         }
         if lease.backend.is_some()
-            && lease.phase != crate::daemon_protocol::LifecyclePhase::Stopping
+            && !matches!(
+                lease.phase,
+                crate::daemon_protocol::LifecyclePhase::Stopping
+                    | crate::daemon_protocol::LifecyclePhase::Restarting
+            )
         {
             anyhow::bail!(
-                "non-stopping lifecycle lease '{}' has a backend abort claim",
+                "lifecycle lease '{}' has a backend cleanup claim in an invalid phase",
                 session_id
             );
+        }
+        if lease.restart_target_owner.is_some() != lease.restart_previous.is_some() {
+            anyhow::bail!(
+                "lifecycle lease '{}' has an incomplete restart target claim",
+                session_id
+            );
+        }
+        if let (Some(target), Some(previous)) =
+            (&lease.restart_target_owner, &lease.restart_previous)
+        {
+            if lease.phase != crate::daemon_protocol::LifecyclePhase::Restarting {
+                anyhow::bail!(
+                    "non-restarting lifecycle lease '{}' has a restart target claim",
+                    session_id
+                );
+            }
+            if target.session_id != *session_id
+                || previous.id != *session_id
+                || previous.owner() != lease.owner
+                || !matches!(previous.origin, crate::daemon_protocol::Origin::Local)
+                || target.incarnation <= lease.owner.incarnation
+            {
+                anyhow::bail!(
+                    "lifecycle lease '{}' has inconsistent restart ownership",
+                    session_id
+                );
+            }
         }
         if lease.project_dir.is_some() != lease.project_dir_owner.is_some() {
             anyhow::bail!(
@@ -583,6 +633,8 @@ mod tests {
                     backend: None,
                     backend_session_id: None,
                     backend_session_owner: None,
+                    restart_target_owner: None,
+                    restart_previous: None,
                     project_dir: None,
                     project_dir_owner: None,
                     project_dir_cleanup_on_abandon: false,
@@ -648,6 +700,68 @@ mod tests {
     }
 
     #[test]
+    fn restart_lease_round_trip_advances_high_water_through_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let incumbent = crate::daemon_protocol::ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(5),
+        };
+        let target = crate::daemon_protocol::ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(9),
+        };
+        let previous = crate::daemon_protocol::SessionEntry {
+            id: "worker".into(),
+            pane: Some("%2".into()),
+            metadata: crate::daemon_protocol::SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_incumbent".into()),
+                session_incarnation: incumbent.incarnation,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let state = PersistedLifecycleState::new(
+            vec![],
+            incumbent.incarnation,
+            BTreeMap::from([(
+                "worker".into(),
+                crate::daemon_protocol::LifecycleLease {
+                    owner: incumbent.clone(),
+                    phase: crate::daemon_protocol::LifecyclePhase::Restarting,
+                    backend: None,
+                    backend_session_id: None,
+                    backend_session_owner: None,
+                    restart_target_owner: Some(target.clone()),
+                    restart_previous: Some(Box::new(previous.clone())),
+                    project_dir: None,
+                    project_dir_owner: None,
+                    project_dir_cleanup_on_abandon: false,
+                    inert_pane: None,
+                    inert_pane_owner: None,
+                },
+            )]),
+        );
+
+        save_sessions(dir.path(), &state).unwrap();
+        let loaded = load_sessions(dir.path()).unwrap();
+
+        assert_eq!(loaded.incarnation_high_water, target.incarnation);
+        assert_eq!(
+            loaded.lifecycle_leases["worker"]
+                .restart_target_owner
+                .as_ref(),
+            Some(&target)
+        );
+        assert_eq!(
+            loaded.lifecycle_leases["worker"]
+                .restart_previous
+                .as_deref(),
+            Some(&previous)
+        );
+    }
+
+    #[test]
     fn load_sessions_rejects_mismatched_lease_owner_key() {
         let dir = tempfile::tempdir().unwrap();
         let snapshot = PersistedLifecycleState {
@@ -665,6 +779,8 @@ mod tests {
                     backend: None,
                     backend_session_id: None,
                     backend_session_owner: None,
+                    restart_target_owner: None,
+                    restart_previous: None,
                     project_dir: None,
                     project_dir_owner: None,
                     project_dir_cleanup_on_abandon: false,
@@ -700,6 +816,8 @@ mod tests {
                     backend: None,
                     backend_session_id: None,
                     backend_session_owner: None,
+                    restart_target_owner: None,
+                    restart_previous: None,
                     project_dir: None,
                     project_dir_owner: None,
                     project_dir_cleanup_on_abandon: false,
