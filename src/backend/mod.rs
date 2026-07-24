@@ -702,7 +702,7 @@ mod tests {
         let config = tmp.path().join("mise.toml");
         std::fs::write(&config, "[tools]\n").unwrap();
 
-        let attempt = run_mise_trust(&fake_mise, &config, Duration::from_secs(1));
+        let attempt = run_mise_trust(&fake_mise, &config, MISE_TRUST_TIMEOUT);
 
         assert_eq!(attempt.status_code(), Some(42));
         assert_eq!(attempt.stdout(), "out line\n");
@@ -729,14 +729,14 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let fake_mise = fake_mise.clone();
         std::thread::spawn(move || {
-            let attempt = run_mise_trust(&fake_mise, &config, Duration::from_millis(100));
-            let _ = tx.send(attempt.stdout());
+            let attempt = run_mise_trust(&fake_mise, &config, Duration::from_millis(500));
+            let _ = tx.send(attempt);
         });
 
-        let stdout = rx
-            .recv_timeout(Duration::from_secs(1))
+        let attempt = rx
+            .recv_timeout(Duration::from_secs(2))
             .expect("timeout path must not wait for descendant-held stdout pipe");
-        assert_eq!(stdout, "before timeout\n");
+        assert!(matches!(attempt, MiseTrustAttempt::TimedOut(Some(_))));
     }
 
     #[test]

@@ -399,6 +399,7 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
                 state,
                 task,
                 None,
+                None,
                 task.model.clone(),
                 task.effort.clone(),
                 None,
@@ -424,6 +425,7 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
         return revive_from_task(
             state,
             task,
+            Some(session.owner()),
             None,
             task.model.clone().or_else(|| {
                 task_backend
@@ -445,6 +447,7 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
 
     // Check if pane is alive
     let alive = task_pane_alive(state, pane).await;
+    let snapshot_owner = session.owner();
 
     // Capture model/effort from the session snapshot we already have, so a
     // subsequent Unregister race cannot silently downgrade the respawn to
@@ -474,37 +477,35 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
     };
 
     if alive {
+        if !scheduled_snapshot_is_current(state, &snapshot_owner, Some(pane)).await {
+            return TaskRun::failed(
+                task,
+                format!(
+                    "scheduled liveness result for '{session_name}' was superseded by a replacement"
+                ),
+            );
+        }
         if task.on_fire.kills_alive() {
             let dir = task
                 .project_dir
                 .as_deref()
                 .or(session.metadata.project_dir.as_deref())
                 .unwrap_or("/tmp");
-            return respawn_and_inject(state, task, pane, dir, launch).await;
+            return respawn_and_inject(state, task, &snapshot_owner, pane, dir, launch).await;
         }
-        // Verify session still exists — a concurrent kill may have removed it
-        // while we were checking pane liveness. If gone, fall through to revival.
-        if state
-            .protocol
-            .read()
-            .await
-            .sessions
-            .contains_key(session_name)
+        if let Err(error) = inject_alive_session_prompt(
+            state,
+            task,
+            &snapshot_owner,
+            session_name,
+            pane,
+            session.metadata.vim_mode,
+        )
+        .await
         {
-            if let Err(error) = inject_alive_session_prompt(
-                state,
-                task,
-                session_name,
-                pane,
-                session.metadata.vim_mode,
-            )
-            .await
-            {
-                return TaskRun::failed(task, error);
-            }
-            return TaskRun::ok(task, None);
+            return TaskRun::failed(task, error);
         }
-        tracing::info!("session '{session_name}' disappeared during alive check, reviving");
+        return TaskRun::ok(task, None);
     }
 
     // Pane is dead — attempt revival, falling back to session's project_dir
@@ -515,6 +516,7 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
     revive_from_task(
         state,
         task,
+        Some(snapshot_owner),
         project_dir,
         launch.model,
         launch.effort,
@@ -522,6 +524,44 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
         launch.backend_name,
     )
     .await
+}
+
+async fn scheduled_snapshot_is_current(
+    state: &SharedState,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    pane: Option<&str>,
+) -> bool {
+    state
+        .protocol
+        .read()
+        .await
+        .sessions
+        .get(&owner.session_id)
+        .is_some_and(|session| session.owner() == *owner && session.pane.as_deref() == pane)
+}
+
+async fn scheduled_launch_is_current(
+    state: &SharedState,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    pane: &str,
+) -> bool {
+    let protocol = state.protocol.read().await;
+    let session_matches = protocol
+        .sessions
+        .get(&owner.session_id)
+        .is_some_and(|session| session.owner() == *owner);
+    let pane_matches = protocol
+        .sessions
+        .get(&owner.session_id)
+        .is_some_and(|session| session.pane.as_deref() == Some(pane))
+        || protocol
+            .lifecycle_leases
+            .get(&owner.session_id)
+            .is_some_and(|lease| {
+                lease.inert_pane.as_deref() == Some(pane)
+                    && lease.inert_pane_owner.as_ref() == Some(owner)
+            });
+    session_matches && pane_matches
 }
 
 async fn task_pane_alive(state: &SharedState, pane: &str) -> bool {
@@ -553,6 +593,7 @@ fn task_prompt_text(task: &ScheduledTask) -> Option<String> {
 async fn inject_alive_session_prompt(
     state: &SharedState,
     task: &ScheduledTask,
+    owner: &crate::daemon_protocol::ResourceOwner,
     session_name: &str,
     pane: &str,
     vim_mode: bool,
@@ -561,8 +602,9 @@ async fn inject_alive_session_prompt(
         return Ok(());
     };
 
-    match crate::state::deliver_inject_message_effect(
+    match crate::state::deliver_owned_inject_message_effect(
         state,
+        owner,
         crate::state::InjectDeliveryRequest {
             session_id: session_name,
             pane,
@@ -582,6 +624,126 @@ async fn inject_alive_session_prompt(
     }
 }
 
+async fn remove_scheduled_pane_for_owners(
+    state: &SharedState,
+    pane: &str,
+    owners: Vec<crate::daemon_protocol::ResourceOwner>,
+) -> anyhow::Result<()> {
+    let pane = pane.to_string();
+    let pane_for_guard = pane.clone();
+    let owners_for_guard = owners.clone();
+    state
+        .with_allowed_pane_cleanup(&owners_for_guard, &pane_for_guard, move || async move {
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let live_owner = crate::tmux::inspect_pane_owner(&pane)?;
+                if !live_owner.as_ref().is_some_and(|owner| {
+                    owners
+                        .iter()
+                        .any(|expected| crate::tmux::physical_owner_matches(owner, expected))
+                }) {
+                    return Ok(());
+                }
+                let status = std::process::Command::new("tmux")
+                    .args(["kill-pane", "-t", &pane])
+                    .status()?;
+                let remaining_owner = crate::tmux::inspect_pane_owner(&pane)?;
+                if !status.success()
+                    && remaining_owner.as_ref().is_some_and(|owner| {
+                        owners
+                            .iter()
+                            .any(|expected| crate::tmux::physical_owner_matches(owner, expected))
+                    })
+                {
+                    anyhow::bail!("failed to remove exact scheduled pane {pane}");
+                }
+                Ok(())
+            })
+            .await?
+        })
+        .await
+        .unwrap_or(Ok(()))
+}
+
+async fn rollback_reserved_scheduled_pane(
+    state: &SharedState,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    pane: &str,
+    credential: Option<&str>,
+) -> anyhow::Result<()> {
+    remove_scheduled_pane_for_owners(state, pane, vec![owner.clone()]).await?;
+    let outcome = state
+        .rollback_reserved_start(owner, pane, credential)
+        .await?;
+    if outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied {
+        state.abort_lifecycle(owner).await?;
+    }
+    Ok(())
+}
+
+async fn rollback_scheduled_revival_authority(
+    state: &SharedState,
+    reserved_owner: Option<&crate::daemon_protocol::ResourceOwner>,
+    restart_claim: Option<&ScheduledExistingLaunchClaim>,
+    pane: &str,
+    credential: Option<&str>,
+) -> anyhow::Result<()> {
+    if let Some(claim) = restart_claim {
+        remove_scheduled_pane_for_owners(state, pane, vec![claim.target_owner.clone()]).await?;
+        let outcome = state
+            .rollback_restart_launch(&claim.lease_owner, &claim.target_owner, None)
+            .await?;
+        if !matches!(
+            outcome,
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+                | crate::daemon_protocol::LifecycleMutationOutcome::NotFound
+                | crate::daemon_protocol::LifecycleMutationOutcome::Superseded
+        ) {
+            anyhow::bail!("scheduled restart rollback was rejected ({outcome:?})");
+        }
+        return Ok(());
+    }
+    let Some(owner) = reserved_owner else {
+        anyhow::bail!("scheduled revival rollback has no lifecycle authority");
+    };
+    rollback_reserved_scheduled_pane(state, owner, pane, credential).await
+}
+
+async fn rollback_scheduled_respawn_claim_with<F, Fut>(
+    state: &SharedState,
+    claim: &ScheduledExistingLaunchClaim,
+    pane: &str,
+    cleanup: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(crate::daemon_protocol::ResourceOwner, String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    cleanup(claim.target_owner.clone(), pane.to_string()).await?;
+    let outcome = state
+        .rollback_restart_launch(&claim.lease_owner, &claim.target_owner, None)
+        .await?;
+    if !matches!(
+        outcome,
+        crate::daemon_protocol::LifecycleMutationOutcome::Applied
+            | crate::daemon_protocol::LifecycleMutationOutcome::NotFound
+            | crate::daemon_protocol::LifecycleMutationOutcome::Superseded
+    ) {
+        anyhow::bail!("scheduled same-pane rollback was rejected ({outcome:?})");
+    }
+    Ok(())
+}
+
+async fn rollback_scheduled_respawn_claim(
+    state: &SharedState,
+    claim: &ScheduledExistingLaunchClaim,
+    pane: &str,
+) -> anyhow::Result<()> {
+    rollback_scheduled_respawn_claim_with(state, claim, pane, |owner, pane| async move {
+        remove_scheduled_pane_for_owners(state, &pane, vec![owner]).await
+    })
+    .await
+}
+
 #[derive(Debug, Clone)]
 struct TaskLaunchSelection {
     model: Option<String>,
@@ -590,15 +752,100 @@ struct TaskLaunchSelection {
     backend_name: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ScheduledExistingLaunchClaim {
+    lease_owner: crate::daemon_protocol::ResourceOwner,
+    target_owner: crate::daemon_protocol::ResourceOwner,
+}
+
+async fn claim_scheduled_existing_launch(
+    state: &SharedState,
+    expected_owner: &crate::daemon_protocol::ResourceOwner,
+    backend_name: &str,
+    replace_backend_identity: bool,
+    session_start_credential: Option<String>,
+) -> Result<ScheduledExistingLaunchClaim, String> {
+    claim_scheduled_existing_owner(state, expected_owner).await?;
+    stage_claimed_scheduled_existing_launch(
+        state,
+        expected_owner,
+        backend_name,
+        replace_backend_identity,
+        session_start_credential,
+    )
+    .await
+}
+
+async fn claim_scheduled_existing_owner(
+    state: &SharedState,
+    expected_owner: &crate::daemon_protocol::ResourceOwner,
+) -> Result<(), String> {
+    match state.claim_existing_start(expected_owner).await {
+        Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => Ok(()),
+        Ok(outcome) => Err(format!(
+            "scheduled launch for '{}' was superseded before external work ({outcome:?})",
+            expected_owner.session_id
+        )),
+        Err(error) => Err(format!(
+            "scheduled launch for '{}' could not persist lifecycle authority: {error}",
+            expected_owner.session_id
+        )),
+    }
+}
+
+async fn stage_claimed_scheduled_existing_launch(
+    state: &SharedState,
+    expected_owner: &crate::daemon_protocol::ResourceOwner,
+    backend_name: &str,
+    replace_backend_identity: bool,
+    session_start_credential: Option<String>,
+) -> Result<ScheduledExistingLaunchClaim, String> {
+    let staged = state
+        .stage_restart_launch(
+            expected_owner,
+            backend_name.to_string(),
+            replace_backend_identity,
+            session_start_credential,
+            None,
+        )
+        .await;
+    match staged {
+        crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
+            Ok(ScheduledExistingLaunchClaim {
+                lease_owner: expected_owner.clone(),
+                target_owner: crate::daemon_protocol::ResourceOwner {
+                    session_id: expected_owner.session_id.clone(),
+                    incarnation,
+                },
+            })
+        }
+        crate::daemon_protocol::StageFreshLaunchOutcome::Rejected => {
+            let _ = state.abort_lifecycle(expected_owner).await;
+            Err(format!(
+                "scheduled launch for '{}' was superseded before external work",
+                expected_owner.session_id
+            ))
+        }
+        crate::daemon_protocol::StageFreshLaunchOutcome::PersistenceFailed => {
+            let _ = state.abort_lifecycle(expected_owner).await;
+            Err(format!(
+                "scheduled launch for '{}' could not persist target lifecycle authority",
+                expected_owner.session_id
+            ))
+        }
+    }
+}
+
 /// Stage a scheduled Codex clear-context launch before its pane is respawned.
 /// The returned incarnation is the only generation allowed to receive the
 /// launch credential's eventual SessionStart binding.
+#[cfg(test)]
 async fn stage_scheduled_codex_launch(
     state: &SharedState,
     session_id: &str,
     backend_name: &str,
     session_start_credential: Option<String>,
-) -> Result<Option<i64>, String> {
+) -> Result<Option<crate::daemon_protocol::SessionIncarnation>, String> {
     let Some(session_start_credential) = session_start_credential else {
         return Ok(None);
     };
@@ -618,6 +865,9 @@ async fn stage_scheduled_codex_launch(
         crate::daemon_protocol::StageFreshLaunchOutcome::Rejected => Err(format!(
             "scheduled launch for '{session_id}' was superseded before pane respawn"
         )),
+        crate::daemon_protocol::StageFreshLaunchOutcome::PersistenceFailed => Err(format!(
+            "scheduled launch for '{session_id}' could not persist lifecycle authority"
+        )),
     }
 }
 
@@ -630,6 +880,7 @@ async fn stage_scheduled_codex_launch(
 async fn respawn_and_inject(
     state: &SharedState,
     task: &ScheduledTask,
+    expected_owner: &crate::daemon_protocol::ResourceOwner,
     pane: &str,
     dir: &str,
     launch: TaskLaunchSelection,
@@ -651,28 +902,61 @@ async fn respawn_and_inject(
     let backend_name = backend.name().to_string();
     let session_start_credential =
         (backend_name == "codex-cli").then(crate::daemon_protocol::new_session_start_credential);
-    let prior_session = state
-        .protocol
-        .read()
-        .await
-        .sessions
-        .get(task.session_name())
-        .cloned();
-
-    // Codex reports its new thread ID only after the pane starts. Advance the
-    // managed incarnation and clear the old pair before respawning, while
-    // retaining the one-time credential for the new SessionStart hook.
-    let staged_incarnation = match stage_scheduled_codex_launch(
+    let prior_session = {
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .get(task.session_name())
+            .filter(|session| session.owner() == *expected_owner)
+            .cloned()
+    };
+    let Some(_prior_session) = prior_session else {
+        return TaskRun::failed(
+            task,
+            "scheduled pane owner changed before lifecycle claim".into(),
+        );
+    };
+    let claim = match claim_scheduled_existing_launch(
         state,
-        task.session_name(),
+        expected_owner,
         &backend_name,
+        true,
         session_start_credential.clone(),
     )
     .await
     {
-        Ok(incarnation) => incarnation,
+        Ok(claim) => claim,
         Err(error) => return TaskRun::failed(task, error),
     };
+    let staged_incarnation = claim.target_owner.incarnation;
+    match state
+        .record_inert_start_pane(
+            &claim.lease_owner,
+            claim.target_owner.clone(),
+            pane_id.clone(),
+        )
+        .await
+    {
+        Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
+        Ok(outcome) => {
+            let _ = state
+                .rollback_restart_launch(&claim.lease_owner, &claim.target_owner, None)
+                .await;
+            return TaskRun::failed(
+                task,
+                format!("scheduled pane claim was superseded before respawn ({outcome:?})"),
+            );
+        }
+        Err(error) => {
+            let _ = state
+                .rollback_restart_launch(&claim.lease_owner, &claim.target_owner, None)
+                .await;
+            return TaskRun::failed(
+                task,
+                format!("scheduled pane claim could not be persisted: {error}"),
+            );
+        }
+    }
     let settings = state.settings.read().await;
     let claude_permission_mode = settings.claude_permission_mode.clone();
     let launch_model =
@@ -702,25 +986,22 @@ async fn respawn_and_inject(
             launch_codex_home.as_deref(),
             task.session_name(),
             credential,
+            staged_incarnation,
         ) {
             Ok(command) => command,
             Err(error) => {
-                if let (Some(staged_incarnation), Some(previous)) =
-                    (staged_incarnation, prior_session.as_ref())
-                {
-                    rollback_staged_fresh_launch(
-                        state,
-                        task.session_name(),
-                        &pane_id,
-                        credential,
-                        staged_incarnation,
-                        previous,
-                    )
-                    .await;
-                }
+                let cleanup = rollback_scheduled_respawn_claim(state, &claim, &pane_id).await;
                 return TaskRun::failed(
                     task,
-                    format!("could not stage Codex launch credential: {error}"),
+                    format!(
+                        "could not stage Codex launch credential: {error}{}",
+                        cleanup
+                            .err()
+                            .map(|cleanup_error| {
+                                format!("; exact target cleanup failed: {cleanup_error}")
+                            })
+                            .unwrap_or_default()
+                    ),
                 );
             }
         },
@@ -739,87 +1020,74 @@ async fn respawn_and_inject(
     };
 
     let session_name = task.session_name().to_string();
-    let respawn_result = tokio::task::spawn_blocking({
-        let pane_id = pane_id.clone();
-        let pane_credential = session_start_credential.clone();
-        move || -> anyhow::Result<()> {
-            // See `pane_env_args` for why OUIJA_SESSION_ID must ride along.
-            let env_args = crate::tmux::pane_env_args(&session_name, pane_credential.as_deref());
-            let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
-            args.extend(env_args.iter().map(String::as_str));
-            args.extend_from_slice(&["-t", &pane_id, &full_cmd]);
-            crate::tmux::configure_managed_pane(&pane_id);
-            let output = std::process::Command::new("tmux").args(&args).output()?;
-            if !output.status.success() {
-                anyhow::bail!(
-                    "respawn-pane failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
+    let pane_incarnation = Some(staged_incarnation);
+    let respawn_owner = claim.target_owner.clone();
+    let respawn_session_name = session_name.clone();
+    let respawn_credential = session_start_credential.clone();
+    let respawn_command = full_cmd.clone();
+    let respawn_pane_id = pane_id.clone();
+    let respawn_operation = move || {
+        tokio::task::spawn_blocking({
+            let pane_id = respawn_pane_id;
+            let pane_credential = respawn_credential;
+            move || -> anyhow::Result<()> {
+                // See `pane_env_args` for why OUIJA_SESSION_ID must ride along.
+                let env_args = crate::tmux::pane_env_args(
+                    &respawn_session_name,
+                    pane_credential.as_deref(),
+                    pane_incarnation,
                 );
+                let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
+                args.extend(env_args.iter().map(String::as_str));
+                args.extend_from_slice(&["-t", &pane_id, &respawn_command]);
+                crate::tmux::configure_managed_pane(&pane_id);
+                let output = std::process::Command::new("tmux").args(&args).output()?;
+                if !output.status.success() {
+                    anyhow::bail!(
+                        "respawn-pane failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                Ok(())
             }
-            Ok(())
-        }
-    })
-    .await;
+        })
+    };
+    let respawn_result = state
+        .with_owned_pane_claim(&respawn_owner, pane, respawn_operation)
+        .await
+        .unwrap_or_else(|| {
+            Ok(Err(anyhow::anyhow!(
+                "scheduled pane ownership changed before respawn"
+            )))
+        });
 
     match respawn_result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            if let (Some(credential), Some(staged_incarnation), Some(previous)) = (
-                session_start_credential.as_deref(),
-                staged_incarnation,
-                prior_session.as_ref(),
-            ) {
-                rollback_staged_fresh_launch(
-                    state,
-                    task.session_name(),
-                    &pane_id,
-                    credential,
-                    staged_incarnation,
-                    previous,
-                )
-                .await;
-            }
-            return TaskRun::failed(task, e.to_string());
+            let cleanup = rollback_scheduled_respawn_claim(state, &claim, &pane_id).await;
+            return TaskRun::failed(
+                task,
+                format!(
+                    "{e}{}",
+                    cleanup
+                        .err()
+                        .map(|error| format!("; exact target cleanup failed: {error}"))
+                        .unwrap_or_default()
+                ),
+            );
         }
         Err(e) => {
-            if let (Some(credential), Some(staged_incarnation), Some(previous)) = (
-                session_start_credential.as_deref(),
-                staged_incarnation,
-                prior_session.as_ref(),
-            ) {
-                rollback_staged_fresh_launch(
-                    state,
-                    task.session_name(),
-                    &pane_id,
-                    credential,
-                    staged_incarnation,
-                    previous,
-                )
-                .await;
-            }
-            return TaskRun::failed(task, e.to_string());
-        }
-    }
-
-    // Stamp bootstrap metadata and clear backend_session_id since we started fresh
-    {
-        let mut proto = state.protocol.write().await;
-        if let Some(s) = proto.sessions.get_mut(task.session_name()) {
-            if s.metadata.prompt.is_none() {
-                s.metadata.prompt = task.prompt.clone();
-            }
-            if s.metadata.reminder.is_none() {
-                s.metadata.reminder = task.reminder.clone();
-            }
-            if s.metadata.on_fire.is_none() {
-                s.metadata.on_fire = Some(task.on_fire.clone());
-            }
-            // Codex cleared and credentialed this slot before respawn. Its
-            // SessionStart hook may already have atomically bound the new
-            // thread ID, so do not clobber that result here.
-            if session_start_credential.is_none() {
-                s.metadata.backend_session_id = None;
-            }
+            let cleanup = rollback_scheduled_respawn_claim(state, &claim, &pane_id).await;
+            return TaskRun::failed(
+                task,
+                format!(
+                    "{e}{}",
+                    cleanup
+                        .err()
+                        .map(|error| format!("; exact target cleanup failed: {error}"))
+                        .unwrap_or_default()
+                ),
+            );
         }
     }
 
@@ -841,7 +1109,54 @@ async fn respawn_and_inject(
         tracing::warn!("backend did not start in time after respawn in pane {pane_id}");
     }
 
-    TaskRun::ok(task, None)
+    let final_metadata = {
+        let proto = state.protocol.read().await;
+        proto
+            .sessions
+            .get(task.session_name())
+            .filter(|session| session.owner() == claim.target_owner)
+            .map(|session| {
+                let mut metadata = session.metadata.clone();
+                if metadata.prompt.is_none() {
+                    metadata.prompt = task.prompt.clone();
+                }
+                if metadata.reminder.is_none() {
+                    metadata.reminder = task.reminder.clone();
+                }
+                if metadata.on_fire.is_none() {
+                    metadata.on_fire = Some(task.on_fire.clone());
+                }
+                if session_start_credential.is_none() {
+                    metadata.backend_session_id = None;
+                }
+                metadata
+            })
+    };
+    let Some(final_metadata) = final_metadata else {
+        return TaskRun::failed(
+            task,
+            "scheduled readiness result was superseded by a replacement".into(),
+        );
+    };
+    match state
+        .complete_restart_launch(
+            &claim.lease_owner,
+            &claim.target_owner,
+            Some(pane_id),
+            final_metadata,
+        )
+        .await
+    {
+        Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => TaskRun::ok(task, None),
+        Ok(outcome) => TaskRun::failed(
+            task,
+            format!("scheduled restart completion was superseded ({outcome:?})"),
+        ),
+        Err(error) => TaskRun::failed(
+            task,
+            format!("scheduled restart completion could not be persisted: {error}"),
+        ),
+    }
 }
 
 /// Create or revive a session and inject a message.
@@ -850,9 +1165,14 @@ async fn respawn_and_inject(
 /// Backend metadata is passed through from the caller's session snapshot;
 /// for the 'session not found' path the caller passes `None` (there is no
 /// prior metadata to honour).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the scheduler threads one atomic session snapshot without a second mutable config type"
+)]
 async fn revive_from_task(
     state: &SharedState,
     task: &ScheduledTask,
+    expected_owner: Option<crate::daemon_protocol::ResourceOwner>,
     project_dir_override: Option<&str>,
     model: Option<String>,
     effort: Option<String>,
@@ -863,6 +1183,7 @@ async fn revive_from_task(
     match revive_and_inject(
         state,
         task,
+        expected_owner,
         project_dir,
         model,
         effort,
@@ -884,9 +1205,14 @@ async fn revive_from_task(
 /// read and this function cannot silently downgrade the revive to backend
 /// defaults. When the caller is the 'session not found' branch, both are
 /// `None` (no prior metadata to honour).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the scheduler threads one atomic session snapshot without a second mutable config type"
+)]
 async fn revive_and_inject(
     state: &SharedState,
     task: &ScheduledTask,
+    expected_owner: Option<crate::daemon_protocol::ResourceOwner>,
     project_dir: Option<&str>,
     model: Option<String>,
     effort: Option<String>,
@@ -924,6 +1250,47 @@ async fn revive_and_inject(
         crate::backend::DeliveryMode::TuiInjection
     );
     let backend_name = backend.name().to_string();
+    let _prior_session = if let Some(expected_owner) = expected_owner.as_ref() {
+        let prior = state
+            .protocol
+            .read()
+            .await
+            .sessions
+            .get(task.session_name())
+            .filter(|session| session.owner() == *expected_owner)
+            .cloned();
+        let Some(prior) = prior else {
+            anyhow::bail!(
+                "scheduled revival for '{}' was superseded before lifecycle claim",
+                task.session_name()
+            );
+        };
+        claim_scheduled_existing_owner(state, expected_owner)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        Some(prior)
+    } else {
+        None
+    };
+    let reserved_owner = if expected_owner.is_none() {
+        match state.reserve_start(task.session_name()).await? {
+            crate::daemon_protocol::StartDisposition::Reserved(owner) => Some(owner),
+            crate::daemon_protocol::StartDisposition::Existing(owner) => {
+                anyhow::bail!(
+                    "scheduled revival for '{}' was superseded by existing owner {owner:?}",
+                    task.session_name()
+                );
+            }
+            crate::daemon_protocol::StartDisposition::InProgress(owner) => {
+                anyhow::bail!(
+                    "scheduled revival for '{}' was superseded by in-progress owner {owner:?}",
+                    task.session_name()
+                );
+            }
+        }
+    } else {
+        None
+    };
     let settings = state.settings.read().await;
     let claude_permission_mode = settings.claude_permission_mode.clone();
     let launch_model =
@@ -940,26 +1307,34 @@ async fn revive_and_inject(
         .backend_session_id
         .clone()
         .or_else(|| detected_backend_session_id.clone());
-    let session_start_credential = (backend_name == "codex-cli" && clears_context)
+    let replace_backend_identity = clears_context || resume_backend_session_id.is_none();
+    let session_start_credential = (backend_name == "codex-cli" && replace_backend_identity)
         .then(crate::daemon_protocol::new_session_start_credential);
+    let restart_claim = if let Some(expected_owner) = expected_owner.as_ref() {
+        match stage_claimed_scheduled_existing_launch(
+            state,
+            expected_owner,
+            &backend_name,
+            replace_backend_identity,
+            session_start_credential.clone(),
+        )
+        .await
+        {
+            Ok(claim) => Some(claim),
+            Err(error) => return Err(anyhow::Error::msg(error)),
+        }
+    } else {
+        None
+    };
     let launch_cmd = if clears_context {
-        let command = backend.build_start_command(&crate::backend::StartOpts {
+        backend.build_start_command(&crate::backend::StartOpts {
             project_dir: dir.clone(),
             worktree,
             model: launch_model.model.clone(),
             effort: effort.clone(),
             permission_mode: claude_permission_mode.clone(),
             codex_home: launch_codex_home.clone(),
-        });
-        match session_start_credential.as_deref() {
-            Some(credential) => crate::backend::codex::with_session_start_hook(
-                command,
-                launch_codex_home.as_deref(),
-                task.session_name(),
-                credential,
-            )?,
-            None => command,
-        }
+        })
     } else {
         backend
             .build_resume_command(&crate::backend::ResumeOpts {
@@ -983,21 +1358,6 @@ async fn revive_and_inject(
             })
     };
 
-    // Pass prompt as CLI arg so Claude loads CLAUDE.md before processing it.
-    // TuiInjection always uses CLI arg; HttpApi only when starting fresh.
-    let full_launch_cmd = if clears_context || is_tui {
-        if let Some(full_text) = task_prompt_text(task) {
-            let prompt_path = format!("/tmp/ouija-prompt-{}.txt", task.name.replace('/', "-"));
-            let _ = std::fs::write(&prompt_path, &full_text);
-            let escaped_pf = shell_escape(&prompt_path);
-            format!("{launch_cmd} \"$(cat {escaped_pf})\" ; rm -f {escaped_pf}")
-        } else {
-            launch_cmd.clone()
-        }
-    } else {
-        launch_cmd.clone()
-    };
-
     crate::backend::claude_code::pre_trust_workspace(&dir);
     crate::backend::pre_trust_mise(&dir);
 
@@ -1016,122 +1376,446 @@ async fn revive_and_inject(
         },
     );
     let scheduled_prompt_backend_session_id = proto_meta.backend_session_id.clone();
+    let initial_pane_owner = reserved_owner.clone().or_else(|| {
+        restart_claim
+            .as_ref()
+            .map(|claim| claim.target_owner.clone())
+    });
+    let initial_pane_incarnation = initial_pane_owner.as_ref().map(|owner| owner.incarnation);
 
     // Create named tmux session/window for the revived session.
     // If a tmux session with the target name exists, add a window to it;
     // otherwise create a new tmux session. Both get the ouija session name.
-    let new_pane = tokio::task::spawn_blocking({
-        let dir = dir.clone();
-        let window_name = task.session_name().to_string();
-        let tmux_session = crate::tmux::tmux_session_name(&dir);
-        let pane_credential = session_start_credential.clone();
-        move || -> anyhow::Result<String> {
-            let tmux_session_exists = std::process::Command::new("tmux")
-                .args(["has-session", "-t", &tmux_session])
-                .output()
-                .is_ok_and(|o| o.status.success());
+    let create_pane = || {
+        tokio::task::spawn_blocking({
+            let dir = dir.clone();
+            let window_name = task.session_name().to_string();
+            let tmux_session = crate::tmux::tmux_session_name(&dir);
+            let pane_credential = session_start_credential.clone();
+            let pane_incarnation = initial_pane_incarnation;
+            move || -> anyhow::Result<String> {
+                let tmux_session_exists = std::process::Command::new("tmux")
+                    .args(["has-session", "-t", &tmux_session])
+                    .output()
+                    .is_ok_and(|o| o.status.success());
 
-            let target = format!("{tmux_session}:");
-            // `pane_env_args` exports OUIJA_SESSION_ID (so the ouija CLI
-            // can resolve the caller's identity) and suppresses shell
-            // history (HISTFILE/fish_history).
-            let env_args = crate::tmux::pane_env_args(&window_name, pane_credential.as_deref());
-            let output = if tmux_session_exists {
-                let mut args: Vec<&str> = vec!["new-window", "-d"];
-                args.extend(env_args.iter().map(String::as_str));
-                args.extend_from_slice(&[
-                    "-t",
-                    &target,
-                    "-n",
+                let target = format!("{tmux_session}:");
+                // `pane_env_args` exports OUIJA_SESSION_ID (so the ouija CLI
+                // can resolve the caller's identity) and suppresses shell
+                // history (HISTFILE/fish_history).
+                let env_args = crate::tmux::pane_env_args(
                     &window_name,
-                    "-P",
-                    "-F",
-                    "#{pane_id}",
-                ]);
-                std::process::Command::new("tmux").args(&args).output()?
-            } else {
-                let mut args: Vec<&str> = vec!["new-session", "-d"];
-                args.extend(env_args.iter().map(String::as_str));
-                args.extend_from_slice(&[
-                    "-s",
-                    &tmux_session,
-                    "-n",
-                    &window_name,
-                    "-P",
-                    "-F",
-                    "#{pane_id}",
-                ]);
-                std::process::Command::new("tmux").args(&args).output()?
-            };
-            if !output.status.success() {
-                anyhow::bail!(
-                    "tmux session/window creation failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
+                    pane_credential.as_deref(),
+                    pane_incarnation,
                 );
+                let output = if tmux_session_exists {
+                    let mut args: Vec<&str> = vec!["new-window", "-d"];
+                    args.extend(env_args.iter().map(String::as_str));
+                    args.extend_from_slice(&[
+                        "-t",
+                        &target,
+                        "-n",
+                        &window_name,
+                        "-P",
+                        "-F",
+                        "#{pane_id}",
+                    ]);
+                    std::process::Command::new("tmux").args(&args).output()?
+                } else {
+                    let mut args: Vec<&str> = vec!["new-session", "-d"];
+                    args.extend(env_args.iter().map(String::as_str));
+                    args.extend_from_slice(&[
+                        "-s",
+                        &tmux_session,
+                        "-n",
+                        &window_name,
+                        "-P",
+                        "-F",
+                        "#{pane_id}",
+                    ]);
+                    std::process::Command::new("tmux").args(&args).output()?
+                };
+                if !output.status.success() {
+                    anyhow::bail!(
+                        "tmux session/window creation failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                Ok(pane_id)
             }
-            let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            Ok(pane_id)
+        })
+    };
+    let (directory_lease_owner, directory_owner) = if let Some(owner) = reserved_owner.as_ref() {
+        (owner, owner.clone())
+    } else if let Some(claim) = restart_claim.as_ref() {
+        (&claim.lease_owner, claim.target_owner.clone())
+    } else {
+        anyhow::bail!("scheduled revival missing lifecycle authority");
+    };
+    let new_pane_result = match state
+        .with_reserved_project_dir_claim(
+            directory_lease_owner,
+            directory_owner,
+            &dir,
+            false,
+            create_pane,
+        )
+        .await?
+    {
+        Some(result) => result,
+        None => {
+            if let Some(claim) = restart_claim.as_ref() {
+                let _ = state
+                    .rollback_restart_launch(&claim.lease_owner, &claim.target_owner, None)
+                    .await;
+            } else if let Some(owner) = reserved_owner.as_ref() {
+                let _ = state.abort_lifecycle(owner).await;
+            }
+            anyhow::bail!(
+                "scheduled revival directory claim was superseded for '{}'",
+                task.session_name()
+            );
         }
-    })
-    .await??;
+    };
+    let new_pane = match new_pane_result {
+        Ok(Ok(pane)) => pane,
+        Ok(Err(error)) => {
+            if let Some(claim) = restart_claim.as_ref() {
+                let _ = state
+                    .rollback_restart_launch(&claim.lease_owner, &claim.target_owner, None)
+                    .await;
+            } else if let Some(owner) = reserved_owner.as_ref() {
+                let _ = state.abort_lifecycle(owner).await;
+            }
+            return Err(error);
+        }
+        Err(error) => {
+            if let Some(claim) = restart_claim.as_ref() {
+                let _ = state
+                    .rollback_restart_launch(&claim.lease_owner, &claim.target_owner, None)
+                    .await;
+            } else if let Some(owner) = reserved_owner.as_ref() {
+                let _ = state.abort_lifecycle(owner).await;
+            }
+            return Err(anyhow::anyhow!(
+                "scheduled pane creation task failed: {error}"
+            ));
+        }
+    };
 
     // The pane exists but has not started the backend yet. Register its
     // launch credential first so Codex's SessionStart hook can find and
     // authenticate the exact pane before it reports its initial thread ID.
-    let prior_session = state
-        .protocol
-        .read()
-        .await
-        .sessions
-        .get(task.session_name())
-        .cloned();
-
-    state
-        .apply_and_execute(crate::daemon_protocol::Event::Register {
-            id: task.session_name().to_string(),
-            pane: Some(new_pane.clone()),
-            metadata: proto_meta,
-        })
-        .await;
-
-    let pane_for_launch = new_pane.clone();
-    let launch_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        crate::tmux::configure_managed_pane(&pane_for_launch);
-        // Leading space prevents the command from being recorded in shell
-        // history (zsh HIST_IGNORE_SPACE / bash HISTCONTROL=ignorespace).
-        let launch_then_exit = crate::tmux::close_shell_after(&full_launch_cmd);
-        let hidden_cmd = format!(" {launch_then_exit}");
-        let status = std::process::Command::new("tmux")
-            .args(["send-keys", "-t", &pane_for_launch, &hidden_cmd, "Enter"])
-            .status()?;
-        if !status.success() {
-            anyhow::bail!("tmux send-keys failed for pane {pane_for_launch}");
+    if let Some(owner) = reserved_owner.as_ref() {
+        match state
+            .record_inert_start_pane(owner, owner.clone(), new_pane.clone())
+            .await
+        {
+            Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
+            Ok(outcome) => {
+                let cleanup =
+                    remove_scheduled_pane_for_owners(state, &new_pane, vec![owner.clone()]).await;
+                if cleanup.is_ok() {
+                    let _ = state.abort_lifecycle(owner).await;
+                }
+                anyhow::bail!(
+                    "scheduled revival pane reservation was superseded ({outcome:?}){}",
+                    cleanup
+                        .err()
+                        .map(|error| format!("; exact pane cleanup failed: {error}"))
+                        .unwrap_or_default()
+                );
+            }
+            Err(error) => {
+                let cleanup =
+                    remove_scheduled_pane_for_owners(state, &new_pane, vec![owner.clone()]).await;
+                if cleanup.is_ok() {
+                    let _ = state.abort_lifecycle(owner).await;
+                }
+                anyhow::bail!(
+                    "scheduled revival could not persist pane authority: {error}{}",
+                    cleanup
+                        .err()
+                        .map(|cleanup_error| {
+                            format!("; exact pane cleanup failed: {cleanup_error}")
+                        })
+                        .unwrap_or_default()
+                );
+            }
         }
-        Ok(())
-    })
-    .await;
-    match launch_result {
+        match state
+            .commit_reserved_start(owner, Some(new_pane.clone()), proto_meta.clone())
+            .await
+        {
+            Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
+            Ok(outcome) => {
+                let cleanup =
+                    remove_scheduled_pane_for_owners(state, &new_pane, vec![owner.clone()]).await;
+                if cleanup.is_ok() {
+                    let _ = state.abort_lifecycle(owner).await;
+                }
+                anyhow::bail!(
+                    "scheduled revival registration was superseded ({outcome:?}){}",
+                    cleanup
+                        .err()
+                        .map(|error| format!("; exact pane cleanup failed: {error}"))
+                        .unwrap_or_default()
+                );
+            }
+            Err(error) => {
+                let cleanup =
+                    remove_scheduled_pane_for_owners(state, &new_pane, vec![owner.clone()]).await;
+                if cleanup.is_ok() {
+                    let _ = state.abort_lifecycle(owner).await;
+                }
+                anyhow::bail!(
+                    "scheduled revival could not persist registration: {error}{}",
+                    cleanup
+                        .err()
+                        .map(|cleanup_error| {
+                            format!("; exact pane cleanup failed: {cleanup_error}")
+                        })
+                        .unwrap_or_default()
+                );
+            }
+        }
+    } else if let Some(claim) = restart_claim.as_ref() {
+        match state
+            .record_inert_start_pane(
+                &claim.lease_owner,
+                claim.target_owner.clone(),
+                new_pane.clone(),
+            )
+            .await
+        {
+            Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
+            Ok(outcome) => {
+                let cleanup = remove_scheduled_pane_for_owners(
+                    state,
+                    &new_pane,
+                    vec![claim.target_owner.clone()],
+                )
+                .await;
+                if cleanup.is_ok() {
+                    let _ = state
+                        .rollback_restart_launch(&claim.lease_owner, &claim.target_owner, None)
+                        .await;
+                }
+                anyhow::bail!(
+                    "scheduled revival pane reservation was superseded ({outcome:?}){}",
+                    cleanup
+                        .err()
+                        .map(|error| format!("; exact pane cleanup failed: {error}"))
+                        .unwrap_or_default()
+                );
+            }
+            Err(error) => {
+                let cleanup = remove_scheduled_pane_for_owners(
+                    state,
+                    &new_pane,
+                    vec![claim.target_owner.clone()],
+                )
+                .await;
+                if cleanup.is_ok() {
+                    let _ = state
+                        .rollback_restart_launch(&claim.lease_owner, &claim.target_owner, None)
+                        .await;
+                }
+                anyhow::bail!(
+                    "scheduled revival could not persist pane authority: {error}{}",
+                    cleanup
+                        .err()
+                        .map(|cleanup_error| {
+                            format!("; exact pane cleanup failed: {cleanup_error}")
+                        })
+                        .unwrap_or_default()
+                );
+            }
+        }
+    }
+
+    // Registration allocates the authoritative incarnation for a newly
+    // revived ID. Respawn the still-inert shell with that exact environment
+    // before the backend command can run.
+    let registered_owner = initial_pane_owner
+        .clone()
+        .expect("scheduled lifecycle authority has an exact target owner");
+    let registered_authority = {
+        let proto = state.protocol.read().await;
+        let session_matches = proto
+            .sessions
+            .get(task.session_name())
+            .is_some_and(|session| session.owner() == registered_owner);
+        let pane_matches = if let Some(claim) = restart_claim.as_ref() {
+            proto
+                .lifecycle_leases
+                .get(task.session_name())
+                .is_some_and(|lease| {
+                    lease.owner == claim.lease_owner
+                        && lease.restart_target_owner.as_ref() == Some(&registered_owner)
+                        && lease.inert_pane.as_deref() == Some(new_pane.as_str())
+                        && lease.inert_pane_owner.as_ref() == Some(&registered_owner)
+                })
+        } else {
+            proto
+                .sessions
+                .get(task.session_name())
+                .is_some_and(|session| session.pane.as_deref() == Some(new_pane.as_str()))
+        };
+        session_matches && pane_matches
+    };
+    if !registered_authority {
+        if let Some(initial_owner) = initial_pane_owner.as_ref() {
+            remove_scheduled_pane_for_owners(state, &new_pane, vec![initial_owner.clone()]).await?;
+        }
+        if let Some(claim) = restart_claim.as_ref() {
+            let _ = state
+                .rollback_restart_launch(&claim.lease_owner, &claim.target_owner, None)
+                .await;
+        } else if let Some(owner) = reserved_owner.as_ref() {
+            let _ = state.abort_lifecycle(owner).await;
+        }
+        anyhow::bail!(
+            "scheduled revival registration was superseded before launch for '{}'",
+            task.session_name()
+        );
+    }
+    let registered_incarnation = registered_owner.incarnation;
+    let launch_cmd = match session_start_credential.as_deref() {
+        Some(credential) => crate::backend::codex::with_session_start_hook(
+            launch_cmd,
+            launch_codex_home.as_deref(),
+            task.session_name(),
+            credential,
+            registered_incarnation,
+        )?,
+        None => launch_cmd,
+    };
+    // Pass prompt as CLI arg so Claude loads CLAUDE.md before processing it.
+    // TuiInjection always uses CLI arg; HttpApi only when starting fresh.
+    let full_launch_cmd = if clears_context || is_tui {
+        if let Some(full_text) = task_prompt_text(task) {
+            let prompt_path = format!("/tmp/ouija-prompt-{}.txt", task.name.replace('/', "-"));
+            let _ = std::fs::write(&prompt_path, &full_text);
+            let escaped_pf = shell_escape(&prompt_path);
+            format!("{launch_cmd} \"$(cat {escaped_pf})\" ; rm -f {escaped_pf}")
+        } else {
+            launch_cmd.clone()
+        }
+    } else {
+        launch_cmd.clone()
+    };
+    let pane_for_environment = new_pane.clone();
+    let session_for_environment = task.session_name().to_string();
+    let credential_for_environment = session_start_credential.clone();
+    let registered_owner = crate::daemon_protocol::ResourceOwner {
+        session_id: task.session_name().to_string(),
+        incarnation: registered_incarnation,
+    };
+    let environment_operation = move || {
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let env_args = crate::tmux::pane_env_args(
+                &session_for_environment,
+                credential_for_environment.as_deref(),
+                Some(registered_incarnation),
+            );
+            let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
+            args.extend(env_args.iter().map(String::as_str));
+            args.extend_from_slice(&["-t", &pane_for_environment]);
+            let output = std::process::Command::new("tmux").args(&args).output()?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "scheduled pane environment respawn failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Ok(())
+        })
+    };
+    let environment_result = state
+        .with_owned_pane_claim(&registered_owner, &new_pane, environment_operation)
+        .await
+        .unwrap_or_else(|| {
+            Ok(Err(anyhow::anyhow!(
+                "scheduled pane ownership changed before environment respawn"
+            )))
+        });
+    match environment_result {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            rollback_provisional_revival(
+            rollback_scheduled_revival_authority(
                 state,
-                task.session_name(),
+                reserved_owner.as_ref(),
+                restart_claim.as_ref(),
                 &new_pane,
                 session_start_credential.as_deref(),
-                prior_session.as_ref(),
             )
-            .await;
+            .await?;
             return Err(error);
         }
         Err(error) => {
-            rollback_provisional_revival(
+            rollback_scheduled_revival_authority(
                 state,
-                task.session_name(),
+                reserved_owner.as_ref(),
+                restart_claim.as_ref(),
                 &new_pane,
                 session_start_credential.as_deref(),
-                prior_session.as_ref(),
             )
-            .await;
+            .await?;
+            return Err(anyhow::anyhow!(
+                "scheduled pane environment task failed: {error}"
+            ));
+        }
+    }
+
+    let pane_for_launch = new_pane.clone();
+    let launch_operation = move || {
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            crate::tmux::configure_managed_pane(&pane_for_launch);
+            // Leading space prevents the command from being recorded in shell
+            // history (zsh HIST_IGNORE_SPACE / bash HISTCONTROL=ignorespace).
+            let launch_then_exit = crate::tmux::close_shell_after(&full_launch_cmd);
+            let hidden_cmd = format!(" {launch_then_exit}");
+            let status = std::process::Command::new("tmux")
+                .args(["send-keys", "-t", &pane_for_launch, &hidden_cmd, "Enter"])
+                .status()?;
+            if !status.success() {
+                anyhow::bail!("tmux send-keys failed for pane {pane_for_launch}");
+            }
+            Ok(())
+        })
+    };
+    let launch_result = state
+        .with_owned_pane_claim(&registered_owner, &new_pane, launch_operation)
+        .await
+        .unwrap_or_else(|| {
+            Ok(Err(anyhow::anyhow!(
+                "scheduled pane ownership changed before backend launch"
+            )))
+        });
+    match launch_result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            rollback_scheduled_revival_authority(
+                state,
+                reserved_owner.as_ref(),
+                restart_claim.as_ref(),
+                &new_pane,
+                session_start_credential.as_deref(),
+            )
+            .await?;
+            return Err(error);
+        }
+        Err(error) => {
+            rollback_scheduled_revival_authority(
+                state,
+                reserved_owner.as_ref(),
+                restart_claim.as_ref(),
+                &new_pane,
+                session_start_credential.as_deref(),
+            )
+            .await?;
             return Err(anyhow::anyhow!("scheduled launch task failed: {error}"));
         }
     }
@@ -1153,6 +1837,14 @@ async fn revive_and_inject(
     .unwrap_or(false);
 
     if !process_ready {
+        rollback_scheduled_revival_authority(
+            state,
+            reserved_owner.as_ref(),
+            restart_claim.as_ref(),
+            &new_pane,
+            session_start_credential.as_deref(),
+        )
+        .await?;
         anyhow::bail!(
             "{backend_name} did not start within {REVIVAL_TIMEOUT_SECS}s in pane {new_pane}"
         );
@@ -1174,14 +1866,83 @@ async fn revive_and_inject(
         }
     }
 
+    if !scheduled_launch_is_current(state, &registered_owner, &new_pane).await {
+        anyhow::bail!(
+            "scheduled readiness result for '{}' was superseded",
+            task.session_name()
+        );
+    }
+
+    if let Some(claim) = restart_claim.as_ref() {
+        let final_metadata = {
+            let proto = state.protocol.read().await;
+            proto
+                .sessions
+                .get(task.session_name())
+                .filter(|session| session.owner() == claim.target_owner)
+                .map(|session| {
+                    let mut metadata = session.metadata.clone();
+                    metadata.project_dir = proto_meta.project_dir.clone();
+                    metadata.prompt = proto_meta.prompt.clone();
+                    metadata.reminder = proto_meta.reminder.clone();
+                    metadata.model = proto_meta.model.clone();
+                    metadata.effort = proto_meta.effort.clone();
+                    metadata.codex_home = proto_meta.codex_home.clone();
+                    metadata.on_fire = proto_meta.on_fire.clone();
+                    metadata.backend = proto_meta.backend.clone();
+                    if !replace_backend_identity {
+                        metadata.backend_session_id = proto_meta.backend_session_id.clone();
+                    }
+                    metadata.opencode_binding = metadata
+                        .opencode_binding
+                        .or(proto_meta.opencode_binding.clone());
+                    metadata
+                })
+        };
+        let Some(final_metadata) = final_metadata else {
+            anyhow::bail!(
+                "scheduled launch completion for '{}' was superseded",
+                task.session_name()
+            );
+        };
+        match state
+            .complete_restart_launch(
+                &claim.lease_owner,
+                &claim.target_owner,
+                Some(new_pane.clone()),
+                final_metadata,
+            )
+            .await
+        {
+            Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
+            Ok(outcome) => {
+                anyhow::bail!("scheduled launch completion was superseded ({outcome:?})");
+            }
+            Err(error) => {
+                anyhow::bail!(
+                    "scheduled launch completion could not be persisted; recovery authority retained: {error}"
+                );
+            }
+        }
+    } else if let Some(owner) = reserved_owner.as_ref()
+        && let Err(error) = state.abort_lifecycle(owner).await
+    {
+        rollback_reserved_scheduled_pane(
+            state,
+            owner,
+            &new_pane,
+            session_start_credential.as_deref(),
+        )
+        .await?;
+        anyhow::bail!("scheduled revival failed to persist launch completion: {error}");
+    }
+
     // Track disposable worktree panes for reaper cleanup
     if task.on_fire.is_disposable_worktree() {
-        if let Some(ref dir) = project_dir {
+        if let Some(dir) = project_dir {
             state
-                .perfire_worktree_panes
-                .write()
-                .await
-                .insert(new_pane.clone(), dir.to_string());
+                .track_perfire_worktree(&registered_owner, &new_pane, dir)
+                .await;
         }
     }
 
@@ -1193,12 +1954,13 @@ async fn revive_and_inject(
                 Some(r) => format!("{prompt}\n\n{r}"),
                 None => prompt.clone(),
             };
-            crate::nostr_transport::schedule_prompt_injection(
+            crate::nostr_transport::schedule_prompt_injection_owned(
                 state,
                 task.session_name(),
                 new_pane.clone(),
                 full_text,
                 scheduled_prompt_backend_session_id,
+                registered_owner.clone(),
             );
         }
     }
@@ -1209,6 +1971,7 @@ async fn revive_and_inject(
 /// Undo a definite post-registration launch failure only while this invocation
 /// still owns the staged pane and credential. A SessionStart hook that already
 /// consumed the credential has committed a newer binding and must win.
+#[cfg(test)]
 async fn rollback_provisional_revival(
     state: &SharedState,
     session_id: &str,
@@ -1231,12 +1994,13 @@ async fn rollback_provisional_revival(
 /// Invert a StageFreshLaunch only while its exact incarnation remains pending.
 /// A SessionStart hook consumes the credential, so a concurrently bound thread
 /// cannot satisfy this guard and always wins over the failed launch.
+#[cfg(test)]
 async fn rollback_staged_fresh_launch(
     state: &SharedState,
     session_id: &str,
     pane_id: &str,
     credential: &str,
-    staged_incarnation: i64,
+    staged_incarnation: crate::daemon_protocol::SessionIncarnation,
     previous: &crate::daemon_protocol::SessionEntry,
 ) {
     state
@@ -1834,6 +2598,129 @@ mod tests {
         assert_eq!(metadata.session_incarnation, staged_incarnation);
         assert_eq!(metadata.backend_session_id.as_deref(), Some("thread-new"));
         assert!(metadata.session_start_credential.is_none());
+    }
+
+    #[tokio::test]
+    async fn scheduled_liveness_result_rejects_same_pane_replacement() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "scheduled".into(),
+                pane: Some("%same".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        let stale_owner = state.protocol.read().await.sessions["scheduled"].owner();
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "scheduled".into(),
+                pane: Some("%same".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+
+        assert!(
+            !scheduled_snapshot_is_current(&state, &stale_owner, Some("%same")).await,
+            "a liveness observation for an old incarnation must not authorize injection or revival"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_revival_cannot_claim_replacement_from_stale_snapshot() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "scheduled".into(),
+                pane: Some("%old".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_old".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let stale_owner = state.protocol.read().await.sessions["scheduled"].owner();
+
+        {
+            let mut proto = state.protocol.write().await;
+            proto.apply(crate::daemon_protocol::Event::Remove {
+                id: "scheduled".into(),
+                keep_worktree: true,
+            });
+            proto.apply(crate::daemon_protocol::Event::Register {
+                id: "scheduled".into(),
+                pane: Some("%winner".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_winner".into()),
+                    ..Default::default()
+                },
+            });
+        }
+        let winner = state.protocol.read().await.sessions["scheduled"].clone();
+
+        let claimed =
+            claim_scheduled_existing_launch(&state, &stale_owner, "opencode", false, None).await;
+
+        assert!(claimed.is_err());
+        let proto = state.protocol.read().await;
+        assert_eq!(proto.sessions["scheduled"], winner);
+        assert!(
+            !proto.lifecycle_leases.contains_key("scheduled"),
+            "a stale scheduler snapshot must not retain lifecycle authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_same_pane_respawn_cleans_target_before_restoring_incumbent() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "scheduled".into(),
+                pane: Some("%same".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    backend_session_id: Some("thread-old".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let incumbent = state.protocol.read().await.sessions["scheduled"].clone();
+        let claim = claim_scheduled_existing_launch(
+            &state,
+            &incumbent.owner(),
+            "codex-cli",
+            true,
+            Some("proof".into()),
+        )
+        .await
+        .unwrap();
+        state
+            .record_inert_start_pane(
+                &claim.lease_owner,
+                claim.target_owner.clone(),
+                "%same".into(),
+            )
+            .await
+            .unwrap();
+        let cleaned = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cleaned_in_action = cleaned.clone();
+        let expected_target = claim.target_owner.clone();
+
+        rollback_scheduled_respawn_claim_with(&state, &claim, "%same", move |owner, pane| {
+            assert_eq!(owner, expected_target);
+            assert_eq!(pane, "%same");
+            cleaned_in_action.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(cleaned.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let proto = state.protocol.read().await;
+        assert_eq!(proto.sessions["scheduled"], incumbent);
+        assert!(!proto.lifecycle_leases.contains_key("scheduled"));
     }
 
     #[tokio::test]

@@ -85,6 +85,38 @@ session_field() {
         '.sessions[] | select(.id == $id) | .[$f] // ""'
 }
 
+persisted_session_incarnation() {
+    local sid="$1"
+    jq -er --arg id "$sid" \
+        '.sessions[] | select(.id == $id) | .metadata.session_incarnation' \
+        /tmp/ouija-test/sessions.json
+}
+
+persisted_session_launch_completed() {
+    local sid="$1"
+    local incarnation pane pane_pid physical_session physical_incarnation
+    jq -e --arg id "$sid" '
+        (.sessions[] | select(.id == $id)) as $session
+        | ($session.pane | type == "string")
+          and (.lifecycle_leases[$id] == null)
+    ' /tmp/ouija-test/sessions.json >/dev/null
+    incarnation=$(persisted_session_incarnation "$sid")
+    pane=$(jq -er --arg id "$sid" '.sessions[] | select(.id == $id) | .pane' /tmp/ouija-test/sessions.json)
+    pane_pid=$(tmux display-message -t "$pane" -p '#{pane_pid}') || return 1
+    [ -n "$pane_pid" ] && [ -r "/proc/$pane_pid/environ" ] || return 1
+    physical_session=$(tr '\0' '\n' <"/proc/$pane_pid/environ" | sed -n 's/^OUIJA_SESSION_ID=//p')
+    physical_incarnation=$(tr '\0' '\n' <"/proc/$pane_pid/environ" | sed -n 's/^OUIJA_SESSION_INCARNATION=//p')
+    [ "$physical_session" = "$sid" ] && [ "$physical_incarnation" = "$incarnation" ]
+}
+
+persisted_session_restart_completed() {
+    local sid="$1" previous_incarnation="$2"
+    local incarnation
+    incarnation=$(persisted_session_incarnation "$sid")
+    [ "$incarnation" != "$previous_incarnation" ] &&
+        persisted_session_launch_completed "$sid"
+}
+
 remote_session_ids() {
     api "$1" GET /api/status | jq -r '[.sessions[] | select(.origin == "remote") | .id] | join(" ")'
 }
@@ -182,7 +214,7 @@ find_script() {
 }
 
 # ── Export helpers for use in bash -c subshells (e.g. wait_for) ────
-export -f api session_ids session_count session_field remote_session_ids transport_names
+export -f api session_ids session_count session_field persisted_session_incarnation persisted_session_launch_completed persisted_session_restart_completed remote_session_ids transport_names
 
 # ── Results ─────────────────────────────────────────────────────────
 print_results() {

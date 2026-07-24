@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use anyhow::Result;
@@ -30,7 +30,7 @@ fn save_json<T: Serialize>(path: &Path, value: &T, pretty: bool) -> Result<()> {
 }
 
 /// On-disk representation of a local session for restart recovery.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PersistedSession {
     pub id: String,
     pub pane: Option<String>,
@@ -38,6 +38,102 @@ pub struct PersistedSession {
     #[serde(default = "Utc::now")]
     pub last_activity_at: DateTime<Utc>,
     pub metadata: SessionMetadata,
+}
+
+pub const SESSION_STATE_VERSION: u32 = 1;
+
+/// Versioned atomic snapshot of local sessions and lifecycle authority.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PersistedLifecycleState {
+    pub version: u32,
+    pub sessions: Vec<PersistedSession>,
+    #[serde(default)]
+    pub incarnation_high_water: crate::daemon_protocol::SessionIncarnation,
+    #[serde(default)]
+    pub lifecycle_leases: BTreeMap<String, crate::daemon_protocol::LifecycleLease>,
+}
+
+impl Default for PersistedLifecycleState {
+    fn default() -> Self {
+        Self {
+            version: SESSION_STATE_VERSION,
+            sessions: Vec::new(),
+            incarnation_high_water: Default::default(),
+            lifecycle_leases: BTreeMap::new(),
+        }
+    }
+}
+
+impl PersistedLifecycleState {
+    pub fn new(
+        sessions: Vec<PersistedSession>,
+        incarnation_high_water: crate::daemon_protocol::SessionIncarnation,
+        lifecycle_leases: BTreeMap<String, crate::daemon_protocol::LifecycleLease>,
+    ) -> Self {
+        Self {
+            version: SESSION_STATE_VERSION,
+            sessions,
+            incarnation_high_water,
+            lifecycle_leases,
+        }
+        .normalized()
+    }
+
+    fn normalized(mut self) -> Self {
+        let session_max = self
+            .sessions
+            .iter()
+            .map(|session| session.metadata.session_incarnation)
+            .max()
+            .unwrap_or_default();
+        let lease_max = self
+            .lifecycle_leases
+            .values()
+            .flat_map(|lease| {
+                std::iter::once(lease.owner.incarnation)
+                    .chain(
+                        lease
+                            .inert_pane_owner
+                            .as_ref()
+                            .map(|owner| owner.incarnation),
+                    )
+                    .chain(
+                        lease
+                            .project_dir_owner
+                            .as_ref()
+                            .map(|owner| owner.incarnation),
+                    )
+                    .chain(
+                        lease
+                            .backend_session_owner
+                            .as_ref()
+                            .map(|owner| owner.incarnation),
+                    )
+                    .chain(
+                        lease
+                            .restart_target_owner
+                            .as_ref()
+                            .map(|owner| owner.incarnation),
+                    )
+                    .chain(
+                        lease
+                            .restart_previous
+                            .as_ref()
+                            .map(|session| session.metadata.session_incarnation),
+                    )
+            })
+            .max()
+            .unwrap_or_default();
+        self.incarnation_high_water = self.incarnation_high_water.max(session_max).max(lease_max);
+        self
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PersistedLifecycleStateFile {
+    Versioned(PersistedLifecycleState),
+    Legacy(Vec<PersistedSession>),
 }
 
 impl PersistedSession {
@@ -75,8 +171,146 @@ pub struct PersistedConnection {
 /// # Errors
 ///
 /// Returns an error if the file exists but contains invalid JSON.
-pub fn load_sessions(data_dir: &Path) -> Result<Vec<PersistedSession>> {
-    load_json(&data_dir.join("sessions.json"), vec![])
+pub fn load_sessions(data_dir: &Path) -> Result<PersistedLifecycleState> {
+    let path = data_dir.join("sessions.json");
+    let data = match std::fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PersistedLifecycleState::default());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let state = match serde_json::from_str::<PersistedLifecycleStateFile>(&data)? {
+        PersistedLifecycleStateFile::Versioned(state) => {
+            if state.version != SESSION_STATE_VERSION {
+                anyhow::bail!(
+                    "unsupported sessions.json version {} (expected {})",
+                    state.version,
+                    SESSION_STATE_VERSION
+                );
+            }
+            state
+        }
+        PersistedLifecycleStateFile::Legacy(sessions) => {
+            PersistedLifecycleState::new(sessions, Default::default(), BTreeMap::new())
+        }
+    };
+    for (session_id, lease) in &state.lifecycle_leases {
+        if lease.owner.session_id != *session_id {
+            anyhow::bail!(
+                "lifecycle lease key '{}' does not match owner '{}'",
+                session_id,
+                lease.owner.session_id
+            );
+        }
+        if let Some(inert_owner) = &lease.inert_pane_owner
+            && inert_owner.session_id != *session_id
+        {
+            anyhow::bail!(
+                "lifecycle lease key '{}' does not match inert pane owner '{}'",
+                session_id,
+                inert_owner.session_id
+            );
+        }
+        if let Some(project_dir_owner) = &lease.project_dir_owner
+            && project_dir_owner.session_id != *session_id
+        {
+            anyhow::bail!(
+                "lifecycle lease key '{}' does not match project directory owner '{}'",
+                session_id,
+                project_dir_owner.session_id
+            );
+        }
+        if let Some(backend_session_owner) = &lease.backend_session_owner
+            && backend_session_owner.session_id != *session_id
+        {
+            anyhow::bail!(
+                "lifecycle lease key '{}' does not match backend session owner '{}'",
+                session_id,
+                backend_session_owner.session_id
+            );
+        }
+        if let Some(backend_session_owner) = &lease.backend_session_owner {
+            let expected_owner = match lease.phase {
+                crate::daemon_protocol::LifecyclePhase::Stopping => Some(&lease.owner),
+                crate::daemon_protocol::LifecyclePhase::Restarting => {
+                    lease.restart_target_owner.as_ref()
+                }
+                crate::daemon_protocol::LifecyclePhase::Starting => None,
+            };
+            if expected_owner != Some(backend_session_owner) {
+                anyhow::bail!(
+                    "lifecycle lease '{}' backend cleanup owner does not match its lifecycle phase",
+                    session_id
+                );
+            }
+        }
+        let backend_claim_fields = [
+            lease.backend.is_some(),
+            lease.backend_session_id.is_some(),
+            lease.backend_session_owner.is_some(),
+        ];
+        if backend_claim_fields.iter().any(|present| *present)
+            && !backend_claim_fields.iter().all(|present| *present)
+        {
+            anyhow::bail!(
+                "lifecycle lease '{}' has an incomplete backend abort claim",
+                session_id
+            );
+        }
+        if lease.backend.is_some()
+            && !matches!(
+                lease.phase,
+                crate::daemon_protocol::LifecyclePhase::Stopping
+                    | crate::daemon_protocol::LifecyclePhase::Restarting
+            )
+        {
+            anyhow::bail!(
+                "lifecycle lease '{}' has a backend cleanup claim in an invalid phase",
+                session_id
+            );
+        }
+        if lease.restart_target_owner.is_some() != lease.restart_previous.is_some() {
+            anyhow::bail!(
+                "lifecycle lease '{}' has an incomplete restart target claim",
+                session_id
+            );
+        }
+        if let (Some(target), Some(previous)) =
+            (&lease.restart_target_owner, &lease.restart_previous)
+        {
+            if lease.phase != crate::daemon_protocol::LifecyclePhase::Restarting {
+                anyhow::bail!(
+                    "non-restarting lifecycle lease '{}' has a restart target claim",
+                    session_id
+                );
+            }
+            if target.session_id != *session_id
+                || previous.id != *session_id
+                || previous.owner() != lease.owner
+                || !matches!(previous.origin, crate::daemon_protocol::Origin::Local)
+                || target.incarnation <= lease.owner.incarnation
+            {
+                anyhow::bail!(
+                    "lifecycle lease '{}' has inconsistent restart ownership",
+                    session_id
+                );
+            }
+        }
+        if lease.project_dir.is_some() != lease.project_dir_owner.is_some() {
+            anyhow::bail!(
+                "lifecycle lease '{}' has an incomplete project directory claim",
+                session_id
+            );
+        }
+        if lease.project_dir_cleanup_on_abandon && lease.project_dir.is_none() {
+            anyhow::bail!(
+                "lifecycle lease '{}' grants cleanup without a project directory claim",
+                session_id
+            );
+        }
+    }
+    Ok(state.normalized())
 }
 
 /// Atomically write sessions to `sessions.json`.
@@ -84,8 +318,8 @@ pub fn load_sessions(data_dir: &Path) -> Result<Vec<PersistedSession>> {
 /// # Errors
 ///
 /// Returns an error if serialization or file I/O fails.
-pub fn save_sessions(data_dir: &Path, sessions: &[PersistedSession]) -> Result<()> {
-    save_json(&data_dir.join("sessions.json"), &sessions, false)
+pub fn save_sessions(data_dir: &Path, state: &PersistedLifecycleState) -> Result<()> {
+    save_json(&data_dir.join("sessions.json"), state, false)
 }
 
 // --- Connections ---
@@ -384,19 +618,248 @@ mod tests {
                 },
             },
         ];
-        save_sessions(dir.path(), &sessions).unwrap();
+        let owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "pending".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(30),
+        };
+        let state = PersistedLifecycleState::new(
+            sessions,
+            crate::daemon_protocol::SessionIncarnation(31),
+            BTreeMap::from([(
+                owner.session_id.clone(),
+                crate::daemon_protocol::LifecycleLease {
+                    owner: owner.clone(),
+                    phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                    backend: None,
+                    backend_session_id: None,
+                    backend_session_owner: None,
+                    restart_target_owner: None,
+                    restart_previous: None,
+                    project_dir: None,
+                    project_dir_owner: None,
+                    project_dir_cleanup_on_abandon: false,
+                    inert_pane: Some("%42".into()),
+                    inert_pane_owner: Some(owner.clone()),
+                },
+            )]),
+        );
+        save_sessions(dir.path(), &state).unwrap();
         let loaded = load_sessions(dir.path()).unwrap();
-        assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded[0].id, "a");
-        assert_eq!(loaded[1].id, "b");
-        assert!(loaded[1].metadata.vim_mode);
-        assert_eq!(loaded[1].metadata.project_dir.as_deref(), Some("/tmp"));
+        assert_eq!(loaded.version, SESSION_STATE_VERSION);
+        assert_eq!(
+            loaded.incarnation_high_water,
+            crate::daemon_protocol::SessionIncarnation(31)
+        );
+        assert_eq!(loaded.lifecycle_leases["pending"].owner, owner);
+        assert_eq!(
+            loaded.lifecycle_leases["pending"].inert_pane.as_deref(),
+            Some("%42")
+        );
+        assert_eq!(
+            loaded.lifecycle_leases["pending"].inert_pane_owner.as_ref(),
+            Some(&owner)
+        );
+        assert_eq!(loaded.sessions.len(), 2);
+        assert_eq!(loaded.sessions[0].id, "a");
+        assert_eq!(loaded.sessions[1].id, "b");
+        assert!(loaded.sessions[1].metadata.vim_mode);
+        assert_eq!(
+            loaded.sessions[1].metadata.project_dir.as_deref(),
+            Some("/tmp")
+        );
+    }
+
+    #[test]
+    fn load_sessions_migrates_legacy_array_and_derives_high_water() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = vec![PersistedSession {
+            id: "legacy".into(),
+            pane: Some("%9".into()),
+            registered_at: Utc::now(),
+            last_activity_at: Utc::now(),
+            metadata: SessionMetadata {
+                session_incarnation: crate::daemon_protocol::SessionIncarnation(17),
+                ..Default::default()
+            },
+        }];
+        std::fs::write(
+            dir.path().join("sessions.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_sessions(dir.path()).unwrap();
+
+        assert_eq!(loaded.sessions.len(), 1);
+        assert_eq!(loaded.sessions[0].id, "legacy");
+        assert_eq!(
+            loaded.incarnation_high_water,
+            crate::daemon_protocol::SessionIncarnation(17)
+        );
+        assert!(loaded.lifecycle_leases.is_empty());
+    }
+
+    #[test]
+    fn restart_lease_round_trip_advances_high_water_through_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let incumbent = crate::daemon_protocol::ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(5),
+        };
+        let target = crate::daemon_protocol::ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(9),
+        };
+        let previous = crate::daemon_protocol::SessionEntry {
+            id: "worker".into(),
+            pane: Some("%2".into()),
+            metadata: crate::daemon_protocol::SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_incumbent".into()),
+                session_incarnation: incumbent.incarnation,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let state = PersistedLifecycleState::new(
+            vec![],
+            incumbent.incarnation,
+            BTreeMap::from([(
+                "worker".into(),
+                crate::daemon_protocol::LifecycleLease {
+                    owner: incumbent.clone(),
+                    phase: crate::daemon_protocol::LifecyclePhase::Restarting,
+                    backend: None,
+                    backend_session_id: None,
+                    backend_session_owner: None,
+                    restart_target_owner: Some(target.clone()),
+                    restart_previous: Some(Box::new(previous.clone())),
+                    project_dir: None,
+                    project_dir_owner: None,
+                    project_dir_cleanup_on_abandon: false,
+                    inert_pane: None,
+                    inert_pane_owner: None,
+                },
+            )]),
+        );
+
+        save_sessions(dir.path(), &state).unwrap();
+        let loaded = load_sessions(dir.path()).unwrap();
+
+        assert_eq!(loaded.incarnation_high_water, target.incarnation);
+        assert_eq!(
+            loaded.lifecycle_leases["worker"]
+                .restart_target_owner
+                .as_ref(),
+            Some(&target)
+        );
+        assert_eq!(
+            loaded.lifecycle_leases["worker"]
+                .restart_previous
+                .as_deref(),
+            Some(&previous)
+        );
+    }
+
+    #[test]
+    fn load_sessions_rejects_mismatched_lease_owner_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = PersistedLifecycleState {
+            version: SESSION_STATE_VERSION,
+            sessions: vec![],
+            incarnation_high_water: crate::daemon_protocol::SessionIncarnation(5),
+            lifecycle_leases: BTreeMap::from([(
+                "wrong-key".into(),
+                crate::daemon_protocol::LifecycleLease {
+                    owner: crate::daemon_protocol::ResourceOwner {
+                        session_id: "actual-owner".into(),
+                        incarnation: crate::daemon_protocol::SessionIncarnation(5),
+                    },
+                    phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                    backend: None,
+                    backend_session_id: None,
+                    backend_session_owner: None,
+                    restart_target_owner: None,
+                    restart_previous: None,
+                    project_dir: None,
+                    project_dir_owner: None,
+                    project_dir_cleanup_on_abandon: false,
+                    inert_pane: None,
+                    inert_pane_owner: None,
+                },
+            )]),
+        };
+        std::fs::write(
+            dir.path().join("sessions.json"),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        assert!(load_sessions(dir.path()).is_err());
+    }
+
+    #[test]
+    fn load_sessions_rejects_mismatched_inert_pane_owner_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = PersistedLifecycleState {
+            version: SESSION_STATE_VERSION,
+            sessions: vec![],
+            incarnation_high_water: crate::daemon_protocol::SessionIncarnation(6),
+            lifecycle_leases: BTreeMap::from([(
+                "pending".into(),
+                crate::daemon_protocol::LifecycleLease {
+                    owner: crate::daemon_protocol::ResourceOwner {
+                        session_id: "pending".into(),
+                        incarnation: crate::daemon_protocol::SessionIncarnation(5),
+                    },
+                    phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                    backend: None,
+                    backend_session_id: None,
+                    backend_session_owner: None,
+                    restart_target_owner: None,
+                    restart_previous: None,
+                    project_dir: None,
+                    project_dir_owner: None,
+                    project_dir_cleanup_on_abandon: false,
+                    inert_pane: Some("%1".into()),
+                    inert_pane_owner: Some(crate::daemon_protocol::ResourceOwner {
+                        session_id: "other".into(),
+                        incarnation: crate::daemon_protocol::SessionIncarnation(6),
+                    }),
+                },
+            )]),
+        };
+        std::fs::write(
+            dir.path().join("sessions.json"),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        assert!(load_sessions(dir.path()).is_err());
+    }
+
+    #[test]
+    fn load_sessions_rejects_unsupported_envelope_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = serde_json::json!({
+            "version": SESSION_STATE_VERSION + 1,
+            "sessions": [],
+            "incarnation_high_water": 0,
+            "lifecycle_leases": {}
+        });
+        std::fs::write(
+            dir.path().join("sessions.json"),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        assert!(load_sessions(dir.path()).is_err());
     }
 
     #[test]
     fn load_sessions_missing_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(load_sessions(dir.path()).unwrap().is_empty());
+        assert!(load_sessions(dir.path()).unwrap().sessions.is_empty());
     }
 
     #[test]

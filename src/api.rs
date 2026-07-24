@@ -681,6 +681,7 @@ pub async fn register(
         crate::daemon_protocol::Effect::RegisterOk {
             session_id,
             replaced,
+            ..
         } => Some((session_id.clone(), replaced.clone())),
         _ => None,
     }) {
@@ -796,12 +797,17 @@ pub async fn send_msg(
             );
         }
     }
-    if state.is_soft_restart_in_progress(&body.to) {
+    let restart_in_progress = state
+        .protocol
+        .read()
+        .await
+        .lifecycle_leases
+        .get(&body.to)
+        .is_some_and(|lease| lease.phase == crate::daemon_protocol::LifecyclePhase::Restarting);
+    if restart_in_progress {
         return (
             StatusCode::CONFLICT,
-            Json(
-                json!({ "error": format!("soft restart is in progress for session '{}'", body.to) }),
-            ),
+            Json(json!({ "error": format!("restart is in progress for session '{}'", body.to) })),
         );
     }
     let from = body.from.clone();
@@ -2515,7 +2521,13 @@ pub async fn kill_session(
     } else {
         crate::nostr_transport::kill_session(&state, &body.name).await
     };
-    (StatusCode::OK, Json(json!({ "result": result })))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "result": result.message,
+            "outcome": result.outcome,
+        })),
+    )
 }
 
 /// Prune stale sessions whose worktree is missing.
@@ -2527,7 +2539,7 @@ pub async fn prune_stale_sessions(
     State(state): State<SharedState>,
     Json(body): Json<PruneStaleBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let stale_sessions: Vec<(String, String)> = {
+    let stale_sessions: Vec<(crate::daemon_protocol::ResourceOwner, String)> = {
         let proto = state.protocol.read().await;
         proto
             .sessions
@@ -2540,7 +2552,7 @@ pub async fn prune_stale_sessions(
                 s.metadata
                     .project_dir
                     .as_ref()
-                    .map(|d| (s.id.clone(), d.clone()))
+                    .map(|d| (s.owner(), d.clone()))
             })
             .collect()
     };
@@ -2548,7 +2560,7 @@ pub async fn prune_stale_sessions(
         return (
             StatusCode::OK,
             Json(
-                json!({ "dry_run": true, "would_prune": stale_sessions.iter().map(|(id, _)| id).cloned().collect::<Vec<_>>() }),
+                json!({ "dry_run": true, "would_prune": stale_sessions.iter().map(|(owner, _)| owner.session_id.clone()).collect::<Vec<_>>() }),
             ),
         );
     }
@@ -2558,7 +2570,10 @@ pub async fn prune_stale_sessions(
     // Single batched apply: the handler runs each session's RemoveIfStale guard
     // under one write lock and coalesces Persist + BroadcastSessionList into
     // one of each, rather than N full state writes for N stale sessions.
-    let input_ids: Vec<String> = stale_sessions.iter().map(|(id, _)| id.clone()).collect();
+    let input_ids: Vec<String> = stale_sessions
+        .iter()
+        .map(|(owner, _)| owner.session_id.clone())
+        .collect();
     let effects = state
         .apply_and_execute(crate::daemon_protocol::Event::PruneStale {
             sessions: stale_sessions,
@@ -2657,18 +2672,70 @@ pub async fn start_session(
         return response;
     }
 
-    // Return 202 immediately — all work (registration + boot) happens in background.
+    // Decide start ownership before returning or spawning any directory,
+    // worktree, tmux, process, or network work. A second same-ID request sees
+    // the durable lease and cannot reach the backend launch boundary.
+    let disposition =
+        match crate::nostr_transport::reserve_start_for_launch(&state, &body.name).await {
+            Ok(disposition) => disposition,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": format!(
+                            "failed to reserve session '{}' for launch: {error}",
+                            body.name
+                        )
+                    })),
+                );
+            }
+        };
+    let (existing_owner, reserved_owner) = match disposition {
+        crate::daemon_protocol::StartDisposition::Reserved(owner) => (None, Some(owner)),
+        crate::daemon_protocol::StartDisposition::Existing(owner) => {
+            match state.claim_existing_start(&owner).await {
+                Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {
+                    (Some(owner), None)
+                }
+                Ok(_) => {
+                    return (
+                        StatusCode::ACCEPTED,
+                        Json(json!({
+                            "session": body.name,
+                            "status": "start_in_progress"
+                        })),
+                    );
+                }
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "error": format!(
+                                "failed to claim existing session '{}' for restart: {error}",
+                                body.name
+                            )
+                        })),
+                    );
+                }
+            }
+        }
+        crate::daemon_protocol::StartDisposition::InProgress(_) => {
+            return (
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "session": body.name,
+                    "status": "start_in_progress"
+                })),
+            );
+        }
+    };
+
+    // Return 202 immediately — all boot work happens in background.
     let name = body.name.clone();
     let state2 = state.clone();
     tokio::spawn(async move {
         // If session already exists, restart with fresh context instead of failing.
-        let exists = state2
-            .protocol
-            .read()
-            .await
-            .sessions
-            .contains_key(&body.name);
-        if exists {
+        if let Some(existing_owner) = existing_owner {
             tracing::info!(
                 "session '{}' exists, restarting with fresh context",
                 body.name
@@ -2676,8 +2743,9 @@ pub async fn start_session(
             if let Some(msg) = restart_drops_destructive_intent(&body) {
                 tracing::warn!("{msg}");
             }
-            let (_result, _msg_id, _) = crate::nostr_transport::restart_session(
+            let (_result, _msg_id, _) = crate::nostr_transport::restart_session_for_start(
                 &state2,
+                &existing_owner,
                 &body.name,
                 true, // fresh
                 None,
@@ -2717,6 +2785,7 @@ pub async fn start_session(
             body.branch.as_deref(),
             body.base_branch.as_deref(),
             body.force_reset.unwrap_or(false),
+            reserved_owner,
         )
         .await;
 
@@ -2950,10 +3019,14 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
     let pane_id = pending.pane_id.clone();
     let prompt = pending.prompt.clone();
 
-    let (pane_still_registered, backend_session_matches, http_delivery) = {
+    let (owner_matches, pane_still_registered, backend_session_matches, http_delivery) = {
         let proto = state.protocol.read().await;
         match proto.sessions.get(session_name) {
             Some(session) => (
+                pending
+                    .owner
+                    .as_ref()
+                    .is_none_or(|owner| session.owner() == *owner),
                 session.pane.as_deref() == Some(pane_id.as_str()),
                 pending
                     .backend_session_id
@@ -2967,9 +3040,15 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
                     .then(|| session.metadata.http_delivery_snapshot())
                     .flatten(),
             ),
-            None => (false, false, None),
+            None => (false, false, false, None),
         }
     };
+    if !owner_matches {
+        tracing::info!(
+            "readiness prompt delivery discarded for {session_name}: queued incarnation was superseded"
+        );
+        return false;
+    }
     if !pane_still_registered {
         restore_pending_prompt_if_absent(state, session_name, pending);
         tracing::warn!(
@@ -2987,16 +3066,18 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
 
     let used_http_delivery = http_delivery.is_some();
     let result = match http_delivery {
-        Some(delivery) => match deliver_http_message_outcome(state, &delivery, &prompt).await {
-            crate::state::DeliveryOutcome::Accepted => Ok(()),
-            crate::state::DeliveryOutcome::Ambiguous(_) => {
-                tracing::warn!(
-                    "readiness prompt HTTP delivery failed ambiguously for {session_name}; not retrying via raw tmux"
-                );
-                return false;
+        Some(delivery) => {
+            match deliver_pending_prompt_http_outcome(state, &pending, &delivery, &prompt).await {
+                crate::state::DeliveryOutcome::Accepted => Ok(()),
+                crate::state::DeliveryOutcome::Ambiguous(_) => {
+                    tracing::warn!(
+                        "readiness prompt HTTP delivery failed ambiguously for {session_name}; not retrying via raw tmux"
+                    );
+                    return false;
+                }
+                crate::state::DeliveryOutcome::Rejected(reason) => Err(anyhow::anyhow!(reason)),
             }
-            crate::state::DeliveryOutcome::Rejected(reason) => Err(anyhow::anyhow!(reason)),
-        },
+        }
         None => {
             deliver_pending_prompt_via_raw_tmux(
                 state,
@@ -3004,10 +3085,28 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
                 &pane_id,
                 &prompt,
                 pending.backend_session_id.as_deref(),
+                pending.owner.as_ref(),
             )
             .await
         }
     };
+    if result.is_err()
+        && let Some(owner) = pending.owner.as_ref()
+    {
+        let owner_is_current = state
+            .protocol
+            .read()
+            .await
+            .sessions
+            .get(session_name)
+            .is_some_and(|session| session.owner() == *owner);
+        if !owner_is_current {
+            tracing::info!(
+                "readiness prompt delivery discarded for {session_name}: queued incarnation was superseded during delivery"
+            );
+            return false;
+        }
+    }
 
     match result {
         Ok(()) => {
@@ -3024,6 +3123,7 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
                 &pane_id,
                 &prompt,
                 pending.backend_session_id.as_deref(),
+                pending.owner.as_ref(),
             )
             .await
             {
@@ -3050,6 +3150,30 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
             false
         }
     }
+}
+
+async fn deliver_pending_prompt_http_outcome(
+    state: &SharedState,
+    pending: &crate::state::PendingPrompt,
+    delivery: &crate::daemon_protocol::HttpDeliverySnapshot,
+    prompt: &str,
+) -> crate::state::DeliveryOutcome {
+    let (Some(owner), Some(backend_session_id)) = (
+        pending.owner.as_ref(),
+        pending.backend_session_id.as_deref(),
+    ) else {
+        return deliver_http_message_outcome(state, delivery, prompt).await;
+    };
+    state
+        .with_owned_backend_claim(owner, backend_session_id, || async {
+            deliver_http_message_outcome(state, delivery, prompt).await
+        })
+        .await
+        .unwrap_or_else(|| {
+            crate::state::DeliveryOutcome::Rejected(
+                "queued restart incarnation was superseded before readiness delivery".into(),
+            )
+        })
 }
 
 #[cfg(test)]
@@ -3092,6 +3216,7 @@ fn schedule_pending_prompt_retry_attempt(
             &pending.pane_id,
             &pending.prompt,
             pending.backend_session_id.as_deref(),
+            pending.owner.as_ref(),
         )
         .await
         {
@@ -3133,6 +3258,43 @@ fn reserve_pending_prompt_if_matches(
 }
 
 async fn deliver_pending_prompt_via_raw_tmux(
+    state: &SharedState,
+    session_name: &str,
+    pane_id: &str,
+    prompt: &str,
+    expected_backend_session_id: Option<&str>,
+    expected_owner: Option<&crate::daemon_protocol::ResourceOwner>,
+) -> anyhow::Result<()> {
+    if let Some(owner) = expected_owner {
+        return state
+            .with_owned_pane_claim(owner, pane_id, || async {
+                deliver_pending_prompt_via_raw_tmux_unchecked(
+                    state,
+                    session_name,
+                    pane_id,
+                    prompt,
+                    expected_backend_session_id,
+                )
+                .await
+            })
+            .await
+            .unwrap_or_else(|| {
+                Err(anyhow::anyhow!(
+                    "readiness prompt fallback skipped: queued incarnation is no longer current for session {session_name}"
+                ))
+            });
+    }
+    deliver_pending_prompt_via_raw_tmux_unchecked(
+        state,
+        session_name,
+        pane_id,
+        prompt,
+        expected_backend_session_id,
+    )
+    .await
+}
+
+async fn deliver_pending_prompt_via_raw_tmux_unchecked(
     state: &SharedState,
     session_name: &str,
     pane_id: &str,
@@ -3330,15 +3492,14 @@ pub async fn bind_backend_identity(
         );
     };
 
-    let result = {
-        let mut protocol = state.protocol.write().await;
-        protocol.bind_backend_identity(&body.target_session_id, &identity, Some(launch_credential))
-    };
-    // Bind mutates only under the protocol lock. Persistence/broadcast effects
-    // run afterward, matching AppState::apply_and_execute's lock discipline.
-    if !result.effects.is_empty() {
-        state.execute_effects(&result.effects).await;
-    }
+    let result = state
+        .bind_backend_identity(
+            &body.target_session_id,
+            &identity,
+            Some(launch_credential),
+            None,
+        )
+        .await;
     match result.outcome {
         crate::daemon_protocol::BackendIdentityBindOutcome::Bound { session_id } => (
             StatusCode::OK,
@@ -3381,6 +3542,13 @@ pub async fn bind_backend_identity(
             Json(json!({
                 "outcome": "target_already_bound",
                 "error": "target is already bound to a different backend identity; use an explicit fresh managed repair"
+            })),
+        ),
+        crate::daemon_protocol::BackendIdentityBindOutcome::LifecycleInProgress { .. } => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "outcome": "lifecycle_in_progress",
+                "error": "target session has a lifecycle operation in progress"
             })),
         ),
         crate::daemon_protocol::BackendIdentityBindOutcome::CredentialExpired => (
@@ -3680,6 +3848,11 @@ struct BackendSessionReadyHints {
     pane: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::daemon_protocol::deserialize_optional_incarnation"
+    )]
+    session_incarnation: Option<crate::daemon_protocol::SessionIncarnation>,
 }
 
 #[cfg(test)]
@@ -3703,10 +3876,27 @@ async fn backend_session_ready_inner_with_hints(
     // Step 1: direct lookup. This runs FIRST regardless of hints — hub-
     // spawned and previously-adopted sessions must win over any hint-derived
     // id, or a stale plugin cwd could shadow the real session.
-    let resolution = {
+    let (resolution, hinted_owner_matches) = {
         let proto = state.protocol.read().await;
-        resolve_opencode_backend_identity(&proto, &backend_sid)
+        let resolution = resolve_opencode_backend_identity(&proto, &backend_sid);
+        let hinted_owner_matches = hints.session_incarnation.is_none_or(|expected| {
+            matches!(
+                &resolution,
+                crate::daemon_protocol::BackendIdentityResolution::Resolved { session_id }
+                    if proto.sessions.get(session_id).is_some_and(|session| {
+                        session.metadata.session_incarnation == expected
+                    })
+            )
+        });
+        (resolution, hinted_owner_matches)
     };
+    if !hinted_owner_matches {
+        return json!({
+            "delivered": false,
+            "outcome": "superseded",
+            "error": "backend readiness belongs to a replaced session incarnation",
+        });
+    }
     let name = match resolution {
         crate::daemon_protocol::BackendIdentityResolution::Resolved { session_id } => {
             let n = session_id;
@@ -3829,6 +4019,24 @@ async fn backend_session_ready_inner_with_hints(
         }
     };
 
+    let current_incarnation = state
+        .protocol
+        .read()
+        .await
+        .sessions
+        .get(&name)
+        .map(|session| session.metadata.session_incarnation);
+    if hints
+        .session_incarnation
+        .is_some_and(|expected| current_incarnation != Some(expected))
+    {
+        return json!({
+            "delivered": false,
+            "outcome": "superseded",
+            "error": "backend readiness belongs to a replaced session incarnation",
+        });
+    }
+
     let delivered = deliver_pending_prompt(state, &name).await;
     tracing::info!(
         target: "ouija::api::backend_session_ready",
@@ -3837,7 +4045,11 @@ async fn backend_session_ready_inner_with_hints(
         delivered,
         "backend session ready complete"
     );
-    json!({"delivered": delivered, "session": name})
+    json!({
+        "delivered": delivered,
+        "session": name,
+        "session_incarnation": current_incarnation.map(|incarnation| incarnation.to_string()),
+    })
 }
 
 fn validate_backend_session_id_boundary(backend_sid: &str) -> Option<String> {
@@ -4414,7 +4626,7 @@ struct OpenCodeAdoptionCandidate {
     backend: Option<String>,
     backend_session_id: Option<String>,
     session_start_credential: Option<String>,
-    incarnation: i64,
+    incarnation: crate::daemon_protocol::SessionIncarnation,
 }
 
 /// Bind an uncredentialed OpenCode identity only if the exact candidate that
@@ -4425,35 +4637,29 @@ async fn commit_opencode_adoption_if_unchanged(
     candidate: OpenCodeAdoptionCandidate,
     backend_sid: &str,
 ) -> Option<String> {
-    let effects = {
-        let mut proto = state.protocol.write().await;
-        let unchanged = proto
-            .sessions
-            .get(&candidate.session_id)
-            .is_some_and(|session| {
-                matches!(session.origin, crate::daemon_protocol::Origin::Local)
-                    && session.metadata.backend == candidate.backend
-                    && session.metadata.backend_session_id == candidate.backend_session_id
-                    && session.metadata.session_start_credential
-                        == candidate.session_start_credential
-                    && session.metadata.session_incarnation == candidate.incarnation
-            });
-        if unchanged {
-            proto.apply(crate::daemon_protocol::Event::AdoptBackend {
-                id: candidate.session_id.clone(),
-                backend: "opencode".into(),
-                backend_session_id: backend_sid.to_string(),
-                expected_backend_session_id: candidate.backend_session_id.clone(),
-                expected_session_start_credential: candidate.session_start_credential.clone(),
-            })
-        } else {
-            vec![]
-        }
+    let owner = crate::daemon_protocol::ResourceOwner {
+        session_id: candidate.session_id.clone(),
+        incarnation: candidate.incarnation,
     };
+    let event = crate::daemon_protocol::Event::AdoptBackend {
+        id: candidate.session_id.clone(),
+        backend: "opencode".into(),
+        backend_session_id: backend_sid.to_string(),
+        expected_backend_session_id: candidate.backend_session_id.clone(),
+        expected_session_start_credential: candidate.session_start_credential.clone(),
+    };
+    let effects = state
+        .apply_owned_event_if(&owner, event, |session| {
+            matches!(session.origin, crate::daemon_protocol::Origin::Local)
+                && session.metadata.backend == candidate.backend
+                && session.metadata.backend_session_id == candidate.backend_session_id
+                && session.metadata.session_start_credential == candidate.session_start_credential
+                && session.metadata.session_incarnation == candidate.incarnation
+        })
+        .await;
     if effects.is_empty() {
         return None;
     }
-    state.execute_effects(&effects).await;
     let proto = state.protocol.read().await;
     matches!(
         resolve_opencode_backend_identity(&proto, backend_sid),
@@ -5055,6 +5261,131 @@ mod tests {
         .await;
 
         assert_unknown_backend_response(status, &body);
+    }
+
+    #[tokio::test]
+    async fn start_session_does_not_spawn_when_same_id_lease_is_in_progress() {
+        let state = crate::state::AppState::new_for_test();
+        let reserved = state.reserve_start("same-id").await.unwrap();
+        assert!(matches!(
+            reserved,
+            crate::daemon_protocol::StartDisposition::Reserved(_)
+        ));
+
+        let (status, Json(body)) = start_session(
+            State(state.clone()),
+            Json(SessionNameBody {
+                name: "same-id".into(),
+                fresh: None,
+                worktree: None,
+                project_dir: None,
+                prompt: None,
+                from: None,
+                backend: None,
+                model: None,
+                effort: None,
+                reminder: None,
+                parent_session: None,
+                no_parent_session: Some(true),
+                idle_policy: Some(crate::daemon_protocol::IdlePolicy::KeepOpen),
+                branch: None,
+                base_branch: None,
+                keep_worktree: None,
+                force_reset: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["status"], "start_in_progress");
+        assert!(state.protocol.read().await.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn kill_session_response_exposes_typed_outcome() {
+        let state = crate::state::AppState::new_for_test();
+
+        let (status, Json(body)) = kill_session(
+            State(state),
+            Json(SessionNameBody {
+                name: "missing".into(),
+                fresh: None,
+                worktree: None,
+                project_dir: None,
+                prompt: None,
+                from: None,
+                backend: None,
+                model: None,
+                effort: None,
+                reminder: None,
+                parent_session: None,
+                no_parent_session: None,
+                idle_policy: None,
+                branch: None,
+                base_branch: None,
+                keep_worktree: None,
+                force_reset: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["outcome"], "failed");
+        assert_eq!(body["result"], "session 'missing' not found");
+    }
+
+    #[tokio::test]
+    async fn kill_session_response_reports_superseded_claim() {
+        let state = crate::state::AppState::new_for_test();
+        let owner = {
+            let mut protocol = state.protocol.write().await;
+            protocol.apply(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%2".into()),
+                metadata: Default::default(),
+            });
+            protocol.sessions["worker"].owner()
+        };
+        assert_eq!(
+            state
+                .claim_existing_stop(&owner, "%2", false)
+                .await
+                .unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+
+        let (status, Json(body)) = kill_session(
+            State(state),
+            Json(SessionNameBody {
+                name: "worker".into(),
+                fresh: None,
+                worktree: None,
+                project_dir: None,
+                prompt: None,
+                from: None,
+                backend: None,
+                model: None,
+                effort: None,
+                reminder: None,
+                parent_session: None,
+                no_parent_session: None,
+                idle_policy: None,
+                branch: None,
+                base_branch: None,
+                keep_worktree: None,
+                force_reset: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["outcome"], "superseded");
+        assert!(
+            body["result"]
+                .as_str()
+                .unwrap()
+                .contains("backend exit was superseded")
+        );
     }
 
     #[tokio::test]
@@ -5854,7 +6185,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_to_session_with_soft_restart_in_progress_returns_conflict() {
+    async fn send_to_session_with_restart_lease_returns_conflict() {
         let state = crate::state::AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -5875,9 +6206,11 @@ mod tests {
                 },
             })
             .await;
-        let _guard = state
-            .try_acquire_soft_restart_in_progress("oc-managed")
-            .expect("soft restart guard should be acquired");
+        let owner = state.protocol.read().await.sessions["oc-managed"].owner();
+        assert_eq!(
+            state.claim_existing_start(&owner).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
 
         let (status, body) = send_msg(
             State(state.clone()),
@@ -5898,7 +6231,7 @@ mod tests {
             body["error"]
                 .as_str()
                 .unwrap_or("")
-                .contains("soft restart is in progress"),
+                .contains("restart is in progress"),
             "expected in-flight restart error, got {body:?}"
         );
     }
@@ -8566,6 +8899,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backend_session_ready_rejects_stale_incarnation_hint() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "prebound".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_known".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let current = state.protocol.read().await.sessions["prebound"]
+            .metadata
+            .session_incarnation;
+
+        let response = backend_session_ready_inner_with_hints(
+            &state,
+            "ses_known".into(),
+            BackendSessionReadyHints {
+                pane: Some("%17".into()),
+                cwd: Some("/tmp/freshproject".into()),
+                session_incarnation: Some(crate::daemon_protocol::SessionIncarnation(
+                    current.0.saturating_sub(1),
+                )),
+            },
+        )
+        .await;
+
+        assert_eq!(response["outcome"], "superseded");
+        assert_eq!(response["delivered"], false);
+    }
+
+    #[tokio::test]
+    async fn stale_readiness_hint_does_not_adopt_an_unbound_candidate() {
+        use axum::Router;
+        use axum::routing::get;
+        use tokio::net::TcpListener;
+
+        async fn session_dir() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "directory": "/tmp/stale-adoption" }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_port = listener.local_addr().unwrap().port();
+        assert!(serve_port >= 320, "test listener port must be >= 320");
+        let app = Router::new().route("/session/{session_id}", get(session_dir));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: serve_port - 320,
+            data_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+            config_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "unbound".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/stale-adoption".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let response = backend_session_ready_inner_with_hints(
+            &state,
+            "ses_stale_adoption".into(),
+            BackendSessionReadyHints {
+                pane: Some("%17".into()),
+                cwd: Some("/tmp/stale-adoption".into()),
+                session_incarnation: Some(crate::daemon_protocol::SessionIncarnation(u64::MAX)),
+            },
+        )
+        .await;
+
+        assert_eq!(response["outcome"], "superseded");
+        let proto = state.protocol.read().await;
+        let candidate = &proto.sessions["unbound"];
+        assert_eq!(candidate.metadata.backend, None);
+        assert_eq!(candidate.metadata.backend_session_id, None);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_readiness_hint_does_not_auto_provision_a_session() {
+        use axum::Router;
+        use axum::routing::get;
+        use tokio::net::TcpListener;
+
+        async fn session_dir() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "directory": "/tmp/stale-provision" }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_port = listener.local_addr().unwrap().port();
+        assert!(serve_port >= 320, "test listener port must be >= 320");
+        let app = Router::new().route("/session/{session_id}", get(session_dir));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: serve_port - 320,
+            data_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+            config_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+        });
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/stale-provision", "%31")];
+
+        let response = backend_session_ready_inner_with_hints(
+            &state,
+            "ses_stale_provision".into(),
+            BackendSessionReadyHints {
+                pane: Some("%31".into()),
+                cwd: Some("/tmp/stale-provision".into()),
+                session_incarnation: Some(crate::daemon_protocol::SessionIncarnation(u64::MAX)),
+            },
+        )
+        .await;
+
+        assert_eq!(response["outcome"], "superseded");
+        assert!(
+            state.protocol.read().await.sessions.is_empty(),
+            "stale readiness must fail before auto-provision mutates state"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn backend_session_ready_does_not_match_a_different_backend_with_same_native_id() {
         let state = crate::state::AppState::new_for_test();
         state
@@ -8628,6 +9095,7 @@ mod tests {
         let hints = BackendSessionReadyHints {
             pane: Some("%31".into()),
             cwd: Some("/tmp/local-project".into()),
+            session_incarnation: None,
         };
 
         let response =
@@ -8706,6 +9174,7 @@ mod tests {
         let hints = BackendSessionReadyHints {
             pane: Some("%31".into()),
             cwd: Some("/tmp/local-project".into()),
+            session_incarnation: None,
         };
 
         let response =
@@ -8761,6 +9230,7 @@ mod tests {
         let hints = BackendSessionReadyHints {
             pane: Some("%31".into()),
             cwd: Some("/tmp/explicit-project".into()),
+            session_incarnation: None,
         };
 
         let response =
@@ -8801,6 +9271,7 @@ mod tests {
         let hints = BackendSessionReadyHints {
             pane: Some("%31".into()),
             cwd: Some("/tmp/explicit-project".into()),
+            session_incarnation: None,
         };
 
         let response =
@@ -8838,6 +9309,7 @@ mod tests {
         let hints = BackendSessionReadyHints {
             pane: Some("%31".into()),
             cwd: None,
+            session_incarnation: None,
         };
 
         let response =
@@ -8874,6 +9346,7 @@ mod tests {
         let hints = BackendSessionReadyHints {
             pane: Some("%99".into()),
             cwd: Some("/tmp/unrelated".into()),
+            session_incarnation: None,
         };
 
         let response =

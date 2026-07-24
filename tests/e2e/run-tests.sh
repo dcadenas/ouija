@@ -280,7 +280,7 @@ assert_contains "self-send mentions yourself" "$result" 'cannot send a message t
 
 log "Test 12b: Sessions persisted to disk"
 assert_eq "sessions.json exists" "$(test -f /tmp/ouija-test/sessions.json && echo yes)" "yes"
-persisted_count=$(jq 'length' /tmp/ouija-test/sessions.json 2>/dev/null || echo 0)
+persisted_count=$(jq '.sessions | length' /tmp/ouija-test/sessions.json 2>/dev/null || echo 0)
 assert_eq "persisted session count matches" "$persisted_count" "$(session_count "$BASE")"
 
 log "Test 12c: Sessions restored after daemon restart"
@@ -570,11 +570,20 @@ api "$BASE" POST /api/sessions/kill -d '{"name":"tmux-collide"}' >/dev/null 2>&1
 tmux kill-session -t tmux-collide 2>/dev/null || true
 
 log "Test L2: Start duplicate session restarts existing"
+L2_INCARNATION_BEFORE=$(persisted_session_incarnation "lifecycle-test")
 L2=$(api "$BASE" POST /api/sessions/start -d '{"name":"lifecycle-test"}')
 assert_contains "L2: duplicate returns 202 (restart)" "$L2" "lifecycle-test"
+wait_for 10 persisted_session_restart_completed "lifecycle-test" "$L2_INCARNATION_BEFORE"
+L2_INCARNATION_AFTER=$(persisted_session_incarnation "lifecycle-test")
+L2_PANE=$(session_field "$BASE" "lifecycle-test" "pane")
+L2_PANE_PID=$(tmux display-message -t "$L2_PANE" -p '#{pane_pid}')
+L2_PHYSICAL_SESSION=$(tr '\0' '\n' <"/proc/$L2_PANE_PID/environ" | sed -n 's/^OUIJA_SESSION_ID=//p')
+L2_PHYSICAL_INCARNATION=$(tr '\0' '\n' <"/proc/$L2_PANE_PID/environ" | sed -n 's/^OUIJA_SESSION_INCARNATION=//p')
+assert_eq "L2: respawn exports session ID" "$L2_PHYSICAL_SESSION" "lifecycle-test"
+assert_eq "L2: respawn exports committed incarnation" "$L2_PHYSICAL_INCARNATION" "$L2_INCARNATION_AFTER"
 
 log "Test L3: Kill session via REST API"
-# Wait for session to have a pane (async start may still be in progress)
+# The incarnation wait above proves the asynchronous same-ID restart committed.
 wait_for 10 bash -c "session_field '$BASE' 'lifecycle-test' 'pane' | grep -q '%'"
 L3=$(api "$BASE" POST /api/sessions/kill -d '{"name":"lifecycle-test"}')
 assert_contains "L3: kill response" "$L3" "removed"
@@ -603,15 +612,30 @@ assert_contains "L6: session still registered after restart" "$L6_IDS" "restart-
 
 log "Test L6b: Metadata preserved after restart"
 # Register a session with rich metadata, restart, verify metadata survives
-# Use a pane with fake claude process so pane_alive (has_claude_descendant) passes
-L6B_PANE=$(create_claude_pane "$FAKE_BIN")
+# Use a dedicated fake claude process so backend detection succeeds, then
+# stamp the externally registered pane with its allocated lifecycle owner.
+mkdir -p /tmp/meta-test
+L6B_FAKE_BIN=$(create_fake_claude)
+L6B_PANE=$(create_claude_pane "$L6B_FAKE_BIN")
 sleep 0.5
 api "$BASE" POST /api/register -d "{\"id\":\"meta-restart\",\"pane\":\"$L6B_PANE\",\"vim_mode\":true,\"role\":\"backend\",\"project_dir\":\"/tmp/meta-test\"}" >/dev/null
+L6B_INCARNATION=$(persisted_session_incarnation "meta-restart")
+tmux respawn-pane -k \
+    -e "OUIJA_SESSION_ID=meta-restart" \
+    -e "OUIJA_SESSION_INCARNATION=$L6B_INCARNATION" \
+    -t "$L6B_PANE" "$L6B_FAKE_BIN/claude 3600"
+L6B_PANE_PID=$(tmux display-message -t "$L6B_PANE" -p '#{pane_pid}')
+L6B_PHYSICAL_INCARNATION=$(tr '\0' '\n' <"/proc/$L6B_PANE_PID/environ" | sed -n 's/^OUIJA_SESSION_INCARNATION=//p')
+assert_eq "L6b: fixture exports the registered incarnation" "$L6B_PHYSICAL_INCARNATION" "$L6B_INCARNATION"
+# Let restart commands resolve the argument-tolerant Docker fake instead of
+# the copied sleep binary, which rejects claude's --continue flag.
+mv "$L6B_FAKE_BIN/claude" "$L6B_FAKE_BIN/claude-pane"
 L6B_ROLE_BEFORE=$(session_field "$BASE" "meta-restart" "role")
 assert_eq "L6b: role set before restart" "$L6B_ROLE_BEFORE" "backend"
 # Restart and check metadata survived
-api "$BASE" POST /api/sessions/restart -d '{"name":"meta-restart"}' >/dev/null
-wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'meta-restart'"
+L6B_RESTART=$(api "$BASE" POST /api/sessions/restart -d '{"name":"meta-restart"}')
+assert_contains "L6b: managed restart succeeds" "$L6B_RESTART" "restarted"
+wait_for 10 persisted_session_restart_completed "meta-restart" "$L6B_INCARNATION"
 L6B_VIM=$(session_field "$BASE" "meta-restart" "vim_mode")
 L6B_ROLE=$(session_field "$BASE" "meta-restart" "role")
 L6B_DIR=$(session_field "$BASE" "meta-restart" "project_dir")
@@ -619,25 +643,27 @@ assert_eq "L6b: vim_mode preserved" "$L6B_VIM" "true"
 assert_eq "L6b: role preserved" "$L6B_ROLE" "backend"
 assert_eq "L6b: project_dir preserved" "$L6B_DIR" "/tmp/meta-test"
 
-log "Test L6c: Pane ID changes after restart"
+log "Test L6c: Restart reuses pane with a new physical incarnation"
 L6C_PANE_BEFORE=$(session_field "$BASE" "meta-restart" "pane")
-api "$BASE" POST /api/sessions/restart -d '{"name":"meta-restart"}' >/dev/null
-wait_for 5 bash -c '[ "$(session_field "'"$BASE"'" "meta-restart" "pane")" != "'"$L6C_PANE_BEFORE"'" ]'
+L6C_INCARNATION_BEFORE=$(persisted_session_incarnation "meta-restart")
+L6C_RESTART=$(api "$BASE" POST /api/sessions/restart -d '{"name":"meta-restart"}')
+assert_contains "L6c: second managed restart succeeds" "$L6C_RESTART" "restarted"
+wait_for 10 persisted_session_restart_completed "meta-restart" "$L6C_INCARNATION_BEFORE"
 L6C_PANE_AFTER=$(session_field "$BASE" "meta-restart" "pane")
-if [ -n "$L6C_PANE_BEFORE" ] && [ -n "$L6C_PANE_AFTER" ] && [ "$L6C_PANE_BEFORE" != "$L6C_PANE_AFTER" ]; then
-    pass "L6c: pane changed after restart ($L6C_PANE_BEFORE -> $L6C_PANE_AFTER)"
-else
-    fail "L6c: pane should change after restart" "different pane" "before=$L6C_PANE_BEFORE after=$L6C_PANE_AFTER"
-fi
+L6C_INCARNATION_AFTER=$(persisted_session_incarnation "meta-restart")
+L6C_PANE_PID=$(tmux display-message -t "$L6C_PANE_AFTER" -p '#{pane_pid}')
+L6C_PHYSICAL_INCARNATION=$(tr '\0' '\n' <"/proc/$L6C_PANE_PID/environ" | sed -n 's/^OUIJA_SESSION_INCARNATION=//p')
+assert_eq "L6c: restart reuses the managed pane" "$L6C_PANE_AFTER" "$L6C_PANE_BEFORE"
+assert_eq "L6c: pane exports the committed incarnation" "$L6C_PHYSICAL_INCARNATION" "$L6C_INCARNATION_AFTER"
 
 log "Test L6d: Restart pane runs correct command"
 L6D_PANE=$(session_field "$BASE" "meta-restart" "pane")
-wait_for 5 bash -c "tmux capture-pane -t '$L6D_PANE' -p 2>/dev/null | grep -qE '(--resume|--continue)'"
-L6D_CONTENT=$(tmux capture-pane -t "$L6D_PANE" -p 2>/dev/null || echo "")
-if echo "$L6D_CONTENT" | grep -qE '(--resume|--continue)'; then
+wait_for 5 bash -c "tmux display-message -t '$L6D_PANE' -p '#{pane_start_command}' 2>/dev/null | grep -qE '(--resume|--continue)'"
+L6D_COMMAND=$(tmux display-message -t "$L6D_PANE" -p '#{pane_start_command}' 2>/dev/null || echo "")
+if echo "$L6D_COMMAND" | grep -qE '(--resume|--continue)'; then
     pass "L6d: restart pane has --resume or --continue flag"
 else
-    fail "L6d: restart pane should have --resume or --continue" "--resume or --continue" "$L6D_CONTENT"
+    fail "L6d: restart pane should have --resume or --continue" "--resume or --continue" "$L6D_COMMAND"
 fi
 
 log "Test L6e: Reaper grace period — session survives reaper cycle after restart"
@@ -666,12 +692,17 @@ api "$BASE" POST /api/sessions/kill -d '{"name":"restart-test"}' >/dev/null 2>&1
 log "Test L7: REST start session"
 L7=$(api "$BASE" POST /api/sessions/start -d '{"name":"rest-lifecycle"}')
 assert_contains "L7: REST start response" "$L7" "rest-lifecycle"
-wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'rest-lifecycle'"
+wait_for 10 persisted_session_launch_completed "rest-lifecycle"
 L7_IDS=$(session_ids "$BASE")
 assert_contains "L7: REST started session registered" "$L7_IDS" "rest-lifecycle"
 
 log "Test L8: REST kill session"
-L8=$(api "$BASE" POST /api/sessions/kill -d '{"name":"rest-lifecycle"}')
+L8=""
+for _ in $(seq 1 20); do
+    L8=$(api "$BASE" POST /api/sessions/kill -d '{"name":"rest-lifecycle"}')
+    [[ "$L8" == *removed* ]] && break
+    sleep 0.25
+done
 assert_contains "L8: REST kill removed" "$L8" "removed"
 wait_for 5 bash -c "! session_ids '$BASE' | grep -qF 'rest-lifecycle'"
 L8_IDS=$(session_ids "$BASE")
@@ -680,10 +711,16 @@ assert_not_contains "L8: REST killed session gone" "$L8_IDS" "rest-lifecycle"
 log "Test L9: REST restart session"
 # Start first, then restart
 api "$BASE" POST /api/sessions/start -d '{"name":"rest-restart"}' >/dev/null
-wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'rest-restart'"
-L9=$(api "$BASE" POST /api/sessions/restart -d '{"name":"rest-restart"}')
+wait_for 10 persisted_session_launch_completed "rest-restart"
+L9_INCARNATION_BEFORE=$(persisted_session_incarnation "rest-restart")
+L9=""
+for _ in $(seq 1 20); do
+    L9=$(api "$BASE" POST /api/sessions/restart -d '{"name":"rest-restart"}')
+    [[ "$L9" == *restarted* ]] && break
+    sleep 0.25
+done
 assert_contains "L9: REST restart response" "$L9" "restarted"
-wait_for 5 bash -c "session_ids '$BASE' | grep -qF 'rest-restart'"
+wait_for 10 persisted_session_restart_completed "rest-restart" "$L9_INCARNATION_BEFORE"
 L9_IDS=$(session_ids "$BASE")
 assert_contains "L9: REST restarted session registered" "$L9_IDS" "rest-restart"
 
@@ -1072,8 +1109,19 @@ api "$BASE" POST /api/register -d "{\"id\":\"keep-a\",\"pane\":\"$PANE_A\"}" >/d
 api "$BASE" POST /api/register -d "{\"id\":\"keep-b\",\"pane\":\"$PANE_B\"}" >/dev/null
 api "$BASE" POST /api/register -d "{\"id\":\"evict-me\",\"pane\":\"$PANE_C\"}" >/dev/null
 assert_eq "21: 3 sessions before limit" "$(session_count "$BASE")" "3"
+# Auto-close must prove that it still owns the physical pane. Stamp these
+# externally registered fixtures with the incarnations allocated above.
+for owner_spec in "keep-a:$PANE_A" "keep-b:$PANE_B" "evict-me:$PANE_C"; do
+    owner_id="${owner_spec%%:*}"
+    owner_pane="${owner_spec#*:}"
+    owner_incarnation=$(persisted_session_incarnation "$owner_id")
+    tmux respawn-pane -k \
+        -e "OUIJA_SESSION_ID=$owner_id" \
+        -e "OUIJA_SESSION_INCARNATION=$owner_incarnation" \
+        -t "$owner_pane" "$FAKE_BIN/claude 3600"
+done
 # Backdate evict-me so it's the most idle, then restart to load it
-jq 'map(if .id == "evict-me" then .last_activity_at = "2000-01-01T00:00:00Z" else . end)' \
+jq '.sessions |= map(if .id == "evict-me" then .last_activity_at = "2000-01-01T00:00:00Z" else . end)' \
     /tmp/ouija-test/sessions.json > /tmp/ouija-test/sessions.json.tmp \
     && mv /tmp/ouija-test/sessions.json.tmp /tmp/ouija-test/sessions.json
 kill $DAEMON_PID 2>/dev/null || true
@@ -1462,16 +1510,15 @@ result=$(curl -s -X POST "${BASE}/api/send" -H 'Content-Type: application/json' 
     -d '{"from":"sess-a2","to":"sess-b","message":"legacy caller"}')
 assert_contains "33d: ctx-less legacy send delivered" "$result" "delivered"
 
-log "Test 34: CLI sends sender_ctx — non-tmux claim of tmux session fails via CLI"
-# The CLI always attaches sender_ctx, so a non-tmux shell claiming a
-# tmux-native session via $OUIJA_SESSION_ID must be rejected end-to-end.
+log "Test 34: CLI sends sender_ctx with resolved self-proof or matching pane"
+# A resolved $OUIJA_SESSION_ID is the CLI's generic paneless self-proof.
 set +e
-err=$(env -u TMUX_PANE OUIJA_SESSION_ID=sess-b OUIJA_PORT=$PORT \
-    ouija tell sess-a2 "cli impersonation attempt" 2>&1)
+out=$(env -u TMUX_PANE OUIJA_SESSION_ID=sess-b OUIJA_PORT=$PORT \
+    ouija tell sess-a2 "cli paneless self-proof" 2>&1)
 rc=$?
 set -e
-assert_eq "34a: CLI send rejected non-zero" "$rc" "1"
-assert_contains "34a: CLI surfaces sender claim rejection" "$err" "sender claim rejected"
+assert_eq "34a: CLI accepts resolved paneless self-proof" "$rc" "0"
+assert_contains "34a: paneless self-proof send delivered" "$out" "delivered"
 # Positive control: same claim from the session's own pane succeeds
 out=$(env TMUX_PANE="$PANE_B" OUIJA_PORT=$PORT ouija tell sess-a2 "cli genuine send" 2>&1)
 assert_contains "34b: CLI send from own pane delivered" "$out" "delivered"

@@ -440,13 +440,15 @@ pub(crate) fn format_session_start_hook_flags(
     codex_home: &str,
     launch_session_id: &str,
     launch_credential_file: &Path,
+    session_incarnation: crate::daemon_protocol::SessionIncarnation,
 ) -> String {
     let script = hooks_dir(Path::new(codex_home)).join("codex-register.sh");
     let command = format!(
-        "{} --launch-session-id {} --launch-credential-file {}",
+        "{} --launch-session-id {} --launch-credential-file {} --session-incarnation {}",
         crate::scheduler::shell_escape(&script.to_string_lossy()),
         crate::scheduler::shell_escape(launch_session_id),
         crate::scheduler::shell_escape(&launch_credential_file.to_string_lossy()),
+        session_incarnation,
     );
     // Codex hashes the TOML-normalized command handler. Optional TOML fields
     // are absent, while the hook engine supplies timeout=600 and async=false.
@@ -485,6 +487,7 @@ pub(crate) fn with_session_start_hook(
     codex_home: Option<&str>,
     launch_session_id: &str,
     launch_credential: &str,
+    session_incarnation: crate::daemon_protocol::SessionIncarnation,
 ) -> anyhow::Result<String> {
     let home = codex_home
         .map(crate::state::expand_tilde)
@@ -497,7 +500,8 @@ pub(crate) fn with_session_start_hook(
         format_session_start_hook_flags(
             &home.to_string_lossy(),
             launch_session_id,
-            &credential_file
+            &credential_file,
+            session_incarnation,
         )
     ))
 }
@@ -706,6 +710,7 @@ mod tests {
             &home.path().to_string_lossy(),
             "public-launch",
             &credential_file,
+            crate::daemon_protocol::SessionIncarnation(42),
         );
 
         assert!(
@@ -1222,9 +1227,12 @@ mod tests {
             "ambient launch variables must never become managed proof: {s}"
         );
         assert!(
-            s.contains("--launch-session-id") && s.contains("--launch-credential-file"),
+            s.contains("--launch-session-id")
+                && s.contains("--launch-credential-file")
+                && s.contains("--session-incarnation"),
             "the per-launch SessionFlags hook must receive its proof by private file: {s}"
         );
+        assert!(s.contains("session_incarnation"), "{s}");
         assert!(
             s.contains("mv -- \"$EXPLICIT_LAUNCH_CREDENTIAL_FILE\"")
                 && s.contains("rm -f -- \"$CLAIMED_CREDENTIAL_FILE\""),
@@ -1244,10 +1252,94 @@ mod tests {
     }
 
     #[test]
+    fn manual_register_script_does_not_claim_live_pane_incarnation() {
+        let root = tempfile::tempdir().unwrap();
+        let bin_dir = root.path().join("bin");
+        let script = root.path().join("codex-register.sh");
+        let capture = root.path().join("request.json");
+        std::fs::create_dir(&bin_dir).unwrap();
+        std::fs::write(&script, embedded::SCRIPT_REGISTER).unwrap();
+        std::fs::write(
+            bin_dir.join("tmux"),
+            r#"#!/bin/bash
+case "$*" in
+  *'#{pane_current_path}'*) printf '/repo\n' ;;
+  *'#{@ouija_incarnation}'*) printf '77\n' ;;
+  *) exit 1 ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            bin_dir.join("curl"),
+            r#"#!/bin/bash
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -d) printf '%s' "$2" > "$OUIJA_HOOK_CAPTURE"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '{"registered":"worker","session_incarnation":"77","output":""}'
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [&script, &bin_dir.join("tmux"), &bin_dir.join("curl")] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+
+        let mut child = std::process::Command::new("bash")
+            .arg(&script)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("TMUX_PANE", "%42")
+            .env("OUIJA_HOOK_CAPTURE", &capture)
+            .env_remove("OUIJA_SESSION_ID")
+            .env_remove("OUIJA_SESSION_START_CREDENTIAL")
+            .env_remove("OUIJA_SESSION_INCARNATION")
+            .env_remove("CODEX_THREAD_ID")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(br#"{"session_id":"thread-manual","cwd":"/repo"}"#)
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "register script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let request: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(capture).unwrap()).unwrap();
+        assert!(
+            request.get("session_incarnation").is_none(),
+            "manual SessionStart must not treat a reusable pane variable as generation proof: {request}"
+        );
+        assert_eq!(request["backend_session_id"], "thread-manual");
+        assert!(request.get("launch_credential").is_none());
+    }
+
+    #[test]
     fn prompt_submit_script_signals_activity() {
         let s = embedded::SCRIPT_PROMPT_SUBMIT;
         assert!(s.contains("/api/hooks/prompt-submit"), "{s}");
         assert!(s.contains("UserPromptSubmit"), "{s}");
+        assert!(s.contains("session_incarnation"), "{s}");
     }
 
     #[test]
@@ -1255,6 +1347,7 @@ mod tests {
         let s = embedded::SCRIPT_STOP;
         // Pings the turn-stop endpoint...
         assert!(s.contains("/api/hooks/stop"), "{s}");
+        assert!(s.contains("session_incarnation"), "{s}");
         // ...returns {"continue":true} so Codex proceeds...
         assert!(s.contains(r#"{"continue":true}"#), "{s}");
         // ...and must NOT unregister (Codex Stop fires every turn).

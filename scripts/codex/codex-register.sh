@@ -12,6 +12,7 @@ LAUNCH_SESSION_ID=""
 LAUNCH_CREDENTIAL=""
 EXPLICIT_LAUNCH_SESSION_ID=""
 EXPLICIT_LAUNCH_CREDENTIAL_FILE=""
+EXPLICIT_SESSION_INCARNATION=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --launch-session-id)
@@ -20,6 +21,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --launch-credential-file)
       EXPLICIT_LAUNCH_CREDENTIAL_FILE="${2:-}"
+      shift 2
+      ;;
+    --session-incarnation)
+      EXPLICIT_SESSION_INCARNATION="${2:-}"
       shift 2
       ;;
     *)
@@ -48,6 +53,10 @@ fi
 PANE="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}' 2>/dev/null)}"
 CWD=$(printf '%s' "$PAYLOAD" | jq -r '.cwd // empty' 2>/dev/null)
 [ -z "$CWD" ] && CWD="$PWD"
+INCARNATION="$EXPLICIT_SESSION_INCARNATION"
+case "$INCARNATION" in
+  ''|*[!0-9]*) INCARNATION="" ;;
+esac
 # Codex's shared app-server can inherit TMUX_PANE from the terminal that
 # started it. Do not let that unrelated pane claim this SessionStart payload.
 # The daemon repeats this check with project-root normalization; this raw path
@@ -63,8 +72,8 @@ if [ -z "$LAUNCH_SESSION_ID" ] || [ -z "$LAUNCH_CREDENTIAL" ] || [ -z "$BACKEND_
 fi
 RESP=$(curl -sf -X POST "http://localhost:${OUIJA_PORT:-7880}/api/hooks/session-start" \
   -H "Content-Type: application/json" \
-  -d "$(jq -cn --arg pane "$PANE" --arg cwd "$CWD" --arg backend_session_id "$BACKEND_SESSION_ID" --arg adapter "codex-cli" --arg launch_session_id "$LAUNCH_SESSION_ID" --arg launch_credential "$LAUNCH_CREDENTIAL" \
-    '{pane:$pane,cwd:$cwd,adapter:$adapter} + (if $launch_session_id == "" then {} else {launch_session_id:$launch_session_id} end) + (if $launch_credential == "" then {} else {launch_credential:$launch_credential} end) + (if $backend_session_id == "" then {} else {backend_session_id:$backend_session_id,backend_identity:{backend:$adapter,session_id:$backend_session_id}} end)')" 2>/dev/null) || exit 0
+  -d "$(jq -cn --arg pane "$PANE" --arg cwd "$CWD" --arg backend_session_id "$BACKEND_SESSION_ID" --arg adapter "codex-cli" --arg launch_session_id "$LAUNCH_SESSION_ID" --arg launch_credential "$LAUNCH_CREDENTIAL" --arg incarnation "$INCARNATION" \
+    '{pane:$pane,cwd:$cwd,adapter:$adapter} + (if $launch_session_id == "" then {} else {launch_session_id:$launch_session_id} end) + (if $launch_credential == "" then {} else {launch_credential:$launch_credential} end) + (if $incarnation == "" then {} else {session_incarnation:$incarnation} end) + (if $backend_session_id == "" then {} else {backend_session_id:$backend_session_id,backend_identity:{backend:$adapter,session_id:$backend_session_id}} end)')" 2>/dev/null) || exit 0
 CONTEXT=$(printf '%s' "$RESP" | jq -r '.output // empty' 2>/dev/null)
 [ -z "$CONTEXT" ] && exit 0
 jq -cn --arg ctx "$CONTEXT" \

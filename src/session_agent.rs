@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use ractor::concurrency::JoinHandle;
 use ractor::{Actor, ActorProcessingErr, ActorRef, MessagingErr};
 
-use crate::daemon_protocol::{IterationLogEntry, PendingReplyEntry};
+use crate::daemon_protocol::{IterationLogEntry, PendingReplyEntry, ResourceOwner};
 use crate::state::AppState;
 
 /// Hardcoded stall thresholds.
@@ -35,8 +35,11 @@ pub enum SessionMsg {
     Active,
     /// Query: return current pending replies from DaemonState (RPC).
     GetPendingReplies(ractor::RpcReplyPort<Vec<PendingReplyEntry>>),
-    /// Session was renamed — update internal session_id.
-    Renamed { new_id: String },
+    /// Session was renamed — update internal owner only when both sides match.
+    Renamed {
+        old_owner: ResourceOwner,
+        new_owner: ResourceOwner,
+    },
     /// Internal: idle timer expired.
     IdleTimeout,
     /// loop_next was called — reset loop stall timer.
@@ -51,6 +54,13 @@ pub enum SessionMsg {
     /// Used by the compact endpoint to reject concurrent compact attempts on the same session
     /// so a second caller cannot overwrite the first caller's continuation.
     TrySetPendingCompactContinuation(String, ractor::RpcReplyPort<bool>),
+    #[cfg(test)]
+    TestTrySetAfterOwnershipCheck(
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+        ractor::RpcReplyPort<bool>,
+    ),
     /// Drain (take + clear) the pending compact continuation (RPC).
     DrainPendingCompactContinuation(ractor::RpcReplyPort<Option<String>>),
     /// Internal: watchdog timer expired (no Active or Stopped within 2x idle_timeout).
@@ -59,7 +69,7 @@ pub enum SessionMsg {
 
 /// Per-session behavioral state owned by the agent.
 pub struct SessionAgentState {
-    pub session_id: String,
+    pub owner: ResourceOwner,
     pub pane: String,
     pub idle: bool,
     pub last_stopped_at: Option<DateTime<Utc>>,
@@ -81,18 +91,46 @@ pub struct SessionAgentState {
 impl std::fmt::Debug for SessionAgentState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionAgentState")
-            .field("session_id", &self.session_id)
+            .field("owner", &self.owner)
             .field("pane", &self.pane)
             .field("idle", &self.idle)
             .finish_non_exhaustive()
     }
 }
 
+async fn claim_hard_stall_restart(
+    app_state: &Arc<AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    pane: &str,
+) -> bool {
+    match app_state.claim_existing_start(owner).await {
+        Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
+        Ok(_) | Err(_) => return false,
+    }
+    let exact_claim = {
+        let proto = app_state.protocol.read().await;
+        proto
+            .sessions
+            .get(&owner.session_id)
+            .is_some_and(|session| {
+                session.owner() == *owner && session.pane.as_deref() == Some(pane)
+            })
+            && proto
+                .lifecycle_leases
+                .get(&owner.session_id)
+                .is_some_and(|lease| lease.owner == *owner)
+    };
+    if !exact_claim {
+        let _ = app_state.abort_lifecycle(owner).await;
+    }
+    exact_claim
+}
+
 impl SessionAgentState {
     /// Create initial agent state for a session and pane.
-    pub fn new(session_id: String, pane: String) -> Self {
+    pub fn new(owner: ResourceOwner, pane: String) -> Self {
         Self {
-            session_id,
+            owner,
             pane,
             idle: false,
             last_stopped_at: None,
@@ -104,6 +142,10 @@ impl SessionAgentState {
             watchdog_timer: None,
             pending_compact_continuation: None,
         }
+    }
+
+    fn owns(&self, session: &crate::daemon_protocol::SessionEntry) -> bool {
+        session.owner() == self.owner && session.pane.as_deref() == Some(self.pane.as_str())
     }
 }
 
@@ -117,7 +159,7 @@ pub struct SessionAgent {
 /// Arguments passed when spawning the agent.
 #[derive(Debug)]
 pub struct SessionAgentArgs {
-    pub session_id: String,
+    pub owner: ResourceOwner,
     pub pane: String,
 }
 
@@ -132,8 +174,12 @@ impl Actor for SessionAgent {
         _myself: ActorRef<Self::Msg>,
         args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        tracing::info!("session agent started: {}", args.session_id);
-        Ok(SessionAgentState::new(args.session_id, args.pane))
+        tracing::info!(
+            session = %args.owner.session_id,
+            incarnation = %args.owner.incarnation,
+            "session agent started"
+        );
+        Ok(SessionAgentState::new(args.owner, args.pane))
     }
 
     async fn handle(
@@ -142,6 +188,43 @@ impl Actor for SessionAgent {
         message: Self::Msg,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
+        if let SessionMsg::Renamed {
+            old_owner,
+            new_owner,
+        } = &message
+        {
+            let renamed_is_current = (state.owner == *old_owner || state.owner == *new_owner)
+                && self
+                    .app_state
+                    .protocol
+                    .read()
+                    .await
+                    .sessions
+                    .get(&new_owner.session_id)
+                    .is_some_and(|session| {
+                        session.owner() == *new_owner
+                            && session.pane.as_deref() == Some(state.pane.as_str())
+                    });
+            if renamed_is_current {
+                tracing::info!(
+                    old = %old_owner.session_id,
+                    new = %new_owner.session_id,
+                    incarnation = %new_owner.incarnation,
+                    "session agent renamed"
+                );
+                state.owner = new_owner.clone();
+            } else {
+                myself.stop(None);
+            }
+            return Ok(());
+        }
+
+        if !self.refresh_renamed_owner(state).await {
+            Self::reject_stale_message(message);
+            myself.stop(None);
+            return Ok(());
+        }
+
         match message {
             SessionMsg::Stopped => {
                 state.last_stopped_at = Some(Utc::now());
@@ -161,15 +244,16 @@ impl Actor for SessionAgent {
                 // triggers Active→Stopped→repeat).
                 let (has_pending, has_reminder) = {
                     let proto = self.app_state.protocol.read().await;
-                    let pending = proto
-                        .pending_replies
-                        .get(&state.session_id)
-                        .map(|p| !p.is_empty())
-                        .unwrap_or(false);
-                    let reminder = proto
+                    let session = proto
                         .sessions
-                        .get(&state.session_id)
-                        .is_some_and(|s| s.metadata.has_active_reminder());
+                        .get(&state.owner.session_id)
+                        .filter(|session| state.owns(session));
+                    let pending = session.is_some()
+                        && proto
+                            .pending_replies
+                            .get(&state.owner.session_id)
+                            .is_some_and(|pending| !pending.is_empty());
+                    let reminder = session.is_some_and(|s| s.metadata.has_active_reminder());
                     (pending, reminder)
                 };
 
@@ -190,15 +274,22 @@ impl Actor for SessionAgent {
                 // Nudge about pending replies older than idle_timeout
                 if has_pending {
                     let cutoff = Utc::now().timestamp() - timeout as i64;
-                    let pending = self
-                        .app_state
-                        .protocol
-                        .read()
-                        .await
-                        .pending_replies
-                        .get(&state.session_id)
-                        .cloned()
-                        .unwrap_or_default();
+                    let pending = {
+                        let protocol = self.app_state.protocol.read().await;
+                        if protocol
+                            .sessions
+                            .get(&state.owner.session_id)
+                            .is_some_and(|session| state.owns(session))
+                        {
+                            protocol
+                                .pending_replies
+                                .get(&state.owner.session_id)
+                                .cloned()
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        }
+                    };
                     let overdue: Vec<&PendingReplyEntry> = pending
                         .iter()
                         .filter(|p| p.last_activity < cutoff)
@@ -224,26 +315,24 @@ impl Actor for SessionAgent {
             }
             SessionMsg::GetPendingReplies(reply) => {
                 if !reply.is_closed() {
-                    let pending = self
-                        .app_state
-                        .protocol
-                        .read()
-                        .await
-                        .pending_replies
-                        .get(&state.session_id)
-                        .cloned()
-                        .unwrap_or_default();
+                    let protocol = self.app_state.protocol.read().await;
+                    let pending = if protocol
+                        .sessions
+                        .get(&state.owner.session_id)
+                        .is_some_and(|session| state.owns(session))
+                    {
+                        protocol
+                            .pending_replies
+                            .get(&state.owner.session_id)
+                            .cloned()
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     let _ = reply.send(pending);
                 }
             }
-            SessionMsg::Renamed { new_id } => {
-                tracing::info!(
-                    old = %state.session_id,
-                    new = %new_id,
-                    "session agent renamed"
-                );
-                state.session_id = new_id;
-            }
+            SessionMsg::Renamed { .. } => unreachable!("renames handled before owner validation"),
             SessionMsg::LoopProgress => {
                 // Cancel existing stall timer
                 if let Some(h) = state.loop_hard_timer.take() {
@@ -255,7 +344,8 @@ impl Actor for SessionAgent {
                     let proto = self.app_state.protocol.read().await;
                     proto
                         .sessions
-                        .get(&state.session_id)
+                        .get(&state.owner.session_id)
+                        .filter(|session| state.owns(session))
                         .map(|s| compute_average_loop_interval(&s.metadata.iteration_log))
                         .unwrap_or(None)
                 };
@@ -271,7 +361,7 @@ impl Actor for SessionAgent {
                     );
 
                     tracing::debug!(
-                        session = %state.session_id,
+                        session = %state.owner.session_id,
                         avg_interval = avg,
                         hard_timeout = hard_secs,
                         "loop stall timer set"
@@ -281,7 +371,7 @@ impl Actor for SessionAgent {
             SessionMsg::LoopHardStall => {
                 state.loop_hard_timer = None;
                 tracing::warn!(
-                    session = %state.session_id,
+                    session = %state.owner.session_id,
                     "hard loop stall detected — forcing clean context restart"
                 );
 
@@ -291,7 +381,7 @@ impl Actor for SessionAgent {
                 if clearing_id == state.next_clearing_id {
                     state.reminder_cleared = true;
                     tracing::debug!(
-                        session = %state.session_id,
+                        session = %state.owner.session_id,
                         clearing_id,
                         "reminder cleared by session"
                     );
@@ -304,24 +394,38 @@ impl Actor for SessionAgent {
                 // and every subsequent compact would 409 until the agent is
                 // restarted and the next post-compact hook would drain the
                 // orphan into an unrelated turn.
-                if reply.is_closed() {
-                    return Ok(());
+                if !self.try_set_compact_continuation(state, text, reply).await {
+                    myself.stop(None);
                 }
-                let acquired = state.pending_compact_continuation.is_none();
-                if acquired {
-                    state.pending_compact_continuation = Some(text);
+            }
+            #[cfg(test)]
+            SessionMsg::TestTrySetAfterOwnershipCheck(text, checked, proceed, reply) => {
+                let _ = checked.send(());
+                let _ = proceed.await;
+                if !self.try_set_compact_continuation(state, text, reply).await {
+                    myself.stop(None);
                 }
-                let _ = reply.send(acquired);
             }
             SessionMsg::DrainPendingCompactContinuation(reply) => {
+                let protocol = self.app_state.protocol.read().await;
+                let current = protocol
+                    .sessions
+                    .get(&state.owner.session_id)
+                    .is_some_and(|session| state.owns(session));
                 if !reply.is_closed() {
-                    let _ = reply.send(state.pending_compact_continuation.take());
+                    let value = current
+                        .then(|| state.pending_compact_continuation.take())
+                        .flatten();
+                    let _ = reply.send(value);
+                }
+                if !current {
+                    myself.stop(None);
                 }
             }
             SessionMsg::WatchdogTimeout => {
                 state.watchdog_timer = None;
                 tracing::warn!(
-                    session = %state.session_id,
+                    session = %state.owner.session_id,
                     "watchdog timeout: no activity for 2x idle_timeout, treating as idle"
                 );
                 // Trigger idle handling — same as IdleTimeout
@@ -333,7 +437,7 @@ impl Actor for SessionAgent {
 
                 if state.reminder_cleared {
                     tracing::debug!(
-                        session = %state.session_id,
+                        session = %state.owner.session_id,
                         "idle timeout fired but reminder was cleared — skipping injection"
                     );
                 } else {
@@ -348,26 +452,33 @@ impl Actor for SessionAgent {
                     // is ever bypassed (watchdog, future caller).
                     let (reminder, has_lifecycle_policy, vim_mode, pending) = {
                         let proto = self.app_state.protocol.read().await;
-                        let session = proto.sessions.get(&state.session_id);
+                        let session = proto
+                            .sessions
+                            .get(&state.owner.session_id)
+                            .filter(|session| state.owns(session));
                         let reminder = session
                             .filter(|s| s.metadata.has_active_reminder())
                             .and_then(|s| {
                                 s.metadata
-                                    .effective_reminder(&state.session_id, Some(clearing_id))
+                                    .effective_reminder(&state.owner.session_id, Some(clearing_id))
                             });
                         let has_lifecycle_policy =
                             session.is_some_and(|s| s.metadata.idle_policy.is_some());
                         let vim_mode = session.map(|s| s.metadata.vim_mode).unwrap_or(false);
-                        let pending = proto
-                            .pending_replies
-                            .get(&state.session_id)
-                            .cloned()
-                            .unwrap_or_default();
+                        let pending = if session.is_some() {
+                            proto
+                                .pending_replies
+                                .get(&state.owner.session_id)
+                                .cloned()
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
                         (reminder, has_lifecycle_policy, vim_mode, pending)
                     };
 
                     tracing::debug!(
-                        session = %state.session_id,
+                        session = %state.owner.session_id,
                         clearing_id,
                         pending = pending.len(),
                         has_reminder = reminder.is_some(),
@@ -388,31 +499,36 @@ impl Actor for SessionAgent {
                         let wrapped = format!(
                             "<ouija-status type=\"reminder\" clearing_id=\"{clearing_id}\">{reminder_body}</ouija-status>"
                         );
-                        let _ = crate::tmux::locked_inject(
-                            &self.app_state,
-                            &state.session_id,
-                            &state.pane,
-                            &wrapped,
-                            vim_mode,
-                        )
-                        .await;
+                        if self.is_current(state).await {
+                            let _ = crate::tmux::locked_inject_owned(
+                                &self.app_state,
+                                &state.owner,
+                                &state.pane,
+                                &wrapped,
+                                vim_mode,
+                            )
+                            .await;
+                        }
                     }
 
                     // Append pending reply info with per-message format
                     if !pending.is_empty() {
                         tracing::info!(
-                            session = %state.session_id,
+                            session = %state.owner.session_id,
                             count = pending.len(),
                             "reminding about unanswered pending replies"
                         );
                         for p in &pending {
+                            if !self.is_current(state).await {
+                                break;
+                            }
                             let msg = format!(
                                 "<ouija-status type=\"reminder\" clearing_id=\"{clearing_id}\">Pending reply owed: msg #{} from {}</ouija-status>",
                                 p.msg_id, p.from
                             );
-                            let _ = crate::tmux::locked_inject(
+                            let _ = crate::tmux::locked_inject_owned(
                                 &self.app_state,
-                                &state.session_id,
+                                &state.owner,
                                 &state.pane,
                                 &msg,
                                 vim_mode,
@@ -431,12 +547,102 @@ impl Actor for SessionAgent {
         _myself: ActorRef<Self::Msg>,
         state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
-        tracing::info!("session agent stopped: {}", state.session_id);
+        tracing::info!(
+            session = %state.owner.session_id,
+            incarnation = %state.owner.incarnation,
+            "session agent stopped"
+        );
         Ok(())
     }
 }
 
 impl SessionAgent {
+    /// Keep an actor alive when a protocol rename committed before its queued
+    /// `Renamed` control message reached the mailbox. Ordinary messages ahead
+    /// of that control message may safely promote the owner through the exact
+    /// local alias only when incarnation and pane are unchanged.
+    async fn refresh_renamed_owner(&self, state: &mut SessionAgentState) -> bool {
+        let protocol = self.app_state.protocol.read().await;
+        if protocol
+            .sessions
+            .get(&state.owner.session_id)
+            .is_some_and(|session| state.owns(session))
+        {
+            return true;
+        }
+        let Some(new_id) = protocol.aliases.get(&state.owner.session_id) else {
+            return false;
+        };
+        let Some(session) = protocol.sessions.get(new_id) else {
+            return false;
+        };
+        if session.metadata.session_incarnation != state.owner.incarnation
+            || session.pane.as_deref() != Some(state.pane.as_str())
+        {
+            return false;
+        }
+        state.owner = session.owner();
+        true
+    }
+
+    async fn is_current(&self, state: &SessionAgentState) -> bool {
+        self.app_state
+            .protocol
+            .read()
+            .await
+            .sessions
+            .get(&state.owner.session_id)
+            .is_some_and(|session| {
+                session.owner() == state.owner
+                    && session.pane.as_deref() == Some(state.pane.as_str())
+            })
+    }
+
+    fn reject_stale_message(message: SessionMsg) {
+        match message {
+            SessionMsg::GetPendingReplies(reply) if !reply.is_closed() => {
+                let _ = reply.send(Vec::new());
+            }
+            SessionMsg::TrySetPendingCompactContinuation(_, reply) if !reply.is_closed() => {
+                let _ = reply.send(false);
+            }
+            #[cfg(test)]
+            SessionMsg::TestTrySetAfterOwnershipCheck(_, _, _, reply) if !reply.is_closed() => {
+                let _ = reply.send(false);
+            }
+            SessionMsg::DrainPendingCompactContinuation(reply) if !reply.is_closed() => {
+                let _ = reply.send(None);
+            }
+            _ => {}
+        }
+    }
+
+    /// Mutate the actor-local compact slot only while a protocol read guard
+    /// proves that this exact owner and pane remain current. Holding the guard
+    /// through the synchronous mutation and RPC reply excludes replacement on
+    /// another Tokio worker.
+    async fn try_set_compact_continuation(
+        &self,
+        state: &mut SessionAgentState,
+        text: String,
+        reply: ractor::RpcReplyPort<bool>,
+    ) -> bool {
+        let protocol = self.app_state.protocol.read().await;
+        let current = protocol
+            .sessions
+            .get(&state.owner.session_id)
+            .is_some_and(|session| state.owns(session));
+        if reply.is_closed() {
+            return current;
+        }
+        let acquired = current && state.pending_compact_continuation.is_none();
+        if acquired {
+            state.pending_compact_continuation = Some(text);
+        }
+        let _ = reply.send(acquired);
+        current
+    }
+
     /// Inject pending-reply reminders into the session's pane.
     async fn send_reminders(&self, entries: &[&PendingReplyEntry], state: &SessionAgentState) {
         let vim_mode = self
@@ -445,18 +651,25 @@ impl SessionAgent {
             .read()
             .await
             .sessions
-            .get(&state.session_id)
+            .get(&state.owner.session_id)
+            .filter(|session| {
+                session.owner() == state.owner
+                    && session.pane.as_deref() == Some(state.pane.as_str())
+            })
             .map(|s| s.metadata.vim_mode)
             .unwrap_or(false);
 
         for p in entries {
+            if !self.is_current(state).await {
+                break;
+            }
             let reminder = format!(
                 "<ouija-status type=\"reminder\">You have an unanswered question from {} (msg {}) — reply using: ouija reply {} {} \"your answer\"</ouija-status>",
                 p.from, p.msg_id, p.from, p.msg_id
             );
-            let _ = crate::tmux::locked_inject(
+            let _ = crate::tmux::locked_inject_owned(
                 &self.app_state,
-                &state.session_id,
+                &state.owner,
                 &state.pane,
                 &reminder,
                 vim_mode,
@@ -471,7 +684,11 @@ impl SessionAgent {
             let proto = self.app_state.protocol.read().await;
             proto
                 .sessions
-                .get(&state.session_id)
+                .get(&state.owner.session_id)
+                .filter(|session| {
+                    session.owner() == state.owner
+                        && session.pane.as_deref() == Some(state.pane.as_str())
+                })
                 .map(|s| s.metadata.clone())
         };
 
@@ -485,14 +702,18 @@ impl SessionAgent {
         let prompt = prompt.clone();
         let reminder = meta.reminder.clone();
         let app_state = self.app_state.clone();
-        let sid = state.session_id.clone();
+        let owner = state.owner.clone();
+        let pane = state.pane.clone();
+        let sid = owner.session_id.clone();
 
-        // Snapshot loop state before restart
-        let stash = meta.clone();
+        if !claim_hard_stall_restart(&app_state, &owner, &pane).await {
+            return;
+        }
 
         tokio::spawn(async move {
-            crate::nostr_transport::restart_session(
+            crate::nostr_transport::restart_session_for_start(
                 &app_state,
+                &owner,
                 &sid,
                 true,
                 None,
@@ -507,16 +728,6 @@ impl SessionAgent {
                 None, // idle_policy (fallback to prev_metadata.idle_policy)
             )
             .await;
-
-            // Re-stamp loop fields
-            {
-                let mut proto = app_state.protocol.write().await;
-                if let Some(session) = proto.sessions.get_mut(&sid) {
-                    session.metadata.inherit_recurrence_from(&stash);
-                }
-            }
-            let proto = app_state.protocol.read().await;
-            app_state.persist_protocol_state(&proto);
         });
     }
 }
@@ -601,8 +812,9 @@ mod tests {
         let agent = SessionAgent {
             app_state: state.clone(),
         };
+        let owner = state.protocol.read().await.sessions[session_id].owner();
         let args = SessionAgentArgs {
-            session_id: session_id.into(),
+            owner,
             pane: "%99".into(),
         };
         let (actor, handle) = Actor::spawn(None, agent, args).await.expect("spawn failed");
@@ -614,9 +826,30 @@ mod tests {
         handle.await.expect("actor failed");
     }
 
+    async fn register_test_session(
+        state: &std::sync::Arc<crate::state::AppState>,
+        id: &str,
+        pane: &str,
+    ) -> ResourceOwner {
+        let mut protocol = state.protocol.write().await;
+        protocol.apply(crate::daemon_protocol::Event::Register {
+            id: id.into(),
+            pane: Some(pane.into()),
+            metadata: Default::default(),
+        });
+        protocol.sessions[id].owner()
+    }
+
+    fn test_owner(id: &str) -> ResourceOwner {
+        ResourceOwner {
+            session_id: id.into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(1),
+        }
+    }
+
     #[test]
     fn agent_state_starts_not_idle() {
-        let state = SessionAgentState::new("test-sess".into(), "%1".into());
+        let state = SessionAgentState::new(test_owner("test-sess"), "%1".into());
         assert!(!state.idle);
     }
 
@@ -626,8 +859,9 @@ mod tests {
         let agent = SessionAgent {
             app_state: state.clone(),
         };
+        let owner = register_test_session(&state, "test-idle", "%99").await;
         let args = SessionAgentArgs {
-            session_id: "test-idle".into(),
+            owner,
             pane: "%99".into(),
         };
 
@@ -650,8 +884,9 @@ mod tests {
         let agent = SessionAgent {
             app_state: state.clone(),
         };
+        let owner = register_test_session(&state, "test-active", "%99").await;
         let args = SessionAgentArgs {
-            session_id: "test-active".into(),
+            owner,
             pane: "%99".into(),
         };
         state.settings.write().await.idle_timeout_secs = 1;
@@ -667,6 +902,181 @@ mod tests {
 
         actor.stop(None);
         handle.await.expect("actor failed");
+    }
+
+    #[tokio::test]
+    async fn replaced_agent_rejects_messages_without_mutating_its_state() {
+        let app_state = crate::state::AppState::new_for_test();
+        app_state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%99".into()),
+                metadata: Default::default(),
+            })
+            .await;
+        let old_owner = app_state.protocol.read().await.sessions["worker"].owner();
+        let agent = SessionAgent {
+            app_state: app_state.clone(),
+        };
+        let args = SessionAgentArgs {
+            owner: old_owner.clone(),
+            pane: "%99".into(),
+        };
+        let (actor, handle) = Actor::spawn(None, agent, args).await.expect("spawn failed");
+
+        {
+            let mut protocol = app_state.protocol.write().await;
+            protocol.apply(crate::daemon_protocol::Event::Remove {
+                id: "worker".into(),
+                keep_worktree: true,
+            });
+            protocol.apply(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%99".into()),
+                metadata: Default::default(),
+            });
+            assert_ne!(
+                protocol.sessions["worker"].metadata.session_incarnation,
+                old_owner.incarnation
+            );
+        }
+
+        let acquired = ractor::call!(
+            actor,
+            SessionMsg::TrySetPendingCompactContinuation,
+            "stale".into()
+        )
+        .unwrap_or(false);
+
+        assert!(!acquired, "a replaced actor must reject stale RPC work");
+        actor.stop(None);
+        handle.await.expect("actor failed");
+    }
+
+    #[tokio::test]
+    async fn compact_slot_rechecks_owner_after_initial_check() {
+        let app_state = crate::state::AppState::new_for_test();
+        let old_owner = register_test_session(&app_state, "worker", "%99").await;
+        let agent = SessionAgent {
+            app_state: app_state.clone(),
+        };
+        let args = SessionAgentArgs {
+            owner: old_owner.clone(),
+            pane: "%99".into(),
+        };
+        let (actor, handle) = Actor::spawn(None, agent, args).await.expect("spawn failed");
+        let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
+        let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
+        let call_actor = actor.clone();
+        let call = tokio::spawn(async move {
+            ractor::call!(
+                call_actor,
+                SessionMsg::TestTrySetAfterOwnershipCheck,
+                "stale".into(),
+                checked_tx,
+                proceed_rx
+            )
+            .unwrap_or(false)
+        });
+
+        checked_rx
+            .await
+            .expect("actor must pass the initial ownership check");
+        {
+            let mut protocol = app_state.protocol.write().await;
+            protocol.apply(crate::daemon_protocol::Event::Remove {
+                id: "worker".into(),
+                keep_worktree: true,
+            });
+            protocol.apply(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%99".into()),
+                metadata: Default::default(),
+            });
+            assert_ne!(protocol.sessions["worker"].owner(), old_owner);
+        }
+        proceed_tx.send(()).expect("resume compact-slot RPC");
+
+        assert!(
+            !call.await.expect("compact-slot RPC task failed"),
+            "a replacement committed after dispatch must exclude the old actor's slot mutation"
+        );
+        actor.stop(None);
+        handle.await.expect("actor failed");
+    }
+
+    #[tokio::test]
+    async fn message_queued_before_rename_control_promotes_exact_owner() {
+        let app_state = crate::state::AppState::new_for_test();
+        let old_owner = register_test_session(&app_state, "worker", "%99").await;
+        let agent = SessionAgent {
+            app_state: app_state.clone(),
+        };
+        let args = SessionAgentArgs {
+            owner: old_owner.clone(),
+            pane: "%99".into(),
+        };
+        let (actor, handle) = Actor::spawn(None, agent, args).await.expect("spawn failed");
+        let new_owner = {
+            let mut protocol = app_state.protocol.write().await;
+            protocol.apply(crate::daemon_protocol::Event::Rename {
+                old_id: "worker".into(),
+                new_id: "renamed".into(),
+            });
+            protocol.sessions["renamed"].owner()
+        };
+
+        actor.cast(SessionMsg::Active).expect("queue message");
+        actor
+            .cast(SessionMsg::Renamed {
+                old_owner,
+                new_owner,
+            })
+            .expect("queue rename");
+        let acquired = ractor::call!(
+            actor,
+            SessionMsg::TrySetPendingCompactContinuation,
+            "current".into()
+        )
+        .unwrap_or(false);
+
+        assert!(
+            acquired,
+            "a message ahead of rename control must not stop the exact renamed actor"
+        );
+        actor.stop(None);
+        handle.await.expect("actor failed");
+    }
+
+    #[tokio::test]
+    async fn hard_stall_cannot_claim_same_pane_replacement() {
+        let state = crate::state::AppState::new_for_test();
+        let stale_owner = register_test_session(&state, "worker", "%same").await;
+        {
+            let mut proto = state.protocol.write().await;
+            proto.apply(crate::daemon_protocol::Event::Remove {
+                id: "worker".into(),
+                keep_worktree: true,
+            });
+            proto.apply(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%same".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            });
+        }
+
+        assert!(
+            !claim_hard_stall_restart(&state, &stale_owner, "%same").await,
+            "the hard-stall actor must claim its exact incarnation before restart work"
+        );
+        assert!(
+            !state
+                .protocol
+                .read()
+                .await
+                .lifecycle_leases
+                .contains_key("worker")
+        );
     }
 
     #[test]
@@ -742,8 +1152,9 @@ mod tests {
         let agent = SessionAgent {
             app_state: state.clone(),
         };
+        let owner = state.protocol.read().await.sessions["test-reminder"].owner();
         let args = SessionAgentArgs {
-            session_id: "test-reminder".into(),
+            owner,
             pane: "%99".into(),
         };
         state.settings.write().await.idle_timeout_secs = 1;
@@ -824,7 +1235,7 @@ mod tests {
 
     #[test]
     fn agent_state_starts_reminder_not_cleared() {
-        let state = SessionAgentState::new("test-sess".into(), "%1".into());
+        let state = SessionAgentState::new(test_owner("test-sess"), "%1".into());
         assert!(!state.reminder_cleared);
         assert_eq!(state.next_clearing_id, 0);
     }
@@ -835,8 +1246,9 @@ mod tests {
         let agent = SessionAgent {
             app_state: state.clone(),
         };
+        let owner = register_test_session(&state, "test-clear", "%99").await;
         let args = SessionAgentArgs {
-            session_id: "test-clear".into(),
+            owner,
             pane: "%99".into(),
         };
         state.settings.write().await.idle_timeout_secs = 60;
@@ -863,8 +1275,9 @@ mod tests {
         let agent = SessionAgent {
             app_state: state.clone(),
         };
+        let owner = register_test_session(&state, "test-wrong-id", "%99").await;
         let args = SessionAgentArgs {
-            session_id: "test-wrong-id".into(),
+            owner,
             pane: "%99".into(),
         };
         state.settings.write().await.idle_timeout_secs = 60;
