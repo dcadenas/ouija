@@ -351,6 +351,31 @@ pub(crate) async fn deliver_inject_message_effect(
     }
 }
 
+pub(crate) async fn deliver_owned_inject_message_effect(
+    state: &Arc<AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    request: InjectDeliveryRequest<'_>,
+) -> DeliveryOutcome {
+    if owner.session_id != request.session_id {
+        return DeliveryOutcome::Rejected(format!(
+            "scheduled delivery owner changed for session {}",
+            request.session_id
+        ));
+    }
+    let pane = request.pane.to_string();
+    state
+        .with_owned_pane_claim(owner, &pane, || {
+            deliver_inject_message_effect(state, request)
+        })
+        .await
+        .unwrap_or_else(|| {
+            DeliveryOutcome::Rejected(format!(
+                "scheduled delivery owner changed for session {}",
+                owner.session_id
+            ))
+        })
+}
+
 /// Central daemon state holding sessions, nodes, and transports.
 pub struct AppState {
     pub config: OuijaConfig,
@@ -1043,15 +1068,22 @@ impl AppState {
     {
         let gate = self.pane_resource_gate(pane);
         let _resource = gate.lock().await;
-        let current = self
-            .protocol
-            .read()
-            .await
-            .sessions
-            .get(&owner.session_id)
-            .is_some_and(|session| {
-                session.owner() == *owner && session.pane.as_deref() == Some(pane)
-            });
+        let current = {
+            let protocol = self.protocol.read().await;
+            protocol
+                .sessions
+                .get(&owner.session_id)
+                .is_some_and(|session| {
+                    session.owner() == *owner && session.pane.as_deref() == Some(pane)
+                })
+                || protocol
+                    .lifecycle_leases
+                    .get(&owner.session_id)
+                    .is_some_and(|lease| {
+                        lease.inert_pane.as_deref() == Some(pane)
+                            && lease.inert_pane_owner.as_ref() == Some(owner)
+                    })
+        };
         if current { Some(action().await) } else { None }
     }
 
@@ -1559,6 +1591,7 @@ impl AppState {
         result
     }
 
+    #[cfg(test)]
     pub(crate) async fn with_backend_binding_transition<F, T>(
         &self,
         target_session_id: &str,
@@ -1589,6 +1622,7 @@ impl AppState {
     /// Unlike the generic event API, this exposes whether the authority
     /// transition was accepted so a caller can avoid doing external launch
     /// work after a concurrent restart or repair has taken ownership.
+    #[cfg(test)]
     pub fn stage_fresh_launch(
         self: &Arc<Self>,
         id: &str,
@@ -1610,6 +1644,7 @@ impl AppState {
         ))
     }
 
+    #[cfg(test)]
     async fn _stage_fresh_launch(
         self: &Arc<Self>,
         id: String,
@@ -4670,6 +4705,25 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn inert_pane_owner_can_launch_before_session_commit() {
+        let state = AppState::new_for_test();
+        let owner = match state.reserve_start("worker").await.unwrap() {
+            crate::daemon_protocol::StartDisposition::Reserved(owner) => owner,
+            other => panic!("expected reservation, got {other:?}"),
+        };
+        state
+            .record_inert_start_pane(&owner, owner.clone(), "%staged".into())
+            .await
+            .unwrap();
+
+        let allowed = state
+            .with_owned_pane_claim(&owner, "%staged", || async { "launched" })
+            .await;
+
+        assert_eq!(allowed, Some("launched"));
+    }
+
+    #[tokio::test]
     async fn durable_start_commit_rolls_back_when_snapshot_write_fails() {
         let config = test_config();
         let state = AppState::new(config.clone());
@@ -5054,6 +5108,44 @@ pub(crate) mod tests {
         assert!(
             matches!(outcome, DeliveryOutcome::Rejected(ref reason) if reason.contains("pane %2 is not owned by session target")),
             "expected stale pane rejection, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_inject_rejects_same_pane_replacement() {
+        let state = AppState::new_for_test();
+        proto_register(&state, "target", Some("%same")).await;
+        let stale_owner = state.protocol.read().await.sessions["target"].owner();
+        {
+            let mut proto = state.protocol.write().await;
+            proto.apply(crate::daemon_protocol::Event::Remove {
+                id: "target".into(),
+                keep_worktree: true,
+            });
+            proto.apply(crate::daemon_protocol::Event::Register {
+                id: "target".into(),
+                pane: Some("%same".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            });
+        }
+
+        let outcome = deliver_owned_inject_message_effect(
+            &state,
+            &stale_owner,
+            InjectDeliveryRequest {
+                session_id: "target",
+                pane: "%same",
+                message: "must not reach replacement",
+                vim_mode: false,
+                delivery_method: Some("tmux"),
+                recorded_method: None,
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, DeliveryOutcome::Rejected(ref reason) if reason.contains("owner changed")),
+            "expected exact-owner rejection, got {outcome:?}"
         );
     }
 

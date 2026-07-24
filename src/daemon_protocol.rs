@@ -10778,6 +10778,27 @@ mod stateright_model {
         ReapDead {
             ids: Vec<String>,
         },
+        ReserveStart {
+            id: String,
+        },
+        CommitStart {
+            id: String,
+        },
+        AbortLease {
+            id: String,
+        },
+        ClaimRestart {
+            id: String,
+        },
+        StageRestart {
+            id: String,
+        },
+        CompleteRestart {
+            id: String,
+        },
+        StaleReap {
+            id: String,
+        },
         Rename {
             old_id: String,
             new_id: String,
@@ -10844,6 +10865,13 @@ mod stateright_model {
         Remove(String),
         RemoveKeep(String),
         ReapDead(Vec<String>),
+        ReserveStart(String),
+        CommitStart(String),
+        AbortLease(String),
+        ClaimRestart(String),
+        StageRestart(String),
+        CompleteRestart(String),
+        StaleReap(String),
         Rename(String, String),
         Send {
             from: String,
@@ -10870,6 +10898,9 @@ mod stateright_model {
         SessionDriver {
             target: Id,
         },
+        LifecycleDriver {
+            target: Id,
+        },
     }
 
     #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -10885,6 +10916,8 @@ mod stateright_model {
             last_cleaned_worktrees: BTreeSet<String>,
             /// Whether the last event was a ReapDead.
             last_was_reap: bool,
+            /// Once false, a stale delayed result removed or replaced its winner.
+            stale_result_preserved: bool,
         },
         Driver {
             actions_taken: u8,
@@ -10892,6 +10925,7 @@ mod stateright_model {
     }
 
     const MAX_DRIVER_ACTIONS: u8 = 2;
+    const MAX_LIFECYCLE_ACTIONS: u8 = 5;
 
     #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
     enum SendOutcome {
@@ -10939,9 +10973,14 @@ mod stateright_model {
                     last_event_type: LastEvent::Other,
                     last_cleaned_worktrees: BTreeSet::new(),
                     last_was_reap: false,
+                    stale_result_preserved: true,
                 },
                 Self::SessionDriver { .. } => {
                     offer_actions(o);
+                    ModelState::Driver { actions_taken: 0 }
+                }
+                Self::LifecycleDriver { .. } => {
+                    offer_lifecycle_actions(o);
                     ModelState::Driver { actions_taken: 0 }
                 }
             }
@@ -10968,6 +11007,7 @@ mod stateright_model {
                 last_event_type,
                 last_cleaned_worktrees,
                 last_was_reap,
+                stale_result_preserved,
             } = s
             else {
                 return;
@@ -11104,6 +11144,126 @@ mod stateright_model {
                     route_effects(ds, &effects, peers, o);
                 }
 
+                ModelMsg::ReserveStart { id: _ }
+                | ModelMsg::CommitStart { id: _ }
+                | ModelMsg::AbortLease { id: _ }
+                | ModelMsg::ClaimRestart { id: _ }
+                | ModelMsg::StageRestart { id: _ }
+                | ModelMsg::CompleteRestart { id: _ }
+                | ModelMsg::StaleReap { id: _ } => {
+                    let mut is_reap = false;
+                    let effects = match msg {
+                        ModelMsg::ReserveStart { id } => {
+                            let _ = ds.reserve_start(&id);
+                            Vec::new()
+                        }
+                        ModelMsg::CommitStart { id } => {
+                            let owner = ds.lifecycle_leases.get(&id).and_then(|lease| {
+                                (lease.phase == LifecyclePhase::Starting)
+                                    .then(|| lease.owner.clone())
+                            });
+                            owner
+                                .map(|owner| {
+                                    ds.commit_reserved_start(
+                                        &owner,
+                                        Some(format!("model-pane-{id}")),
+                                        SessionMeta {
+                                            networked: true,
+                                            ..Default::default()
+                                        },
+                                    )
+                                    .effects
+                                })
+                                .unwrap_or_default()
+                        }
+                        ModelMsg::AbortLease { id } => {
+                            if let Some(owner) = ds
+                                .lifecycle_leases
+                                .get(&id)
+                                .map(|lease| lease.owner.clone())
+                            {
+                                let _ = ds.abort_lifecycle(&owner);
+                            }
+                            Vec::new()
+                        }
+                        ModelMsg::ClaimRestart { id } => {
+                            if let Some(owner) = ds.sessions.get(&id).map(SessionEntry::owner) {
+                                let _ = ds.claim_existing_start(&owner);
+                            }
+                            Vec::new()
+                        }
+                        ModelMsg::StageRestart { id } => {
+                            let owner = ds.lifecycle_leases.get(&id).and_then(|lease| {
+                                (lease.phase == LifecyclePhase::Restarting
+                                    && lease.restart_target_owner.is_none())
+                                .then(|| lease.owner.clone())
+                            });
+                            owner
+                                .map(|owner| {
+                                    ds.stage_restart_launch(
+                                        &owner,
+                                        "codex-cli".into(),
+                                        true,
+                                        Some("model-proof".into()),
+                                        None,
+                                    )
+                                    .effects
+                                })
+                                .unwrap_or_default()
+                        }
+                        ModelMsg::CompleteRestart { id } => {
+                            let authority = ds.lifecycle_leases.get(&id).and_then(|lease| {
+                                Some((lease.owner.clone(), lease.restart_target_owner.clone()?))
+                            });
+                            authority
+                                .and_then(|(owner, target)| {
+                                    let metadata = ds.sessions.get(&id)?.metadata.clone();
+                                    Some(
+                                        ds.complete_restart_launch(
+                                            &owner,
+                                            &target,
+                                            Some(format!("model-pane-{id}")),
+                                            metadata,
+                                        )
+                                        .effects,
+                                    )
+                                })
+                                .unwrap_or_default()
+                        }
+                        ModelMsg::StaleReap { id } => {
+                            is_reap = true;
+                            let before = ds.sessions.get(&id).map(SessionEntry::owner);
+                            let effects = before
+                                .as_ref()
+                                .and_then(|owner| {
+                                    let pane = ds.sessions.get(&id)?.pane.clone()?;
+                                    let stale_incarnation =
+                                        SessionIncarnation(owner.incarnation.0.saturating_sub(1));
+                                    Some(ds.apply(Event::ReapDead {
+                                        dead_sessions: vec![(
+                                            ResourceOwner {
+                                                session_id: id.clone(),
+                                                incarnation: stale_incarnation,
+                                            },
+                                            pane,
+                                        )],
+                                    }))
+                                })
+                                .unwrap_or_default();
+                            *stale_result_preserved &=
+                                before == ds.sessions.get(&id).map(SessionEntry::owner);
+                            effects
+                        }
+                        _ => unreachable!(),
+                    };
+                    normalize_timestamps(ds);
+                    *last_send_result = None;
+                    *last_event_type = LastEvent::Other;
+                    *last_cleaned_worktrees = extract_cleaned_worktrees(&effects);
+                    *last_was_reap = is_reap;
+                    route_effects(ds, &effects, peers, o);
+                }
+
                 // -- Send (local API call) --
                 ModelMsg::Send {
                     from,
@@ -11199,7 +11359,7 @@ mod stateright_model {
             random: &Self::Random,
             o: &mut Out<Self>,
         ) {
-            if let Self::SessionDriver { target } = self {
+            if let Self::SessionDriver { target } | Self::LifecycleDriver { target } = self {
                 let s = state.to_mut();
                 if let ModelState::Driver { actions_taken } = s {
                     *actions_taken += 1;
@@ -11229,6 +11389,27 @@ mod stateright_model {
                         }
                         ModelAction::ReapDead(ids) => {
                             o.send(*target, ModelMsg::ReapDead { ids: ids.clone() })
+                        }
+                        ModelAction::ReserveStart(id) => {
+                            o.send(*target, ModelMsg::ReserveStart { id: id.clone() })
+                        }
+                        ModelAction::CommitStart(id) => {
+                            o.send(*target, ModelMsg::CommitStart { id: id.clone() })
+                        }
+                        ModelAction::AbortLease(id) => {
+                            o.send(*target, ModelMsg::AbortLease { id: id.clone() })
+                        }
+                        ModelAction::ClaimRestart(id) => {
+                            o.send(*target, ModelMsg::ClaimRestart { id: id.clone() })
+                        }
+                        ModelAction::StageRestart(id) => {
+                            o.send(*target, ModelMsg::StageRestart { id: id.clone() })
+                        }
+                        ModelAction::CompleteRestart(id) => {
+                            o.send(*target, ModelMsg::CompleteRestart { id: id.clone() })
+                        }
+                        ModelAction::StaleReap(id) => {
+                            o.send(*target, ModelMsg::StaleReap { id: id.clone() })
                         }
                         ModelAction::Rename(old, new) => o.send(
                             *target,
@@ -11265,8 +11446,17 @@ mod stateright_model {
                             },
                         ),
                     }
-                    if *actions_taken < MAX_DRIVER_ACTIONS {
-                        offer_actions(o);
+                    let max_actions = match self {
+                        Self::SessionDriver { .. } => MAX_DRIVER_ACTIONS,
+                        Self::LifecycleDriver { .. } => MAX_LIFECYCLE_ACTIONS,
+                        Self::Daemon { .. } => unreachable!(),
+                    };
+                    if *actions_taken < max_actions {
+                        match self {
+                            Self::SessionDriver { .. } => offer_actions(o),
+                            Self::LifecycleDriver { .. } => offer_lifecycle_actions(o),
+                            Self::Daemon { .. } => unreachable!(),
+                        }
                     }
                 }
             }
@@ -11482,6 +11672,22 @@ mod stateright_model {
         o.choose_random("action", c);
     }
 
+    fn offer_lifecycle_actions(o: &mut Out<ModelActor>) {
+        let id = SESSION_IDS[0].to_string();
+        o.choose_random(
+            "lifecycle-action",
+            vec![
+                ModelAction::ReserveStart(id.clone()),
+                ModelAction::CommitStart(id.clone()),
+                ModelAction::AbortLease(id.clone()),
+                ModelAction::ClaimRestart(id.clone()),
+                ModelAction::StageRestart(id.clone()),
+                ModelAction::CompleteRestart(id.clone()),
+                ModelAction::StaleReap(id),
+            ],
+        );
+    }
+
     // -- Property checkers ---------------------------------------------------
 
     fn daemon_states(actor_states: &[std::sync::Arc<ModelState>]) -> Vec<&DaemonState> {
@@ -11611,6 +11817,124 @@ mod stateright_model {
         true
     }
 
+    fn lifecycle_authority_is_consistent(ds: &DaemonState) -> bool {
+        for (id, session) in &ds.sessions {
+            if session.id != *id {
+                return false;
+            }
+            if matches!(session.origin, Origin::Local) && session.owner().session_id != *id {
+                return false;
+            }
+            if session.metadata.session_incarnation > ds.incarnation_high_water {
+                return false;
+            }
+        }
+        for (id, lease) in &ds.lifecycle_leases {
+            if lease.owner.session_id != *id
+                || lease.owner.incarnation > ds.incarnation_high_water
+                || lease.restart_target_owner.as_ref().is_some_and(|owner| {
+                    owner.session_id != *id || owner.incarnation > ds.incarnation_high_water
+                })
+                || lease
+                    .inert_pane_owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.session_id != *id)
+                || lease
+                    .project_dir_owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.session_id != *id)
+                || lease
+                    .backend_session_owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.session_id != *id)
+            {
+                return false;
+            }
+            let current_owner = ds.sessions.get(id).map(SessionEntry::owner);
+            match lease.phase {
+                LifecyclePhase::Starting => {
+                    if lease.restart_target_owner.is_some()
+                        || lease.restart_previous.is_some()
+                        || current_owner
+                            .as_ref()
+                            .is_some_and(|owner| owner != &lease.owner)
+                        || lease
+                            .inert_pane_owner
+                            .as_ref()
+                            .is_some_and(|owner| owner != &lease.owner)
+                    {
+                        return false;
+                    }
+                }
+                LifecyclePhase::Restarting => {
+                    match (
+                        lease.restart_target_owner.as_ref(),
+                        lease.restart_previous.as_deref(),
+                    ) {
+                        (None, None) => {
+                            if current_owner.as_ref() != Some(&lease.owner) {
+                                return false;
+                            }
+                        }
+                        (Some(target), Some(previous)) => {
+                            if current_owner.as_ref() != Some(target)
+                                || previous.owner() != lease.owner
+                                || lease
+                                    .inert_pane_owner
+                                    .as_ref()
+                                    .is_some_and(|owner| owner != target)
+                                || lease
+                                    .backend_session_owner
+                                    .as_ref()
+                                    .is_some_and(|owner| owner != target)
+                            {
+                                return false;
+                            }
+                        }
+                        _ => return false,
+                    }
+                }
+                LifecyclePhase::Stopping => {
+                    if lease.restart_target_owner.is_some()
+                        || lease.restart_previous.is_some()
+                        || current_owner.as_ref() != Some(&lease.owner)
+                        || lease
+                            .inert_pane_owner
+                            .as_ref()
+                            .is_some_and(|owner| owner != &lease.owner)
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn check_lifecycle_authority(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        daemon_states(&state.actor_states)
+            .iter()
+            .all(|ds| lifecycle_authority_is_consistent(ds))
+    }
+
+    fn check_stale_result_preserves_winner(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        state.actor_states.iter().all(|state| {
+            !matches!(
+                state.as_ref(),
+                ModelState::Daemon {
+                    stale_result_preserved: false,
+                    ..
+                }
+            )
+        })
+    }
+
     /// wire_seq is monotonically increasing (never decreases).
     fn check_seq_monotonic(
         _: &ActorModel<ModelActor, ()>,
@@ -11732,6 +12056,15 @@ mod stateright_model {
         })
     }
 
+    fn check_some_lifecycle_lease(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        daemon_states(&state.actor_states)
+            .iter()
+            .any(|ds| !ds.lifecycle_leases.is_empty())
+    }
+
     // -- Model builder -------------------------------------------------------
 
     fn build_model() -> ActorModel<ModelActor, ()> {
@@ -11757,6 +12090,16 @@ mod stateright_model {
                 Expectation::Always,
                 "register idempotent",
                 check_register_idempotent,
+            )
+            .property(
+                Expectation::Always,
+                "single lifecycle authority",
+                check_lifecycle_authority,
+            )
+            .property(
+                Expectation::Always,
+                "stale results preserve winner",
+                check_stale_result_preserves_winner,
             )
             .property(Expectation::Always, "seq monotonic", check_seq_monotonic)
             .property(
@@ -11818,6 +12161,38 @@ mod stateright_model {
             )
             .property(Expectation::Sometimes, "reap exercised", check_some_reap)
             .within_boundary(|_, state| state.network.len() <= 12)
+    }
+
+    fn build_lifecycle_model() -> ActorModel<ModelActor, ()> {
+        let daemon = Id::from(0usize);
+        ActorModel::new((), ())
+            .actor(ModelActor::Daemon {
+                daemon_id: "npub-lifecycle".into(),
+                daemon_name: "host-lifecycle".into(),
+                peers: vec![],
+            })
+            .actor(ModelActor::LifecycleDriver { target: daemon })
+            .init_network(Network::new_unordered_nonduplicating([]))
+            .property(
+                Expectation::Always,
+                "single lifecycle authority",
+                check_lifecycle_authority,
+            )
+            .property(
+                Expectation::Always,
+                "stale results preserve winner",
+                check_stale_result_preserves_winner,
+            )
+            .property(
+                Expectation::Always,
+                "reap never cleans worktree",
+                check_reap_never_cleans_worktree,
+            )
+            .property(
+                Expectation::Sometimes,
+                "lifecycle lease exercised",
+                check_some_lifecycle_lease,
+            )
     }
 
     // -- Reply threading property checkers -----------------------------------
@@ -11986,19 +12361,41 @@ mod stateright_model {
     // -- Tests ---------------------------------------------------------------
 
     #[test]
+    fn lifecycle_authority_invariant_detects_conflicting_inert_owner() {
+        let mut state = DaemonState::new_for_model("d1".into(), "host1".into());
+        let owner = match state.reserve_start("A").unwrap() {
+            StartDisposition::Reserved(owner) => owner,
+            other => panic!("expected reservation, got {other:?}"),
+        };
+        let lease = state.lifecycle_leases.get_mut("A").unwrap();
+        lease.inert_pane = Some("model-pane-A".into());
+        lease.inert_pane_owner = Some(ResourceOwner {
+            session_id: "B".into(),
+            incarnation: owner.incarnation,
+        });
+
+        assert!(!lifecycle_authority_is_consistent(&state));
+    }
+
+    #[test]
     #[ignore = "expensive exhaustive Stateright model check; run explicitly"]
     fn model_check_bfs() {
         use std::time::Instant;
         let start = Instant::now();
         let checker = build_model().checker().spawn_bfs().join();
+        let lifecycle_checker = build_lifecycle_model().checker().spawn_bfs().join();
         let elapsed = start.elapsed();
         println!(
-            "Real DaemonState model -- states: {}, unique: {}, depth: {}, time: {:.1}s",
+            "Real DaemonState model -- states: {}, unique: {}, depth: {}; lifecycle states: {}, unique: {}, depth: {}; time: {:.1}s",
             checker.state_count(),
             checker.unique_state_count(),
             checker.max_depth(),
+            lifecycle_checker.state_count(),
+            lifecycle_checker.unique_state_count(),
+            lifecycle_checker.max_depth(),
             elapsed.as_secs_f64(),
         );
         checker.assert_properties();
+        lifecycle_checker.assert_properties();
     }
 }

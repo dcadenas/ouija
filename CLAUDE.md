@@ -40,7 +40,13 @@ Activity signals that reset idle or watchdog timers should use the existing `Ses
 
 `Event::Register` owns local pane binding. `apply_register` deduplicates by pane and can evict the previous Local session for that pane, so every external registration path must apply the same defenses as the canonical scan path: only register assistant panes, skip panes already bound to Local sessions, respect the `@ouija_id` claim marker when scanning, require a usable current path/session name, normalize through `resolve_project_root` + `sanitize_session_id`, and share `resolve_unique_session_id` conflict handling instead of reimplementing it (#1442).
 
-When spawning or respawning tmux panes for Ouija-managed sessions, route environment arguments through `tmux::pane_env_args(session_id)`. That helper exports `OUIJA_SESSION_ID` and the history-suppression variables for `new-window`, `new-session`, and `respawn-pane`; inlining `-e KEY=VALUE` at spawn sites can break `resolve_my_session_id` during the pane-var race window (#1429).
+When spawning or respawning tmux panes for Ouija-managed sessions, route environment arguments through `tmux::pane_env_args(session_id, credential, incarnation)`. That helper exports `OUIJA_SESSION_ID`, `OUIJA_SESSION_INCARNATION`, any one-time launch credential, and the history-suppression variables for `new-window`, `new-session`, and `respawn-pane`; inlining `-e KEY=VALUE` at spawn sites can break identity resolution during the pane-var race window (#1429).
+
+### Session lifecycle ownership invariant
+
+Every local session incarnation has one daemon-issued, monotonically increasing `SessionIncarnation`. A `ResourceOwner` (public session ID plus incarnation) is the authority for its pane, backend session, worktree, hooks, session agent, and delayed observations. Public IDs and pane IDs alone are never sufficient ownership checks because both can be reused.
+
+Starts, restarts, kills, scheduler revivals, and hard-stall recovery must persist a `LifecycleLease` before filesystem, tmux, process, or HTTP work. Delayed success, failure, readiness, prompt, attach, cleanup, and reaper results compare the exact owner and no-op when superseded. Resource gates serialize the comparison and side effect without holding the protocol lock across I/O. Reaping preserves worktrees; only an explicit, exact-owner cleanup may remove one.
 
 ### Key modules
 

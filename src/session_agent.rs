@@ -98,6 +98,34 @@ impl std::fmt::Debug for SessionAgentState {
     }
 }
 
+async fn claim_hard_stall_restart(
+    app_state: &Arc<AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    pane: &str,
+) -> bool {
+    match app_state.claim_existing_start(owner).await {
+        Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
+        Ok(_) | Err(_) => return false,
+    }
+    let exact_claim = {
+        let proto = app_state.protocol.read().await;
+        proto
+            .sessions
+            .get(&owner.session_id)
+            .is_some_and(|session| {
+                session.owner() == *owner && session.pane.as_deref() == Some(pane)
+            })
+            && proto
+                .lifecycle_leases
+                .get(&owner.session_id)
+                .is_some_and(|lease| lease.owner == *owner)
+    };
+    if !exact_claim {
+        let _ = app_state.abort_lifecycle(owner).await;
+    }
+    exact_claim
+}
+
 impl SessionAgentState {
     /// Create initial agent state for a session and pane.
     pub fn new(owner: ResourceOwner, pane: String) -> Self {
@@ -678,24 +706,14 @@ impl SessionAgent {
         let pane = state.pane.clone();
         let sid = owner.session_id.clone();
 
-        // Snapshot loop state before restart
-        let stash = meta.clone();
+        if !claim_hard_stall_restart(&app_state, &owner, &pane).await {
+            return;
+        }
 
         tokio::spawn(async move {
-            let still_current = app_state
-                .protocol
-                .read()
-                .await
-                .sessions
-                .get(&owner.session_id)
-                .is_some_and(|session| {
-                    session.owner() == owner && session.pane.as_deref() == Some(pane.as_str())
-                });
-            if !still_current {
-                return;
-            }
-            crate::nostr_transport::restart_session(
+            crate::nostr_transport::restart_session_for_start(
                 &app_state,
+                &owner,
                 &sid,
                 true,
                 None,
@@ -710,27 +728,6 @@ impl SessionAgent {
                 None, // idle_policy (fallback to prev_metadata.idle_policy)
             )
             .await;
-
-            // Re-stamp loop fields
-            let restamped = {
-                let mut proto = app_state.protocol.write().await;
-                if let Some(session) = proto.sessions.get_mut(&sid)
-                    && session.owner() == owner
-                    && session.pane.as_deref() == Some(pane.as_str())
-                {
-                    session.metadata.inherit_recurrence_from(&stash);
-                    true
-                } else {
-                    false
-                }
-            };
-            if !restamped {
-                return;
-            }
-            let proto = app_state.protocol.read().await;
-            if let Err(error) = app_state.persist_protocol_state(&proto) {
-                tracing::warn!("failed to persist session-agent state: {error}");
-            }
         });
     }
 }
@@ -815,8 +812,9 @@ mod tests {
         let agent = SessionAgent {
             app_state: state.clone(),
         };
+        let owner = state.protocol.read().await.sessions[session_id].owner();
         let args = SessionAgentArgs {
-            session_id: session_id.into(),
+            owner,
             pane: "%99".into(),
         };
         let (actor, handle) = Actor::spawn(None, agent, args).await.expect("spawn failed");
@@ -1048,6 +1046,37 @@ mod tests {
         );
         actor.stop(None);
         handle.await.expect("actor failed");
+    }
+
+    #[tokio::test]
+    async fn hard_stall_cannot_claim_same_pane_replacement() {
+        let state = crate::state::AppState::new_for_test();
+        let stale_owner = register_test_session(&state, "worker", "%same").await;
+        {
+            let mut proto = state.protocol.write().await;
+            proto.apply(crate::daemon_protocol::Event::Remove {
+                id: "worker".into(),
+                keep_worktree: true,
+            });
+            proto.apply(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%same".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            });
+        }
+
+        assert!(
+            !claim_hard_stall_restart(&state, &stale_owner, "%same").await,
+            "the hard-stall actor must claim its exact incarnation before restart work"
+        );
+        assert!(
+            !state
+                .protocol
+                .read()
+                .await
+                .lifecycle_leases
+                .contains_key("worker")
+        );
     }
 
     #[test]

@@ -884,6 +884,29 @@ pub fn close_shell_after(command: &str) -> String {
     format!("{command}; exit")
 }
 
+/// Resolve the shell tmux itself is configured to launch for a new pane.
+///
+/// `respawn-pane` without a shell-command reuses the pane's original command,
+/// which may be a backend binary for externally registered panes. Callers
+/// that need a fresh interactive command boundary must pass this explicitly.
+pub fn default_shell() -> String {
+    Command::new("tmux")
+        .args(["show-options", "-gv", "default-shell"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            let shell = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            (!shell.is_empty()).then_some(shell)
+        })
+        .or_else(|| {
+            std::env::var("SHELL")
+                .ok()
+                .filter(|shell| !shell.is_empty())
+        })
+        .unwrap_or_else(|| "/bin/sh".into())
+}
+
 /// Build the `-e KEY=VALUE` argument list handed to `tmux new-window`,
 /// `tmux new-session`, and `tmux respawn-pane` when ouija spawns a pane.
 ///

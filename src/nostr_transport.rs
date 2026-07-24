@@ -2434,30 +2434,7 @@ pub async fn start_session(
             })
             .await;
             match launch_result {
-                Ok(Ok(())) => {
-                    if let Err(error) = state.abort_lifecycle(&owner).await {
-                        let cleanup = remove_inert_start_pane(state, &owner, &pane_id).await;
-                        cleanup_reserved_start(
-                            state,
-                            &owner,
-                            &pane_id,
-                            session_start_credential.as_deref(),
-                        )
-                        .await;
-                        return (
-                            format!(
-                                "start failed to persist launch completion: {error}{}",
-                                cleanup
-                                    .err()
-                                    .map(|cleanup_error| {
-                                        format!("; launched pane cleanup failed: {cleanup_error}")
-                                    })
-                                    .unwrap_or_default()
-                            ),
-                            None,
-                        );
-                    }
-                }
+                Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     cleanup_reserved_start(
                         state,
@@ -2561,6 +2538,28 @@ pub async fn start_session(
                         None,
                     );
                 }
+            }
+            if let Err(error) = state.abort_lifecycle(&owner).await {
+                let cleanup = remove_inert_start_pane(state, &owner, &pane_id).await;
+                cleanup_reserved_start(
+                    state,
+                    &owner,
+                    &pane_id,
+                    session_start_credential.as_deref(),
+                )
+                .await;
+                return (
+                    format!(
+                        "start failed to persist launch completion: {error}{}",
+                        cleanup
+                            .err()
+                            .map(|cleanup_error| {
+                                format!("; launched pane cleanup failed: {cleanup_error}")
+                            })
+                            .unwrap_or_default()
+                    ),
+                    None,
+                );
             }
             let prompt_delivery = pre_queued_prompt
                 .as_ref()
@@ -2723,6 +2722,7 @@ pub enum RestartOutcome {
     Superseded,
 }
 
+#[cfg(test)]
 async fn claim_restart_for_external_work(
     state: &std::sync::Arc<AppState>,
     name: &str,
@@ -2941,21 +2941,85 @@ pub async fn restart_session(
     parent_session_override: ParentSessionOverride,
     idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
 ) -> (String, Option<u64>, RestartOutcome) {
-    let owner = match claim_restart_for_external_work(state, name).await {
-        Ok(owner) => owner,
-        Err(RestartOutcome::Superseded) => {
+    let disposition = match reserve_start_for_launch(state, name).await {
+        Ok(disposition) => disposition,
+        Err(error) => {
+            tracing::warn!(
+                session = name,
+                "failed to persist restart reservation: {error}"
+            );
+            return (
+                format!("failed to reserve restart for '{name}'"),
+                None,
+                RestartOutcome::Failed,
+            );
+        }
+    };
+    let owner = match disposition {
+        crate::daemon_protocol::StartDisposition::Reserved(owner) => {
+            if repair_reservation.is_some() {
+                let _ = state.abort_lifecycle(&owner).await;
+                return (
+                    "restart repair target disappeared before staging".into(),
+                    None,
+                    RestartOutcome::Superseded,
+                );
+            }
+            let parent_session = parent_session_override.resolve(None);
+            let result = start_session(
+                state,
+                name,
+                None,
+                None,
+                prompt,
+                from,
+                expects_reply,
+                backend,
+                model,
+                effort,
+                reminder,
+                parent_session.as_deref(),
+                idle_policy,
+                None,
+                None,
+                false,
+                Some(owner.clone()),
+            )
+            .await;
+            let protocol = state.protocol.read().await;
+            let outcome = match protocol.sessions.get(name) {
+                Some(session) if session.owner() == owner => RestartOutcome::Restarted,
+                Some(_) => RestartOutcome::Superseded,
+                None => RestartOutcome::Failed,
+            };
+            return (result.0, result.1, outcome);
+        }
+        crate::daemon_protocol::StartDisposition::InProgress(_) => {
             return (
                 format!("restart already in progress for '{name}'"),
                 None,
                 RestartOutcome::Superseded,
             );
         }
-        Err(_) => {
-            return (
-                format!("session '{name}' not found or restart claim failed"),
-                None,
-                RestartOutcome::Failed,
-            );
+        crate::daemon_protocol::StartDisposition::Existing(owner) => {
+            match state.claim_existing_start(&owner).await {
+                Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => owner,
+                Ok(_) => {
+                    return (
+                        format!("restart superseded while claiming '{name}'"),
+                        None,
+                        RestartOutcome::Superseded,
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(session = name, "failed to persist restart claim: {error}");
+                    return (
+                        format!("failed to claim restart for '{name}'"),
+                        None,
+                        RestartOutcome::Failed,
+                    );
+                }
+            }
         }
     };
     restart_session_for_start(
@@ -3493,15 +3557,28 @@ async fn restart_session_claimed(
                     let mut respawn_args: Vec<&str> = vec!["respawn-pane", "-k"];
                     respawn_args.extend(env_args.iter().map(String::as_str));
                     respawn_args.extend_from_slice(&["-t", pane]);
-                    if !is_http_api {
-                        respawn_args.push(&respawn_cmd);
-                    }
+                    let respawn_shell = crate::tmux::default_shell();
+                    let direct_tui_command = (!is_http_api).then(|| {
+                        format!(
+                            "{} -lc {}",
+                            crate::scheduler::shell_escape(&respawn_shell),
+                            crate::scheduler::shell_escape(&respawn_cmd)
+                        )
+                    });
+                    respawn_args.push(
+                        direct_tui_command
+                            .as_deref()
+                            .unwrap_or(respawn_shell.as_str()),
+                    );
                     crate::tmux::configure_managed_pane(pane);
                     let output = Command::new("tmux").args(&respawn_args).output();
                     match output {
                         Ok(o) if o.status.success() => {
                             if is_http_api {
-                                // Give the fresh shell a moment to initialise
+                                // A backgrounded serve command would let a
+                                // non-interactive shell exit immediately, so
+                                // keep the fresh shell alive and launch it via
+                                // terminal input.
                                 std::thread::sleep(std::time::Duration::from_millis(300));
                                 let hidden = format!(" {respawn_cmd}");
                                 let status = Command::new("tmux")
@@ -5911,6 +5988,7 @@ fn ouija_worktree_candidates(repo_dir: &str, name: &str, home: &std::path::Path)
 ///
 /// TuiInjection sessions pass prompts as CLI args instead — this function
 /// should only be called for HttpApi backends.
+#[cfg(test)]
 pub(crate) fn schedule_prompt_injection(
     state: &std::sync::Arc<AppState>,
     session_name: &str,
@@ -5925,6 +6003,24 @@ pub(crate) fn schedule_prompt_injection(
         prompt,
         backend_session_id,
         None,
+    );
+}
+
+pub(crate) fn schedule_prompt_injection_owned(
+    state: &std::sync::Arc<AppState>,
+    session_name: &str,
+    pane_id: String,
+    prompt: String,
+    backend_session_id: Option<String>,
+    owner: crate::daemon_protocol::ResourceOwner,
+) {
+    schedule_prompt_injection_for_owner(
+        state,
+        session_name,
+        pane_id,
+        prompt,
+        backend_session_id,
+        Some(owner),
     );
 }
 
