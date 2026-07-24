@@ -196,7 +196,7 @@ wake a session without a manual reminder. Ouija supplies the concrete
 `clear-reminder` command and current ID in each injected nudge, so manual
 reminder text must not include its own clearing command.
 
-Outside tmux, such as an OpenCode HTTP/API tool process, run `ouija whoami` to resolve your own session id and pass its exact output as the sender: `ouija ask <to> "msg" --from <public-ouija-id>`. Never guess a sender id (project directory name, branch name, or an `ouija ls` entry) — the daemon rejects sender claims it can disprove. Do not use backend labels like `opencode` or opaque OpenCode `backend_session_id` values as `--from`.
+Outside tmux, such as an OpenCode HTTP/API tool process, run `ouija whoami` to resolve your own session id. Implicit resolution remains fail-closed when no pane, environment, or complete backend pair proves one Local owner. For an explicit local send, an exact public Local id from injected context or the operator remains authoritative despite missing, not-found, or incomplete backend evidence: `ouija ask <to> "msg" --from <public-ouija-id>`. The daemon rejects absent, Remote/Human, and sibling-conflicted claims. Never guess a sender id (project directory name, branch name, or an `ouija ls` entry), and never use a backend label or opaque backend session id as `--from`.
 
 Run `ouija --help` for the full command list.
 

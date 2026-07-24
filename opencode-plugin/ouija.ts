@@ -78,8 +78,8 @@ export const OuijaPlugin: Plugin = async (ctx) => {
         const resolved = sid !== "(unknown)"
         const publicSessionId = resolved ? sid : "YOUR_OUIJA_ID"
         const senderGuidance = resolved
-          ? `Use your public Ouija session id (\`${publicSessionId}\`) as the sender. Never substitute another session's id.`
-          : `Your public Ouija session id could not be resolved when this session started. Run \`ouija whoami\` and use its exact output in place of \`YOUR_OUIJA_ID\` above; if it fails, relay its diagnostics to the user. While your identity is unresolved the daemon fail-closed rejects your sends \u2014 even a correct hand-typed \`--from\` is refused, because the CLI can only prove your identity from \`$OUIJA_SESSION_ID\`. The fix is the environment (export \`OUIJA_SESSION_ID\` in this shell, or restart the session), never retrying with another id. Never guess a sender id \u2014 not the project directory name, a branch name, or an entry picked from \`ouija ls\`. A guessed \`--from\` impersonates another session and misroutes its replies.`
+          ? `Use your exact public Ouija session id (\`${publicSessionId}\`) as the sender. Never substitute another session's id.`
+          : `Your public Ouija session id could not be resolved automatically when this session started. Implicit \`ouija whoami\` remains fail-closed when pane, environment, or backend evidence cannot prove one Local owner. An exact injected or operator-provided public Local session id is authoritative for an explicit local send: replace \`YOUR_OUIJA_ID\` above with that exact id and use \`--from\`, even when implicit evidence is missing, not found, or incomplete. The daemon still requires an existing Local session and rejects positive evidence that resolves to a sibling. If you have no exact injected or operator-provided id, run \`ouija whoami\` and relay its diagnostics to the user. Never guess a sender id \u2014 not the project directory name, a branch name, or an entry picked from \`ouija ls\`. A guessed \`--from\` impersonates another session and misroutes its replies.`
         output.system.push(`
 # Ouija Mesh
 

@@ -5977,6 +5977,151 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "body: {:?}", body.0);
     }
 
+    fn trusted_local_sender_context(
+        pane: Option<&str>,
+        self_id: Option<&str>,
+        backend_identity: Option<crate::backend::BackendSessionIdentity>,
+    ) -> crate::daemon_protocol::SenderContext {
+        serde_json::from_value(serde_json::json!({
+            "pane": pane,
+            "self_id": self_id,
+            "backend_identity": backend_identity,
+            "trusted_local_claim": true,
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn send_accepts_trusted_local_claim_from_replacement_codex_thread() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "hub-4".into(),
+                pane: Some("%old".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    backend_session_id: Some("old-thread".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "recipient".into(),
+                pane: Some("%recipient".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+
+        let (status, body) = send_msg(
+            State(state),
+            Json(SendBody {
+                from: "hub-4".into(),
+                to: "recipient".into(),
+                message: "replacement thread".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+                sender_ctx: Some(trusted_local_sender_context(
+                    None,
+                    None,
+                    Some(crate::backend::BackendSessionIdentity {
+                        backend: "codex-cli".into(),
+                        session_id: "new-thread".into(),
+                    }),
+                )),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body: {:?}", body.0);
+    }
+
+    #[tokio::test]
+    async fn send_rejects_trusted_local_claim_of_absent_sender_before_mutation() {
+        let state = state_with_victim_and_recipient().await;
+
+        let (status, body) = send_msg(
+            State(state.clone()),
+            Json(SendBody {
+                from: "missing".into(),
+                to: "recipient".into(),
+                message: "forged".into(),
+                expects_reply: true,
+                responds_to: None,
+                done: false,
+                sender_ctx: Some(trusted_local_sender_context(None, None, None)),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN, "body: {:?}", body.0);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not registered")
+        );
+        assert!(
+            !state
+                .protocol
+                .read()
+                .await
+                .pending_replies
+                .contains_key("recipient"),
+            "rejected send must not mutate pending-reply state"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_rejects_trusted_local_claim_of_remote_or_human_before_mutation() {
+        for (from, origin) in [
+            (
+                "peer/task",
+                crate::daemon_protocol::Origin::Remote("npub1peer".into()),
+            ),
+            (
+                "operator",
+                crate::daemon_protocol::Origin::Human("npub1operator".into()),
+            ),
+        ] {
+            let state = state_with_victim_and_recipient().await;
+            state.protocol.write().await.sessions.insert(
+                from.into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: from.into(),
+                    origin,
+                    ..Default::default()
+                },
+            );
+
+            let (status, body) = send_msg(
+                State(state.clone()),
+                Json(SendBody {
+                    from: from.into(),
+                    to: "recipient".into(),
+                    message: "forged".into(),
+                    expects_reply: true,
+                    responds_to: None,
+                    done: false,
+                    sender_ctx: Some(trusted_local_sender_context(None, None, None)),
+                }),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::FORBIDDEN, "{from}: {:?}", body.0);
+            assert!(
+                !state
+                    .protocol
+                    .read()
+                    .await
+                    .pending_replies
+                    .contains_key("recipient"),
+                "{from}: rejected send must not mutate pending-reply state"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn send_rejects_paneless_opencode_sibling_impersonation() {
         // Two opencode sessions in the same dir. The caller resolved its own
@@ -9061,31 +9206,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backend_session_ready_rejects_both_incomplete_legacy_identity_forms() {
-        for metadata in [
-            crate::daemon_protocol::SessionMeta {
-                backend: Some("opencode".into()),
-                ..Default::default()
-            },
-            crate::daemon_protocol::SessionMeta {
-                backend_session_id: Some("legacy-native-id".into()),
-                ..Default::default()
-            },
-        ] {
-            let state = crate::state::AppState::new_for_test();
-            state
-                .apply_and_execute(crate::daemon_protocol::Event::Register {
-                    id: "legacy".into(),
-                    pane: Some("%17".into()),
-                    metadata,
-                })
-                .await;
+    async fn backend_session_ready_only_overlaps_legacy_row_by_exact_native_id() {
+        let backend_only_state = crate::state::AppState::new_for_test();
+        backend_only_state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "backend-only".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
 
-            let response = backend_session_ready_inner(&state, "legacy-native-id".into()).await;
+        let response =
+            backend_session_ready_inner(&backend_only_state, "unrelated-native-id".into()).await;
 
-            assert_eq!(response["outcome"], "incomplete_legacy", "got: {response}");
-            assert!(response.get("session").is_none(), "got: {response}");
-        }
+        assert!(response.get("outcome").is_none(), "got: {response}");
+        assert_eq!(response["error"], "no session with this backend_session_id");
+        assert!(response.get("session").is_none(), "got: {response}");
+
+        let id_only_state = crate::state::AppState::new_for_test();
+        id_only_state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "id-only".into(),
+                pane: Some("%18".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend_session_id: Some("legacy-native-id".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let response = backend_session_ready_inner(&id_only_state, "legacy-native-id".into()).await;
+
+        assert_eq!(response["outcome"], "incomplete_legacy", "got: {response}");
+        assert!(response.get("session").is_none(), "got: {response}");
     }
 
     #[tokio::test]

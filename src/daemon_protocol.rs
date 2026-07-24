@@ -1238,6 +1238,15 @@ pub(crate) fn validate_backend_session_id_boundary(backend_sid: &str) -> Option<
 /// context means the new CLI positively reports it has no `$TMUX_PANE`.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct SenderContext {
+    /// The CLI received an explicit public sender id from its trusted local
+    /// invocation context. The daemon still requires that id to name an
+    /// existing Local session and rejects any observation that positively
+    /// resolves the caller to a different Local session.
+    ///
+    /// This marker is only valid on the local `/api/send` control plane.
+    /// Remote ingress uses `Event::IncomingWire` and cannot set it.
+    #[serde(default)]
+    pub trusted_local_claim: bool,
     /// The caller's `$TMUX_PANE`, if any. `None` (in a present context) means
     /// the caller positively reports it runs outside tmux.
     #[serde(default)]
@@ -1355,6 +1364,10 @@ pub fn validate_sender_claim(
     from: &str,
     ctx: &SenderContext,
 ) -> Result<(), String> {
+    if ctx.trusted_local_claim {
+        return validate_trusted_local_sender_claim(state, from, ctx);
+    }
+
     let Some(session) = state.sessions.get(from) else {
         return Ok(());
     };
@@ -1390,6 +1403,83 @@ pub fn validate_sender_claim(
             verify_session_self_claim(from, session, ctx)
         }
     }
+}
+
+/// Validate an explicit public Local sender id supplied to the local CLI.
+///
+/// Missing, unregistered, and incomplete observations are absence of proof,
+/// not proof of a sibling caller. Only an observation that resolves through
+/// daemon state to another Local session vetoes the claim.
+fn validate_trusted_local_sender_claim(
+    state: &DaemonState,
+    from: &str,
+    ctx: &SenderContext,
+) -> Result<(), String> {
+    let Some(session) = state.sessions.get(from) else {
+        return Err(format!(
+            "sender claim rejected: explicit Local session '{from}' is not registered"
+        ));
+    };
+    if !matches!(session.origin, Origin::Local) {
+        return Err(format!(
+            "sender claim rejected: '{from}' is a {} session, and a local caller cannot send \
+             as it. Run `ouija whoami` to get your own session id.",
+            session.origin.label()
+        ));
+    }
+
+    if let Some(caller_pane) = ctx.pane.as_deref().filter(|pane| !pane.is_empty()) {
+        if let Some(sibling) = state.sessions.values().find(|candidate| {
+            candidate.id != from
+                && matches!(candidate.origin, Origin::Local)
+                && candidate.pane.as_deref() == Some(caller_pane)
+        }) {
+            return Err(format!(
+                "sender claim rejected: explicit Local session '{from}' conflicts with pane \
+                 {caller_pane}, which belongs to Local session '{}'. Never stamp a sibling \
+                 sender id.",
+                sibling.id
+            ));
+        }
+    }
+
+    if let Some(self_id) = ctx.self_id.as_deref().filter(|id| !id.is_empty()) {
+        if state.sessions.get(self_id).is_some_and(|candidate| {
+            candidate.id != from && matches!(candidate.origin, Origin::Local)
+        }) {
+            return Err(format!(
+                "sender claim rejected: explicit Local session '{from}' conflicts with this \
+                 caller's Local session '{self_id}'. Never stamp a sibling sender id."
+            ));
+        }
+    }
+
+    if let Some(identity) = ctx.backend_identity.as_ref() {
+        match state.resolve_backend_identity(identity) {
+            BackendIdentityResolution::Resolved { session_id } if session_id != from => {
+                return Err(format!(
+                    "sender claim rejected: explicit Local session '{from}' conflicts with \
+                     backend identity '{}/{}', which belongs to Local session '{session_id}'. \
+                     Never stamp a sibling sender id.",
+                    identity.backend, identity.session_id
+                ));
+            }
+            BackendIdentityResolution::Ambiguous { session_ids } => {
+                return Err(format!(
+                    "sender claim rejected: backend identity '{}/{}' ambiguously belongs to \
+                     Local sessions {}",
+                    identity.backend,
+                    identity.session_id,
+                    session_ids.join(", ")
+                ));
+            }
+            BackendIdentityResolution::Resolved { .. }
+            | BackendIdentityResolution::NotFound
+            | BackendIdentityResolution::IncompleteLegacy { .. } => {}
+        }
+    }
+
+    Ok(())
 }
 
 /// Bind a paneless backend claim to the caller's own stable identity.
@@ -3425,9 +3515,8 @@ impl DaemonState {
             .filter(|session| {
                 matches!(session.origin, Origin::Local)
                     && metadata_has_incomplete_backend_pair(&session.metadata)
-                    && (session.metadata.backend_session_id.as_deref()
+                    && session.metadata.backend_session_id.as_deref()
                         == Some(identity.session_id.as_str())
-                        || session.metadata.backend.as_deref() == Some(identity.backend.as_str()))
             })
             .map(|session| session.id.clone())
             .collect();
@@ -3937,26 +4026,30 @@ impl DaemonState {
         // Three-tier reply handling — pending is keyed by the session that
         // owes the reply (from), not the recipient of this wire message (to).
         // Resolve bare `from` to daemon-prefixed remote session key.
-        // First try exact match in known remote sessions.
-        // If not found, derive prefix from any remote session sharing the sender's npub.
-        let remote_match = self
-            .sessions
-            .iter()
-            .find(|(_, s)| {
-                matches!(&s.origin, Origin::Remote(_)) && strip_remote_prefix(&s.id) == from
-            })
-            .map(|(key, _)| key.clone());
+        // First try an exact match owned by the verified transport peer.
+        // A duplicate bare id announced by another peer cannot identify this
+        // sender.
+        let remote_match = sender_npub.and_then(|npub| {
+            self.sessions
+                .iter()
+                .find(|(_, session)| {
+                    matches!(&session.origin, Origin::Remote(owner) if owner == npub)
+                        && strip_remote_prefix(&session.id) == from
+                })
+                .map(|(key, _)| key.clone())
+        });
         let display_from = remote_match.unwrap_or_else(|| {
-            // Session not in our list — derive prefix from sender's daemon npub
+            // Session not in our list — reuse the verified peer's known
+            // daemon-name prefix, or fall back to the verified npub itself.
+            // Never expose the unqualified wire value as a Local-looking id.
             if let Some(npub) = sender_npub {
-                if let Some((key, _)) = self
+                let prefix = self
                     .sessions
                     .iter()
                     .find(|(_, s)| matches!(&s.origin, Origin::Remote(d) if d == npub))
-                {
-                    let prefix = key.split('/').next().unwrap_or(from);
-                    return format!("{prefix}/{from}");
-                }
+                    .and_then(|(key, _)| key.split('/').next())
+                    .unwrap_or(npub);
+                return format!("{prefix}/{from}");
             }
             from.to_string()
         });
@@ -4891,6 +4984,182 @@ mod tests {
                 ..Default::default()
             },
         });
+    }
+
+    fn trusted_local_sender_context(
+        pane: Option<&str>,
+        self_id: Option<&str>,
+        backend_identity: Option<crate::backend::BackendSessionIdentity>,
+    ) -> SenderContext {
+        serde_json::from_value(serde_json::json!({
+            "pane": pane,
+            "self_id": self_id,
+            "backend_identity": backend_identity,
+            "trusted_local_claim": true,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn trusted_local_claim_accepts_replacement_codex_thread_without_other_proof() {
+        let mut state = claim_state();
+        register_codex(&mut state, "hub-4", Some("%10"), "old-thread");
+        let ctx = trusted_local_sender_context(
+            None,
+            None,
+            Some(crate::backend::BackendSessionIdentity {
+                backend: "codex-cli".into(),
+                session_id: "new-thread".into(),
+            }),
+        );
+
+        assert_eq!(validate_sender_claim(&state, "hub-4", &ctx), Ok(()));
+    }
+
+    #[test]
+    fn trusted_local_claim_accepts_missing_identity_observations() {
+        let mut state = claim_state();
+        register_codex(&mut state, "hub-4", Some("%10"), "old-thread");
+        let ctx = trusted_local_sender_context(None, None, None);
+
+        assert_eq!(validate_sender_claim(&state, "hub-4", &ctx), Ok(()));
+    }
+
+    #[test]
+    fn trusted_local_claim_accepts_unregistered_pane_observation() {
+        let mut state = claim_state();
+        register_codex(&mut state, "hub-4", Some("%10"), "old-thread");
+        let ctx = trusted_local_sender_context(Some("%replacement"), None, None);
+
+        assert_eq!(validate_sender_claim(&state, "hub-4", &ctx), Ok(()));
+    }
+
+    #[test]
+    fn trusted_local_claim_accepts_incomplete_backend_observation() {
+        let mut state = claim_state();
+        register_codex(&mut state, "hub-4", Some("%10"), "old-thread");
+        state.sessions.insert(
+            "legacy-id-only".into(),
+            SessionEntry {
+                id: "legacy-id-only".into(),
+                metadata: SessionMeta {
+                    backend_session_id: Some("new-thread".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let ctx = trusted_local_sender_context(
+            None,
+            None,
+            Some(crate::backend::BackendSessionIdentity {
+                backend: "codex-cli".into(),
+                session_id: "new-thread".into(),
+            }),
+        );
+
+        assert_eq!(validate_sender_claim(&state, "hub-4", &ctx), Ok(()));
+    }
+
+    #[test]
+    fn trusted_local_claim_rejects_backend_observation_resolving_to_sibling() {
+        let mut state = claim_state();
+        register_codex(&mut state, "hub-4", Some("%10"), "old-thread");
+        register_codex(&mut state, "sibling", Some("%11"), "new-thread");
+        let ctx = trusted_local_sender_context(
+            Some("%10"),
+            None,
+            Some(crate::backend::BackendSessionIdentity {
+                backend: "codex-cli".into(),
+                session_id: "new-thread".into(),
+            }),
+        );
+
+        let err = validate_sender_claim(&state, "hub-4", &ctx).unwrap_err();
+        assert!(
+            err.contains("sibling") && err.contains("hub-4"),
+            "rejection must name the conflicting Local sessions, got: {err}"
+        );
+    }
+
+    #[test]
+    fn trusted_local_claim_rejects_self_id_observation_resolving_to_sibling() {
+        let mut state = claim_state();
+        register_codex(&mut state, "hub-4", Some("%10"), "old-thread");
+        register_codex(&mut state, "sibling", Some("%11"), "sibling-thread");
+        let ctx = trusted_local_sender_context(Some("%10"), Some("sibling"), None);
+
+        let err = validate_sender_claim(&state, "hub-4", &ctx).unwrap_err();
+        assert!(
+            err.contains("sibling") && err.contains("hub-4"),
+            "rejection must name the conflicting Local sessions, got: {err}"
+        );
+    }
+
+    #[test]
+    fn trusted_local_claim_rejects_pane_observation_resolving_to_sibling() {
+        let mut state = claim_state();
+        register_codex(&mut state, "hub-4", Some("%10"), "old-thread");
+        register_codex(&mut state, "sibling", Some("%11"), "sibling-thread");
+        let ctx = trusted_local_sender_context(Some("%11"), None, None);
+
+        let err = validate_sender_claim(&state, "hub-4", &ctx).unwrap_err();
+        assert!(
+            err.contains("sibling") && err.contains("hub-4"),
+            "rejection must name the conflicting Local sessions, got: {err}"
+        );
+    }
+
+    #[test]
+    fn trusted_local_claim_rejects_absent_sender() {
+        let state = claim_state();
+        let ctx = trusted_local_sender_context(None, None, None);
+
+        let err = validate_sender_claim(&state, "missing", &ctx).unwrap_err();
+        assert!(
+            err.contains("not registered") && err.contains("missing"),
+            "rejection must identify the absent claim, got: {err}"
+        );
+    }
+
+    #[test]
+    fn trusted_local_claim_rejects_human_sender() {
+        let mut state = claim_state();
+        state.sessions.insert(
+            "operator".into(),
+            SessionEntry {
+                id: "operator".into(),
+                origin: Origin::Human("npub1operator".into()),
+                ..Default::default()
+            },
+        );
+        let ctx = trusted_local_sender_context(None, None, None);
+
+        let err = validate_sender_claim(&state, "operator", &ctx).unwrap_err();
+        assert!(
+            err.contains("human"),
+            "must explain a local caller cannot claim a human session, got: {err}"
+        );
+    }
+
+    #[test]
+    fn trusted_local_claim_rejects_remote_sender() {
+        let mut state = claim_state();
+        state.sessions.insert(
+            "peer/task".into(),
+            SessionEntry {
+                id: "peer/task".into(),
+                origin: Origin::Remote("npub1peer".into()),
+                ..Default::default()
+            },
+        );
+        let ctx = trusted_local_sender_context(None, None, None);
+
+        let err = validate_sender_claim(&state, "peer/task", &ctx).unwrap_err();
+        assert!(
+            err.contains("remote"),
+            "must explain a local caller cannot claim a remote session, got: {err}"
+        );
     }
 
     #[test]
@@ -6181,11 +6450,12 @@ mod tests {
             "pending should be stored for local target"
         );
         assert_eq!(state.pending_replies["B"][0].msg_id, 42);
+        assert_eq!(state.pending_replies["B"][0].from, "npub1remote/A");
 
-        // B replies locally with done=true
+        // B replies locally with done=true to the verified, displayed sender.
         state.apply(Event::Send {
             from: "B".into(),
-            to: "A".into(),
+            to: "npub1remote/A".into(),
             message: "all done".into(),
             expects_reply: false,
             responds_to: Some(42),
@@ -8556,6 +8826,113 @@ mod tests {
         )));
     }
 
+    fn incoming_sender_provenance_state() -> DaemonState {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "web".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                networked: true,
+                ..Default::default()
+            },
+        });
+        state
+    }
+
+    fn incoming_sender_provenance_effects(
+        state: &mut DaemonState,
+        from: &str,
+        sender_npub: &str,
+    ) -> Vec<Effect> {
+        state.apply(Event::IncomingWire {
+            msg: crate::protocol::WireMessage::SessionSend {
+                from: from.into(),
+                to: "web".into(),
+                message: "hello".into(),
+                expects_reply: true,
+                msg_id: 42,
+                responds_to: None,
+                done: false,
+            },
+            sender_npub: Some(sender_npub.into()),
+        })
+    }
+
+    fn injected_sender_message(effects: &[Effect]) -> &str {
+        effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::InjectMessage { message, .. } => Some(message.as_str()),
+                _ => None,
+            })
+            .expect("incoming send must inject into the Local target")
+    }
+
+    #[test]
+    fn incoming_sender_provenance_namespaces_bare_id_that_matches_local_session() {
+        let mut state = incoming_sender_provenance_state();
+        state.apply(Event::Register {
+            id: "shared".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta::default(),
+        });
+
+        let effects = incoming_sender_provenance_effects(&mut state, "shared", "npub1peer");
+
+        assert!(
+            injected_sender_message(&effects).contains(r#"from="npub1peer/shared""#),
+            "wire sender must display with verified transport provenance"
+        );
+        assert_eq!(state.pending_replies["web"][0].from, "npub1peer/shared");
+    }
+
+    #[test]
+    fn incoming_sender_provenance_ignores_duplicate_bare_id_owned_by_other_peer() {
+        let mut state = incoming_sender_provenance_state();
+        state.sessions.insert(
+            "other-host/worker".into(),
+            SessionEntry {
+                id: "other-host/worker".into(),
+                origin: Origin::Remote("npub1other".into()),
+                ..Default::default()
+            },
+        );
+
+        let effects = incoming_sender_provenance_effects(&mut state, "worker", "npub1actual");
+
+        assert!(
+            injected_sender_message(&effects).contains(r#"from="npub1actual/worker""#),
+            "a different peer's announced session must not win"
+        );
+        assert_eq!(state.pending_replies["web"][0].from, "npub1actual/worker");
+    }
+
+    #[test]
+    fn incoming_sender_provenance_uses_canonical_session_announced_by_verified_peer() {
+        let mut state = incoming_sender_provenance_state();
+        for (key, npub) in [
+            ("a-host/worker", "npub1other"),
+            ("z-host/worker", "npub1actual"),
+        ] {
+            state.sessions.insert(
+                key.into(),
+                SessionEntry {
+                    id: key.into(),
+                    origin: Origin::Remote(npub.into()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let effects = incoming_sender_provenance_effects(&mut state, "worker", "npub1actual");
+
+        assert!(
+            injected_sender_message(&effects).contains(r#"from="z-host/worker""#),
+            "the verified peer's canonical announced key must win"
+        );
+        assert_eq!(state.pending_replies["web"][0].from, "z-host/worker");
+    }
+
     #[test]
     fn incoming_session_send_to_local_returns_inject() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
@@ -9239,9 +9616,7 @@ mod tests {
         );
         assert_eq!(
             state.resolve_backend_identity(&backend_identity("future", "native-2")),
-            BackendIdentityResolution::IncompleteLegacy {
-                session_ids: vec!["legacy-backend-only".into()]
-            }
+            BackendIdentityResolution::NotFound
         );
 
         state.sessions.clear();
