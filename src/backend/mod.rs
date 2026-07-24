@@ -730,13 +730,13 @@ mod tests {
         let fake_mise = fake_mise.clone();
         std::thread::spawn(move || {
             let attempt = run_mise_trust(&fake_mise, &config, Duration::from_millis(500));
-            let _ = tx.send(attempt.stdout());
+            let _ = tx.send(attempt);
         });
 
-        let stdout = rx
+        let attempt = rx
             .recv_timeout(Duration::from_secs(2))
             .expect("timeout path must not wait for descendant-held stdout pipe");
-        assert_eq!(stdout, "before timeout\n");
+        assert!(matches!(attempt, MiseTrustAttempt::TimedOut(Some(_))));
     }
 
     #[test]
