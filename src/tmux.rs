@@ -971,6 +971,9 @@ pub fn inspect_pane_owner(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
+    if pane_pid.is_empty() {
+        return Ok(None);
+    }
 
     #[cfg(target_os = "linux")]
     let environment = std::fs::read(format!("/proc/{pane_pid}/environ"))

@@ -1760,10 +1760,11 @@ impl AppState {
         self: &Arc<Self>,
         owner: &crate::daemon_protocol::ResourceOwner,
         pane: &str,
+        cleanup_project_dir_on_abandon: bool,
     ) -> anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome> {
         let mut proto = self.protocol.write().await;
         let before = proto.clone();
-        let outcome = proto.claim_existing_stop(owner, pane);
+        let outcome = proto.claim_existing_stop(owner, pane, cleanup_project_dir_on_abandon);
         if outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied
             && let Err(error) = self.persist_protocol_state(&proto)
         {
@@ -4482,6 +4483,44 @@ pub(crate) mod tests {
         let proto = state.protocol.read().await;
         assert_eq!(proto.lifecycle_leases["worker"].owner, owner);
         assert!(!proto.sessions.contains_key("worker"));
+    }
+
+    #[tokio::test]
+    async fn durable_stop_claim_persists_cleanup_authority_before_external_work() {
+        let config = test_config();
+        let state = AppState::new(config.clone());
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%1".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_worker".into()),
+                    project_dir: Some("/tmp/.ouija/worktrees/project/worker".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["worker"].owner();
+
+        let outcome = state.claim_existing_stop(&owner, "%1", true).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        let persisted = crate::persistence::load_sessions(&config.data_dir).unwrap();
+        let lease = &persisted.lifecycle_leases["worker"];
+        assert_eq!(lease.owner, owner);
+        assert_eq!(
+            lease.phase,
+            crate::daemon_protocol::LifecyclePhase::Stopping
+        );
+        assert!(lease.project_dir_cleanup_on_abandon);
+        assert_eq!(lease.inert_pane.as_deref(), Some("%1"));
+        assert_eq!(lease.backend.as_deref(), Some("opencode"));
+        assert_eq!(lease.backend_session_id.as_deref(), Some("ses_worker"));
+        assert_eq!(lease.backend_session_owner.as_ref(), Some(&owner));
     }
 
     #[tokio::test]

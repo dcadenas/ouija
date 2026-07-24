@@ -1343,7 +1343,7 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         }
     } else if let Some(name) = cmd.strip_prefix("/kill ") {
         let name = name.trim();
-        kill_session(state, name).await
+        kill_session(state, name).await.message
     } else if let Some(rest) = cmd.strip_prefix("/start ") {
         let name = rest.trim();
         // /start chat-command never resets — no base_branch supplied anyway.
@@ -1384,12 +1384,54 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
     }
 }
 
+/// Machine-readable terminal state for an explicit session kill.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KillOutcome {
+    Removed,
+    Failed,
+    Superseded,
+}
+
+/// Typed kill result paired with the existing human-facing status text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KillSessionResult {
+    pub message: String,
+    pub outcome: KillOutcome,
+}
+
+impl KillSessionResult {
+    fn removed(message: String) -> Self {
+        Self {
+            message,
+            outcome: KillOutcome::Removed,
+        }
+    }
+
+    fn failed(message: String) -> Self {
+        Self {
+            message,
+            outcome: KillOutcome::Failed,
+        }
+    }
+
+    fn superseded(message: String) -> Self {
+        Self {
+            message,
+            outcome: KillOutcome::Superseded,
+        }
+    }
+}
+
 /// Kill the Claude process in a named session's pane.
-pub async fn kill_session(state: &std::sync::Arc<AppState>, name: &str) -> String {
+pub async fn kill_session(state: &std::sync::Arc<AppState>, name: &str) -> KillSessionResult {
     kill_session_inner(state, name, false, None).await
 }
 
-pub async fn kill_session_keep_worktree(state: &std::sync::Arc<AppState>, name: &str) -> String {
+pub async fn kill_session_keep_worktree(
+    state: &std::sync::Arc<AppState>,
+    name: &str,
+) -> KillSessionResult {
     kill_session_inner(state, name, true, None).await
 }
 
@@ -1398,7 +1440,7 @@ pub async fn kill_session_owned(
     state: &std::sync::Arc<AppState>,
     owner: &crate::daemon_protocol::ResourceOwner,
     expected_pane: &str,
-) -> String {
+) -> KillSessionResult {
     kill_session_inner(
         state,
         &owner.session_id,
@@ -1413,42 +1455,92 @@ async fn kill_session_inner(
     name: &str,
     keep_worktree: bool,
     expected_owner: Option<(crate::daemon_protocol::ResourceOwner, String)>,
-) -> String {
+) -> KillSessionResult {
     let session = state.protocol.read().await.sessions.get(name).cloned();
     let Some(session) = session else {
-        return format!("session '{name}' not found");
+        return KillSessionResult::failed(format!("session '{name}' not found"));
     };
     if !matches!(session.origin, crate::daemon_protocol::Origin::Local) {
-        return format!("'{name}' is not a local session");
+        return KillSessionResult::failed(format!("'{name}' is not a local session"));
     }
     let Some(pane) = &session.pane else {
-        return format!("'{name}' has no pane");
+        return KillSessionResult::failed(format!("'{name}' has no pane"));
     };
     if expected_owner
         .as_ref()
         .is_some_and(|(owner, expected_pane)| session.owner() != *owner || pane != expected_pane)
     {
-        return format!("session '{name}' was replaced before eviction");
+        return KillSessionResult::superseded(format!(
+            "session '{name}' was replaced before eviction"
+        ));
     }
-
     let pane = pane.clone();
     let owner = session.owner();
-    match state.claim_existing_stop(&owner, &pane).await {
+    match state
+        .claim_existing_stop(&owner, &pane, !keep_worktree)
+        .await
+    {
         Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
         Ok(outcome) => {
-            return format!("session '{name}' backend exit was superseded ({outcome:?})");
+            return KillSessionResult::superseded(format!(
+                "session '{name}' backend exit was superseded ({outcome:?})"
+            ));
         }
         Err(error) => {
-            return format!("failed to persist backend exit authority for '{name}': {error}");
+            return KillSessionResult::failed(format!(
+                "failed to persist backend exit authority for '{name}': {error}"
+            ));
         }
     }
-    let project_dir = session.metadata.project_dir.clone();
-    let backend_session_id = session.metadata.backend_session_id.clone();
-    let backend = state.backend_for_session(name).await;
+    let claimed_session = {
+        let protocol = state.protocol.read().await;
+        let lease_matches = protocol.lifecycle_leases.get(name).is_some_and(|lease| {
+            lease.owner == owner && lease.phase == crate::daemon_protocol::LifecyclePhase::Stopping
+        });
+        protocol
+            .sessions
+            .get(name)
+            .filter(|current| {
+                lease_matches
+                    && current.owner() == owner
+                    && current.pane.as_deref() == Some(pane.as_str())
+            })
+            .cloned()
+    };
+    let Some(claimed_session) = claimed_session else {
+        let _ = state.abort_lifecycle(&owner).await;
+        return KillSessionResult::superseded(format!(
+            "session '{name}' backend exit was superseded after claim"
+        ));
+    };
+    let project_dir = claimed_session.metadata.project_dir.clone();
+    let backend_session_id = claimed_session.metadata.backend_session_id.clone();
+    let backend = claimed_session
+        .metadata
+        .backend
+        .as_deref()
+        .and_then(|backend| state.backends.get(backend))
+        .unwrap_or_else(|| state.backends.default());
     let is_http_api = matches!(
         backend.delivery_mode(),
         crate::backend::DeliveryMode::HttpApi { .. }
     );
+    if is_http_api && backend_session_id.is_none() {
+        let release = state.abort_lifecycle(&owner).await;
+        return match release {
+            Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {
+                KillSessionResult::failed(format!(
+                    "HttpApi session '{name}' has no backend session ID; no external cleanup was started"
+                ))
+            }
+            Ok(outcome) => KillSessionResult::superseded(format!(
+                "HttpApi session '{name}' has no backend session ID and its stop claim was superseded ({outcome:?})"
+            )),
+            Err(error) => KillSessionResult::failed(format!(
+                "HttpApi session '{name}' has no backend session ID and its unused stop claim could not be released: {error}"
+            )),
+        };
+    }
     let process_names: Vec<String> = backend
         .process_names()
         .iter()
@@ -1463,7 +1555,9 @@ async fn kill_session_inner(
     if is_http_api {
         if !state.owns_stopping_session(&owner, &pane).await {
             let _ = state.abort_lifecycle(&owner).await;
-            return format!("session '{name}' backend exit was superseded before abort");
+            return KillSessionResult::superseded(format!(
+                "session '{name}' backend exit was superseded before abort"
+            ));
         }
         if let Some(ref oc_sid) = backend_session_id {
             let port = state.opencode_serve_port();
@@ -1480,29 +1574,29 @@ async fn kill_session_inner(
                 .await;
             let Some(response) = response else {
                 let _ = state.abort_lifecycle(&owner).await;
-                return format!("session '{name}' backend exit was superseded before abort");
+                return KillSessionResult::superseded(format!(
+                    "session '{name}' backend exit was superseded before abort"
+                ));
             };
             match response {
-                Ok(r) if r.status().is_success() => {
+                Ok(r)
+                    if r.status().is_success() || r.status() == reqwest::StatusCode::NOT_FOUND =>
+                {
                     tracing::info!(session = %name, oc_sid, "aborted opencode server session");
                 }
                 Ok(r) => {
                     let status = r.status();
                     let text = r.text().await.unwrap_or_default();
-                    tracing::warn!(
-                        session = %name, oc_sid, %status,
-                        "opencode abort returned non-success: {text}"
-                    );
+                    return KillSessionResult::failed(format!(
+                        "opencode abort for session '{name}' returned {status}: {text}; stop authority retained for recovery"
+                    ));
                 }
                 Err(e) => {
-                    tracing::warn!(session = %name, oc_sid, "opencode abort failed: {e}");
+                    return KillSessionResult::failed(format!(
+                        "opencode abort for session '{name}' failed: {e}; stop authority retained for recovery"
+                    ));
                 }
             }
-        } else {
-            tracing::warn!(
-                session = %name,
-                "HttpApi session has no backend_session_id, cannot abort server-side"
-            );
         }
     }
 
@@ -1536,6 +1630,30 @@ async fn kill_session_inner(
                     }
                     Ok(())
                 };
+                let process_alive = |pid: u32| -> anyhow::Result<bool> {
+                    Ok(Command::new("kill")
+                        .args(["-0", &pid.to_string()])
+                        .status()?
+                        .success())
+                };
+                let kill_owned_pane = || -> anyhow::Result<()> {
+                    require_pane_owner()?;
+                    let status = Command::new("tmux")
+                        .args(["kill-pane", "-t", &pane_for_kill])
+                        .status()?;
+                    let remaining_owner = crate::tmux::inspect_pane_owner(&pane_for_kill)?;
+                    if remaining_owner.as_ref().is_some_and(|observed| {
+                        crate::tmux::physical_owner_matches(observed, &pane_owner)
+                    }) {
+                        anyhow::bail!(
+                            "tmux kill-pane left the owned pane alive (status {status})"
+                        );
+                    }
+                    if remaining_owner.is_some() {
+                        anyhow::bail!("pane owner changed during backend exit");
+                    }
+                    Ok(())
+                };
 
                 // Get pane PID
                 require_pane_owner()?;
@@ -1550,10 +1668,7 @@ async fn kill_session_inner(
                     Ok(pid) => pid,
                     Err(_) => {
                         // Pane exists but has no running process — skip process kill, just clean up
-                        require_pane_owner()?;
-                        let _ = Command::new("tmux")
-                            .args(["kill-pane", "-t", &pane_for_kill])
-                            .status();
+                        kill_owned_pane()?;
                         return Ok("no running process in pane".to_string());
                     }
                 };
@@ -1607,25 +1722,28 @@ async fn kill_session_inner(
                         // Go straight to SIGKILL to prevent cleanup handlers.
                         if keep_worktree {
                             require_pane_owner()?;
-                            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+                            let signal_status =
+                                Command::new("kill").args(["-9", &pid.to_string()]).status()?;
                             std::thread::sleep(std::time::Duration::from_millis(500));
+                            if process_alive(pid)? {
+                                anyhow::bail!(
+                                    "SIGKILL did not stop {cli_name} pid {pid} (status {signal_status})"
+                                );
+                            }
                         } else {
                             // Graceful: send exit command if backend supports it
                             if let Some(ref exit) = exit_cmd {
                                 require_pane_owner()?;
-                                let _ = Command::new("tmux")
+                                let _send_status = Command::new("tmux")
                                     .args(["send-keys", "-t", &pane_for_kill, exit, "Enter"])
-                                    .status();
+                                    .status()?;
 
                                 // Poll up to 10s for process to exit
                                 let deadline = std::time::Instant::now()
                                     + std::time::Duration::from_secs(PROCESS_EXIT_TIMEOUT_SECS);
                                 while std::time::Instant::now() < deadline {
                                     std::thread::sleep(std::time::Duration::from_secs(1));
-                                    let status = Command::new("kill")
-                                        .args(["-0", &pid.to_string()])
-                                        .status();
-                                    if !status.is_ok_and(|s| s.success()) {
+                                    if !process_alive(pid)? {
                                         exited = true;
                                         break;
                                     }
@@ -1635,15 +1753,24 @@ async fn kill_session_inner(
                             if !exited {
                                 // Fallback: SIGTERM
                                 require_pane_owner()?;
-                                let _ = Command::new("kill").arg(pid.to_string()).status();
+                                let _signal_status =
+                                    Command::new("kill").arg(pid.to_string()).status()?;
                                 std::thread::sleep(std::time::Duration::from_secs(1));
+                                exited = !process_alive(pid)?;
                             }
                         }
 
-                        require_pane_owner()?;
-                        let _ = Command::new("tmux")
-                            .args(["kill-pane", "-t", &pane_for_kill])
-                            .status();
+                        kill_owned_pane()?;
+                        if !exited && process_alive(pid)? {
+                            let signal_status =
+                                Command::new("kill").args(["-9", &pid.to_string()]).status()?;
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            if process_alive(pid)? {
+                                anyhow::bail!(
+                                    "pane cleanup left {cli_name} pid {pid} alive (SIGKILL status {signal_status})"
+                                );
+                            }
+                        }
                         let method = if keep_worktree {
                             "SIGKILL (worktree preserved)"
                         } else if exited {
@@ -1654,10 +1781,7 @@ async fn kill_session_inner(
                         Ok(format!("killed {cli_name} (pid {pid}, {method})"))
                     }
                     None => {
-                        require_pane_owner()?;
-                        let _ = Command::new("tmux")
-                            .args(["kill-pane", "-t", &pane_for_kill])
-                            .status();
+                        kill_owned_pane()?;
                         Ok(format!("no {cli_name} process found"))
                     }
                 }
@@ -1678,13 +1802,23 @@ async fn kill_session_inner(
                 || error.to_string().contains("stop authority changed")
     ) {
         let _ = state.abort_lifecycle(&owner).await;
-        return format!("session '{name}' pane was replaced before backend exit");
+        return KillSessionResult::superseded(format!(
+            "session '{name}' pane was replaced before backend exit"
+        ));
     }
 
     let msg = match kill_result {
         Ok(Ok(msg)) => msg,
-        Ok(Err(e)) => format!("kill failed: {e}"),
-        Err(e) => format!("kill failed: {e}"),
+        Ok(Err(error)) => {
+            return KillSessionResult::failed(format!(
+                "session '{name}' backend exit failed: {error}; stop authority retained for recovery"
+            ));
+        }
+        Err(error) => {
+            return KillSessionResult::failed(format!(
+                "session '{name}' backend exit task failed: {error}; stop authority retained for recovery"
+            ));
+        }
     };
 
     let removal_effects = state
@@ -1701,7 +1835,9 @@ async fn kill_session_inner(
         )
     }) {
         let _ = state.abort_lifecycle(&owner).await;
-        return format!("session '{name}' backend exit completion was superseded");
+        return KillSessionResult::superseded(format!(
+            "session '{name}' backend exit completion was superseded"
+        ));
     }
 
     // Worktree cleanup AFTER the process is confirmed dead, so we don't
@@ -1718,7 +1854,17 @@ async fn kill_session_inner(
         }
     }
 
-    format!("{msg}, session '{name}' removed")
+    match state.abort_lifecycle(&owner).await {
+        Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {
+            KillSessionResult::removed(format!("{msg}, session '{name}' removed"))
+        }
+        Ok(outcome) => KillSessionResult::superseded(format!(
+            "session '{name}' cleanup completion was superseded ({outcome:?})"
+        )),
+        Err(error) => KillSessionResult::failed(format!(
+            "session '{name}' was removed but stop authority could not be released: {error}"
+        )),
+    }
 }
 
 /// Start a new session in a tmux pane, optionally in a worktree.
@@ -6126,6 +6272,91 @@ pub(crate) fn opencode_prompt_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stale_owned_kill_returns_typed_superseded_before_external_work() {
+        let state = AppState::new_for_test();
+        let current_owner = {
+            let mut protocol = state.protocol.write().await;
+            protocol.apply(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%2".into()),
+                metadata: Default::default(),
+            });
+            protocol.sessions["worker"].owner()
+        };
+        let stale_owner = crate::daemon_protocol::ResourceOwner {
+            session_id: current_owner.session_id.clone(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(
+                current_owner.incarnation.0 + 1,
+            ),
+        };
+
+        let result = kill_session_owned(&state, &stale_owner, "%2").await;
+
+        assert_eq!(result.outcome, KillOutcome::Superseded);
+        let protocol = state.protocol.read().await;
+        assert_eq!(protocol.sessions["worker"].owner(), current_owner);
+        assert!(
+            protocol.lifecycle_leases.is_empty(),
+            "a stale kill must not claim lifecycle authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_kill_returns_typed_superseded_after_first_claims_owner() {
+        let state = AppState::new_for_test();
+        let owner = {
+            let mut protocol = state.protocol.write().await;
+            protocol.apply(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%2".into()),
+                metadata: Default::default(),
+            });
+            protocol.sessions["worker"].owner()
+        };
+        assert_eq!(
+            state
+                .claim_existing_stop(&owner, "%2", false)
+                .await
+                .unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+
+        let result = kill_session(&state, "worker").await;
+
+        assert_eq!(result.outcome, KillOutcome::Superseded);
+        let protocol = state.protocol.read().await;
+        assert_eq!(protocol.sessions["worker"].owner(), owner);
+        assert_eq!(protocol.lifecycle_leases["worker"].owner, owner);
+    }
+
+    #[tokio::test]
+    async fn http_kill_without_backend_session_id_releases_unused_stop_authority() {
+        let state = AppState::new_for_test();
+        {
+            let mut protocol = state.protocol.write().await;
+            protocol.apply(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%2".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: None,
+                    ..Default::default()
+                },
+            });
+        }
+
+        let result = kill_session(&state, "worker").await;
+
+        assert_eq!(result.outcome, KillOutcome::Failed);
+        let protocol = state.protocol.read().await;
+        assert!(protocol.sessions.contains_key("worker"));
+        assert!(
+            protocol.lifecycle_leases.is_empty(),
+            "an invalid HTTP kill must release its claim because no external work started"
+        );
+    }
 
     #[tokio::test]
     async fn concurrent_same_id_starts_cross_the_launch_boundary_once() {

@@ -1418,6 +1418,67 @@ async fn restore_persisted_sessions(state: &state::AppState) -> anyhow::Result<(
     // release the public ID. A Restarting lease whose row still has the
     // incumbent incarnation stopped before staging and therefore preserves it.
     if !abandoned_leases.is_empty() {
+        // A durable Stopping lease can outlive its registry row. Finish the
+        // exact HTTP-backend abort obligation before releasing any pane,
+        // worktree, row, or public-ID authority. A different persisted owner
+        // of the same backend identity wins and must never be aborted.
+        for lease in &abandoned_leases {
+            let (Some(backend), Some(backend_session_id), Some(backend_session_owner)) = (
+                lease.backend.as_deref(),
+                lease.backend_session_id.as_deref(),
+                lease.backend_session_owner.as_ref(),
+            ) else {
+                continue;
+            };
+            if lease.phase != crate::daemon_protocol::LifecyclePhase::Stopping
+                || !state.backends.uses_http_delivery(backend)
+            {
+                continue;
+            }
+            let persisted_sharer = sessions.iter().any(|session| {
+                session.metadata.backend.as_deref() == Some(backend)
+                    && session.metadata.backend_session_id.as_deref() == Some(backend_session_id)
+                    && !abandoned_lease_owns_staged_row(session, lease)
+            });
+            if persisted_sharer {
+                tracing::info!(
+                    backend,
+                    backend_session_id,
+                    "skipping abandoned backend abort: persisted session still owns it"
+                );
+                continue;
+            }
+            if backend_session_owner != &lease.owner {
+                anyhow::bail!(
+                    "abandoned backend abort owner does not match stopping lease for '{}'",
+                    lease.owner.session_id
+                );
+            }
+            let port = state.opencode_serve_port();
+            let backend_session_id_segment = encode_path_segment(backend_session_id);
+            let url = format!("http://127.0.0.1:{port}/session/{backend_session_id_segment}/abort");
+            let response = state
+                .http_client
+                .post(&url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to abort abandoned backend session {backend_session_id} for lifecycle owner {backend_session_owner:?}"
+                    )
+                })?;
+            if !response.status().is_success()
+                && response.status() != reqwest::StatusCode::NOT_FOUND
+            {
+                anyhow::bail!(
+                    "backend abort for abandoned session '{}' returned {}",
+                    backend_session_id,
+                    response.status()
+                );
+            }
+        }
+
         let inert_panes: Vec<_> = abandoned_leases
             .iter()
             .filter_map(|lease| {
@@ -1459,9 +1520,10 @@ async fn restore_persisted_sessions(state: &state::AppState) -> anyhow::Result<(
             .context("failed to reconcile abandoned start panes")?;
         }
 
-        // Project-directory claims cover the crash envelope before a pane is
-        // created. Serialize each cleanup with live claims and preserve any
-        // directory shared by a persisted row that this lease does not own.
+        // Project-directory claims cover both pre-launch and terminating
+        // crash envelopes. Serialize each cleanup with live claims and
+        // preserve any directory shared by a persisted row that this lease
+        // does not own.
         for lease in &abandoned_leases {
             let (Some(project_dir), Some(project_dir_owner)) =
                 (&lease.project_dir, &lease.project_dir_owner)
@@ -3647,6 +3709,9 @@ mod tests {
                 crate::daemon_protocol::LifecycleLease {
                     owner: owner.clone(),
                     phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                    backend: None,
+                    backend_session_id: None,
+                    backend_session_owner: None,
                     project_dir: Some("/tmp/.ouija/worktrees/project/shared-replacement".into()),
                     project_dir_owner: Some(owner.clone()),
                     project_dir_cleanup_on_abandon: true,
@@ -3756,6 +3821,9 @@ mod tests {
                 crate::daemon_protocol::LifecycleLease {
                     owner: incumbent.clone(),
                     phase: crate::daemon_protocol::LifecyclePhase::Restarting,
+                    backend: None,
+                    backend_session_id: None,
+                    backend_session_owner: None,
                     project_dir: Some(worktree.to_string_lossy().into_owned()),
                     project_dir_owner: Some(incumbent),
                     project_dir_cleanup_on_abandon: false,
@@ -3852,6 +3920,9 @@ mod tests {
                 crate::daemon_protocol::LifecycleLease {
                     owner: owner.clone(),
                     phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                    backend: None,
+                    backend_session_id: None,
+                    backend_session_owner: None,
                     project_dir: Some(canonical_worktree),
                     project_dir_owner: Some(owner),
                     project_dir_cleanup_on_abandon: true,
@@ -3881,6 +3952,325 @@ mod tests {
                 .lifecycle_leases
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn restore_finishes_owned_stop_after_registry_removal() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let worktree = repo.join(".ouija/worktrees/worker");
+        let data_dir = root.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let run_git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_git(&["init", "-b", "main", repo.to_str().unwrap()]);
+        run_git(&[
+            "-C",
+            repo.to_str().unwrap(),
+            "config",
+            "user.email",
+            "test@example.com",
+        ]);
+        run_git(&["-C", repo.to_str().unwrap(), "config", "user.name", "Test"]);
+        std::fs::write(repo.join("tracked"), "base\n").unwrap();
+        run_git(&["-C", repo.to_str().unwrap(), "add", "tracked"]);
+        run_git(&["-C", repo.to_str().unwrap(), "commit", "-m", "initial"]);
+        run_git(&[
+            "-C",
+            repo.to_str().unwrap(),
+            "worktree",
+            "add",
+            "-b",
+            "worker",
+            worktree.to_str().unwrap(),
+        ]);
+
+        let owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(1),
+        };
+        let snapshot = crate::persistence::PersistedLifecycleState::new(
+            vec![],
+            owner.incarnation,
+            std::collections::BTreeMap::from([(
+                owner.session_id.clone(),
+                crate::daemon_protocol::LifecycleLease {
+                    owner: owner.clone(),
+                    phase: crate::daemon_protocol::LifecyclePhase::Stopping,
+                    backend: None,
+                    backend_session_id: None,
+                    backend_session_owner: None,
+                    project_dir: Some(crate::state::project_dir_identity(
+                        worktree.to_str().unwrap(),
+                    )),
+                    project_dir_owner: Some(owner.clone()),
+                    project_dir_cleanup_on_abandon: true,
+                    inert_pane: Some("%999999999".into()),
+                    inert_pane_owner: Some(owner.clone()),
+                },
+            )]),
+        );
+        crate::persistence::save_sessions(&data_dir, &snapshot).unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: 0,
+            data_dir: data_dir.clone(),
+            config_dir: data_dir.clone(),
+        });
+
+        restore_persisted_sessions(&state).await.unwrap();
+
+        assert!(
+            !worktree.exists(),
+            "startup recovery must finish the explicit kill's durable worktree cleanup"
+        );
+        assert!(
+            crate::persistence::load_sessions(&data_dir)
+                .unwrap()
+                .lifecycle_leases
+                .is_empty()
+        );
+        assert!(matches!(
+            state
+                .protocol
+                .write()
+                .await
+                .reserve_start("worker")
+                .unwrap(),
+            crate::daemon_protocol::StartDisposition::Reserved(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn restore_aborts_claimed_http_backend_before_releasing_stop_lease() {
+        use axum::Router;
+        use axum::extract::{Path, State};
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone)]
+        struct AbortProbe {
+            data_dir: std::path::PathBuf,
+            calls: std::sync::Arc<AtomicUsize>,
+        }
+
+        async fn abort_backend(
+            Path(backend_session_id): Path<String>,
+            State(probe): State<AbortProbe>,
+        ) -> StatusCode {
+            assert_eq!(backend_session_id, "ses_worker");
+            assert!(
+                crate::persistence::load_sessions(&probe.data_dir)
+                    .unwrap()
+                    .lifecycle_leases
+                    .contains_key("worker"),
+                "the stopping lease must remain durable through HTTP abort"
+            );
+            probe.calls.fetch_add(1, Ordering::SeqCst);
+            StatusCode::NO_CONTENT
+        }
+
+        for pane in [Some("%999999999"), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let abort_port = listener.local_addr().unwrap().port();
+            let daemon_port = abort_port.checked_sub(320).unwrap();
+            let calls = std::sync::Arc::new(AtomicUsize::new(0));
+            let app = Router::new()
+                .route("/session/{session_id}/abort", post(abort_backend))
+                .with_state(AbortProbe {
+                    data_dir: dir.path().to_path_buf(),
+                    calls: calls.clone(),
+                });
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let owner = crate::daemon_protocol::ResourceOwner {
+                session_id: "worker".into(),
+                incarnation: crate::daemon_protocol::SessionIncarnation(7),
+            };
+            let snapshot = crate::persistence::PersistedLifecycleState::new(
+                vec![],
+                owner.incarnation,
+                std::collections::BTreeMap::from([(
+                    owner.session_id.clone(),
+                    crate::daemon_protocol::LifecycleLease {
+                        owner: owner.clone(),
+                        phase: crate::daemon_protocol::LifecyclePhase::Stopping,
+                        backend: Some("opencode".into()),
+                        backend_session_id: Some("ses_worker".into()),
+                        backend_session_owner: Some(owner.clone()),
+                        project_dir: None,
+                        project_dir_owner: None,
+                        project_dir_cleanup_on_abandon: false,
+                        inert_pane: pane.map(str::to_owned),
+                        inert_pane_owner: pane.map(|_| owner.clone()),
+                    },
+                )]),
+            );
+            crate::persistence::save_sessions(dir.path(), &snapshot).unwrap();
+            let state = crate::state::AppState::new(crate::config::OuijaConfig {
+                name: "test".into(),
+                npub: "npub1test".into(),
+                port: daemon_port,
+                data_dir: dir.path().to_path_buf(),
+                config_dir: dir.path().to_path_buf(),
+            });
+
+            restore_persisted_sessions(&state).await.unwrap();
+
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(
+                crate::persistence::load_sessions(dir.path())
+                    .unwrap()
+                    .lifecycle_leases
+                    .is_empty()
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_never_aborts_replacement_using_same_http_backend_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale_owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(7),
+        };
+        let replacement_owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(8),
+        };
+        let snapshot = crate::persistence::PersistedLifecycleState::new(
+            vec![crate::persistence::PersistedSession {
+                id: "worker".into(),
+                pane: None,
+                registered_at: chrono::Utc::now(),
+                last_activity_at: chrono::Utc::now(),
+                metadata: crate::state::SessionMetadata {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_worker".into()),
+                    session_incarnation: replacement_owner.incarnation,
+                    ..Default::default()
+                },
+            }],
+            replacement_owner.incarnation,
+            std::collections::BTreeMap::from([(
+                stale_owner.session_id.clone(),
+                crate::daemon_protocol::LifecycleLease {
+                    owner: stale_owner.clone(),
+                    phase: crate::daemon_protocol::LifecyclePhase::Stopping,
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_worker".into()),
+                    backend_session_owner: Some(stale_owner),
+                    project_dir: None,
+                    project_dir_owner: None,
+                    project_dir_cleanup_on_abandon: false,
+                    inert_pane: None,
+                    inert_pane_owner: None,
+                },
+            )]),
+        );
+        crate::persistence::save_sessions(dir.path(), &snapshot).unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: 0,
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+
+        restore_persisted_sessions(&state).await.unwrap();
+
+        let persisted = crate::persistence::load_sessions(dir.path()).unwrap();
+        assert!(persisted.lifecycle_leases.is_empty());
+        assert_eq!(persisted.sessions.len(), 1);
+        assert_eq!(
+            persisted.sessions[0].metadata.session_incarnation,
+            replacement_owner.incarnation
+        );
+        assert_eq!(
+            state.protocol.read().await.sessions["worker"].owner(),
+            replacement_owner
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_retains_stop_lease_when_http_abort_is_not_confirmed() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+
+        async fn reject_abort() -> StatusCode {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let abort_port = listener.local_addr().unwrap().port();
+        let daemon_port = abort_port.checked_sub(320).unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route("/session/{session_id}/abort", post(reject_abort)),
+            )
+            .await
+            .unwrap();
+        });
+        let owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(9),
+        };
+        let snapshot = crate::persistence::PersistedLifecycleState::new(
+            vec![],
+            owner.incarnation,
+            std::collections::BTreeMap::from([(
+                owner.session_id.clone(),
+                crate::daemon_protocol::LifecycleLease {
+                    owner: owner.clone(),
+                    phase: crate::daemon_protocol::LifecyclePhase::Stopping,
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_worker".into()),
+                    backend_session_owner: Some(owner),
+                    project_dir: None,
+                    project_dir_owner: None,
+                    project_dir_cleanup_on_abandon: false,
+                    inert_pane: None,
+                    inert_pane_owner: None,
+                },
+            )]),
+        );
+        crate::persistence::save_sessions(dir.path(), &snapshot).unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: daemon_port,
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+
+        let result = restore_persisted_sessions(&state).await;
+
+        assert!(result.is_err());
+        assert!(
+            crate::persistence::load_sessions(dir.path())
+                .unwrap()
+                .lifecycle_leases
+                .contains_key("worker")
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -4069,6 +4459,9 @@ mod tests {
                 crate::daemon_protocol::LifecycleLease {
                     owner: owner.clone(),
                     phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                    backend: None,
+                    backend_session_id: None,
+                    backend_session_owner: None,
                     project_dir: None,
                     project_dir_owner: None,
                     project_dir_cleanup_on_abandon: false,
@@ -4142,6 +4535,9 @@ mod tests {
                     crate::daemon_protocol::LifecycleLease {
                         owner: incumbent_owner.clone(),
                         phase: crate::daemon_protocol::LifecyclePhase::Restarting,
+                        backend: None,
+                        backend_session_id: None,
+                        backend_session_owner: None,
                         project_dir: None,
                         project_dir_owner: None,
                         project_dir_cleanup_on_abandon: false,
@@ -4154,6 +4550,9 @@ mod tests {
                     crate::daemon_protocol::LifecycleLease {
                         owner: staged_lease_owner,
                         phase: crate::daemon_protocol::LifecyclePhase::Restarting,
+                        backend: None,
+                        backend_session_id: None,
+                        backend_session_owner: None,
                         project_dir: None,
                         project_dir_owner: None,
                         project_dir_cleanup_on_abandon: false,
@@ -4202,6 +4601,9 @@ mod tests {
         let lease = crate::daemon_protocol::LifecycleLease {
             owner: owner.clone(),
             phase: crate::daemon_protocol::LifecyclePhase::Restarting,
+            backend: None,
+            backend_session_id: None,
+            backend_session_owner: None,
             project_dir: None,
             project_dir_owner: None,
             project_dir_cleanup_on_abandon: false,
@@ -4225,6 +4627,9 @@ mod tests {
         let lease = crate::daemon_protocol::LifecycleLease {
             owner: incumbent.clone(),
             phase: crate::daemon_protocol::LifecyclePhase::Restarting,
+            backend: None,
+            backend_session_id: None,
+            backend_session_owner: None,
             project_dir: None,
             project_dir_owner: None,
             project_dir_cleanup_on_abandon: false,

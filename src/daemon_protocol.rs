@@ -82,6 +82,16 @@ pub enum LifecyclePhase {
 pub struct LifecycleLease {
     pub owner: ResourceOwner,
     pub phase: LifecyclePhase,
+    /// HTTP backend whose server-side session must be aborted before this
+    /// stopping lease can release its public ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// Exact server-side session identity covered by the abort obligation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_session_id: Option<String>,
+    /// Exact lifecycle owner that claimed the server-side session identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_session_owner: Option<ResourceOwner>,
     /// Directory claimed before launch performs filesystem work. This makes
     /// paneless crashes recoverable and prevents an abandoned lease from
     /// deleting a replacement incarnation's directory.
@@ -754,8 +764,8 @@ pub enum Event {
         expected_pane: Option<String>,
         keep_worktree: bool,
     },
-    /// Finish an externally completed backend exit while holding its exact
-    /// durable stopping lease.
+    /// Remove the registry row after backend exit while retaining its exact
+    /// durable stopping lease through remaining owned cleanup.
     CompleteOwnedStop {
         owner: ResourceOwner,
         expected_pane: String,
@@ -1280,6 +1290,9 @@ pub enum BackendIdentityBindOutcome {
     TargetAlreadyBound {
         session_id: String,
     },
+    LifecycleInProgress {
+        session_id: String,
+    },
     CredentialExpired,
     InvalidCredential,
     IdentityBoundToOther {
@@ -1453,6 +1466,12 @@ impl DaemonState {
         Some(incarnation)
     }
 
+    fn has_stopping_lease(&self, session_id: &str) -> bool {
+        self.lifecycle_leases
+            .get(session_id)
+            .is_some_and(|lease| lease.phase == LifecyclePhase::Stopping)
+    }
+
     /// Reserve exclusive authority for a new session start before any
     /// filesystem, tmux, process, or network work begins.
     pub fn reserve_start(
@@ -1481,6 +1500,9 @@ impl DaemonState {
             LifecycleLease {
                 owner: owner.clone(),
                 phase: LifecyclePhase::Starting,
+                backend: None,
+                backend_session_id: None,
+                backend_session_owner: None,
                 project_dir: None,
                 project_dir_owner: None,
                 project_dir_cleanup_on_abandon: false,
@@ -1562,6 +1584,9 @@ impl DaemonState {
             LifecycleLease {
                 owner: owner.clone(),
                 phase: LifecyclePhase::Restarting,
+                backend: None,
+                backend_session_id: None,
+                backend_session_owner: None,
                 project_dir,
                 project_dir_owner,
                 project_dir_cleanup_on_abandon: false,
@@ -1577,6 +1602,7 @@ impl DaemonState {
         &mut self,
         owner: &ResourceOwner,
         pane: &str,
+        cleanup_project_dir_on_abandon: bool,
     ) -> LifecycleMutationOutcome {
         if self.lifecycle_leases.contains_key(&owner.session_id) {
             return LifecycleMutationOutcome::Rejected;
@@ -1592,14 +1618,32 @@ impl DaemonState {
         }
         let project_dir = session.metadata.project_dir.clone();
         let project_dir_owner = project_dir.as_ref().map(|_| owner.clone());
+        let (backend, backend_session_id, backend_session_owner) = match (
+            &session.metadata.backend,
+            &session.metadata.backend_session_id,
+        ) {
+            (Some(backend), Some(backend_session_id)) => (
+                Some(backend.clone()),
+                Some(backend_session_id.clone()),
+                Some(owner.clone()),
+            ),
+            _ => (None, None, None),
+        };
+        let cleanup_project_dir_on_abandon = cleanup_project_dir_on_abandon
+            && project_dir.as_deref().is_some_and(|dir| {
+                dir.contains("/.ouija/worktrees/") || dir.contains("/.claude/worktrees/")
+            });
         self.lifecycle_leases.insert(
             owner.session_id.clone(),
             LifecycleLease {
                 owner: owner.clone(),
                 phase: LifecyclePhase::Stopping,
+                backend,
+                backend_session_id,
+                backend_session_owner,
                 project_dir,
                 project_dir_owner,
-                project_dir_cleanup_on_abandon: false,
+                project_dir_cleanup_on_abandon: cleanup_project_dir_on_abandon,
                 inert_pane: Some(pane.to_string()),
                 inert_pane_owner: Some(owner.clone()),
             },
@@ -2189,6 +2233,12 @@ impl DaemonState {
         session_start_credential: Option<String>,
         expected_repair_reservation: Option<BackendRepairReservation>,
     ) -> StageFreshLaunchResult {
+        if self.has_stopping_lease(id) {
+            return StageFreshLaunchResult {
+                outcome: StageFreshLaunchOutcome::Rejected,
+                effects: vec![],
+            };
+        }
         let Some(session) = self.sessions.get(id) else {
             return StageFreshLaunchResult {
                 outcome: StageFreshLaunchOutcome::Rejected,
@@ -2262,6 +2312,9 @@ impl DaemonState {
         pane: Option<String>,
         mut metadata: SessionMeta,
     ) -> Vec<Effect> {
+        if self.has_stopping_lease(&id) {
+            return vec![];
+        }
         let Some(existing) = self.sessions.get(&id) else {
             return vec![];
         };
@@ -2516,6 +2569,12 @@ impl DaemonState {
             });
             return effects;
         }
+        if self.has_stopping_lease(old_id) {
+            effects.push(Effect::RenameFailed {
+                reason: format!("session '{old_id}' has a lifecycle operation in progress"),
+            });
+            return effects;
+        }
 
         // Check origin before removing
         match self.sessions.get(old_id).map(|s| &s.origin) {
@@ -2613,7 +2672,8 @@ impl DaemonState {
         self.apply_remove_unleased(id, keep_worktree)
     }
 
-    /// Remove after the caller has proved it owns the lifecycle lease.
+    /// Remove after the caller has proved no lease conflicts with the removal,
+    /// or while an exact stopping lease deliberately remains authoritative.
     fn apply_remove_unleased(&mut self, id: &str, keep_worktree: bool) -> Vec<Effect> {
         let mut effects = Vec::new();
 
@@ -2756,7 +2816,6 @@ impl DaemonState {
         if !lease_matches || !session_matches {
             return vec![];
         }
-        self.lifecycle_leases.remove(&owner.session_id);
         self.apply_remove_unleased(&owner.session_id, keep_worktree)
     }
 
@@ -2767,6 +2826,9 @@ impl DaemonState {
         credential: Option<&str>,
         previous: Option<SessionEntry>,
     ) -> Vec<Effect> {
+        if self.has_stopping_lease(id) {
+            return vec![];
+        }
         let still_staged = self.sessions.get(id).is_some_and(|session| {
             matches!(session.origin, Origin::Local)
                 && session.pane.as_deref() == Some(pane)
@@ -2803,6 +2865,9 @@ impl DaemonState {
         previous: Option<SessionEntry>,
         provisional_pane: Option<&str>,
     ) -> Vec<Effect> {
+        if self.has_stopping_lease(id) {
+            return vec![];
+        }
         let still_staged = self.sessions.get(id).is_some_and(|session| {
             matches!(session.origin, Origin::Local)
                 && session.pane.as_deref() == pane
@@ -2985,9 +3050,15 @@ impl DaemonState {
         id: &str,
         role: Option<String>,
         bulletin: Option<String>,
-        project_dir: Option<String>,
+        mut project_dir: Option<String>,
         networked: Option<bool>,
     ) -> Vec<Effect> {
+        if project_dir.is_some() && self.has_stopping_lease(id) {
+            project_dir = None;
+        }
+        if role.is_none() && bulletin.is_none() && project_dir.is_none() && networked.is_none() {
+            return vec![];
+        }
         let session = match self.sessions.get_mut(id) {
             Some(s) if matches!(s.origin, Origin::Local) => s,
             _ => return vec![],
@@ -3092,6 +3163,14 @@ impl DaemonState {
         if !matches!(target.origin, Origin::Local) {
             return BackendIdentityBindResult {
                 outcome: BackendIdentityBindOutcome::TargetNotLocal,
+                effects: vec![],
+            };
+        }
+        if self.has_stopping_lease(id) {
+            return BackendIdentityBindResult {
+                outcome: BackendIdentityBindOutcome::LifecycleInProgress {
+                    session_id: id.into(),
+                },
                 effects: vec![],
             };
         }
@@ -3201,6 +3280,9 @@ impl DaemonState {
         expected_backend_session_id: Option<String>,
         expected_session_start_credential: Option<String>,
     ) -> Vec<Effect> {
+        if self.has_stopping_lease(id) {
+            return vec![];
+        }
         let (current_backend, current_backend_session_id, current_session_start_credential) =
             match self.sessions.get(id) {
                 Some(s) if matches!(s.origin, Origin::Local) => (
@@ -3260,6 +3342,9 @@ impl DaemonState {
         backend_session_id: String,
         expected_backend_session_id: String,
     ) -> Vec<Effect> {
+        if self.has_stopping_lease(id) {
+            return vec![];
+        }
         let Some(current) = self.sessions.get(id) else {
             return vec![];
         };
@@ -6473,13 +6558,15 @@ mod tests {
     }
 
     #[test]
-    fn stop_lease_holds_identity_until_external_exit_completes() {
+    fn stop_lease_holds_identity_through_registry_removal_until_cleanup_finishes() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
         state.apply(Event::Register {
             id: "worker".into(),
             pane: Some("%2".into()),
             metadata: SessionMeta {
-                project_dir: Some("/tmp/worker".into()),
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_worker".into()),
+                project_dir: Some("/tmp/.ouija/worktrees/project/worker".into()),
                 worktree_present: Some(false),
                 ..Default::default()
             },
@@ -6487,8 +6574,29 @@ mod tests {
         let owner = test_owner(&state, "worker");
 
         assert_eq!(
-            state.claim_existing_stop(&owner, "%2"),
+            state.claim_existing_stop(&owner, "%2", true),
             LifecycleMutationOutcome::Applied
+        );
+        assert!(
+            state.lifecycle_leases["worker"].project_dir_cleanup_on_abandon,
+            "the durable stop claim must retain explicit worktree cleanup intent"
+        );
+        assert_eq!(
+            state.lifecycle_leases["worker"].backend.as_deref(),
+            Some("opencode")
+        );
+        assert_eq!(
+            state.lifecycle_leases["worker"]
+                .backend_session_id
+                .as_deref(),
+            Some("ses_worker")
+        );
+        assert_eq!(
+            state.lifecycle_leases["worker"]
+                .backend_session_owner
+                .as_ref(),
+            Some(&owner),
+            "the abort obligation must remain attributable after registry removal"
         );
         assert!(
             state
@@ -6571,16 +6679,263 @@ mod tests {
         state.sessions.insert("worker".into(), retained);
 
         let effects = state.apply(Event::CompleteOwnedStop {
-            owner,
+            owner: owner.clone(),
             expected_pane: "%2".into(),
             keep_worktree: true,
         });
         assert!(!state.sessions.contains_key("worker"));
-        assert!(!state.lifecycle_leases.contains_key("worker"));
+        assert_eq!(
+            state.reserve_start("worker").unwrap(),
+            StartDisposition::InProgress(owner.clone()),
+            "registry removal must not release the public ID before owned cleanup finishes"
+        );
         assert!(
             effects
                 .iter()
                 .any(|effect| { matches!(effect, Effect::RemoveOk { id } if id == "worker") })
+        );
+        assert_eq!(
+            state.abort_lifecycle(&owner),
+            LifecycleMutationOutcome::Applied
+        );
+        assert!(matches!(
+            state.reserve_start("worker").unwrap(),
+            StartDisposition::Reserved(_)
+        ));
+    }
+
+    #[test]
+    fn stop_cleanup_intent_requires_a_claimed_project_directory() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%2".into()),
+            metadata: Default::default(),
+        });
+        let owner = test_owner(&state, "worker");
+
+        assert_eq!(
+            state.claim_existing_stop(&owner, "%2", true),
+            LifecycleMutationOutcome::Applied
+        );
+        assert!(
+            !state.lifecycle_leases["worker"].project_dir_cleanup_on_abandon,
+            "recovery cleanup authority cannot exist without an exact directory claim"
+        );
+    }
+
+    #[test]
+    fn delayed_stop_completion_cannot_remove_same_id_resource_replacement() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_worker".into()),
+                project_dir: Some("/tmp/.ouija/worktrees/project/worker".into()),
+                ..Default::default()
+            },
+        });
+        let stale_owner = test_owner(&state, "worker");
+        assert_eq!(
+            state.claim_existing_stop(&stale_owner, "%2", true),
+            LifecycleMutationOutcome::Applied
+        );
+        assert_eq!(
+            state.abort_lifecycle(&stale_owner),
+            LifecycleMutationOutcome::Applied
+        );
+        state.apply(Event::Remove {
+            id: "worker".into(),
+            keep_worktree: true,
+        });
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_worker".into()),
+                project_dir: Some("/tmp/.ouija/worktrees/project/worker".into()),
+                ..Default::default()
+            },
+        });
+        let replacement_owner = test_owner(&state, "worker");
+        assert_ne!(replacement_owner, stale_owner);
+
+        let effects = state.apply(Event::CompleteOwnedStop {
+            owner: stale_owner,
+            expected_pane: "%2".into(),
+            keep_worktree: true,
+        });
+
+        assert!(effects.is_empty());
+        assert_eq!(state.sessions["worker"].owner(), replacement_owner);
+        assert_eq!(
+            state.sessions["worker"]
+                .metadata
+                .backend_session_id
+                .as_deref(),
+            Some("ses_worker")
+        );
+        assert_eq!(
+            state.sessions["worker"].metadata.project_dir.as_deref(),
+            Some("/tmp/.ouija/worktrees/project/worker")
+        );
+    }
+
+    #[test]
+    fn stopping_lease_rejects_delayed_resource_mutations() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: None,
+                session_start_credential: Some("launch-proof".into()),
+                project_dir: Some("/tmp/.ouija/worktrees/project/worker".into()),
+                ..Default::default()
+            },
+        });
+        let owner = test_owner(&state, "worker");
+        assert_eq!(
+            state.claim_existing_stop(&owner, "%2", false),
+            LifecycleMutationOutcome::Applied
+        );
+
+        let adopt_effects = state.apply(Event::AdoptBackend {
+            id: "worker".into(),
+            backend: "opencode".into(),
+            backend_session_id: "ses_delayed".into(),
+            expected_backend_session_id: None,
+            expected_session_start_credential: Some("launch-proof".into()),
+        });
+
+        assert!(
+            adopt_effects.is_empty(),
+            "backend adoption queued before kill must lose to stopping authority"
+        );
+        assert_eq!(state.sessions["worker"].metadata.backend_session_id, None);
+        let bind = state.bind_backend_identity(
+            "worker",
+            &backend_identity("opencode", "ses_delayed"),
+            Some("launch-proof"),
+        );
+        assert_eq!(
+            bind.outcome,
+            BackendIdentityBindOutcome::LifecycleInProgress {
+                session_id: "worker".into()
+            }
+        );
+        assert!(bind.effects.is_empty());
+
+        let update_effects = state.apply(Event::UpdateMetadata {
+            id: "worker".into(),
+            role: None,
+            bulletin: None,
+            project_dir: Some("/tmp/.ouija/worktrees/project/replacement".into()),
+            networked: None,
+        });
+        assert!(
+            update_effects.is_empty(),
+            "project ownership queued before kill must lose to stopping authority"
+        );
+        assert_eq!(
+            state.sessions["worker"].metadata.project_dir.as_deref(),
+            Some("/tmp/.ouija/worktrees/project/worker")
+        );
+        let refresh_effects = state.apply(Event::RefreshLaunchMetadata {
+            id: "worker".into(),
+            expected_incarnation: owner.incarnation,
+            pane: Some("%4".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_delayed".into()),
+                project_dir: Some("/tmp/.ouija/worktrees/project/replacement".into()),
+                ..Default::default()
+            },
+        });
+        assert!(
+            refresh_effects.is_empty(),
+            "a delayed launch finalizer must not mutate resources after kill claims the owner"
+        );
+        assert_eq!(state.sessions["worker"].pane.as_deref(), Some("%2"));
+        assert!(matches!(
+            state
+                .apply(Event::Rename {
+                    old_id: "worker".into(),
+                    new_id: "winner".into(),
+                })
+                .as_slice(),
+            [Effect::RenameFailed { .. }]
+        ));
+        assert!(
+            state
+                .apply(Event::RollbackProvisionalRegistration {
+                    id: "worker".into(),
+                    pane: "%2".into(),
+                    credential: Some("launch-proof".into()),
+                    previous: None,
+                })
+                .is_empty()
+        );
+        assert!(
+            state
+                .apply(Event::RollbackFreshLaunch {
+                    id: "worker".into(),
+                    pane: Some("%2".into()),
+                    credential: Some("launch-proof".into()),
+                    staged_incarnation: owner.incarnation,
+                    previous: None,
+                    provisional_pane: Some("%2".into()),
+                })
+                .is_empty()
+        );
+        assert_eq!(
+            state
+                .stage_fresh_launch(
+                    "worker",
+                    "opencode".into(),
+                    Some("replacement-proof".into()),
+                    None,
+                )
+                .outcome,
+            StageFreshLaunchOutcome::Rejected
+        );
+        assert_eq!(state.sessions["worker"].owner(), owner);
+
+        let mut rebound = DaemonState::new("d1".into(), "host1".into());
+        rebound.apply(Event::Register {
+            id: "bound".into(),
+            pane: Some("%3".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_old".into()),
+                ..Default::default()
+            },
+        });
+        let bound_owner = test_owner(&rebound, "bound");
+        assert_eq!(
+            rebound.claim_existing_stop(&bound_owner, "%3", false),
+            LifecycleMutationOutcome::Applied
+        );
+        assert!(
+            rebound
+                .apply(Event::RebindBackend {
+                    id: "bound".into(),
+                    backend: "opencode".into(),
+                    backend_session_id: "ses_replacement".into(),
+                    expected_backend_session_id: "ses_old".into(),
+                })
+                .is_empty()
+        );
+        assert_eq!(
+            rebound.sessions["bound"]
+                .metadata
+                .backend_session_id
+                .as_deref(),
+            Some("ses_old")
         );
     }
 

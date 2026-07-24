@@ -103,6 +103,12 @@ impl PersistedLifecycleState {
                             .as_ref()
                             .map(|owner| owner.incarnation),
                     )
+                    .chain(
+                        lease
+                            .backend_session_owner
+                            .as_ref()
+                            .map(|owner| owner.incarnation),
+                    )
             })
             .max()
             .unwrap_or_default();
@@ -201,6 +207,44 @@ pub fn load_sessions(data_dir: &Path) -> Result<PersistedLifecycleState> {
                 "lifecycle lease key '{}' does not match project directory owner '{}'",
                 session_id,
                 project_dir_owner.session_id
+            );
+        }
+        if let Some(backend_session_owner) = &lease.backend_session_owner
+            && backend_session_owner.session_id != *session_id
+        {
+            anyhow::bail!(
+                "lifecycle lease key '{}' does not match backend session owner '{}'",
+                session_id,
+                backend_session_owner.session_id
+            );
+        }
+        if let Some(backend_session_owner) = &lease.backend_session_owner
+            && backend_session_owner != &lease.owner
+        {
+            anyhow::bail!(
+                "lifecycle lease '{}' backend abort owner does not match lease owner",
+                session_id
+            );
+        }
+        let backend_claim_fields = [
+            lease.backend.is_some(),
+            lease.backend_session_id.is_some(),
+            lease.backend_session_owner.is_some(),
+        ];
+        if backend_claim_fields.iter().any(|present| *present)
+            && !backend_claim_fields.iter().all(|present| *present)
+        {
+            anyhow::bail!(
+                "lifecycle lease '{}' has an incomplete backend abort claim",
+                session_id
+            );
+        }
+        if lease.backend.is_some()
+            && lease.phase != crate::daemon_protocol::LifecyclePhase::Stopping
+        {
+            anyhow::bail!(
+                "non-stopping lifecycle lease '{}' has a backend abort claim",
+                session_id
             );
         }
         if lease.project_dir.is_some() != lease.project_dir_owner.is_some() {
@@ -536,6 +580,9 @@ mod tests {
                 crate::daemon_protocol::LifecycleLease {
                     owner: owner.clone(),
                     phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                    backend: None,
+                    backend_session_id: None,
+                    backend_session_owner: None,
                     project_dir: None,
                     project_dir_owner: None,
                     project_dir_cleanup_on_abandon: false,
@@ -615,6 +662,9 @@ mod tests {
                         incarnation: crate::daemon_protocol::SessionIncarnation(5),
                     },
                     phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                    backend: None,
+                    backend_session_id: None,
+                    backend_session_owner: None,
                     project_dir: None,
                     project_dir_owner: None,
                     project_dir_cleanup_on_abandon: false,
@@ -647,6 +697,9 @@ mod tests {
                         incarnation: crate::daemon_protocol::SessionIncarnation(5),
                     },
                     phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                    backend: None,
+                    backend_session_id: None,
+                    backend_session_owner: None,
                     project_dir: None,
                     project_dir_owner: None,
                     project_dir_cleanup_on_abandon: false,

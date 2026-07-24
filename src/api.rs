@@ -2515,7 +2515,13 @@ pub async fn kill_session(
     } else {
         crate::nostr_transport::kill_session(&state, &body.name).await
     };
-    (StatusCode::OK, Json(json!({ "result": result })))
+    (
+        StatusCode::OK,
+        Json(json!({
+            "result": result.message,
+            "outcome": result.outcome,
+        })),
+    )
 }
 
 /// Prune stale sessions whose worktree is missing.
@@ -3437,6 +3443,13 @@ pub async fn bind_backend_identity(
             Json(json!({
                 "outcome": "target_already_bound",
                 "error": "target is already bound to a different backend identity; use an explicit fresh managed repair"
+            })),
+        ),
+        crate::daemon_protocol::BackendIdentityBindOutcome::LifecycleInProgress { .. } => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "outcome": "lifecycle_in_progress",
+                "error": "target session has a lifecycle operation in progress"
             })),
         ),
         crate::daemon_protocol::BackendIdentityBindOutcome::CredentialExpired => (
@@ -5187,6 +5200,93 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(body["status"], "start_in_progress");
         assert!(state.protocol.read().await.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn kill_session_response_exposes_typed_outcome() {
+        let state = crate::state::AppState::new_for_test();
+
+        let (status, Json(body)) = kill_session(
+            State(state),
+            Json(SessionNameBody {
+                name: "missing".into(),
+                fresh: None,
+                worktree: None,
+                project_dir: None,
+                prompt: None,
+                from: None,
+                backend: None,
+                model: None,
+                effort: None,
+                reminder: None,
+                parent_session: None,
+                no_parent_session: None,
+                idle_policy: None,
+                branch: None,
+                base_branch: None,
+                keep_worktree: None,
+                force_reset: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["outcome"], "failed");
+        assert_eq!(body["result"], "session 'missing' not found");
+    }
+
+    #[tokio::test]
+    async fn kill_session_response_reports_superseded_claim() {
+        let state = crate::state::AppState::new_for_test();
+        let owner = {
+            let mut protocol = state.protocol.write().await;
+            protocol.apply(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%2".into()),
+                metadata: Default::default(),
+            });
+            protocol.sessions["worker"].owner()
+        };
+        assert_eq!(
+            state
+                .claim_existing_stop(&owner, "%2", false)
+                .await
+                .unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+
+        let (status, Json(body)) = kill_session(
+            State(state),
+            Json(SessionNameBody {
+                name: "worker".into(),
+                fresh: None,
+                worktree: None,
+                project_dir: None,
+                prompt: None,
+                from: None,
+                backend: None,
+                model: None,
+                effort: None,
+                reminder: None,
+                parent_session: None,
+                no_parent_session: None,
+                idle_policy: None,
+                branch: None,
+                base_branch: None,
+                keep_worktree: None,
+                force_reset: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["outcome"], "superseded");
+        assert!(
+            body["result"]
+                .as_str()
+                .unwrap()
+                .contains("backend exit was superseded")
+        );
     }
 
     #[tokio::test]
