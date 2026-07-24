@@ -4973,11 +4973,9 @@ mod tests {
         let (status, Json(response)) = start_session(State(state), Json(body)).await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(
-            response["error"]
-                .as_str()
-                .is_some_and(|error| error.contains("ouija clear-reminder"))
-        );
+        assert!(response["error"].as_str().is_some_and(|error| {
+            error.contains("ouija clear-reminder") && error.contains("generated")
+        }));
     }
 
     #[test]
@@ -5117,11 +5115,9 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(
-            body["error"]
-                .as_str()
-                .is_some_and(|error| error.contains("ouija clear-reminder"))
-        );
+        assert!(body["error"].as_str().is_some_and(|error| {
+            error.contains("ouija clear-reminder") && error.contains("generated")
+        }));
     }
 
     #[tokio::test]
