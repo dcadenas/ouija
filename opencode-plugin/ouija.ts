@@ -17,12 +17,18 @@ export const OuijaPlugin: Plugin = async (ctx) => {
 
   console.error(`ouija plugin v${OUIJA_VERSION}: connected to daemon at ${base}`)
 
+  // OpenCode serves multiple backend sessions from one plugin process. Keep
+  // lifecycle authority per native session rather than in one ambient slot.
+  const sessionIncarnations = new Map<string, string>()
+
   /** Build hook body with pane or backend_session_id. */
-  function hookBody(sessionID?: string): Record<string, string> {
-    const body: Record<string, string> = {}
+  function hookBody(sessionID?: string): Record<string, string | number> {
+    const body: Record<string, string | number> = {}
     const pane = process.env.TMUX_PANE
     if (pane) body.pane = pane
     else if (sessionID) body.backend_session_id = sessionID
+    const incarnation = sessionID ? sessionIncarnations.get(sessionID) : undefined
+    if (incarnation !== undefined) body.session_incarnation = incarnation
     return body
   }
 
@@ -39,9 +45,13 @@ export const OuijaPlugin: Plugin = async (ctx) => {
       let sid = "(unknown)"
       if (input.sessionID) {
         try {
-          const readyBody: Record<string, string> = {}
+          const readyBody: Record<string, string | number> = {}
           const pane = process.env.TMUX_PANE
           if (pane) readyBody.pane = pane
+          const knownIncarnation = sessionIncarnations.get(input.sessionID)
+          if (knownIncarnation !== undefined) {
+            readyBody.session_incarnation = knownIncarnation
+          }
           try { readyBody.cwd = process.cwd() } catch {}
           const resp = await fetch(
             `${base}/api/backend-session/${encodeURIComponent(input.sessionID)}/ready`,
@@ -55,6 +65,9 @@ export const OuijaPlugin: Plugin = async (ctx) => {
             const body: any = await resp.json().catch(() => ({}))
             if (typeof body?.session === "string" && body.session.length > 0) {
               sid = body.session
+            }
+            if (typeof body?.session_incarnation === "string") {
+              sessionIncarnations.set(input.sessionID, body.session_incarnation)
             }
           }
         } catch {
@@ -99,19 +112,29 @@ Load the ouija skill for full documentation on session management, task scheduli
         // auto-provision (ouija#35) without a round-trip to opencode serve
         // or a tmux pane scan. The daemon treats both as optional and
         // falls back to the serve+scan path when either is absent.
-        const readyBody: Record<string, string> = {}
+        const readyBody: Record<string, string | number> = {}
         const pane = process.env.TMUX_PANE
         if (pane) readyBody.pane = pane
+        const knownIncarnation = sessionIncarnations.get(sid)
+        if (knownIncarnation !== undefined) {
+          readyBody.session_incarnation = knownIncarnation
+        }
         try {
           readyBody.cwd = process.cwd()
         } catch {}
         setTimeout(async () => {
           try {
-            await fetch(`${base}/api/backend-session/${encodeURIComponent(sid)}/ready`, {
+            const resp = await fetch(`${base}/api/backend-session/${encodeURIComponent(sid)}/ready`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify(readyBody)
             })
+            if (resp.ok) {
+              const body: any = await resp.json().catch(() => ({}))
+              if (typeof body?.session_incarnation === "string") {
+                sessionIncarnations.set(sid, body.session_incarnation)
+              }
+            }
           } catch {}
         }, 0)
       }

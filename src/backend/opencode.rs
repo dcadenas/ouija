@@ -235,6 +235,22 @@ mod tests {
     }
 
     #[test]
+    fn plugin_tracks_incarnation_per_backend_session() {
+        assert!(
+            embedded::PLUGIN_TS.contains("new Map<string, string>()"),
+            "readiness state must be per OpenCode backend session"
+        );
+        assert!(
+            embedded::PLUGIN_TS.contains("body.session_incarnation = incarnation"),
+            "activity hooks must carry the exact ready incarnation"
+        );
+        assert!(
+            embedded::PLUGIN_TS.contains("sessionIncarnations.set"),
+            "ready responses must refresh exact backend-session authority"
+        );
+    }
+
+    #[test]
     fn embedded_skill_distinguishes_public_session_id_from_opencode_backend_ids() {
         assert!(
             embedded::SKILL_MD.contains("ouija ask target-id \"question\" --from public-ouija-id"),

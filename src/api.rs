@@ -2527,7 +2527,7 @@ pub async fn prune_stale_sessions(
     State(state): State<SharedState>,
     Json(body): Json<PruneStaleBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let stale_sessions: Vec<(String, String)> = {
+    let stale_sessions: Vec<(crate::daemon_protocol::ResourceOwner, String)> = {
         let proto = state.protocol.read().await;
         proto
             .sessions
@@ -2540,7 +2540,7 @@ pub async fn prune_stale_sessions(
                 s.metadata
                     .project_dir
                     .as_ref()
-                    .map(|d| (s.id.clone(), d.clone()))
+                    .map(|d| (s.owner(), d.clone()))
             })
             .collect()
     };
@@ -2548,7 +2548,7 @@ pub async fn prune_stale_sessions(
         return (
             StatusCode::OK,
             Json(
-                json!({ "dry_run": true, "would_prune": stale_sessions.iter().map(|(id, _)| id).cloned().collect::<Vec<_>>() }),
+                json!({ "dry_run": true, "would_prune": stale_sessions.iter().map(|(owner, _)| owner.session_id.clone()).collect::<Vec<_>>() }),
             ),
         );
     }
@@ -2558,7 +2558,10 @@ pub async fn prune_stale_sessions(
     // Single batched apply: the handler runs each session's RemoveIfStale guard
     // under one write lock and coalesces Persist + BroadcastSessionList into
     // one of each, rather than N full state writes for N stale sessions.
-    let input_ids: Vec<String> = stale_sessions.iter().map(|(id, _)| id.clone()).collect();
+    let input_ids: Vec<String> = stale_sessions
+        .iter()
+        .map(|(owner, _)| owner.session_id.clone())
+        .collect();
     let effects = state
         .apply_and_execute(crate::daemon_protocol::Event::PruneStale {
             sessions: stale_sessions,
@@ -3734,6 +3737,11 @@ struct BackendSessionReadyHints {
     pane: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::daemon_protocol::deserialize_optional_incarnation"
+    )]
+    session_incarnation: Option<crate::daemon_protocol::SessionIncarnation>,
 }
 
 #[cfg(test)]
@@ -3757,10 +3765,27 @@ async fn backend_session_ready_inner_with_hints(
     // Step 1: direct lookup. This runs FIRST regardless of hints — hub-
     // spawned and previously-adopted sessions must win over any hint-derived
     // id, or a stale plugin cwd could shadow the real session.
-    let resolution = {
+    let (resolution, hinted_owner_matches) = {
         let proto = state.protocol.read().await;
-        resolve_opencode_backend_identity(&proto, &backend_sid)
+        let resolution = resolve_opencode_backend_identity(&proto, &backend_sid);
+        let hinted_owner_matches = hints.session_incarnation.is_none_or(|expected| {
+            matches!(
+                &resolution,
+                crate::daemon_protocol::BackendIdentityResolution::Resolved { session_id }
+                    if proto.sessions.get(session_id).is_some_and(|session| {
+                        session.metadata.session_incarnation == expected
+                    })
+            )
+        });
+        (resolution, hinted_owner_matches)
     };
+    if !hinted_owner_matches {
+        return json!({
+            "delivered": false,
+            "outcome": "superseded",
+            "error": "backend readiness belongs to a replaced session incarnation",
+        });
+    }
     let name = match resolution {
         crate::daemon_protocol::BackendIdentityResolution::Resolved { session_id } => {
             let n = session_id;
@@ -3883,6 +3908,24 @@ async fn backend_session_ready_inner_with_hints(
         }
     };
 
+    let current_incarnation = state
+        .protocol
+        .read()
+        .await
+        .sessions
+        .get(&name)
+        .map(|session| session.metadata.session_incarnation);
+    if hints
+        .session_incarnation
+        .is_some_and(|expected| current_incarnation != Some(expected))
+    {
+        return json!({
+            "delivered": false,
+            "outcome": "superseded",
+            "error": "backend readiness belongs to a replaced session incarnation",
+        });
+    }
+
     let delivered = deliver_pending_prompt(state, &name).await;
     tracing::info!(
         target: "ouija::api::backend_session_ready",
@@ -3891,7 +3934,11 @@ async fn backend_session_ready_inner_with_hints(
         delivered,
         "backend session ready complete"
     );
-    json!({"delivered": delivered, "session": name})
+    json!({
+        "delivered": delivered,
+        "session": name,
+        "session_incarnation": current_incarnation.map(|incarnation| incarnation.to_string()),
+    })
 }
 
 fn validate_backend_session_id_boundary(backend_sid: &str) -> Option<String> {
@@ -8658,6 +8705,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backend_session_ready_rejects_stale_incarnation_hint() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "prebound".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_known".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let current = state.protocol.read().await.sessions["prebound"]
+            .metadata
+            .session_incarnation;
+
+        let response = backend_session_ready_inner_with_hints(
+            &state,
+            "ses_known".into(),
+            BackendSessionReadyHints {
+                pane: Some("%17".into()),
+                cwd: Some("/tmp/freshproject".into()),
+                session_incarnation: Some(crate::daemon_protocol::SessionIncarnation(
+                    current.0.saturating_sub(1),
+                )),
+            },
+        )
+        .await;
+
+        assert_eq!(response["outcome"], "superseded");
+        assert_eq!(response["delivered"], false);
+    }
+
+    #[tokio::test]
+    async fn stale_readiness_hint_does_not_adopt_an_unbound_candidate() {
+        use axum::Router;
+        use axum::routing::get;
+        use tokio::net::TcpListener;
+
+        async fn session_dir() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "directory": "/tmp/stale-adoption" }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_port = listener.local_addr().unwrap().port();
+        assert!(serve_port >= 320, "test listener port must be >= 320");
+        let app = Router::new().route("/session/{session_id}", get(session_dir));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: serve_port - 320,
+            data_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+            config_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "unbound".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/stale-adoption".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let response = backend_session_ready_inner_with_hints(
+            &state,
+            "ses_stale_adoption".into(),
+            BackendSessionReadyHints {
+                pane: Some("%17".into()),
+                cwd: Some("/tmp/stale-adoption".into()),
+                session_incarnation: Some(crate::daemon_protocol::SessionIncarnation(u64::MAX)),
+            },
+        )
+        .await;
+
+        assert_eq!(response["outcome"], "superseded");
+        let proto = state.protocol.read().await;
+        let candidate = &proto.sessions["unbound"];
+        assert_eq!(candidate.metadata.backend, None);
+        assert_eq!(candidate.metadata.backend_session_id, None);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_readiness_hint_does_not_auto_provision_a_session() {
+        use axum::Router;
+        use axum::routing::get;
+        use tokio::net::TcpListener;
+
+        async fn session_dir() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "directory": "/tmp/stale-provision" }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_port = listener.local_addr().unwrap().port();
+        assert!(serve_port >= 320, "test listener port must be >= 320");
+        let app = Router::new().route("/session/{session_id}", get(session_dir));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: serve_port - 320,
+            data_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+            config_dir: std::path::PathBuf::from("/tmp/ouija-test-agent"),
+        });
+        *state.cached_assistant_panes.write().await = vec![pane_in("/tmp/stale-provision", "%31")];
+
+        let response = backend_session_ready_inner_with_hints(
+            &state,
+            "ses_stale_provision".into(),
+            BackendSessionReadyHints {
+                pane: Some("%31".into()),
+                cwd: Some("/tmp/stale-provision".into()),
+                session_incarnation: Some(crate::daemon_protocol::SessionIncarnation(u64::MAX)),
+            },
+        )
+        .await;
+
+        assert_eq!(response["outcome"], "superseded");
+        assert!(
+            state.protocol.read().await.sessions.is_empty(),
+            "stale readiness must fail before auto-provision mutates state"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn backend_session_ready_does_not_match_a_different_backend_with_same_native_id() {
         let state = crate::state::AppState::new_for_test();
         state
@@ -8720,6 +8901,7 @@ mod tests {
         let hints = BackendSessionReadyHints {
             pane: Some("%31".into()),
             cwd: Some("/tmp/local-project".into()),
+            session_incarnation: None,
         };
 
         let response =
@@ -8798,6 +8980,7 @@ mod tests {
         let hints = BackendSessionReadyHints {
             pane: Some("%31".into()),
             cwd: Some("/tmp/local-project".into()),
+            session_incarnation: None,
         };
 
         let response =
@@ -8853,6 +9036,7 @@ mod tests {
         let hints = BackendSessionReadyHints {
             pane: Some("%31".into()),
             cwd: Some("/tmp/explicit-project".into()),
+            session_incarnation: None,
         };
 
         let response =
@@ -8893,6 +9077,7 @@ mod tests {
         let hints = BackendSessionReadyHints {
             pane: Some("%31".into()),
             cwd: Some("/tmp/explicit-project".into()),
+            session_incarnation: None,
         };
 
         let response =
@@ -8930,6 +9115,7 @@ mod tests {
         let hints = BackendSessionReadyHints {
             pane: Some("%31".into()),
             cwd: None,
+            session_incarnation: None,
         };
 
         let response =
@@ -8966,6 +9152,7 @@ mod tests {
         let hints = BackendSessionReadyHints {
             pane: Some("%99".into()),
             cwd: Some("/tmp/unrelated".into()),
+            session_incarnation: None,
         };
 
         let response =

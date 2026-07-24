@@ -1390,17 +1390,33 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
 
 /// Kill the Claude process in a named session's pane.
 pub async fn kill_session(state: &std::sync::Arc<AppState>, name: &str) -> String {
-    kill_session_inner(state, name, false).await
+    kill_session_inner(state, name, false, None).await
 }
 
 pub async fn kill_session_keep_worktree(state: &std::sync::Arc<AppState>, name: &str) -> String {
-    kill_session_inner(state, name, true).await
+    kill_session_inner(state, name, true, None).await
+}
+
+/// Kill only the exact idle-session snapshot selected by max-session eviction.
+pub async fn kill_session_owned(
+    state: &std::sync::Arc<AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    expected_pane: &str,
+) -> String {
+    kill_session_inner(
+        state,
+        &owner.session_id,
+        false,
+        Some((owner.clone(), expected_pane.to_string())),
+    )
+    .await
 }
 
 async fn kill_session_inner(
     state: &std::sync::Arc<AppState>,
     name: &str,
     keep_worktree: bool,
+    expected_owner: Option<(crate::daemon_protocol::ResourceOwner, String)>,
 ) -> String {
     let session = state.protocol.read().await.sessions.get(name).cloned();
     let Some(session) = session else {
@@ -1412,8 +1428,24 @@ async fn kill_session_inner(
     let Some(pane) = &session.pane else {
         return format!("'{name}' has no pane");
     };
+    if expected_owner
+        .as_ref()
+        .is_some_and(|(owner, expected_pane)| session.owner() != *owner || pane != expected_pane)
+    {
+        return format!("session '{name}' was replaced before eviction");
+    }
 
     let pane = pane.clone();
+    let owner = session.owner();
+    match state.claim_existing_stop(&owner, &pane).await {
+        Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
+        Ok(outcome) => {
+            return format!("session '{name}' backend exit was superseded ({outcome:?})");
+        }
+        Err(error) => {
+            return format!("failed to persist backend exit authority for '{name}': {error}");
+        }
+    }
     let project_dir = session.metadata.project_dir.clone();
     let backend_session_id = session.metadata.backend_session_id.clone();
     let backend = state.backend_for_session(name).await;
@@ -1433,6 +1465,10 @@ async fn kill_session_inner(
     // killing the client process. The attach client is just a TUI — killing
     // it does NOT stop the server from executing the current assistant turn.
     if is_http_api {
+        if !state.owns_stopping_session(&owner, &pane).await {
+            let _ = state.abort_lifecycle(&owner).await;
+            return format!("session '{name}' backend exit was superseded before abort");
+        }
         if let Some(ref oc_sid) = backend_session_id {
             let port = state.opencode_serve_port();
             let url = format!("http://127.0.0.1:{port}/session/{oc_sid}/abort");
@@ -1466,26 +1502,31 @@ async fn kill_session_inner(
         }
     }
 
-    // Remove from the registry BEFORE killing the process. When Claude
-    // runs its SessionEnd hook during /exit, the hook will find no
-    // session and no-op — otherwise the hook races with this function's
-    // final Remove and usually wins, masking CleanupWorktree.
-    // We always pass keep_worktree: true here; worktree teardown (if
-    // requested) happens AFTER the process is confirmed dead so we don't
-    // race the still-running claude writing to its cwd.
-    state
-        .apply_and_execute(crate::daemon_protocol::Event::Remove {
-            id: name.to_string(),
-            keep_worktree: true,
-        })
-        .await;
-
+    // Keep the registry row and durable stop lease until the external exit is
+    // complete. SessionEnd is owner-scoped and the lease prevents it (or a
+    // same-ID registration) from releasing this identity while we await.
+    let pane_owner = owner.clone();
+    let pane_for_kill = pane.clone();
+    let state_for_kill = std::sync::Arc::clone(state);
+    let runtime = tokio::runtime::Handle::current();
     let kill_result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
         use std::process::Command;
 
+        let require_pane_owner = || -> anyhow::Result<()> {
+            if !runtime.block_on(state_for_kill.owns_stopping_session(&pane_owner, &pane_for_kill))
+            {
+                anyhow::bail!("stop authority changed before backend exit");
+            }
+            if crate::tmux::inspect_pane_owner(&pane_for_kill)?.as_ref() != Some(&pane_owner) {
+                anyhow::bail!("pane owner changed before backend exit");
+            }
+            Ok(())
+        };
+
         // Get pane PID
+        require_pane_owner()?;
         let output = Command::new("tmux")
-            .args(["display-message", "-t", &pane, "-p", "#{pane_pid}"])
+            .args(["display-message", "-t", &pane_for_kill, "-p", "#{pane_pid}"])
             .output()?;
         if !output.status.success() {
             anyhow::bail!("could not get pane PID");
@@ -1495,8 +1536,9 @@ async fn kill_session_inner(
             Ok(pid) => pid,
             Err(_) => {
                 // Pane exists but has no running process — skip process kill, just clean up
+                require_pane_owner()?;
                 let _ = Command::new("tmux")
-                    .args(["kill-pane", "-t", &pane])
+                    .args(["kill-pane", "-t", &pane_for_kill])
                     .status();
                 return Ok("no running process in pane".to_string());
             }
@@ -1549,13 +1591,15 @@ async fn kill_session_inner(
                 // backend may clean up its own worktree during exit.
                 // Go straight to SIGKILL to prevent cleanup handlers.
                 if keep_worktree {
+                    require_pane_owner()?;
                     let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 } else {
                     // Graceful: send exit command if backend supports it
                     if let Some(ref exit) = exit_cmd {
+                        require_pane_owner()?;
                         let _ = Command::new("tmux")
-                            .args(["send-keys", "-t", &pane, exit, "Enter"])
+                            .args(["send-keys", "-t", &pane_for_kill, exit, "Enter"])
                             .status();
 
                         // Poll up to 10s for process to exit
@@ -1574,13 +1618,15 @@ async fn kill_session_inner(
 
                     if !exited {
                         // Fallback: SIGTERM
+                        require_pane_owner()?;
                         let _ = Command::new("kill").arg(pid.to_string()).status();
                         std::thread::sleep(std::time::Duration::from_secs(1));
                     }
                 }
 
+                require_pane_owner()?;
                 let _ = Command::new("tmux")
-                    .args(["kill-pane", "-t", &pane])
+                    .args(["kill-pane", "-t", &pane_for_kill])
                     .status();
                 let method = if keep_worktree {
                     "SIGKILL (worktree preserved)"
@@ -1592,8 +1638,9 @@ async fn kill_session_inner(
                 Ok(format!("killed {cli_name} (pid {pid}, {method})"))
             }
             None => {
+                require_pane_owner()?;
                 let _ = Command::new("tmux")
-                    .args(["kill-pane", "-t", &pane])
+                    .args(["kill-pane", "-t", &pane_for_kill])
                     .status();
                 Ok(format!("no {cli_name} process found"))
             }
@@ -1601,23 +1648,38 @@ async fn kill_session_inner(
     })
     .await;
 
-    // Session is already out of the registry (Remove above). Even on kill
-    // failure, keep the session unregistered — a bail here usually means
-    // the pane was already gone, so it was effectively dead anyway.
+    if matches!(
+        &kill_result,
+        Ok(Err(error))
+            if error.to_string().contains("pane owner changed")
+                || error.to_string().contains("stop authority changed")
+    ) {
+        let _ = state.abort_lifecycle(&owner).await;
+        return format!("session '{name}' pane was replaced before backend exit");
+    }
+
     let msg = match kill_result {
         Ok(Ok(msg)) => msg,
         Ok(Err(e)) => format!("kill failed: {e}"),
         Err(e) => format!("kill failed: {e}"),
     };
 
-    // Also kill any tmux session that matches the ouija session name
-    let session_name = name.to_string();
-    let _ = tokio::task::spawn_blocking(move || {
-        let _ = std::process::Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .status();
-    })
-    .await;
+    let removal_effects = state
+        .apply_and_execute(crate::daemon_protocol::Event::CompleteOwnedStop {
+            owner: owner.clone(),
+            expected_pane: pane.clone(),
+            keep_worktree: true,
+        })
+        .await;
+    if !removal_effects.iter().any(|effect| {
+        matches!(
+            effect,
+            crate::daemon_protocol::Effect::RemoveOk { id } if id == name
+        )
+    }) {
+        let _ = state.abort_lifecycle(&owner).await;
+        return format!("session '{name}' backend exit completion was superseded");
+    }
 
     // Worktree cleanup AFTER the process is confirmed dead, so we don't
     // race against claude writing to its cwd. Mirrors the shared-worktree
@@ -1628,20 +1690,7 @@ async fn kill_session_inner(
             let is_worktree_path =
                 dir.contains("/.ouija/worktrees/") || dir.contains("/.claude/worktrees/");
             if is_worktree_path {
-                let shared = state
-                    .protocol
-                    .read()
-                    .await
-                    .sessions
-                    .values()
-                    .any(|s| s.metadata.project_dir.as_deref() == Some(dir.as_str()));
-                if shared {
-                    tracing::info!(
-                        "skipping worktree cleanup for {dir}: other sessions still using it"
-                    );
-                } else {
-                    crate::state::AppState::cleanup_worktree_dir(&dir).await;
-                }
+                state.cleanup_worktree_dir_if_unused(&dir).await;
             }
         }
     }
@@ -1873,6 +1922,7 @@ pub async fn start_session(
             launch_model.codex_home.as_deref(),
             name,
             credential,
+            owner.incarnation,
         ) {
             Ok(command) => command,
             Err(error) => {
@@ -2757,32 +2807,14 @@ pub async fn restart_session(
     crate::backend::codex::install_configured_home(launch_codex_home.as_deref());
 
     let claude_cmd = if fresh {
-        let command = backend.build_start_command(&crate::backend::StartOpts {
+        backend.build_start_command(&crate::backend::StartOpts {
             project_dir: dir.clone(),
             worktree: None, // ouija manages worktrees, not the backend
             model: launch_model.model.clone(),
             effort: effective_effort.clone(),
             permission_mode: claude_permission_mode,
             codex_home: launch_codex_home.clone(),
-        });
-        match session_start_credential.as_deref() {
-            Some(credential) => match crate::backend::codex::with_session_start_hook(
-                command,
-                launch_codex_home.as_deref(),
-                name,
-                credential,
-            ) {
-                Ok(command) => command,
-                Err(error) => {
-                    return (
-                        format!("could not stage Codex launch credential: {error}"),
-                        None,
-                        RestartOutcome::Failed,
-                    );
-                }
-            },
-            None => command,
-        }
+        })
     } else {
         backend
             .build_resume_command(&crate::backend::ResumeOpts {
@@ -3005,6 +3037,53 @@ pub async fn restart_session(
         restart_lease_owner
     } else {
         None
+    };
+
+    let claude_cmd = match session_start_credential.as_deref() {
+        Some(credential) => {
+            let Some(incarnation) = staged_incarnation else {
+                return (
+                    "restart missing staged Codex incarnation".into(),
+                    None,
+                    RestartOutcome::Failed,
+                );
+            };
+            match crate::backend::codex::with_session_start_hook(
+                claude_cmd,
+                launch_codex_home.as_deref(),
+                name,
+                credential,
+                incarnation,
+            ) {
+                Ok(command) => command,
+                Err(error) => {
+                    let rollback = recover_failed_fresh_launch(
+                        state,
+                        name,
+                        existing_pane.clone(),
+                        session_start_credential.clone(),
+                        fresh_launch_staged_incarnation,
+                        session.clone(),
+                        None,
+                    )
+                    .await;
+                    return (
+                        format!(
+                            "could not stage Codex launch credential: {error}{}",
+                            rollback
+                                .err()
+                                .map(|rollback_error| {
+                                    format!("; durable rollback failed: {rollback_error}")
+                                })
+                                .unwrap_or_default()
+                        ),
+                        None,
+                        RestartOutcome::Failed,
+                    );
+                }
+            }
+        }
+        None => claude_cmd,
     };
 
     // For TuiInjection: pass prompt as CLI arg (same as start_session).

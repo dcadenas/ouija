@@ -537,7 +537,7 @@ async fn main() -> anyhow::Result<()> {
                     tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
 
                     // Reap dead local sessions via protocol
-                    let panes_to_check: Vec<(String, String)> = {
+                    let panes_to_check: Vec<(crate::daemon_protocol::ResourceOwner, String)> = {
                         let proto = reaper_state.protocol.read().await;
                         let now = chrono::Utc::now().timestamp();
                         proto
@@ -554,32 +554,33 @@ async fn main() -> anyhow::Result<()> {
                                         reaper_state.backends.uses_http_delivery(b)
                                     })
                             })
-                            .filter_map(|s| Some((s.id.clone(), s.pane.clone()?)))
+                            .filter_map(|s| Some((s.owner(), s.pane.clone()?)))
                             .collect()
                     };
-                    let dead_ids: Vec<String> = if !panes_to_check.is_empty() {
-                        let names: Vec<String> = reaper_state.backends.all_process_names();
-                        let dead = tokio::task::spawn_blocking(move || {
-                            let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-                            panes_to_check
-                                .into_iter()
-                                .filter(|(_, pane)| !crate::tmux::pane_alive(pane, &name_refs))
-                                .map(|(id, _)| id)
-                                .collect::<Vec<_>>()
-                        })
-                        .await
-                        .unwrap_or_default();
-                        if !dead.is_empty() {
-                            reaper_state
-                                .apply_and_execute(crate::daemon_protocol::Event::ReapDead {
-                                    dead_ids: dead.clone(),
-                                })
-                                .await;
-                        }
-                        dead
-                    } else {
-                        vec![]
-                    };
+                    let dead_sessions: Vec<(crate::daemon_protocol::ResourceOwner, String)> =
+                        if !panes_to_check.is_empty() {
+                            let names: Vec<String> = reaper_state.backends.all_process_names();
+                            let dead = tokio::task::spawn_blocking(move || {
+                                let name_refs: Vec<&str> =
+                                    names.iter().map(|s| s.as_str()).collect();
+                                panes_to_check
+                                    .into_iter()
+                                    .filter(|(_, pane)| !crate::tmux::pane_alive(pane, &name_refs))
+                                    .collect::<Vec<_>>()
+                            })
+                            .await
+                            .unwrap_or_default();
+                            if !dead.is_empty() {
+                                reaper_state
+                                    .apply_and_execute(crate::daemon_protocol::Event::ReapDead {
+                                        dead_sessions: dead.clone(),
+                                    })
+                                    .await;
+                            }
+                            dead
+                        } else {
+                            vec![]
+                        };
                     // Clean up per-fire worktree panes
                     let perfire_to_check: Vec<(String, String)> = {
                         let pf = reaper_state.perfire_worktree_panes.read().await;
@@ -612,15 +613,17 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
-                    let _ = dead_ids; // suppress unused warning
+                    let _ = dead_sessions; // suppress unused warning
 
                     // If over the max session limit, close the most idle ones.
                     // Killing the pane lets the next reaper cycle clean up + broadcast.
-                    for id in reaper_state.collect_excess_idle_sessions().await {
+                    for (owner, pane) in reaper_state.collect_excess_idle_sessions().await {
+                        let id = owner.session_id.clone();
                         tracing::info!(
                             "auto-closing idle session '{id}' (over max_local_sessions)"
                         );
-                        crate::nostr_transport::kill_session(&reaper_state, &id).await;
+                        crate::nostr_transport::kill_session_owned(&reaper_state, &owner, &pane)
+                            .await;
                     }
 
                     // Scan tmux, update cache, auto-register unregistered panes
@@ -1372,6 +1375,11 @@ fn abandoned_lease_owns_staged_row(
                 });
             owns_recorded_inert_pane
                 || session.metadata.session_incarnation != lease.owner.incarnation
+        }
+        crate::daemon_protocol::LifecyclePhase::Stopping => {
+            session.metadata.session_incarnation == lease.owner.incarnation
+                && lease.inert_pane.as_ref() == session.pane.as_ref()
+                && lease.inert_pane_owner.as_ref() == Some(&lease.owner)
         }
     }
 }

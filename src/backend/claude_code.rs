@@ -622,6 +622,23 @@ mod tests {
         assert!(script.contains("--arg adapter \"claude-code\""), "{script}");
         assert!(script.contains("launch_session_id"), "{script}");
         assert!(script.contains("${OUIJA_SESSION_ID:-}"), "{script}");
+        assert!(script.contains("OUIJA_SESSION_INCARNATION"), "{script}");
+        assert!(script.contains("session_incarnation"), "{script}");
+        assert!(
+            embedded::SCRIPT_UNREGISTER.contains("OUIJA_SESSION_INCARNATION"),
+            "{}",
+            embedded::SCRIPT_UNREGISTER
+        );
+        assert!(
+            embedded::SCRIPT_TOOL_ACTIVITY.contains("session_incarnation"),
+            "{}",
+            embedded::SCRIPT_TOOL_ACTIVITY
+        );
+        assert!(
+            embedded::SCRIPT_PROMPT_SUBMIT.contains("session_incarnation"),
+            "{}",
+            embedded::SCRIPT_PROMPT_SUBMIT
+        );
     }
 
     #[test]

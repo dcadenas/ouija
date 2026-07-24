@@ -440,13 +440,15 @@ pub(crate) fn format_session_start_hook_flags(
     codex_home: &str,
     launch_session_id: &str,
     launch_credential_file: &Path,
+    session_incarnation: crate::daemon_protocol::SessionIncarnation,
 ) -> String {
     let script = hooks_dir(Path::new(codex_home)).join("codex-register.sh");
     let command = format!(
-        "{} --launch-session-id {} --launch-credential-file {}",
+        "{} --launch-session-id {} --launch-credential-file {} --session-incarnation {}",
         crate::scheduler::shell_escape(&script.to_string_lossy()),
         crate::scheduler::shell_escape(launch_session_id),
         crate::scheduler::shell_escape(&launch_credential_file.to_string_lossy()),
+        session_incarnation,
     );
     // Codex hashes the TOML-normalized command handler. Optional TOML fields
     // are absent, while the hook engine supplies timeout=600 and async=false.
@@ -485,6 +487,7 @@ pub(crate) fn with_session_start_hook(
     codex_home: Option<&str>,
     launch_session_id: &str,
     launch_credential: &str,
+    session_incarnation: crate::daemon_protocol::SessionIncarnation,
 ) -> anyhow::Result<String> {
     let home = codex_home
         .map(crate::state::expand_tilde)
@@ -497,7 +500,8 @@ pub(crate) fn with_session_start_hook(
         format_session_start_hook_flags(
             &home.to_string_lossy(),
             launch_session_id,
-            &credential_file
+            &credential_file,
+            session_incarnation,
         )
     ))
 }
@@ -706,6 +710,7 @@ mod tests {
             &home.path().to_string_lossy(),
             "public-launch",
             &credential_file,
+            crate::daemon_protocol::SessionIncarnation(42),
         );
 
         assert!(
@@ -1222,9 +1227,12 @@ mod tests {
             "ambient launch variables must never become managed proof: {s}"
         );
         assert!(
-            s.contains("--launch-session-id") && s.contains("--launch-credential-file"),
+            s.contains("--launch-session-id")
+                && s.contains("--launch-credential-file")
+                && s.contains("--session-incarnation"),
             "the per-launch SessionFlags hook must receive its proof by private file: {s}"
         );
+        assert!(s.contains("session_incarnation"), "{s}");
         assert!(
             s.contains("mv -- \"$EXPLICIT_LAUNCH_CREDENTIAL_FILE\"")
                 && s.contains("rm -f -- \"$CLAIMED_CREDENTIAL_FILE\""),
@@ -1248,6 +1256,7 @@ mod tests {
         let s = embedded::SCRIPT_PROMPT_SUBMIT;
         assert!(s.contains("/api/hooks/prompt-submit"), "{s}");
         assert!(s.contains("UserPromptSubmit"), "{s}");
+        assert!(s.contains("session_incarnation"), "{s}");
     }
 
     #[test]
@@ -1255,6 +1264,7 @@ mod tests {
         let s = embedded::SCRIPT_STOP;
         // Pings the turn-stop endpoint...
         assert!(s.contains("/api/hooks/stop"), "{s}");
+        assert!(s.contains("session_incarnation"), "{s}");
         // ...returns {"continue":true} so Codex proceeds...
         assert!(s.contains(r#"{"continue":true}"#), "{s}");
         // ...and must NOT unregister (Codex Stop fires every turn).

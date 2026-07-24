@@ -15,6 +15,11 @@ pub struct PaneBody {
     pub pane: Option<String>,
     #[serde(default)]
     pub backend_session_id: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::daemon_protocol::deserialize_optional_incarnation"
+    )]
+    pub session_incarnation: Option<crate::daemon_protocol::SessionIncarnation>,
 }
 
 /// POST /api/hooks/session-end
@@ -30,19 +35,24 @@ async fn session_end_inner(
     state: &std::sync::Arc<crate::state::AppState>,
     body: PaneBody,
 ) -> Value {
+    let Some(expected_incarnation) = body.session_incarnation else {
+        return json!({ "skipped": "missing session incarnation" });
+    };
     let session = {
         let proto = state.protocol.read().await;
         let found = proto
             .sessions
             .values()
             .find(|s| {
-                body.pane
-                    .as_deref()
-                    .is_some_and(|p| s.pane.as_deref() == Some(p))
-                    || body
-                        .backend_session_id
+                s.metadata.session_incarnation == expected_incarnation
+                    && (body
+                        .pane
                         .as_deref()
-                        .is_some_and(|b| s.metadata.backend_session_id.as_deref() == Some(b))
+                        .is_some_and(|p| s.pane.as_deref() == Some(p))
+                        || body
+                            .backend_session_id
+                            .as_deref()
+                            .is_some_and(|b| s.metadata.backend_session_id.as_deref() == Some(b)))
             })
             .cloned();
         match found {
@@ -50,28 +60,43 @@ async fn session_end_inner(
             None => return json!({ "skipped": "no session" }),
         }
     };
-    // Reject if recently registered (stale SessionEnd hook from pre-restart Claude)
-    let age = chrono::Utc::now().timestamp() - session.registered_at;
-    if session.registered_at > 0 && age < 5 {
-        return json!({ "skipped": format!("recently registered ({}s ago)", age) });
-    }
     let id = session.id.clone();
     // SessionEnd hook: always preserve worktrees. Cleanup should only happen
     // via explicit API call with keep_worktree=false.
-    state
-        .apply_and_execute(crate::daemon_protocol::Event::Remove {
-            id: id.clone(),
+    let effects = state
+        .apply_and_execute(crate::daemon_protocol::Event::RemoveOwned {
+            owner: session.owner(),
+            expected_pane: session.pane.clone(),
             keep_worktree: true,
         })
         .await;
-    // Clear tmux @ouija_id
-    let pane = session.pane.unwrap_or_default();
-    tokio::task::spawn_blocking(move || {
-        let _ = std::process::Command::new("tmux")
-            .args(["set-option", "-pu", "-t", &pane, "@ouija_id"])
-            .status();
-    });
+    if !effects.iter().any(
+        |effect| matches!(effect, crate::daemon_protocol::Effect::RemoveOk { id: removed } if removed == &id),
+    ) {
+        return json!({ "skipped": "session replaced" });
+    }
     json!({ "removed": id })
+}
+
+async fn exact_hook_session_id(
+    state: &std::sync::Arc<crate::state::AppState>,
+    pane: Option<&str>,
+    backend_session_id: Option<&str>,
+    incarnation: Option<crate::daemon_protocol::SessionIncarnation>,
+) -> Option<String> {
+    let incarnation = incarnation?;
+    let proto = state.protocol.read().await;
+    proto
+        .sessions
+        .values()
+        .find(|session| {
+            session.metadata.session_incarnation == incarnation
+                && (pane.is_some_and(|pane| session.pane.as_deref() == Some(pane))
+                    || backend_session_id.is_some_and(|backend_session_id| {
+                        session.metadata.backend_session_id.as_deref() == Some(backend_session_id)
+                    }))
+        })
+        .map(|session| session.id.clone())
 }
 
 /// POST /api/hooks/stop
@@ -84,12 +109,13 @@ pub async fn hook_stop(
 }
 
 async fn hook_stop_inner(state: &std::sync::Arc<crate::state::AppState>, body: PaneBody) -> Value {
-    if let Some(id) = state
-        .find_session_by_pane_or_backend_sid(
-            body.pane.as_deref(),
-            body.backend_session_id.as_deref(),
-        )
-        .await
+    if let Some(id) = exact_hook_session_id(
+        state,
+        body.pane.as_deref(),
+        body.backend_session_id.as_deref(),
+        body.session_incarnation,
+    )
+    .await
     {
         state
             .notify_agent(&id, crate::session_agent::SessionMsg::Stopped)
@@ -114,12 +140,13 @@ async fn prompt_submit_inner(
     // The prompt-submit hook no longer injects mesh state into the LLM
     // context window. We still notify the session agent that the session
     // is active (to reset idle / watchdog timers).
-    if let Some(id) = state
-        .find_session_by_pane_or_backend_sid(
-            body.pane.as_deref(),
-            body.backend_session_id.as_deref(),
-        )
-        .await
+    if let Some(id) = exact_hook_session_id(
+        state,
+        body.pane.as_deref(),
+        body.backend_session_id.as_deref(),
+        body.session_incarnation,
+    )
+    .await
     {
         state
             .notify_agent(&id, crate::session_agent::SessionMsg::Active)
@@ -135,6 +162,11 @@ pub struct PreToolUseBody {
     pub pane: Option<String>,
     #[serde(default)]
     pub backend_session_id: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::daemon_protocol::deserialize_optional_incarnation"
+    )]
+    pub session_incarnation: Option<crate::daemon_protocol::SessionIncarnation>,
     #[serde(default)]
     pub tool_name: Option<String>,
 }
@@ -155,12 +187,13 @@ async fn pre_tool_use_inner(
     // Treat any tool invocation as session activity: cancel the idle timer
     // so long sequences of tool calls within a single turn don't trigger
     // spurious idle-check nudges.
-    if let Some(id) = state
-        .find_session_by_pane_or_backend_sid(
-            body.pane.as_deref(),
-            body.backend_session_id.as_deref(),
-        )
-        .await
+    if let Some(id) = exact_hook_session_id(
+        state,
+        body.pane.as_deref(),
+        body.backend_session_id.as_deref(),
+        body.session_incarnation,
+    )
+    .await
     {
         state
             .notify_agent(&id, crate::session_agent::SessionMsg::Active)
@@ -184,12 +217,13 @@ async fn post_compact_inner(
     state: &std::sync::Arc<crate::state::AppState>,
     body: PaneBody,
 ) -> Value {
-    let session_id = match state
-        .find_session_by_pane_or_backend_sid(
-            body.pane.as_deref(),
-            body.backend_session_id.as_deref(),
-        )
-        .await
+    let session_id = match exact_hook_session_id(
+        state,
+        body.pane.as_deref(),
+        body.backend_session_id.as_deref(),
+        body.session_incarnation,
+    )
+    .await
     {
         Some(id) => id,
         None => return json!({ "ok": true, "continuation_injected": false }),
@@ -248,6 +282,12 @@ pub struct SessionStartBody {
     pub launch_session_id: Option<String>,
     #[serde(default)]
     pub launch_credential: Option<String>,
+    /// Exact daemon-issued incarnation exported into this backend process.
+    #[serde(
+        default,
+        deserialize_with = "crate::daemon_protocol::deserialize_optional_incarnation"
+    )]
+    pub session_incarnation: Option<crate::daemon_protocol::SessionIncarnation>,
 }
 
 /// POST /api/hooks/session-start
@@ -444,6 +484,26 @@ async fn existing_local_pane_rebinding_provenance_matches(
         })
 }
 
+async fn apply_existing_hook_event(
+    state: &std::sync::Arc<crate::state::AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    event: crate::daemon_protocol::Event,
+) -> Vec<crate::daemon_protocol::Effect> {
+    let effects = {
+        let mut protocol = state.protocol.write().await;
+        if protocol
+            .sessions
+            .get(&owner.session_id)
+            .is_none_or(|session| session.owner() != *owner)
+        {
+            return vec![];
+        }
+        protocol.apply(event)
+    };
+    state.execute_effects(&effects).await;
+    effects
+}
+
 async fn session_start_inner(
     state: &std::sync::Arc<crate::state::AppState>,
     body: SessionStartBody,
@@ -451,10 +511,11 @@ async fn session_start_inner(
     // A complete managed proof is sufficient to select the atomic bind path.
     // An app-server can inherit an unrelated pane, so pane/cwd may corroborate
     // ordinary registration but must never decide ownership of this launch.
-    if let (Some(identity), Some(launch_id), Some(credential)) = (
+    if let (Some(identity), Some(launch_id), Some(credential), Some(incarnation)) = (
         body.backend_identity.as_ref(),
         body.launch_session_id.as_deref(),
         body.launch_credential.as_deref(),
+        body.session_incarnation,
     ) {
         let identity = crate::backend::BackendSessionIdentity {
             backend: identity.backend.trim().to_string(),
@@ -468,6 +529,16 @@ async fn session_start_inner(
         }
         let result = {
             let mut protocol = state.protocol.write().await;
+            if protocol
+                .sessions
+                .get(launch_id)
+                .is_none_or(|session| session.metadata.session_incarnation != incarnation)
+            {
+                return json!({
+                    "skipped": "paneless SessionStart incarnation mismatch",
+                    "output": "",
+                });
+            }
             protocol.bind_backend_identity(launch_id, &identity, Some(credential))
         };
         if !result.effects.is_empty() {
@@ -517,6 +588,7 @@ async fn session_start_inner(
     // gets it (claude-code/opencode carry the skill and stay empty).
     if let Some(existing_id) = state.find_session_by_pane(&body.pane).await {
         let (
+            existing_owner,
             existing_origin,
             existing_backend,
             registered_project_dir,
@@ -528,14 +600,24 @@ async fn session_start_inner(
                 .get(&existing_id)
                 .map(|session| {
                     (
+                        session.owner(),
                         session.origin.clone(),
                         session.metadata.backend.clone(),
                         session.metadata.project_dir.clone(),
                         session.metadata.backend_session_id.clone(),
                     )
                 })
-                .unwrap_or_default()
+                .expect("pane lookup returned an existing session")
         };
+        if body
+            .session_incarnation
+            .is_some_and(|incarnation| incarnation != existing_owner.incarnation)
+        {
+            return json!({
+                "skipped": "existing pane incarnation mismatch",
+                "output": "",
+            });
+        }
         if !existing_pane_identity_matches(
             state,
             &body.pane,
@@ -588,15 +670,18 @@ async fn session_start_inner(
                         "output": "",
                     });
                 };
-                state
-                    .apply_and_execute(crate::daemon_protocol::Event::AdoptBackend {
+                apply_existing_hook_event(
+                    state,
+                    &existing_owner,
+                    crate::daemon_protocol::Event::AdoptBackend {
                         id: existing_id.clone(),
                         backend: "codex-cli".into(),
                         backend_session_id: backend_session_id.clone(),
                         expected_backend_session_id: None,
                         expected_session_start_credential: Some(credential),
-                    })
-                    .await;
+                    },
+                )
+                .await;
                 let claimed = {
                     let proto = state.protocol.read().await;
                     proto.sessions.get(&existing_id).is_some_and(|session| {
@@ -633,15 +718,18 @@ async fn session_start_inner(
                             .or(body.adapter.as_deref())
                             .expect("proven existing-pane binding has a backend adapter")
                             .to_string();
-                        state
-                            .apply_and_execute(crate::daemon_protocol::Event::AdoptBackend {
+                        apply_existing_hook_event(
+                            state,
+                            &existing_owner,
+                            crate::daemon_protocol::Event::AdoptBackend {
                                 id: existing_id.clone(),
                                 backend,
                                 backend_session_id: backend_session_id.clone(),
                                 expected_backend_session_id: None,
                                 expected_session_start_credential: None,
-                            })
-                            .await;
+                            },
+                        )
+                        .await;
                         let claimed = {
                             let proto = state.protocol.read().await;
                             proto.sessions.get(&existing_id).is_some_and(|session| {
@@ -685,14 +773,17 @@ async fn session_start_inner(
                         let backend = existing_backend
                             .clone()
                             .expect("verified complete binding has a backend adapter");
-                        state
-                            .apply_and_execute(crate::daemon_protocol::Event::RebindBackend {
+                        apply_existing_hook_event(
+                            state,
+                            &existing_owner,
+                            crate::daemon_protocol::Event::RebindBackend {
                                 id: existing_id.clone(),
                                 backend,
                                 backend_session_id: backend_session_id.clone(),
                                 expected_backend_session_id,
-                            })
-                            .await;
+                            },
+                        )
+                        .await;
                         let rebound = {
                             let proto = state.protocol.read().await;
                             proto.sessions.get(&existing_id).is_some_and(|session| {
@@ -842,6 +933,15 @@ async fn resolve_opencode_session_id(
 mod tests {
     use super::*;
 
+    async fn session_incarnation(
+        state: &std::sync::Arc<crate::state::AppState>,
+        session_id: &str,
+    ) -> crate::daemon_protocol::SessionIncarnation {
+        state.protocol.read().await.sessions[session_id]
+            .metadata
+            .session_incarnation
+    }
+
     #[tokio::test]
     async fn paneless_session_start_binds_only_credentialed_named_launch() {
         let state = crate::state::AppState::new_for_test();
@@ -870,6 +970,7 @@ mod tests {
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("managed".into()),
                 launch_credential: Some("proof".into()),
+                session_incarnation: Some(session_incarnation(&state, "managed").await),
             },
         )
         .await;
@@ -898,6 +999,7 @@ mod tests {
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("managed".into()),
                 launch_credential: Some("proof".into()),
+                session_incarnation: Some(session_incarnation(&state, "managed").await),
             },
         )
         .await;
@@ -944,6 +1046,7 @@ mod tests {
             adapter: Some("codex-cli".into()),
             launch_session_id: Some("intended".into()),
             launch_credential: Some("proof".into()),
+            session_incarnation: Some(session_incarnation(&state, "intended").await),
         };
         assert_eq!(
             session_start_inner(&state, body.clone()).await["registered"],
@@ -997,6 +1100,7 @@ mod tests {
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("managed".into()),
                 launch_credential: None,
+                session_incarnation: None,
             },
         )
         .await;
@@ -1045,6 +1149,7 @@ mod tests {
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("launch-a".into()),
                 launch_credential: None,
+                session_incarnation: None,
             },
         )
         .await;
@@ -1093,6 +1198,7 @@ mod tests {
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("worker-a".into()),
                 launch_credential: Some("proof-b".into()),
+                session_incarnation: Some(session_incarnation(&state, "worker-a").await),
             },
         )
         .await;
@@ -1136,17 +1242,10 @@ mod tests {
             .await;
         assert!(state.find_session_by_pane("%99").await.is_some());
 
-        // Manually set registered_at to 10 seconds ago so the guard doesn't trigger
-        {
-            let mut proto = state.protocol.write().await;
-            if let Some(s) = proto.sessions.get_mut("test-session") {
-                s.registered_at = chrono::Utc::now().timestamp() - 10;
-            }
-        }
-
         let body = PaneBody {
             pane: Some("%99".into()),
             backend_session_id: None,
+            session_incarnation: Some(session_incarnation(&state, "test-session").await),
         };
         let result = session_end_inner(&state, body).await;
         assert!(result.get("removed").is_some());
@@ -1154,7 +1253,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_end_rejects_recently_registered() {
+    async fn legacy_tokenless_session_end_fails_closed() {
         let state = crate::state::AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -1163,14 +1262,54 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta::default(),
             })
             .await;
-        // registered_at is now(), so age < 5s — should reject
         let body = PaneBody {
             pane: Some("%99".into()),
             backend_session_id: None,
+            session_incarnation: None,
         };
         let result = session_end_inner(&state, body).await;
-        assert!(result.get("skipped").is_some());
-        // Session still exists
+        assert_eq!(result["skipped"], "missing session incarnation");
+        assert!(state.find_session_by_pane("%99").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn stale_session_end_does_not_remove_same_pane_replacement() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%99".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        let stale_incarnation = state.protocol.read().await.sessions["worker"]
+            .metadata
+            .session_incarnation;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Remove {
+                id: "worker".into(),
+                keep_worktree: true,
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%99".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+
+        let result = session_end_inner(
+            &state,
+            PaneBody {
+                pane: Some("%99".into()),
+                backend_session_id: None,
+                session_incarnation: Some(stale_incarnation),
+            },
+        )
+        .await;
+
+        assert_eq!(result["skipped"], "no session");
         assert!(state.find_session_by_pane("%99").await.is_some());
     }
 
@@ -1180,6 +1319,7 @@ mod tests {
         let body = PaneBody {
             pane: Some("%999".into()),
             backend_session_id: None,
+            session_incarnation: None,
         };
         let result = session_end_inner(&state, body).await;
         assert!(result.get("skipped").is_some());
@@ -1191,6 +1331,7 @@ mod tests {
         let body = PaneBody {
             pane: Some("%999".into()),
             backend_session_id: None,
+            session_incarnation: None,
         };
         let result = hook_stop_inner(&state, body).await;
         assert_eq!(result, json!({ "ok": true }));
@@ -1202,6 +1343,7 @@ mod tests {
         let body = PaneBody {
             pane: Some("%999".into()),
             backend_session_id: None,
+            session_incarnation: None,
         };
         let result = prompt_submit_inner(&state, body).await;
         assert_eq!(result["output"], "");
@@ -1213,6 +1355,7 @@ mod tests {
         let body = PreToolUseBody {
             pane: Some("%999".into()),
             backend_session_id: None,
+            session_incarnation: None,
             tool_name: Some("AskUserQuestion".into()),
         };
         let result = pre_tool_use_inner(&state, body).await;
@@ -1250,6 +1393,7 @@ mod tests {
         let body = PreToolUseBody {
             pane: Some("%42".into()),
             backend_session_id: None,
+            session_incarnation: Some(session_incarnation(&state, "tool-activity").await),
             tool_name: Some("Bash".into()),
         };
         let result = pre_tool_use_inner(&state, body).await;
@@ -1280,6 +1424,7 @@ mod tests {
         let body = PreToolUseBody {
             pane: None,
             backend_session_id: Some("oc-uuid-123".into()),
+            session_incarnation: Some(session_incarnation(&state, "oc-session").await),
             tool_name: Some("bash".into()),
         };
         let result = pre_tool_use_inner(&state, body).await;
@@ -1337,6 +1482,7 @@ mod tests {
             adapter: Some("codex-cli".into()),
             launch_session_id: Some("feat/worker".into()),
             launch_credential: None,
+            session_incarnation: None,
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "feat/worker");
@@ -1384,6 +1530,7 @@ mod tests {
             adapter: Some("claude-code".into()),
             launch_session_id: Some("claude-worker".into()),
             launch_credential: None,
+            session_incarnation: None,
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "claude-worker");
@@ -1428,6 +1575,7 @@ mod tests {
                 adapter: Some("claude-code".into()),
                 launch_session_id: Some("claude-worker".into()),
                 launch_credential: None,
+                session_incarnation: None,
             },
         )
         .await;
@@ -1475,6 +1623,7 @@ mod tests {
                 adapter: Some("claude-code".into()),
                 launch_session_id: None,
                 launch_credential: None,
+                session_incarnation: None,
             },
         )
         .await;
@@ -1519,6 +1668,7 @@ mod tests {
                 adapter: Some("codex-cli".into()),
                 launch_session_id: None,
                 launch_credential: None,
+                session_incarnation: None,
             },
         )
         .await;
@@ -1567,6 +1717,7 @@ mod tests {
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("unknown-worker".into()),
                 launch_credential: None,
+                session_incarnation: None,
             },
         )
         .await;
@@ -1615,6 +1766,7 @@ mod tests {
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("remote-worker".into()),
                 launch_credential: None,
+                session_incarnation: None,
             },
         )
         .await;
@@ -1657,6 +1809,7 @@ mod tests {
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("feat/worker".into()),
                 launch_credential: None,
+                session_incarnation: None,
             },
         )
         .await;
@@ -1707,6 +1860,7 @@ mod tests {
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("feat/worker".into()),
                 launch_credential: None,
+                session_incarnation: None,
             },
         )
         .await;
@@ -1751,6 +1905,7 @@ mod tests {
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("feat/worker".into()),
                 launch_credential: Some("launch-secret".into()),
+                session_incarnation: Some(session_incarnation(&state, "feat/worker").await),
             },
         )
         .await;
@@ -1788,6 +1943,7 @@ mod tests {
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("feat/worker".into()),
                 launch_credential: Some("launch-secret".into()),
+                session_incarnation: Some(session_incarnation(&state, "feat/worker").await),
             },
         )
         .await;
@@ -1836,6 +1992,7 @@ mod tests {
                 adapter: Some("codex-cli".into()),
                 launch_session_id: None,
                 launch_credential: None,
+                session_incarnation: None,
             },
         )
         .await;
@@ -1883,6 +2040,7 @@ mod tests {
                 adapter: Some("codex-cli".into()),
                 launch_session_id: None,
                 launch_credential: None,
+                session_incarnation: None,
             },
         )
         .await;
@@ -1928,6 +2086,7 @@ mod tests {
                 adapter: Some("codex-cli".into()),
                 launch_session_id: Some("hub-worker".into()),
                 launch_credential: None,
+                session_incarnation: None,
             },
         )
         .await;
@@ -1971,6 +2130,7 @@ mod tests {
                 adapter: Some("claude-code".into()),
                 launch_session_id: Some("worker".into()),
                 launch_credential: None,
+                session_incarnation: None,
             },
         )
         .await;
@@ -2001,6 +2161,7 @@ mod tests {
             adapter: None,
             launch_session_id: None,
             launch_credential: None,
+            session_incarnation: None,
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "myproject");
@@ -2024,6 +2185,7 @@ mod tests {
             adapter: None,
             launch_session_id: None,
             launch_credential: None,
+            session_incarnation: None,
         };
         let result = session_start_inner(&state, body).await;
         assert!(
@@ -2045,6 +2207,7 @@ mod tests {
             adapter: None,
             launch_session_id: None,
             launch_credential: None,
+            session_incarnation: None,
         };
         let result = session_start_inner(&state, body).await;
         assert!(
@@ -2077,6 +2240,7 @@ mod tests {
             adapter: None,
             launch_session_id: None,
             launch_credential: None,
+            session_incarnation: None,
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "existing");
@@ -2097,6 +2261,7 @@ mod tests {
             adapter: None,
             launch_session_id: None,
             launch_credential: None,
+            session_incarnation: None,
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "ouija");
@@ -2108,6 +2273,7 @@ mod tests {
         let body = PaneBody {
             pane: Some("%999".into()),
             backend_session_id: None,
+            session_incarnation: None,
         };
         let result = post_compact_inner(&state, body).await;
         assert_eq!(result["ok"], true);
@@ -2127,6 +2293,7 @@ mod tests {
         let body = PaneBody {
             pane: Some("%88".into()),
             backend_session_id: None,
+            session_incarnation: Some(session_incarnation(&state, "compact-test").await),
         };
         let result = post_compact_inner(&state, body).await;
         assert_eq!(result["ok"], true);

@@ -836,24 +836,6 @@ impl AppState {
             .map(|s| s.id.clone())
     }
 
-    /// Find session by pane OR backend session ID (opencode UUID).
-    pub async fn find_session_by_pane_or_backend_sid(
-        &self,
-        pane: Option<&str>,
-        backend_sid: Option<&str>,
-    ) -> Option<String> {
-        let proto = self.protocol.read().await;
-        proto
-            .sessions
-            .values()
-            .find(|s| {
-                pane.is_some_and(|p| s.pane.as_deref() == Some(p))
-                    || backend_sid
-                        .is_some_and(|b| s.metadata.backend_session_id.as_deref() == Some(b))
-            })
-            .map(|s| s.id.clone())
-    }
-
     /// Apply a protocol event and execute all resulting effects.
     ///
     /// The pure state transition happens under the protocol lock.
@@ -993,6 +975,36 @@ impl AppState {
         Ok(outcome)
     }
 
+    /// Durably retain an exact session ID and pane while its backend exits.
+    pub async fn claim_existing_stop(
+        self: &Arc<Self>,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        pane: &str,
+    ) -> anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome> {
+        let mut proto = self.protocol.write().await;
+        let before = proto.clone();
+        let outcome = proto.claim_existing_stop(owner, pane);
+        if outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied
+            && let Err(error) = self.persist_protocol_state(&proto)
+        {
+            *proto = before;
+            return Err(error);
+        }
+        Ok(outcome)
+    }
+
+    /// Revalidate the exact live row and durable Stopping lease together.
+    pub async fn owns_stopping_session(
+        &self,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        pane: &str,
+    ) -> bool {
+        self.protocol
+            .read()
+            .await
+            .owns_stopping_session(owner, pane)
+    }
+
     /// Publish a reserved start's active owner while retaining its pre-launch
     /// lease through the external backend-command boundary.
     pub async fn commit_reserved_start(
@@ -1057,6 +1069,31 @@ impl AppState {
                         crate::tmux_var::clear(&pane, &name);
                     });
                 }
+                Effect::ClearOwnedTmuxVar { owner, pane, name } => {
+                    let protocol = self.protocol.read().await;
+                    if protocol.sessions.contains_key(&owner.session_id)
+                        || protocol
+                            .sessions
+                            .values()
+                            .any(|session| session.pane.as_deref() == Some(pane.as_str()))
+                    {
+                        continue;
+                    }
+                    let owner = owner.clone();
+                    let pane = pane.clone();
+                    let name = name.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if crate::tmux::inspect_pane_owner(&pane)
+                            .ok()
+                            .flatten()
+                            .as_ref()
+                            == Some(&owner)
+                        {
+                            crate::tmux_var::clear(&pane, &name);
+                        }
+                    })
+                    .await;
+                }
                 Effect::HoldAutoregister { pane } => {
                     self.autoregister_suppressed_panes
                         .lock()
@@ -1073,6 +1110,30 @@ impl AppState {
                         crate::tmux::enable_automatic_rename(&pane);
                     });
                 }
+                Effect::EnableOwnedAutoRename { owner, pane } => {
+                    let protocol = self.protocol.read().await;
+                    if protocol.sessions.contains_key(&owner.session_id)
+                        || protocol
+                            .sessions
+                            .values()
+                            .any(|session| session.pane.as_deref() == Some(pane.as_str()))
+                    {
+                        continue;
+                    }
+                    let owner = owner.clone();
+                    let pane = pane.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if crate::tmux::inspect_pane_owner(&pane)
+                            .ok()
+                            .flatten()
+                            .as_ref()
+                            == Some(&owner)
+                        {
+                            crate::tmux::enable_automatic_rename(&pane);
+                        }
+                    })
+                    .await;
+                }
                 Effect::SpawnAgent { session_id, pane } => {
                     self.spawn_session_agent(session_id, pane).await;
                 }
@@ -1086,8 +1147,31 @@ impl AppState {
                         agent.stop(None);
                     }
                 }
+                Effect::StopOwnedAgent { owner } => {
+                    let protocol = self.protocol.read().await;
+                    if protocol.sessions.contains_key(&owner.session_id) {
+                        continue;
+                    }
+                    if let Some(agent) = self
+                        .session_agents
+                        .write()
+                        .await
+                        .remove(owner.session_id.as_str())
+                    {
+                        agent.stop(None);
+                    }
+                }
                 Effect::ClearPendingReplies { removed_ids } => {
                     self.clear_orphaned_pending_replies(removed_ids).await;
+                }
+                Effect::ClearOwnedPendingReplies { removed_owners } => {
+                    let mut protocol = self.protocol.write().await;
+                    let removed_ids = removed_owners
+                        .iter()
+                        .filter(|owner| !protocol.sessions.contains_key(&owner.session_id))
+                        .map(|owner| owner.session_id.clone())
+                        .collect::<Vec<_>>();
+                    protocol.clear_orphaned_replies(&removed_ids);
                 }
                 Effect::ProvisionalRollbackOk { pane } => {
                     if !cfg!(test) {
@@ -1417,6 +1501,31 @@ impl AppState {
                     let n = name.clone();
                     tokio::task::spawn_blocking(move || crate::tmux_var::clear(&p, &n));
                 }
+                Effect::ClearOwnedTmuxVar { owner, pane, name } => {
+                    let protocol = self.protocol.read().await;
+                    if protocol.sessions.contains_key(&owner.session_id)
+                        || protocol
+                            .sessions
+                            .values()
+                            .any(|session| session.pane.as_deref() == Some(pane.as_str()))
+                    {
+                        continue;
+                    }
+                    let owner = owner.clone();
+                    let pane = pane.clone();
+                    let name = name.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if crate::tmux::inspect_pane_owner(&pane)
+                            .ok()
+                            .flatten()
+                            .as_ref()
+                            == Some(&owner)
+                        {
+                            crate::tmux_var::clear(&pane, &name);
+                        }
+                    })
+                    .await;
+                }
                 Effect::HoldAutoregister { pane } => {
                     self.autoregister_suppressed_panes
                         .lock()
@@ -1446,6 +1555,30 @@ impl AppState {
                     let p = pane.clone();
                     tokio::task::spawn_blocking(move || crate::tmux::enable_automatic_rename(&p));
                 }
+                Effect::EnableOwnedAutoRename { owner, pane } => {
+                    let protocol = self.protocol.read().await;
+                    if protocol.sessions.contains_key(&owner.session_id)
+                        || protocol
+                            .sessions
+                            .values()
+                            .any(|session| session.pane.as_deref() == Some(pane.as_str()))
+                    {
+                        continue;
+                    }
+                    let owner = owner.clone();
+                    let pane = pane.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if crate::tmux::inspect_pane_owner(&pane)
+                            .ok()
+                            .flatten()
+                            .as_ref()
+                            == Some(&owner)
+                        {
+                            crate::tmux::enable_automatic_rename(&pane);
+                        }
+                    })
+                    .await;
+                }
                 Effect::SpawnAgent { session_id, pane } => {
                     self.spawn_session_agent(session_id, pane).await;
                 }
@@ -1455,6 +1588,20 @@ impl AppState {
                         .write()
                         .await
                         .remove(session_id.as_str())
+                    {
+                        agent.stop(None);
+                    }
+                }
+                Effect::StopOwnedAgent { owner } => {
+                    let protocol = self.protocol.read().await;
+                    if protocol.sessions.contains_key(&owner.session_id) {
+                        continue;
+                    }
+                    if let Some(agent) = self
+                        .session_agents
+                        .write()
+                        .await
+                        .remove(owner.session_id.as_str())
                     {
                         agent.stop(None);
                     }
@@ -1471,6 +1618,15 @@ impl AppState {
                 Effect::ClearPendingReplies { removed_ids } => {
                     self.clear_orphaned_pending_replies(removed_ids).await;
                 }
+                Effect::ClearOwnedPendingReplies { removed_owners } => {
+                    let mut protocol = self.protocol.write().await;
+                    let removed_ids = removed_owners
+                        .iter()
+                        .filter(|owner| !protocol.sessions.contains_key(&owner.session_id))
+                        .map(|owner| owner.session_id.clone())
+                        .collect::<Vec<_>>();
+                    protocol.clear_orphaned_replies(&removed_ids);
+                }
                 Effect::Persist => {
                     let proto = self.protocol.read().await;
                     if let Err(error) = self.persist_protocol_state(&proto) {
@@ -1478,10 +1634,7 @@ impl AppState {
                     }
                 }
                 Effect::CleanupWorktree { project_dir } => {
-                    let dir = project_dir.clone();
-                    tokio::task::spawn(async move {
-                        Self::cleanup_worktree_dir(&dir).await;
-                    });
+                    self.cleanup_worktree_dir_if_unused(project_dir).await;
                 }
                 Effect::SendToHuman { npub, message } => {
                     let _ = crate::nostr_transport::send_plain_dm(self, npub, message).await;
@@ -1909,6 +2062,25 @@ impl AppState {
         .await;
     }
 
+    /// Remove a worktree only while no registered session can start using it.
+    ///
+    /// The protocol read guard deliberately spans cleanup: registration needs
+    /// the write guard, so a replacement cannot claim `dir` after the check
+    /// but before `git worktree remove` completes.
+    pub(crate) async fn cleanup_worktree_dir_if_unused(&self, dir: &str) -> bool {
+        let protocol = self.protocol.read().await;
+        let in_use = protocol
+            .sessions
+            .values()
+            .any(|session| session.metadata.project_dir.as_deref() == Some(dir));
+        if in_use {
+            tracing::info!("skipping worktree cleanup for {dir}: other sessions still using it");
+            return false;
+        }
+        Self::cleanup_worktree_dir(dir).await;
+        true
+    }
+
     /// Register a connected node by npub.
     ///
     /// Returns the existing node name if this npub is already connected.
@@ -2111,7 +2283,9 @@ impl AppState {
     /// If local session count exceeds `max_local_sessions`, return idle/stale
     /// sessions that can be closed to bring the count back to the limit.
     /// Only sessions with stale metadata are eligible — active sessions are never killed.
-    pub async fn collect_excess_idle_sessions(&self) -> Vec<String> {
+    pub async fn collect_excess_idle_sessions(
+        &self,
+    ) -> Vec<(crate::daemon_protocol::ResourceOwner, String)> {
         let max = self.settings.read().await.max_local_sessions as usize;
         if max == 0 {
             return vec![];
@@ -2133,7 +2307,11 @@ impl AppState {
             .collect();
         // Sort by last activity (oldest first)
         stale.sort_by_key(|s| s.metadata.last_metadata_update.unwrap_or(s.registered_at));
-        stale.iter().take(excess).map(|s| s.id.clone()).collect()
+        stale
+            .iter()
+            .take(excess)
+            .filter_map(|s| Some((s.owner(), s.pane.clone()?)))
+            .collect()
     }
 
     /// Sweep worktree presence for local sessions with project_dir.
@@ -2161,7 +2339,7 @@ impl AppState {
                     .store(false, std::sync::atomic::Ordering::Relaxed);
             }
         }
-        let sessions_with_dirs: Vec<(String, String)> = {
+        let sessions_with_dirs: Vec<(crate::daemon_protocol::ResourceOwner, String)> = {
             let proto = self.protocol.read().await;
             proto
                 .sessions
@@ -2170,7 +2348,7 @@ impl AppState {
                     matches!(s.origin, crate::daemon_protocol::Origin::Local)
                         && s.metadata.project_dir.is_some()
                 })
-                .filter_map(|s| Some((s.id.clone(), s.metadata.project_dir.clone()?)))
+                .filter_map(|s| Some((s.owner(), s.metadata.project_dir.clone()?)))
                 .collect()
         };
         if sessions_with_dirs.is_empty() {
@@ -2255,10 +2433,11 @@ impl AppState {
             }
         };
         // Only update sessions whose dirs were successfully checked
-        let updates: Vec<(String, String, bool)> = sessions_with_dirs
-            .into_iter()
-            .filter_map(|(id, dir)| presence_map.get(&dir).map(|p| (id, dir.clone(), *p)))
-            .collect();
+        let updates: Vec<(crate::daemon_protocol::ResourceOwner, String, bool)> =
+            sessions_with_dirs
+                .into_iter()
+                .filter_map(|(owner, dir)| presence_map.get(&dir).map(|p| (owner, dir.clone(), *p)))
+                .collect();
         if !updates.is_empty() {
             let _ = self
                 .apply_and_execute(crate::daemon_protocol::Event::MarkWorktreePresence { updates })
@@ -3078,6 +3257,58 @@ pub(crate) mod tests {
                 metadata: crate::daemon_protocol::SessionMeta::default(),
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn delayed_remove_effects_do_not_stop_a_replacement_agent() {
+        let state = AppState::new_for_test();
+        proto_register(&state, "worker", Some("%1")).await;
+        let old_owner = state.protocol.read().await.sessions["worker"].owner();
+
+        let stale_effects = {
+            let mut proto = state.protocol.write().await;
+            proto.apply(crate::daemon_protocol::Event::RemoveOwned {
+                owner: old_owner.clone(),
+                expected_pane: Some("%1".into()),
+                keep_worktree: true,
+            })
+        };
+        proto_register(&state, "worker", Some("%1")).await;
+        let replacement_owner = state.protocol.read().await.sessions["worker"].owner();
+        assert_ne!(replacement_owner, old_owner);
+        assert!(state.session_agents.read().await.contains_key("worker"));
+
+        state.execute_effects(&stale_effects).await;
+
+        assert_eq!(
+            state.protocol.read().await.sessions["worker"].owner(),
+            replacement_owner
+        );
+        assert!(
+            state.session_agents.read().await.contains_key("worker"),
+            "old removal effects must not stop the replacement's agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_cleanup_fails_closed_when_a_replacement_uses_the_directory() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "replacement".into(),
+                pane: Some("%2".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/.ouija/worktrees/project/replacement".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        assert!(
+            !state
+                .cleanup_worktree_dir_if_unused("/tmp/.ouija/worktrees/project/replacement")
+                .await
+        );
     }
 
     #[tokio::test]

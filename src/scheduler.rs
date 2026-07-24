@@ -750,6 +750,7 @@ async fn respawn_and_inject(
             launch_codex_home.as_deref(),
             task.session_name(),
             credential,
+            staged_incarnation.expect("Codex launch credential has a staged incarnation"),
         ) {
             Ok(command) => command,
             Err(error) => {
@@ -1000,23 +1001,14 @@ async fn revive_and_inject(
     let session_start_credential = (backend_name == "codex-cli" && clears_context)
         .then(crate::daemon_protocol::new_session_start_credential);
     let launch_cmd = if clears_context {
-        let command = backend.build_start_command(&crate::backend::StartOpts {
+        backend.build_start_command(&crate::backend::StartOpts {
             project_dir: dir.clone(),
             worktree,
             model: launch_model.model.clone(),
             effort: effort.clone(),
             permission_mode: claude_permission_mode.clone(),
             codex_home: launch_codex_home.clone(),
-        });
-        match session_start_credential.as_deref() {
-            Some(credential) => crate::backend::codex::with_session_start_hook(
-                command,
-                launch_codex_home.as_deref(),
-                task.session_name(),
-                credential,
-            )?,
-            None => command,
-        }
+        })
     } else {
         backend
             .build_resume_command(&crate::backend::ResumeOpts {
@@ -1038,21 +1030,6 @@ async fn revive_and_inject(
                     codex_home: launch_codex_home.clone(),
                 })
             })
-    };
-
-    // Pass prompt as CLI arg so Claude loads CLAUDE.md before processing it.
-    // TuiInjection always uses CLI arg; HttpApi only when starting fresh.
-    let full_launch_cmd = if clears_context || is_tui {
-        if let Some(full_text) = task_prompt_text(task) {
-            let prompt_path = format!("/tmp/ouija-prompt-{}.txt", task.name.replace('/', "-"));
-            let _ = std::fs::write(&prompt_path, &full_text);
-            let escaped_pf = shell_escape(&prompt_path);
-            format!("{launch_cmd} \"$(cat {escaped_pf})\" ; rm -f {escaped_pf}")
-        } else {
-            launch_cmd.clone()
-        }
-    } else {
-        launch_cmd.clone()
     };
 
     crate::backend::claude_code::pre_trust_workspace(&dir);
@@ -1306,6 +1283,30 @@ async fn revive_and_inject(
             "scheduled revival registration was superseded before launch for '{}'",
             task.session_name()
         );
+    };
+    let launch_cmd = match session_start_credential.as_deref() {
+        Some(credential) => crate::backend::codex::with_session_start_hook(
+            launch_cmd,
+            launch_codex_home.as_deref(),
+            task.session_name(),
+            credential,
+            registered_incarnation,
+        )?,
+        None => launch_cmd,
+    };
+    // Pass prompt as CLI arg so Claude loads CLAUDE.md before processing it.
+    // TuiInjection always uses CLI arg; HttpApi only when starting fresh.
+    let full_launch_cmd = if clears_context || is_tui {
+        if let Some(full_text) = task_prompt_text(task) {
+            let prompt_path = format!("/tmp/ouija-prompt-{}.txt", task.name.replace('/', "-"));
+            let _ = std::fs::write(&prompt_path, &full_text);
+            let escaped_pf = shell_escape(&prompt_path);
+            format!("{launch_cmd} \"$(cat {escaped_pf})\" ; rm -f {escaped_pf}")
+        } else {
+            launch_cmd.clone()
+        }
+    } else {
+        launch_cmd.clone()
     };
     let pane_for_environment = new_pane.clone();
     let session_for_environment = task.session_name().to_string();

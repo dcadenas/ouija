@@ -32,6 +32,33 @@ impl std::fmt::Display for SessionIncarnation {
     }
 }
 
+/// Deserialize an optional incarnation from either the historical JSON number
+/// form or a decimal string. JavaScript adapters use the string form so values
+/// above `Number.MAX_SAFE_INTEGER` retain all 64 bits.
+pub fn deserialize_optional_incarnation<'de, D>(
+    deserializer: D,
+) -> Result<Option<SessionIncarnation>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum WireIncarnation {
+        Number(u64),
+        Decimal(String),
+    }
+
+    let wire = <Option<WireIncarnation> as serde::Deserialize>::deserialize(deserializer)?;
+    wire.map(|value| match value {
+        WireIncarnation::Number(value) => Ok(SessionIncarnation(value)),
+        WireIncarnation::Decimal(value) => value
+            .parse::<u64>()
+            .map(SessionIncarnation)
+            .map_err(serde::de::Error::custom),
+    })
+    .transpose()
+}
+
 /// Exact owner of lifecycle authority for a public session ID.
 #[derive(
     Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
@@ -47,6 +74,7 @@ pub struct ResourceOwner {
 pub enum LifecyclePhase {
     Starting,
     Restarting,
+    Stopping,
 }
 
 /// Durable in-flight lifecycle authority for one public session ID.
@@ -145,6 +173,15 @@ pub struct SessionEntry {
     /// Unix timestamp of registration. Used for reaper grace period.
     #[serde(default)]
     pub registered_at: i64,
+}
+
+impl SessionEntry {
+    pub fn owner(&self) -> ResourceOwner {
+        ResourceOwner {
+            session_id: self.id.clone(),
+            incarnation: self.metadata.session_incarnation,
+        }
+    }
 }
 
 /// Where a session originates: local, remote peer, or human operator.
@@ -696,6 +733,20 @@ pub enum Event {
         id: String,
         keep_worktree: bool,
     },
+    /// Remove only the exact session incarnation and pane observed by the
+    /// caller. Delayed lifecycle callbacks must use this instead of `Remove`.
+    RemoveOwned {
+        owner: ResourceOwner,
+        expected_pane: Option<String>,
+        keep_worktree: bool,
+    },
+    /// Finish an externally completed backend exit while holding its exact
+    /// durable stopping lease.
+    CompleteOwnedStop {
+        owner: ResourceOwner,
+        expected_pane: String,
+        keep_worktree: bool,
+    },
     /// Atomically undo a scheduler's provisional registration only if the
     /// session still owns the staged pane and launch credential.
     RollbackProvisionalRegistration {
@@ -727,9 +778,9 @@ pub enum Event {
     /// Emits `RemoveFailed` if the session is missing, non-Local, or
     /// `worktree_present != Some(false)`.
     RemoveIfStale {
-        id: String,
-        /// Optional TOCTOU guard: project_dir must match this value.
-        expected_project_dir: Option<String>,
+        owner: ResourceOwner,
+        /// TOCTOU guard: project_dir must match this value.
+        expected_project_dir: String,
     },
     UpdateMetadata {
         id: String,
@@ -764,7 +815,7 @@ pub enum Event {
         expected_backend_session_id: String,
     },
     ReapDead {
-        dead_ids: Vec<String>,
+        dead_sessions: Vec<(ResourceOwner, String)>,
     },
     IncomingWire {
         msg: crate::protocol::WireMessage,
@@ -785,7 +836,7 @@ pub enum Event {
     /// Carries expected project_dir to avoid TOCTOU races where project_dir
     /// changes between snapshot and apply.
     MarkWorktreePresence {
-        updates: Vec<(String, String, bool)>,
+        updates: Vec<(ResourceOwner, String, bool)>,
     },
     /// Batched atomic prune of multiple stale local sessions under one lock.
     ///
@@ -795,7 +846,7 @@ pub enum Event {
     /// one [`Effect::BroadcastSessionList`] are emitted for the whole batch,
     /// regardless of how many sessions were removed.
     PruneStale {
-        sessions: Vec<(String, String)>,
+        sessions: Vec<(ResourceOwner, String)>,
     },
 }
 
@@ -817,6 +868,8 @@ pub enum RemoveFailureKind {
     NotStale,
     /// TOCTOU project_dir mismatch between snapshot and apply.
     ProjectDirMismatch,
+    /// A start, restart, or stop lease currently owns this lifecycle.
+    LifecycleInProgress,
 }
 
 /// The runtime executes them. The model inspects or ignores them.
@@ -837,6 +890,11 @@ pub enum Effect {
         pane: String,
         name: String,
     },
+    ClearOwnedTmuxVar {
+        owner: ResourceOwner,
+        pane: String,
+        name: String,
+    },
     /// Keep a just-removed pane out of auto-registration until its explicit
     /// kill has had time to complete.
     HoldAutoregister {
@@ -847,6 +905,10 @@ pub enum Effect {
         name: String,
     },
     EnableAutoRename {
+        pane: String,
+    },
+    EnableOwnedAutoRename {
+        owner: ResourceOwner,
         pane: String,
     },
     InjectMessage {
@@ -875,12 +937,18 @@ pub enum Effect {
     StopAgent {
         session_id: String,
     },
+    StopOwnedAgent {
+        owner: ResourceOwner,
+    },
     RenameAgent {
         old_id: String,
         new_id: String,
     },
     ClearPendingReplies {
         removed_ids: Vec<String>,
+    },
+    ClearOwnedPendingReplies {
+        removed_owners: Vec<ResourceOwner>,
     },
 
     // Persistence
@@ -1458,6 +1526,53 @@ impl DaemonState {
         LifecycleMutationOutcome::Applied
     }
 
+    /// Hold an exact incumbent and pane through asynchronous backend exit.
+    pub fn claim_existing_stop(
+        &mut self,
+        owner: &ResourceOwner,
+        pane: &str,
+    ) -> LifecycleMutationOutcome {
+        if self.lifecycle_leases.contains_key(&owner.session_id) {
+            return LifecycleMutationOutcome::Rejected;
+        }
+        let Some(session) = self.sessions.get(&owner.session_id) else {
+            return LifecycleMutationOutcome::NotFound;
+        };
+        if !matches!(session.origin, Origin::Local)
+            || session.metadata.session_incarnation != owner.incarnation
+            || session.pane.as_deref() != Some(pane)
+        {
+            return LifecycleMutationOutcome::Superseded;
+        }
+        self.lifecycle_leases.insert(
+            owner.session_id.clone(),
+            LifecycleLease {
+                owner: owner.clone(),
+                phase: LifecyclePhase::Stopping,
+                inert_pane: Some(pane.to_string()),
+                inert_pane_owner: Some(owner.clone()),
+            },
+        );
+        LifecycleMutationOutcome::Applied
+    }
+
+    /// Whether an exact owner and pane still hold durable stop authority.
+    pub fn owns_stopping_session(&self, owner: &ResourceOwner, pane: &str) -> bool {
+        self.lifecycle_leases
+            .get(&owner.session_id)
+            .is_some_and(|lease| {
+                lease.owner == *owner
+                    && lease.phase == LifecyclePhase::Stopping
+                    && lease.inert_pane.as_deref() == Some(pane)
+                    && lease.inert_pane_owner.as_ref() == Some(owner)
+            })
+            && self.sessions.get(&owner.session_id).is_some_and(|session| {
+                matches!(session.origin, Origin::Local)
+                    && session.owner() == *owner
+                    && session.pane.as_deref() == Some(pane)
+            })
+    }
+
     /// Commit a reserved start into the active session map with the exact
     /// incarnation allocated by [`Self::reserve_start`].
     pub fn commit_reserved_start(
@@ -1598,6 +1713,16 @@ impl DaemonState {
             } => self.apply_refresh_launch_metadata(id, expected_incarnation, pane, metadata),
             Event::Rename { old_id, new_id } => self.apply_rename(&old_id, &new_id),
             Event::Remove { id, keep_worktree } => self.apply_remove(&id, keep_worktree),
+            Event::RemoveOwned {
+                owner,
+                expected_pane,
+                keep_worktree,
+            } => self.apply_remove_owned(&owner, expected_pane.as_deref(), keep_worktree),
+            Event::CompleteOwnedStop {
+                owner,
+                expected_pane,
+                keep_worktree,
+            } => self.apply_complete_owned_stop(&owner, &expected_pane, keep_worktree),
             Event::RollbackProvisionalRegistration {
                 id,
                 pane,
@@ -1625,9 +1750,9 @@ impl DaemonState {
                 provisional_pane.as_deref(),
             ),
             Event::RemoveIfStale {
-                id,
+                owner,
                 expected_project_dir,
-            } => self.apply_remove_if_stale(&id, expected_project_dir.as_deref()),
+            } => self.apply_remove_if_stale(&owner, &expected_project_dir),
             Event::UpdateMetadata {
                 id,
                 role,
@@ -1659,7 +1784,7 @@ impl DaemonState {
                 backend_session_id,
                 expected_backend_session_id,
             ),
-            Event::ReapDead { dead_ids } => self.apply_reap(dead_ids),
+            Event::ReapDead { dead_sessions } => self.apply_reap(dead_sessions),
             Event::IncomingWire { msg, sender_npub } => self.apply_incoming_wire(msg, sender_npub),
             Event::Send {
                 from,
@@ -1842,6 +1967,22 @@ impl DaemonState {
             ];
         }
 
+        if reserved_owner.is_none()
+            && let Some(ref pane_id) = pane
+            && let Some(lease) = self
+                .lifecycle_leases
+                .values()
+                .find(|lease| lease.inert_pane.as_deref() == Some(pane_id.as_str()))
+        {
+            return vec![Effect::RegisterFailed {
+                session_id: id,
+                reason: format!(
+                    "pane '{pane_id}' is reserved by session '{}' with a lifecycle operation in progress",
+                    lease.owner.session_id
+                ),
+            }];
+        }
+
         let incarnation = if let Some(owner) = reserved_owner {
             owner.incarnation
         } else {
@@ -1875,6 +2016,14 @@ impl DaemonState {
                 })
                 .map(|(key, _)| key.clone());
             if let Some(ref old_key) = old_key {
+                if self.lifecycle_leases.contains_key(old_key) {
+                    return vec![Effect::RegisterFailed {
+                        session_id: id,
+                        reason: format!(
+                            "pane '{pane_id}' belongs to session '{old_key}' with a lifecycle operation in progress"
+                        ),
+                    }];
+                }
                 self.sessions.remove(old_key);
                 effects.push(Effect::StopAgent {
                     session_id: old_key.clone(),
@@ -2363,6 +2512,18 @@ impl DaemonState {
     }
 
     fn apply_remove(&mut self, id: &str, keep_worktree: bool) -> Vec<Effect> {
+        if self.lifecycle_leases.contains_key(id) {
+            return vec![Effect::RemoveFailed {
+                id: id.to_string(),
+                kind: RemoveFailureKind::LifecycleInProgress,
+                reason: format!("session '{id}' has a lifecycle operation in progress"),
+            }];
+        }
+        self.apply_remove_unleased(id, keep_worktree)
+    }
+
+    /// Remove after the caller has proved it owns the lifecycle lease.
+    fn apply_remove_unleased(&mut self, id: &str, keep_worktree: bool) -> Vec<Effect> {
         let mut effects = Vec::new();
 
         // Check origin before removing
@@ -2394,26 +2555,29 @@ impl DaemonState {
             .sessions
             .remove(id)
             .expect("session must exist after origin guard");
+        let owner = session.owner();
         effects.push(Effect::Persist);
 
         if let Some(ref pane_id) = session.pane {
             effects.push(Effect::HoldAutoregister {
                 pane: pane_id.clone(),
             });
-            effects.push(Effect::ClearTmuxVar {
+            effects.push(Effect::ClearOwnedTmuxVar {
+                owner: owner.clone(),
                 pane: pane_id.clone(),
                 name: "@ouija_session".into(),
             });
-            effects.push(Effect::EnableAutoRename {
+            effects.push(Effect::EnableOwnedAutoRename {
+                owner: owner.clone(),
                 pane: pane_id.clone(),
             });
         }
 
-        effects.push(Effect::StopAgent {
-            session_id: id.to_string(),
+        effects.push(Effect::StopOwnedAgent {
+            owner: owner.clone(),
         });
-        effects.push(Effect::ClearPendingReplies {
-            removed_ids: vec![id.to_string()],
+        effects.push(Effect::ClearOwnedPendingReplies {
+            removed_owners: vec![owner.clone()],
         });
 
         // Worktree cleanup on explicit kill (not reap), unless keep_worktree is set
@@ -2455,6 +2619,52 @@ impl DaemonState {
         effects.push(Effect::RemoveOk { id: id.to_string() });
 
         effects
+    }
+
+    fn apply_remove_owned(
+        &mut self,
+        owner: &ResourceOwner,
+        expected_pane: Option<&str>,
+        keep_worktree: bool,
+    ) -> Vec<Effect> {
+        let Some(session) = self.sessions.get(&owner.session_id) else {
+            return vec![];
+        };
+        if self.lifecycle_leases.contains_key(&owner.session_id)
+            || !matches!(session.origin, Origin::Local)
+            || session.metadata.session_incarnation != owner.incarnation
+            || session.pane.as_deref() != expected_pane
+        {
+            return vec![];
+        }
+        self.apply_remove(&owner.session_id, keep_worktree)
+    }
+
+    fn apply_complete_owned_stop(
+        &mut self,
+        owner: &ResourceOwner,
+        expected_pane: &str,
+        keep_worktree: bool,
+    ) -> Vec<Effect> {
+        let lease_matches = self
+            .lifecycle_leases
+            .get(&owner.session_id)
+            .is_some_and(|lease| {
+                lease.owner == *owner
+                    && lease.phase == LifecyclePhase::Stopping
+                    && lease.inert_pane.as_deref() == Some(expected_pane)
+                    && lease.inert_pane_owner.as_ref() == Some(owner)
+            });
+        let session_matches = self.sessions.get(&owner.session_id).is_some_and(|session| {
+            matches!(session.origin, Origin::Local)
+                && session.metadata.session_incarnation == owner.incarnation
+                && session.pane.as_deref() == Some(expected_pane)
+        });
+        if !lease_matches || !session_matches {
+            return vec![];
+        }
+        self.lifecycle_leases.remove(&owner.session_id);
+        self.apply_remove_unleased(&owner.session_id, keep_worktree)
     }
 
     fn apply_rollback_provisional_registration(
@@ -2519,7 +2729,7 @@ impl DaemonState {
                 }
                 effects
             }
-            None => self.apply_remove(id, true),
+            None => self.apply_remove_unleased(id, true),
         };
         if let Some(provisional_pane) = provisional_pane
             && restore_pane.as_deref() != Some(provisional_pane)
@@ -2541,9 +2751,17 @@ impl DaemonState {
     /// and the remove.
     fn apply_remove_if_stale(
         &mut self,
-        id: &str,
-        expected_project_dir: Option<&str>,
+        owner: &ResourceOwner,
+        expected_project_dir: &str,
     ) -> Vec<Effect> {
+        let id = owner.session_id.as_str();
+        if self.lifecycle_leases.contains_key(id) {
+            return vec![Effect::RemoveFailed {
+                id: id.to_string(),
+                kind: RemoveFailureKind::LifecycleInProgress,
+                reason: format!("session '{id}' has a lifecycle operation in progress"),
+            }];
+        }
         match self.sessions.get(id) {
             Some(session) => {
                 if !matches!(session.origin, Origin::Local) {
@@ -2553,18 +2771,19 @@ impl DaemonState {
                         reason: format!("cannot prune remote session '{id}'"),
                     }];
                 }
+                if session.metadata.session_incarnation != owner.incarnation {
+                    return vec![];
+                }
                 // TOCTOU guard: verify project_dir hasn't changed since snapshot
-                if let Some(exp_dir) = expected_project_dir {
-                    if session.metadata.project_dir.as_ref() != Some(&exp_dir.to_string()) {
-                        return vec![Effect::RemoveFailed {
-                            id: id.to_string(),
-                            kind: RemoveFailureKind::ProjectDirMismatch,
-                            reason: format!(
-                                "session '{id}' project_dir mismatch (expected {}, got {:?})",
-                                exp_dir, session.metadata.project_dir
-                            ),
-                        }];
-                    }
+                if session.metadata.project_dir.as_deref() != Some(expected_project_dir) {
+                    return vec![Effect::RemoveFailed {
+                        id: id.to_string(),
+                        kind: RemoveFailureKind::ProjectDirMismatch,
+                        reason: format!(
+                            "session '{id}' project_dir mismatch (expected {}, got {:?})",
+                            expected_project_dir, session.metadata.project_dir
+                        ),
+                    }];
                 }
                 if session.metadata.worktree_present != Some(false) {
                     return vec![Effect::RemoveFailed {
@@ -2595,11 +2814,11 @@ impl DaemonState {
     /// session if they pass. Coalesces persistence: a single [`Effect::Persist`]
     /// and a single [`Effect::BroadcastSessionList`] cover the whole batch
     /// instead of one per pruned session.
-    fn apply_prune_stale_many(&mut self, sessions: Vec<(String, String)>) -> Vec<Effect> {
+    fn apply_prune_stale_many(&mut self, sessions: Vec<(ResourceOwner, String)>) -> Vec<Effect> {
         let mut tail = Vec::new();
         let mut any_removed = false;
-        for (id, expected_dir) in sessions {
-            let sub_effects = self.apply_remove_if_stale(&id, Some(&expected_dir));
+        for (owner, expected_dir) in sessions {
+            let sub_effects = self.apply_remove_if_stale(&owner, &expected_dir);
             for e in sub_effects {
                 match e {
                     Effect::Persist | Effect::BroadcastSessionList => {
@@ -2625,16 +2844,18 @@ impl DaemonState {
 
     fn apply_mark_worktree_presence(
         &mut self,
-        updates: Vec<(String, String, bool)>,
+        updates: Vec<(ResourceOwner, String, bool)>,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
         let mut any_changed = false;
 
-        for (id, expected_dir, present) in updates {
-            let Some(session) = self.sessions.get_mut(&id) else {
+        for (owner, expected_dir, present) in updates {
+            let Some(session) = self.sessions.get_mut(&owner.session_id) else {
                 continue;
             };
-            if !matches!(session.origin, Origin::Local) {
+            if !matches!(session.origin, Origin::Local)
+                || session.metadata.session_incarnation != owner.incarnation
+            {
                 continue;
             }
 
@@ -2972,18 +3193,31 @@ impl DaemonState {
         effects
     }
 
-    fn apply_reap(&mut self, dead_ids: Vec<String>) -> Vec<Effect> {
+    fn apply_reap(&mut self, dead_sessions: Vec<(ResourceOwner, String)>) -> Vec<Effect> {
         let mut effects = Vec::new();
+        let mut removed_ids = Vec::new();
+        let mut removed_owners = Vec::new();
 
-        for id in &dead_ids {
-            let session = match self.sessions.remove(id) {
-                Some(s) if matches!(s.origin, Origin::Local) => s,
-                Some(s) => {
-                    self.sessions.insert(id.clone(), s);
-                    continue;
-                }
-                None => continue,
+        for (owner, expected_pane) in dead_sessions {
+            if self.lifecycle_leases.contains_key(&owner.session_id) {
+                continue;
+            }
+            let Some(current) = self.sessions.get(&owner.session_id) else {
+                continue;
             };
+            if !matches!(current.origin, Origin::Local)
+                || current.metadata.session_incarnation != owner.incarnation
+                || current.pane.as_deref() != Some(expected_pane.as_str())
+            {
+                continue;
+            }
+            let id = owner.session_id.clone();
+            let session = self
+                .sessions
+                .remove(&id)
+                .expect("exact reaper owner checked above");
+            removed_ids.push(id.clone());
+            removed_owners.push(owner.clone());
 
             effects.push(Effect::Log {
                 level: LogLevel::Info,
@@ -2991,30 +3225,31 @@ impl DaemonState {
             });
 
             if let Some(ref pane_id) = session.pane {
-                effects.push(Effect::ClearTmuxVar {
+                effects.push(Effect::ClearOwnedTmuxVar {
+                    owner: owner.clone(),
                     pane: pane_id.clone(),
                     name: "@ouija_session".into(),
                 });
-                effects.push(Effect::ClearTmuxVar {
+                effects.push(Effect::ClearOwnedTmuxVar {
+                    owner: owner.clone(),
                     pane: pane_id.clone(),
                     name: "@ouija_id".into(),
                 });
-                effects.push(Effect::EnableAutoRename {
+                effects.push(Effect::EnableOwnedAutoRename {
+                    owner: owner.clone(),
                     pane: pane_id.clone(),
                 });
             }
 
-            effects.push(Effect::StopAgent {
-                session_id: id.clone(),
+            effects.push(Effect::StopOwnedAgent {
+                owner: owner.clone(),
             });
             // Note: no CleanupWorktree on reap (preserves uncommitted work)
         }
 
-        if !dead_ids.is_empty() {
+        if !removed_ids.is_empty() {
             effects.push(Effect::Persist);
-            effects.push(Effect::ClearPendingReplies {
-                removed_ids: dead_ids,
-            });
+            effects.push(Effect::ClearOwnedPendingReplies { removed_owners });
             // Increment wire_seq so the session list carries a fresh sequence
             // number. Without this, the list shares the seq of the prior
             // mutation and can be reordered with it, breaking convergence.
@@ -3869,6 +4104,20 @@ impl DaemonState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_incarnation_wire_accepts_full_width_decimal_string() {
+        #[derive(serde::Deserialize)]
+        struct Body {
+            #[serde(default, deserialize_with = "deserialize_optional_incarnation")]
+            session_incarnation: Option<SessionIncarnation>,
+        }
+
+        let body: Body =
+            serde_json::from_str(r#"{"session_incarnation":"18446744073709551615"}"#).unwrap();
+
+        assert_eq!(body.session_incarnation, Some(SessionIncarnation(u64::MAX)));
+    }
 
     #[test]
     fn registration_allocates_above_restored_high_water_after_removal() {
@@ -5546,7 +5795,7 @@ mod tests {
         assert!(
             effects.iter().any(|e| matches!(
                 e,
-                Effect::ClearTmuxVar { name, .. } if name == "@ouija_session"
+                Effect::ClearOwnedTmuxVar { name, .. } if name == "@ouija_session"
             )),
             "Remove must still clear @ouija_session, got: {effects:?}"
         );
@@ -5733,15 +5982,14 @@ mod tests {
             keep_worktree: false,
         });
         assert!(!state.sessions.contains_key("s1"));
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::StopOwnedAgent { owner } if owner.session_id == "s1"
+        )));
         assert!(
             effects
                 .iter()
-                .any(|e| matches!(e, Effect::StopAgent { session_id } if session_id == "s1"))
-        );
-        assert!(
-            effects
-                .iter()
-                .any(|e| matches!(e, Effect::ClearPendingReplies { .. }))
+                .any(|e| matches!(e, Effect::ClearOwnedPendingReplies { .. }))
         );
         assert!(effects.iter().any(|e| matches!(e, Effect::Persist)));
     }
@@ -5915,8 +6163,8 @@ mod tests {
             },
         });
         let effects = state.apply(Event::RemoveIfStale {
-            id: "s1".into(),
-            expected_project_dir: Some("/tmp/gone".into()),
+            owner: test_owner(&state, "s1"),
+            expected_project_dir: "/tmp/gone".into(),
         });
         assert!(!state.sessions.contains_key("s1"));
         assert!(
@@ -5945,8 +6193,8 @@ mod tests {
             },
         });
         let effects = state.apply(Event::RemoveIfStale {
-            id: "s1".into(),
-            expected_project_dir: Some("/tmp/live".into()),
+            owner: test_owner(&state, "s1"),
+            expected_project_dir: "/tmp/live".into(),
         });
         assert!(
             state.sessions.contains_key("s1"),
@@ -5973,8 +6221,8 @@ mod tests {
             },
         });
         let effects = state.apply(Event::RemoveIfStale {
-            id: "s1".into(),
-            expected_project_dir: Some("/tmp/unknown".into()),
+            owner: test_owner(&state, "s1"),
+            expected_project_dir: "/tmp/unknown".into(),
         });
         assert!(
             state.sessions.contains_key("s1"),
@@ -5991,8 +6239,8 @@ mod tests {
     fn remove_if_stale_fails_on_missing_session() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
         let effects = state.apply(Event::RemoveIfStale {
-            id: "nope".into(),
-            expected_project_dir: None,
+            owner: missing_owner("nope"),
+            expected_project_dir: "/tmp/nope".into(),
         });
         assert!(
             effects
@@ -6014,8 +6262,9 @@ mod tests {
             pane: Some("%2".into()),
             metadata: Default::default(),
         });
+        let dead_owner = test_owner(&state, "dead");
         let effects = state.apply(Event::ReapDead {
-            dead_ids: vec!["dead".into()],
+            dead_sessions: vec![(dead_owner, "%2".into())],
         });
         assert!(!state.sessions.contains_key("dead"));
         assert!(state.sessions.contains_key("alive"));
@@ -6027,10 +6276,190 @@ mod tests {
         assert!(
             effects.iter().any(|e| matches!(
                 e,
-                Effect::ClearTmuxVar { pane, name }
+                Effect::ClearOwnedTmuxVar { pane, name, .. }
                     if pane == "%2" && name == "@ouija_id"
             )),
             "the reaper has proved this pane dead, so its stale autoregister marker must be released"
+        );
+    }
+
+    #[test]
+    fn stale_reaper_observation_does_not_remove_replacement_using_same_pane() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%2".into()),
+            metadata: Default::default(),
+        });
+        let stale_owner = ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: state.sessions["worker"].metadata.session_incarnation,
+        };
+
+        state.apply(Event::Remove {
+            id: "worker".into(),
+            keep_worktree: true,
+        });
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%2".into()),
+            metadata: Default::default(),
+        });
+        let replacement_incarnation = state.sessions["worker"].metadata.session_incarnation;
+        assert_ne!(replacement_incarnation, stale_owner.incarnation);
+
+        let effects = state.apply(Event::ReapDead {
+            dead_sessions: vec![(stale_owner, "%2".into())],
+        });
+
+        assert_eq!(
+            state.sessions["worker"].metadata.session_incarnation,
+            replacement_incarnation
+        );
+        assert!(
+            effects.is_empty(),
+            "a stale liveness result must not affect the replacement: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn stale_backend_exit_does_not_remove_replacement_using_same_pane() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%2".into()),
+            metadata: Default::default(),
+        });
+        let stale_owner = test_owner(&state, "worker");
+        state.apply(Event::Remove {
+            id: "worker".into(),
+            keep_worktree: true,
+        });
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%2".into()),
+            metadata: Default::default(),
+        });
+
+        let effects = state.apply(Event::RemoveOwned {
+            owner: stale_owner,
+            expected_pane: Some("%2".into()),
+            keep_worktree: true,
+        });
+
+        assert!(state.sessions.contains_key("worker"));
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn stop_lease_holds_identity_until_external_exit_completes() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/worker".into()),
+                worktree_present: Some(false),
+                ..Default::default()
+            },
+        });
+        let owner = test_owner(&state, "worker");
+
+        assert_eq!(
+            state.claim_existing_stop(&owner, "%2"),
+            LifecycleMutationOutcome::Applied
+        );
+        assert!(
+            state
+                .apply(Event::RemoveOwned {
+                    owner: owner.clone(),
+                    expected_pane: Some("%2".into()),
+                    keep_worktree: true,
+                })
+                .is_empty(),
+            "SessionEnd must not release an ID while backend exit owns it"
+        );
+        let remove_effects = state.apply(Event::Remove {
+            id: "worker".into(),
+            keep_worktree: true,
+        });
+        assert!(state.sessions.contains_key("worker"));
+        assert!(matches!(
+            remove_effects.as_slice(),
+            [Effect::RemoveFailed {
+                kind: RemoveFailureKind::LifecycleInProgress,
+                ..
+            }]
+        ));
+        assert!(
+            state
+                .apply(Event::ReapDead {
+                    dead_sessions: vec![(owner.clone(), "%2".into())],
+                })
+                .is_empty()
+        );
+        assert!(state.sessions.contains_key("worker"));
+        assert!(
+            state
+                .apply(Event::RemoveIfStale {
+                    owner: owner.clone(),
+                    expected_project_dir: "/tmp/worker".into(),
+                })
+                .iter()
+                .any(|effect| matches!(
+                    effect,
+                    Effect::RemoveFailed {
+                        kind: RemoveFailureKind::LifecycleInProgress,
+                        ..
+                    }
+                ))
+        );
+        assert!(state.sessions.contains_key("worker"));
+        assert!(matches!(
+            state
+                .apply(Event::Register {
+                    id: "worker".into(),
+                    pane: Some("%3".into()),
+                    metadata: Default::default(),
+                })
+                .as_slice(),
+            [Effect::RegisterFailed { .. }]
+        ));
+        assert!(matches!(
+            state
+                .apply(Event::Register {
+                    id: "replacement".into(),
+                    pane: Some("%2".into()),
+                    metadata: Default::default(),
+                })
+                .as_slice(),
+            [Effect::RegisterFailed { .. }]
+        ));
+
+        let retained = state.sessions.remove("worker").unwrap();
+        assert!(matches!(
+            state
+                .apply(Event::Register {
+                    id: "lease-only-replacement".into(),
+                    pane: Some("%2".into()),
+                    metadata: Default::default(),
+                })
+                .as_slice(),
+            [Effect::RegisterFailed { .. }]
+        ));
+        state.sessions.insert("worker".into(), retained);
+
+        let effects = state.apply(Event::CompleteOwnedStop {
+            owner,
+            expected_pane: "%2".into(),
+            keep_worktree: true,
+        });
+        assert!(!state.sessions.contains_key("worker"));
+        assert!(!state.lifecycle_leases.contains_key("worker"));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| { matches!(effect, Effect::RemoveOk { id } if id == "worker") })
         );
     }
 
@@ -6045,8 +6474,9 @@ mod tests {
                 ..Default::default()
             },
         });
+        let owner = test_owner(&state, "s1");
         let effects = state.apply(Event::MarkWorktreePresence {
-            updates: vec![("s1".into(), "/tmp/dir1".into(), false)],
+            updates: vec![(owner, "/tmp/dir1".into(), false)],
         });
         assert_eq!(
             state.sessions.get("s1").unwrap().metadata.worktree_present,
@@ -6070,13 +6500,43 @@ mod tests {
                 ..Default::default()
             },
         });
+        let owner = test_owner(&state, "s1");
         let effects = state.apply(Event::MarkWorktreePresence {
-            updates: vec![("s1".into(), "/tmp/missing".into(), false)],
+            updates: vec![(owner, "/tmp/missing".into(), false)],
         });
         assert!(
             !effects.iter().any(|e| matches!(e, Effect::Persist)),
             "idempotent update should not persist"
         );
+    }
+
+    #[test]
+    fn stale_worktree_result_does_not_mark_replacement_using_same_project_dir() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        register_stale_session(&mut state, "worker", "/tmp/shared", "%1");
+        let stale_owner = test_owner(&state, "worker");
+        state.apply(Event::Remove {
+            id: "worker".into(),
+            keep_worktree: true,
+        });
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/shared".into()),
+                ..Default::default()
+            },
+        });
+
+        let effects = state.apply(Event::MarkWorktreePresence {
+            updates: vec![(stale_owner, "/tmp/shared".into(), false)],
+        });
+
+        assert_eq!(
+            state.sessions["worker"].metadata.worktree_present, None,
+            "same project_dir is not ownership proof"
+        );
+        assert!(effects.is_empty());
     }
 
     #[test]
@@ -6117,11 +6577,14 @@ mod tests {
                 ..Default::default()
             },
         });
+        let remote_owner = test_owner(&state, "remote/s1");
+        let human_owner = test_owner(&state, "human/s1");
+        let local_owner = test_owner(&state, "local/s1");
         let effects = state.apply(Event::MarkWorktreePresence {
             updates: vec![
-                ("remote/s1".into(), "/tmp/remote".into(), false),
-                ("human/s1".into(), "/tmp/human".into(), false),
-                ("local/s1".into(), "/tmp/local".into(), false),
+                (remote_owner, "/tmp/remote".into(), false),
+                (human_owner, "/tmp/human".into(), false),
+                (local_owner, "/tmp/local".into(), false),
             ],
         });
         // Local should be set
@@ -6205,6 +6668,17 @@ mod tests {
         });
     }
 
+    fn test_owner(state: &DaemonState, id: &str) -> ResourceOwner {
+        state.sessions[id].owner()
+    }
+
+    fn missing_owner(id: &str) -> ResourceOwner {
+        ResourceOwner {
+            session_id: id.into(),
+            incarnation: SessionIncarnation::default(),
+        }
+    }
+
     #[test]
     fn prune_stale_many_emits_single_persist_for_batch() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
@@ -6213,9 +6687,9 @@ mod tests {
         register_stale_session(&mut state, "s3", "/tmp/gone3", "%3");
         let effects = state.apply(Event::PruneStale {
             sessions: vec![
-                ("s1".into(), "/tmp/gone1".into()),
-                ("s2".into(), "/tmp/gone2".into()),
-                ("s3".into(), "/tmp/gone3".into()),
+                (test_owner(&state, "s1"), "/tmp/gone1".into()),
+                (test_owner(&state, "s2"), "/tmp/gone2".into()),
+                (test_owner(&state, "s3"), "/tmp/gone3".into()),
             ],
         });
         assert!(!state.sessions.contains_key("s1"));
@@ -6261,8 +6735,8 @@ mod tests {
         register_stale_session(&mut state, "s2", "/tmp/gone2", "%2");
         let effects = state.apply(Event::PruneStale {
             sessions: vec![
-                ("s1".into(), "/tmp/gone1".into()),
-                ("s2".into(), "/tmp/gone2".into()),
+                (test_owner(&state, "s1"), "/tmp/gone1".into()),
+                (test_owner(&state, "s2"), "/tmp/gone2".into()),
             ],
         });
         let persist_idx = effects
@@ -6299,8 +6773,8 @@ mod tests {
         // Sessions that don't exist
         let effects = state.apply(Event::PruneStale {
             sessions: vec![
-                ("missing1".into(), "/tmp/x".into()),
-                ("missing2".into(), "/tmp/y".into()),
+                (missing_owner("missing1"), "/tmp/x".into()),
+                (missing_owner("missing2"), "/tmp/y".into()),
             ],
         });
         assert!(
@@ -6339,9 +6813,9 @@ mod tests {
         });
         let effects = state.apply(Event::PruneStale {
             sessions: vec![
-                ("stale".into(), "/tmp/gone".into()),
-                ("live".into(), "/tmp/here".into()),
-                ("missing".into(), "/tmp/anywhere".into()),
+                (test_owner(&state, "stale"), "/tmp/gone".into()),
+                (test_owner(&state, "live"), "/tmp/here".into()),
+                (missing_owner("missing"), "/tmp/anywhere".into()),
             ],
         });
         // Stale was pruned; live and missing failed
@@ -6368,6 +6842,25 @@ mod tests {
     }
 
     #[test]
+    fn stale_prune_snapshot_does_not_remove_replacement_using_same_project_dir() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        register_stale_session(&mut state, "worker", "/tmp/shared", "%1");
+        let stale_owner = test_owner(&state, "worker");
+        state.apply(Event::Remove {
+            id: "worker".into(),
+            keep_worktree: true,
+        });
+        register_stale_session(&mut state, "worker", "/tmp/shared", "%2");
+
+        let effects = state.apply(Event::PruneStale {
+            sessions: vec![(stale_owner, "/tmp/shared".into())],
+        });
+
+        assert!(state.sessions.contains_key("worker"));
+        assert!(effects.is_empty());
+    }
+
+    #[test]
     fn remove_failed_kind_distinguishes_failures_regardless_of_substring() {
         // Regression: bucketing on `reason.contains("not found")` misclassified
         // failures whenever the interpolated id or project_dir happened to
@@ -6377,8 +6870,8 @@ mod tests {
 
         // Case A: missing session — kind must be NotFound regardless of substring in id
         let effects = state.apply(Event::RemoveIfStale {
-            id: "card-not-found-test-1".into(),
-            expected_project_dir: None,
+            owner: missing_owner("card-not-found-test-1"),
+            expected_project_dir: "/tmp/missing".into(),
         });
         let kind = effects
             .iter()
@@ -6404,8 +6897,8 @@ mod tests {
             },
         });
         let effects = state.apply(Event::RemoveIfStale {
-            id: "live-not-found-id".into(),
-            expected_project_dir: Some("/tmp/live".into()),
+            owner: test_owner(&state, "live-not-found-id"),
+            expected_project_dir: "/tmp/live".into(),
         });
         let kind = effects
             .iter()
@@ -6423,8 +6916,8 @@ mod tests {
         // Case C: project_dir mismatch — kind must be ProjectDirMismatch even if path contains 'not found'
         register_stale_session(&mut state, "stale-1", "/tmp/has not found in path", "%2");
         let effects = state.apply(Event::RemoveIfStale {
-            id: "stale-1".into(),
-            expected_project_dir: Some("/tmp/snapshot-was-different".into()),
+            owner: test_owner(&state, "stale-1"),
+            expected_project_dir: "/tmp/snapshot-was-different".into(),
         });
         let kind = effects
             .iter()
@@ -6450,8 +6943,8 @@ mod tests {
         // Override origin to Remote post-registration (Register defaults to Local).
         state.sessions.get_mut("remote-1").unwrap().origin = Origin::Remote("npub1xyz".into());
         let effects = state.apply(Event::RemoveIfStale {
-            id: "remote-1".into(),
-            expected_project_dir: None,
+            owner: test_owner(&state, "remote-1"),
+            expected_project_dir: "/tmp/remote".into(),
         });
         let kind = effects
             .iter()
@@ -6482,9 +6975,9 @@ mod tests {
         });
         let effects = state.apply(Event::PruneStale {
             sessions: vec![
-                ("stale".into(), "/tmp/gone".into()),
-                ("live".into(), "/tmp/here".into()),
-                ("missing".into(), "/tmp/anywhere".into()),
+                (test_owner(&state, "stale"), "/tmp/gone".into()),
+                (test_owner(&state, "live"), "/tmp/here".into()),
+                (missing_owner("missing"), "/tmp/anywhere".into()),
             ],
         });
         // Each failure must carry the session id so callers can pair without
@@ -9089,8 +9582,9 @@ mod tests {
         assert!(!d1.sessions.contains_key("host0/api"));
 
         // d0 reaps a dead session
+        let frontend_owner = d0.sessions["frontend"].owner();
         d0.apply(Event::ReapDead {
-            dead_ids: vec!["frontend".into()],
+            dead_sessions: vec![(frontend_owner, "%1".into())],
         });
         assert!(!d0.sessions.contains_key("frontend"));
 
@@ -9529,7 +10023,15 @@ mod stateright_model {
                             id,
                             keep_worktree: true,
                         },
-                        ModelMsg::ReapDead { ids } => Event::ReapDead { dead_ids: ids },
+                        ModelMsg::ReapDead { ids } => Event::ReapDead {
+                            dead_sessions: ids
+                                .into_iter()
+                                .filter_map(|id| {
+                                    let session = ds.sessions.get(&id)?;
+                                    Some((session.owner(), session.pane.clone()?))
+                                })
+                                .collect(),
+                        },
                         ModelMsg::Rename { old_id, new_id } => Event::Rename { old_id, new_id },
                         ModelMsg::WireAnnounce {
                             id,
