@@ -2862,9 +2862,12 @@ impl DaemonState {
             });
             return effects;
         }
-        if self.has_stopping_lease(old_id) {
+        if let Some(reserved_id) = [old_id, new_id]
+            .into_iter()
+            .find(|id| self.lifecycle_leases.contains_key(*id))
+        {
             effects.push(Effect::RenameFailed {
-                reason: format!("session '{old_id}' has a lifecycle operation in progress"),
+                reason: format!("session '{reserved_id}' has a lifecycle operation in progress"),
             });
             return effects;
         }
@@ -6464,6 +6467,98 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::RenameFailed { .. }))
         );
+    }
+
+    #[test]
+    fn rename_rejects_claimed_restart_source() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "old".into(),
+            pane: Some("%1".into()),
+            metadata: Default::default(),
+        });
+        let owner = state.sessions["old"].owner();
+        assert_eq!(
+            state.claim_existing_start(&owner),
+            LifecycleMutationOutcome::Applied
+        );
+
+        let effects = state.apply(Event::Rename {
+            old_id: "old".into(),
+            new_id: "new".into(),
+        });
+
+        assert!(state.sessions.contains_key("old"));
+        assert!(!state.sessions.contains_key("new"));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::RenameFailed { reason }]
+                if reason == "session 'old' has a lifecycle operation in progress"
+        ));
+    }
+
+    #[test]
+    fn rename_rejects_staged_restart_source() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "old".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("claude-code".into()),
+                ..Default::default()
+            },
+        });
+        let owner = state.sessions["old"].owner();
+        assert_eq!(
+            state.claim_existing_start(&owner),
+            LifecycleMutationOutcome::Applied
+        );
+        assert!(matches!(
+            state
+                .stage_restart_launch(&owner, "claude-code".into(), true, None, None)
+                .outcome,
+            StageFreshLaunchOutcome::Staged { .. }
+        ));
+
+        let effects = state.apply(Event::Rename {
+            old_id: "old".into(),
+            new_id: "new".into(),
+        });
+
+        assert!(state.sessions.contains_key("old"));
+        assert!(!state.sessions.contains_key("new"));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::RenameFailed { reason }]
+                if reason == "session 'old' has a lifecycle operation in progress"
+        ));
+    }
+
+    #[test]
+    fn rename_rejects_reserved_start_destination() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "old".into(),
+            pane: Some("%1".into()),
+            metadata: Default::default(),
+        });
+        assert!(matches!(
+            state.reserve_start("new").unwrap(),
+            StartDisposition::Reserved(_)
+        ));
+
+        let effects = state.apply(Event::Rename {
+            old_id: "old".into(),
+            new_id: "new".into(),
+        });
+
+        assert!(state.sessions.contains_key("old"));
+        assert!(!state.sessions.contains_key("new"));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::RenameFailed { reason }]
+                if reason == "session 'new' has a lifecycle operation in progress"
+        ));
     }
 
     #[test]
