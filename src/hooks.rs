@@ -650,6 +650,12 @@ async fn session_start_inner(
                         "output": "",
                     });
                 };
+                if body.session_incarnation != Some(existing_owner.incarnation) {
+                    return json!({
+                        "skipped": "existing pane owner proof mismatch",
+                        "output": "",
+                    });
+                }
                 apply_existing_hook_event(
                     state,
                     &existing_owner,
@@ -693,6 +699,12 @@ async fn session_start_inner(
                 };
                 match binding {
                     Some(Ok(())) => {
+                        if body.session_incarnation != Some(existing_owner.incarnation) {
+                            return json!({
+                                "skipped": "existing pane owner proof mismatch",
+                                "output": "",
+                            });
+                        }
                         let backend = existing_backend
                             .as_deref()
                             .or(body.adapter.as_deref())
@@ -743,6 +755,12 @@ async fn session_start_inner(
                             );
                             return json!({
                                 "skipped": "existing pane backend session ID mismatch",
+                                "output": "",
+                            });
+                        }
+                        if body.session_incarnation != Some(existing_owner.incarnation) {
+                            return json!({
+                                "skipped": "existing pane owner proof mismatch",
                                 "output": "",
                             });
                         }
@@ -1593,7 +1611,7 @@ mod tests {
             adapter: Some("claude-code".into()),
             launch_session_id: Some("claude-worker".into()),
             launch_credential: None,
-            session_incarnation: None,
+            session_incarnation: Some(session_incarnation(&state, "claude-worker").await),
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "claude-worker");
@@ -1704,9 +1722,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_start_binds_first_local_backend_for_backend_unset_pane() {
-        // A live same-host pane with no recorded backend is locally trusted:
-        // its first hook claim fills both backend identity fields atomically.
+    async fn session_start_rejects_tokenless_first_binding_for_backend_unset_pane() {
+        // A live same-host pane is corroborating evidence, not ownership
+        // authority. Its first hook claim still needs the exact incarnation
+        // that the daemon stamped when it auto-registered the pane.
         let state = crate::state::AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -1736,12 +1755,46 @@ mod tests {
         )
         .await;
 
+        assert_eq!(result["skipped"], "existing pane owner proof mismatch");
+        let proto = state.protocol.read().await;
+        let metadata = &proto.sessions["unknown-worker"].metadata;
+        assert_eq!(metadata.backend, None);
+        assert_eq!(metadata.backend_session_id, None);
+    }
+
+    #[tokio::test]
+    async fn session_start_accepts_exact_owner_proof_for_backend_unset_pane() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "unknown-worker".into(),
+                pane: Some("%74".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/home/user/code/proj".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        *state.cached_assistant_panes.write().await =
+            vec![assistant_pane("%74", "/home/user/code/proj")];
+        let incarnation = session_incarnation(&state, "unknown-worker").await;
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: "%74".into(),
+                cwd: "/home/user/code/proj".into(),
+                backend_session_id: Some("codex-thread-1".into()),
+                backend_identity: None,
+                adapter: Some("codex-cli".into()),
+                launch_session_id: None,
+                launch_credential: None,
+                session_incarnation: Some(incarnation),
+            },
+        )
+        .await;
+
         assert_eq!(result["registered"], "unknown-worker");
-        assert!(
-            result["output"]
-                .as_str()
-                .is_some_and(|output| !output.is_empty())
-        );
         let proto = state.protocol.read().await;
         let metadata = &proto.sessions["unknown-worker"].metadata;
         assert_eq!(metadata.backend.as_deref(), Some("codex-cli"));
@@ -2024,11 +2077,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_start_rotates_thread_for_verified_existing_local_pane() {
-        // A fresh backend thread in the same verified local pane supersedes
-        // the pane's previous thread binding. This keeps manually started
-        // sessions routable across fresh Codex threads without weakening the
-        // managed-launch or remote identity paths.
+    async fn session_start_rejects_tokenless_thread_rotation_for_existing_local_pane() {
+        // Pane, cwd, and live backend provenance are reusable observations.
+        // They must not authorize a fresh thread to replace the exact backend
+        // binding owned by the daemon's current session incarnation.
         let state = crate::state::AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -2060,15 +2112,121 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result["registered"], "feat/worker");
+        assert_eq!(result["skipped"], "existing pane owner proof mismatch");
         let proto = state.protocol.read().await;
         assert_eq!(
             proto.sessions["feat/worker"]
                 .metadata
                 .backend_session_id
                 .as_deref(),
-            Some("codex-thread-2"),
-            "the verified pane's fresh thread must replace its previous binding"
+            Some("codex-thread-1"),
+            "a tokenless hook must not replace the existing thread binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_rotates_thread_with_exact_owner_proof() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "feat/worker".into(),
+                pane: Some("%72".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    backend_session_id: Some("codex-thread-1".into()),
+                    project_dir: Some("/home/user/code/proj".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        *state.cached_assistant_panes.write().await =
+            vec![assistant_pane("%72", "/home/user/code/proj")];
+        let incarnation = session_incarnation(&state, "feat/worker").await;
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: "%72".into(),
+                cwd: "/home/user/code/proj".into(),
+                backend_session_id: Some("codex-thread-2".into()),
+                backend_identity: None,
+                adapter: Some("codex-cli".into()),
+                launch_session_id: None,
+                launch_credential: None,
+                session_incarnation: Some(incarnation),
+            },
+        )
+        .await;
+
+        assert_eq!(result["registered"], "feat/worker");
+        assert_eq!(
+            state.protocol.read().await.sessions["feat/worker"]
+                .metadata
+                .backend_session_id
+                .as_deref(),
+            Some("codex-thread-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_owner_proof_cannot_bind_same_pane_replacement() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "feat/worker".into(),
+                pane: Some("%72".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    backend_session_id: Some("codex-thread-old".into()),
+                    project_dir: Some("/home/user/code/proj".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let stale_incarnation = session_incarnation(&state, "feat/worker").await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Remove {
+                id: "feat/worker".into(),
+                keep_worktree: true,
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "feat/worker".into(),
+                pane: Some("%72".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    backend_session_id: Some("codex-thread-winner".into()),
+                    project_dir: Some("/home/user/code/proj".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        *state.cached_assistant_panes.write().await =
+            vec![assistant_pane("%72", "/home/user/code/proj")];
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: "%72".into(),
+                cwd: "/home/user/code/proj".into(),
+                backend_session_id: Some("codex-thread-stale".into()),
+                backend_identity: None,
+                adapter: Some("codex-cli".into()),
+                launch_session_id: None,
+                launch_credential: None,
+                session_incarnation: Some(stale_incarnation),
+            },
+        )
+        .await;
+
+        assert_eq!(result["skipped"], "existing pane incarnation mismatch");
+        assert_eq!(
+            state.protocol.read().await.sessions["feat/worker"]
+                .metadata
+                .backend_session_id
+                .as_deref(),
+            Some("codex-thread-winner")
         );
     }
 

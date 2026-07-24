@@ -659,6 +659,18 @@ mod tests {
         std::fs::create_dir_all(&runtime_dir).unwrap();
         write_embedded_plugin_files(&plugin_dir);
 
+        let fake_tmux = bin_dir.join("tmux");
+        std::fs::write(
+            &fake_tmux,
+            r#"#!/bin/bash
+if [[ "$*" == *'#{@ouija_incarnation}'* ]]; then
+  printf '77\n'
+  exit 0
+fi
+exit 1
+"#,
+        )
+        .unwrap();
         let fake_curl = bin_dir.join("curl");
         std::fs::write(
             &fake_curl,
@@ -691,6 +703,7 @@ fi
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
             std::fs::set_permissions(&fake_curl, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
@@ -709,6 +722,9 @@ fi
                 .env("XDG_RUNTIME_DIR", &runtime_dir)
                 .env("TMUX_PANE", "%42")
                 .env("OUIJA_HOOK_CAPTURE", &capture)
+                .env_remove("OUIJA_SESSION_ID")
+                .env_remove("OUIJA_SESSION_START_CREDENTIAL")
+                .env_remove("OUIJA_SESSION_INCARNATION")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -768,6 +784,17 @@ fi
             .iter()
             .filter(|request| !request["url"].as_str().unwrap().ends_with("session-start"))
             .collect();
+        let session_start_requests: Vec<_> = requests
+            .iter()
+            .filter(|request| request["url"].as_str().unwrap().ends_with("session-start"))
+            .collect();
+        assert_eq!(session_start_requests.len(), 2);
+        assert!(
+            session_start_requests
+                .iter()
+                .all(|request| request["body"]["session_incarnation"] == "77"),
+            "manual SessionStart must carry the daemon-stamped pane owner: {session_start_requests:?}"
+        );
         let expected = [
             ("/api/hooks/stop", "thread-old", "41", 1),
             ("/api/hooks/prompt-submit", "thread-new", "42", 1),

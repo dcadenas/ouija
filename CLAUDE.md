@@ -46,6 +46,8 @@ When spawning or respawning tmux panes for Ouija-managed sessions, route environ
 
 Every local session incarnation has one daemon-issued, monotonically increasing `SessionIncarnation`. A `ResourceOwner` (public session ID plus incarnation) is the authority for its pane, backend session, worktree, hooks, session agent, and delayed observations. Public IDs and pane IDs alone are never sufficient ownership checks because both can be reused.
 
+An existing-pane `SessionStart` may adopt or replace a backend binding only when it presents the exact daemon-stamped incarnation for that pane. Pane, cwd, and live process checks corroborate the claim but never mint authority; managed launches still use their one-time binding credential as an additional first-bind proof.
+
 Starts, restarts, kills, scheduler revivals, and hard-stall recovery must persist a `LifecycleLease` before filesystem, tmux, process, or HTTP work. Delayed success, failure, readiness, prompt, attach, cleanup, and reaper results compare the exact owner and no-op when superseded. Resource gates serialize the comparison and side effect without holding the protocol lock across I/O. Reaping preserves worktrees; only an explicit, exact-owner cleanup may remove one.
 
 ### Key modules
