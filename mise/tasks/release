@@ -113,6 +113,7 @@ cargo publish --manifest-path "$REPO_DIR/Cargo.toml"
 
 # Update local daemon
 ouija self-update
+bash "$REPO_DIR/mise/tasks/sync-installed-binaries"
 
 # Request macOS builds from the Mac via ouija (non-blocking, best-effort)
 request_macos_builds "$NEXT"

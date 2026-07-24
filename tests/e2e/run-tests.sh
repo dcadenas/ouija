@@ -293,6 +293,47 @@ log "  Sessions before restart: $ids_before ($count_before)"
 kill $DAEMON_PID 2>/dev/null || true
 wait $DAEMON_PID 2>/dev/null || true
 sleep 0.5
+
+# Simulate a live pre-alpha.220 worker: its durable record has the exact Hub
+# public ID and incarnation, but its live pane has no incarnation marker.
+MARKERLESS_OLD_ID="sess-a2"
+MARKERLESS_ID="feat/markerless-restore"
+MARKERLESS_PANE="$PANE_A"
+MARKERLESS_INCARNATION=$(jq -r --arg id "$MARKERLESS_OLD_ID" \
+    '.sessions[] | select(.id == $id) | .metadata.session_incarnation' \
+    /tmp/ouija-test/sessions.json)
+MARKERLESS_TMP=$(mktemp)
+jq --arg old "$MARKERLESS_OLD_ID" --arg new "$MARKERLESS_ID" \
+    '(.sessions[] | select(.id == $old) | .id) = $new' \
+    /tmp/ouija-test/sessions.json >"$MARKERLESS_TMP"
+mv "$MARKERLESS_TMP" /tmp/ouija-test/sessions.json
+tmux set-option -p -t "$MARKERLESS_PANE" @ouija_session "$MARKERLESS_ID"
+tmux set-option -p -t "$MARKERLESS_PANE" @ouija_id "$MARKERLESS_ID"
+tmux set-option -p -t "$MARKERLESS_PANE" @ouija_incarnation ""
+ids_before="${ids_before//$MARKERLESS_OLD_ID/$MARKERLESS_ID}"
+
+restore_markerless_fixture() {
+    if curl -sf "$BASE/api/status" >/dev/null 2>&1; then
+        api "$BASE" POST /api/rename \
+            -d "{\"old_id\":\"$MARKERLESS_ID\",\"new_id\":\"$MARKERLESS_OLD_ID\"}" \
+            >/dev/null 2>&1 || true
+    elif [ -f /tmp/ouija-test/sessions.json ]; then
+        local restore_tmp
+        restore_tmp=$(mktemp)
+        jq --arg old "$MARKERLESS_ID" --arg new "$MARKERLESS_OLD_ID" \
+            '(.sessions[] | select(.id == $old) | .id) = $new' \
+            /tmp/ouija-test/sessions.json >"$restore_tmp" 2>/dev/null \
+            && mv "$restore_tmp" /tmp/ouija-test/sessions.json
+    fi
+    tmux set-option -p -t "$MARKERLESS_PANE" @ouija_session "$MARKERLESS_OLD_ID" \
+        2>/dev/null || true
+    tmux set-option -p -t "$MARKERLESS_PANE" @ouija_id "$MARKERLESS_OLD_ID" \
+        2>/dev/null || true
+    tmux set-option -p -t "$MARKERLESS_PANE" @ouija_incarnation \
+        "$MARKERLESS_INCARNATION" 2>/dev/null || true
+}
+trap restore_markerless_fixture EXIT
+
 RUST_LOG=ouija=debug ouija start-server --port $PORT --data /tmp/ouija-test >/tmp/daemon-restart.log 2>&1 &
 DAEMON_PID=$!
 # Wait for HTTP to be ready
@@ -311,6 +352,11 @@ assert_eq "session count preserved after restart" "$count_after" "$count_before"
 for sid in $ids_before; do
     assert_contains "session $sid survived restart" "$ids_after" "$sid"
 done
+assert_eq "markerless persisted incarnation restored" \
+    "$(tmux display-message -t "$MARKERLESS_PANE" -p '#{@ouija_incarnation}')" \
+    "$MARKERLESS_INCARNATION"
+restore_markerless_fixture
+trap - EXIT
 # Restore auto_register
 api "$BASE" POST /api/settings -d '{"auto_register":true}' >/dev/null
 

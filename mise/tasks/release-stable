@@ -113,6 +113,7 @@ git -C "$REPO_DIR" push && git -C "$REPO_DIR" push origin "v$NEXT"
 cargo publish --manifest-path "$REPO_DIR/Cargo.toml"
 
 ouija self-update
+bash "$REPO_DIR/mise/tasks/sync-installed-binaries"
 request_macos_builds "$NEXT"
 
 echo "Released $NEXT"

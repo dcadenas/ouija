@@ -1450,7 +1450,7 @@ fn persisted_session_from_entry(
     })
 }
 
-async fn restore_persisted_sessions(state: &state::AppState) -> anyhow::Result<()> {
+async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Result<()> {
     let persisted = persistence::load_sessions(&state.config.data_dir)
         .context("failed to restore lifecycle authority from sessions.json")?;
     let persistence::PersistedLifecycleState {
@@ -1761,17 +1761,50 @@ async fn restore_persisted_sessions(state: &state::AppState) -> anyhow::Result<(
         return Ok(());
     }
 
-    let mut proto = state.protocol.write().await;
-    for ps in &alive {
-        let entry = crate::daemon_protocol::SessionEntry {
-            id: ps.id.clone(),
-            pane: ps.pane.clone(),
-            origin: crate::daemon_protocol::Origin::Local,
-            metadata: metadata_for_restored_session(&ps.metadata),
-            ..Default::default()
-        };
-        proto.sessions.insert(ps.id.clone(), entry);
-    }
+    let marker_effects = {
+        let mut proto = state.protocol.write().await;
+        let mut marker_effects = Vec::new();
+        for ps in &alive {
+            let entry = crate::daemon_protocol::SessionEntry {
+                id: ps.id.clone(),
+                pane: ps.pane.clone(),
+                origin: crate::daemon_protocol::Origin::Local,
+                metadata: metadata_for_restored_session(&ps.metadata),
+                ..Default::default()
+            };
+            let owner = entry.owner();
+            if let Some(pane) = &entry.pane {
+                marker_effects.extend([
+                    crate::daemon_protocol::Effect::SetTmuxVar {
+                        owner: owner.clone(),
+                        pane: pane.clone(),
+                        name: "@ouija_session".into(),
+                        value: entry.id.clone(),
+                    },
+                    crate::daemon_protocol::Effect::SetTmuxVar {
+                        owner: owner.clone(),
+                        pane: pane.clone(),
+                        name: "@ouija_id".into(),
+                        value: entry.id.clone(),
+                    },
+                    crate::daemon_protocol::Effect::SetTmuxVar {
+                        owner,
+                        pane: pane.clone(),
+                        name: "@ouija_incarnation".into(),
+                        value: entry.metadata.session_incarnation.to_string(),
+                    },
+                ]);
+            }
+            proto.sessions.insert(ps.id.clone(), entry);
+        }
+        marker_effects
+    };
+
+    // Startup rehydration bypasses Event::Register so it can preserve the
+    // durable incarnation exactly. Re-emit only Register's pane markers after
+    // the rows are visible; the normal pane resource gate and physical-owner
+    // check reject a conflicting live incarnation.
+    let _ = state.execute_effects(&marker_effects).await;
     tracing::info!("restored {} persisted sessions", alive.len());
     Ok(())
 }

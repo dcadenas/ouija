@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 
 fn task_command_lines(task: &str) -> Vec<String> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(task);
@@ -52,4 +53,30 @@ fn use_local_updates_the_user_path_copy_and_restarts_the_fresh_binary() {
             .any(|line| line == "\"$CARGO_BIN\" restart-server"),
         "use-local must restart through the binary it just built"
     );
+}
+
+#[test]
+fn installed_binary_sync_refreshes_an_existing_user_path_copy() {
+    let home = tempfile::tempdir().expect("temporary home");
+    let cargo_bin = home.path().join(".cargo/bin/ouija");
+    let local_bin = home.path().join(".local/bin/ouija");
+    fs::create_dir_all(cargo_bin.parent().expect("cargo bin parent")).unwrap();
+    fs::create_dir_all(local_bin.parent().expect("local bin parent")).unwrap();
+    fs::write(&cargo_bin, b"alpha.221\n").unwrap();
+    fs::write(&local_bin, b"alpha.220\n").unwrap();
+
+    let script =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("mise/tasks/sync-installed-binaries");
+    let output = Command::new("bash")
+        .arg(script)
+        .env("HOME", home.path())
+        .output()
+        .expect("run installed-binary synchronization");
+
+    assert!(
+        output.status.success(),
+        "sync failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(&local_bin).unwrap(), b"alpha.221\n");
 }

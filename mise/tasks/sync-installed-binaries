@@ -1,0 +1,15 @@
+#!/bin/bash
+# Keep an existing user-PATH Ouija copy aligned with cargo install.
+set -euo pipefail
+
+CARGO_BIN="$HOME/.cargo/bin/ouija"
+LOCAL_BIN="$HOME/.local/bin/ouija"
+
+if [ ! -f "$CARGO_BIN" ]; then
+    echo "error: installed Ouija binary not found at $CARGO_BIN" >&2
+    exit 1
+fi
+
+if [ -f "$LOCAL_BIN" ] && [ "$LOCAL_BIN" != "$CARGO_BIN" ]; then
+    cp "$CARGO_BIN" "$LOCAL_BIN"
+fi
