@@ -1520,14 +1520,6 @@ impl AppState {
         Box::pin(self._apply_and_execute(event))
     }
 
-    pub(crate) async fn apply_owned_event(
-        self: &Arc<Self>,
-        owner: &crate::daemon_protocol::ResourceOwner,
-        event: crate::daemon_protocol::Event,
-    ) -> Vec<crate::daemon_protocol::Effect> {
-        self.apply_owned_event_if(owner, event, |_| true).await
-    }
-
     pub(crate) async fn apply_owned_event_if<F>(
         self: &Arc<Self>,
         owner: &crate::daemon_protocol::ResourceOwner,

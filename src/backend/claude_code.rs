@@ -792,8 +792,8 @@ fi
         assert!(
             session_start_requests
                 .iter()
-                .all(|request| request["body"]["session_incarnation"] == "77"),
-            "manual SessionStart must carry the daemon-stamped pane owner: {session_start_requests:?}"
+                .all(|request| request["body"].get("session_incarnation").is_none()),
+            "manual SessionStart must not treat a reusable pane variable as generation proof: {session_start_requests:?}"
         );
         let expected = [
             ("/api/hooks/stop", "thread-old", "41", 1),

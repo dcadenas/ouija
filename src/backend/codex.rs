@@ -1252,7 +1252,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_register_script_sends_daemon_stamped_pane_incarnation() {
+    fn manual_register_script_does_not_claim_live_pane_incarnation() {
         let root = tempfile::tempdir().unwrap();
         let bin_dir = root.path().join("bin");
         let script = root.path().join("codex-register.sh");
@@ -1326,7 +1326,10 @@ printf '{"registered":"worker","session_incarnation":"77","output":""}'
         );
         let request: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(capture).unwrap()).unwrap();
-        assert_eq!(request["session_incarnation"], "77");
+        assert!(
+            request.get("session_incarnation").is_none(),
+            "manual SessionStart must not treat a reusable pane variable as generation proof: {request}"
+        );
         assert_eq!(request["backend_session_id"], "thread-manual");
         assert!(request.get("launch_credential").is_none());
     }

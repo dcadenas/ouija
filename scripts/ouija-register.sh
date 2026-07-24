@@ -3,9 +3,6 @@ PAYLOAD=$(cat)
 PANE="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}' 2>/dev/null)}"
 [ -z "$PANE" ] && exit 0
 INCARNATION="${OUIJA_SESSION_INCARNATION:-}"
-if [ -z "$INCARNATION" ]; then
-  INCARNATION=$(tmux display-message -p -t "$PANE" '#{@ouija_incarnation}' 2>/dev/null)
-fi
 case "$INCARNATION" in
   ''|*[!0-9]*) INCARNATION="" ;;
 esac

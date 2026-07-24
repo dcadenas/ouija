@@ -54,9 +54,6 @@ PANE="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}' 2>/dev/null)}"
 CWD=$(printf '%s' "$PAYLOAD" | jq -r '.cwd // empty' 2>/dev/null)
 [ -z "$CWD" ] && CWD="$PWD"
 INCARNATION="$EXPLICIT_SESSION_INCARNATION"
-if [ -z "$INCARNATION" ] && [ -n "$PANE" ]; then
-  INCARNATION=$(tmux display-message -p -t "$PANE" '#{@ouija_incarnation}' 2>/dev/null)
-fi
 case "$INCARNATION" in
   ''|*[!0-9]*) INCARNATION="" ;;
 esac
