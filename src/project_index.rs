@@ -71,12 +71,13 @@ pub fn scan_projects_dir(projects_dir: &Path) -> HashMap<String, ProjectInfo> {
     index
 }
 
-/// Extract a short description from a description file or README.md.
+/// Extract a short description from agent guidance or README.md.
 ///
 /// Phase 2: replace the hardcoded list with `backend.description_file_priority()`.
 fn extract_description(dir: &Path) -> Option<String> {
-    // Try CLAUDE.md first, then README.md
-    for filename in &["CLAUDE.md", "README.md"] {
+    // AGENTS.md is canonical. CLAUDE.md remains a compatibility fallback for
+    // projects that have not migrated, followed by the user-facing README.
+    for filename in &["AGENTS.md", "CLAUDE.md", "README.md"] {
         let path = dir.join(filename);
         if let Ok(content) = std::fs::read_to_string(&path) {
             // Take first ~500 bytes to avoid reading huge files
@@ -110,6 +111,11 @@ fn first_meaningful_line(content: &str) -> Option<String> {
         }
         // Skip HTML comments and tags
         if trimmed.starts_with("<!--") || trimmed.starts_with('<') {
+            continue;
+        }
+        // Claude compatibility files may contain only this include directive.
+        // It is agent configuration, not a useful project description.
+        if trimmed == "@AGENTS.md" {
             continue;
         }
         // Skip badge/image markdown
@@ -202,6 +208,43 @@ mod tests {
             Some("A web app.")
         );
         assert!(!index.contains_key(".hidden"));
+    }
+
+    #[test]
+    fn extract_description_prefers_agents_over_thin_claude_include() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("AGENTS.md"),
+            "# Agent guidance\n\nCanonical project description.\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("CLAUDE.md"), "@AGENTS.md\n").unwrap();
+        fs::write(
+            tmp.path().join("README.md"),
+            "# Project\n\nREADME fallback description.\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            extract_description(tmp.path()).as_deref(),
+            Some("Canonical project description.")
+        );
+    }
+
+    #[test]
+    fn extract_description_skips_thin_claude_include_without_agents() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("CLAUDE.md"), "@AGENTS.md\n").unwrap();
+        fs::write(
+            tmp.path().join("README.md"),
+            "# Project\n\nREADME fallback description.\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            extract_description(tmp.path()).as_deref(),
+            Some("README fallback description.")
+        );
     }
 
     #[test]
