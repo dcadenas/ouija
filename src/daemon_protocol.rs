@@ -270,6 +270,7 @@ impl std::str::FromStr for IdlePolicy {
 }
 
 pub const IDLE_POLICY_CHOICES: &str = "keep-open|ask-parent-when-done|close-when-done";
+pub const WHEN_DONE_CHOICES: &str = "keep-open|ask-parent|close";
 
 /// Generate an unguessable one-time credential for a managed backend launch.
 ///
@@ -305,13 +306,24 @@ pub fn validate_spawn_lifecycle(
 
     let Some(idle_policy) = idle_policy else {
         return Err(format!(
-            "spawn-session requires --idle-policy <{IDLE_POLICY_CHOICES}>"
+            "spawn-session requires --when-done <{WHEN_DONE_CHOICES}>"
         ));
     };
 
     if *idle_policy == IdlePolicy::AskParentWhenDone && parent_session.is_none() {
         return Err(
             "idle policy ask-parent-when-done requires --parent-session <SESSION_ID>; use keep-open or close-when-done with --no-parent-session"
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+pub fn validate_spawn_reminder(reminder: Option<&str>) -> Result<(), String> {
+    if reminder.is_some_and(|text| text.contains("ouija clear-reminder")) {
+        return Err(
+            "manual reminders must not contain 'ouija clear-reminder'; Ouija supplies a generated clearing command with the correct reminder ID"
                 .to_string(),
         );
     }
@@ -370,14 +382,13 @@ impl SessionMeta {
     /// Returns `true` if this session has a reminder whose body is more than
     /// just whitespace. An empty-string or whitespace-only reminder is treated
     /// as if no reminder were set: injecting it would produce a `<ouija-status
-    /// type="reminder">` with only the `ouija clear-reminder N` tail, which
-    /// is the exact "non-signal injection" this daemon's session_agent is
-    /// meant to avoid.
+    /// type="reminder">` with only a generated clearing-command tail, which is
+    /// the exact "non-signal injection" this daemon's session_agent is meant
+    /// to avoid.
     pub fn has_active_reminder(&self) -> bool {
         self.reminder
             .as_deref()
             .is_some_and(|r| !r.trim().is_empty())
-            || self.idle_policy.is_some()
     }
 
     pub fn effective_reminder(&self, session_id: &str, clearing_id: Option<u64>) -> Option<String> {
@@ -4060,6 +4071,39 @@ mod tests {
 
         meta.reminder = Some("   \t\n".into());
         assert!(!meta.has_active_reminder(), "whitespace-only is not active");
+    }
+
+    #[test]
+    fn lifecycle_only_metadata_does_not_activate_recurring_reminders_for_any_backend() {
+        for backend in ["claude-code", "codex-cli", "opencode"] {
+            let meta = SessionMeta {
+                backend: Some(backend.into()),
+                idle_policy: Some(IdlePolicy::KeepOpen),
+                ..Default::default()
+            };
+
+            assert!(
+                !meta.has_active_reminder(),
+                "{backend} lifecycle metadata must not opt into recurring reminders"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_nonblank_reminders_activate_recurrence_for_any_backend() {
+        for backend in ["claude-code", "codex-cli", "opencode"] {
+            let meta = SessionMeta {
+                backend: Some(backend.into()),
+                reminder: Some("resume the assigned task".into()),
+                idle_policy: Some(IdlePolicy::KeepOpen),
+                ..Default::default()
+            };
+
+            assert!(
+                meta.has_active_reminder(),
+                "{backend} explicit reminders must opt into recurrence"
+            );
+        }
     }
 
     #[test]

@@ -2107,6 +2107,9 @@ pub async fn create_task(
     State(state): State<SharedState>,
     Json(body): Json<CreateTaskBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(error) = crate::daemon_protocol::validate_spawn_reminder(body.reminder.as_deref()) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
+    }
     if let Err(e) = scheduler::validate_cron(&body.cron) {
         return (
             StatusCode::BAD_REQUEST,
@@ -2498,7 +2501,8 @@ fn validate_start_lifecycle(body: &mut SessionNameBody) -> Result<(), String> {
         body.parent_session.as_deref(),
         body.no_parent_session.unwrap_or(false),
         body.idle_policy.as_ref(),
-    )
+    )?;
+    crate::daemon_protocol::validate_spawn_reminder(body.reminder.as_deref())
 }
 
 /// Kill the coding assistant process in a session's tmux pane.
@@ -2738,6 +2742,9 @@ pub async fn restart_session(
     body.model = normalize_optional_string(body.model);
     body.effort = normalize_optional_string(body.effort);
     body.backend = normalize_optional_string(body.backend);
+    if let Err(error) = crate::daemon_protocol::validate_spawn_reminder(body.reminder.as_deref()) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
+    }
     if let Err(response) = validate_backend_name(&state, body.backend.as_deref()) {
         return response;
     }
@@ -4924,9 +4931,51 @@ mod tests {
         let err = validate_start_lifecycle(&mut body).unwrap_err();
 
         assert!(
-            err.contains("--idle-policy <keep-open|ask-parent-when-done|close-when-done>"),
-            "error must teach idle-policy choices, got: {err}"
+            err.contains("--when-done <keep-open|ask-parent|close>"),
+            "error must teach when-done choices, got: {err}"
         );
+    }
+
+    #[test]
+    fn start_lifecycle_validation_rejects_manual_clear_reminder_commands() {
+        let mut body: SessionNameBody = serde_json::from_str(
+            r#"{
+                "name":"s",
+                "no_parent_session":true,
+                "idle_policy":"keep-open",
+                "reminder":"When done, run ouija clear-reminder 7"
+            }"#,
+        )
+        .unwrap();
+
+        let err = validate_start_lifecycle(&mut body).unwrap_err();
+
+        assert!(err.contains("ouija clear-reminder"));
+        assert!(
+            err.contains("generated"),
+            "error must explain that Ouija supplies the command, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_session_rejects_manual_clear_reminder_commands_at_api_boundary() {
+        let state = crate::state::AppState::new_for_test();
+        let body: SessionNameBody = serde_json::from_str(
+            r#"{
+                "name":"s",
+                "no_parent_session":true,
+                "idle_policy":"keep-open",
+                "reminder":"When done, run ouija clear-reminder 7"
+            }"#,
+        )
+        .unwrap();
+
+        let (status, Json(response)) = start_session(State(state), Json(body)).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(response["error"].as_str().is_some_and(|error| {
+            error.contains("ouija clear-reminder") && error.contains("generated")
+        }));
     }
 
     #[test]
@@ -5036,6 +5085,39 @@ mod tests {
         .await;
 
         assert_unknown_backend_response(status, &body);
+    }
+
+    #[tokio::test]
+    async fn restart_session_rejects_manual_clear_reminder_before_restart() {
+        let state = crate::state::AppState::new_for_test();
+        let (status, Json(body)) = restart_session(
+            State(state),
+            Json(SessionNameBody {
+                name: "restart-clear-reminder".into(),
+                fresh: Some(true),
+                worktree: None,
+                project_dir: None,
+                prompt: None,
+                from: None,
+                backend: None,
+                model: None,
+                effort: None,
+                reminder: Some("When done, run ouija clear-reminder 7".into()),
+                parent_session: None,
+                no_parent_session: None,
+                idle_policy: None,
+                branch: None,
+                base_branch: None,
+                keep_worktree: None,
+                force_reset: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().is_some_and(|error| {
+            error.contains("ouija clear-reminder") && error.contains("generated")
+        }));
     }
 
     #[tokio::test]
@@ -5176,6 +5258,38 @@ mod tests {
         .await;
 
         assert_unknown_backend_response(status, &body);
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_manual_clear_reminder_before_persistence() {
+        let state = crate::state::AppState::new_for_test();
+        let (status, Json(body)) = create_task(
+            State(state.clone()),
+            Json(CreateTaskBody {
+                name: "clear-reminder-task".into(),
+                cron: "0 0 * * *".into(),
+                target_session: None,
+                message: Some("run".into()),
+                prompt: None,
+                reminder: Some("When done, run ouija clear-reminder 7".into()),
+                project_dir: None,
+                backend: None,
+                model: None,
+                effort: None,
+                once: None,
+                backend_session_id: None,
+                on_fire: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("ouija clear-reminder"))
+        );
+        assert!(state.scheduled_tasks.read().await.is_empty());
     }
 
     #[test]

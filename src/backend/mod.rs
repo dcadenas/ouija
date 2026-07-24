@@ -550,6 +550,35 @@ pub trait CodingAssistant: Send + Sync + std::fmt::Debug + 'static {
 }
 
 #[cfg(test)]
+pub(crate) fn assert_shared_task_reminder_guidance(skill: &str) {
+    assert!(
+        skill.contains("`--reminder` alone opts the session into recurring recovery nudges."),
+        "skill must make recurring reminders explicitly opt in"
+    );
+    assert!(
+        skill.contains("`--when-done keep-open|ask-parent|close`"),
+        "skill must teach the primary completion option independently"
+    );
+    assert!(
+        skill.contains("`--idle-policy` is deprecated"),
+        "skill must label the compatibility option as deprecated"
+    );
+    assert!(
+        skill.contains("Pending replies can still wake a session without `--reminder`."),
+        "skill must preserve the independent pending-reply wakeup contract"
+    );
+    assert!(
+        skill.contains("Never put `ouija clear-reminder` in manual reminder text."),
+        "skill must reserve generated clearing commands for Ouija"
+    );
+    let placeholder_command = ["ouija clear-reminder", "N"].join(" ");
+    assert!(
+        !skill.contains(&placeholder_command),
+        "skill must not contain a copyable placeholder clearing command"
+    );
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

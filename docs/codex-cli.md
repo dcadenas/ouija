@@ -66,7 +66,7 @@ ouija config set-codex-model-route gemini \
   --codex-home ~/.cache/codex-gemini
 
 ouija spawn-session worker --backend codex-cli --model gemini \
-  --no-parent-session --idle-policy keep-open
+  --no-parent-session --when-done keep-open
 ```
 
 Codex requires a Responses-compatible endpoint. Google's OpenAI-compatible
@@ -128,8 +128,15 @@ before launch and starts Codex inside it with `cd`. Codex's own app-managed
 worktrees (under `$CODEX_HOME/worktrees`, detached HEAD by default) are a separate
 feature and are **not** used by the Ouija backend. Use Ouija's `--worktree` /
 `--branch` options on `spawn-session` as usual, along with explicit lifecycle
-flags such as `--parent-session hub --idle-policy ask-parent-when-done` or
-`--no-parent-session --idle-policy close-when-done`.
+flags such as `--parent-session hub --when-done ask-parent` or
+`--no-parent-session --when-done close`. The legacy `--idle-policy` spellings
+remain compatible but are deprecated.
+
+`--when-done` controls completion only. Add `--reminder` when the Codex session
+should receive recurring recovery nudges; omit it for no task-reminder
+recurrence. Pending replies can still wake the session independently. Ouija
+adds the concrete clearing command and current ID to every injected nudge, so
+do not put a clearing command in manual reminder text.
 
 ## Lifecycle: turn-scoped Stop, liveness-based cleanup
 
