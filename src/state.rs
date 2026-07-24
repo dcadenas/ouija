@@ -317,6 +317,10 @@ pub struct AppState {
     last_reciprocated: std::sync::Mutex<HashMap<String, std::time::Instant>>,
     /// Active session agents keyed by exact lifecycle owner.
     session_agents: RwLock<HashMap<crate::daemon_protocol::ResourceOwner, OwnedSessionAgent>>,
+    /// Per-resource async gates serialize external pane/backend claims and cleanup
+    /// without holding the protocol lock across tmux, process, or HTTP I/O.
+    resource_gates:
+        std::sync::Mutex<HashMap<ResourceGateKey, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// Indexed projects from projects_dir, keyed by directory basename.
     pub project_index: RwLock<HashMap<String, ProjectInfo>>,
     /// Pending remote command results: command string → oneshot senders.
@@ -347,6 +351,12 @@ pub struct AppState {
     pub pending_prompts: std::sync::Mutex<std::collections::HashMap<String, PendingPrompt>>,
     compact_in_progress: std::sync::Mutex<std::collections::HashSet<String>>,
     soft_restart_in_progress: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum ResourceGateKey {
+    Pane(String),
+    BackendSession(String),
 }
 
 pub(crate) struct CompactInProgressGuard<'a> {
@@ -639,6 +649,7 @@ impl AppState {
             connected_npubs: std::sync::Mutex::new(HashMap::new()),
             last_reciprocated: std::sync::Mutex::new(HashMap::new()),
             session_agents: RwLock::new(HashMap::new()),
+            resource_gates: std::sync::Mutex::new(HashMap::new()),
             project_index: RwLock::new(HashMap::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
             cached_assistant_panes: RwLock::new(Vec::new()),
@@ -676,6 +687,7 @@ impl AppState {
             connected_npubs: std::sync::Mutex::new(HashMap::new()),
             last_reciprocated: std::sync::Mutex::new(HashMap::new()),
             session_agents: RwLock::new(HashMap::new()),
+            resource_gates: std::sync::Mutex::new(HashMap::new()),
             project_index: RwLock::new(HashMap::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
             cached_assistant_panes: RwLock::new(Vec::new()),
@@ -689,6 +701,303 @@ impl AppState {
             compact_in_progress: std::sync::Mutex::new(std::collections::HashSet::new()),
             soft_restart_in_progress: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
+    }
+
+    fn resource_gate(&self, key: ResourceGateKey) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self
+            .resource_gates
+            .lock()
+            .expect("resource gate map mutex poisoned");
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(&key).and_then(std::sync::Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        gates.insert(key, Arc::downgrade(&gate));
+        gate
+    }
+
+    fn pane_resource_gate(&self, pane: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.resource_gate(ResourceGateKey::Pane(pane.to_string()))
+    }
+
+    fn backend_resource_gate(&self, backend_session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.resource_gate(ResourceGateKey::BackendSession(
+            backend_session_id.to_string(),
+        ))
+    }
+
+    async fn event_resource_keys(
+        &self,
+        event: &crate::daemon_protocol::Event,
+    ) -> Vec<ResourceGateKey> {
+        fn add_entry(
+            keys: &mut Vec<ResourceGateKey>,
+            entry: &crate::daemon_protocol::SessionEntry,
+        ) {
+            if let Some(pane) = &entry.pane {
+                keys.push(ResourceGateKey::Pane(pane.clone()));
+            }
+            if let Some(backend_session_id) = &entry.metadata.backend_session_id {
+                keys.push(ResourceGateKey::BackendSession(backend_session_id.clone()));
+            }
+        }
+        fn add_current(
+            keys: &mut Vec<ResourceGateKey>,
+            protocol: &crate::daemon_protocol::DaemonState,
+            id: &str,
+        ) {
+            if let Some(entry) = protocol.sessions.get(id) {
+                add_entry(keys, entry);
+            }
+        }
+
+        let protocol = self.protocol.read().await;
+        let mut keys = Vec::new();
+        match event {
+            crate::daemon_protocol::Event::Register { id, pane, metadata } => {
+                add_current(&mut keys, &protocol, id);
+                if let Some(pane) = pane {
+                    keys.push(ResourceGateKey::Pane(pane.clone()));
+                }
+                if let Some(backend_session_id) = &metadata.backend_session_id {
+                    keys.push(ResourceGateKey::BackendSession(backend_session_id.clone()));
+                }
+            }
+            crate::daemon_protocol::Event::RegisterIfPaneUnbound {
+                id, pane, metadata, ..
+            } => {
+                add_current(&mut keys, &protocol, id);
+                keys.push(ResourceGateKey::Pane(pane.clone()));
+                if let Some(backend_session_id) = &metadata.backend_session_id {
+                    keys.push(ResourceGateKey::BackendSession(backend_session_id.clone()));
+                }
+            }
+            crate::daemon_protocol::Event::StageFreshLaunch { id, .. }
+            | crate::daemon_protocol::Event::Rename { old_id: id, .. }
+            | crate::daemon_protocol::Event::Remove { id, .. }
+            | crate::daemon_protocol::Event::UpdateMetadata { id, .. } => {
+                add_current(&mut keys, &protocol, id);
+            }
+            crate::daemon_protocol::Event::RefreshLaunchMetadata {
+                id, pane, metadata, ..
+            } => {
+                add_current(&mut keys, &protocol, id);
+                if let Some(pane) = pane {
+                    keys.push(ResourceGateKey::Pane(pane.clone()));
+                }
+                if let Some(backend_session_id) = &metadata.backend_session_id {
+                    keys.push(ResourceGateKey::BackendSession(backend_session_id.clone()));
+                }
+            }
+            crate::daemon_protocol::Event::RemoveOwned {
+                owner,
+                expected_pane,
+                ..
+            } => {
+                add_current(&mut keys, &protocol, &owner.session_id);
+                if let Some(pane) = expected_pane {
+                    keys.push(ResourceGateKey::Pane(pane.clone()));
+                }
+            }
+            crate::daemon_protocol::Event::CompleteOwnedStop {
+                owner,
+                expected_pane,
+                ..
+            } => {
+                add_current(&mut keys, &protocol, &owner.session_id);
+                keys.push(ResourceGateKey::Pane(expected_pane.clone()));
+            }
+            crate::daemon_protocol::Event::RollbackProvisionalRegistration {
+                id,
+                pane,
+                previous,
+                ..
+            } => {
+                add_current(&mut keys, &protocol, id);
+                keys.push(ResourceGateKey::Pane(pane.clone()));
+                if let Some(previous) = previous {
+                    add_entry(&mut keys, previous);
+                }
+            }
+            crate::daemon_protocol::Event::RollbackFreshLaunch {
+                id,
+                pane,
+                previous,
+                provisional_pane,
+                ..
+            } => {
+                add_current(&mut keys, &protocol, id);
+                if let Some(pane) = pane {
+                    keys.push(ResourceGateKey::Pane(pane.clone()));
+                }
+                if let Some(pane) = provisional_pane {
+                    keys.push(ResourceGateKey::Pane(pane.clone()));
+                }
+                if let Some(previous) = previous {
+                    add_entry(&mut keys, previous);
+                }
+            }
+            crate::daemon_protocol::Event::RemoveIfStale { owner, .. } => {
+                add_current(&mut keys, &protocol, &owner.session_id);
+            }
+            crate::daemon_protocol::Event::AdoptBackend {
+                id,
+                backend_session_id,
+                ..
+            }
+            | crate::daemon_protocol::Event::RebindBackend {
+                id,
+                backend_session_id,
+                ..
+            } => {
+                add_current(&mut keys, &protocol, id);
+                if !backend_session_id.is_empty() {
+                    keys.push(ResourceGateKey::BackendSession(backend_session_id.clone()));
+                }
+            }
+            crate::daemon_protocol::Event::ReapDead { dead_sessions } => {
+                for (owner, pane) in dead_sessions {
+                    add_current(&mut keys, &protocol, &owner.session_id);
+                    keys.push(ResourceGateKey::Pane(pane.clone()));
+                }
+            }
+            crate::daemon_protocol::Event::PruneStale { sessions } => {
+                for (owner, _) in sessions {
+                    add_current(&mut keys, &protocol, &owner.session_id);
+                }
+            }
+            crate::daemon_protocol::Event::IncomingWire { .. }
+            | crate::daemon_protocol::Event::Send { .. }
+            | crate::daemon_protocol::Event::MarkWorktreePresence { .. } => {}
+        }
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    async fn lock_event_resources(
+        &self,
+        event: &crate::daemon_protocol::Event,
+    ) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+        loop {
+            let keys = self.event_resource_keys(event).await;
+            let mut guards = Vec::with_capacity(keys.len());
+            for key in &keys {
+                guards.push(self.resource_gate(key.clone()).lock_owned().await);
+            }
+            if self.event_resource_keys(event).await == keys {
+                return guards;
+            }
+        }
+    }
+
+    pub(crate) async fn with_owned_pane_claim<F, Fut, T>(
+        &self,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        pane: &str,
+        action: F,
+    ) -> Option<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let gate = self.pane_resource_gate(pane);
+        let _resource = gate.lock().await;
+        let current = self
+            .protocol
+            .read()
+            .await
+            .sessions
+            .get(&owner.session_id)
+            .is_some_and(|session| {
+                session.owner() == *owner && session.pane.as_deref() == Some(pane)
+            });
+        if current { Some(action().await) } else { None }
+    }
+
+    pub(crate) async fn with_owned_pane_cleanup<F, Fut, T>(
+        &self,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        pane: &str,
+        action: F,
+    ) -> Option<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        self.with_allowed_pane_cleanup(std::slice::from_ref(owner), pane, action)
+            .await
+    }
+
+    pub(crate) async fn with_allowed_pane_cleanup<F, Fut, T>(
+        &self,
+        owners: &[crate::daemon_protocol::ResourceOwner],
+        pane: &str,
+        action: F,
+    ) -> Option<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let gate = self.pane_resource_gate(pane);
+        let _resource = gate.lock().await;
+        let allowed = {
+            let protocol = self.protocol.read().await;
+            let pane_conflict = protocol.sessions.values().any(|session| {
+                session.pane.as_deref() == Some(pane) && !owners.contains(&session.owner())
+            });
+            !pane_conflict
+        };
+        if allowed { Some(action().await) } else { None }
+    }
+
+    pub(crate) async fn with_owned_backend_cleanup<F, Fut, T>(
+        &self,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        backend_session_id: &str,
+        action: F,
+    ) -> Option<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let gate = self.backend_resource_gate(backend_session_id);
+        let _resource = gate.lock().await;
+        let allowed = {
+            let protocol = self.protocol.read().await;
+            let backend_conflict = protocol.sessions.values().any(|session| {
+                session.metadata.backend_session_id.as_deref() == Some(backend_session_id)
+                    && session.owner() != *owner
+            });
+            !backend_conflict
+        };
+        if allowed { Some(action().await) } else { None }
+    }
+
+    pub(crate) async fn with_owned_backend_claim<F, Fut, T>(
+        &self,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        backend_session_id: &str,
+        action: F,
+    ) -> Option<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let gate = self.backend_resource_gate(backend_session_id);
+        let _resource = gate.lock().await;
+        let current = self
+            .protocol
+            .read()
+            .await
+            .sessions
+            .get(&owner.session_id)
+            .is_some_and(|session| {
+                session.owner() == *owner
+                    && session.metadata.backend_session_id.as_deref() == Some(backend_session_id)
+            });
+        if current { Some(action().await) } else { None }
     }
 
     pub(crate) fn try_acquire_compact_in_progress(
@@ -856,6 +1165,102 @@ impl AppState {
         Box::pin(self._apply_and_execute(event))
     }
 
+    pub(crate) async fn apply_owned_event(
+        self: &Arc<Self>,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        event: crate::daemon_protocol::Event,
+    ) -> Vec<crate::daemon_protocol::Effect> {
+        self.apply_owned_event_if(owner, event, |_| true).await
+    }
+
+    pub(crate) async fn apply_owned_event_if<F>(
+        self: &Arc<Self>,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        event: crate::daemon_protocol::Event,
+        predicate: F,
+    ) -> Vec<crate::daemon_protocol::Effect>
+    where
+        F: FnOnce(&crate::daemon_protocol::SessionEntry) -> bool,
+    {
+        let resource_guards = self.lock_event_resources(&event).await;
+        let effects = {
+            let mut protocol = self.protocol.write().await;
+            if protocol
+                .sessions
+                .get(&owner.session_id)
+                .is_none_or(|session| session.owner() != *owner || !predicate(session))
+            {
+                return vec![];
+            }
+            protocol.apply(event)
+        };
+        drop(resource_guards);
+        self.execute_effects(&effects).await;
+        effects
+    }
+
+    pub async fn bind_backend_identity(
+        self: &Arc<Self>,
+        target_session_id: &str,
+        identity: &crate::backend::BackendSessionIdentity,
+        launch_credential: Option<&str>,
+        expected_incarnation: Option<crate::daemon_protocol::SessionIncarnation>,
+    ) -> crate::daemon_protocol::BackendIdentityBindResult {
+        let resource_event = crate::daemon_protocol::Event::AdoptBackend {
+            id: target_session_id.to_string(),
+            backend: identity.backend.clone(),
+            backend_session_id: identity.session_id.clone(),
+            expected_backend_session_id: None,
+            expected_session_start_credential: launch_credential.map(String::from),
+        };
+        let resource_guards = self.lock_event_resources(&resource_event).await;
+        let result = {
+            let mut protocol = self.protocol.write().await;
+            if expected_incarnation.is_some_and(|expected| {
+                protocol
+                    .sessions
+                    .get(target_session_id)
+                    .is_none_or(|session| session.metadata.session_incarnation != expected)
+            }) {
+                return crate::daemon_protocol::BackendIdentityBindResult {
+                    outcome: crate::daemon_protocol::BackendIdentityBindOutcome::TargetNotFound,
+                    effects: vec![],
+                };
+            }
+            protocol.bind_backend_identity(target_session_id, identity, launch_credential)
+        };
+        drop(resource_guards);
+        if !result.effects.is_empty() {
+            self.execute_effects(&result.effects).await;
+        }
+        result
+    }
+
+    pub(crate) async fn with_backend_binding_transition<F, T>(
+        &self,
+        target_session_id: &str,
+        target_backend_session_id: Option<&str>,
+        transition: F,
+    ) -> T
+    where
+        F: FnOnce(&mut crate::daemon_protocol::DaemonState) -> T,
+    {
+        let resource_event = crate::daemon_protocol::Event::AdoptBackend {
+            id: target_session_id.to_string(),
+            backend: String::new(),
+            backend_session_id: target_backend_session_id.unwrap_or_default().to_string(),
+            expected_backend_session_id: None,
+            expected_session_start_credential: None,
+        };
+        let resource_guards = self.lock_event_resources(&resource_event).await;
+        let result = {
+            let mut protocol = self.protocol.write().await;
+            transition(&mut protocol)
+        };
+        drop(resource_guards);
+        result
+    }
+
     /// Atomically stage a fresh managed launch and publish its effects.
     ///
     /// Unlike the generic event API, this exposes whether the authority
@@ -889,6 +1294,13 @@ impl AppState {
         session_start_credential: Option<String>,
         expected_repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
     ) -> crate::daemon_protocol::StageFreshLaunchOutcome {
+        let resource_event = crate::daemon_protocol::Event::StageFreshLaunch {
+            id: id.clone(),
+            backend: backend.clone(),
+            session_start_credential: session_start_credential.clone(),
+            expected_repair_reservation: expected_repair_reservation.clone(),
+        };
+        let resource_guards = self.lock_event_resources(&resource_event).await;
         let (outcome, effects) = {
             let mut state = self.protocol.write().await;
             let before = state.clone();
@@ -917,6 +1329,7 @@ impl AppState {
                 .collect();
             (result.outcome, effects)
         };
+        drop(resource_guards);
         self.execute_effects(&effects).await;
         outcome
     }
@@ -952,6 +1365,8 @@ impl AppState {
         pane_owner: crate::daemon_protocol::ResourceOwner,
         pane: String,
     ) -> anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome> {
+        let pane_gate = self.pane_resource_gate(&pane);
+        let _resource = pane_gate.lock().await;
         let mut proto = self.protocol.write().await;
         let before = proto.clone();
         let outcome = proto.record_inert_start_pane(lease_owner, pane_owner, pane);
@@ -1020,6 +1435,12 @@ impl AppState {
         pane: Option<String>,
         metadata: crate::daemon_protocol::SessionMeta,
     ) -> anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome> {
+        let resource_event = crate::daemon_protocol::Event::Register {
+            id: owner.session_id.clone(),
+            pane: pane.clone(),
+            metadata: metadata.clone(),
+        };
+        let resource_guards = self.lock_event_resources(&resource_event).await;
         let (outcome, effects) = {
             let mut proto = self.protocol.write().await;
             let before = proto.clone();
@@ -1037,6 +1458,7 @@ impl AppState {
                 .collect();
             (result.outcome, effects)
         };
+        drop(resource_guards);
         self.execute_launch_registration_effects(&effects).await;
         Ok(outcome)
     }
@@ -1061,45 +1483,16 @@ impl AppState {
                 Effect::BroadcastSessionList => {
                     crate::transport::broadcast_local_sessions(self).await;
                 }
-                Effect::SetTmuxVar { pane, name, value } => {
-                    let pane = pane.clone();
-                    let name = name.clone();
-                    let value = value.clone();
-                    tokio::task::spawn_blocking(move || {
-                        crate::tmux_var::set(&pane, &name, &value);
-                    });
+                Effect::SetTmuxVar {
+                    owner,
+                    pane,
+                    name,
+                    value,
+                } => {
+                    self.set_owned_tmux_var(owner, pane, name, value).await;
                 }
-                Effect::ClearTmuxVar { pane, name } => {
-                    let pane = pane.clone();
-                    let name = name.clone();
-                    tokio::task::spawn_blocking(move || {
-                        crate::tmux_var::clear(&pane, &name);
-                    });
-                }
-                Effect::ClearOwnedTmuxVar { owner, pane, name } => {
-                    let protocol = self.protocol.read().await;
-                    if protocol.sessions.contains_key(&owner.session_id)
-                        || protocol
-                            .sessions
-                            .values()
-                            .any(|session| session.pane.as_deref() == Some(pane.as_str()))
-                    {
-                        continue;
-                    }
-                    let owner = owner.clone();
-                    let pane = pane.clone();
-                    let name = name.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if crate::tmux::inspect_pane_owner(&pane)
-                            .ok()
-                            .flatten()
-                            .as_ref()
-                            == Some(&owner)
-                        {
-                            crate::tmux_var::clear(&pane, &name);
-                        }
-                    })
-                    .await;
+                Effect::ClearTmuxVar { owner, pane, name } => {
+                    self.clear_owned_tmux_var(owner, pane, name).await;
                 }
                 Effect::HoldAutoregister { pane } => {
                     self.autoregister_suppressed_panes
@@ -1111,35 +1504,8 @@ impl AppState {
                                 + std::time::Duration::from_secs(AUTOREGISTER_REMOVE_GRACE_SECS),
                         );
                 }
-                Effect::EnableAutoRename { pane } => {
-                    let pane = pane.clone();
-                    tokio::task::spawn_blocking(move || {
-                        crate::tmux::enable_automatic_rename(&pane);
-                    });
-                }
-                Effect::EnableOwnedAutoRename { owner, pane } => {
-                    let protocol = self.protocol.read().await;
-                    if protocol.sessions.contains_key(&owner.session_id)
-                        || protocol
-                            .sessions
-                            .values()
-                            .any(|session| session.pane.as_deref() == Some(pane.as_str()))
-                    {
-                        continue;
-                    }
-                    let owner = owner.clone();
-                    let pane = pane.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if crate::tmux::inspect_pane_owner(&pane)
-                            .ok()
-                            .flatten()
-                            .as_ref()
-                            == Some(&owner)
-                        {
-                            crate::tmux::enable_automatic_rename(&pane);
-                        }
-                    })
-                    .await;
+                Effect::EnableAutoRename { owner, pane } => {
+                    self.enable_owned_auto_rename(owner, pane).await;
                 }
                 Effect::SpawnAgent { owner, pane } => {
                     self.spawn_session_agent(owner, pane).await;
@@ -1159,15 +1525,8 @@ impl AppState {
                         .collect::<Vec<_>>();
                     protocol.clear_orphaned_replies(&removed_ids);
                 }
-                Effect::ProvisionalRollbackOk { pane } => {
-                    if !cfg!(test) {
-                        let pane = pane.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let _ = std::process::Command::new("tmux")
-                                .args(["kill-pane", "-t", &pane])
-                                .status();
-                        });
-                    }
+                Effect::ProvisionalRollbackOk { owner, pane } => {
+                    self.kill_owned_pane(owner, pane).await;
                 }
                 Effect::Log { level, message } => match level {
                     crate::daemon_protocol::LogLevel::Debug => tracing::debug!("{message}"),
@@ -1193,6 +1552,13 @@ impl AppState {
         pane: Option<String>,
         metadata: crate::daemon_protocol::SessionMeta,
     ) -> anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome> {
+        let event = crate::daemon_protocol::Event::RefreshLaunchMetadata {
+            id: owner.session_id.clone(),
+            expected_incarnation: owner.incarnation,
+            pane,
+            metadata,
+        };
+        let resource_guards = self.lock_event_resources(&event).await;
         let effects = {
             let mut proto = self.protocol.write().await;
             let Some(current) = proto.sessions.get(&owner.session_id) else {
@@ -1206,12 +1572,7 @@ impl AppState {
             }
 
             let before = proto.clone();
-            let effects = proto.apply(crate::daemon_protocol::Event::RefreshLaunchMetadata {
-                id: owner.session_id.clone(),
-                expected_incarnation: owner.incarnation,
-                pane,
-                metadata,
-            });
+            let effects = proto.apply(event);
             if let Err(error) = self.persist_protocol_state(&proto) {
                 *proto = before;
                 return Err(error);
@@ -1221,6 +1582,7 @@ impl AppState {
                 .filter(|effect| !matches!(effect, crate::daemon_protocol::Effect::Persist))
                 .collect::<Vec<_>>()
         };
+        drop(resource_guards);
         self.execute_launch_registration_effects(&effects).await;
         Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied)
     }
@@ -1248,6 +1610,15 @@ impl AppState {
         previous: Option<crate::daemon_protocol::SessionEntry>,
         provisional_pane: Option<&str>,
     ) -> anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome> {
+        let event = crate::daemon_protocol::Event::RollbackFreshLaunch {
+            id: owner.session_id.clone(),
+            pane: pane.map(String::from),
+            credential: credential.map(String::from),
+            staged_incarnation: owner.incarnation,
+            previous,
+            provisional_pane: provisional_pane.map(String::from),
+        };
+        let resource_guards = self.lock_event_resources(&event).await;
         let effects = {
             let mut proto = self.protocol.write().await;
             let Some(current) = proto.sessions.get(&owner.session_id) else {
@@ -1264,14 +1635,7 @@ impl AppState {
             }
 
             let before = proto.clone();
-            let effects = proto.apply(crate::daemon_protocol::Event::RollbackFreshLaunch {
-                id: owner.session_id.clone(),
-                pane: pane.map(String::from),
-                credential: credential.map(String::from),
-                staged_incarnation: owner.incarnation,
-                previous,
-                provisional_pane: provisional_pane.map(String::from),
-            });
+            let effects = proto.apply(event);
             if let Some(lease) = proto.lifecycle_leases.get_mut(&owner.session_id)
                 && lease.inert_pane.as_deref() == provisional_pane
                 && lease.inert_pane_owner.as_ref() == Some(owner)
@@ -1294,6 +1658,7 @@ impl AppState {
                 })
                 .collect::<Vec<_>>()
         };
+        drop(resource_guards);
         self.execute_launch_registration_effects(&effects).await;
         Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied)
     }
@@ -1320,6 +1685,7 @@ impl AppState {
         self: &Arc<Self>,
         event: crate::daemon_protocol::Event,
     ) -> Vec<crate::daemon_protocol::Effect> {
+        let resource_guards = self.lock_event_resources(&event).await;
         let (effects, rollback) = {
             let mut state = self.protocol.write().await;
             let mut rollback = FailedEffectSendRollback::capture_for_event(&state, &event);
@@ -1330,6 +1696,7 @@ impl AppState {
             }
             (effects, rollback)
         };
+        drop(resource_guards);
 
         let delivery_failure = self.execute_effects(&effects).await;
 
@@ -1468,49 +1835,16 @@ impl AppState {
                         });
                     }
                 },
-                Effect::SetTmuxVar { pane, name, value } => {
-                    let p = pane.clone();
-                    let n = name.clone();
-                    let v = value.clone();
-                    // FIXME: fire-and-forget — this spawn_blocking is NOT
-                    // awaited, so a fast caller (e.g. `ouija clear-reminder`
-                    // from the newly spawned session) can race against the
-                    // `@ouija_session` pane-var write and fall through to the
-                    // slower API lookup. The OUIJA_SESSION_ID env var set by
-                    // `tmux::pane_env_args` at spawn time is the primary
-                    // signal and masks this race in practice; do not rely on
-                    // the tmux pane var as the sole session-id source.
-                    tokio::task::spawn_blocking(move || crate::tmux_var::set(&p, &n, &v));
+                Effect::SetTmuxVar {
+                    owner,
+                    pane,
+                    name,
+                    value,
+                } => {
+                    self.set_owned_tmux_var(owner, pane, name, value).await;
                 }
-                Effect::ClearTmuxVar { pane, name } => {
-                    let p = pane.clone();
-                    let n = name.clone();
-                    tokio::task::spawn_blocking(move || crate::tmux_var::clear(&p, &n));
-                }
-                Effect::ClearOwnedTmuxVar { owner, pane, name } => {
-                    let protocol = self.protocol.read().await;
-                    if protocol.sessions.contains_key(&owner.session_id)
-                        || protocol
-                            .sessions
-                            .values()
-                            .any(|session| session.pane.as_deref() == Some(pane.as_str()))
-                    {
-                        continue;
-                    }
-                    let owner = owner.clone();
-                    let pane = pane.clone();
-                    let name = name.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if crate::tmux::inspect_pane_owner(&pane)
-                            .ok()
-                            .flatten()
-                            .as_ref()
-                            == Some(&owner)
-                        {
-                            crate::tmux_var::clear(&pane, &name);
-                        }
-                    })
-                    .await;
+                Effect::ClearTmuxVar { owner, pane, name } => {
+                    self.clear_owned_tmux_var(owner, pane, name).await;
                 }
                 Effect::HoldAutoregister { pane } => {
                     self.autoregister_suppressed_panes
@@ -1522,48 +1856,16 @@ impl AppState {
                                 + std::time::Duration::from_secs(AUTOREGISTER_REMOVE_GRACE_SECS),
                         );
                 }
-                Effect::ProvisionalRollbackOk { pane } => {
-                    if !cfg!(test) {
-                        let pane = pane.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let _ = std::process::Command::new("tmux")
-                                .args(["kill-pane", "-t", &pane])
-                                .status();
-                        });
-                    }
+                Effect::ProvisionalRollbackOk { owner, pane } => {
+                    self.kill_owned_pane(owner, pane).await;
                 }
                 Effect::RenameWindow { pane, name } => {
                     let p = pane.clone();
                     let n = name.clone();
                     tokio::task::spawn_blocking(move || crate::tmux::rename_window(&p, &n));
                 }
-                Effect::EnableAutoRename { pane } => {
-                    let p = pane.clone();
-                    tokio::task::spawn_blocking(move || crate::tmux::enable_automatic_rename(&p));
-                }
-                Effect::EnableOwnedAutoRename { owner, pane } => {
-                    let protocol = self.protocol.read().await;
-                    if protocol.sessions.contains_key(&owner.session_id)
-                        || protocol
-                            .sessions
-                            .values()
-                            .any(|session| session.pane.as_deref() == Some(pane.as_str()))
-                    {
-                        continue;
-                    }
-                    let owner = owner.clone();
-                    let pane = pane.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if crate::tmux::inspect_pane_owner(&pane)
-                            .ok()
-                            .flatten()
-                            .as_ref()
-                            == Some(&owner)
-                        {
-                            crate::tmux::enable_automatic_rename(&pane);
-                        }
-                    })
-                    .await;
+                Effect::EnableAutoRename { owner, pane } => {
+                    self.enable_owned_auto_rename(owner, pane).await;
                 }
                 Effect::SpawnAgent { owner, pane } => {
                     self.spawn_session_agent(owner, pane).await;
@@ -2289,6 +2591,125 @@ impl AppState {
         }
     }
 
+    async fn set_owned_tmux_var(
+        &self,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        pane: &str,
+        name: &str,
+        value: &str,
+    ) {
+        let owner = owner.clone();
+        let pane = pane.to_string();
+        let name = name.to_string();
+        let value = value.to_string();
+        let pane_for_guard = pane.clone();
+        let owner_for_guard = owner.clone();
+        let _ = self
+            .with_owned_pane_claim(&owner_for_guard, &pane_for_guard, move || async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    let owns_process = crate::tmux::inspect_pane_owner(&pane)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|observed| {
+                            crate::tmux::physical_owner_matches(&observed, &owner)
+                        });
+                    if owns_process {
+                        crate::tmux_var::set(&pane, &name, &value);
+                    }
+                })
+                .await;
+            })
+            .await;
+    }
+
+    async fn clear_owned_tmux_var(
+        &self,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        pane: &str,
+        name: &str,
+    ) {
+        let owner = owner.clone();
+        let pane = pane.to_string();
+        let name = name.to_string();
+        let pane_for_guard = pane.clone();
+        let owner_for_guard = owner.clone();
+        let _ = self
+            .with_owned_pane_cleanup(&owner_for_guard, &pane_for_guard, move || async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    if crate::tmux::inspect_pane_owner(&pane)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|observed| {
+                            crate::tmux::physical_owner_matches(&observed, &owner)
+                        })
+                    {
+                        crate::tmux_var::clear(&pane, &name);
+                    }
+                })
+                .await;
+            })
+            .await;
+    }
+
+    async fn enable_owned_auto_rename(
+        &self,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        pane: &str,
+    ) {
+        let owner = owner.clone();
+        let pane = pane.to_string();
+        let pane_for_guard = pane.clone();
+        let owner_for_guard = owner.clone();
+        let _ = self
+            .with_owned_pane_cleanup(&owner_for_guard, &pane_for_guard, move || async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    if crate::tmux::inspect_pane_owner(&pane)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|observed| {
+                            crate::tmux::physical_owner_matches(&observed, &owner)
+                        })
+                    {
+                        crate::tmux::enable_automatic_rename(&pane);
+                    }
+                })
+                .await;
+            })
+            .await;
+    }
+
+    pub(crate) async fn kill_owned_pane(
+        &self,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        pane: &str,
+    ) {
+        if cfg!(test) {
+            return;
+        }
+        let owner = owner.clone();
+        let pane = pane.to_string();
+        let pane_for_guard = pane.clone();
+        let owner_for_guard = owner.clone();
+        let _ = self
+            .with_owned_pane_cleanup(&owner_for_guard, &pane_for_guard, move || async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    if crate::tmux::inspect_pane_owner(&pane)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|observed| {
+                            crate::tmux::physical_owner_matches(&observed, &owner)
+                        })
+                    {
+                        let _ = std::process::Command::new("tmux")
+                            .args(["kill-pane", "-t", &pane])
+                            .status();
+                    }
+                })
+                .await;
+            })
+            .await;
+    }
+
     /// Atomically set a pending compact continuation only if the slot is empty (RPC).
     /// Returns true if acquired, false if a continuation is already pending or the
     /// session has no agent. Used to reject concurrent compact requests that would
@@ -2948,6 +3369,275 @@ impl FailedEffectSendRollback {
 pub(crate) mod tests {
     use super::*;
     use crate::daemon_protocol::Origin;
+
+    #[tokio::test]
+    async fn queued_old_pane_cleanup_skips_same_pane_replacement() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%99".into()),
+                metadata: Default::default(),
+            })
+            .await;
+        let old_owner = state.protocol.read().await.sessions["worker"].owner();
+        let gate = state.pane_resource_gate("%99");
+        let held = gate.lock().await;
+        let touched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let queued = std::sync::Arc::new(tokio::sync::Notify::new());
+        let cleanup_state = state.clone();
+        let cleanup_owner = old_owner.clone();
+        let cleanup_touched = touched.clone();
+        let cleanup_queued = queued.clone();
+        let cleanup = tokio::spawn(async move {
+            cleanup_queued.notify_one();
+            cleanup_state
+                .with_owned_pane_cleanup(&cleanup_owner, "%99", || async move {
+                    cleanup_touched.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+                .await
+        });
+        queued.notified().await;
+
+        {
+            let mut protocol = state.protocol.write().await;
+            protocol.apply(crate::daemon_protocol::Event::Remove {
+                id: "worker".into(),
+                keep_worktree: true,
+            });
+            protocol.apply(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%99".into()),
+                metadata: Default::default(),
+            });
+            assert_ne!(protocol.sessions["worker"].owner(), old_owner);
+        }
+        drop(held);
+
+        assert_eq!(cleanup.await.expect("cleanup task failed"), None);
+        assert!(
+            !touched.load(std::sync::atomic::Ordering::SeqCst),
+            "stale cleanup must not touch a pane now claimed by a replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_old_backend_cleanup_skips_replacement_binding() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%99".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_shared".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let old_owner = state.protocol.read().await.sessions["worker"].owner();
+        let gate = state.backend_resource_gate("ses_shared");
+        let held = gate.lock().await;
+        let touched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let queued = std::sync::Arc::new(tokio::sync::Notify::new());
+        let cleanup_state = state.clone();
+        let cleanup_owner = old_owner.clone();
+        let cleanup_touched = touched.clone();
+        let cleanup_queued = queued.clone();
+        let cleanup = tokio::spawn(async move {
+            cleanup_queued.notify_one();
+            cleanup_state
+                .with_owned_backend_cleanup(&cleanup_owner, "ses_shared", || async move {
+                    cleanup_touched.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+                .await
+        });
+        queued.notified().await;
+
+        {
+            let mut protocol = state.protocol.write().await;
+            protocol.apply(crate::daemon_protocol::Event::Remove {
+                id: "worker".into(),
+                keep_worktree: true,
+            });
+            protocol.apply(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%99".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_shared".into()),
+                    ..Default::default()
+                },
+            });
+            assert_ne!(protocol.sessions["worker"].owner(), old_owner);
+        }
+        drop(held);
+
+        assert_eq!(cleanup.await.expect("cleanup task failed"), None);
+        assert!(
+            !touched.load(std::sync::atomic::Ordering::SeqCst),
+            "stale cleanup must not delete a backend session rebound to a replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_pane_cleanup_serializes_replacement_transition() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%99".into()),
+                metadata: Default::default(),
+            })
+            .await;
+        let old_owner = state.protocol.read().await.sessions["worker"].owner();
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let cleanup_state = state.clone();
+        let cleanup_owner = old_owner.clone();
+        let cleanup_entered = entered.clone();
+        let cleanup = tokio::spawn(async move {
+            cleanup_state
+                .with_owned_pane_cleanup(&cleanup_owner, "%99", || async move {
+                    cleanup_entered.notify_one();
+                    let _ = release_rx.await;
+                })
+                .await
+        });
+        entered.notified().await;
+
+        let attempted = std::sync::Arc::new(tokio::sync::Notify::new());
+        let replacement_state = state.clone();
+        let replacement_attempted = attempted.clone();
+        let replacement = tokio::spawn(async move {
+            replacement_attempted.notify_one();
+            replacement_state
+                .apply_and_execute(crate::daemon_protocol::Event::Remove {
+                    id: "worker".into(),
+                    keep_worktree: true,
+                })
+                .await;
+            replacement_state
+                .apply_and_execute(crate::daemon_protocol::Event::Register {
+                    id: "worker".into(),
+                    pane: Some("%99".into()),
+                    metadata: Default::default(),
+                })
+                .await;
+            replacement_state.protocol.read().await.sessions["worker"].owner()
+        });
+        attempted.notified().await;
+        assert_eq!(
+            state.protocol.read().await.sessions["worker"].owner(),
+            old_owner,
+            "replacement must not publish ownership while old cleanup holds the pane gate"
+        );
+
+        release_tx.send(()).expect("release cleanup");
+        assert_eq!(cleanup.await.expect("cleanup task failed"), Some(()));
+        assert_ne!(
+            replacement.await.expect("replacement task failed"),
+            old_owner
+        );
+    }
+
+    #[tokio::test]
+    async fn active_backend_cleanup_serializes_identity_bind() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%99".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    session_start_credential: Some("proof".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["worker"].owner();
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let cleanup_state = state.clone();
+        let cleanup_owner = owner.clone();
+        let cleanup_entered = entered.clone();
+        let cleanup = tokio::spawn(async move {
+            cleanup_state
+                .with_owned_backend_cleanup(&cleanup_owner, "ses_shared", || async move {
+                    cleanup_entered.notify_one();
+                    let _ = release_rx.await;
+                })
+                .await
+        });
+        entered.notified().await;
+
+        let attempted = std::sync::Arc::new(tokio::sync::Notify::new());
+        let bind_state = state.clone();
+        let bind_attempted = attempted.clone();
+        let bind = tokio::spawn(async move {
+            bind_attempted.notify_one();
+            bind_state
+                .bind_backend_identity(
+                    "worker",
+                    &crate::backend::BackendSessionIdentity {
+                        backend: "opencode".into(),
+                        session_id: "ses_shared".into(),
+                    },
+                    Some("proof"),
+                    Some(owner.incarnation),
+                )
+                .await
+        });
+        attempted.notified().await;
+        assert!(
+            state.protocol.read().await.sessions["worker"]
+                .metadata
+                .backend_session_id
+                .is_none(),
+            "backend bind must not publish while cleanup holds the backend gate"
+        );
+
+        release_tx.send(()).expect("release backend cleanup");
+        assert_eq!(cleanup.await.expect("cleanup task failed"), Some(()));
+        assert!(matches!(
+            bind.await.expect("bind task failed").outcome,
+            crate::daemon_protocol::BackendIdentityBindOutcome::Bound { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn renamed_session_retains_physical_pane_cleanup_authority() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "before".into(),
+                pane: Some("%99".into()),
+                metadata: Default::default(),
+            })
+            .await;
+        let immutable_process_owner = state.protocol.read().await.sessions["before"].owner();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Rename {
+                old_id: "before".into(),
+                new_id: "after".into(),
+            })
+            .await;
+        let renamed_owner = state.protocol.read().await.sessions["after"].owner();
+        let touched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_touched = touched.clone();
+
+        let result = state
+            .with_owned_pane_cleanup(&renamed_owner, "%99", || async move {
+                cleanup_touched.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await;
+
+        assert_eq!(result, Some(()));
+        assert!(touched.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(crate::tmux::physical_owner_matches(
+            &immutable_process_owner,
+            &renamed_owner
+        ));
+    }
 
     // --- Pure functions ---
 

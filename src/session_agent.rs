@@ -472,9 +472,9 @@ impl Actor for SessionAgent {
                             "<ouija-status type=\"reminder\" clearing_id=\"{clearing_id}\">{reminder_body}</ouija-status>"
                         );
                         if self.is_current(state).await {
-                            let _ = crate::tmux::locked_inject(
+                            let _ = crate::tmux::locked_inject_owned(
                                 &self.app_state,
-                                &state.owner.session_id,
+                                &state.owner,
                                 &state.pane,
                                 &wrapped,
                                 vim_mode,
@@ -498,9 +498,9 @@ impl Actor for SessionAgent {
                                 "<ouija-status type=\"reminder\" clearing_id=\"{clearing_id}\">Pending reply owed: msg #{} from {}</ouija-status>",
                                 p.msg_id, p.from
                             );
-                            let _ = crate::tmux::locked_inject(
+                            let _ = crate::tmux::locked_inject_owned(
                                 &self.app_state,
-                                &state.owner.session_id,
+                                &state.owner,
                                 &state.pane,
                                 &msg,
                                 vim_mode,
@@ -639,9 +639,9 @@ impl SessionAgent {
                 "<ouija-status type=\"reminder\">You have an unanswered question from {} (msg {}) — reply using: ouija reply {} {} \"your answer\"</ouija-status>",
                 p.from, p.msg_id, p.from, p.msg_id
             );
-            let _ = crate::tmux::locked_inject(
+            let _ = crate::tmux::locked_inject_owned(
                 &self.app_state,
-                &state.owner.session_id,
+                &state.owner,
                 &state.pane,
                 &reminder,
                 vim_mode,

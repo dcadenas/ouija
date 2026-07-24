@@ -583,32 +583,43 @@ async fn inject_alive_session_prompt(
 }
 
 async fn remove_scheduled_pane_for_owners(
+    state: &SharedState,
     pane: &str,
     owners: Vec<crate::daemon_protocol::ResourceOwner>,
 ) -> anyhow::Result<()> {
     let pane = pane.to_string();
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let live_owner = crate::tmux::inspect_pane_owner(&pane)?;
-        if !live_owner
-            .as_ref()
-            .is_some_and(|owner| owners.contains(owner))
-        {
-            return Ok(());
-        }
-        let status = std::process::Command::new("tmux")
-            .args(["kill-pane", "-t", &pane])
-            .status()?;
-        let remaining_owner = crate::tmux::inspect_pane_owner(&pane)?;
-        if !status.success()
-            && remaining_owner
-                .as_ref()
-                .is_some_and(|owner| owners.contains(owner))
-        {
-            anyhow::bail!("failed to remove exact scheduled pane {pane}");
-        }
-        Ok(())
-    })
-    .await?
+    let pane_for_guard = pane.clone();
+    let owners_for_guard = owners.clone();
+    state
+        .with_allowed_pane_cleanup(&owners_for_guard, &pane_for_guard, move || async move {
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let live_owner = crate::tmux::inspect_pane_owner(&pane)?;
+                if !live_owner.as_ref().is_some_and(|owner| {
+                    owners
+                        .iter()
+                        .any(|expected| crate::tmux::physical_owner_matches(owner, expected))
+                }) {
+                    return Ok(());
+                }
+                let status = std::process::Command::new("tmux")
+                    .args(["kill-pane", "-t", &pane])
+                    .status()?;
+                let remaining_owner = crate::tmux::inspect_pane_owner(&pane)?;
+                if !status.success()
+                    && remaining_owner.as_ref().is_some_and(|owner| {
+                        owners
+                            .iter()
+                            .any(|expected| crate::tmux::physical_owner_matches(owner, expected))
+                    })
+                {
+                    anyhow::bail!("failed to remove exact scheduled pane {pane}");
+                }
+                Ok(())
+            })
+            .await?
+        })
+        .await
+        .unwrap_or(Ok(()))
 }
 
 async fn rollback_reserved_scheduled_pane(
@@ -617,7 +628,7 @@ async fn rollback_reserved_scheduled_pane(
     pane: &str,
     credential: Option<&str>,
 ) -> anyhow::Result<()> {
-    remove_scheduled_pane_for_owners(pane, vec![owner.clone()]).await?;
+    remove_scheduled_pane_for_owners(state, pane, vec![owner.clone()]).await?;
     let outcome = state
         .rollback_reserved_start(owner, pane, credential)
         .await?;
@@ -793,31 +804,58 @@ async fn respawn_and_inject(
             .as_ref()
             .map(|session| session.metadata.session_incarnation)
     });
-    let respawn_result = tokio::task::spawn_blocking({
-        let pane_id = pane_id.clone();
-        let pane_credential = session_start_credential.clone();
-        move || -> anyhow::Result<()> {
-            // See `pane_env_args` for why OUIJA_SESSION_ID must ride along.
-            let env_args = crate::tmux::pane_env_args(
-                &session_name,
-                pane_credential.as_deref(),
-                pane_incarnation,
-            );
-            let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
-            args.extend(env_args.iter().map(String::as_str));
-            args.extend_from_slice(&["-t", &pane_id, &full_cmd]);
-            crate::tmux::configure_managed_pane(&pane_id);
-            let output = std::process::Command::new("tmux").args(&args).output()?;
-            if !output.status.success() {
-                anyhow::bail!(
-                    "respawn-pane failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
+    let respawn_owner = state
+        .protocol
+        .read()
+        .await
+        .sessions
+        .get(task.session_name())
+        .filter(|session| session.pane.as_deref() == Some(pane_id.as_str()))
+        .map(crate::daemon_protocol::SessionEntry::owner);
+    let respawn_session_name = session_name.clone();
+    let respawn_credential = session_start_credential.clone();
+    let respawn_command = full_cmd.clone();
+    let respawn_pane_id = pane_id.clone();
+    let respawn_operation = move || {
+        tokio::task::spawn_blocking({
+            let pane_id = respawn_pane_id;
+            let pane_credential = respawn_credential;
+            move || -> anyhow::Result<()> {
+                // See `pane_env_args` for why OUIJA_SESSION_ID must ride along.
+                let env_args = crate::tmux::pane_env_args(
+                    &respawn_session_name,
+                    pane_credential.as_deref(),
+                    pane_incarnation,
                 );
+                let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
+                args.extend(env_args.iter().map(String::as_str));
+                args.extend_from_slice(&["-t", &pane_id, &respawn_command]);
+                crate::tmux::configure_managed_pane(&pane_id);
+                let output = std::process::Command::new("tmux").args(&args).output()?;
+                if !output.status.success() {
+                    anyhow::bail!(
+                        "respawn-pane failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                Ok(())
             }
-            Ok(())
-        }
-    })
-    .await;
+        })
+    };
+    let respawn_result = if let Some(owner) = respawn_owner {
+        state
+            .with_owned_pane_claim(&owner, pane, respawn_operation)
+            .await
+            .unwrap_or_else(|| {
+                Ok(Err(anyhow::anyhow!(
+                    "scheduled pane ownership changed before respawn"
+                )))
+            })
+    } else {
+        Ok(Err(anyhow::anyhow!(
+            "scheduled pane owner missing before respawn"
+        )))
+    };
 
     match respawn_result {
         Ok(Ok(())) => {}
@@ -860,26 +898,27 @@ async fn respawn_and_inject(
     }
 
     // Stamp bootstrap metadata and clear backend_session_id since we started fresh
-    {
-        let mut proto = state.protocol.write().await;
-        if let Some(s) = proto.sessions.get_mut(task.session_name()) {
-            if s.metadata.prompt.is_none() {
-                s.metadata.prompt = task.prompt.clone();
+    state
+        .with_backend_binding_transition(task.session_name(), None, |proto| {
+            if let Some(s) = proto.sessions.get_mut(task.session_name()) {
+                if s.metadata.prompt.is_none() {
+                    s.metadata.prompt = task.prompt.clone();
+                }
+                if s.metadata.reminder.is_none() {
+                    s.metadata.reminder = task.reminder.clone();
+                }
+                if s.metadata.on_fire.is_none() {
+                    s.metadata.on_fire = Some(task.on_fire.clone());
+                }
+                // Codex cleared and credentialed this slot before respawn. Its
+                // SessionStart hook may already have atomically bound the new
+                // thread ID, so do not clobber that result here.
+                if session_start_credential.is_none() {
+                    s.metadata.backend_session_id = None;
+                }
             }
-            if s.metadata.reminder.is_none() {
-                s.metadata.reminder = task.reminder.clone();
-            }
-            if s.metadata.on_fire.is_none() {
-                s.metadata.on_fire = Some(task.on_fire.clone());
-            }
-            // Codex cleared and credentialed this slot before respawn. Its
-            // SessionStart hook may already have atomically bound the new
-            // thread ID, so do not clobber that result here.
-            if session_start_credential.is_none() {
-                s.metadata.backend_session_id = None;
-            }
-        }
-    }
+        })
+        .await;
 
     // Wait for the backend process to start, then inject
     let poll_pane = pane_id.clone();
@@ -1177,7 +1216,7 @@ async fn revive_and_inject(
             Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
             Ok(outcome) => {
                 let cleanup =
-                    remove_scheduled_pane_for_owners(&new_pane, vec![owner.clone()]).await;
+                    remove_scheduled_pane_for_owners(state, &new_pane, vec![owner.clone()]).await;
                 if cleanup.is_ok() {
                     let _ = state.abort_lifecycle(owner).await;
                 }
@@ -1191,7 +1230,7 @@ async fn revive_and_inject(
             }
             Err(error) => {
                 let cleanup =
-                    remove_scheduled_pane_for_owners(&new_pane, vec![owner.clone()]).await;
+                    remove_scheduled_pane_for_owners(state, &new_pane, vec![owner.clone()]).await;
                 if cleanup.is_ok() {
                     let _ = state.abort_lifecycle(owner).await;
                 }
@@ -1213,7 +1252,7 @@ async fn revive_and_inject(
             Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
             Ok(outcome) => {
                 let cleanup =
-                    remove_scheduled_pane_for_owners(&new_pane, vec![owner.clone()]).await;
+                    remove_scheduled_pane_for_owners(state, &new_pane, vec![owner.clone()]).await;
                 if cleanup.is_ok() {
                     let _ = state.abort_lifecycle(owner).await;
                 }
@@ -1227,7 +1266,7 @@ async fn revive_and_inject(
             }
             Err(error) => {
                 let cleanup =
-                    remove_scheduled_pane_for_owners(&new_pane, vec![owner.clone()]).await;
+                    remove_scheduled_pane_for_owners(state, &new_pane, vec![owner.clone()]).await;
                 if cleanup.is_ok() {
                     let _ = state.abort_lifecycle(owner).await;
                 }
@@ -1265,7 +1304,7 @@ async fn revive_and_inject(
     };
     let Some(registered_incarnation) = registered_incarnation else {
         if let Some(initial_owner) = initial_pane_owner.as_ref() {
-            remove_scheduled_pane_for_owners(&new_pane, vec![initial_owner.clone()]).await?;
+            remove_scheduled_pane_for_owners(state, &new_pane, vec![initial_owner.clone()]).await?;
         }
         if let Some(owner) = reserved_owner.as_ref() {
             let _ = state.abort_lifecycle(owner).await;
@@ -1311,39 +1350,48 @@ async fn revive_and_inject(
     let pane_for_environment = new_pane.clone();
     let session_for_environment = task.session_name().to_string();
     let credential_for_environment = session_start_credential.clone();
-    let environment_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let env_args = crate::tmux::pane_env_args(
-            &session_for_environment,
-            credential_for_environment.as_deref(),
-            Some(registered_incarnation),
-        );
-        let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
-        args.extend(env_args.iter().map(String::as_str));
-        args.extend_from_slice(&["-t", &pane_for_environment]);
-        let output = std::process::Command::new("tmux").args(&args).output()?;
-        if !output.status.success() {
-            anyhow::bail!(
-                "scheduled pane environment respawn failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+    let registered_owner = crate::daemon_protocol::ResourceOwner {
+        session_id: task.session_name().to_string(),
+        incarnation: registered_incarnation,
+    };
+    let environment_operation = move || {
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let env_args = crate::tmux::pane_env_args(
+                &session_for_environment,
+                credential_for_environment.as_deref(),
+                Some(registered_incarnation),
             );
-        }
-        Ok(())
-    })
-    .await;
+            let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
+            args.extend(env_args.iter().map(String::as_str));
+            args.extend_from_slice(&["-t", &pane_for_environment]);
+            let output = std::process::Command::new("tmux").args(&args).output()?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "scheduled pane environment respawn failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Ok(())
+        })
+    };
+    let environment_result = state
+        .with_owned_pane_claim(&registered_owner, &new_pane, environment_operation)
+        .await
+        .unwrap_or_else(|| {
+            Ok(Err(anyhow::anyhow!(
+                "scheduled pane ownership changed before environment respawn"
+            )))
+        });
     match environment_result {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            let registered_owner = crate::daemon_protocol::ResourceOwner {
-                session_id: task.session_name().to_string(),
-                incarnation: registered_incarnation,
-            };
-            let mut cleanup_owners = vec![registered_owner];
+            let mut cleanup_owners = vec![registered_owner.clone()];
             if let Some(initial_owner) = initial_pane_owner.as_ref()
                 && !cleanup_owners.contains(initial_owner)
             {
                 cleanup_owners.push(initial_owner.clone());
             }
-            remove_scheduled_pane_for_owners(&new_pane, cleanup_owners).await?;
+            remove_scheduled_pane_for_owners(state, &new_pane, cleanup_owners).await?;
             if let Some(owner) = reserved_owner.as_ref() {
                 rollback_reserved_scheduled_pane(
                     state,
@@ -1375,7 +1423,7 @@ async fn revive_and_inject(
             {
                 cleanup_owners.push(initial_owner.clone());
             }
-            remove_scheduled_pane_for_owners(&new_pane, cleanup_owners).await?;
+            remove_scheduled_pane_for_owners(state, &new_pane, cleanup_owners).await?;
             if let Some(owner) = reserved_owner.as_ref() {
                 rollback_reserved_scheduled_pane(
                     state,
@@ -1401,21 +1449,30 @@ async fn revive_and_inject(
     }
 
     let pane_for_launch = new_pane.clone();
-    let launch_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        crate::tmux::configure_managed_pane(&pane_for_launch);
-        // Leading space prevents the command from being recorded in shell
-        // history (zsh HIST_IGNORE_SPACE / bash HISTCONTROL=ignorespace).
-        let launch_then_exit = crate::tmux::close_shell_after(&full_launch_cmd);
-        let hidden_cmd = format!(" {launch_then_exit}");
-        let status = std::process::Command::new("tmux")
-            .args(["send-keys", "-t", &pane_for_launch, &hidden_cmd, "Enter"])
-            .status()?;
-        if !status.success() {
-            anyhow::bail!("tmux send-keys failed for pane {pane_for_launch}");
-        }
-        Ok(())
-    })
-    .await;
+    let launch_operation = move || {
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            crate::tmux::configure_managed_pane(&pane_for_launch);
+            // Leading space prevents the command from being recorded in shell
+            // history (zsh HIST_IGNORE_SPACE / bash HISTCONTROL=ignorespace).
+            let launch_then_exit = crate::tmux::close_shell_after(&full_launch_cmd);
+            let hidden_cmd = format!(" {launch_then_exit}");
+            let status = std::process::Command::new("tmux")
+                .args(["send-keys", "-t", &pane_for_launch, &hidden_cmd, "Enter"])
+                .status()?;
+            if !status.success() {
+                anyhow::bail!("tmux send-keys failed for pane {pane_for_launch}");
+            }
+            Ok(())
+        })
+    };
+    let launch_result = state
+        .with_owned_pane_claim(&registered_owner, &new_pane, launch_operation)
+        .await
+        .unwrap_or_else(|| {
+            Ok(Err(anyhow::anyhow!(
+                "scheduled pane ownership changed before backend launch"
+            )))
+        });
     match launch_result {
         Ok(Ok(())) => {
             if let Some(owner) = reserved_owner.as_ref()
@@ -1445,7 +1502,7 @@ async fn revive_and_inject(
                     session_id: task.session_name().to_string(),
                     incarnation: registered_incarnation,
                 };
-                remove_scheduled_pane_for_owners(&new_pane, vec![owner]).await?;
+                remove_scheduled_pane_for_owners(state, &new_pane, vec![owner]).await?;
                 rollback_provisional_revival(
                     state,
                     task.session_name(),
@@ -1471,7 +1528,7 @@ async fn revive_and_inject(
                     session_id: task.session_name().to_string(),
                     incarnation: registered_incarnation,
                 };
-                remove_scheduled_pane_for_owners(&new_pane, vec![owner]).await?;
+                remove_scheduled_pane_for_owners(state, &new_pane, vec![owner]).await?;
                 rollback_provisional_revival(
                     state,
                     task.session_name(),

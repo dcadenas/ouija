@@ -604,6 +604,72 @@ pub(crate) async fn session_delivery_plan(
 /// Messages are queued in a per-pane FIFO and processed by a background
 /// worker. Ordering is preserved and messages are never lost. On injection
 /// failure the worker retries with backoff before returning the error.
+pub async fn locked_inject_owned(
+    state: &crate::state::AppState,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    pane: &str,
+    message: &str,
+    vim_mode: bool,
+) -> anyhow::Result<()> {
+    state
+        .with_owned_pane_claim(owner, pane, || async {
+            match session_delivery_plan(state, &owner.session_id, pane).await {
+                SessionDeliveryPlan::Http(delivery) => state
+                    .with_owned_backend_claim(owner, &delivery.backend_session_id, || async {
+                        if let Err(decision) = deliver_via_http(
+                            state,
+                            &delivery.backend_session_id,
+                            delivery.project_dir.as_deref(),
+                            message,
+                            delivery.model.as_deref(),
+                            delivery.effort.as_deref(),
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                session = %owner.session_id,
+                                ?decision,
+                                "owned http delivery failed"
+                            );
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .unwrap_or_else(|| {
+                        Err(anyhow::anyhow!(
+                            "session '{}' incarnation {} no longer owns backend session '{}'",
+                            owner.session_id,
+                            owner.incarnation,
+                            delivery.backend_session_id
+                        ))
+                    }),
+                SessionDeliveryPlan::RawTmux {
+                    inject_config,
+                    tui_pattern,
+                } => {
+                    locked_inject_raw_tmux_with_config(
+                        state,
+                        pane,
+                        message,
+                        vim_mode,
+                        inject_config,
+                        tui_pattern,
+                    )
+                    .await
+                }
+                SessionDeliveryPlan::Unavailable(reason) => Err(anyhow::anyhow!(reason)),
+            }
+        })
+        .await
+        .unwrap_or_else(|| {
+            Err(anyhow::anyhow!(
+                "session '{}' incarnation {} no longer owns pane '{pane}'",
+                owner.session_id,
+                owner.incarnation
+            ))
+        })
+}
+
 pub async fn locked_inject(
     state: &crate::state::AppState,
     session_id: &str,
@@ -945,6 +1011,17 @@ pub fn inspect_pane_owner(
     }))
 }
 
+/// Process environments are immutable across a logical session rename. The
+/// allocator-issued incarnation remains globally unique, so it is the durable
+/// physical pane identity while protocol ownership still compares the full
+/// `(session_id, incarnation)` pair.
+pub(crate) fn physical_owner_matches(
+    observed: &crate::daemon_protocol::ResourceOwner,
+    expected: &crate::daemon_protocol::ResourceOwner,
+) -> bool {
+    observed.incarnation == expected.incarnation
+}
+
 /// Derive a tmux session name from a project directory path.
 /// Uses the directory basename with dots replaced by underscores
 /// (matching tmux-sessionizer convention).
@@ -982,6 +1059,25 @@ pub fn tmux_session_name(project_dir: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renamed_owner_matches_immutable_pane_incarnation() {
+        let observed = crate::daemon_protocol::ResourceOwner {
+            session_id: "before".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(42),
+        };
+        let renamed = crate::daemon_protocol::ResourceOwner {
+            session_id: "after".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(42),
+        };
+        let replacement = crate::daemon_protocol::ResourceOwner {
+            session_id: "after".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(43),
+        };
+
+        assert!(physical_owner_matches(&observed, &renamed));
+        assert!(!physical_owner_matches(&observed, &replacement));
+    }
 
     #[test]
     fn pane_env_args_includes_ouija_session_id() {

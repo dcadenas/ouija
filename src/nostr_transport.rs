@@ -144,16 +144,12 @@ fn should_remove_session_after_failed_restart(
         && existing_pane_id.is_none_or(|existing| existing == failed_pane_id)
 }
 
-fn cleanup_failed_opencode_attach_pane(pane_id: &str) {
-    if cfg!(test) {
-        return;
-    }
-    let pane = pane_id.to_string();
-    tokio::task::spawn_blocking(move || {
-        let _ = std::process::Command::new("tmux")
-            .args(["kill-pane", "-t", &pane])
-            .status();
-    });
+async fn cleanup_failed_opencode_attach_pane(
+    state: &std::sync::Arc<AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    pane_id: &str,
+) {
+    state.kill_owned_pane(owner, pane_id).await;
 }
 
 #[cfg(test)]
@@ -196,7 +192,7 @@ async fn cleanup_reserved_start(
     pane_id: &str,
     credential: Option<&str>,
 ) {
-    if let Err(error) = remove_inert_start_pane(owner, pane_id).await {
+    if let Err(error) = remove_inert_start_pane(state, owner, pane_id).await {
         tracing::warn!(
             session_id = %owner.session_id,
             incarnation = %owner.incarnation,
@@ -1472,13 +1468,21 @@ async fn kill_session_inner(
         if let Some(ref oc_sid) = backend_session_id {
             let port = state.opencode_serve_port();
             let url = format!("http://127.0.0.1:{port}/session/{oc_sid}/abort");
-            match state
-                .http_client
-                .post(&url)
-                .timeout(std::time::Duration::from_secs(5))
-                .send()
-                .await
-            {
+            let response = state
+                .with_owned_backend_cleanup(&owner, oc_sid, || async {
+                    state
+                        .http_client
+                        .post(&url)
+                        .timeout(std::time::Duration::from_secs(5))
+                        .send()
+                        .await
+                })
+                .await;
+            let Some(response) = response else {
+                let _ = state.abort_lifecycle(&owner).await;
+                return format!("session '{name}' backend exit was superseded before abort");
+            };
+            match response {
                 Ok(r) if r.status().is_success() => {
                     tracing::info!(session = %name, oc_sid, "aborted opencode server session");
                 }
@@ -1509,144 +1513,163 @@ async fn kill_session_inner(
     let pane_for_kill = pane.clone();
     let state_for_kill = std::sync::Arc::clone(state);
     let runtime = tokio::runtime::Handle::current();
-    let kill_result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
-        use std::process::Command;
+    let gate_owner = owner.clone();
+    let gate_pane = pane.clone();
+    let kill_result = state
+        .with_owned_pane_cleanup(&gate_owner, &gate_pane, move || async move {
+            tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+                use std::process::Command;
 
-        let require_pane_owner = || -> anyhow::Result<()> {
-            if !runtime.block_on(state_for_kill.owns_stopping_session(&pane_owner, &pane_for_kill))
-            {
-                anyhow::bail!("stop authority changed before backend exit");
-            }
-            if crate::tmux::inspect_pane_owner(&pane_for_kill)?.as_ref() != Some(&pane_owner) {
-                anyhow::bail!("pane owner changed before backend exit");
-            }
-            Ok(())
-        };
+                let require_pane_owner = || -> anyhow::Result<()> {
+                    if !runtime
+                        .block_on(state_for_kill.owns_stopping_session(&pane_owner, &pane_for_kill))
+                    {
+                        anyhow::bail!("stop authority changed before backend exit");
+                    }
+                    if !crate::tmux::inspect_pane_owner(&pane_for_kill)?
+                        .as_ref()
+                        .is_some_and(|observed| {
+                            crate::tmux::physical_owner_matches(observed, &pane_owner)
+                        })
+                    {
+                        anyhow::bail!("pane owner changed before backend exit");
+                    }
+                    Ok(())
+                };
 
-        // Get pane PID
-        require_pane_owner()?;
-        let output = Command::new("tmux")
-            .args(["display-message", "-t", &pane_for_kill, "-p", "#{pane_pid}"])
-            .output()?;
-        if !output.status.success() {
-            anyhow::bail!("could not get pane PID");
-        }
-        let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let pane_pid: u32 = match pid_str.parse() {
-            Ok(pid) => pid,
-            Err(_) => {
-                // Pane exists but has no running process — skip process kill, just clean up
+                // Get pane PID
                 require_pane_owner()?;
-                let _ = Command::new("tmux")
-                    .args(["kill-pane", "-t", &pane_for_kill])
-                    .status();
-                return Ok("no running process in pane".to_string());
-            }
-        };
-
-        // Find backend process in the tree
-        let output = Command::new("ps").args(["-eo", "pid,ppid,comm"]).output()?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut children: std::collections::HashMap<u32, Vec<u32>> =
-            std::collections::HashMap::new();
-        let mut names: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
-
-        for line in stdout.lines().skip(1) {
-            let mut parts = line.split_whitespace();
-            let (Some(pid_s), Some(ppid_s), Some(comm)) =
-                (parts.next(), parts.next(), parts.next())
-            else {
-                continue;
-            };
-            let (Ok(pid), Ok(ppid)) = (pid_s.parse::<u32>(), ppid_s.parse::<u32>()) else {
-                continue;
-            };
-            children.entry(ppid).or_default().push(pid);
-            names.insert(pid, comm.to_string());
-        }
-
-        // BFS to find backend PID.
-        // Match both exact name and dot-prefixed name (e.g. ".opencode"
-        // which appears when run via npm/node wrapper).
-        let mut stack = vec![pane_pid];
-        let mut backend_pid = None;
-        while let Some(pid) = stack.pop() {
-            if names.get(&pid).is_some_and(|n| {
-                process_names
-                    .iter()
-                    .any(|pn| pn == n || n.strip_prefix('.') == Some(pn.as_str()))
-            }) {
-                backend_pid = Some(pid);
-                break;
-            }
-            if let Some(kids) = children.get(&pid) {
-                stack.extend(kids);
-            }
-        }
-
-        match backend_pid {
-            Some(pid) => {
-                let mut exited = false;
-                // When preserving worktrees, skip graceful /exit — the
-                // backend may clean up its own worktree during exit.
-                // Go straight to SIGKILL to prevent cleanup handlers.
-                if keep_worktree {
-                    require_pane_owner()?;
-                    let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                } else {
-                    // Graceful: send exit command if backend supports it
-                    if let Some(ref exit) = exit_cmd {
+                let output = Command::new("tmux")
+                    .args(["display-message", "-t", &pane_for_kill, "-p", "#{pane_pid}"])
+                    .output()?;
+                if !output.status.success() {
+                    anyhow::bail!("could not get pane PID");
+                }
+                let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let pane_pid: u32 = match pid_str.parse() {
+                    Ok(pid) => pid,
+                    Err(_) => {
+                        // Pane exists but has no running process — skip process kill, just clean up
                         require_pane_owner()?;
                         let _ = Command::new("tmux")
-                            .args(["send-keys", "-t", &pane_for_kill, exit, "Enter"])
+                            .args(["kill-pane", "-t", &pane_for_kill])
                             .status();
-
-                        // Poll up to 10s for process to exit
-                        let deadline = std::time::Instant::now()
-                            + std::time::Duration::from_secs(PROCESS_EXIT_TIMEOUT_SECS);
-                        while std::time::Instant::now() < deadline {
-                            std::thread::sleep(std::time::Duration::from_secs(1));
-                            let status =
-                                Command::new("kill").args(["-0", &pid.to_string()]).status();
-                            if !status.is_ok_and(|s| s.success()) {
-                                exited = true;
-                                break;
-                            }
-                        }
+                        return Ok("no running process in pane".to_string());
                     }
+                };
 
-                    if !exited {
-                        // Fallback: SIGTERM
-                        require_pane_owner()?;
-                        let _ = Command::new("kill").arg(pid.to_string()).status();
-                        std::thread::sleep(std::time::Duration::from_secs(1));
+                // Find backend process in the tree
+                let output = Command::new("ps").args(["-eo", "pid,ppid,comm"]).output()?;
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut children: std::collections::HashMap<u32, Vec<u32>> =
+                    std::collections::HashMap::new();
+                let mut names: std::collections::HashMap<u32, String> =
+                    std::collections::HashMap::new();
+
+                for line in stdout.lines().skip(1) {
+                    let mut parts = line.split_whitespace();
+                    let (Some(pid_s), Some(ppid_s), Some(comm)) =
+                        (parts.next(), parts.next(), parts.next())
+                    else {
+                        continue;
+                    };
+                    let (Ok(pid), Ok(ppid)) = (pid_s.parse::<u32>(), ppid_s.parse::<u32>()) else {
+                        continue;
+                    };
+                    children.entry(ppid).or_default().push(pid);
+                    names.insert(pid, comm.to_string());
+                }
+
+                // BFS to find backend PID.
+                // Match both exact name and dot-prefixed name (e.g. ".opencode"
+                // which appears when run via npm/node wrapper).
+                let mut stack = vec![pane_pid];
+                let mut backend_pid = None;
+                while let Some(pid) = stack.pop() {
+                    if names.get(&pid).is_some_and(|n| {
+                        process_names
+                            .iter()
+                            .any(|pn| pn == n || n.strip_prefix('.') == Some(pn.as_str()))
+                    }) {
+                        backend_pid = Some(pid);
+                        break;
+                    }
+                    if let Some(kids) = children.get(&pid) {
+                        stack.extend(kids);
                     }
                 }
 
-                require_pane_owner()?;
-                let _ = Command::new("tmux")
-                    .args(["kill-pane", "-t", &pane_for_kill])
-                    .status();
-                let method = if keep_worktree {
-                    "SIGKILL (worktree preserved)"
-                } else if exited {
-                    "exited gracefully"
-                } else {
-                    "SIGTERM"
-                };
-                Ok(format!("killed {cli_name} (pid {pid}, {method})"))
-            }
-            None => {
-                require_pane_owner()?;
-                let _ = Command::new("tmux")
-                    .args(["kill-pane", "-t", &pane_for_kill])
-                    .status();
-                Ok(format!("no {cli_name} process found"))
-            }
-        }
-    })
-    .await;
+                match backend_pid {
+                    Some(pid) => {
+                        let mut exited = false;
+                        // When preserving worktrees, skip graceful /exit — the
+                        // backend may clean up its own worktree during exit.
+                        // Go straight to SIGKILL to prevent cleanup handlers.
+                        if keep_worktree {
+                            require_pane_owner()?;
+                            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                        } else {
+                            // Graceful: send exit command if backend supports it
+                            if let Some(ref exit) = exit_cmd {
+                                require_pane_owner()?;
+                                let _ = Command::new("tmux")
+                                    .args(["send-keys", "-t", &pane_for_kill, exit, "Enter"])
+                                    .status();
+
+                                // Poll up to 10s for process to exit
+                                let deadline = std::time::Instant::now()
+                                    + std::time::Duration::from_secs(PROCESS_EXIT_TIMEOUT_SECS);
+                                while std::time::Instant::now() < deadline {
+                                    std::thread::sleep(std::time::Duration::from_secs(1));
+                                    let status = Command::new("kill")
+                                        .args(["-0", &pid.to_string()])
+                                        .status();
+                                    if !status.is_ok_and(|s| s.success()) {
+                                        exited = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if !exited {
+                                // Fallback: SIGTERM
+                                require_pane_owner()?;
+                                let _ = Command::new("kill").arg(pid.to_string()).status();
+                                std::thread::sleep(std::time::Duration::from_secs(1));
+                            }
+                        }
+
+                        require_pane_owner()?;
+                        let _ = Command::new("tmux")
+                            .args(["kill-pane", "-t", &pane_for_kill])
+                            .status();
+                        let method = if keep_worktree {
+                            "SIGKILL (worktree preserved)"
+                        } else if exited {
+                            "exited gracefully"
+                        } else {
+                            "SIGTERM"
+                        };
+                        Ok(format!("killed {cli_name} (pid {pid}, {method})"))
+                    }
+                    None => {
+                        require_pane_owner()?;
+                        let _ = Command::new("tmux")
+                            .args(["kill-pane", "-t", &pane_for_kill])
+                            .status();
+                        Ok(format!("no {cli_name} process found"))
+                    }
+                }
+            })
+            .await
+        })
+        .await
+        .unwrap_or_else(|| {
+            Ok(Err(anyhow::anyhow!(
+                "pane owner changed before backend exit"
+            )))
+        });
 
     if matches!(
         &kill_result,
@@ -1721,6 +1744,7 @@ async fn fail_reserved_start(
 }
 
 async fn remove_inert_start_pane(
+    state: &std::sync::Arc<AppState>,
     owner: &crate::daemon_protocol::ResourceOwner,
     pane: &str,
 ) -> anyhow::Result<()> {
@@ -1729,25 +1753,41 @@ async fn remove_inert_start_pane(
     }
     let owner = owner.clone();
     let pane = pane.to_string();
-    tokio::task::spawn_blocking(move || {
-        if crate::tmux::inspect_pane_owner(&pane)?.as_ref() != Some(&owner) {
-            return Ok(());
-        }
-        let status = std::process::Command::new("tmux")
-            .args(["kill-pane", "-t", &pane])
-            .status()
-            .with_context(|| format!("failed to kill inert start pane {pane}"))?;
-        if !status.success() && crate::tmux::inspect_pane_owner(&pane)?.as_ref() == Some(&owner) {
-            anyhow::bail!(
-                "failed to remove inert pane {pane} for {} incarnation {}",
-                owner.session_id,
-                owner.incarnation
-            );
-        }
-        Ok(())
-    })
-    .await
-    .context("inert start pane cleanup task failed")?
+    let pane_for_guard = pane.clone();
+    let owner_for_guard = owner.clone();
+    state
+        .with_owned_pane_cleanup(&owner_for_guard, &pane_for_guard, move || async move {
+            tokio::task::spawn_blocking(move || {
+                if !crate::tmux::inspect_pane_owner(&pane)?
+                    .as_ref()
+                    .is_some_and(|observed| crate::tmux::physical_owner_matches(observed, &owner))
+                {
+                    return Ok(());
+                }
+                let status = std::process::Command::new("tmux")
+                    .args(["kill-pane", "-t", &pane])
+                    .status()
+                    .with_context(|| format!("failed to kill inert start pane {pane}"))?;
+                if !status.success()
+                    && crate::tmux::inspect_pane_owner(&pane)?
+                        .as_ref()
+                        .is_some_and(|observed| {
+                            crate::tmux::physical_owner_matches(observed, &owner)
+                        })
+                {
+                    anyhow::bail!(
+                        "failed to remove inert pane {pane} for {} incarnation {}",
+                        owner.session_id,
+                        owner.incarnation
+                    );
+                }
+                Ok(())
+            })
+            .await
+            .context("inert start pane cleanup task failed")?
+        })
+        .await
+        .unwrap_or(Ok(()))
 }
 
 async fn finalize_reserved_start(
@@ -2076,7 +2116,7 @@ pub async fn start_session(
             {
                 Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
                 Ok(outcome) => {
-                    let cleanup = remove_inert_start_pane(&owner, &pane_id).await;
+                    let cleanup = remove_inert_start_pane(state, &owner, &pane_id).await;
                     if cleanup.is_ok() {
                         let _ = state.abort_lifecycle(&owner).await;
                     }
@@ -2092,7 +2132,7 @@ pub async fn start_session(
                     );
                 }
                 Err(error) => {
-                    let cleanup = remove_inert_start_pane(&owner, &pane_id).await;
+                    let cleanup = remove_inert_start_pane(state, &owner, &pane_id).await;
                     if cleanup.is_ok() {
                         let _ = state.abort_lifecycle(&owner).await;
                     }
@@ -2133,7 +2173,7 @@ pub async fn start_session(
             {
                 Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
                 Ok(outcome) => {
-                    let cleanup = remove_inert_start_pane(&owner, &pane_id).await;
+                    let cleanup = remove_inert_start_pane(state, &owner, &pane_id).await;
                     if cleanup.is_ok() {
                         let _ = state.abort_lifecycle(&owner).await;
                     }
@@ -2149,7 +2189,7 @@ pub async fn start_session(
                     );
                 }
                 Err(error) => {
-                    let cleanup = remove_inert_start_pane(&owner, &pane_id).await;
+                    let cleanup = remove_inert_start_pane(state, &owner, &pane_id).await;
                     if cleanup.is_ok() {
                         let _ = state.abort_lifecycle(&owner).await;
                     }
@@ -2191,7 +2231,7 @@ pub async fn start_session(
             match launch_result {
                 Ok(Ok(())) => {
                     if let Err(error) = state.abort_lifecycle(&owner).await {
-                        let cleanup = remove_inert_start_pane(&owner, &pane_id).await;
+                        let cleanup = remove_inert_start_pane(state, &owner, &pane_id).await;
                         cleanup_reserved_start(
                             state,
                             &owner,
@@ -2241,7 +2281,7 @@ pub async fn start_session(
                 crate::backend::DeliveryMode::HttpApi { .. }
             );
             let backend_session_id = if is_http_api {
-                match setup_shared_serve_session(state, &pane_id, &dir).await {
+                match setup_shared_serve_session(state, &owner, &pane_id, &dir).await {
                     Ok(sid) => Some(sid),
                     Err(e) => {
                         tracing::warn!("shared serve session setup failed: {e}");
@@ -2517,7 +2557,7 @@ async fn recover_failed_fresh_launch(
         incarnation: staged_incarnation,
     };
     if let Some(ref provisional_pane) = provisional_pane {
-        remove_inert_start_pane(&owner, provisional_pane).await?;
+        remove_inert_start_pane(state, &owner, provisional_pane).await?;
     }
     state
         .rollback_launch(
@@ -2900,7 +2940,8 @@ pub async fn restart_session(
             let live_owner =
                 tokio::task::spawn_blocking(move || crate::tmux::inspect_pane_owner(&pane)).await;
             match live_owner {
-                Ok(Ok(Some(live_owner))) if live_owner == restart_lease_owner => {}
+                Ok(Ok(Some(live_owner)))
+                    if crate::tmux::physical_owner_matches(&live_owner, &restart_lease_owner) => {}
                 Ok(Ok(live_owner)) => {
                     return (
                         format!(
@@ -3101,149 +3142,186 @@ pub async fn restart_session(
         claude_cmd.clone()
     };
 
-    let start_result = tokio::task::spawn_blocking({
-        let window_name = window_name.clone();
-        let tmux_session = tmux_session.clone();
-        let existing_pane = existing_pane.clone();
-        let pane_credential = session_start_credential.clone();
-        let pane_incarnation = staged_incarnation;
-        let direct_restart_lease_owner = direct_restart_lease_owner.clone();
-        let respawn_cmd = full_cmd.clone();
-        move || -> anyhow::Result<(String, bool)> {
-            use std::process::Command;
+    let start_gate = if let Some(pane) = existing_pane.as_deref() {
+        state
+            .protocol
+            .read()
+            .await
+            .sessions
+            .get(name)
+            .filter(|session| session.pane.as_deref() == Some(pane))
+            .map(|session| (session.owner(), pane.to_string()))
+    } else {
+        None
+    };
+    let start_existing_pane = existing_pane.clone();
+    let start_session_credential = session_start_credential.clone();
+    let start_full_cmd = full_cmd.clone();
+    let start_operation = move || {
+        tokio::task::spawn_blocking({
+            let window_name = window_name.clone();
+            let tmux_session = tmux_session.clone();
+            let existing_pane = start_existing_pane;
+            let pane_credential = start_session_credential;
+            let pane_incarnation = staged_incarnation;
+            let direct_restart_lease_owner = direct_restart_lease_owner.clone();
+            let respawn_cmd = start_full_cmd;
+            move || -> anyhow::Result<(String, bool)> {
+                use std::process::Command;
 
-            // Try respawn-pane on existing pane — kills the process and restarts
-            // in-place, keeping the same pane ID and tmux session intact.
-            //
-            // For HttpApi backends the serve command is backgrounded (`&`), so
-            // we respawn with a bare shell and then send-keys instead of letting
-            // respawn-pane run the command directly (which would exit immediately).
-            if let Some(ref pane) = existing_pane {
-                // See `pane_env_args` docs for why OUIJA_SESSION_ID must
-                // be set on every pane spawn (including respawn-pane).
+                // Try respawn-pane on existing pane — kills the process and restarts
+                // in-place, keeping the same pane ID and tmux session intact.
+                //
+                // For HttpApi backends the serve command is backgrounded (`&`), so
+                // we respawn with a bare shell and then send-keys instead of letting
+                // respawn-pane run the command directly (which would exit immediately).
+                if let Some(ref pane) = existing_pane {
+                    // See `pane_env_args` docs for why OUIJA_SESSION_ID must
+                    // be set on every pane spawn (including respawn-pane).
+                    let env_args = crate::tmux::pane_env_args(
+                        &window_name,
+                        pane_credential.as_deref(),
+                        pane_incarnation,
+                    );
+                    let mut respawn_args: Vec<&str> = vec!["respawn-pane", "-k"];
+                    respawn_args.extend(env_args.iter().map(String::as_str));
+                    respawn_args.extend_from_slice(&["-t", pane]);
+                    if !is_http_api {
+                        respawn_args.push(&respawn_cmd);
+                    }
+                    crate::tmux::configure_managed_pane(pane);
+                    let output = Command::new("tmux").args(&respawn_args).output();
+                    match output {
+                        Ok(o) if o.status.success() => {
+                            if is_http_api {
+                                // Give the fresh shell a moment to initialise
+                                std::thread::sleep(std::time::Duration::from_millis(300));
+                                let hidden = format!(" {respawn_cmd}");
+                                let status = Command::new("tmux")
+                                    .args(["send-keys", "-t", pane, &hidden, "Enter"])
+                                    .status()?;
+                                if !status.success() {
+                                    anyhow::bail!(
+                                        "tmux send-keys failed for direct respawn pane {pane}"
+                                    );
+                                }
+                            }
+                            tracing::info!("restart: respawn-pane {pane} succeeded");
+                            return Ok((pane.clone(), false));
+                        }
+                        Ok(o) => {
+                            tracing::info!(
+                                "restart: respawn-pane {pane} failed: {}",
+                                String::from_utf8_lossy(&o.stderr).trim()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::info!("restart: respawn-pane {pane} error: {e}");
+                        }
+                    }
+
+                    // A failed respawn can be ambiguous about whether tmux
+                    // replaced the process before reporting failure. Remove the
+                    // exact incumbent/staged managed pane before creating a
+                    // fallback, otherwise overwriting the lease record would
+                    // strand an unregistered backend.
+                    if let Some(ref lease_owner) = direct_restart_lease_owner {
+                        let live_owner = crate::tmux::inspect_pane_owner(pane)?;
+                        let staged_owner = pane_incarnation.map(|incarnation| {
+                            crate::daemon_protocol::ResourceOwner {
+                                session_id: window_name.clone(),
+                                incarnation,
+                            }
+                        });
+                        let owned = live_owner.as_ref().is_some_and(|owner| {
+                            crate::tmux::physical_owner_matches(owner, lease_owner)
+                                || staged_owner.as_ref().is_some_and(|staged_owner| {
+                                    crate::tmux::physical_owner_matches(owner, staged_owner)
+                                })
+                        });
+                        if owned {
+                            let status = Command::new("tmux")
+                                .args(["kill-pane", "-t", pane])
+                                .status()?;
+                            let remaining_owner = crate::tmux::inspect_pane_owner(pane)?;
+                            if !status.success()
+                                && remaining_owner.as_ref().is_some_and(|owner| {
+                                    crate::tmux::physical_owner_matches(owner, lease_owner)
+                                        || staged_owner.as_ref().is_some_and(|staged_owner| {
+                                            crate::tmux::physical_owner_matches(owner, staged_owner)
+                                        })
+                                })
+                            {
+                                anyhow::bail!(
+                                    "failed to remove ambiguous direct respawn pane {pane}"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Fallback: add window to existing tmux session, or create new one
+                let tmux_session_exists = Command::new("tmux")
+                    .args(["has-session", "-t", &tmux_session])
+                    .output()
+                    .is_ok_and(|o| o.status.success());
+
+                let target = format!("{tmux_session}:");
                 let env_args = crate::tmux::pane_env_args(
                     &window_name,
                     pane_credential.as_deref(),
                     pane_incarnation,
                 );
-                let mut respawn_args: Vec<&str> = vec!["respawn-pane", "-k"];
-                respawn_args.extend(env_args.iter().map(String::as_str));
-                respawn_args.extend_from_slice(&["-t", pane]);
-                if !is_http_api {
-                    respawn_args.push(&respawn_cmd);
+                let output = if tmux_session_exists {
+                    let mut args: Vec<&str> = vec!["new-window", "-d"];
+                    args.extend(env_args.iter().map(String::as_str));
+                    args.extend_from_slice(&[
+                        "-t",
+                        &target,
+                        "-n",
+                        &window_name,
+                        "-P",
+                        "-F",
+                        "#{pane_id}",
+                    ]);
+                    Command::new("tmux").args(&args).output()?
+                } else {
+                    let mut args: Vec<&str> = vec!["new-session", "-d"];
+                    args.extend(env_args.iter().map(String::as_str));
+                    args.extend_from_slice(&[
+                        "-s",
+                        &tmux_session,
+                        "-n",
+                        &window_name,
+                        "-P",
+                        "-F",
+                        "#{pane_id}",
+                    ]);
+                    Command::new("tmux").args(&args).output()?
+                };
+                if !output.status.success() {
+                    anyhow::bail!(
+                        "tmux session/window creation failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
                 }
-                crate::tmux::configure_managed_pane(pane);
-                let output = Command::new("tmux").args(&respawn_args).output();
-                match output {
-                    Ok(o) if o.status.success() => {
-                        if is_http_api {
-                            // Give the fresh shell a moment to initialise
-                            std::thread::sleep(std::time::Duration::from_millis(300));
-                            let hidden = format!(" {respawn_cmd}");
-                            let status = Command::new("tmux")
-                                .args(["send-keys", "-t", pane, &hidden, "Enter"])
-                                .status()?;
-                            if !status.success() {
-                                anyhow::bail!(
-                                    "tmux send-keys failed for direct respawn pane {pane}"
-                                );
-                            }
-                        }
-                        tracing::info!("restart: respawn-pane {pane} succeeded");
-                        return Ok((pane.clone(), false));
-                    }
-                    Ok(o) => {
-                        tracing::info!(
-                            "restart: respawn-pane {pane} failed: {}",
-                            String::from_utf8_lossy(&o.stderr).trim()
-                        );
-                    }
-                    Err(e) => {
-                        tracing::info!("restart: respawn-pane {pane} error: {e}");
-                    }
-                }
-
-                // A failed respawn can be ambiguous about whether tmux
-                // replaced the process before reporting failure. Remove the
-                // exact incumbent/staged managed pane before creating a
-                // fallback, otherwise overwriting the lease record would
-                // strand an unregistered backend.
-                if let Some(ref lease_owner) = direct_restart_lease_owner {
-                    let live_owner = crate::tmux::inspect_pane_owner(pane)?;
-                    let staged_owner =
-                        pane_incarnation.map(|incarnation| crate::daemon_protocol::ResourceOwner {
-                            session_id: window_name.clone(),
-                            incarnation,
-                        });
-                    let owned = live_owner.as_ref().is_some_and(|owner| {
-                        owner == lease_owner || staged_owner.as_ref() == Some(owner)
-                    });
-                    if owned {
-                        let status = Command::new("tmux")
-                            .args(["kill-pane", "-t", pane])
-                            .status()?;
-                        let remaining_owner = crate::tmux::inspect_pane_owner(pane)?;
-                        if !status.success()
-                            && remaining_owner.as_ref().is_some_and(|owner| {
-                                owner == lease_owner || staged_owner.as_ref() == Some(owner)
-                            })
-                        {
-                            anyhow::bail!("failed to remove ambiguous direct respawn pane {pane}");
-                        }
-                    }
-                }
+                let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                Ok((pane_id, true))
             }
-
-            // Fallback: add window to existing tmux session, or create new one
-            let tmux_session_exists = Command::new("tmux")
-                .args(["has-session", "-t", &tmux_session])
-                .output()
-                .is_ok_and(|o| o.status.success());
-
-            let target = format!("{tmux_session}:");
-            let env_args = crate::tmux::pane_env_args(
-                &window_name,
-                pane_credential.as_deref(),
-                pane_incarnation,
-            );
-            let output = if tmux_session_exists {
-                let mut args: Vec<&str> = vec!["new-window", "-d"];
-                args.extend(env_args.iter().map(String::as_str));
-                args.extend_from_slice(&[
-                    "-t",
-                    &target,
-                    "-n",
-                    &window_name,
-                    "-P",
-                    "-F",
-                    "#{pane_id}",
-                ]);
-                Command::new("tmux").args(&args).output()?
-            } else {
-                let mut args: Vec<&str> = vec!["new-session", "-d"];
-                args.extend(env_args.iter().map(String::as_str));
-                args.extend_from_slice(&[
-                    "-s",
-                    &tmux_session,
-                    "-n",
-                    &window_name,
-                    "-P",
-                    "-F",
-                    "#{pane_id}",
-                ]);
-                Command::new("tmux").args(&args).output()?
-            };
-            if !output.status.success() {
-                anyhow::bail!(
-                    "tmux session/window creation failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            Ok((pane_id, true))
-        }
-    })
-    .await;
+        })
+    };
+    let start_result = if let Some((owner, pane)) = start_gate {
+        state
+            .with_owned_pane_claim(&owner, &pane, start_operation)
+            .await
+            .unwrap_or_else(|| {
+                Ok(Err(anyhow::anyhow!(
+                    "pane ownership changed before restart"
+                )))
+            })
+    } else {
+        start_operation().await
+    };
 
     match start_result {
         Ok(Ok((pane_id, launch_after_registration))) => {
@@ -3294,7 +3372,8 @@ pub async fn restart_session(
                         {
                             Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
                             Ok(outcome) => {
-                                let cleanup = remove_inert_start_pane(&pane_owner, &pane_id).await;
+                                let cleanup =
+                                    remove_inert_start_pane(state, &pane_owner, &pane_id).await;
                                 return (
                                     format!(
                                         "restart superseded before fallback pane registration ({outcome:?}){}",
@@ -3310,7 +3389,8 @@ pub async fn restart_session(
                                 );
                             }
                             Err(error) => {
-                                let cleanup = remove_inert_start_pane(&pane_owner, &pane_id).await;
+                                let cleanup =
+                                    remove_inert_start_pane(state, &pane_owner, &pane_id).await;
                                 return (
                                     format!(
                                         "restart failed to persist inert fallback pane: {error}{}",
@@ -3333,7 +3413,8 @@ pub async fn restart_session(
                     {
                         Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
                         Ok(outcome) => {
-                            let cleanup = remove_inert_start_pane(&pane_owner, &pane_id).await;
+                            let cleanup =
+                                remove_inert_start_pane(state, &pane_owner, &pane_id).await;
                             return (
                                 format!(
                                     "restart superseded before backend launch ({outcome:?}){}",
@@ -3349,7 +3430,8 @@ pub async fn restart_session(
                             );
                         }
                         Err(error) => {
-                            let cleanup = remove_inert_start_pane(&pane_owner, &pane_id).await;
+                            let cleanup =
+                                remove_inert_start_pane(state, &pane_owner, &pane_id).await;
                             if let Err(rollback_error) = recover_failed_fresh_launch(
                                 state,
                                 name,
@@ -3436,7 +3518,7 @@ pub async fn restart_session(
                                 }
                             });
                             let cleanup = if let Some(ref pane_owner) = pane_owner {
-                                remove_inert_start_pane(pane_owner, &pane_id).await
+                                remove_inert_start_pane(state, pane_owner, &pane_id).await
                             } else {
                                 Ok(())
                             };
@@ -3529,7 +3611,21 @@ pub async fn restart_session(
                 backend.delivery_mode(),
                 crate::backend::DeliveryMode::HttpApi { .. }
             ) {
-                match setup_shared_serve_session(state, &pane_id, &dir).await {
+                let setup_owner = state
+                    .protocol
+                    .read()
+                    .await
+                    .sessions
+                    .get(name)
+                    .filter(|session| session.pane.as_deref() == Some(pane_id.as_str()))
+                    .map(crate::daemon_protocol::SessionEntry::owner);
+                let setup_result = match setup_owner {
+                    Some(owner) => setup_shared_serve_session(state, &owner, &pane_id, &dir).await,
+                    None => Err(anyhow::anyhow!(
+                        "restart owner changed before OpenCode session setup"
+                    )),
+                };
+                match setup_result {
                     Ok(sid) => Some(sid),
                     Err(e) => {
                         tracing::warn!("shared serve session setup failed: {e}");
@@ -3617,7 +3713,17 @@ pub async fn restart_session(
                     "restart_session: not registering {name} because OpenCode attach setup failed"
                 );
                 if should_cleanup_failed_opencode_attach_pane(is_http_api, None) {
-                    cleanup_failed_opencode_attach_pane(&pane_id);
+                    let owner = state
+                        .protocol
+                        .read()
+                        .await
+                        .sessions
+                        .get(name)
+                        .filter(|session| session.pane.as_deref() == Some(pane_id.as_str()))
+                        .map(crate::daemon_protocol::SessionEntry::owner);
+                    if let Some(owner) = owner {
+                        cleanup_failed_opencode_attach_pane(state, &owner, &pane_id).await;
+                    }
                 }
                 if should_remove_session_after_failed_restart(
                     is_http_api,
@@ -3857,6 +3963,17 @@ async fn soft_restart_session(
         tracing::warn!("soft restart: restart already in progress for '{name}'");
         return Err(());
     };
+    let Some(operation_owner) = state
+        .protocol
+        .read()
+        .await
+        .sessions
+        .get(name)
+        .map(crate::daemon_protocol::SessionEntry::owner)
+    else {
+        tracing::warn!("soft restart: session '{name}' disappeared before backend creation");
+        return Err(());
+    };
 
     // 1. Create a new session on the opencode serve
     let resp = state
@@ -3933,11 +4050,18 @@ async fn soft_restart_session(
                 // reclaim the session on its own restart; the Err return
                 // below is the important signal to the caller.
                 let port = state.opencode_serve_port();
-                let client = state.http_client.clone();
                 let orphan_id = new_session_id.clone();
+                let cleanup_state = state.clone();
+                let cleanup_owner = operation_owner.clone();
                 tokio::spawn(async move {
-                    delete_opencode_session(&client, port, &orphan_id, "soft restart cleanup")
-                        .await;
+                    delete_owned_opencode_session(
+                        &cleanup_state,
+                        cleanup_owner,
+                        port,
+                        &orphan_id,
+                        "soft restart cleanup",
+                    )
+                    .await;
                 });
                 return Err(());
             }
@@ -3959,12 +4083,13 @@ async fn soft_restart_session(
     // 3. Respawn the TUI attach to point at the new session.
     if let Some(pane) = pane {
         match respawn_opencode_attach_for_session(
+            state,
+            &owner_snapshot.resource_owner(),
             pane,
             project_dir,
             &new_session_id,
             port,
             name,
-            &state.http_client,
         )
         .await
         {
@@ -3988,6 +4113,7 @@ async fn soft_restart_session(
                 {
                     rollback_pane_after_failed_soft_restart_commit(
                         state,
+                        &owner_snapshot,
                         pane,
                         project_dir,
                         port,
@@ -3995,8 +4121,9 @@ async fn soft_restart_session(
                         &previous_metadata,
                     )
                     .await;
-                    delete_opencode_session(
-                        &state.http_client,
+                    delete_owned_opencode_session(
+                        state,
+                        operation_owner.clone(),
                         port,
                         &new_session_id,
                         "soft restart cleanup",
@@ -4010,8 +4137,9 @@ async fn soft_restart_session(
             }
             Ok(false) => {
                 tracing::warn!("soft restart: opencode attach did not start in pane {pane}");
-                delete_opencode_session(
-                    &state.http_client,
+                delete_owned_opencode_session(
+                    state,
+                    operation_owner.clone(),
                     port,
                     &new_session_id,
                     "soft restart cleanup",
@@ -4021,8 +4149,9 @@ async fn soft_restart_session(
             }
             Err(e) => {
                 tracing::warn!("soft restart: respawn-pane {pane} failed: {e}");
-                delete_opencode_session(
-                    &state.http_client,
+                delete_owned_opencode_session(
+                    state,
+                    operation_owner.clone(),
                     port,
                     &new_session_id,
                     "soft restart cleanup",
@@ -4054,8 +4183,9 @@ async fn soft_restart_session(
             .await
             .is_err()
             {
-                delete_opencode_session(
-                    &state.http_client,
+                delete_owned_opencode_session(
+                    state,
+                    operation_owner.clone(),
                     port,
                     &new_session_id,
                     "soft restart cleanup",
@@ -4121,12 +4251,13 @@ async fn soft_restart_session(
                             ),
                         ) {
                             match respawn_opencode_attach_for_session(
+                                state,
+                                &owner_snapshot.resource_owner(),
                                 pane,
                                 project_dir,
                                 previous_session_id,
                                 port,
                                 name,
-                                &state.http_client,
                             )
                             .await
                             {
@@ -4139,8 +4270,9 @@ async fn soft_restart_session(
                                 ),
                             }
                         }
-                        delete_opencode_session(
-                            &state.http_client,
+                        delete_owned_opencode_session(
+                            state,
+                            operation_owner.clone(),
                             port,
                             &new_session_id,
                             "soft restart cleanup",
@@ -4160,12 +4292,13 @@ async fn soft_restart_session(
                     previous_backend_session_for_prompt_failure_rollback(pane, &previous_metadata),
                 ) {
                     match respawn_opencode_attach_for_session(
+                        state,
+                        &owner_snapshot.resource_owner(),
                         pane,
                         project_dir,
                         previous_session_id,
                         port,
                         name,
-                        &state.http_client,
                     )
                     .await
                     {
@@ -4177,8 +4310,9 @@ async fn soft_restart_session(
                             "soft restart: failed to roll back pane {pane} to previous opencode session after ambiguous prompt_async outcome: {error}"
                         ),
                     }
-                    delete_opencode_session(
-                        &state.http_client,
+                    delete_owned_opencode_session(
+                        state,
+                        operation_owner.clone(),
                         port,
                         &new_session_id,
                         "soft restart cleanup",
@@ -4194,12 +4328,13 @@ async fn soft_restart_session(
                     previous_backend_session_for_prompt_failure_rollback(pane, &previous_metadata),
                 ) {
                     match respawn_opencode_attach_for_session(
+                        state,
+                        &owner_snapshot.resource_owner(),
                         pane,
                         project_dir,
                         previous_session_id,
                         port,
                         name,
-                        &state.http_client,
                     )
                     .await
                     {
@@ -4212,8 +4347,9 @@ async fn soft_restart_session(
                         ),
                     }
                 }
-                delete_opencode_session(
-                    &state.http_client,
+                delete_owned_opencode_session(
+                    state,
+                    operation_owner.clone(),
                     port,
                     &new_session_id,
                     "soft restart cleanup",
@@ -4243,8 +4379,9 @@ async fn soft_restart_session(
         .await
         .is_err()
     {
-        delete_opencode_session(
-            &state.http_client,
+        delete_owned_opencode_session(
+            state,
+            operation_owner,
             port,
             &new_session_id,
             "soft restart cleanup",
@@ -4273,57 +4410,61 @@ async fn apply_soft_restart_metadata(
     expected_restart_generation: u64,
     update: SoftRestartMetadataUpdate<'_>,
 ) -> Result<(), ()> {
-    let mut proto = state.protocol.write().await;
-    let Some(session) = proto.sessions.get_mut(&owner.session_id) else {
-        return Err(());
-    };
-    if session.metadata.session_incarnation != owner.incarnation {
-        return Err(());
-    }
-    if session.metadata.restart_generation != expected_restart_generation {
-        return Err(());
-    }
-    session.metadata.backend = Some("opencode".to_string());
-    session.metadata.backend_session_id = Some(new_session_id.to_string());
-    session.metadata.opencode_binding =
-        Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged);
-    session.metadata.restart_generation = session.metadata.restart_generation.saturating_add(1);
-    if session
-        .metadata
-        .backend_repair_reservation
-        .as_ref()
-        .is_some_and(|reservation| {
-            reservation.restart_generation == session.metadata.restart_generation
-                && reservation.phase == crate::daemon_protocol::BackendRepairPhase::Staged
+    state
+        .with_backend_binding_transition(&owner.session_id, Some(new_session_id), |proto| {
+            let Some(session) = proto.sessions.get_mut(&owner.session_id) else {
+                return Err(());
+            };
+            if session.metadata.session_incarnation != owner.incarnation {
+                return Err(());
+            }
+            if session.metadata.restart_generation != expected_restart_generation {
+                return Err(());
+            }
+            session.metadata.backend = Some("opencode".to_string());
+            session.metadata.backend_session_id = Some(new_session_id.to_string());
+            session.metadata.opencode_binding =
+                Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged);
+            session.metadata.restart_generation =
+                session.metadata.restart_generation.saturating_add(1);
+            if session
+                .metadata
+                .backend_repair_reservation
+                .as_ref()
+                .is_some_and(|reservation| {
+                    reservation.restart_generation == session.metadata.restart_generation
+                        && reservation.phase == crate::daemon_protocol::BackendRepairPhase::Staged
+                })
+            {
+                session.metadata.backend_repair_reservation = None;
+            }
+            if let Some(r) = update.reminder {
+                session.metadata.reminder = Some(r.to_string());
+            }
+            match update.parent_session {
+                ParentSessionOverride::PreservePrevious => {}
+                ParentSessionOverride::SetParent(parent) => {
+                    session.metadata.parent_session = Some(parent);
+                }
+                ParentSessionOverride::NoParent => {
+                    session.metadata.parent_session = None;
+                }
+            }
+            if let Some(policy) = update.idle_policy {
+                session.metadata.idle_policy = Some(policy);
+            }
+            if let Some(m) = update.model {
+                session.metadata.model = Some(m.to_string());
+            }
+            if let Some(e) = update.effort {
+                session.metadata.effort = Some(e.to_string());
+            }
+            if let Err(error) = state.persist_protocol_state(proto) {
+                tracing::warn!("failed to persist soft-restart metadata: {error}");
+            }
+            Ok(())
         })
-    {
-        session.metadata.backend_repair_reservation = None;
-    }
-    if let Some(r) = update.reminder {
-        session.metadata.reminder = Some(r.to_string());
-    }
-    match update.parent_session {
-        ParentSessionOverride::PreservePrevious => {}
-        ParentSessionOverride::SetParent(parent) => {
-            session.metadata.parent_session = Some(parent);
-        }
-        ParentSessionOverride::NoParent => {
-            session.metadata.parent_session = None;
-        }
-    }
-    if let Some(policy) = update.idle_policy {
-        session.metadata.idle_policy = Some(policy);
-    }
-    if let Some(m) = update.model {
-        session.metadata.model = Some(m.to_string());
-    }
-    if let Some(e) = update.effort {
-        session.metadata.effort = Some(e.to_string());
-    }
-    if let Err(error) = state.persist_protocol_state(&proto) {
-        tracing::warn!("failed to persist soft-restart metadata: {error}");
-    }
-    Ok(())
+        .await
 }
 
 #[derive(Default)]
@@ -4348,6 +4489,13 @@ impl SoftRestartOwnerSnapshot {
             incarnation: session.metadata.session_incarnation,
         }
     }
+
+    fn resource_owner(&self) -> crate::daemon_protocol::ResourceOwner {
+        crate::daemon_protocol::ResourceOwner {
+            session_id: self.session_id.clone(),
+            incarnation: self.incarnation,
+        }
+    }
 }
 
 async fn restore_soft_restart_metadata(
@@ -4356,22 +4504,29 @@ async fn restore_soft_restart_metadata(
     failed_session_id: &str,
     previous_metadata: &crate::daemon_protocol::SessionMeta,
 ) {
-    let mut proto = state.protocol.write().await;
-    let Some(session) = proto.sessions.get_mut(name) else {
-        return;
-    };
-    if session.metadata.backend_session_id.as_deref() != Some(failed_session_id) {
-        return;
-    }
-    session.metadata.backend = previous_metadata.backend.clone();
-    session.metadata.backend_session_id = previous_metadata.backend_session_id.clone();
-    session.metadata.opencode_binding = previous_metadata.opencode_binding.clone();
-    session.metadata.model = previous_metadata.model.clone();
-    session.metadata.effort = previous_metadata.effort.clone();
-    session.metadata.restart_generation = previous_metadata.restart_generation;
-    if let Err(error) = state.persist_protocol_state(&proto) {
-        tracing::warn!("failed to persist soft-restart rollback metadata: {error}");
-    }
+    state
+        .with_backend_binding_transition(
+            name,
+            previous_metadata.backend_session_id.as_deref(),
+            |proto| {
+                let Some(session) = proto.sessions.get_mut(name) else {
+                    return;
+                };
+                if session.metadata.backend_session_id.as_deref() != Some(failed_session_id) {
+                    return;
+                }
+                session.metadata.backend = previous_metadata.backend.clone();
+                session.metadata.backend_session_id = previous_metadata.backend_session_id.clone();
+                session.metadata.opencode_binding = previous_metadata.opencode_binding.clone();
+                session.metadata.model = previous_metadata.model.clone();
+                session.metadata.effort = previous_metadata.effort.clone();
+                session.metadata.restart_generation = previous_metadata.restart_generation;
+                if let Err(error) = state.persist_protocol_state(proto) {
+                    tracing::warn!("failed to persist soft-restart rollback metadata: {error}");
+                }
+            },
+        )
+        .await;
 }
 
 async fn failed_soft_restart_commit_rollback_target(
@@ -4392,6 +4547,7 @@ async fn failed_soft_restart_commit_rollback_target(
 
 async fn rollback_pane_after_failed_soft_restart_commit(
     state: &AppState,
+    owner: &SoftRestartOwnerSnapshot,
     pane: &str,
     project_dir: &str,
     port: u16,
@@ -4410,12 +4566,13 @@ async fn rollback_pane_after_failed_soft_restart_commit(
     };
 
     match respawn_opencode_attach_for_session(
+        state,
+        &owner.resource_owner(),
         pane,
         project_dir,
         &target_session_id,
         port,
         name,
-        &state.http_client,
     )
     .await
     {
@@ -4702,6 +4859,37 @@ async fn respawn_pane_opencode_attach_skew_notice(
 }
 
 async fn respawn_opencode_attach_for_session(
+    state: &AppState,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    pane_id: &str,
+    project_dir: &str,
+    session_id: &str,
+    port: u16,
+    ouija_session_id: &str,
+) -> anyhow::Result<bool> {
+    state
+        .with_owned_pane_claim(owner, pane_id, || async {
+            respawn_opencode_attach_for_session_unchecked(
+                pane_id,
+                project_dir,
+                session_id,
+                port,
+                ouija_session_id,
+                &state.http_client,
+            )
+            .await
+        })
+        .await
+        .unwrap_or_else(|| {
+            Err(anyhow::anyhow!(
+                "session '{}' incarnation {} no longer owns pane '{pane_id}'",
+                owner.session_id,
+                owner.incarnation
+            ))
+        })
+}
+
+async fn respawn_opencode_attach_for_session_unchecked(
     pane_id: &str,
     project_dir: &str,
     session_id: &str,
@@ -4817,8 +5005,28 @@ async fn delete_opencode_session(
     }
 }
 
+async fn delete_owned_opencode_session(
+    state: &std::sync::Arc<AppState>,
+    owner: crate::daemon_protocol::ResourceOwner,
+    port: u16,
+    session_id: &str,
+    context: &str,
+) -> bool {
+    let client = state.http_client.clone();
+    let session_id = session_id.to_string();
+    let context = context.to_string();
+    let session_id_for_guard = session_id.clone();
+    state
+        .with_owned_backend_cleanup(&owner, &session_id_for_guard, move || async move {
+            delete_opencode_session(&client, port, &session_id, &context).await
+        })
+        .await
+        .unwrap_or(false)
+}
+
 async fn setup_shared_serve_session(
     state: &std::sync::Arc<AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
     pane_id: &str,
     project_dir: &str,
 ) -> anyhow::Result<String> {
@@ -4922,8 +5130,9 @@ async fn setup_shared_serve_session(
         match launch_opencode_attach_for_session(pane_id, project_dir, &session_id, port).await {
             Ok(ready) => ready,
             Err(e) => {
-                delete_opencode_session(
-                    &state.http_client,
+                delete_owned_opencode_session(
+                    state,
+                    owner.clone(),
                     port,
                     &session_id,
                     "shared serve attach cleanup",
@@ -4936,8 +5145,9 @@ async fn setup_shared_serve_session(
     match shared_serve_session_after_attach(session_id.clone(), attach_ready, pane_id) {
         Ok(session_id) => Ok(session_id),
         Err(e) => {
-            delete_opencode_session(
-                &state.http_client,
+            delete_owned_opencode_session(
+                state,
+                owner.clone(),
                 port,
                 &session_id,
                 "shared serve attach cleanup",

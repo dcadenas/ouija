@@ -3387,15 +3387,14 @@ pub async fn bind_backend_identity(
         );
     };
 
-    let result = {
-        let mut protocol = state.protocol.write().await;
-        protocol.bind_backend_identity(&body.target_session_id, &identity, Some(launch_credential))
-    };
-    // Bind mutates only under the protocol lock. Persistence/broadcast effects
-    // run afterward, matching AppState::apply_and_execute's lock discipline.
-    if !result.effects.is_empty() {
-        state.execute_effects(&result.effects).await;
-    }
+    let result = state
+        .bind_backend_identity(
+            &body.target_session_id,
+            &identity,
+            Some(launch_credential),
+            None,
+        )
+        .await;
     match result.outcome {
         crate::daemon_protocol::BackendIdentityBindOutcome::Bound { session_id } => (
             StatusCode::OK,
@@ -4526,35 +4525,29 @@ async fn commit_opencode_adoption_if_unchanged(
     candidate: OpenCodeAdoptionCandidate,
     backend_sid: &str,
 ) -> Option<String> {
-    let effects = {
-        let mut proto = state.protocol.write().await;
-        let unchanged = proto
-            .sessions
-            .get(&candidate.session_id)
-            .is_some_and(|session| {
-                matches!(session.origin, crate::daemon_protocol::Origin::Local)
-                    && session.metadata.backend == candidate.backend
-                    && session.metadata.backend_session_id == candidate.backend_session_id
-                    && session.metadata.session_start_credential
-                        == candidate.session_start_credential
-                    && session.metadata.session_incarnation == candidate.incarnation
-            });
-        if unchanged {
-            proto.apply(crate::daemon_protocol::Event::AdoptBackend {
-                id: candidate.session_id.clone(),
-                backend: "opencode".into(),
-                backend_session_id: backend_sid.to_string(),
-                expected_backend_session_id: candidate.backend_session_id.clone(),
-                expected_session_start_credential: candidate.session_start_credential.clone(),
-            })
-        } else {
-            vec![]
-        }
+    let owner = crate::daemon_protocol::ResourceOwner {
+        session_id: candidate.session_id.clone(),
+        incarnation: candidate.incarnation,
     };
+    let event = crate::daemon_protocol::Event::AdoptBackend {
+        id: candidate.session_id.clone(),
+        backend: "opencode".into(),
+        backend_session_id: backend_sid.to_string(),
+        expected_backend_session_id: candidate.backend_session_id.clone(),
+        expected_session_start_credential: candidate.session_start_credential.clone(),
+    };
+    let effects = state
+        .apply_owned_event_if(&owner, event, |session| {
+            matches!(session.origin, crate::daemon_protocol::Origin::Local)
+                && session.metadata.backend == candidate.backend
+                && session.metadata.backend_session_id == candidate.backend_session_id
+                && session.metadata.session_start_credential == candidate.session_start_credential
+                && session.metadata.session_incarnation == candidate.incarnation
+        })
+        .await;
     if effects.is_empty() {
         return None;
     }
-    state.execute_effects(&effects).await;
     let proto = state.protocol.read().await;
     matches!(
         resolve_opencode_backend_identity(&proto, backend_sid),

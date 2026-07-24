@@ -882,15 +882,12 @@ pub enum Effect {
 
     // Tmux
     SetTmuxVar {
+        owner: ResourceOwner,
         pane: String,
         name: String,
         value: String,
     },
     ClearTmuxVar {
-        pane: String,
-        name: String,
-    },
-    ClearOwnedTmuxVar {
         owner: ResourceOwner,
         pane: String,
         name: String,
@@ -905,9 +902,6 @@ pub enum Effect {
         name: String,
     },
     EnableAutoRename {
-        pane: String,
-    },
-    EnableOwnedAutoRename {
         owner: ResourceOwner,
         pane: String,
     },
@@ -1055,6 +1049,7 @@ pub enum Effect {
         reason: String,
     },
     ProvisionalRollbackOk {
+        owner: ResourceOwner,
         pane: String,
     },
     CleanupWorktree {
@@ -1862,10 +1857,12 @@ impl DaemonState {
                         if old_pane != new_pane {
                             let old_owner = existing.owner();
                             effects.push(Effect::ClearTmuxVar {
+                                owner: old_owner.clone(),
                                 pane: old_pane.clone(),
                                 name: "@ouija_session".into(),
                             });
                             effects.push(Effect::EnableAutoRename {
+                                owner: old_owner.clone(),
                                 pane: old_pane.clone(),
                             });
                             effects.push(Effect::StopAgent {
@@ -2051,7 +2048,9 @@ impl DaemonState {
 
         // Tmux effects
         if let Some(ref pane_id) = pane {
+            let owner = self.sessions[&id].owner();
             effects.push(Effect::SetTmuxVar {
+                owner: owner.clone(),
                 pane: pane_id.clone(),
                 name: "@ouija_session".into(),
                 value: id.clone(),
@@ -2061,9 +2060,16 @@ impl DaemonState {
             // on Remove so the reaper skips dead-but-not-yet-destroyed panes
             // during kill-session's graceful-exit window.
             effects.push(Effect::SetTmuxVar {
+                owner: owner.clone(),
                 pane: pane_id.clone(),
                 name: "@ouija_id".into(),
                 value: id.clone(),
+            });
+            effects.push(Effect::SetTmuxVar {
+                owner,
+                pane: pane_id.clone(),
+                name: "@ouija_incarnation".into(),
+                value: incarnation.to_string(),
             });
         }
 
@@ -2247,6 +2253,7 @@ impl DaemonState {
         if old_pane != pane {
             if let Some(old_pane) = old_pane {
                 effects.push(Effect::ClearTmuxVar {
+                    owner: owner.clone(),
                     pane: old_pane.clone(),
                     name: "@ouija_session".into(),
                 });
@@ -2254,19 +2261,30 @@ impl DaemonState {
                     owner: owner.clone(),
                     pane: old_pane.clone(),
                 });
-                effects.push(Effect::EnableAutoRename { pane: old_pane });
+                effects.push(Effect::EnableAutoRename {
+                    owner: owner.clone(),
+                    pane: old_pane,
+                });
             }
         }
         if let Some(pane) = pane {
             effects.push(Effect::SetTmuxVar {
+                owner: owner.clone(),
                 pane: pane.clone(),
                 name: "@ouija_session".into(),
                 value: id.clone(),
             });
             effects.push(Effect::SetTmuxVar {
+                owner: owner.clone(),
                 pane: pane.clone(),
                 name: "@ouija_id".into(),
                 value: id.clone(),
+            });
+            effects.push(Effect::SetTmuxVar {
+                owner: owner.clone(),
+                pane: pane.clone(),
+                name: "@ouija_incarnation".into(),
+                value: owner.incarnation.to_string(),
             });
             effects.push(Effect::SpawnAgent { owner, pane });
         }
@@ -2477,9 +2495,22 @@ impl DaemonState {
 
         if let Some(ref pane_id) = pane {
             effects.push(Effect::SetTmuxVar {
+                owner: new_owner.clone(),
                 pane: pane_id.clone(),
                 name: "@ouija_session".into(),
                 value: new_id.to_string(),
+            });
+            effects.push(Effect::SetTmuxVar {
+                owner: new_owner.clone(),
+                pane: pane_id.clone(),
+                name: "@ouija_id".into(),
+                value: new_id.to_string(),
+            });
+            effects.push(Effect::SetTmuxVar {
+                owner: new_owner.clone(),
+                pane: pane_id.clone(),
+                name: "@ouija_incarnation".into(),
+                value: new_owner.incarnation.to_string(),
             });
         }
 
@@ -2564,12 +2595,12 @@ impl DaemonState {
             effects.push(Effect::HoldAutoregister {
                 pane: pane_id.clone(),
             });
-            effects.push(Effect::ClearOwnedTmuxVar {
+            effects.push(Effect::ClearTmuxVar {
                 owner: owner.clone(),
                 pane: pane_id.clone(),
                 name: "@ouija_session".into(),
             });
-            effects.push(Effect::EnableOwnedAutoRename {
+            effects.push(Effect::EnableAutoRename {
                 owner: owner.clone(),
                 pane: pane_id.clone(),
             });
@@ -2685,6 +2716,7 @@ impl DaemonState {
         if !still_staged {
             return vec![];
         }
+        let staged_owner = self.sessions[id].owner();
 
         let kill_provisional_pane = previous
             .as_ref()
@@ -2696,6 +2728,7 @@ impl DaemonState {
         };
         if kill_provisional_pane {
             effects.push(Effect::ProvisionalRollbackOk {
+                owner: staged_owner,
                 pane: pane.to_string(),
             });
         }
@@ -2738,6 +2771,10 @@ impl DaemonState {
             && restore_pane.as_deref() != Some(provisional_pane)
         {
             effects.push(Effect::ProvisionalRollbackOk {
+                owner: ResourceOwner {
+                    session_id: id.to_string(),
+                    incarnation: staged_incarnation,
+                },
                 pane: provisional_pane.to_string(),
             });
         }
@@ -3228,17 +3265,22 @@ impl DaemonState {
             });
 
             if let Some(ref pane_id) = session.pane {
-                effects.push(Effect::ClearOwnedTmuxVar {
+                effects.push(Effect::ClearTmuxVar {
                     owner: owner.clone(),
                     pane: pane_id.clone(),
                     name: "@ouija_session".into(),
                 });
-                effects.push(Effect::ClearOwnedTmuxVar {
+                effects.push(Effect::ClearTmuxVar {
                     owner: owner.clone(),
                     pane: pane_id.clone(),
                     name: "@ouija_id".into(),
                 });
-                effects.push(Effect::EnableOwnedAutoRename {
+                effects.push(Effect::ClearTmuxVar {
+                    owner: owner.clone(),
+                    pane: pane_id.clone(),
+                    name: "@ouija_incarnation".into(),
+                });
+                effects.push(Effect::EnableAutoRename {
                     owner: owner.clone(),
                     pane: pane_id.clone(),
                 });
@@ -5759,10 +5801,25 @@ mod tests {
         assert!(
             effects.iter().any(|e| matches!(
                 e,
-                Effect::SetTmuxVar { name, value, pane }
+                Effect::SetTmuxVar { name, value, pane, .. }
                     if name == "@ouija_id" && value == "pat-paral" && pane == "%1"
             )),
             "Register must emit SetTmuxVar for @ouija_id, got: {effects:?}"
+        );
+        let incarnation = state.sessions["pat-paral"]
+            .metadata
+            .session_incarnation
+            .to_string();
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::SetTmuxVar { owner, name, value, pane }
+                    if owner == &state.sessions["pat-paral"].owner()
+                        && name == "@ouija_incarnation"
+                        && value == &incarnation
+                        && pane == "%1"
+            )),
+            "Register must stamp the exact pane incarnation, got: {effects:?}"
         );
     }
 
@@ -5799,7 +5856,7 @@ mod tests {
         assert!(
             effects.iter().any(|e| matches!(
                 e,
-                Effect::ClearOwnedTmuxVar { name, .. } if name == "@ouija_session"
+                Effect::ClearTmuxVar { name, .. } if name == "@ouija_session"
             )),
             "Remove must still clear @ouija_session, got: {effects:?}"
         );
@@ -6113,7 +6170,7 @@ mod tests {
         let kills: Vec<_> = effects
             .iter()
             .filter_map(|effect| match effect {
-                Effect::ProvisionalRollbackOk { pane } => Some(pane.as_str()),
+                Effect::ProvisionalRollbackOk { pane, .. } => Some(pane.as_str()),
                 _ => None,
             })
             .collect();
@@ -6279,7 +6336,7 @@ mod tests {
         assert!(
             effects.iter().any(|e| matches!(
                 e,
-                Effect::ClearOwnedTmuxVar { pane, name, .. }
+                Effect::ClearTmuxVar { pane, name, .. }
                     if pane == "%2" && name == "@ouija_id"
             )),
             "the reaper has proved this pane dead, so its stale autoregister marker must be released"
@@ -8856,7 +8913,7 @@ mod tests {
 
         assert_eq!(state.sessions["legacy"], previous);
         assert!(effects.iter().any(
-            |effect| matches!(effect, Effect::ProvisionalRollbackOk { pane } if pane == "%fallback")
+            |effect| matches!(effect, Effect::ProvisionalRollbackOk { pane, .. } if pane == "%fallback")
         ));
     }
 

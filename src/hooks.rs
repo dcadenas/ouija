@@ -489,19 +489,7 @@ async fn apply_existing_hook_event(
     owner: &crate::daemon_protocol::ResourceOwner,
     event: crate::daemon_protocol::Event,
 ) -> Vec<crate::daemon_protocol::Effect> {
-    let effects = {
-        let mut protocol = state.protocol.write().await;
-        if protocol
-            .sessions
-            .get(&owner.session_id)
-            .is_none_or(|session| session.owner() != *owner)
-        {
-            return vec![];
-        }
-        protocol.apply(event)
-    };
-    state.execute_effects(&effects).await;
-    effects
+    state.apply_owned_event(owner, event).await
 }
 
 async fn session_start_inner(
@@ -527,23 +515,9 @@ async fn session_start_inner(
                 "output": "",
             });
         }
-        let result = {
-            let mut protocol = state.protocol.write().await;
-            if protocol
-                .sessions
-                .get(launch_id)
-                .is_none_or(|session| session.metadata.session_incarnation != incarnation)
-            {
-                return json!({
-                    "skipped": "paneless SessionStart incarnation mismatch",
-                    "output": "",
-                });
-            }
-            protocol.bind_backend_identity(launch_id, &identity, Some(credential))
-        };
-        if !result.effects.is_empty() {
-            state.execute_effects(&result.effects).await;
-        }
+        let result = state
+            .bind_backend_identity(launch_id, &identity, Some(credential), Some(incarnation))
+            .await;
         return match result.outcome {
             crate::daemon_protocol::BackendIdentityBindOutcome::Bound { session_id }
             | crate::daemon_protocol::BackendIdentityBindOutcome::AlreadyBound { session_id } => {
