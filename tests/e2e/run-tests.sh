@@ -625,8 +625,10 @@ L2_PANE=$(session_field "$BASE" "lifecycle-test" "pane")
 L2_PANE_PID=$(tmux display-message -t "$L2_PANE" -p '#{pane_pid}')
 L2_PHYSICAL_SESSION=$(tr '\0' '\n' <"/proc/$L2_PANE_PID/environ" | sed -n 's/^OUIJA_SESSION_ID=//p')
 L2_PHYSICAL_INCARNATION=$(tr '\0' '\n' <"/proc/$L2_PANE_PID/environ" | sed -n 's/^OUIJA_SESSION_INCARNATION=//p')
+L2_MARKER_INCARNATION=$(tmux display-message -t "$L2_PANE" -p '#{@ouija_incarnation}')
 assert_eq "L2: respawn exports session ID" "$L2_PHYSICAL_SESSION" "lifecycle-test"
 assert_eq "L2: respawn exports committed incarnation" "$L2_PHYSICAL_INCARNATION" "$L2_INCARNATION_AFTER"
+assert_eq "L2: respawn publishes committed incarnation marker" "$L2_MARKER_INCARNATION" "$L2_INCARNATION_AFTER"
 
 log "Test L3: Kill session via REST API"
 # The incarnation wait above proves the asynchronous same-ID restart committed.
@@ -699,8 +701,10 @@ L6C_PANE_AFTER=$(session_field "$BASE" "meta-restart" "pane")
 L6C_INCARNATION_AFTER=$(persisted_session_incarnation "meta-restart")
 L6C_PANE_PID=$(tmux display-message -t "$L6C_PANE_AFTER" -p '#{pane_pid}')
 L6C_PHYSICAL_INCARNATION=$(tr '\0' '\n' <"/proc/$L6C_PANE_PID/environ" | sed -n 's/^OUIJA_SESSION_INCARNATION=//p')
+L6C_MARKER_INCARNATION=$(tmux display-message -t "$L6C_PANE_AFTER" -p '#{@ouija_incarnation}')
 assert_eq "L6c: restart reuses the managed pane" "$L6C_PANE_AFTER" "$L6C_PANE_BEFORE"
 assert_eq "L6c: pane exports the committed incarnation" "$L6C_PHYSICAL_INCARNATION" "$L6C_INCARNATION_AFTER"
+assert_eq "L6c: pane marker matches committed incarnation" "$L6C_MARKER_INCARNATION" "$L6C_INCARNATION_AFTER"
 
 log "Test L6d: Restart pane runs correct command"
 L6D_PANE=$(session_field "$BASE" "meta-restart" "pane")
