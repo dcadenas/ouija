@@ -148,18 +148,20 @@ ouija clear-reply SENDER_ID
 
 ## 7. Non-tmux contexts (opencode HTTP API, etc.)
 
-The CLI infers your session ID from `$TMUX_PANE`. In engines whose bash tool runs outside tmux, that variable is unset and `ouija ask/tell/reply` cannot resolve a sender automatically.
+The CLI infers your session ID from `$TMUX_PANE`. In engines whose bash tool runs outside tmux, that variable may be unset and implicit `ouija ask/tell/reply` cannot always resolve a sender automatically.
 
-Run `ouija whoami` to learn your own id. It resolves through the same signals the send commands use, prints the id on stdout, and fails loudly with per-signal diagnostics when it cannot identify you.
+Run `ouija whoami` to learn your own id when automatic identity evidence is available. It resolves through the same signals implicit sends use, prints the id on stdout, and fails loudly with per-signal diagnostics when it cannot identify you. Implicit `ouija whoami` remains fail-closed when pane, environment, or backend identity cannot prove one Local owner.
 
-Use only an exact id as the sender: the output of `ouija whoami`, your `$OUIJA_SESSION_ID`, or the id in your injected system prompt (`You are session "<id>" on the ouija mesh`). Never guess a sender id — not the project directory name, a branch name, or an entry picked from `ouija ls` (`ouija ls` shows all sessions but cannot tell you which one is you). A guessed `--from` impersonates another session and misroutes its replies; the daemon rejects claims it can disprove, but only an exact id is safe.
+For an explicit local send, an exact injected or operator-provided public Local session id is authoritative even when `ouija whoami` has missing, not-found, or incomplete backend evidence. Use that exact id with `--from`. The daemon requires it to name an existing Local session and rejects the send if pane, environment, or a complete backend pair positively resolves the caller to a different Local session.
+
+Use only an exact public id as the sender: the output of `ouija whoami`, your `$OUIJA_SESSION_ID`, the id in your injected system prompt (`You are session "<id>" on the ouija mesh`), or an exact id explicitly provided by the operator. Never guess a sender id — not the project directory name, a branch name, or an entry picked from `ouija ls` (`ouija ls` shows all sessions but cannot tell you which one is you). A guessed `--from` impersonates another session and misroutes its replies.
 
 Never use `opencode` or an OpenCode `backend_session_id` as `--from`. Those are backend implementation details, not public Ouija route targets.
 
 Two ways to provide the public Ouija sender id explicitly:
 
 ```bash
-# Per-command flag (id from `ouija whoami`, never a guess):
+# Per-command flag (exact public Local id, never a guess):
 ouija ask target-id "question" --from public-ouija-id
 ouija tell target-id "fyi" --from public-ouija-id
 ouija reply target-id 47 "result" --from public-ouija-id
@@ -169,7 +171,7 @@ export OUIJA_SESSION_ID=public-ouija-id
 ouija ask target-id "question"
 ```
 
-If you see an error about being unable to resolve the current session ID, run `ouija whoami` and follow its diagnostics. **Never run `ouija register` to "fix" this** — it would create a duplicate session entry, not register the caller.
+If implicit resolution fails and you do not have an exact injected or operator-provided public Local id, run `ouija whoami` and relay its diagnostics. **Never run `ouija register` to "fix" this** — it would create a duplicate session entry, not register the caller.
 
 ## 8. Patterns
 

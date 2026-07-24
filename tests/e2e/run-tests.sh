@@ -1561,6 +1561,100 @@ assert_eq "35b: mismatched explicit sender exits non-zero" "$rc" "1"
 assert_contains "35b: mismatch names canonical sender" "$err" "paneless-codex"
 api "$BASE" POST /api/remove -d '{"id":"paneless-codex"}' >/dev/null
 
+log "Test 35c: explicit Local sender survives Codex thread rollover"
+identity_rollover_cleanup() {
+    for id in hub-4 legacy-backend-only rollover-sibling; do
+        api "$BASE" POST /api/remove -d "{\"id\":\"$id\"}" >/dev/null 2>&1 || true
+    done
+    api "$BASE" DELETE /api/humans -d '{"name":"rollover-human"}' >/dev/null 2>&1 || true
+}
+trap identity_rollover_cleanup EXIT
+
+# Reproduce the observed shape: the public Local row still owns the old Codex
+# thread, a backend-only legacy row overlaps the backend name, and the
+# replacement process presents a new CODEX_THREAD_ID.
+api "$BASE" POST /api/register \
+    -d '{"id":"hub-4","backend":"codex-cli","backend_session_id":"old-thread"}' >/dev/null
+api "$BASE" POST /api/register \
+    -d '{"id":"legacy-backend-only","backend":"codex-cli"}' >/dev/null
+
+# Implicit inference remains fail-closed: neither the stale complete pair nor
+# a backend-only legacy row can identify the replacement thread.
+set +e
+err=$(env -u TMUX_PANE -u OUIJA_SESSION_ID CODEX_THREAD_ID=new-thread \
+    OUIJA_PORT=$PORT ouija whoami 2>&1)
+rc=$?
+set -e
+assert_eq "35c: implicit rollover whoami exits non-zero" "$rc" "1"
+assert_contains "35c: implicit rollover reports not_found" "$err" "not_found"
+
+# The exact injected/operator-provided public Local id is authoritative. Both
+# not_found backend evidence and entirely missing backend evidence are absence
+# of proof, not sibling proof.
+set +e
+out=$(env -u TMUX_PANE -u OUIJA_SESSION_ID CODEX_THREAD_ID=new-thread \
+    OUIJA_PORT=$PORT ouija tell sess-b "explicit rollover sender" --from hub-4 2>&1)
+rc=$?
+set -e
+assert_eq "35c: explicit rollover send exits zero" "$rc" "0"
+assert_contains "35c: explicit rollover send delivered" "$out" "delivered"
+set +e
+out=$(env -u TMUX_PANE -u OUIJA_SESSION_ID -u CODEX_THREAD_ID \
+    OUIJA_PORT=$PORT ouija tell sess-b "explicit sender without observations" --from hub-4 2>&1)
+rc=$?
+set -e
+assert_eq "35c: explicit send with missing evidence exits zero" "$rc" "0"
+assert_contains "35c: explicit send with missing evidence delivered" "$out" "delivered"
+
+# Positive evidence for a different Local session vetoes the explicit claim.
+set +e
+err=$(env -u OUIJA_SESSION_ID -u CODEX_THREAD_ID TMUX_PANE="$PANE_B" \
+    OUIJA_PORT=$PORT ouija tell sess-b "pane conflict" --from hub-4 2>&1)
+rc=$?
+set -e
+assert_eq "35c: pane sibling conflict exits non-zero" "$rc" "1"
+assert_contains "35c: pane conflict names sibling" "$err" "sess-b"
+
+set +e
+err=$(env -u TMUX_PANE -u CODEX_THREAD_ID OUIJA_SESSION_ID=sess-b \
+    OUIJA_PORT=$PORT ouija tell sess-b "environment conflict" --from hub-4 2>&1)
+rc=$?
+set -e
+assert_eq "35c: environment sibling conflict exits non-zero" "$rc" "1"
+assert_contains "35c: environment conflict names sibling" "$err" "sess-b"
+
+api "$BASE" POST /api/register \
+    -d '{"id":"rollover-sibling","backend":"codex-cli","backend_session_id":"new-thread"}' >/dev/null
+set +e
+err=$(env -u TMUX_PANE -u OUIJA_SESSION_ID CODEX_THREAD_ID=new-thread \
+    OUIJA_PORT=$PORT ouija tell sess-b "backend conflict" --from hub-4 2>&1)
+rc=$?
+set -e
+assert_eq "35c: backend sibling conflict exits non-zero" "$rc" "1"
+assert_contains "35c: backend conflict names sibling" "$err" "rollover-sibling"
+
+# Explicit claims must still name an existing Local session.
+api "$BASE" POST /api/humans \
+    -d '{"name":"rollover-human","npub":"npub1rolloverhuman"}' >/dev/null
+set +e
+err=$(env -u TMUX_PANE -u OUIJA_SESSION_ID -u CODEX_THREAD_ID \
+    OUIJA_PORT=$PORT ouija tell sess-b "human origin" --from rollover-human 2>&1)
+rc=$?
+set -e
+assert_eq "35c: Human-origin claim exits non-zero" "$rc" "1"
+assert_contains "35c: Human-origin rejection names origin" "$err" "human"
+
+set +e
+err=$(env -u TMUX_PANE -u OUIJA_SESSION_ID -u CODEX_THREAD_ID \
+    OUIJA_PORT=$PORT ouija tell sess-b "absent sender" --from absent-rollover-sender 2>&1)
+rc=$?
+set -e
+assert_eq "35c: absent explicit sender exits non-zero" "$rc" "1"
+assert_contains "35c: absent sender rejection explains registration" "$err" "not registered"
+
+identity_rollover_cleanup
+trap - EXIT
+
 # ── Daemon logs ──────────────────────────────────────────────────────
 log "Daemon logs:"
 cat /tmp/ouija-test/daemon.log 2>/dev/null || true

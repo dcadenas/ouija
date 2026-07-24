@@ -290,19 +290,19 @@ mod tests {
             !embedded::PLUGIN_TS.contains("<public-ouija-id>"),
             "bare placeholder invites substituting a guessed id; it must be gone"
         );
-        // Fail-closed policy (#1395 review f0, option B): while the id is
-        // unresolved the daemon rejects sends even with a correct hand-typed
-        // --from, so the prompt must say the fix is the environment, not
-        // retrying with another id.
         assert!(
             embedded::PLUGIN_TS.contains("fail-closed"),
-            "OpenCode prompt must explain the daemon fail-closes sends while \
-             the caller's identity is unresolved"
+            "OpenCode prompt must preserve fail-closed implicit whoami guidance"
         );
         assert!(
-            embedded::PLUGIN_TS.contains("even a correct"),
-            "OpenCode prompt must warn that even a correct id is rejected \
-             until identity resolves"
+            embedded::PLUGIN_TS
+                .contains("exact injected or operator-provided public Local session id"),
+            "OpenCode prompt must allow an authoritative explicit Local id even when implicit \
+             whoami is unresolved"
+        );
+        assert!(
+            !embedded::PLUGIN_TS.contains("even a correct hand-typed"),
+            "OpenCode prompt must not claim authoritative explicit Local ids are refused"
         );
     }
 
@@ -323,6 +323,15 @@ mod tests {
         assert!(
             !embedded::SKILL_MD.contains("such as `hub` or `feat/123-worker`"),
             "the old example read as an invitation to invent a plausible-looking id"
+        );
+        assert!(
+            embedded::SKILL_MD
+                .contains("exact injected or operator-provided public Local session id"),
+            "skill must distinguish authoritative explicit Local ids from guesses"
+        );
+        assert!(
+            embedded::SKILL_MD.contains("Implicit `ouija whoami` remains fail-closed"),
+            "skill must keep unresolved implicit identity separate from explicit Local claims"
         );
     }
 

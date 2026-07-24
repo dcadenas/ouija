@@ -176,13 +176,20 @@ Codex learns the mesh two complementary ways:
    For generated or multi-line text, use `--stdin` or `--message-file` instead
    of putting the message body in shell quotes.
 
-   `--from <your-public-id>` is included as a visible fallback. Normally commands
-   without it resolve through `ouija whoami`: if `TMUX_PANE` and
+   `--from <your-public-id>` is an authoritative explicit-local path when the
+   id came from this injected context or was provided exactly by the operator.
+   It remains valid across a replacement Codex thread when the daemon still
+   records the public Local session against the old thread. Missing, not-found,
+   or incomplete backend evidence does not invalidate the explicit claim. The
+   daemon still requires the claimed id to exist with Local origin and rejects
+   pane, environment, or complete backend evidence that resolves to a sibling.
+
+   Commands without `--from` resolve through `ouija whoami`: if `TMUX_PANE` and
    `OUIJA_SESSION_ID` are absent, the Codex adapter presents its native thread
    identity to the daemon, which returns the canonical public id only for an
-   exact stored `(backend, session_id)` pair. A supplied `--from` must equal that
-   canonical id; a raw Codex thread id or a sibling session id is rejected before
-   sending.
+   exact stored `(backend, session_id)` pair. This implicit path remains
+   fail-closed. A raw Codex thread id, guessed project/branch id, Remote/Human
+   id, or sibling Local id is never a valid explicit sender.
    `ouija ask` is not a synchronous wait operation: it returns after delivery, and
    the eventual reply is pushed into the asking session later as a `<msg ... re>`
    message. A Codex session with no other work should end its turn after asking,
@@ -261,11 +268,14 @@ cargo test scheduler::tests::revived_codex_ --bin ouija
 tests/e2e/run-e2e.sh local
 ```
 
-The local e2e suite verifies that a Codex caller with `TMUX_PANE` and
-`OUIJA_SESSION_ID` absent resolves via its backend identity, can send implicitly,
-and cannot override that identity with a mismatched `--from`. It also retains the
-Claude tmux-path regression checks; `tests/e2e/run-e2e.sh opencode` remains the
-focused HTTP-backend regression suite. On 2026-07-13, installed `codex-cli
+The local e2e suite verifies both identity paths. A Codex caller with
+`TMUX_PANE` and `OUIJA_SESSION_ID` absent resolves implicitly only through an
+exact backend pair. An exact injected/operator-provided public Local `--from`
+survives native-thread rollover and missing, not-found, or incomplete backend
+evidence, while sibling pane/environment/backend conflicts and non-Local claims
+are rejected. The suite also retains the Claude tmux-path regression checks;
+`tests/e2e/run-e2e.sh opencode` remains the focused HTTP-backend regression
+suite. On 2026-07-13, installed `codex-cli
 0.144.1` accepted the generated `hooks.SessionStart` and matching
 `hooks.state."<session-flags>/config.toml:session_start:0:0".trusted_hash`
 configuration under `--strict-config`.
