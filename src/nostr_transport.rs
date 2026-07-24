@@ -1614,21 +1614,24 @@ async fn kill_session_inner(
             tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
                 use std::process::Command;
 
-                let require_pane_owner = || -> anyhow::Result<()> {
+                let pane_still_owned = || -> anyhow::Result<bool> {
                     if !runtime
                         .block_on(state_for_kill.owns_stopping_session(&pane_owner, &pane_for_kill))
                     {
                         anyhow::bail!("stop authority changed before backend exit");
                     }
-                    if !crate::tmux::inspect_pane_owner(&pane_for_kill)?
-                        .as_ref()
-                        .is_some_and(|observed| {
-                            crate::tmux::physical_owner_matches(observed, &pane_owner)
-                        })
-                    {
-                        anyhow::bail!("pane owner changed before backend exit");
+                    match crate::tmux::inspect_managed_pane(&pane_for_kill)? {
+                        crate::tmux::ManagedPaneInspection::Missing => Ok(false),
+                        crate::tmux::ManagedPaneInspection::Managed(observed)
+                            if crate::tmux::physical_owner_matches(&observed, &pane_owner) =>
+                        {
+                            Ok(true)
+                        }
+                        crate::tmux::ManagedPaneInspection::Managed(_)
+                        | crate::tmux::ManagedPaneInspection::Unmanaged => {
+                            anyhow::bail!("pane owner changed before backend exit");
+                        }
                     }
-                    Ok(())
                 };
                 let process_alive = |pid: u32| -> anyhow::Result<bool> {
                     Ok(Command::new("kill")
@@ -1637,30 +1640,50 @@ async fn kill_session_inner(
                         .success())
                 };
                 let kill_owned_pane = || -> anyhow::Result<()> {
-                    require_pane_owner()?;
+                    if !pane_still_owned()? {
+                        return Ok(());
+                    }
                     let status = Command::new("tmux")
                         .args(["kill-pane", "-t", &pane_for_kill])
                         .status()?;
-                    let remaining_owner = crate::tmux::inspect_pane_owner(&pane_for_kill)?;
-                    if remaining_owner.as_ref().is_some_and(|observed| {
-                        crate::tmux::physical_owner_matches(observed, &pane_owner)
-                    }) {
-                        anyhow::bail!(
-                            "tmux kill-pane left the owned pane alive (status {status})"
-                        );
-                    }
-                    if remaining_owner.is_some() {
-                        anyhow::bail!("pane owner changed during backend exit");
+                    match crate::tmux::inspect_managed_pane(&pane_for_kill)? {
+                        crate::tmux::ManagedPaneInspection::Missing => {}
+                        crate::tmux::ManagedPaneInspection::Managed(observed)
+                            if crate::tmux::physical_owner_matches(
+                                &observed,
+                                &pane_owner,
+                            ) =>
+                        {
+                            anyhow::bail!(
+                                "tmux kill-pane left the owned pane alive (status {status})"
+                            );
+                        }
+                        crate::tmux::ManagedPaneInspection::Managed(_)
+                        | crate::tmux::ManagedPaneInspection::Unmanaged => {
+                            anyhow::bail!("pane owner changed during backend exit");
+                        }
                     }
                     Ok(())
                 };
 
+                // The HTTP abort can make an attach client exit before local
+                // pane cleanup begins. A truly missing pane is already clean;
+                // a live unmanaged or differently-owned pane still fails closed.
+                if !pane_still_owned()? {
+                    return Ok("pane already exited".to_string());
+                }
+
                 // Get pane PID
-                require_pane_owner()?;
                 let output = Command::new("tmux")
                     .args(["display-message", "-t", &pane_for_kill, "-p", "#{pane_pid}"])
                     .output()?;
                 if !output.status.success() {
+                    if matches!(
+                        crate::tmux::inspect_managed_pane(&pane_for_kill)?,
+                        crate::tmux::ManagedPaneInspection::Missing
+                    ) {
+                        return Ok("pane already exited".to_string());
+                    }
                     anyhow::bail!("could not get pane PID");
                 }
                 let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1721,7 +1744,9 @@ async fn kill_session_inner(
                         // backend may clean up its own worktree during exit.
                         // Go straight to SIGKILL to prevent cleanup handlers.
                         if keep_worktree {
-                            require_pane_owner()?;
+                            if !pane_still_owned()? {
+                                return Ok("pane already exited".to_string());
+                            }
                             let signal_status =
                                 Command::new("kill").args(["-9", &pid.to_string()]).status()?;
                             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -1733,7 +1758,9 @@ async fn kill_session_inner(
                         } else {
                             // Graceful: send exit command if backend supports it
                             if let Some(ref exit) = exit_cmd {
-                                require_pane_owner()?;
+                                if !pane_still_owned()? {
+                                    return Ok("pane already exited".to_string());
+                                }
                                 let _send_status = Command::new("tmux")
                                     .args(["send-keys", "-t", &pane_for_kill, exit, "Enter"])
                                     .status()?;
@@ -1752,7 +1779,9 @@ async fn kill_session_inner(
 
                             if !exited {
                                 // Fallback: SIGTERM
-                                require_pane_owner()?;
+                                if !pane_still_owned()? {
+                                    return Ok("pane already exited".to_string());
+                                }
                                 let _signal_status =
                                     Command::new("kill").arg(pid.to_string()).status()?;
                                 std::thread::sleep(std::time::Duration::from_secs(1));
@@ -1803,7 +1832,11 @@ async fn kill_session_inner(
     ) {
         let _ = state.abort_lifecycle(&owner).await;
         return KillSessionResult::superseded(format!(
-            "session '{name}' pane was replaced before backend exit"
+            "session '{name}' pane was replaced before backend exit: {}",
+            match &kill_result {
+                Ok(Err(error)) => error,
+                _ => unreachable!("matched kill result must contain an inner error"),
+            }
         ));
     }
 

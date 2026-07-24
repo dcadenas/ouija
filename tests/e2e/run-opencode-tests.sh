@@ -63,7 +63,7 @@ OC_PANE=$(tmux display-message -t test -p '#{pane_id}')
 tmux send-keys -t "$OC_PANE" "GOOGLE_GENERATIVE_AI_API_KEY='${GOOGLE_GENERATIVE_AI_API_KEY:-${GEMINI_API_KEY:-}}' opencode serve --port $OPENCODE_PORT --hostname 127.0.0.1" Enter
 
 log "Waiting for opencode to be ready (up to 15s)"
-if ! wait_for 15 curl -sf "$OC_BASE/global/health" -o /dev/null; then
+if ! wait_for 15 curl --connect-timeout 1 --max-time 2 -sf "$OC_BASE/global/health" -o /dev/null; then
     echo "ERROR: opencode serve did not become ready in 15s" >&2
     tmux capture-pane -t "$OC_PANE" -p
     exit 1
@@ -164,7 +164,7 @@ OC_SERVE_PANE=$(tmux display-message -t test -p '#{pane_id}')
 tmux send-keys -t "$OC_SERVE_PANE" "GOOGLE_GENERATIVE_AI_API_KEY='${GOOGLE_GENERATIVE_AI_API_KEY:-${GEMINI_API_KEY:-}}' opencode serve --port $OC_SERVE_PORT --hostname 127.0.0.1" Enter
 
 log "Waiting for opencode serve on port $OC_SERVE_PORT (up to 15s)"
-if ! wait_for 15 curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/global/health" -o /dev/null; then
+if ! wait_for 15 curl --connect-timeout 1 --max-time 2 -sf "http://127.0.0.1:${OC_SERVE_PORT}/global/health" -o /dev/null; then
     echo "ERROR: opencode serve did not become ready on port $OC_SERVE_PORT in 15s" >&2
     tmux capture-pane -t "$OC_SERVE_PANE" -p
     exit 1
@@ -191,11 +191,19 @@ else
     fail "oc-e2e registration" "session exists" "not found in status"
 fi
 
-log "Test 8a: backend field set to opencode"
+log "Test 8a: managed pane markers carry the exact registration incarnation"
+oc_pane=$(echo "$oc_session" | jq -r '.pane // empty')
+oc_incarnation=$(persisted_session_incarnation "oc-e2e")
+assert_eq "pane owner id marker" \
+    "$(tmux display-message -t "$oc_pane" -p '#{@ouija_id}')" "oc-e2e"
+assert_eq "pane owner incarnation marker" \
+    "$(tmux display-message -t "$oc_pane" -p '#{@ouija_incarnation}')" "$oc_incarnation"
+
+log "Test 8b: backend field set to opencode"
 oc_backend=$(echo "$oc_status" | jq -r '.sessions[] | select(.id == "oc-e2e") | .backend // empty')
 assert_eq "backend is opencode" "$oc_backend" "opencode"
 
-log "Test 8b: backend-session readiness endpoint resolves registered session"
+log "Test 8c: backend-session readiness endpoint resolves registered session"
 backend_sid=$(echo "$oc_status" | jq -r '.sessions[] | select(.id == "oc-e2e") | .backend_session_id // empty')
 if [ -n "$backend_sid" ]; then
     bs_resolve=$(curl -sf -X POST "$BASE/api/backend-session/${backend_sid}/ready" \
@@ -209,7 +217,7 @@ else
     fail "backend_session_id" "non-empty value" "empty in status"
 fi
 
-log "Test 8c: ad-hoc opencode session auto-provisions via explicit pane+cwd hints (#35)"
+log "Test 8d: ad-hoc opencode session auto-provisions via explicit pane+cwd hints (#35)"
 # Simulates the enriched opencode plugin POSTing an unknown backend_session_id
 # with TMUX_PANE and cwd in the body. The daemon should auto-provision a
 # fresh session record so the CLI inside the pane can resolve itself.
@@ -295,7 +303,7 @@ log "Test 10: opencode received the prompt_async message"
 # The shared serve port is daemon_port + 320
 OC_SERVE_PORT=$((PORT + 320))
 # Verify it's reachable
-if curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/global/health" -o /dev/null 2>/dev/null; then
+if curl --connect-timeout 1 --max-time 2 -sf "http://127.0.0.1:${OC_SERVE_PORT}/global/health" -o /dev/null 2>/dev/null; then
     if [ -n "$backend_sid" ]; then
         user_text=""
         latest_session=""
@@ -352,7 +360,7 @@ log "Test 10c: second message exercises plugin chat.message hook"
 # This is the exact code path that had the Zod validation bug.
 send2_result=$(api "$BASE" POST /api/send \
     -d '{"from":"test-sender","to":"oc-e2e","message":"What is 1+1? Reply with just the number.","expects_reply":false}')
-if curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/global/health" -o /dev/null 2>/dev/null; then
+if curl --connect-timeout 1 --max-time 2 -sf "http://127.0.0.1:${OC_SERVE_PORT}/global/health" -o /dev/null 2>/dev/null; then
     latest_session=$(curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/session" \
         -H "x-opencode-directory: /tmp" 2>/dev/null \
         | jq -r 'sort_by(.time.updated) | last | .id // empty' 2>/dev/null)
@@ -443,7 +451,7 @@ api "$BASE" POST /api/send \
 sleep 20
 
 # Verify LLM processed it
-if [ -n "$backend_sid2" ] && curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/global/health" -o /dev/null 2>/dev/null; then
+if [ -n "$backend_sid2" ] && curl --connect-timeout 1 --max-time 2 -sf "http://127.0.0.1:${OC_SERVE_PORT}/global/health" -o /dev/null 2>/dev/null; then
     msgs2=$(curl -sf "http://127.0.0.1:${OC_SERVE_PORT}/session/${backend_sid2}/message" \
         -H "x-opencode-directory: /tmp" 2>/dev/null || echo '[]')
     resp2=$(echo "$msgs2" | jq -r '[.[] | select(.info.role == "assistant") | .parts[]? | select(.type == "text") | .text] | join(" ")' 2>/dev/null | tr '[:upper:]' '[:lower:]')

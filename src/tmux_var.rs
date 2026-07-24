@@ -1,13 +1,20 @@
 use std::process::Command;
 
 /// Set a user variable on a tmux pane (`tmux set -pt <pane> <name> <value>`).
-pub fn set(pane: &str, name: &str, value: &str) {
+pub fn set(pane: &str, name: &str, value: &str) -> anyhow::Result<()> {
     if cfg!(test) {
-        return;
+        return Ok(());
     }
-    let _ = Command::new("tmux")
+    let output = Command::new("tmux")
         .args(["set", "-t", pane, "-p", name, value])
-        .status();
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "failed to set tmux pane variable {name} on {pane}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Read the `@ouija_session` user variable from a tmux pane.

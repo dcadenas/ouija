@@ -3242,6 +3242,9 @@ impl AppState {
         name: &str,
         value: &str,
     ) {
+        if cfg!(test) {
+            return;
+        }
         let owner = owner.clone();
         let pane = pane.to_string();
         let name = name.to_string();
@@ -3251,14 +3254,32 @@ impl AppState {
         let _ = self
             .with_owned_pane_claim(&owner_for_guard, &pane_for_guard, move || async move {
                 let _ = tokio::task::spawn_blocking(move || {
-                    let owns_process = crate::tmux::inspect_pane_owner(&pane)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|observed| {
-                            crate::tmux::physical_owner_matches(&observed, &owner)
-                        });
-                    if owns_process {
-                        crate::tmux_var::set(&pane, &name, &value);
+                    let mut last_error = None;
+                    for _ in 0..20 {
+                        match crate::tmux::inspect_managed_pane(&pane) {
+                            Ok(inspection)
+                                if crate::tmux::pane_accepts_owner_marker(&inspection, &owner) =>
+                            {
+                                match crate::tmux_var::set(&pane, &name, &value) {
+                                    Ok(()) => return,
+                                    Err(error) => last_error = Some(error.to_string()),
+                                }
+                            }
+                            Ok(crate::tmux::ManagedPaneInspection::Missing) => {
+                                last_error = Some("pane is not visible yet".to_string());
+                            }
+                            Ok(_) => return,
+                            Err(error) => last_error = Some(error.to_string()),
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    if let Some(error) = last_error {
+                        tracing::warn!(
+                            %pane,
+                            %name,
+                            %error,
+                            "failed to set owned tmux variable"
+                        );
                     }
                 })
                 .await;

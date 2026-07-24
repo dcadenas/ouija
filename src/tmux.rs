@@ -916,10 +916,9 @@ pub fn default_shell() -> String {
 /// `OUIJA_SESSION_ID` is the primary signal the `ouija` CLI uses to resolve
 /// the caller's session identity. Exporting it into the spawned shell closes
 /// three failure modes seen in the wild:
-///   1. The `@ouija_session` tmux pane var is set by a fire-and-forget
-///      `spawn_blocking` effect (see `state.rs` `Effect::SetTmuxVar`) that
-///      is not awaited; a fast `ouija clear-reminder` call from the newly
-///      spawned session can lose this race.
+///   1. The `@ouija_session` tmux pane var is set only after registration
+///      commits, and a newly allocated pane can take a short time to become
+///      visible to the guarded marker writer.
 ///   2. Opencode bash subshells occasionally do not inherit `TMUX_PANE`.
 ///   3. Sessions launched outside tmux (future non-tmux backends) have no
 ///      pane var to read at all.
@@ -965,6 +964,69 @@ fn process_environment_value(environment: &[u8], name: &str) -> Option<String> {
     })
 }
 
+fn tmux_pane_is_absent(stderr: &str) -> bool {
+    stderr.contains("can't find pane")
+        || stderr.contains("no server running")
+        || stderr.contains("failed to connect to server")
+        || stderr.contains("error connecting to ")
+}
+
+fn inspect_pane_format(pane: &str, format: &str) -> anyhow::Result<Option<String>> {
+    match std::process::Command::new("tmux")
+        .args(["display-message", "-p", "-t", pane, format])
+        .output()
+    {
+        Ok(output) if output.status.success() => Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        )),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if tmux_pane_is_absent(&stderr) {
+                Ok(None)
+            } else {
+                anyhow::bail!("tmux pane inspection failed for {pane}: {}", stderr.trim());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ManagedPaneInspection {
+    Missing,
+    Unmanaged,
+    Managed(crate::daemon_protocol::ResourceOwner),
+}
+
+pub(crate) fn pane_accepts_owner_marker(
+    inspection: &ManagedPaneInspection,
+    expected: &crate::daemon_protocol::ResourceOwner,
+) -> bool {
+    match inspection {
+        ManagedPaneInspection::Unmanaged => true,
+        ManagedPaneInspection::Managed(observed) => physical_owner_matches(observed, expected),
+        ManagedPaneInspection::Missing => false,
+    }
+}
+
+fn parse_owner(
+    session_id: &str,
+    incarnation: &str,
+    source: &str,
+) -> anyhow::Result<Option<crate::daemon_protocol::ResourceOwner>> {
+    if session_id.is_empty() || incarnation.is_empty() {
+        return Ok(None);
+    }
+    let incarnation = incarnation.parse::<u64>().map_err(|error| {
+        anyhow::anyhow!("invalid OUIJA_SESSION_INCARNATION from {source}: {incarnation:?}: {error}")
+    })?;
+    Ok(Some(crate::daemon_protocol::ResourceOwner {
+        session_id: session_id.to_string(),
+        incarnation: crate::daemon_protocol::SessionIncarnation(incarnation),
+    }))
+}
+
 /// Inspect the exact lifecycle owner exported into a live managed pane.
 ///
 /// `Ok(None)` means the pane is absent, unmanaged, or belongs to another
@@ -973,34 +1035,36 @@ fn process_environment_value(environment: &[u8], name: &str) -> Option<String> {
 pub fn inspect_pane_owner(
     pane: &str,
 ) -> anyhow::Result<Option<crate::daemon_protocol::ResourceOwner>> {
-    let inspection = std::process::Command::new("tmux")
-        .args(["display-message", "-p", "-t", pane, "#{pane_pid}"])
-        .output();
-    let pane_pid = match inspection {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if stderr.contains("can't find pane")
-                || stderr.contains("no server running")
-                || stderr.contains("failed to connect to server")
-            {
-                return Ok(None);
-            } else {
-                anyhow::bail!("tmux pane inspection failed for {pane}: {}", stderr.trim());
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+    Ok(match inspect_managed_pane(pane)? {
+        ManagedPaneInspection::Managed(owner) => Some(owner),
+        ManagedPaneInspection::Missing | ManagedPaneInspection::Unmanaged => None,
+    })
+}
+
+/// Distinguish a missing pane from a live pane without managed identity.
+pub(crate) fn inspect_managed_pane(pane: &str) -> anyhow::Result<ManagedPaneInspection> {
+    let Some(pane_pid) = inspect_pane_format(pane, "#{pane_pid}")? else {
+        return Ok(ManagedPaneInspection::Missing);
     };
     if pane_pid.is_empty() {
-        return Ok(None);
+        // Some tmux versions return success with an empty format expansion
+        // when the target pane disappeared. A live pane always has a PID.
+        return Ok(ManagedPaneInspection::Missing);
     }
 
+    // Prefer the current process environment when it is available. A managed
+    // respawn replaces the process before its pane markers are refreshed, so
+    // the process carries the newer incarnation during that transition.
     #[cfg(target_os = "linux")]
-    let environment = std::fs::read(format!("/proc/{pane_pid}/environ"))
-        .with_context(|| format!("failed to inspect environment for pane {pane} pid {pane_pid}"))?;
+    let environment = match std::fs::read(format!("/proc/{pane_pid}/environ")) {
+        Ok(environment) => environment,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect environment for pane {pane} pid {pane_pid}")
+            });
+        }
+    };
     #[cfg(not(target_os = "linux"))]
     let environment = {
         let output = std::process::Command::new("ps")
@@ -1019,22 +1083,40 @@ pub fn inspect_pane_owner(
             .collect::<Vec<_>>()
     };
 
-    let Some(session_id) = process_environment_value(&environment, "OUIJA_SESSION_ID") else {
-        return Ok(None);
+    let process_session_id =
+        process_environment_value(&environment, "OUIJA_SESSION_ID").unwrap_or_default();
+    let process_incarnation =
+        process_environment_value(&environment, "OUIJA_SESSION_INCARNATION").unwrap_or_default();
+    if let Some(owner) = parse_owner(
+        &process_session_id,
+        &process_incarnation,
+        &format!("pane {pane} process"),
+    )? {
+        return Ok(ManagedPaneInspection::Managed(owner));
+    }
+
+    // HTTP-backed sessions return to their persistent shell after the backend
+    // attach exits. That shell may not expose the launch environment, while
+    // these daemon-owned pane markers remain bound to the physical pane.
+    let Some(marker_session_id) = inspect_pane_format(pane, "#{@ouija_id}")? else {
+        return Ok(ManagedPaneInspection::Missing);
     };
-    let Some(incarnation) = process_environment_value(&environment, "OUIJA_SESSION_INCARNATION")
-    else {
-        return Ok(None);
+    let Some(marker_incarnation) = inspect_pane_format(pane, "#{@ouija_incarnation}")? else {
+        return Ok(ManagedPaneInspection::Missing);
     };
-    let incarnation = incarnation.parse::<u64>().map_err(|error| {
-        anyhow::anyhow!(
-            "invalid OUIJA_SESSION_INCARNATION in pane {pane}: {incarnation:?}: {error}"
-        )
-    })?;
-    Ok(Some(crate::daemon_protocol::ResourceOwner {
-        session_id,
-        incarnation: crate::daemon_protocol::SessionIncarnation(incarnation),
-    }))
+    if let Some(owner) = parse_owner(
+        &marker_session_id,
+        &marker_incarnation,
+        &format!("pane {pane} markers"),
+    )? {
+        return Ok(ManagedPaneInspection::Managed(owner));
+    }
+
+    if inspect_pane_format(pane, "#{pane_pid}")?.is_none_or(|pid| pid.is_empty()) {
+        return Ok(ManagedPaneInspection::Missing);
+    }
+
+    Ok(ManagedPaneInspection::Unmanaged)
 }
 
 /// Process environments are immutable across a logical session rename. The
@@ -1184,6 +1266,59 @@ mod tests {
             .as_deref(),
             Some("42")
         );
+    }
+
+    #[test]
+    fn missing_tmux_socket_reports_pane_as_absent() {
+        assert!(tmux_pane_is_absent(
+            "error connecting to /tmp/tmux-1001/default (No such file or directory)"
+        ));
+        assert!(!tmux_pane_is_absent("permission denied"));
+    }
+
+    #[test]
+    fn pane_marker_owner_survives_missing_process_identity() {
+        let owner = parse_owner("oc-e2e", "42", "test marker").unwrap().unwrap();
+        assert_eq!(owner.session_id, "oc-e2e");
+        assert_eq!(
+            owner.incarnation,
+            crate::daemon_protocol::SessionIncarnation(42)
+        );
+        assert!(parse_owner("", "42", "partial marker").unwrap().is_none());
+        assert!(
+            parse_owner("oc-e2e", "", "partial marker")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unmanaged_local_pane_accepts_first_owner_marker_but_replacement_does_not() {
+        let expected = crate::daemon_protocol::ResourceOwner {
+            session_id: "oc-e2e".to_string(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(42),
+        };
+        let replacement = crate::daemon_protocol::ResourceOwner {
+            session_id: "oc-e2e".to_string(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(43),
+        };
+
+        assert!(pane_accepts_owner_marker(
+            &ManagedPaneInspection::Unmanaged,
+            &expected
+        ));
+        assert!(pane_accepts_owner_marker(
+            &ManagedPaneInspection::Managed(expected.clone()),
+            &expected
+        ));
+        assert!(!pane_accepts_owner_marker(
+            &ManagedPaneInspection::Managed(replacement),
+            &expected
+        ));
+        assert!(!pane_accepts_owner_marker(
+            &ManagedPaneInspection::Missing,
+            &expected
+        ));
     }
 
     #[test]
