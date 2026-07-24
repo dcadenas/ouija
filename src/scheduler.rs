@@ -1144,6 +1144,7 @@ async fn respawn_and_inject(
             &claim.target_owner,
             Some(pane_id),
             final_metadata,
+            true,
         )
         .await
     {
@@ -1911,6 +1912,7 @@ async fn revive_and_inject(
                 &claim.target_owner,
                 Some(new_pane.clone()),
                 final_metadata,
+                true,
             )
             .await
         {

@@ -703,21 +703,19 @@ const MAX_NAME_SUFFIX: u32 = 100;
 const RECIPROCATE_DEBOUNCE_SECS: u64 = 30;
 const AUTOREGISTER_REMOVE_GRACE_SECS: u64 = 10;
 
-fn write_tmux_var_after_owner_converges<Inspect, Write, Wait>(
+fn wait_for_tmux_owner_convergence<Inspect, Wait>(
     expected_owner: &crate::daemon_protocol::ResourceOwner,
     attempts: usize,
     mut inspect: Inspect,
-    mut write: Write,
     mut wait: Wait,
 ) -> anyhow::Result<()>
 where
     Inspect: FnMut() -> anyhow::Result<crate::tmux::ManagedPaneInspection>,
-    Write: FnMut() -> anyhow::Result<()>,
     Wait: FnMut(),
 {
     anyhow::ensure!(
         attempts > 0,
-        "owned tmux write requires at least one attempt"
+        "tmux owner wait requires at least one attempt"
     );
     let mut last_error = String::new();
 
@@ -726,10 +724,7 @@ where
             Ok(inspection)
                 if crate::tmux::pane_accepts_owner_marker(&inspection, expected_owner) =>
             {
-                match write() {
-                    Ok(()) => return Ok(()),
-                    Err(error) => last_error = error.to_string(),
-                }
+                return Ok(());
             }
             Ok(crate::tmux::ManagedPaneInspection::Missing) => {
                 last_error = "pane is not visible yet".into();
@@ -1813,6 +1808,7 @@ impl AppState {
         target_owner: &crate::daemon_protocol::ResourceOwner,
         pane: Option<String>,
         metadata: crate::daemon_protocol::SessionMeta,
+        physical_respawned: bool,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -1826,6 +1822,7 @@ impl AppState {
             target_owner.clone(),
             pane,
             metadata,
+            physical_respawned,
         ))
     }
 
@@ -1835,6 +1832,7 @@ impl AppState {
         target_owner: crate::daemon_protocol::ResourceOwner,
         pane: Option<String>,
         metadata: crate::daemon_protocol::SessionMeta,
+        physical_respawned: bool,
     ) -> anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome> {
         let resource_event = crate::daemon_protocol::Event::RefreshLaunchMetadata {
             id: target_owner.session_id.clone(),
@@ -1846,7 +1844,13 @@ impl AppState {
         let (outcome, effects) = {
             let mut state = self.protocol.write().await;
             let before = state.clone();
-            let result = state.complete_restart_launch(&lease_owner, &target_owner, pane, metadata);
+            let result = state.complete_restart_launch(
+                &lease_owner,
+                &target_owner,
+                pane,
+                metadata,
+                physical_respawned,
+            );
             if result.outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied
                 && let Err(error) = self.persist_protocol_state(&state)
             {
@@ -2135,6 +2139,9 @@ impl AppState {
                     value,
                 } => {
                     self.set_owned_tmux_var(owner, pane, name, value).await;
+                }
+                Effect::WaitForTmuxOwner { owner, pane } => {
+                    self.wait_for_owned_tmux_owner(owner, pane).await;
                 }
                 Effect::ClearTmuxVar { owner, pane, name } => {
                     self.clear_owned_tmux_var(owner, pane, name).await;
@@ -2487,6 +2494,9 @@ impl AppState {
                     value,
                 } => {
                     self.set_owned_tmux_var(owner, pane, name, value).await;
+                }
+                Effect::WaitForTmuxOwner { owner, pane } => {
+                    self.wait_for_owned_tmux_owner(owner, pane).await;
                 }
                 Effect::ClearTmuxVar { owner, pane, name } => {
                     self.clear_owned_tmux_var(owner, pane, name).await;
@@ -3304,19 +3314,70 @@ impl AppState {
         let owner_for_guard = owner.clone();
         let _ = self
             .with_owned_pane_claim(&owner_for_guard, &pane_for_guard, move || async move {
+                let _ =
+                    tokio::task::spawn_blocking(move || {
+                        match crate::tmux::inspect_managed_pane(&pane) {
+                            Ok(inspection)
+                                if crate::tmux::pane_accepts_owner_marker(&inspection, &owner) =>
+                            {
+                                if let Err(error) = crate::tmux_var::set(&pane, &name, &value) {
+                                    tracing::warn!(
+                                        %pane,
+                                        %name,
+                                        %error,
+                                        "failed to set owned tmux variable"
+                                    );
+                                }
+                            }
+                            Ok(inspection) => {
+                                tracing::warn!(
+                                    %pane,
+                                    %name,
+                                    ?inspection,
+                                    expected_owner = ?owner,
+                                    "refused tmux variable write for conflicting pane owner"
+                                );
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    %pane,
+                                    %name,
+                                    %error,
+                                    "failed to inspect owner before tmux variable write"
+                                );
+                            }
+                        }
+                    })
+                    .await;
+            })
+            .await;
+    }
+
+    async fn wait_for_owned_tmux_owner(
+        &self,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        pane: &str,
+    ) {
+        if cfg!(test) {
+            return;
+        }
+        let owner = owner.clone();
+        let pane = pane.to_string();
+        let pane_for_guard = pane.clone();
+        let owner_for_guard = owner.clone();
+        let _ = self
+            .with_owned_pane_claim(&owner_for_guard, &pane_for_guard, move || async move {
                 let _ = tokio::task::spawn_blocking(move || {
-                    if let Err(error) = write_tmux_var_after_owner_converges(
+                    if let Err(error) = wait_for_tmux_owner_convergence(
                         &owner,
                         20,
                         || crate::tmux::inspect_managed_pane(&pane),
-                        || crate::tmux_var::set(&pane, &name, &value),
                         || std::thread::sleep(std::time::Duration::from_millis(25)),
                     ) {
                         tracing::warn!(
                             %pane,
-                            %name,
                             %error,
-                            "failed to set owned tmux variable"
+                            "respawned pane owner did not converge"
                         );
                     }
                 })
@@ -4074,7 +4135,7 @@ pub(crate) mod tests {
     use crate::daemon_protocol::Origin;
 
     #[test]
-    fn owned_tmux_var_write_waits_for_respawned_owner() {
+    fn tmux_owner_wait_converges_after_respawn() {
         let incumbent = crate::daemon_protocol::ResourceOwner {
             session_id: "worker".into(),
             incarnation: crate::daemon_protocol::SessionIncarnation(41),
@@ -4089,10 +4150,9 @@ pub(crate) mod tests {
             crate::tmux::ManagedPaneInspection::Managed(replacement.clone()),
         ]);
         let mut inspection_count = 0;
-        let mut write_count = 0;
         let mut wait_count = 0;
 
-        write_tmux_var_after_owner_converges(
+        wait_for_tmux_owner_convergence(
             &replacement,
             20,
             || {
@@ -4101,21 +4161,16 @@ pub(crate) mod tests {
                     .pop_front()
                     .expect("test must provide an inspection for each attempt"))
             },
-            || {
-                write_count += 1;
-                Ok(())
-            },
             || wait_count += 1,
         )
         .expect("replacement owner should become writable");
 
         assert_eq!(inspection_count, 3);
-        assert_eq!(write_count, 1);
         assert_eq!(wait_count, 2);
     }
 
     #[test]
-    fn owned_tmux_var_write_never_overwrites_persistent_other_owner() {
+    fn tmux_owner_wait_rejects_persistent_other_owner() {
         let incumbent = crate::daemon_protocol::ResourceOwner {
             session_id: "worker".into(),
             incarnation: crate::daemon_protocol::SessionIncarnation(41),
@@ -4125,10 +4180,9 @@ pub(crate) mod tests {
             incarnation: crate::daemon_protocol::SessionIncarnation(42),
         };
         let mut inspection_count = 0;
-        let mut write_count = 0;
         let mut wait_count = 0;
 
-        let error = write_tmux_var_after_owner_converges(
+        let error = wait_for_tmux_owner_convergence(
             &replacement,
             3,
             || {
@@ -4137,17 +4191,12 @@ pub(crate) mod tests {
                     incumbent.clone(),
                 ))
             },
-            || {
-                write_count += 1;
-                Ok(())
-            },
             || wait_count += 1,
         )
         .expect_err("a persistent conflicting owner must fail closed");
 
         assert!(error.to_string().contains("expected 42"), "{error}");
         assert_eq!(inspection_count, 3);
-        assert_eq!(write_count, 0);
         assert_eq!(wait_count, 2);
     }
 

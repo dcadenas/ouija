@@ -918,6 +918,13 @@ pub enum Effect {
         name: String,
         value: String,
     },
+    /// Wait for an in-place tmux respawn to expose its replacement owner
+    /// before publishing pane markers. Ordinary registration and startup
+    /// restoration never wait on a conflicting physical owner.
+    WaitForTmuxOwner {
+        owner: ResourceOwner,
+        pane: String,
+    },
     ClearTmuxVar {
         owner: ResourceOwner,
         pane: String,
@@ -2508,6 +2515,7 @@ impl DaemonState {
         target_owner: &ResourceOwner,
         pane: Option<String>,
         metadata: SessionMeta,
+        physical_respawned: bool,
     ) -> LifecycleCommitResult {
         let Some(lease) = self.lifecycle_leases.get(&lease_owner.session_id) else {
             return LifecycleCommitResult {
@@ -2554,7 +2562,8 @@ impl DaemonState {
             };
         }
 
-        let effects = self.apply_refresh_launch_metadata(
+        let restart_pane = pane.clone();
+        let mut effects = self.apply_refresh_launch_metadata(
             target_owner.session_id.clone(),
             target_owner.incarnation,
             pane,
@@ -2565,6 +2574,19 @@ impl DaemonState {
                 outcome: LifecycleMutationOutcome::Superseded,
                 effects,
             };
+        }
+        if physical_respawned && let Some(pane) = restart_pane {
+            let marker_index = effects
+                .iter()
+                .position(|effect| matches!(effect, Effect::SetTmuxVar { .. }))
+                .unwrap_or(effects.len());
+            effects.insert(
+                marker_index,
+                Effect::WaitForTmuxOwner {
+                    owner: target_owner.clone(),
+                    pane,
+                },
+            );
         }
         self.lifecycle_leases.remove(&lease_owner.session_id);
         LifecycleCommitResult {
@@ -7536,6 +7558,7 @@ mod tests {
                 model: Some("stale-model".into()),
                 ..Default::default()
             },
+            true,
         );
 
         assert_eq!(stale.outcome, LifecycleMutationOutcome::Superseded);
@@ -7546,6 +7569,95 @@ mod tests {
                 .restart_target_owner
                 .as_ref(),
             Some(&target)
+        );
+    }
+
+    #[test]
+    fn restart_completion_waits_for_physical_owner_before_marker_writes() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                project_dir: Some("/tmp/project".into()),
+                ..Default::default()
+            },
+        });
+        let incumbent = state.sessions["worker"].owner();
+        assert_eq!(
+            state.claim_existing_start(&incumbent),
+            LifecycleMutationOutcome::Applied
+        );
+        let staged = state.stage_restart_launch(&incumbent, "codex-cli".into(), true, None, None);
+        let StageFreshLaunchOutcome::Staged { incarnation } = staged.outcome else {
+            panic!("restart target was not staged");
+        };
+        let target = ResourceOwner {
+            session_id: "worker".into(),
+            incarnation,
+        };
+        let metadata = state.sessions["worker"].metadata.clone();
+
+        let completed =
+            state.complete_restart_launch(&incumbent, &target, Some("%2".into()), metadata, true);
+
+        assert_eq!(completed.outcome, LifecycleMutationOutcome::Applied);
+        let wait_position = completed
+            .effects
+            .iter()
+            .position(|effect| {
+                matches!(
+                    effect,
+                    Effect::WaitForTmuxOwner { owner, pane }
+                        if owner == &target && pane == "%2"
+                )
+            })
+            .expect("restart completion must wait for the respawned physical owner");
+        let first_marker_position = completed
+            .effects
+            .iter()
+            .position(|effect| matches!(effect, Effect::SetTmuxVar { .. }))
+            .expect("restart completion must publish pane markers");
+        assert!(wait_position < first_marker_position);
+    }
+
+    #[test]
+    fn restart_completion_without_physical_respawn_does_not_wait() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                project_dir: Some("/tmp/project".into()),
+                ..Default::default()
+            },
+        });
+        let incumbent = state.sessions["worker"].owner();
+        assert_eq!(
+            state.claim_existing_start(&incumbent),
+            LifecycleMutationOutcome::Applied
+        );
+        let staged = state.stage_restart_launch(&incumbent, "opencode".into(), true, None, None);
+        let StageFreshLaunchOutcome::Staged { incarnation } = staged.outcome else {
+            panic!("restart target was not staged");
+        };
+        let target = ResourceOwner {
+            session_id: "worker".into(),
+            incarnation,
+        };
+        let metadata = state.sessions["worker"].metadata.clone();
+
+        let completed =
+            state.complete_restart_launch(&incumbent, &target, Some("%2".into()), metadata, false);
+
+        assert_eq!(completed.outcome, LifecycleMutationOutcome::Applied);
+        assert!(
+            completed
+                .effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::WaitForTmuxOwner { .. }))
         );
     }
 
@@ -11697,6 +11809,7 @@ mod stateright_model {
                                             &target,
                                             Some(format!("model-pane-{id}")),
                                             metadata,
+                                            true,
                                         )
                                         .effects,
                                     )

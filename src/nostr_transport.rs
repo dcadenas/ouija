@@ -4123,6 +4123,7 @@ async fn restart_session_claimed(
                     &restart_target_owner,
                     Some(pane_id.clone()),
                     proto_meta,
+                    true,
                 )
                 .await
             {
@@ -4839,7 +4840,13 @@ async fn complete_soft_restart_metadata(
         metadata.effort = Some(effort.to_string());
     }
     match state
-        .complete_restart_launch(lease_owner, target_owner, pane.map(str::to_owned), metadata)
+        .complete_restart_launch(
+            lease_owner,
+            target_owner,
+            pane.map(str::to_owned),
+            metadata,
+            false,
+        )
         .await
     {
         Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => Ok(()),
