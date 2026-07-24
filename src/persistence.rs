@@ -90,12 +90,19 @@ impl PersistedLifecycleState {
             .lifecycle_leases
             .values()
             .flat_map(|lease| {
-                std::iter::once(lease.owner.incarnation).chain(
-                    lease
-                        .inert_pane_owner
-                        .as_ref()
-                        .map(|owner| owner.incarnation),
-                )
+                std::iter::once(lease.owner.incarnation)
+                    .chain(
+                        lease
+                            .inert_pane_owner
+                            .as_ref()
+                            .map(|owner| owner.incarnation),
+                    )
+                    .chain(
+                        lease
+                            .project_dir_owner
+                            .as_ref()
+                            .map(|owner| owner.incarnation),
+                    )
             })
             .max()
             .unwrap_or_default();
@@ -185,6 +192,27 @@ pub fn load_sessions(data_dir: &Path) -> Result<PersistedLifecycleState> {
                 "lifecycle lease key '{}' does not match inert pane owner '{}'",
                 session_id,
                 inert_owner.session_id
+            );
+        }
+        if let Some(project_dir_owner) = &lease.project_dir_owner
+            && project_dir_owner.session_id != *session_id
+        {
+            anyhow::bail!(
+                "lifecycle lease key '{}' does not match project directory owner '{}'",
+                session_id,
+                project_dir_owner.session_id
+            );
+        }
+        if lease.project_dir.is_some() != lease.project_dir_owner.is_some() {
+            anyhow::bail!(
+                "lifecycle lease '{}' has an incomplete project directory claim",
+                session_id
+            );
+        }
+        if lease.project_dir_cleanup_on_abandon && lease.project_dir.is_none() {
+            anyhow::bail!(
+                "lifecycle lease '{}' grants cleanup without a project directory claim",
+                session_id
             );
         }
     }
@@ -508,6 +536,9 @@ mod tests {
                 crate::daemon_protocol::LifecycleLease {
                     owner: owner.clone(),
                     phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                    project_dir: None,
+                    project_dir_owner: None,
+                    project_dir_cleanup_on_abandon: false,
                     inert_pane: Some("%42".into()),
                     inert_pane_owner: Some(owner.clone()),
                 },
@@ -584,6 +615,9 @@ mod tests {
                         incarnation: crate::daemon_protocol::SessionIncarnation(5),
                     },
                     phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                    project_dir: None,
+                    project_dir_owner: None,
+                    project_dir_cleanup_on_abandon: false,
                     inert_pane: None,
                     inert_pane_owner: None,
                 },
@@ -613,6 +647,9 @@ mod tests {
                         incarnation: crate::daemon_protocol::SessionIncarnation(5),
                     },
                     phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                    project_dir: None,
+                    project_dir_owner: None,
+                    project_dir_cleanup_on_abandon: false,
                     inert_pane: Some("%1".into()),
                     inert_pane_owner: Some(crate::daemon_protocol::ResourceOwner {
                         session_id: "other".into(),

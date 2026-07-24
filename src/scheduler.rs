@@ -1128,65 +1128,82 @@ async fn revive_and_inject(
     // Create named tmux session/window for the revived session.
     // If a tmux session with the target name exists, add a window to it;
     // otherwise create a new tmux session. Both get the ouija session name.
-    let new_pane_result = tokio::task::spawn_blocking({
-        let dir = dir.clone();
-        let window_name = task.session_name().to_string();
-        let tmux_session = crate::tmux::tmux_session_name(&dir);
-        let pane_credential = session_start_credential.clone();
-        let pane_incarnation = initial_pane_incarnation;
-        move || -> anyhow::Result<String> {
-            let tmux_session_exists = std::process::Command::new("tmux")
-                .args(["has-session", "-t", &tmux_session])
-                .output()
-                .is_ok_and(|o| o.status.success());
+    let create_pane = || {
+        tokio::task::spawn_blocking({
+            let dir = dir.clone();
+            let window_name = task.session_name().to_string();
+            let tmux_session = crate::tmux::tmux_session_name(&dir);
+            let pane_credential = session_start_credential.clone();
+            let pane_incarnation = initial_pane_incarnation;
+            move || -> anyhow::Result<String> {
+                let tmux_session_exists = std::process::Command::new("tmux")
+                    .args(["has-session", "-t", &tmux_session])
+                    .output()
+                    .is_ok_and(|o| o.status.success());
 
-            let target = format!("{tmux_session}:");
-            // `pane_env_args` exports OUIJA_SESSION_ID (so the ouija CLI
-            // can resolve the caller's identity) and suppresses shell
-            // history (HISTFILE/fish_history).
-            let env_args = crate::tmux::pane_env_args(
-                &window_name,
-                pane_credential.as_deref(),
-                pane_incarnation,
-            );
-            let output = if tmux_session_exists {
-                let mut args: Vec<&str> = vec!["new-window", "-d"];
-                args.extend(env_args.iter().map(String::as_str));
-                args.extend_from_slice(&[
-                    "-t",
-                    &target,
-                    "-n",
+                let target = format!("{tmux_session}:");
+                // `pane_env_args` exports OUIJA_SESSION_ID (so the ouija CLI
+                // can resolve the caller's identity) and suppresses shell
+                // history (HISTFILE/fish_history).
+                let env_args = crate::tmux::pane_env_args(
                     &window_name,
-                    "-P",
-                    "-F",
-                    "#{pane_id}",
-                ]);
-                std::process::Command::new("tmux").args(&args).output()?
-            } else {
-                let mut args: Vec<&str> = vec!["new-session", "-d"];
-                args.extend(env_args.iter().map(String::as_str));
-                args.extend_from_slice(&[
-                    "-s",
-                    &tmux_session,
-                    "-n",
-                    &window_name,
-                    "-P",
-                    "-F",
-                    "#{pane_id}",
-                ]);
-                std::process::Command::new("tmux").args(&args).output()?
-            };
-            if !output.status.success() {
+                    pane_credential.as_deref(),
+                    pane_incarnation,
+                );
+                let output = if tmux_session_exists {
+                    let mut args: Vec<&str> = vec!["new-window", "-d"];
+                    args.extend(env_args.iter().map(String::as_str));
+                    args.extend_from_slice(&[
+                        "-t",
+                        &target,
+                        "-n",
+                        &window_name,
+                        "-P",
+                        "-F",
+                        "#{pane_id}",
+                    ]);
+                    std::process::Command::new("tmux").args(&args).output()?
+                } else {
+                    let mut args: Vec<&str> = vec!["new-session", "-d"];
+                    args.extend(env_args.iter().map(String::as_str));
+                    args.extend_from_slice(&[
+                        "-s",
+                        &tmux_session,
+                        "-n",
+                        &window_name,
+                        "-P",
+                        "-F",
+                        "#{pane_id}",
+                    ]);
+                    std::process::Command::new("tmux").args(&args).output()?
+                };
+                if !output.status.success() {
+                    anyhow::bail!(
+                        "tmux session/window creation failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                Ok(pane_id)
+            }
+        })
+    };
+    let new_pane_result = if let Some(owner) = reserved_owner.as_ref() {
+        match state
+            .with_reserved_project_dir_claim(owner, owner.clone(), &dir, false, create_pane)
+            .await?
+        {
+            Some(result) => result,
+            None => {
                 anyhow::bail!(
-                    "tmux session/window creation failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
+                    "scheduled revival directory claim was superseded for '{}'",
+                    task.session_name()
                 );
             }
-            let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            Ok(pane_id)
         }
-    })
-    .await;
+    } else {
+        create_pane().await
+    };
     let new_pane = match new_pane_result {
         Ok(Ok(pane)) => pane,
         Ok(Err(error)) => {
@@ -1582,12 +1599,10 @@ async fn revive_and_inject(
 
     // Track disposable worktree panes for reaper cleanup
     if task.on_fire.is_disposable_worktree() {
-        if let Some(ref dir) = project_dir {
+        if let Some(dir) = project_dir {
             state
-                .perfire_worktree_panes
-                .write()
-                .await
-                .insert(new_pane.clone(), dir.to_string());
+                .track_perfire_worktree(&registered_owner, &new_pane, dir)
+                .await;
         }
     }
 

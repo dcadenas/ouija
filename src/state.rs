@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -91,6 +91,67 @@ pub fn expand_tilde(path: &str) -> String {
         format!("{home}/{rest}")
     } else {
         path.to_string()
+    }
+}
+
+/// Stable physical identity for project-directory gates and ownership checks.
+///
+/// Existing paths (including symlinks) resolve through `canonicalize`. For a
+/// not-yet-created target, the nearest existing ancestor of the original path
+/// is canonicalized and the missing suffix is then normalized. Resolving the
+/// existing prefix first preserves filesystem semantics for paths such as
+/// `symlink/../missing`, where `..` applies after traversing the symlink.
+pub(crate) fn project_dir_identity(path: &str) -> String {
+    let expanded = PathBuf::from(expand_tilde(path));
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(expanded)
+    };
+    if let Ok(canonical) = std::fs::canonicalize(&absolute) {
+        return canonical.to_string_lossy().into_owned();
+    }
+
+    let normalize = |path: &Path| {
+        let mut normalized = PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    normalized.pop();
+                }
+                other => normalized.push(other.as_os_str()),
+            }
+        }
+        normalized
+    };
+
+    let mut ancestor = absolute.clone();
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(mut canonical) = std::fs::canonicalize(&ancestor) {
+            for component in missing.iter().rev() {
+                canonical.push(component);
+            }
+            return normalize(&canonical).to_string_lossy().into_owned();
+        }
+        let Some(component) = ancestor.components().next_back() else {
+            return normalize(&absolute).to_string_lossy().into_owned();
+        };
+        let component = match component {
+            std::path::Component::Normal(name) => name.to_os_string(),
+            std::path::Component::CurDir => ".".into(),
+            std::path::Component::ParentDir => "..".into(),
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return normalize(&absolute).to_string_lossy().into_owned();
+            }
+        };
+        missing.push(component);
+        if !ancestor.pop() {
+            return normalize(&absolute).to_string_lossy().into_owned();
+        }
     }
 }
 
@@ -331,9 +392,10 @@ pub struct AppState {
     /// indefinite `@ouija_id` marker as the protection against the scanner
     /// re-registering a pane before kill-session finishes.
     autoregister_suppressed_panes: std::sync::Mutex<HashMap<String, std::time::Instant>>,
-    /// Per-fire worktree panes: pane_id → project_dir.
+    /// Per-fire worktree panes bound to the exact session incarnation that
+    /// created them.
     /// Reaper runs `git worktree prune` when these panes die.
-    pub perfire_worktree_panes: RwLock<HashMap<String, String>>,
+    pub perfire_worktree_panes: RwLock<HashMap<String, PerFireWorktreeClaim>>,
     /// Dedup: prevents concurrent sweeps from accumulating hung blocking threads.
     sweep_in_progress: std::sync::atomic::AtomicBool,
     /// Backoff gate after a sweep timeout. When `Some(t)`, sweeps are skipped
@@ -357,6 +419,13 @@ pub struct AppState {
 enum ResourceGateKey {
     Pane(String),
     BackendSession(String),
+    ProjectDir(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PerFireWorktreeClaim {
+    pub owner: crate::daemon_protocol::ResourceOwner,
+    pub project_dir: String,
 }
 
 pub(crate) struct CompactInProgressGuard<'a> {
@@ -727,12 +796,67 @@ impl AppState {
         ))
     }
 
+    #[cfg(test)]
+    fn project_dir_resource_gate(&self, project_dir: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.resource_gate(ResourceGateKey::ProjectDir(project_dir_identity(
+            project_dir,
+        )))
+    }
+
+    async fn lock_project_dir_resource(
+        &self,
+        project_dir: &str,
+    ) -> (tokio::sync::OwnedMutexGuard<()>, String) {
+        loop {
+            let identity = project_dir_identity(project_dir);
+            let resource = self
+                .resource_gate(ResourceGateKey::ProjectDir(identity.clone()))
+                .lock_owned()
+                .await;
+            if project_dir_identity(project_dir) == identity {
+                return (resource, identity);
+            }
+        }
+    }
+
+    async fn lock_project_dir_candidates(
+        &self,
+        project_dirs: &[String],
+    ) -> (Vec<tokio::sync::OwnedMutexGuard<()>>, Vec<String>) {
+        loop {
+            let mut identities = project_dirs
+                .iter()
+                .map(|dir| project_dir_identity(dir))
+                .collect::<Vec<_>>();
+            identities.sort();
+            identities.dedup();
+            let mut guards = Vec::with_capacity(identities.len());
+            for identity in &identities {
+                guards.push(
+                    self.resource_gate(ResourceGateKey::ProjectDir(identity.clone()))
+                        .lock_owned()
+                        .await,
+                );
+            }
+            let mut stable = project_dirs
+                .iter()
+                .map(|dir| project_dir_identity(dir))
+                .collect::<Vec<_>>();
+            stable.sort();
+            stable.dedup();
+            if stable == identities {
+                return (guards, identities);
+            }
+        }
+    }
+
     async fn event_resource_keys(
         &self,
         event: &crate::daemon_protocol::Event,
     ) -> Vec<ResourceGateKey> {
         fn add_entry(
             keys: &mut Vec<ResourceGateKey>,
+            project_dirs: &mut Vec<String>,
             entry: &crate::daemon_protocol::SessionEntry,
         ) {
             if let Some(pane) = &entry.pane {
@@ -741,53 +865,67 @@ impl AppState {
             if let Some(backend_session_id) = &entry.metadata.backend_session_id {
                 keys.push(ResourceGateKey::BackendSession(backend_session_id.clone()));
             }
+            if let Some(project_dir) = &entry.metadata.project_dir {
+                project_dirs.push(project_dir.clone());
+            }
         }
         fn add_current(
             keys: &mut Vec<ResourceGateKey>,
+            project_dirs: &mut Vec<String>,
             protocol: &crate::daemon_protocol::DaemonState,
             id: &str,
         ) {
             if let Some(entry) = protocol.sessions.get(id) {
-                add_entry(keys, entry);
+                add_entry(keys, project_dirs, entry);
             }
         }
 
         let protocol = self.protocol.read().await;
         let mut keys = Vec::new();
+        let mut project_dirs = Vec::new();
         match event {
             crate::daemon_protocol::Event::Register { id, pane, metadata } => {
-                add_current(&mut keys, &protocol, id);
+                add_current(&mut keys, &mut project_dirs, &protocol, id);
                 if let Some(pane) = pane {
                     keys.push(ResourceGateKey::Pane(pane.clone()));
                 }
                 if let Some(backend_session_id) = &metadata.backend_session_id {
                     keys.push(ResourceGateKey::BackendSession(backend_session_id.clone()));
                 }
+                if let Some(project_dir) = &metadata.project_dir {
+                    project_dirs.push(project_dir.clone());
+                }
             }
             crate::daemon_protocol::Event::RegisterIfPaneUnbound {
                 id, pane, metadata, ..
             } => {
-                add_current(&mut keys, &protocol, id);
+                add_current(&mut keys, &mut project_dirs, &protocol, id);
                 keys.push(ResourceGateKey::Pane(pane.clone()));
                 if let Some(backend_session_id) = &metadata.backend_session_id {
                     keys.push(ResourceGateKey::BackendSession(backend_session_id.clone()));
+                }
+                if let Some(project_dir) = &metadata.project_dir {
+                    project_dirs.push(project_dir.clone());
                 }
             }
             crate::daemon_protocol::Event::StageFreshLaunch { id, .. }
             | crate::daemon_protocol::Event::Rename { old_id: id, .. }
             | crate::daemon_protocol::Event::Remove { id, .. }
             | crate::daemon_protocol::Event::UpdateMetadata { id, .. } => {
-                add_current(&mut keys, &protocol, id);
+                add_current(&mut keys, &mut project_dirs, &protocol, id);
             }
             crate::daemon_protocol::Event::RefreshLaunchMetadata {
                 id, pane, metadata, ..
             } => {
-                add_current(&mut keys, &protocol, id);
+                add_current(&mut keys, &mut project_dirs, &protocol, id);
                 if let Some(pane) = pane {
                     keys.push(ResourceGateKey::Pane(pane.clone()));
                 }
                 if let Some(backend_session_id) = &metadata.backend_session_id {
                     keys.push(ResourceGateKey::BackendSession(backend_session_id.clone()));
+                }
+                if let Some(project_dir) = &metadata.project_dir {
+                    project_dirs.push(project_dir.clone());
                 }
             }
             crate::daemon_protocol::Event::RemoveOwned {
@@ -795,7 +933,7 @@ impl AppState {
                 expected_pane,
                 ..
             } => {
-                add_current(&mut keys, &protocol, &owner.session_id);
+                add_current(&mut keys, &mut project_dirs, &protocol, &owner.session_id);
                 if let Some(pane) = expected_pane {
                     keys.push(ResourceGateKey::Pane(pane.clone()));
                 }
@@ -805,7 +943,7 @@ impl AppState {
                 expected_pane,
                 ..
             } => {
-                add_current(&mut keys, &protocol, &owner.session_id);
+                add_current(&mut keys, &mut project_dirs, &protocol, &owner.session_id);
                 keys.push(ResourceGateKey::Pane(expected_pane.clone()));
             }
             crate::daemon_protocol::Event::RollbackProvisionalRegistration {
@@ -814,10 +952,10 @@ impl AppState {
                 previous,
                 ..
             } => {
-                add_current(&mut keys, &protocol, id);
+                add_current(&mut keys, &mut project_dirs, &protocol, id);
                 keys.push(ResourceGateKey::Pane(pane.clone()));
                 if let Some(previous) = previous {
-                    add_entry(&mut keys, previous);
+                    add_entry(&mut keys, &mut project_dirs, previous);
                 }
             }
             crate::daemon_protocol::Event::RollbackFreshLaunch {
@@ -827,7 +965,7 @@ impl AppState {
                 provisional_pane,
                 ..
             } => {
-                add_current(&mut keys, &protocol, id);
+                add_current(&mut keys, &mut project_dirs, &protocol, id);
                 if let Some(pane) = pane {
                     keys.push(ResourceGateKey::Pane(pane.clone()));
                 }
@@ -835,11 +973,11 @@ impl AppState {
                     keys.push(ResourceGateKey::Pane(pane.clone()));
                 }
                 if let Some(previous) = previous {
-                    add_entry(&mut keys, previous);
+                    add_entry(&mut keys, &mut project_dirs, previous);
                 }
             }
             crate::daemon_protocol::Event::RemoveIfStale { owner, .. } => {
-                add_current(&mut keys, &protocol, &owner.session_id);
+                add_current(&mut keys, &mut project_dirs, &protocol, &owner.session_id);
             }
             crate::daemon_protocol::Event::AdoptBackend {
                 id,
@@ -851,26 +989,38 @@ impl AppState {
                 backend_session_id,
                 ..
             } => {
-                add_current(&mut keys, &protocol, id);
+                add_current(&mut keys, &mut project_dirs, &protocol, id);
                 if !backend_session_id.is_empty() {
                     keys.push(ResourceGateKey::BackendSession(backend_session_id.clone()));
                 }
             }
             crate::daemon_protocol::Event::ReapDead { dead_sessions } => {
                 for (owner, pane) in dead_sessions {
-                    add_current(&mut keys, &protocol, &owner.session_id);
+                    add_current(&mut keys, &mut project_dirs, &protocol, &owner.session_id);
                     keys.push(ResourceGateKey::Pane(pane.clone()));
                 }
             }
             crate::daemon_protocol::Event::PruneStale { sessions } => {
-                for (owner, _) in sessions {
-                    add_current(&mut keys, &protocol, &owner.session_id);
+                for (owner, project_dir) in sessions {
+                    add_current(&mut keys, &mut project_dirs, &protocol, &owner.session_id);
+                    project_dirs.push(project_dir.clone());
                 }
             }
             crate::daemon_protocol::Event::IncomingWire { .. }
-            | crate::daemon_protocol::Event::Send { .. }
-            | crate::daemon_protocol::Event::MarkWorktreePresence { .. } => {}
+            | crate::daemon_protocol::Event::Send { .. } => {}
+            crate::daemon_protocol::Event::MarkWorktreePresence { updates } => {
+                for (owner, project_dir, _) in updates {
+                    add_current(&mut keys, &mut project_dirs, &protocol, &owner.session_id);
+                    project_dirs.push(project_dir.clone());
+                }
+            }
         }
+        drop(protocol);
+        keys.extend(
+            project_dirs
+                .into_iter()
+                .map(|dir| ResourceGateKey::ProjectDir(project_dir_identity(&dir))),
+        );
         keys.sort();
         keys.dedup();
         keys
@@ -998,6 +1148,214 @@ impl AppState {
                     && session.metadata.backend_session_id.as_deref() == Some(backend_session_id)
             });
         if current { Some(action().await) } else { None }
+    }
+
+    /// Durably claim a project directory for an exact lifecycle lease and keep
+    /// its resource gate held across the caller's filesystem operation.
+    pub(crate) async fn with_reserved_project_dir_claim<F, Fut, T>(
+        self: &Arc<Self>,
+        lease_owner: &crate::daemon_protocol::ResourceOwner,
+        project_dir_owner: crate::daemon_protocol::ResourceOwner,
+        project_dir: &str,
+        cleanup_if_missing: bool,
+        action: F,
+    ) -> anyhow::Result<Option<T>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let (_resource, identity) = self.lock_project_dir_resource(project_dir).await;
+        let cleanup_on_abandon = cleanup_if_missing && !std::path::Path::new(project_dir).exists();
+        {
+            let mut proto = self.protocol.write().await;
+            let before = proto.clone();
+            let outcome = proto.record_project_dir_claim(
+                lease_owner,
+                project_dir_owner,
+                identity,
+                cleanup_on_abandon,
+            );
+            if outcome != crate::daemon_protocol::LifecycleMutationOutcome::Applied {
+                return Ok(None);
+            }
+            if let Err(error) = self.persist_protocol_state(&proto) {
+                *proto = before;
+                return Err(error);
+            }
+        }
+        Ok(Some(action().await))
+    }
+
+    /// Choose among possible directory layouts only after all candidate gates
+    /// are held, then persist and act on that same resolved target.
+    pub(crate) async fn with_reserved_project_dir_choice<S, F, Fut, T>(
+        self: &Arc<Self>,
+        lease_owner: &crate::daemon_protocol::ResourceOwner,
+        project_dir_owner: crate::daemon_protocol::ResourceOwner,
+        candidates: &[String],
+        select: S,
+        action: F,
+    ) -> anyhow::Result<Option<T>>
+    where
+        S: FnOnce() -> String,
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let (_resources, identities) = self.lock_project_dir_candidates(candidates).await;
+        let project_dir = select();
+        let identity = project_dir_identity(&project_dir);
+        if !identities.contains(&identity) {
+            anyhow::bail!("resolved project directory was not among locked candidates");
+        }
+        let cleanup_on_abandon = !std::path::Path::new(&project_dir).exists();
+        {
+            let mut proto = self.protocol.write().await;
+            let before = proto.clone();
+            let outcome = proto.record_project_dir_claim(
+                lease_owner,
+                project_dir_owner,
+                identity,
+                cleanup_on_abandon,
+            );
+            if outcome != crate::daemon_protocol::LifecycleMutationOutcome::Applied {
+                return Ok(None);
+            }
+            if let Err(error) = self.persist_protocol_state(&proto) {
+                *proto = before;
+                return Err(error);
+            }
+        }
+        Ok(Some(action(project_dir).await))
+    }
+
+    /// Run directory cleanup only when no active session or different
+    /// lifecycle owner currently claims the same path.
+    pub(crate) async fn with_owned_worktree_cleanup<F, Fut, T>(
+        &self,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        project_dir: &str,
+        action: F,
+    ) -> Option<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let (_resource, identity) = self.lock_project_dir_resource(project_dir).await;
+        let (active_dirs, reserved_claims) = {
+            let protocol = self.protocol.read().await;
+            let active_dirs = protocol
+                .sessions
+                .values()
+                .filter_map(|session| session.metadata.project_dir.as_deref())
+                .map(String::from)
+                .collect::<Vec<_>>();
+            let reserved_claims = protocol
+                .lifecycle_leases
+                .values()
+                .filter_map(|lease| {
+                    Some((lease.project_dir.clone()?, lease.project_dir_owner.clone()))
+                })
+                .collect::<Vec<_>>();
+            (active_dirs, reserved_claims)
+        };
+        let active_claim = active_dirs
+            .iter()
+            .any(|dir| project_dir_identity(dir) == identity);
+        let reserved_by_replacement = reserved_claims.iter().any(|(dir, claim_owner)| {
+            project_dir_identity(dir) == identity && claim_owner.as_ref() != Some(owner)
+        });
+        let allowed = !active_claim && !reserved_by_replacement;
+        if allowed { Some(action().await) } else { None }
+    }
+
+    pub(crate) async fn track_perfire_worktree(
+        &self,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        pane: &str,
+        project_dir: &str,
+    ) -> bool {
+        let (_resource, identity) = self.lock_project_dir_resource(project_dir).await;
+        let current = self
+            .protocol
+            .read()
+            .await
+            .sessions
+            .get(&owner.session_id)
+            .map(|session| {
+                (
+                    session.owner(),
+                    session.pane.clone(),
+                    session.metadata.project_dir.clone(),
+                )
+            });
+        let current = current.is_some_and(|(current_owner, current_pane, current_dir)| {
+            current_owner == *owner
+                && current_pane.as_deref() == Some(pane)
+                && current_dir
+                    .as_deref()
+                    .is_some_and(|dir| project_dir_identity(dir) == identity)
+        });
+        if !current {
+            return false;
+        }
+        self.perfire_worktree_panes.write().await.insert(
+            pane.to_string(),
+            PerFireWorktreeClaim {
+                owner: owner.clone(),
+                project_dir: project_dir.to_string(),
+            },
+        );
+        true
+    }
+
+    pub(crate) async fn prune_dead_perfire_worktree(
+        &self,
+        pane: &str,
+        claim: &PerFireWorktreeClaim,
+    ) -> bool {
+        let (_resource, identity) = self.lock_project_dir_resource(&claim.project_dir).await;
+        {
+            let mut tracking = self.perfire_worktree_panes.write().await;
+            if tracking.get(pane) != Some(claim) {
+                return false;
+            }
+            tracking.remove(pane);
+        }
+        let (active_claims, reserved_claims) = {
+            let protocol = self.protocol.read().await;
+            let active_claims = protocol
+                .sessions
+                .values()
+                .filter_map(|session| {
+                    Some((session.metadata.project_dir.clone()?, session.owner()))
+                })
+                .collect::<Vec<_>>();
+            let reserved_claims = protocol
+                .lifecycle_leases
+                .values()
+                .filter_map(|lease| {
+                    Some((lease.project_dir.clone()?, lease.project_dir_owner.clone()))
+                })
+                .collect::<Vec<_>>();
+            (active_claims, reserved_claims)
+        };
+        let replacement_claim = active_claims
+            .iter()
+            .any(|(dir, owner)| project_dir_identity(dir) == identity && *owner != claim.owner)
+            || reserved_claims.iter().any(|(dir, owner)| {
+                project_dir_identity(dir) == identity && owner.as_ref() != Some(&claim.owner)
+            });
+        if replacement_claim {
+            return false;
+        }
+        let project_dir = claim.project_dir.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("git")
+                .args(["-C", &project_dir, "worktree", "prune"])
+                .status()
+        })
+        .await;
+        true
     }
 
     pub(crate) fn try_acquire_compact_in_progress(
@@ -1897,8 +2255,9 @@ impl AppState {
                         tracing::warn!("failed to persist protocol state: {error}");
                     }
                 }
-                Effect::CleanupWorktree { project_dir } => {
-                    self.cleanup_worktree_dir_if_unused(project_dir).await;
+                Effect::CleanupWorktree { owner, project_dir } => {
+                    self.cleanup_worktree_dir_if_unused(owner, project_dir)
+                        .await;
                 }
                 Effect::SendToHuman { npub, message } => {
                     let _ = crate::nostr_transport::send_plain_dm(self, npub, message).await;
@@ -2326,22 +2685,22 @@ impl AppState {
         .await;
     }
 
-    /// Remove a worktree only while no registered session can start using it.
-    ///
-    /// The protocol read guard deliberately spans cleanup: registration needs
-    /// the write guard, so a replacement cannot claim `dir` after the check
-    /// but before `git worktree remove` completes.
-    pub(crate) async fn cleanup_worktree_dir_if_unused(&self, dir: &str) -> bool {
-        let protocol = self.protocol.read().await;
-        let in_use = protocol
-            .sessions
-            .values()
-            .any(|session| session.metadata.project_dir.as_deref() == Some(dir));
-        if in_use {
+    /// Remove a worktree under its project-directory resource gate. Protocol
+    /// state is sampled briefly; git/filesystem I/O never holds that lock.
+    pub(crate) async fn cleanup_worktree_dir_if_unused(
+        &self,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        dir: &str,
+    ) -> bool {
+        let cleaned = self
+            .with_owned_worktree_cleanup(owner, dir, || async move {
+                Self::cleanup_worktree_dir(dir).await;
+            })
+            .await;
+        if cleaned.is_none() {
             tracing::info!("skipping worktree cleanup for {dir}: other sessions still using it");
             return false;
         }
-        Self::cleanup_worktree_dir(dir).await;
         true
     }
 
@@ -3639,7 +3998,254 @@ pub(crate) mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn queued_old_worktree_cleanup_skips_same_directory_replacement() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%99".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/shared-worktree".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let old_owner = state.protocol.read().await.sessions["worker"].owner();
+        let gate = state.project_dir_resource_gate("/tmp/shared-worktree");
+        let held = gate.lock().await;
+        let touched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let queued = std::sync::Arc::new(tokio::sync::Notify::new());
+        let cleanup_state = state.clone();
+        let cleanup_owner = old_owner.clone();
+        let cleanup_touched = touched.clone();
+        let cleanup_queued = queued.clone();
+        let cleanup = tokio::spawn(async move {
+            cleanup_queued.notify_one();
+            cleanup_state
+                .with_owned_worktree_cleanup(
+                    &cleanup_owner,
+                    "/tmp/shared-worktree",
+                    || async move {
+                        cleanup_touched.store(true, std::sync::atomic::Ordering::SeqCst);
+                    },
+                )
+                .await
+        });
+        queued.notified().await;
+
+        {
+            let mut protocol = state.protocol.write().await;
+            protocol.apply(crate::daemon_protocol::Event::Remove {
+                id: "worker".into(),
+                keep_worktree: true,
+            });
+            protocol.apply(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%100".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/./shared-worktree".into()),
+                    ..Default::default()
+                },
+            });
+            assert_ne!(protocol.sessions["worker"].owner(), old_owner);
+        }
+        drop(held);
+
+        assert_eq!(cleanup.await.expect("cleanup task failed"), None);
+        assert!(
+            !touched.load(std::sync::atomic::Ordering::SeqCst),
+            "stale cleanup must not delete a directory claimed by a replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_project_dir_claim_waits_for_inflight_cleanup() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "old".into(),
+                pane: Some("%99".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/serialized-worktree".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let old_owner = state.protocol.read().await.sessions["old"].owner();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::RemoveOwned {
+                owner: old_owner.clone(),
+                expected_pane: Some("%99".into()),
+                keep_worktree: true,
+            })
+            .await;
+
+        let cleanup_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release_cleanup = std::sync::Arc::new(tokio::sync::Notify::new());
+        let cleanup_state = state.clone();
+        let started = cleanup_started.clone();
+        let release = release_cleanup.clone();
+        let cleanup = tokio::spawn(async move {
+            cleanup_state
+                .with_owned_worktree_cleanup(
+                    &old_owner,
+                    "/tmp/serialized-worktree",
+                    || async move {
+                        started.notify_one();
+                        release.notified().await;
+                    },
+                )
+                .await
+        });
+        cleanup_started.notified().await;
+
+        let replacement_state = state.clone();
+        let replacement = tokio::spawn(async move {
+            replacement_state
+                .apply_and_execute(crate::daemon_protocol::Event::Register {
+                    id: "replacement".into(),
+                    pane: Some("%100".into()),
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        project_dir: Some("/tmp/serialized-worktree".into()),
+                        ..Default::default()
+                    },
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !replacement.is_finished(),
+            "replacement claim must wait while cleanup owns the directory gate"
+        );
+
+        release_cleanup.notify_one();
+        assert_eq!(cleanup.await.expect("cleanup task failed"), Some(()));
+        replacement.await.expect("replacement task failed");
+        assert_eq!(
+            state.protocol.read().await.sessions["replacement"]
+                .metadata
+                .project_dir
+                .as_deref(),
+            Some("/tmp/serialized-worktree")
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_cleanup_skips_a_reserved_sharer_without_a_session_row() {
+        let state = AppState::new_for_test();
+        let stale_owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "old".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(1),
+        };
+        let replacement_owner = match state.reserve_start("replacement").await.unwrap() {
+            crate::daemon_protocol::StartDisposition::Reserved(owner) => owner,
+            disposition => panic!("expected reservation, got {disposition:?}"),
+        };
+        let claim_result = state
+            .with_reserved_project_dir_claim(
+                &replacement_owner,
+                replacement_owner.clone(),
+                "/tmp/reserved-worktree",
+                false,
+                || async {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(claim_result, Some(()));
+
+        let touched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_touched = touched.clone();
+        let result = state
+            .with_owned_worktree_cleanup(&stale_owner, "/tmp/reserved-worktree", || async move {
+                cleanup_touched.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await;
+
+        assert_eq!(result, None);
+        assert!(!touched.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn paneless_directory_claim_is_durable_before_external_work() {
+        let state = AppState::new_for_test();
+        let owner = match state.reserve_start("paneless").await.unwrap() {
+            crate::daemon_protocol::StartDisposition::Reserved(owner) => owner,
+            disposition => panic!("expected reservation, got {disposition:?}"),
+        };
+        let external_work_observed_claim =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = external_work_observed_claim.clone();
+        let state_for_action = state.clone();
+        let owner_for_action = owner.clone();
+
+        let result = state
+            .with_reserved_project_dir_claim(
+                &owner,
+                owner.clone(),
+                "/tmp/.ouija/worktrees/project/paneless",
+                true,
+                || async move {
+                    let persisted =
+                        crate::persistence::load_sessions(&state_for_action.config.data_dir)
+                            .unwrap();
+                    let lease = &persisted.lifecycle_leases[&owner_for_action.session_id];
+                    observed.store(
+                        lease.project_dir.as_deref()
+                            == Some("/tmp/.ouija/worktrees/project/paneless")
+                            && lease.project_dir_owner.as_ref() == Some(&owner_for_action)
+                            && lease.project_dir_cleanup_on_abandon
+                            && lease.inert_pane.is_none(),
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result, Some(()));
+        assert!(
+            external_work_observed_claim.load(std::sync::atomic::Ordering::SeqCst),
+            "the paneless crash envelope must be persisted before filesystem work"
+        );
+    }
+
     // --- Pure functions ---
+
+    #[test]
+    #[cfg(unix)]
+    fn project_dir_identity_unifies_symlinked_parent_for_missing_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let physical = root.path().join("physical");
+        let alias = root.path().join("alias");
+        std::fs::create_dir(&physical).unwrap();
+        symlink(&physical, &alias).unwrap();
+
+        assert_eq!(
+            project_dir_identity(physical.join("future").to_str().unwrap()),
+            project_dir_identity(alias.join("./future").to_str().unwrap())
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn project_dir_identity_resolves_parent_after_symlink_traversal() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let physical = root.path().join("physical");
+        let inner = physical.join("inner");
+        let alias = root.path().join("alias");
+        std::fs::create_dir_all(&inner).unwrap();
+        symlink(&inner, &alias).unwrap();
+
+        assert_eq!(
+            project_dir_identity(physical.join("target").to_str().unwrap()),
+            project_dir_identity(alias.join("../target").to_str().unwrap())
+        );
+    }
 
     #[test]
     fn resolve_project_root_normal_path() {
@@ -4069,10 +4675,14 @@ pub(crate) mod tests {
                 },
             })
             .await;
+        let replacement_owner = state.protocol.read().await.sessions["replacement"].owner();
 
         assert!(
             !state
-                .cleanup_worktree_dir_if_unused("/tmp/.ouija/worktrees/project/replacement")
+                .cleanup_worktree_dir_if_unused(
+                    &replacement_owner,
+                    "/tmp/.ouija/worktrees/project/replacement",
+                )
                 .await
         );
     }

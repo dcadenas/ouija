@@ -582,7 +582,7 @@ async fn main() -> anyhow::Result<()> {
                             vec![]
                         };
                     // Clean up per-fire worktree panes
-                    let perfire_to_check: Vec<(String, String)> = {
+                    let perfire_to_check: Vec<(String, crate::state::PerFireWorktreeClaim)> = {
                         let pf = reaper_state.perfire_worktree_panes.read().await;
                         pf.iter().map(|(p, d)| (p.clone(), d.clone())).collect()
                     };
@@ -598,18 +598,14 @@ async fn main() -> anyhow::Result<()> {
                         .await
                         .unwrap_or_default();
                         if !dead_perfire.is_empty() {
-                            let mut pf = reaper_state.perfire_worktree_panes.write().await;
-                            for (pane_id, project_dir) in dead_perfire {
-                                pf.remove(&pane_id);
+                            for (pane_id, claim) in dead_perfire {
                                 tracing::info!(
-                                    "per-fire worktree pane {pane_id} died, pruning worktrees in {project_dir}"
+                                    "per-fire worktree pane {pane_id} died, pruning worktrees in {}",
+                                    claim.project_dir
                                 );
-                                let _ = tokio::task::spawn_blocking(move || {
-                                    std::process::Command::new("git")
-                                        .args(["-C", &project_dir, "worktree", "prune"])
-                                        .status()
-                                })
-                                .await;
+                                reaper_state
+                                    .prune_dead_perfire_worktree(&pane_id, &claim)
+                                    .await;
                             }
                         }
                     }
@@ -1421,8 +1417,6 @@ async fn restore_persisted_sessions(state: &state::AppState) -> anyhow::Result<(
     // discard only the staged session row owned by that lease, then durably
     // release the public ID. A Restarting lease whose row still has the
     // incumbent incarnation stopped before staging and therefore preserves it.
-    // Worktree recovery is handled separately once leases carry owned
-    // filesystem claims.
     if !abandoned_leases.is_empty() {
         let inert_panes: Vec<_> = abandoned_leases
             .iter()
@@ -1463,6 +1457,35 @@ async fn restore_persisted_sessions(state: &state::AppState) -> anyhow::Result<(
             .await
             .context("abandoned start pane reconciliation task failed")?
             .context("failed to reconcile abandoned start panes")?;
+        }
+
+        // Project-directory claims cover the crash envelope before a pane is
+        // created. Serialize each cleanup with live claims and preserve any
+        // directory shared by a persisted row that this lease does not own.
+        for lease in &abandoned_leases {
+            let (Some(project_dir), Some(project_dir_owner)) =
+                (&lease.project_dir, &lease.project_dir_owner)
+            else {
+                continue;
+            };
+            if !lease.project_dir_cleanup_on_abandon {
+                continue;
+            }
+            let project_dir_identity = crate::state::project_dir_identity(project_dir);
+            let persisted_sharer = sessions.iter().any(|session| {
+                session.metadata.project_dir.as_deref().is_some_and(|dir| {
+                    crate::state::project_dir_identity(dir) == project_dir_identity
+                }) && !abandoned_lease_owns_staged_row(session, lease)
+            });
+            if persisted_sharer {
+                tracing::info!(
+                    "skipping abandoned worktree cleanup for {project_dir}: persisted session still uses it"
+                );
+                continue;
+            }
+            state
+                .cleanup_worktree_dir_if_unused(project_dir_owner, project_dir)
+                .await;
         }
 
         sessions.retain(|session| {
@@ -3598,7 +3621,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_persisted_sessions_releases_abandoned_lease_without_reusing_high_water() {
+    async fn restore_releases_paneless_worktree_lease_without_harming_shared_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let owner = crate::daemon_protocol::ResourceOwner {
             session_id: "pending".into(),
@@ -3614,6 +3637,7 @@ mod tests {
                     backend: Some("opencode".into()),
                     backend_session_id: Some("ses_live".into()),
                     session_incarnation: crate::daemon_protocol::SessionIncarnation(48),
+                    project_dir: Some("/tmp/.ouija/worktrees/project/shared-replacement".into()),
                     ..Default::default()
                 },
             }],
@@ -3623,6 +3647,9 @@ mod tests {
                 crate::daemon_protocol::LifecycleLease {
                     owner: owner.clone(),
                     phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                    project_dir: Some("/tmp/.ouija/worktrees/project/shared-replacement".into()),
+                    project_dir_owner: Some(owner.clone()),
+                    project_dir_cleanup_on_abandon: true,
                     inert_pane: None,
                     inert_pane_owner: None,
                 },
@@ -3666,6 +3693,358 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_never_deletes_incumbent_worktree_claimed_by_abandoned_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let worktree = repo.join(".ouija/worktrees/restart");
+        let data_dir = root.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let run_git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_git(&["init", "-b", "main", repo.to_str().unwrap()]);
+        run_git(&[
+            "-C",
+            repo.to_str().unwrap(),
+            "config",
+            "user.email",
+            "test@example.com",
+        ]);
+        run_git(&["-C", repo.to_str().unwrap(), "config", "user.name", "Test"]);
+        std::fs::write(repo.join("tracked"), "incumbent\n").unwrap();
+        run_git(&["-C", repo.to_str().unwrap(), "add", "tracked"]);
+        run_git(&["-C", repo.to_str().unwrap(), "commit", "-m", "initial"]);
+        run_git(&[
+            "-C",
+            repo.to_str().unwrap(),
+            "worktree",
+            "add",
+            "-b",
+            "restart",
+            worktree.to_str().unwrap(),
+        ]);
+
+        let incumbent = crate::daemon_protocol::ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(1),
+        };
+        let snapshot = crate::persistence::PersistedLifecycleState::new(
+            vec![crate::persistence::PersistedSession {
+                id: incumbent.session_id.clone(),
+                pane: None,
+                registered_at: chrono::Utc::now(),
+                last_activity_at: chrono::Utc::now(),
+                metadata: crate::state::SessionMetadata {
+                    backend: Some("opencode".into()),
+                    project_dir: Some(worktree.to_string_lossy().into_owned()),
+                    session_incarnation: crate::daemon_protocol::SessionIncarnation(2),
+                    ..Default::default()
+                },
+            }],
+            crate::daemon_protocol::SessionIncarnation(2),
+            std::collections::BTreeMap::from([(
+                incumbent.session_id.clone(),
+                crate::daemon_protocol::LifecycleLease {
+                    owner: incumbent.clone(),
+                    phase: crate::daemon_protocol::LifecyclePhase::Restarting,
+                    project_dir: Some(worktree.to_string_lossy().into_owned()),
+                    project_dir_owner: Some(incumbent),
+                    project_dir_cleanup_on_abandon: false,
+                    inert_pane: None,
+                    inert_pane_owner: None,
+                },
+            )]),
+        );
+        crate::persistence::save_sessions(&data_dir, &snapshot).unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: 0,
+            data_dir: data_dir.clone(),
+            config_dir: data_dir.clone(),
+        });
+
+        restore_persisted_sessions(&state).await.unwrap();
+
+        assert!(
+            worktree.join("tracked").is_file(),
+            "an abandoned restart may terminalize its staged row but must preserve the incumbent worktree"
+        );
+        let restored = crate::persistence::load_sessions(&data_dir).unwrap();
+        assert!(restored.sessions.is_empty());
+        assert!(restored.lifecycle_leases.is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn restore_cleans_owned_worktree_below_symlinked_managed_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let data_dir = root.path().join("data");
+        let home = root.path().join("home");
+        let physical_managed_root = root.path().join("managed-storage");
+        let raw_managed_root = home.join(".ouija");
+        let raw_worktree = raw_managed_root.join("worktrees/repo/worker");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(physical_managed_root.join("worktrees/repo")).unwrap();
+        symlink(&physical_managed_root, &raw_managed_root).unwrap();
+
+        let run_git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_git(&["init", "-b", "main", repo.to_str().unwrap()]);
+        run_git(&[
+            "-C",
+            repo.to_str().unwrap(),
+            "config",
+            "user.email",
+            "test@example.com",
+        ]);
+        run_git(&["-C", repo.to_str().unwrap(), "config", "user.name", "Test"]);
+        std::fs::write(repo.join("tracked"), "base\n").unwrap();
+        run_git(&["-C", repo.to_str().unwrap(), "add", "tracked"]);
+        run_git(&["-C", repo.to_str().unwrap(), "commit", "-m", "initial"]);
+        run_git(&[
+            "-C",
+            repo.to_str().unwrap(),
+            "worktree",
+            "add",
+            "-b",
+            "worker",
+            raw_worktree.to_str().unwrap(),
+        ]);
+
+        let canonical_worktree = crate::state::project_dir_identity(raw_worktree.to_str().unwrap());
+        assert!(
+            !canonical_worktree.contains("/.ouija/worktrees/"),
+            "the physical identity must exercise recovery without a managed-path marker"
+        );
+        let owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(1),
+        };
+        let snapshot = crate::persistence::PersistedLifecycleState::new(
+            vec![],
+            owner.incarnation,
+            std::collections::BTreeMap::from([(
+                owner.session_id.clone(),
+                crate::daemon_protocol::LifecycleLease {
+                    owner: owner.clone(),
+                    phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                    project_dir: Some(canonical_worktree),
+                    project_dir_owner: Some(owner),
+                    project_dir_cleanup_on_abandon: true,
+                    inert_pane: None,
+                    inert_pane_owner: None,
+                },
+            )]),
+        );
+        crate::persistence::save_sessions(&data_dir, &snapshot).unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: 0,
+            data_dir: data_dir.clone(),
+            config_dir: data_dir.clone(),
+        });
+
+        restore_persisted_sessions(&state).await.unwrap();
+
+        assert!(
+            !raw_worktree.exists(),
+            "cleanup authority must survive canonicalizing a symlinked managed root"
+        );
+        assert!(
+            crate::persistence::load_sessions(&data_dir)
+                .unwrap()
+                .lifecycle_leases
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_replacement_reselects_and_recovers_worktree_after_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let legacy = repo.join(".ouija/worktrees/worker");
+        let replacement = root.path().join("home/.ouija/worktrees/repo/worker");
+        let data_dir = root.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let run_git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_git(&["init", "-b", "main", repo.to_str().unwrap()]);
+        run_git(&[
+            "-C",
+            repo.to_str().unwrap(),
+            "config",
+            "user.email",
+            "test@example.com",
+        ]);
+        run_git(&["-C", repo.to_str().unwrap(), "config", "user.name", "Test"]);
+        std::fs::write(repo.join("tracked"), "base\n").unwrap();
+        run_git(&["-C", repo.to_str().unwrap(), "add", "tracked"]);
+        run_git(&["-C", repo.to_str().unwrap(), "commit", "-m", "initial"]);
+        run_git(&[
+            "-C",
+            repo.to_str().unwrap(),
+            "worktree",
+            "add",
+            "-b",
+            "worker",
+            legacy.to_str().unwrap(),
+        ]);
+
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: 0,
+            data_dir: data_dir.clone(),
+            config_dir: data_dir.clone(),
+        });
+        let owner = match state.reserve_start("worker").await.unwrap() {
+            crate::daemon_protocol::StartDisposition::Reserved(owner) => owner,
+            disposition => panic!("expected reservation, got {disposition:?}"),
+        };
+        let stale_owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "stale".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(0),
+        };
+        let cleanup_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let cleanup_removed = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release_cleanup = std::sync::Arc::new(tokio::sync::Notify::new());
+        let cleanup_state = state.clone();
+        let cleanup_legacy = legacy.to_string_lossy().into_owned();
+        let started = cleanup_started.clone();
+        let removed = cleanup_removed.clone();
+        let release = release_cleanup.clone();
+        let cleanup_action_dir = cleanup_legacy.clone();
+        let cleanup = tokio::spawn(async move {
+            cleanup_state
+                .with_owned_worktree_cleanup(&stale_owner, &cleanup_legacy, || async move {
+                    started.notify_one();
+                    crate::state::AppState::cleanup_worktree_dir(&cleanup_action_dir).await;
+                    removed.notify_one();
+                    release.notified().await;
+                })
+                .await
+        });
+        cleanup_started.notified().await;
+
+        let claim_state = state.clone();
+        let claim_owner = owner.clone();
+        let candidates = vec![
+            legacy.to_string_lossy().into_owned(),
+            replacement.to_string_lossy().into_owned(),
+        ];
+        let select_legacy = candidates[0].clone();
+        let select_replacement = candidates[1].clone();
+        let claim_repo = repo.clone();
+        let claim = tokio::spawn(async move {
+            claim_state
+                .with_reserved_project_dir_choice(
+                    &claim_owner,
+                    claim_owner.clone(),
+                    &candidates,
+                    move || {
+                        if std::path::Path::new(&select_legacy).exists() {
+                            select_legacy
+                        } else {
+                            select_replacement
+                        }
+                    },
+                    move |selected| async move {
+                        let parent = std::path::Path::new(&selected).parent().unwrap();
+                        std::fs::create_dir_all(parent).unwrap();
+                        let output = std::process::Command::new("git")
+                            .args([
+                                "-C",
+                                claim_repo.to_str().unwrap(),
+                                "worktree",
+                                "add",
+                                &selected,
+                                "worker",
+                            ])
+                            .output()
+                            .unwrap();
+                        assert!(
+                            output.status.success(),
+                            "replacement worktree creation failed: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                        selected
+                    },
+                )
+                .await
+        });
+        cleanup_removed.notified().await;
+        assert!(
+            !claim.is_finished(),
+            "replacement selection must wait for cleanup's directory gate"
+        );
+        release_cleanup.notify_one();
+        assert_eq!(cleanup.await.unwrap(), Some(()));
+        let selected = claim.await.unwrap().unwrap().unwrap();
+        assert_eq!(selected, replacement.to_string_lossy());
+        let persisted = crate::persistence::load_sessions(&data_dir).unwrap();
+        assert!(
+            persisted.lifecycle_leases["worker"].project_dir_cleanup_on_abandon,
+            "replacement created after queued cleanup must gain recovery cleanup authority"
+        );
+
+        drop(state);
+        let recovery_state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: 0,
+            data_dir: data_dir.clone(),
+            config_dir: data_dir.clone(),
+        });
+        restore_persisted_sessions(&recovery_state).await.unwrap();
+
+        assert!(
+            !replacement.exists(),
+            "startup recovery must remove the abandoned replacement worktree"
+        );
+        assert!(
+            crate::persistence::load_sessions(&data_dir)
+                .unwrap()
+                .lifecycle_leases
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn restore_persisted_sessions_removes_unlaunched_http_start_before_releasing_id() {
         let dir = tempfile::tempdir().unwrap();
         let owner = crate::daemon_protocol::ResourceOwner {
@@ -3690,6 +4069,9 @@ mod tests {
                 crate::daemon_protocol::LifecycleLease {
                     owner: owner.clone(),
                     phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                    project_dir: None,
+                    project_dir_owner: None,
+                    project_dir_cleanup_on_abandon: false,
                     inert_pane: None,
                     inert_pane_owner: None,
                 },
@@ -3760,6 +4142,9 @@ mod tests {
                     crate::daemon_protocol::LifecycleLease {
                         owner: incumbent_owner.clone(),
                         phase: crate::daemon_protocol::LifecyclePhase::Restarting,
+                        project_dir: None,
+                        project_dir_owner: None,
+                        project_dir_cleanup_on_abandon: false,
                         inert_pane: None,
                         inert_pane_owner: None,
                     },
@@ -3769,6 +4154,9 @@ mod tests {
                     crate::daemon_protocol::LifecycleLease {
                         owner: staged_lease_owner,
                         phase: crate::daemon_protocol::LifecyclePhase::Restarting,
+                        project_dir: None,
+                        project_dir_owner: None,
+                        project_dir_cleanup_on_abandon: false,
                         inert_pane: None,
                         inert_pane_owner: None,
                     },
@@ -3814,6 +4202,9 @@ mod tests {
         let lease = crate::daemon_protocol::LifecycleLease {
             owner: owner.clone(),
             phase: crate::daemon_protocol::LifecyclePhase::Restarting,
+            project_dir: None,
+            project_dir_owner: None,
+            project_dir_cleanup_on_abandon: false,
             inert_pane: Some("%fallback".into()),
             inert_pane_owner: Some(owner),
         };
@@ -3834,6 +4225,9 @@ mod tests {
         let lease = crate::daemon_protocol::LifecycleLease {
             owner: incumbent.clone(),
             phase: crate::daemon_protocol::LifecyclePhase::Restarting,
+            project_dir: None,
+            project_dir_owner: None,
+            project_dir_cleanup_on_abandon: false,
             inert_pane: Some("%existing".into()),
             inert_pane_owner: Some(staged.clone()),
         };

@@ -82,6 +82,20 @@ pub enum LifecyclePhase {
 pub struct LifecycleLease {
     pub owner: ResourceOwner,
     pub phase: LifecyclePhase,
+    /// Directory claimed before launch performs filesystem work. This makes
+    /// paneless crashes recoverable and prevents an abandoned lease from
+    /// deleting a replacement incarnation's directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_dir: Option<String>,
+    /// Exact lifecycle owner whose external work may mutate `project_dir`.
+    /// Fresh restarts can stage a newer owner than the lease claimant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_dir_owner: Option<ResourceOwner>,
+    /// Whether recovery may remove this directory if the lease is abandoned.
+    /// Protection claims on pre-existing directories intentionally leave this
+    /// false.
+    #[serde(default)]
+    pub project_dir_cleanup_on_abandon: bool,
     /// Pane created before the backend command is sent. On daemon restart it
     /// is safe to remove because an accepted backend command releases this
     /// lease.
@@ -1053,6 +1067,7 @@ pub enum Effect {
         pane: String,
     },
     CleanupWorktree {
+        owner: ResourceOwner,
         project_dir: String,
     },
 }
@@ -1466,6 +1481,9 @@ impl DaemonState {
             LifecycleLease {
                 owner: owner.clone(),
                 phase: LifecyclePhase::Starting,
+                project_dir: None,
+                project_dir_owner: None,
+                project_dir_cleanup_on_abandon: false,
                 inert_pane: None,
                 inert_pane_owner: None,
             },
@@ -1494,6 +1512,36 @@ impl DaemonState {
         LifecycleMutationOutcome::Applied
     }
 
+    /// Record the exact directory claim before launch performs filesystem I/O.
+    pub fn record_project_dir_claim(
+        &mut self,
+        lease_owner: &ResourceOwner,
+        project_dir_owner: ResourceOwner,
+        project_dir: String,
+        cleanup_on_abandon: bool,
+    ) -> LifecycleMutationOutcome {
+        let Some(lease) = self.lifecycle_leases.get_mut(&lease_owner.session_id) else {
+            return LifecycleMutationOutcome::NotFound;
+        };
+        if lease.owner != *lease_owner {
+            return LifecycleMutationOutcome::Superseded;
+        }
+        if project_dir_owner.session_id != lease_owner.session_id {
+            return LifecycleMutationOutcome::Rejected;
+        }
+        if lease
+            .project_dir
+            .as_deref()
+            .is_some_and(|current| current != project_dir)
+        {
+            return LifecycleMutationOutcome::Rejected;
+        }
+        lease.project_dir = Some(project_dir);
+        lease.project_dir_owner = Some(project_dir_owner);
+        lease.project_dir_cleanup_on_abandon = cleanup_on_abandon;
+        LifecycleMutationOutcome::Applied
+    }
+
     /// Claim an existing exact owner for the restart behavior of `/start`.
     pub fn claim_existing_start(&mut self, owner: &ResourceOwner) -> LifecycleMutationOutcome {
         if self.lifecycle_leases.contains_key(&owner.session_id) {
@@ -1507,11 +1555,16 @@ impl DaemonState {
         {
             return LifecycleMutationOutcome::Superseded;
         }
+        let project_dir = session.metadata.project_dir.clone();
+        let project_dir_owner = project_dir.as_ref().map(|_| owner.clone());
         self.lifecycle_leases.insert(
             owner.session_id.clone(),
             LifecycleLease {
                 owner: owner.clone(),
                 phase: LifecyclePhase::Restarting,
+                project_dir,
+                project_dir_owner,
+                project_dir_cleanup_on_abandon: false,
                 inert_pane: None,
                 inert_pane_owner: None,
             },
@@ -1537,11 +1590,16 @@ impl DaemonState {
         {
             return LifecycleMutationOutcome::Superseded;
         }
+        let project_dir = session.metadata.project_dir.clone();
+        let project_dir_owner = project_dir.as_ref().map(|_| owner.clone());
         self.lifecycle_leases.insert(
             owner.session_id.clone(),
             LifecycleLease {
                 owner: owner.clone(),
                 phase: LifecyclePhase::Stopping,
+                project_dir,
+                project_dir_owner,
+                project_dir_cleanup_on_abandon: false,
                 inert_pane: Some(pane.to_string()),
                 inert_pane_owner: Some(owner.clone()),
             },
@@ -2632,6 +2690,7 @@ impl DaemonState {
                         });
                     } else {
                         effects.push(Effect::CleanupWorktree {
+                            owner,
                             project_dir: dir.clone(),
                         });
                     }
@@ -6088,15 +6147,17 @@ mod tests {
                 ..Default::default()
             },
         });
+        let removed_owner = state.sessions["wt"].owner();
         let effects = state.apply(Event::Remove {
             id: "wt".into(),
             keep_worktree: false,
         });
-        assert!(
-            effects
-                .iter()
-                .any(|e| matches!(e, Effect::CleanupWorktree { .. }))
-        );
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::CleanupWorktree { owner, project_dir }
+                if owner == &removed_owner
+                    && project_dir == "/code/ouija/.claude/worktrees/wt"
+        )));
     }
 
     #[test]
@@ -10378,7 +10439,7 @@ mod stateright_model {
         effects
             .iter()
             .filter_map(|e| match e {
-                Effect::CleanupWorktree { project_dir } => Some(project_dir.clone()),
+                Effect::CleanupWorktree { project_dir, .. } => Some(project_dir.clone()),
                 _ => None,
             })
             .collect()

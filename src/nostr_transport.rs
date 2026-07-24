@@ -1713,7 +1713,7 @@ async fn kill_session_inner(
             let is_worktree_path =
                 dir.contains("/.ouija/worktrees/") || dir.contains("/.claude/worktrees/");
             if is_worktree_path {
-                state.cleanup_worktree_dir_if_unused(&dir).await;
+                state.cleanup_worktree_dir_if_unused(&owner, &dir).await;
             }
         }
     }
@@ -1898,34 +1898,93 @@ pub async fn start_session(
         }
     };
 
-    // Create directory if it doesn't exist
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        return fail_reserved_start(state, &owner, format!("failed to create {dir}: {e}")).await;
-    }
-
     // If worktree requested, ouija creates it in .ouija/worktrees/<name>.
     // The backend never sees --worktree — it just gets a directory.
     if worktree {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let candidates = ouija_worktree_candidates(&dir, name, std::path::Path::new(&home));
+        let legacy_candidate = candidates[0].clone();
+        let new_candidate = candidates[1].clone();
+        let repo_dir = dir.clone();
         // `force_reset` is the explicit caller opt-in that guards against
         // silent branch wipes on respawn (hub#528). Threaded from the API
         // boundary; defaults to false.
-        match create_ouija_worktree(
-            &dir,
-            name,
-            branch,
-            base_branch,
-            force_reset,
-            std::path::Path::new(&home),
-        ) {
-            Ok(wt_dir) => {
-                dir = wt_dir;
-            }
-            Err(e) => {
+        let claim = state
+            .with_reserved_project_dir_choice(
+                &owner,
+                owner.clone(),
+                &candidates,
+                move || {
+                    if std::path::Path::new(&legacy_candidate).exists() {
+                        legacy_candidate
+                    } else {
+                        new_candidate
+                    }
+                },
+                move |worktree_dir| async move {
+                    create_ouija_worktree_at(
+                        &repo_dir,
+                        name,
+                        branch,
+                        base_branch,
+                        force_reset,
+                        &worktree_dir,
+                    )
+                },
+            )
+            .await;
+        match claim {
+            Ok(Some(Ok(wt_dir))) => dir = wt_dir,
+            Ok(Some(Err(error))) => {
                 return fail_reserved_start(
                     state,
                     &owner,
-                    format!("failed to create worktree: {e}"),
+                    format!("failed to create worktree: {error}"),
+                )
+                .await;
+            }
+            Ok(None) => {
+                return (
+                    format!("start for session '{name}' was superseded before worktree creation"),
+                    None,
+                );
+            }
+            Err(error) => {
+                return fail_reserved_start(
+                    state,
+                    &owner,
+                    format!("failed to persist worktree claim: {error}"),
+                )
+                .await;
+            }
+        }
+    } else {
+        let claim = state
+            .with_reserved_project_dir_claim(&owner, owner.clone(), &dir, false, || async {
+                std::fs::create_dir_all(&dir)
+            })
+            .await;
+        match claim {
+            Ok(Some(Ok(()))) => {}
+            Ok(Some(Err(error))) => {
+                return fail_reserved_start(
+                    state,
+                    &owner,
+                    format!("failed to create {dir}: {error}"),
+                )
+                .await;
+            }
+            Ok(None) => {
+                return (
+                    format!("start for session '{name}' was superseded before directory creation"),
+                    None,
+                );
+            }
+            Err(error) => {
+                return fail_reserved_start(
+                    state,
+                    &owner,
+                    format!("failed to persist directory claim: {error}"),
                 )
                 .await;
             }
@@ -5283,6 +5342,7 @@ fn legacy_drops_destructive_intent(base_branch: Option<&str>, force_reset: bool)
 /// When the branch is ahead and `force_reset` is `false`, the reset is
 /// skipped and a structured warning is logged so the caller can recover via
 /// `git reflog`. This guards against silent data loss (hub#528).
+#[cfg(test)]
 fn create_ouija_worktree(
     repo_dir: &str,
     name: &str,
@@ -5291,9 +5351,20 @@ fn create_ouija_worktree(
     force_reset: bool,
     home: &std::path::Path,
 ) -> anyhow::Result<String> {
-    // Check legacy location first (running sessions may use it)
+    let wt_dir = ouija_worktree_dir(repo_dir, name, home);
+    create_ouija_worktree_at(repo_dir, name, branch, base_branch, force_reset, &wt_dir)
+}
+
+fn create_ouija_worktree_at(
+    repo_dir: &str,
+    name: &str,
+    branch: Option<&str>,
+    base_branch: Option<&str>,
+    force_reset: bool,
+    wt_dir: &str,
+) -> anyhow::Result<String> {
     let legacy_dir = format!("{repo_dir}/.ouija/worktrees/{name}");
-    if std::path::Path::new(&legacy_dir).exists() {
+    if wt_dir == legacy_dir {
         if let Some(msg) = legacy_drops_destructive_intent(base_branch, force_reset) {
             // Mirror the non-legacy arms (Some(0)/Some(n)/None at
             // :2612/:2626/:2640): when force_reset=true is asserted but
@@ -5305,14 +5376,7 @@ fn create_ouija_worktree(
         }
         return Ok(legacy_dir);
     }
-    // New location: <home>/.ouija/worktrees/<repo-slug>/<name>
-    let repo_slug = std::path::Path::new(repo_dir)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("repo");
-    let home_str = home.to_string_lossy();
-    let wt_dir = format!("{home_str}/.ouija/worktrees/{repo_slug}/{name}");
-    if std::path::Path::new(&wt_dir).exists() {
+    if std::path::Path::new(wt_dir).exists() {
         // If base_branch is specified, the caller may want the branch reset
         // to base. This is data-destructive: if the branch is ahead of base
         // (has real commits), an unconditional reset silently discards those
@@ -5321,7 +5385,7 @@ fn create_ouija_worktree(
         // with `force_reset`.
         if let Some(base) = base_branch {
             let branch_name = branch.unwrap_or(name);
-            let ahead = git_rev_count(&wt_dir, base, branch_name);
+            let ahead = git_rev_count(wt_dir, base, branch_name);
             match ahead {
                 Some(0) => {
                     // Zero ahead: nothing to lose. Still run the reset so
@@ -5339,7 +5403,7 @@ fn create_ouija_worktree(
                     // start on a transient git failure. Log the outcome
                     // honestly: on failure, warn; only emit the
                     // "no-op" info line when the reset actually ran.
-                    match run_reset(&wt_dir, branch_name, base) {
+                    match run_reset(wt_dir, branch_name, base) {
                         Ok(()) => {
                             tracing::info!(
                                 "worktree {name}: branch {branch_name} is 0 commits ahead of {base}, reset is a no-op"
@@ -5357,7 +5421,7 @@ fn create_ouija_worktree(
                     }
                 }
                 Some(n) if n > 0 && !force_reset => {
-                    let tip = git_rev_parse(&wt_dir, branch_name).unwrap_or_else(|| "?".into());
+                    let tip = git_rev_parse(wt_dir, branch_name).unwrap_or_else(|| "?".into());
                     tracing::warn!(
                         "worktree {name}: SKIPPING reset of branch {branch_name} to {base} \
                          because it is {n} commits ahead (tip {tip}); \
@@ -5371,11 +5435,11 @@ fn create_ouija_worktree(
                     // about to discard so reflog recovery is discoverable,
                     // then propagate any reset failure so the caller sees
                     // their explicit destructive request was not honored.
-                    let tip = git_rev_parse(&wt_dir, branch_name).unwrap_or_else(|| "?".into());
+                    let tip = git_rev_parse(wt_dir, branch_name).unwrap_or_else(|| "?".into());
                     tracing::warn!(
                         "worktree {name}: force_reset=true, DISCARDING {n} commits on branch {branch_name} (tip {tip}) to reset to {base}"
                     );
-                    run_reset(&wt_dir, branch_name, base)?;
+                    run_reset(wt_dir, branch_name, base)?;
                 }
                 None if force_reset => {
                     // `git rev-list` failed — the base ref might not exist
@@ -5389,7 +5453,7 @@ fn create_ouija_worktree(
                         "worktree {name}: cannot compute {base}..{branch_name} commit count \
                          (base or branch ref missing), but force_reset=true — attempting reset anyway"
                     );
-                    run_reset(&wt_dir, branch_name, base)?;
+                    run_reset(wt_dir, branch_name, base)?;
                 }
                 None => {
                     // `git rev-list` failed and force_reset is false —
@@ -5403,11 +5467,13 @@ fn create_ouija_worktree(
                 }
             }
         }
-        return Ok(wt_dir);
+        return Ok(wt_dir.to_string());
     }
     // Ensure parent dir exists
-    let parent = format!("{home_str}/.ouija/worktrees/{repo_slug}");
-    std::fs::create_dir_all(&parent)?;
+    let parent = std::path::Path::new(wt_dir)
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("worktree path has no parent: {wt_dir}"))?;
+    std::fs::create_dir_all(parent)?;
     // Create worktree with a new branch
     let branch = branch.map(String::from).unwrap_or_else(|| name.to_string());
     if let Some(base) = base_branch {
@@ -5421,8 +5487,8 @@ fn create_ouija_worktree(
                          without reset because it is {n} commits ahead of {base} (tip {tip}); \
                          pass force_reset=true to override"
                     );
-                    add_existing_branch_worktree(repo_dir, &wt_dir, &branch)?;
-                    return Ok(wt_dir);
+                    add_existing_branch_worktree(repo_dir, wt_dir, &branch)?;
+                    return Ok(wt_dir.to_string());
                 }
                 None => {
                     tracing::warn!(
@@ -5430,15 +5496,15 @@ fn create_ouija_worktree(
                          before creating missing worktree; checking out existing branch without \
                          reset to avoid data loss. Pass force_reset=true to override."
                     );
-                    add_existing_branch_worktree(repo_dir, &wt_dir, &branch)?;
-                    return Ok(wt_dir);
+                    add_existing_branch_worktree(repo_dir, wt_dir, &branch)?;
+                    return Ok(wt_dir.to_string());
                 }
                 _ => {}
             }
         }
     }
     let flag = if base_branch.is_some() { "-B" } else { "-b" };
-    let mut args = vec!["-C", repo_dir, "worktree", "add", flag, &branch, &wt_dir];
+    let mut args = vec!["-C", repo_dir, "worktree", "add", flag, &branch, wt_dir];
     if let Some(base) = base_branch {
         args.push(base);
     }
@@ -5451,9 +5517,34 @@ fn create_ouija_worktree(
             );
         }
         // Branch might already exist — check it out in the worktree
-        add_existing_branch_worktree(repo_dir, &wt_dir, &branch)?;
+        add_existing_branch_worktree(repo_dir, wt_dir, &branch)?;
     }
-    Ok(wt_dir)
+    Ok(wt_dir.to_string())
+}
+
+/// Resolve the one project-directory gate a managed worktree must claim
+/// before create/reset I/O begins.
+#[cfg(test)]
+fn ouija_worktree_dir(repo_dir: &str, name: &str, home: &std::path::Path) -> String {
+    let [legacy_dir, new_dir] = ouija_worktree_candidates(repo_dir, name, home);
+    if std::path::Path::new(&legacy_dir).exists() {
+        legacy_dir
+    } else {
+        new_dir
+    }
+}
+
+fn ouija_worktree_candidates(repo_dir: &str, name: &str, home: &std::path::Path) -> [String; 2] {
+    let legacy_dir = format!("{repo_dir}/.ouija/worktrees/{name}");
+    let repo_slug = std::path::Path::new(repo_dir)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("repo");
+    let new_dir = format!(
+        "{}/.ouija/worktrees/{repo_slug}/{name}",
+        home.to_string_lossy()
+    );
+    [legacy_dir, new_dir]
 }
 
 /// Queue a prompt for HttpApi session delivery via readiness signal.
