@@ -1238,6 +1238,15 @@ pub(crate) fn validate_backend_session_id_boundary(backend_sid: &str) -> Option<
 /// context means the new CLI positively reports it has no `$TMUX_PANE`.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct SenderContext {
+    /// The CLI received an explicit public sender id from its trusted local
+    /// invocation context. The daemon still requires that id to name an
+    /// existing Local session and rejects any observation that positively
+    /// resolves the caller to a different Local session.
+    ///
+    /// This marker is only valid on the local `/api/send` control plane.
+    /// Remote ingress uses `Event::IncomingWire` and cannot set it.
+    #[serde(default)]
+    pub trusted_local_claim: bool,
     /// The caller's `$TMUX_PANE`, if any. `None` (in a present context) means
     /// the caller positively reports it runs outside tmux.
     #[serde(default)]
@@ -1355,6 +1364,10 @@ pub fn validate_sender_claim(
     from: &str,
     ctx: &SenderContext,
 ) -> Result<(), String> {
+    if ctx.trusted_local_claim {
+        return validate_trusted_local_sender_claim(state, from, ctx);
+    }
+
     let Some(session) = state.sessions.get(from) else {
         return Ok(());
     };
@@ -1390,6 +1403,83 @@ pub fn validate_sender_claim(
             verify_session_self_claim(from, session, ctx)
         }
     }
+}
+
+/// Validate an explicit public Local sender id supplied to the local CLI.
+///
+/// Missing, unregistered, and incomplete observations are absence of proof,
+/// not proof of a sibling caller. Only an observation that resolves through
+/// daemon state to another Local session vetoes the claim.
+fn validate_trusted_local_sender_claim(
+    state: &DaemonState,
+    from: &str,
+    ctx: &SenderContext,
+) -> Result<(), String> {
+    let Some(session) = state.sessions.get(from) else {
+        return Err(format!(
+            "sender claim rejected: explicit Local session '{from}' is not registered"
+        ));
+    };
+    if !matches!(session.origin, Origin::Local) {
+        return Err(format!(
+            "sender claim rejected: '{from}' is a {} session, and a local caller cannot send \
+             as it. Run `ouija whoami` to get your own session id.",
+            session.origin.label()
+        ));
+    }
+
+    if let Some(caller_pane) = ctx.pane.as_deref().filter(|pane| !pane.is_empty()) {
+        if let Some(sibling) = state.sessions.values().find(|candidate| {
+            candidate.id != from
+                && matches!(candidate.origin, Origin::Local)
+                && candidate.pane.as_deref() == Some(caller_pane)
+        }) {
+            return Err(format!(
+                "sender claim rejected: explicit Local session '{from}' conflicts with pane \
+                 {caller_pane}, which belongs to Local session '{}'. Never stamp a sibling \
+                 sender id.",
+                sibling.id
+            ));
+        }
+    }
+
+    if let Some(self_id) = ctx.self_id.as_deref().filter(|id| !id.is_empty()) {
+        if state.sessions.get(self_id).is_some_and(|candidate| {
+            candidate.id != from && matches!(candidate.origin, Origin::Local)
+        }) {
+            return Err(format!(
+                "sender claim rejected: explicit Local session '{from}' conflicts with this \
+                 caller's Local session '{self_id}'. Never stamp a sibling sender id."
+            ));
+        }
+    }
+
+    if let Some(identity) = ctx.backend_identity.as_ref() {
+        match state.resolve_backend_identity(identity) {
+            BackendIdentityResolution::Resolved { session_id } if session_id != from => {
+                return Err(format!(
+                    "sender claim rejected: explicit Local session '{from}' conflicts with \
+                     backend identity '{}/{}', which belongs to Local session '{session_id}'. \
+                     Never stamp a sibling sender id.",
+                    identity.backend, identity.session_id
+                ));
+            }
+            BackendIdentityResolution::Ambiguous { session_ids } => {
+                return Err(format!(
+                    "sender claim rejected: backend identity '{}/{}' ambiguously belongs to \
+                     Local sessions {}",
+                    identity.backend,
+                    identity.session_id,
+                    session_ids.join(", ")
+                ));
+            }
+            BackendIdentityResolution::Resolved { .. }
+            | BackendIdentityResolution::NotFound
+            | BackendIdentityResolution::IncompleteLegacy { .. } => {}
+        }
+    }
+
+    Ok(())
 }
 
 /// Bind a paneless backend claim to the caller's own stable identity.
@@ -3425,9 +3515,8 @@ impl DaemonState {
             .filter(|session| {
                 matches!(session.origin, Origin::Local)
                     && metadata_has_incomplete_backend_pair(&session.metadata)
-                    && (session.metadata.backend_session_id.as_deref()
+                    && session.metadata.backend_session_id.as_deref()
                         == Some(identity.session_id.as_str())
-                        || session.metadata.backend.as_deref() == Some(identity.backend.as_str()))
             })
             .map(|session| session.id.clone())
             .collect();
@@ -4891,6 +4980,182 @@ mod tests {
                 ..Default::default()
             },
         });
+    }
+
+    fn trusted_local_sender_context(
+        pane: Option<&str>,
+        self_id: Option<&str>,
+        backend_identity: Option<crate::backend::BackendSessionIdentity>,
+    ) -> SenderContext {
+        serde_json::from_value(serde_json::json!({
+            "pane": pane,
+            "self_id": self_id,
+            "backend_identity": backend_identity,
+            "trusted_local_claim": true,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn trusted_local_claim_accepts_replacement_codex_thread_without_other_proof() {
+        let mut state = claim_state();
+        register_codex(&mut state, "hub-4", Some("%10"), "old-thread");
+        let ctx = trusted_local_sender_context(
+            None,
+            None,
+            Some(crate::backend::BackendSessionIdentity {
+                backend: "codex-cli".into(),
+                session_id: "new-thread".into(),
+            }),
+        );
+
+        assert_eq!(validate_sender_claim(&state, "hub-4", &ctx), Ok(()));
+    }
+
+    #[test]
+    fn trusted_local_claim_accepts_missing_identity_observations() {
+        let mut state = claim_state();
+        register_codex(&mut state, "hub-4", Some("%10"), "old-thread");
+        let ctx = trusted_local_sender_context(None, None, None);
+
+        assert_eq!(validate_sender_claim(&state, "hub-4", &ctx), Ok(()));
+    }
+
+    #[test]
+    fn trusted_local_claim_accepts_unregistered_pane_observation() {
+        let mut state = claim_state();
+        register_codex(&mut state, "hub-4", Some("%10"), "old-thread");
+        let ctx = trusted_local_sender_context(Some("%replacement"), None, None);
+
+        assert_eq!(validate_sender_claim(&state, "hub-4", &ctx), Ok(()));
+    }
+
+    #[test]
+    fn trusted_local_claim_accepts_incomplete_backend_observation() {
+        let mut state = claim_state();
+        register_codex(&mut state, "hub-4", Some("%10"), "old-thread");
+        state.sessions.insert(
+            "legacy-id-only".into(),
+            SessionEntry {
+                id: "legacy-id-only".into(),
+                metadata: SessionMeta {
+                    backend_session_id: Some("new-thread".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let ctx = trusted_local_sender_context(
+            None,
+            None,
+            Some(crate::backend::BackendSessionIdentity {
+                backend: "codex-cli".into(),
+                session_id: "new-thread".into(),
+            }),
+        );
+
+        assert_eq!(validate_sender_claim(&state, "hub-4", &ctx), Ok(()));
+    }
+
+    #[test]
+    fn trusted_local_claim_rejects_backend_observation_resolving_to_sibling() {
+        let mut state = claim_state();
+        register_codex(&mut state, "hub-4", Some("%10"), "old-thread");
+        register_codex(&mut state, "sibling", Some("%11"), "new-thread");
+        let ctx = trusted_local_sender_context(
+            Some("%10"),
+            None,
+            Some(crate::backend::BackendSessionIdentity {
+                backend: "codex-cli".into(),
+                session_id: "new-thread".into(),
+            }),
+        );
+
+        let err = validate_sender_claim(&state, "hub-4", &ctx).unwrap_err();
+        assert!(
+            err.contains("sibling") && err.contains("hub-4"),
+            "rejection must name the conflicting Local sessions, got: {err}"
+        );
+    }
+
+    #[test]
+    fn trusted_local_claim_rejects_self_id_observation_resolving_to_sibling() {
+        let mut state = claim_state();
+        register_codex(&mut state, "hub-4", Some("%10"), "old-thread");
+        register_codex(&mut state, "sibling", Some("%11"), "sibling-thread");
+        let ctx = trusted_local_sender_context(Some("%10"), Some("sibling"), None);
+
+        let err = validate_sender_claim(&state, "hub-4", &ctx).unwrap_err();
+        assert!(
+            err.contains("sibling") && err.contains("hub-4"),
+            "rejection must name the conflicting Local sessions, got: {err}"
+        );
+    }
+
+    #[test]
+    fn trusted_local_claim_rejects_pane_observation_resolving_to_sibling() {
+        let mut state = claim_state();
+        register_codex(&mut state, "hub-4", Some("%10"), "old-thread");
+        register_codex(&mut state, "sibling", Some("%11"), "sibling-thread");
+        let ctx = trusted_local_sender_context(Some("%11"), None, None);
+
+        let err = validate_sender_claim(&state, "hub-4", &ctx).unwrap_err();
+        assert!(
+            err.contains("sibling") && err.contains("hub-4"),
+            "rejection must name the conflicting Local sessions, got: {err}"
+        );
+    }
+
+    #[test]
+    fn trusted_local_claim_rejects_absent_sender() {
+        let state = claim_state();
+        let ctx = trusted_local_sender_context(None, None, None);
+
+        let err = validate_sender_claim(&state, "missing", &ctx).unwrap_err();
+        assert!(
+            err.contains("not registered") && err.contains("missing"),
+            "rejection must identify the absent claim, got: {err}"
+        );
+    }
+
+    #[test]
+    fn trusted_local_claim_rejects_human_sender() {
+        let mut state = claim_state();
+        state.sessions.insert(
+            "operator".into(),
+            SessionEntry {
+                id: "operator".into(),
+                origin: Origin::Human("npub1operator".into()),
+                ..Default::default()
+            },
+        );
+        let ctx = trusted_local_sender_context(None, None, None);
+
+        let err = validate_sender_claim(&state, "operator", &ctx).unwrap_err();
+        assert!(
+            err.contains("human"),
+            "must explain a local caller cannot claim a human session, got: {err}"
+        );
+    }
+
+    #[test]
+    fn trusted_local_claim_rejects_remote_sender() {
+        let mut state = claim_state();
+        state.sessions.insert(
+            "peer/task".into(),
+            SessionEntry {
+                id: "peer/task".into(),
+                origin: Origin::Remote("npub1peer".into()),
+                ..Default::default()
+            },
+        );
+        let ctx = trusted_local_sender_context(None, None, None);
+
+        let err = validate_sender_claim(&state, "peer/task", &ctx).unwrap_err();
+        assert!(
+            err.contains("remote"),
+            "must explain a local caller cannot claim a remote session, got: {err}"
+        );
     }
 
     #[test]
@@ -9239,9 +9504,7 @@ mod tests {
         );
         assert_eq!(
             state.resolve_backend_identity(&backend_identity("future", "native-2")),
-            BackendIdentityResolution::IncompleteLegacy {
-                session_ids: vec!["legacy-backend-only".into()]
-            }
+            BackendIdentityResolution::NotFound
         );
 
         state.sessions.clear();

@@ -2631,11 +2631,13 @@ fn sender_context(
     self_id: Option<&str>,
     tmux_pane: Option<String>,
     backend_identity: Option<backend::BackendSessionIdentity>,
+    trusted_local_claim: bool,
 ) -> serde_json::Value {
     serde_json::json!({
         "pane": tmux_pane,
         "self_id": self_id,
         "backend_identity": backend_identity,
+        "trusted_local_claim": trusted_local_claim,
     })
 }
 
@@ -2775,26 +2777,60 @@ async fn resolve_backend_identity_from_daemon(
         })
 }
 
-fn enforce_explicit_sender_match(explicit: &str, canonical: &str) -> anyhow::Result<String> {
-    if explicit == canonical {
-        Ok(explicit.into())
-    } else {
-        anyhow::bail!(
-            "--from '{explicit}' does not match this backend identity's canonical session '{canonical}'; never stamp a raw or sibling sender id"
-        )
-    }
-}
-
 struct ResolvedSender {
     id: String,
     context: serde_json::Value,
 }
 
-/// Resolve a message sender and the proof sent alongside it from one identity
-/// arbitration result. Keeping these together prevents `from` from naming the
-/// backend-canonical session while `sender_ctx.self_id` still reports a stale
-/// pane or environment value.
+/// Build a trusted explicit Local claim from raw caller observations.
+///
+/// The public id is authoritative, while pane/environment/backend signals are
+/// preserved independently so the daemon can reject only positive evidence
+/// that resolves to a sibling Local session. A pane lookup remains represented
+/// by `pane`; the daemon already owns the authoritative pane mapping.
+fn resolve_explicit_sender(
+    explicit: String,
+    tmux_pane: Option<String>,
+    pane_var: Option<String>,
+    env_var: Option<String>,
+    backend_identity: Option<backend::BackendSessionIdentity>,
+) -> ResolvedSender {
+    let self_id = match pick_session_id(tmux_pane.as_deref(), pane_var, env_var) {
+        SessionIdResolution::Found(id, _) => Some(id),
+        SessionIdResolution::LookupByPane(_) | SessionIdResolution::None => None,
+    };
+    let context = sender_context(self_id.as_deref(), tmux_pane, backend_identity, true);
+    ResolvedSender {
+        id: explicit,
+        context,
+    }
+}
+
+/// Resolve a message sender and the observations sent alongside it.
+///
+/// An explicit public Local id is handled separately from fail-closed implicit
+/// identity inference. The daemon validates explicit claims against its
+/// authoritative session state before applying `Event::Send`.
 async fn resolve_sender(explicit: Option<String>) -> anyhow::Result<ResolvedSender> {
+    if let Some(explicit) = explicit {
+        let tmux_pane = std::env::var("TMUX_PANE")
+            .ok()
+            .filter(|pane| !pane.is_empty());
+        let pane_var = tmux_pane.as_deref().and_then(tmux_var::get);
+        let env_var = std::env::var("OUIJA_SESSION_ID")
+            .ok()
+            .filter(|id| !id.is_empty());
+        let backend_identity =
+            backend::BackendRegistry::default_registry().caller_session_identity();
+        return Ok(resolve_explicit_sender(
+            explicit,
+            tmux_pane,
+            pane_var,
+            env_var,
+            backend_identity,
+        ));
+    }
+
     match whoami_outcome().await {
         WhoamiOutcome::Resolved {
             id,
@@ -2803,41 +2839,14 @@ async fn resolve_sender(explicit: Option<String>) -> anyhow::Result<ResolvedSend
             backend_identity,
         } => {
             verify_resolved_id_registered(&id, &source).await?;
-            let id = match explicit {
-                Some(explicit) => enforce_explicit_sender_match(&explicit, &id)?,
-                None => id,
-            };
-            let context = sender_context(Some(&id), tmux_pane, backend_identity);
+            let context = sender_context(Some(&id), tmux_pane, backend_identity, false);
             Ok(ResolvedSender { id, context })
         }
         WhoamiOutcome::Conflict(conflict) => anyhow::bail!(format_identity_conflict(&conflict)),
         WhoamiOutcome::BackendResolutionFailed(error) => anyhow::bail!(
             "backend identity was discovered but could not be resolved safely: {error}"
         ),
-        WhoamiOutcome::Unresolved(_) => {
-            let Some(explicit) = explicit else {
-                return Err(anyhow::anyhow!(unresolved_sender_error()));
-            };
-            let tmux_pane = std::env::var("TMUX_PANE")
-                .ok()
-                .filter(|pane| !pane.is_empty());
-            let backend_identity =
-                backend::BackendRegistry::default_registry().caller_session_identity();
-            if let Some(identity) = backend_identity.as_ref() {
-                let canonical = resolve_backend_identity_from_daemon(identity).await?;
-                let id = enforce_explicit_sender_match(&explicit, &canonical)?;
-                let context = sender_context(Some(&id), tmux_pane, backend_identity);
-                Ok(ResolvedSender { id, context })
-            } else {
-                // Preserve explicit legacy sends that have no observable local
-                // identity. There is no raw signal to report as `self_id`.
-                let context = sender_context(None, tmux_pane, None);
-                Ok(ResolvedSender {
-                    id: explicit,
-                    context,
-                })
-            }
-        }
+        WhoamiOutcome::Unresolved(_) => Err(anyhow::anyhow!(unresolved_sender_error())),
     }
 }
 
@@ -3522,15 +3531,39 @@ mod tests {
     }
 
     #[test]
-    fn explicit_sender_must_match_canonical_backend_identity() {
-        assert_eq!(
-            enforce_explicit_sender_match("canonical", "canonical").unwrap(),
-            "canonical"
+    fn explicit_sender_remains_authoritative_across_backend_thread_rollover() {
+        let sender = resolve_explicit_sender(
+            "hub-4".into(),
+            Some("%replacement".into()),
+            None,
+            None,
+            Some(backend::BackendSessionIdentity {
+                backend: "codex-cli".into(),
+                session_id: "new-thread".into(),
+            }),
         );
-        let err = enforce_explicit_sender_match("sibling", "canonical").unwrap_err();
-        assert!(err.to_string().contains("does not match"));
-        assert!(err.to_string().contains("sibling"));
-        assert!(err.to_string().contains("canonical"));
+
+        assert_eq!(sender.id, "hub-4");
+        assert_eq!(sender.context["trusted_local_claim"], true);
+        assert_eq!(sender.context["pane"], "%replacement");
+        assert!(sender.context["self_id"].is_null());
+        assert_eq!(
+            sender.context["backend_identity"],
+            serde_json::json!({
+                "backend": "codex-cli",
+                "session_id": "new-thread",
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_sender_preserves_registered_env_observation_for_daemon_validation() {
+        let sender =
+            resolve_explicit_sender("hub-4".into(), None, None, Some("sibling".into()), None);
+
+        assert_eq!(sender.id, "hub-4");
+        assert_eq!(sender.context["self_id"], "sibling");
+        assert_eq!(sender.context["trusted_local_claim"], true);
     }
 
     #[test]
