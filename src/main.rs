@@ -19,7 +19,7 @@ mod transport;
 
 use anyhow::{Context, bail};
 use backend::CodingAssistant;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use daemon_protocol::IdlePolicy;
 use nostr_sdk::ToBech32;
 use std::path::PathBuf;
@@ -165,13 +165,21 @@ enum Command {
         project_dir: Option<String>,
         #[arg(long)]
         prompt: Option<String>,
-        #[arg(long)]
+        #[arg(long, value_parser = parse_manual_reminder)]
         reminder: Option<String>,
         #[arg(long)]
         parent_session: Option<String>,
         #[arg(long)]
         no_parent_session: bool,
-        #[arg(long, value_parser = parse_idle_policy)]
+        /// What to do when work completes.
+        #[arg(long, value_enum, conflicts_with = "idle_policy")]
+        when_done: Option<WhenDone>,
+        /// Deprecated: use --when-done. Legacy values: keep-open, ask-parent-when-done, close-when-done.
+        #[arg(
+            long,
+            value_parser = parse_idle_policy,
+            conflicts_with = "when_done"
+        )]
         idle_policy: Option<IdlePolicy>,
         #[arg(long)]
         worktree: bool,
@@ -360,8 +368,30 @@ enum TaskAction {
     Trigger { id: String },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum WhenDone {
+    KeepOpen,
+    AskParent,
+    Close,
+}
+
+impl From<WhenDone> for IdlePolicy {
+    fn from(value: WhenDone) -> Self {
+        match value {
+            WhenDone::KeepOpen => IdlePolicy::KeepOpen,
+            WhenDone::AskParent => IdlePolicy::AskParentWhenDone,
+            WhenDone::Close => IdlePolicy::CloseWhenDone,
+        }
+    }
+}
+
 fn parse_idle_policy(value: &str) -> Result<IdlePolicy, String> {
     value.parse()
+}
+
+fn parse_manual_reminder(value: &str) -> Result<String, String> {
+    daemon_protocol::validate_spawn_reminder(Some(value))?;
+    Ok(value.to_string())
 }
 
 fn validate_spawn_lifecycle(
@@ -835,6 +865,7 @@ async fn main() -> anyhow::Result<()> {
             reminder,
             parent_session,
             no_parent_session,
+            when_done,
             idle_policy,
             worktree,
             branch,
@@ -844,6 +875,7 @@ async fn main() -> anyhow::Result<()> {
             backend,
             from,
         } => {
+            let idle_policy = when_done.map(IdlePolicy::from).or(idle_policy);
             if let Err(err) = validate_spawn_lifecycle(
                 parent_session.as_deref(),
                 no_parent_session,
@@ -2719,7 +2751,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_session_cli_parses_lifecycle_policy_flags() {
+    fn spawn_session_cli_preserves_legacy_idle_policy_values() {
         let cli = Cli::try_parse_from([
             "ouija",
             "spawn-session",
@@ -2747,6 +2779,117 @@ mod tests {
             }
             _ => panic!("expected spawn-session command"),
         }
+    }
+
+    #[test]
+    fn spawn_session_cli_accepts_primary_when_done_values() {
+        for (value, expected) in [
+            ("keep-open", IdlePolicy::KeepOpen),
+            ("ask-parent", IdlePolicy::AskParentWhenDone),
+            ("close", IdlePolicy::CloseWhenDone),
+        ] {
+            let cli = Cli::try_parse_from([
+                "ouija",
+                "spawn-session",
+                "worker",
+                "--parent-session",
+                "parent",
+                "--when-done",
+                value,
+            ])
+            .unwrap_or_else(|error| panic!("--when-done {value} must parse: {error}"));
+
+            match cli.command {
+                Command::SpawnSession {
+                    when_done,
+                    idle_policy,
+                    ..
+                } => {
+                    assert_eq!(when_done.map(IdlePolicy::from), Some(expected));
+                    assert_eq!(idle_policy, None);
+                }
+                _ => panic!("expected spawn-session command"),
+            }
+        }
+    }
+
+    #[test]
+    fn spawn_session_cli_rejects_both_completion_flags() {
+        let error = Cli::try_parse_from([
+            "ouija",
+            "spawn-session",
+            "worker",
+            "--no-parent-session",
+            "--when-done",
+            "keep-open",
+            "--idle-policy",
+            "keep-open",
+        ])
+        .err()
+        .expect("completion flags must conflict")
+        .to_string();
+
+        assert!(error.contains("--when-done"));
+        assert!(error.contains("--idle-policy"));
+        assert!(
+            error.contains("cannot be used with"),
+            "error must explain the conflict, got: {error}"
+        );
+    }
+
+    #[test]
+    fn spawn_session_help_documents_primary_and_deprecated_completion_flags() {
+        use clap::CommandFactory;
+
+        let mut cmd = Cli::command();
+        let spawn_session = cmd
+            .find_subcommand_mut("spawn-session")
+            .expect("spawn-session subcommand exists");
+        let mut help = Vec::new();
+        spawn_session.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+
+        assert!(help.contains("--when-done <WHEN_DONE>"));
+        for value in ["keep-open", "ask-parent", "close"] {
+            assert!(
+                help.contains(value),
+                "primary completion value {value} missing from help:\n{help}"
+            );
+        }
+        assert!(help.contains("--idle-policy <IDLE_POLICY>"));
+        assert!(
+            help.contains("Deprecated"),
+            "legacy flag must be marked deprecated:\n{help}"
+        );
+        for value in ["keep-open", "ask-parent-when-done", "close-when-done"] {
+            assert!(
+                help.contains(value),
+                "legacy completion value {value} missing from help:\n{help}"
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_session_cli_rejects_manual_clear_reminder_commands() {
+        let error = Cli::try_parse_from([
+            "ouija",
+            "spawn-session",
+            "worker",
+            "--no-parent-session",
+            "--idle-policy",
+            "keep-open",
+            "--reminder",
+            "When done, run ouija clear-reminder 7",
+        ])
+        .err()
+        .expect("manual clear-reminder instructions must be rejected")
+        .to_string();
+
+        assert!(error.contains("ouija clear-reminder"));
+        assert!(
+            error.contains("generated"),
+            "error must explain that Ouija supplies the command, got: {error}"
+        );
     }
 
     #[test]
@@ -2796,8 +2939,8 @@ mod tests {
         let err = validate_spawn_lifecycle(None, true, None).unwrap_err();
 
         assert!(
-            err.contains("--idle-policy <keep-open|ask-parent-when-done|close-when-done>"),
-            "error must teach idle-policy choices, got: {err}"
+            err.contains("--when-done <keep-open|ask-parent|close>"),
+            "error must teach when-done choices, got: {err}"
         );
     }
 

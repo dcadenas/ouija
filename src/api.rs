@@ -2498,7 +2498,8 @@ fn validate_start_lifecycle(body: &mut SessionNameBody) -> Result<(), String> {
         body.parent_session.as_deref(),
         body.no_parent_session.unwrap_or(false),
         body.idle_policy.as_ref(),
-    )
+    )?;
+    crate::daemon_protocol::validate_spawn_reminder(body.reminder.as_deref())
 }
 
 /// Kill the coding assistant process in a session's tmux pane.
@@ -4924,8 +4925,52 @@ mod tests {
         let err = validate_start_lifecycle(&mut body).unwrap_err();
 
         assert!(
-            err.contains("--idle-policy <keep-open|ask-parent-when-done|close-when-done>"),
-            "error must teach idle-policy choices, got: {err}"
+            err.contains("--when-done <keep-open|ask-parent|close>"),
+            "error must teach when-done choices, got: {err}"
+        );
+    }
+
+    #[test]
+    fn start_lifecycle_validation_rejects_manual_clear_reminder_commands() {
+        let mut body: SessionNameBody = serde_json::from_str(
+            r#"{
+                "name":"s",
+                "no_parent_session":true,
+                "idle_policy":"keep-open",
+                "reminder":"When done, run ouija clear-reminder 7"
+            }"#,
+        )
+        .unwrap();
+
+        let err = validate_start_lifecycle(&mut body).unwrap_err();
+
+        assert!(err.contains("ouija clear-reminder"));
+        assert!(
+            err.contains("generated"),
+            "error must explain that Ouija supplies the command, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_session_rejects_manual_clear_reminder_commands_at_api_boundary() {
+        let state = crate::state::AppState::new_for_test();
+        let body: SessionNameBody = serde_json::from_str(
+            r#"{
+                "name":"s",
+                "no_parent_session":true,
+                "idle_policy":"keep-open",
+                "reminder":"When done, run ouija clear-reminder 7"
+            }"#,
+        )
+        .unwrap();
+
+        let (status, Json(response)) = start_session(State(state), Json(body)).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            response["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("ouija clear-reminder"))
         );
     }
 

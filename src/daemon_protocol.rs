@@ -270,6 +270,7 @@ impl std::str::FromStr for IdlePolicy {
 }
 
 pub const IDLE_POLICY_CHOICES: &str = "keep-open|ask-parent-when-done|close-when-done";
+pub const WHEN_DONE_CHOICES: &str = "keep-open|ask-parent|close";
 
 /// Generate an unguessable one-time credential for a managed backend launch.
 ///
@@ -305,13 +306,24 @@ pub fn validate_spawn_lifecycle(
 
     let Some(idle_policy) = idle_policy else {
         return Err(format!(
-            "spawn-session requires --idle-policy <{IDLE_POLICY_CHOICES}>"
+            "spawn-session requires --when-done <{WHEN_DONE_CHOICES}>"
         ));
     };
 
     if *idle_policy == IdlePolicy::AskParentWhenDone && parent_session.is_none() {
         return Err(
             "idle policy ask-parent-when-done requires --parent-session <SESSION_ID>; use keep-open or close-when-done with --no-parent-session"
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+pub fn validate_spawn_reminder(reminder: Option<&str>) -> Result<(), String> {
+    if reminder.is_some_and(|text| text.contains("ouija clear-reminder")) {
+        return Err(
+            "manual reminders must not contain 'ouija clear-reminder'; Ouija supplies a generated clearing command with the correct reminder ID"
                 .to_string(),
         );
     }
