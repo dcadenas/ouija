@@ -681,6 +681,7 @@ pub async fn register(
         crate::daemon_protocol::Effect::RegisterOk {
             session_id,
             replaced,
+            ..
         } => Some((session_id.clone(), replaced.clone())),
         _ => None,
     }) {

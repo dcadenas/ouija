@@ -536,6 +536,7 @@ async fn session_start_inner(
                     .map(String::from);
                 json!({
                     "registered": session_id,
+                    "session_incarnation": incarnation.to_string(),
                     "output": mesh_instructions_for_backend(backend.as_deref(), launch_id),
                 })
             }
@@ -791,6 +792,7 @@ async fn session_start_inner(
         let output = mesh_instructions_for_backend(bound_backend.as_deref(), &existing_id);
         return json!({
             "registered": existing_id,
+            "session_incarnation": existing_owner.incarnation.to_string(),
             "output": output,
         });
     }
@@ -855,16 +857,28 @@ async fn session_start_inner(
         backend_session_id,
         ..Default::default()
     };
-    state
+    let effects = state
         .apply_and_execute(crate::daemon_protocol::Event::Register {
             id: id.clone(),
             pane: Some(body.pane.clone()),
             metadata: proto_meta,
         })
         .await;
+    let Some(owner) = effects.iter().find_map(|effect| match effect {
+        crate::daemon_protocol::Effect::RegisterOk { owner, .. } if owner.session_id == id => {
+            Some(owner)
+        }
+        _ => None,
+    }) else {
+        return json!({
+            "skipped": "registration rejected",
+            "output": "",
+        });
+    };
 
     json!({
         "registered": id,
+        "session_incarnation": owner.incarnation.to_string(),
         "output": output,
     })
 }
@@ -2214,6 +2228,14 @@ mod tests {
         };
         let result = session_start_inner(&state, body).await;
         assert_eq!(result["registered"], "myproject");
+        assert_eq!(
+            result["session_incarnation"],
+            state.protocol.read().await.sessions["myproject"]
+                .metadata
+                .session_incarnation
+                .to_string(),
+            "manual auto-registration must return its exact daemon-issued incarnation"
+        );
         // output is intentionally empty — session-start no longer injects mesh
         // state into the LLM context window.
         assert_eq!(result["output"], "");

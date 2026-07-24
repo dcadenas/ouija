@@ -1040,6 +1040,7 @@ pub enum Effect {
     // Results (for callers that need return values)
     RegisterOk {
         session_id: String,
+        owner: ResourceOwner,
         replaced: Option<String>,
     },
     RegisterFailed {
@@ -1710,9 +1711,10 @@ impl DaemonState {
 
         let effects =
             self.apply_register_with_owner(owner.session_id.clone(), pane, metadata, Some(owner));
-        let outcome = if effects.iter().any(
-            |effect| matches!(effect, Effect::RegisterOk { session_id, .. } if session_id == &owner.session_id),
-        ) {
+        let outcome = if effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RegisterOk { owner: registered, .. } if registered == owner))
+        {
             LifecycleMutationOutcome::Applied
         } else {
             LifecycleMutationOutcome::Rejected
@@ -2232,7 +2234,8 @@ impl DaemonState {
         }
 
         effects.push(Effect::RegisterOk {
-            session_id: id,
+            session_id: id.clone(),
+            owner: self.sessions[&id].owner(),
             replaced,
         });
 

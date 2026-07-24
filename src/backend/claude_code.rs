@@ -59,6 +59,7 @@ mod embedded {
     pub const SCRIPT_BLOCK_INTERACTIVE: &str =
         include_str!("../../scripts/block-interactive-prompts.sh");
     pub const SCRIPT_CHECK_PENDING: &str = include_str!("../../scripts/check-pending-replies.sh");
+    pub const SCRIPT_HOOK_INCARNATION: &str = include_str!("../../scripts/hook-incarnation.sh");
     pub const SCRIPT_PROMPT_SUBMIT: &str = include_str!("../../scripts/ouija-prompt-submit.sh");
     pub const SCRIPT_REGISTER: &str = include_str!("../../scripts/ouija-register.sh");
     pub const SCRIPT_STATUSLINE: &str = include_str!("../../scripts/ouija-statusline.sh");
@@ -114,6 +115,10 @@ fn write_embedded_plugin_files(cache_dir: &std::path::Path) {
         (
             "scripts/check-pending-replies.sh",
             embedded::SCRIPT_CHECK_PENDING,
+        ),
+        (
+            "scripts/hook-incarnation.sh",
+            embedded::SCRIPT_HOOK_INCARNATION,
         ),
         (
             "scripts/ouija-prompt-submit.sh",
@@ -588,6 +593,8 @@ impl CodingAssistant for ClaudeCode {
 mod tests {
     use super::*;
     use crate::backend::{ResumeOpts, StartOpts, WorktreeMode};
+    use std::io::Write;
+    use std::process::{Command, Stdio};
 
     fn backend() -> ClaudeCode {
         ClaudeCode
@@ -639,6 +646,151 @@ mod tests {
             "{}",
             embedded::SCRIPT_PROMPT_SUBMIT
         );
+    }
+
+    #[test]
+    fn hook_scripts_keep_incarnations_bound_to_backend_threads() {
+        let root = tempfile::tempdir().unwrap();
+        let plugin_dir = root.path().join("plugin");
+        let bin_dir = root.path().join("bin");
+        let capture = root.path().join("requests.jsonl");
+        let runtime_dir = root.path().join("runtime");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+        write_embedded_plugin_files(&plugin_dir);
+
+        let fake_curl = bin_dir.join("curl");
+        std::fs::write(
+            &fake_curl,
+            r#"#!/bin/bash
+body='{}'
+url=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -d) body="$2"; shift 2 ;;
+    http://*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+jq -cn --arg url "$url" --argjson body "$body" '{url:$url,body:$body}' >> "$OUIJA_HOOK_CAPTURE"
+if [[ "$url" == */api/hooks/session-start ]]; then
+  thread=$(printf '%s' "$body" | jq -r '.backend_session_id // empty')
+  case "$thread" in
+    thread-old) incarnation=41 ;;
+    thread-new) incarnation=42 ;;
+    *) incarnation=43 ;;
+  esac
+  jq -cn --arg incarnation "$incarnation" \
+    '{registered:"worker",session_incarnation:$incarnation,output:""}'
+else
+  printf '{}'
+fi
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let run_hook = |script: &str, payload: &str| {
+            let mut child = Command::new("bash")
+                .arg(plugin_dir.join("scripts").join(script))
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        bin_dir.display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .env("HOME", root.path())
+                .env("XDG_RUNTIME_DIR", &runtime_dir)
+                .env("TMUX_PANE", "%42")
+                .env("OUIJA_HOOK_CAPTURE", &capture)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(payload.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{script} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        run_hook(
+            "ouija-register.sh",
+            r#"{"session_id":"thread-old","cwd":"/repo"}"#,
+        );
+        run_hook(
+            "ouija-register.sh",
+            r#"{"session_id":"thread-new","cwd":"/repo"}"#,
+        );
+        run_hook("check-pending-replies.sh", r#"{"session_id":"thread-old"}"#);
+        run_hook("ouija-prompt-submit.sh", r#"{"session_id":"thread-new"}"#);
+        run_hook(
+            "ouija-tool-activity.sh",
+            r#"{"session_id":"thread-new","tool_name":"Bash"}"#,
+        );
+        run_hook("post-compact.sh", r#"{"session_id":"thread-new"}"#);
+        run_hook("ouija-unregister.sh", r#"{"session_id":"thread-old"}"#);
+        run_hook(
+            "ouija-tool-activity.sh",
+            r#"{"session_id":"thread-new","tool_name":"Bash"}"#,
+        );
+        run_hook("ouija-unregister.sh", r#"{"session_id":"thread-new"}"#);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::fs::read_to_string(&capture)
+            .map(|contents| contents.lines().count())
+            .unwrap_or_default()
+            < 9
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let requests: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let hook_requests: Vec<_> = requests
+            .iter()
+            .filter(|request| !request["url"].as_str().unwrap().ends_with("session-start"))
+            .collect();
+        let expected = [
+            ("/api/hooks/stop", "thread-old", "41", 1),
+            ("/api/hooks/prompt-submit", "thread-new", "42", 1),
+            ("/api/hooks/pre-tool-use", "thread-new", "42", 2),
+            ("/api/hooks/post-compact", "thread-new", "42", 1),
+            ("/api/hooks/session-end", "thread-old", "41", 1),
+            ("/api/hooks/session-end", "thread-new", "42", 1),
+        ];
+        assert_eq!(hook_requests.len(), 7);
+        for (path, thread, incarnation, expected_count) in expected {
+            let actual_count = hook_requests
+                .iter()
+                .filter(|request| {
+                    request["url"].as_str().unwrap().ends_with(path)
+                        && request["body"]["backend_session_id"] == thread
+                        && request["body"]["session_incarnation"] == incarnation
+                })
+                .count();
+            assert_eq!(
+                actual_count, expected_count,
+                "wrong requests for {path}, backend thread {thread}, incarnation {incarnation}: {hook_requests:?}"
+            );
+        }
     }
 
     #[test]
