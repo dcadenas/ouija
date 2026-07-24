@@ -150,7 +150,7 @@ ouija config set-codex-model-route gemini \
   --codex-home ~/.cache/codex-gemini
 
 ouija spawn-session worker --backend codex-cli --model gemini \
-  --no-parent-session --idle-policy keep-open
+  --no-parent-session --when-done keep-open
 ```
 
 The alternate Codex home owns its own `config.toml` and provider setup. For
@@ -174,7 +174,7 @@ ouija tell <to> "msg" # fire-and-forget message
 ouija reply <to> <id> "msg" # reply to a message
 ouija reply <to> <id> --stdin < reply.txt # safer for generated/multiline text
 ouija announce --role "..." --bulletin "..." # update your metadata
-ouija spawn-session <name> --no-parent-session --idle-policy keep-open --prompt "..." # start a new session
+ouija spawn-session <name> --no-parent-session --when-done keep-open --prompt "..." # start a new session
 ouija nodes          # list connected nodes
 ouija config ...     # manage settings, Nostr DM users, router
 ```
@@ -185,8 +185,16 @@ backticks, `$()`, quotes, and JSON before `ouija` receives the message.
 
 `spawn-session` requires explicit lifecycle ownership: choose either
 `--parent-session <SESSION_ID>` or `--no-parent-session`, and choose
-`--idle-policy keep-open`, `--idle-policy ask-parent-when-done`, or
-`--idle-policy close-when-done`.
+`--when-done keep-open`, `--when-done ask-parent`, or `--when-done close`.
+The legacy `--idle-policy` flag remains available for compatibility but is
+deprecated.
+
+Task reminders are opt-in and independent of completion behavior. Supplying
+`--reminder` enables recurring recovery nudges; omitting it prevents
+lifecycle-only metadata from starting a nudge loop. Pending replies can still
+wake a session without a manual reminder. Ouija supplies the concrete
+`clear-reminder` command and current ID in each injected nudge, so manual
+reminder text must not include its own clearing command.
 
 Outside tmux, such as an OpenCode HTTP/API tool process, run `ouija whoami` to resolve your own session id and pass its exact output as the sender: `ouija ask <to> "msg" --from <public-ouija-id>`. Never guess a sender id (project directory name, branch name, or an `ouija ls` entry) — the daemon rejects sender claims it can disprove. Do not use backend labels like `opencode` or opaque OpenCode `backend_session_id` values as `--from`.
 

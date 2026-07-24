@@ -247,6 +247,11 @@ mod tests {
         );
     }
 
+    #[test]
+    fn embedded_skill_teaches_opt_in_task_reminders_for_opencode() {
+        crate::backend::assert_shared_task_reminder_guidance(embedded::SKILL_MD);
+    }
+
     // --- anti-guessing sender guidance (task #1395) ---
     //
     // An opencode agent that could not resolve its identity guessed the

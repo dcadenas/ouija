@@ -88,13 +88,12 @@ debugging suspected delivery failure.
 ```bash
 # Start a session:
 ouija spawn-session worker --project-dir /path/to/project \
-  --parent-session hub --idle-policy ask-parent-when-done \
-  --prompt "implement the feature" \
-  --reminder "When finished, summarize changed files and tests for the parent."
+  --parent-session hub --when-done ask-parent \
+  --prompt "implement the feature"
 
 # With worktree isolation:
 ouija spawn-session worker --project-dir /path --worktree --branch feature --base-branch main \
-  --parent-session hub --idle-policy ask-parent-when-done \
+  --parent-session hub --when-done ask-parent \
   --prompt "task"
 
 # Restart with fresh context:
@@ -107,8 +106,11 @@ ouija kill-session worker
 
 Key fields:
 - `--parent-session <SESSION_ID>` / `--no-parent-session` — required lifecycle ownership choice for spawned sessions
-- `--idle-policy keep-open|ask-parent-when-done|close-when-done` — required idle behavior. Ouija generates the clear/ask/kill instructions from this policy
-- `--reminder` — optional task-specific recovery text re-injected every time the session goes idle. Do not hand-write generic clear/ask/kill lifecycle prose here
+- `--when-done keep-open|ask-parent|close` — required completion behavior, independent of recurring reminders. Ouija generates the stay-open/ask-parent/close instructions
+- `--idle-policy` is deprecated; legacy scripts may still use `keep-open|ask-parent-when-done|close-when-done`
+- `--reminder` alone opts the session into recurring recovery nudges. Omit it for no task-reminder recurrence
+- Pending replies can still wake a session without `--reminder`.
+- Never put `ouija clear-reminder` in manual reminder text. Ouija adds the concrete clearing command and ID to each injected nudge
 - `--worktree` — isolate in a git worktree at `~/.ouija/worktrees/<repo>/<session>`
 - `--branch` / `--base-branch` — git branch control for worktrees
 
@@ -135,10 +137,9 @@ ouija task remove TASK_ID
 ouija announce --role "what you are doing" --bulletin "what you need or offer"
 ```
 
-**Clear idle reminders** — the daemon injects `<ouija-status type="reminder" clearing_id="N">` when idle:
-```bash
-ouija clear-reminder N
-```
+**Clear idle reminders** — an injected `<ouija-status type="reminder">` includes
+the exact clearing command for that nudge. Run that generated command verbatim;
+do not invent an ID or place a clearing command in `--reminder`.
 
 **Clear pending replies** when the sender disconnected:
 ```bash
@@ -172,7 +173,7 @@ If you see an error about being unable to resolve the current session ID, run `o
 
 ## 8. Patterns
 
-The reminder is re-injected every idle cycle and should carry task-specific recovery context. Lifecycle control flow comes from `--parent-session` / `--no-parent-session` plus `--idle-policy`, which Ouija renders into consistent clear, ask-parent, or close commands.
+Recurring recovery and completion are separate. Supplying `--reminder` opts into idle-cycle recovery nudges; `--when-done` controls what the session does after completion. Pending replies remain an independent reason to wake a session.
 
 ### Loop with termination
 
@@ -180,29 +181,30 @@ Two nested loops: the reminder re-injection is the inner loop (same context); `o
 
 ```bash
 ouija spawn-session counter \
-  --no-parent-session --idle-policy keep-open \
+  --no-parent-session --when-done keep-open \
   --prompt "read value.txt, add 1 to the number, write it back" \
   --reminder "If the number is below 10, call 'ouija restart-session counter --fresh'. If it reached 10, record that state in value.txt."
 ```
 
-The reminder is the task loop's recovery context. State lives in the world (files, git, APIs), not in the session's memory, so every iteration is re-enterable from scratch. The `keep-open` lifecycle policy tells idle sessions how to clear the idle nudge and remain available.
+The reminder is the task loop's recovery context. State lives in the world (files, git, APIs), not in the session's memory, so every iteration is re-enterable from scratch. Ouija appends the concrete clearing command to each nudge. The `keep-open` completion policy leaves the session available after the loop finishes.
 
 ### Report-back when done
 
 ```bash
 ouija spawn-session worker --project-dir /path --prompt "implement feature X" \
-  --parent-session hub --idle-policy ask-parent-when-done \
-  --reminder "When finished, include summary, tests, and changed files in the parent handoff."
+  --parent-session hub --when-done ask-parent
 ```
 
-The generated lifecycle reminder includes the parent id, an `ouija ask <parent> --stdin --from <self>` handoff pattern, and the current `ouija clear-reminder N` command. The manual reminder only adds task-specific detail.
+This launch receives generated ask-parent completion instructions but no recurring task reminder. Add `--reminder "Re-check task state and continue unfinished work."` only when recovery nudges are desired; Ouija appends the current clearing command.
 
 ### State-check (not state-assume) reminders
 
 A static reminder like *"Run init to begin"* becomes noise on the second re-injection — the session already ran init. Reminders must make sense on the 5th re-injection, not just the first. Phrase them as state checks:
 
 ```
-reminder: "Check state: if pending → init. If running → continue your open work. If complete → report done and ouija clear-reminder N."
+reminder: "Check state: if pending → initialize. If running → continue open work. If complete → verify and report the final state."
 ```
 
-This is the anti-pattern fix for workers that get stuck in post-success idle: the reminder reads the world on every re-injection and picks the right branch, instead of assuming it's still the start.
+This prevents workers from treating every re-injection as the first turn. Keep
+completion behavior and clearing commands out of manual reminder text; Ouija
+generates both from live session state.

@@ -382,9 +382,9 @@ impl SessionMeta {
     /// Returns `true` if this session has a reminder whose body is more than
     /// just whitespace. An empty-string or whitespace-only reminder is treated
     /// as if no reminder were set: injecting it would produce a `<ouija-status
-    /// type="reminder">` with only the `ouija clear-reminder N` tail, which
-    /// is the exact "non-signal injection" this daemon's session_agent is
-    /// meant to avoid.
+    /// type="reminder">` with only a generated clearing-command tail, which is
+    /// the exact "non-signal injection" this daemon's session_agent is meant
+    /// to avoid.
     pub fn has_active_reminder(&self) -> bool {
         self.reminder
             .as_deref()

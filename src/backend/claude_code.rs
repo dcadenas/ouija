@@ -625,6 +625,11 @@ mod tests {
     }
 
     #[test]
+    fn embedded_skill_teaches_opt_in_task_reminders_for_claude_code() {
+        crate::backend::assert_shared_task_reminder_guidance(embedded::SKILLS_PEER_TRUST);
+    }
+
+    #[test]
     fn start_command_no_worktree() {
         let cmd = backend().build_start_command(&start_opts("/home/user/myproject"));
         assert_eq!(cmd, "cd '/home/user/myproject' && claude");

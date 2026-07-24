@@ -1433,6 +1433,11 @@ mod tests {
     }
 
     #[test]
+    fn embedded_skill_teaches_opt_in_task_reminders_for_codex() {
+        crate::backend::assert_shared_task_reminder_guidance(embedded::SKILL_MD);
+    }
+
+    #[test]
     fn install_skill_is_idempotent_and_preserves_unrelated_skills() {
         let home = tempfile::tempdir().unwrap();
         // A pre-existing unrelated user skill must survive install.
