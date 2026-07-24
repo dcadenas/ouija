@@ -2107,6 +2107,9 @@ pub async fn create_task(
     State(state): State<SharedState>,
     Json(body): Json<CreateTaskBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(error) = crate::daemon_protocol::validate_spawn_reminder(body.reminder.as_deref()) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
+    }
     if let Err(e) = scheduler::validate_cron(&body.cron) {
         return (
             StatusCode::BAD_REQUEST,
@@ -2739,6 +2742,9 @@ pub async fn restart_session(
     body.model = normalize_optional_string(body.model);
     body.effort = normalize_optional_string(body.effort);
     body.backend = normalize_optional_string(body.backend);
+    if let Err(error) = crate::daemon_protocol::validate_spawn_reminder(body.reminder.as_deref()) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
+    }
     if let Err(response) = validate_backend_name(&state, body.backend.as_deref()) {
         return response;
     }
@@ -5084,6 +5090,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_session_rejects_manual_clear_reminder_before_restart() {
+        let state = crate::state::AppState::new_for_test();
+        let (status, Json(body)) = restart_session(
+            State(state),
+            Json(SessionNameBody {
+                name: "restart-clear-reminder".into(),
+                fresh: Some(true),
+                worktree: None,
+                project_dir: None,
+                prompt: None,
+                from: None,
+                backend: None,
+                model: None,
+                effort: None,
+                reminder: Some("When done, run ouija clear-reminder 7".into()),
+                parent_session: None,
+                no_parent_session: None,
+                idle_policy: None,
+                branch: None,
+                base_branch: None,
+                keep_worktree: None,
+                force_reset: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("ouija clear-reminder"))
+        );
+    }
+
+    #[tokio::test]
     async fn start_existing_session_no_parent_clears_previous_parent() {
         use axum::Json;
         use axum::Router;
@@ -5221,6 +5262,38 @@ mod tests {
         .await;
 
         assert_unknown_backend_response(status, &body);
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_manual_clear_reminder_before_persistence() {
+        let state = crate::state::AppState::new_for_test();
+        let (status, Json(body)) = create_task(
+            State(state.clone()),
+            Json(CreateTaskBody {
+                name: "clear-reminder-task".into(),
+                cron: "0 0 * * *".into(),
+                target_session: None,
+                message: Some("run".into()),
+                prompt: None,
+                reminder: Some("When done, run ouija clear-reminder 7".into()),
+                project_dir: None,
+                backend: None,
+                model: None,
+                effort: None,
+                once: None,
+                backend_session_id: None,
+                on_fire: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("ouija clear-reminder"))
+        );
+        assert!(state.scheduled_tasks.read().await.is_empty());
     }
 
     #[test]

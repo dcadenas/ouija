@@ -220,7 +220,7 @@ enum Command {
         fresh: bool,
         #[arg(long)]
         prompt: Option<String>,
-        #[arg(long)]
+        #[arg(long, value_parser = parse_manual_reminder)]
         reminder: Option<String>,
         /// Override the LLM model on restart (defaults to the previous model).
         #[arg(long)]
@@ -2890,6 +2890,21 @@ mod tests {
             error.contains("generated"),
             "error must explain that Ouija supplies the command, got: {error}"
         );
+    }
+
+    #[test]
+    fn restart_session_cli_rejects_manual_clear_reminder_commands() {
+        let error = Cli::try_parse_from([
+            "ouija",
+            "restart-session",
+            "worker",
+            "--reminder",
+            "When done, run ouija clear-reminder 7",
+        ])
+        .err()
+        .expect("manual clear-reminder instructions must be rejected");
+
+        assert!(error.to_string().contains("ouija clear-reminder"));
     }
 
     #[test]
