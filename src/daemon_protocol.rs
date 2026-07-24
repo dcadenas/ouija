@@ -931,18 +931,16 @@ pub enum Effect {
 
     // Agents
     SpawnAgent {
-        session_id: String,
+        owner: ResourceOwner,
         pane: String,
     },
     StopAgent {
-        session_id: String,
-    },
-    StopOwnedAgent {
         owner: ResourceOwner,
+        pane: String,
     },
     RenameAgent {
-        old_id: String,
-        new_id: String,
+        old_owner: ResourceOwner,
+        new_owner: ResourceOwner,
     },
     ClearPendingReplies {
         removed_ids: Vec<String>,
@@ -1862,6 +1860,7 @@ impl DaemonState {
                 if matches!(existing.origin, Origin::Local) {
                     if let Some(ref old_pane) = existing.pane {
                         if old_pane != new_pane {
+                            let old_owner = existing.owner();
                             effects.push(Effect::ClearTmuxVar {
                                 pane: old_pane.clone(),
                                 name: "@ouija_session".into(),
@@ -1870,7 +1869,8 @@ impl DaemonState {
                                 pane: old_pane.clone(),
                             });
                             effects.push(Effect::StopAgent {
-                                session_id: id.clone(),
+                                owner: old_owner,
+                                pane: old_pane.clone(),
                             });
                         }
                     }
@@ -2006,7 +2006,7 @@ impl DaemonState {
         // session ownership, so all registration-level validation and
         // fallible allocation must happen first.
         let replaced = if let Some(ref pane_id) = pane {
-            let old_key = self
+            let replaced_owner = self
                 .sessions
                 .iter()
                 .find(|(key, s)| {
@@ -2014,8 +2014,8 @@ impl DaemonState {
                         && matches!(s.origin, Origin::Local)
                         && s.pane.as_deref() == Some(pane_id)
                 })
-                .map(|(key, _)| key.clone());
-            if let Some(ref old_key) = old_key {
+                .map(|(key, session)| (key.clone(), session.owner()));
+            if let Some((ref old_key, ref old_owner)) = replaced_owner {
                 if self.lifecycle_leases.contains_key(old_key) {
                     return vec![Effect::RegisterFailed {
                         session_id: id,
@@ -2026,10 +2026,11 @@ impl DaemonState {
                 }
                 self.sessions.remove(old_key);
                 effects.push(Effect::StopAgent {
-                    session_id: old_key.clone(),
+                    owner: old_owner.clone(),
+                    pane: pane_id.clone(),
                 });
             }
-            old_key
+            replaced_owner.map(|(key, _)| key)
         } else {
             None
         };
@@ -2074,7 +2075,7 @@ impl DaemonState {
         // Agent
         if let Some(ref pane_id) = pane {
             effects.push(Effect::SpawnAgent {
-                session_id: id.clone(),
+                owner: self.sessions[&id].owner(),
                 pane: pane_id.clone(),
             });
         }
@@ -2235,6 +2236,7 @@ impl DaemonState {
         }
 
         let old_pane = existing.pane.clone();
+        let owner = existing.owner();
         let networked = existing.metadata.networked;
         metadata.session_incarnation = expected_incarnation;
         let session = self.sessions.get_mut(&id).expect("session checked above");
@@ -2248,10 +2250,11 @@ impl DaemonState {
                     pane: old_pane.clone(),
                     name: "@ouija_session".into(),
                 });
-                effects.push(Effect::EnableAutoRename { pane: old_pane });
                 effects.push(Effect::StopAgent {
-                    session_id: id.clone(),
+                    owner: owner.clone(),
+                    pane: old_pane.clone(),
                 });
+                effects.push(Effect::EnableAutoRename { pane: old_pane });
             }
         }
         if let Some(pane) = pane {
@@ -2265,10 +2268,7 @@ impl DaemonState {
                 name: "@ouija_id".into(),
                 value: id.clone(),
             });
-            effects.push(Effect::SpawnAgent {
-                session_id: id.clone(),
-                pane,
-            });
+            effects.push(Effect::SpawnAgent { owner, pane });
         }
         if networked {
             effects.push(Effect::BroadcastSessionList);
@@ -2462,7 +2462,9 @@ impl DaemonState {
             .sessions
             .remove(old_id)
             .expect("session must exist after origin guard");
+        let old_owner = renamed.owner();
         renamed.id = new_id.to_string();
+        let new_owner = renamed.owner();
         let pane = renamed.pane.clone();
         self.sessions.insert(new_id.to_string(), renamed);
 
@@ -2486,8 +2488,8 @@ impl DaemonState {
         self.add_local_rename_alias(old_id, new_id);
 
         effects.push(Effect::RenameAgent {
-            old_id: old_id.to_string(),
-            new_id: new_id.to_string(),
+            old_owner,
+            new_owner,
         });
 
         let seq = self.next_seq();
@@ -2571,11 +2573,12 @@ impl DaemonState {
                 owner: owner.clone(),
                 pane: pane_id.clone(),
             });
+            effects.push(Effect::StopAgent {
+                owner: owner.clone(),
+                pane: pane_id.clone(),
+            });
         }
 
-        effects.push(Effect::StopOwnedAgent {
-            owner: owner.clone(),
-        });
         effects.push(Effect::ClearOwnedPendingReplies {
             removed_owners: vec![owner.clone()],
         });
@@ -3239,11 +3242,12 @@ impl DaemonState {
                     owner: owner.clone(),
                     pane: pane_id.clone(),
                 });
+                effects.push(Effect::StopAgent {
+                    owner: owner.clone(),
+                    pane: pane_id.clone(),
+                });
             }
 
-            effects.push(Effect::StopOwnedAgent {
-                owner: owner.clone(),
-            });
             // Note: no CleanupWorktree on reap (preserves uncommitted work)
         }
 
@@ -5845,11 +5849,10 @@ mod tests {
         assert!(!state.sessions.contains_key("old-name"));
         assert!(state.sessions.contains_key("new-name"));
         assert_eq!(state.aliases.get("old-name"), Some(&"new-name".into()));
-        assert!(
-            effects
-                .iter()
-                .any(|e| matches!(e, Effect::StopAgent { session_id } if session_id == "old-name"))
-        );
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::StopAgent { owner, .. } if owner.session_id == "old-name"
+        )));
     }
 
     #[test]
@@ -5984,7 +5987,7 @@ mod tests {
         assert!(!state.sessions.contains_key("s1"));
         assert!(effects.iter().any(|e| matches!(
             e,
-            Effect::StopOwnedAgent { owner } if owner.session_id == "s1"
+            Effect::StopAgent { owner, .. } if owner.session_id == "s1"
         )));
         assert!(
             effects

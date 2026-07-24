@@ -14,6 +14,13 @@ use crate::project_index::ProjectInfo;
 use crate::scheduler::{ScheduledTask, TaskRun};
 use crate::transport::Transport;
 
+#[derive(Clone)]
+struct OwnedSessionAgent {
+    owner: crate::daemon_protocol::ResourceOwner,
+    pane: String,
+    actor: ActorRef<crate::session_agent::SessionMsg>,
+}
+
 /// Sanitize a name into a valid session ID (lowercase alphanumeric + dashes).
 pub fn sanitize_session_id(name: &str) -> String {
     name.to_lowercase()
@@ -308,8 +315,8 @@ pub struct AppState {
     connected_npubs: std::sync::Mutex<HashMap<String, String>>,
     /// Debounce: last time we reciprocated a session list to each node.
     last_reciprocated: std::sync::Mutex<HashMap<String, std::time::Instant>>,
-    /// Active session agents, keyed by session ID.
-    session_agents: RwLock<HashMap<String, ActorRef<crate::session_agent::SessionMsg>>>,
+    /// Active session agents keyed by exact lifecycle owner.
+    session_agents: RwLock<HashMap<crate::daemon_protocol::ResourceOwner, OwnedSessionAgent>>,
     /// Indexed projects from projects_dir, keyed by directory basename.
     pub project_index: RwLock<HashMap<String, ProjectInfo>>,
     /// Pending remote command results: command string → oneshot senders.
@@ -1134,32 +1141,11 @@ impl AppState {
                     })
                     .await;
                 }
-                Effect::SpawnAgent { session_id, pane } => {
-                    self.spawn_session_agent(session_id, pane).await;
+                Effect::SpawnAgent { owner, pane } => {
+                    self.spawn_session_agent(owner, pane).await;
                 }
-                Effect::StopAgent { session_id } => {
-                    if let Some(agent) = self
-                        .session_agents
-                        .write()
-                        .await
-                        .remove(session_id.as_str())
-                    {
-                        agent.stop(None);
-                    }
-                }
-                Effect::StopOwnedAgent { owner } => {
-                    let protocol = self.protocol.read().await;
-                    if protocol.sessions.contains_key(&owner.session_id) {
-                        continue;
-                    }
-                    if let Some(agent) = self
-                        .session_agents
-                        .write()
-                        .await
-                        .remove(owner.session_id.as_str())
-                    {
-                        agent.stop(None);
-                    }
+                Effect::StopAgent { owner, pane } => {
+                    self.stop_session_agent(owner, pane).await;
                 }
                 Effect::ClearPendingReplies { removed_ids } => {
                     self.clear_orphaned_pending_replies(removed_ids).await;
@@ -1579,41 +1565,17 @@ impl AppState {
                     })
                     .await;
                 }
-                Effect::SpawnAgent { session_id, pane } => {
-                    self.spawn_session_agent(session_id, pane).await;
+                Effect::SpawnAgent { owner, pane } => {
+                    self.spawn_session_agent(owner, pane).await;
                 }
-                Effect::StopAgent { session_id } => {
-                    if let Some(agent) = self
-                        .session_agents
-                        .write()
-                        .await
-                        .remove(session_id.as_str())
-                    {
-                        agent.stop(None);
-                    }
+                Effect::StopAgent { owner, pane } => {
+                    self.stop_session_agent(owner, pane).await;
                 }
-                Effect::StopOwnedAgent { owner } => {
-                    let protocol = self.protocol.read().await;
-                    if protocol.sessions.contains_key(&owner.session_id) {
-                        continue;
-                    }
-                    if let Some(agent) = self
-                        .session_agents
-                        .write()
-                        .await
-                        .remove(owner.session_id.as_str())
-                    {
-                        agent.stop(None);
-                    }
-                }
-                Effect::RenameAgent { old_id, new_id } => {
-                    let mut agents = self.session_agents.write().await;
-                    if let Some(agent) = agents.remove(old_id.as_str()) {
-                        let _ = agent.cast(crate::session_agent::SessionMsg::Renamed {
-                            new_id: new_id.clone(),
-                        });
-                        agents.insert(new_id.clone(), agent);
-                    }
+                Effect::RenameAgent {
+                    old_owner,
+                    new_owner,
+                } => {
+                    self.rename_session_agent(old_owner, new_owner).await;
                 }
                 Effect::ClearPendingReplies { removed_ids } => {
                     self.clear_orphaned_pending_replies(removed_ids).await;
@@ -2185,39 +2147,116 @@ impl AppState {
             .insert(t.transport_name().to_string(), t);
     }
 
-    /// Spawn a session agent for a local session.
-    pub async fn spawn_session_agent(self: &Arc<Self>, id: &str, pane: &str) {
-        // Stop any existing agent first (e.g. from pane dedup re-registration)
-        if let Some(old) = self.session_agents.write().await.remove(id) {
-            old.stop(None);
+    /// Spawn an agent only while the exact owner and pane are current.
+    pub async fn spawn_session_agent(
+        self: &Arc<Self>,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        pane: &str,
+    ) {
+        let protocol = self.protocol.read().await;
+        if protocol
+            .sessions
+            .get(&owner.session_id)
+            .is_none_or(|session| {
+                session.owner() != *owner || session.pane.as_deref() != Some(pane)
+            })
+        {
+            return;
+        }
+
+        let mut agents = self.session_agents.write().await;
+        if let Some(old) = agents.remove(owner) {
+            old.actor.stop(None);
         }
         let agent = crate::session_agent::SessionAgent {
             app_state: Arc::clone(self),
         };
         let args = crate::session_agent::SessionAgentArgs {
-            session_id: id.to_string(),
+            owner: owner.clone(),
             pane: pane.to_string(),
         };
         match Actor::spawn(None, agent, args).await {
             Ok((actor_ref, _handle)) => {
-                self.session_agents
-                    .write()
-                    .await
-                    .insert(id.to_string(), actor_ref);
-                tracing::info!("spawned session agent for {id}");
+                agents.insert(
+                    owner.clone(),
+                    OwnedSessionAgent {
+                        owner: owner.clone(),
+                        pane: pane.to_string(),
+                        actor: actor_ref,
+                    },
+                );
+                tracing::info!(
+                    session = %owner.session_id,
+                    incarnation = %owner.incarnation,
+                    "spawned session agent"
+                );
             }
             Err(e) => {
-                tracing::error!("failed to spawn session agent for {id}: {e}");
+                tracing::error!(
+                    session = %owner.session_id,
+                    incarnation = %owner.incarnation,
+                    "failed to spawn session agent: {e}"
+                );
             }
         }
     }
 
+    async fn stop_session_agent(&self, owner: &crate::daemon_protocol::ResourceOwner, pane: &str) {
+        let mut agents = self.session_agents.write().await;
+        if agents.get(owner).is_some_and(|agent| agent.pane == pane)
+            && let Some(agent) = agents.remove(owner)
+        {
+            agent.actor.stop(None);
+        }
+    }
+
+    async fn rename_session_agent(
+        &self,
+        old_owner: &crate::daemon_protocol::ResourceOwner,
+        new_owner: &crate::daemon_protocol::ResourceOwner,
+    ) {
+        let protocol = self.protocol.read().await;
+        if protocol
+            .sessions
+            .get(&new_owner.session_id)
+            .is_none_or(|session| session.owner() != *new_owner)
+        {
+            return;
+        }
+        let mut agents = self.session_agents.write().await;
+        let Some(mut agent) = agents.get(old_owner).cloned() else {
+            return;
+        };
+        if protocol.sessions[&new_owner.session_id].pane.as_deref() != Some(agent.pane.as_str()) {
+            return;
+        }
+        agents.remove(old_owner);
+        let _ = agent.actor.cast(crate::session_agent::SessionMsg::Renamed {
+            old_owner: old_owner.clone(),
+            new_owner: new_owner.clone(),
+        });
+        agent.owner = new_owner.clone();
+        if let Some(displaced) = agents.insert(new_owner.clone(), agent) {
+            displaced.actor.stop(None);
+        }
+    }
+
+    async fn current_session_agent(
+        &self,
+        session_id: &str,
+    ) -> Option<ActorRef<crate::session_agent::SessionMsg>> {
+        let protocol = self.protocol.read().await;
+        let owner = protocol.sessions.get(session_id)?.owner();
+        self.session_agents
+            .read()
+            .await
+            .get(&owner)
+            .map(|agent| agent.actor.clone())
+    }
+
     /// Send a message to a session's agent (if it exists).
     pub async fn notify_agent(&self, session_id: &str, msg: crate::session_agent::SessionMsg) {
-        let agent = {
-            let agents = self.session_agents.read().await;
-            agents.get(session_id).cloned()
-        };
+        let agent = self.current_session_agent(session_id).await;
         if let Some(agent) = agent {
             let _ = agent.cast(msg);
         }
@@ -2228,8 +2267,7 @@ impl AppState {
         &self,
         session_id: &str,
     ) -> Vec<crate::daemon_protocol::PendingReplyEntry> {
-        let agents = self.session_agents.read().await;
-        if let Some(agent) = agents.get(session_id) {
+        if let Some(agent) = self.current_session_agent(session_id).await {
             ractor::call!(agent, crate::session_agent::SessionMsg::GetPendingReplies)
                 .unwrap_or_default()
         } else {
@@ -2240,8 +2278,7 @@ impl AppState {
     /// Drain the pending compact continuation from a session agent (RPC).
     /// Returns None if the agent has no pending continuation or the session has no agent.
     pub async fn drain_agent_compact_continuation(&self, session_id: &str) -> Option<String> {
-        let agents = self.session_agents.read().await;
-        if let Some(agent) = agents.get(session_id) {
+        if let Some(agent) = self.current_session_agent(session_id).await {
             ractor::call!(
                 agent,
                 crate::session_agent::SessionMsg::DrainPendingCompactContinuation
@@ -2261,8 +2298,7 @@ impl AppState {
         session_id: &str,
         text: String,
     ) -> bool {
-        let agents = self.session_agents.read().await;
-        if let Some(agent) = agents.get(session_id) {
+        if let Some(agent) = self.current_session_agent(session_id).await {
             ractor::call!(
                 agent,
                 crate::session_agent::SessionMsg::TrySetPendingCompactContinuation,
@@ -3276,7 +3312,13 @@ pub(crate) mod tests {
         proto_register(&state, "worker", Some("%1")).await;
         let replacement_owner = state.protocol.read().await.sessions["worker"].owner();
         assert_ne!(replacement_owner, old_owner);
-        assert!(state.session_agents.read().await.contains_key("worker"));
+        assert!(
+            state
+                .session_agents
+                .read()
+                .await
+                .contains_key(&replacement_owner)
+        );
 
         state.execute_effects(&stale_effects).await;
 
@@ -3285,9 +3327,43 @@ pub(crate) mod tests {
             replacement_owner
         );
         assert!(
-            state.session_agents.read().await.contains_key("worker"),
+            state
+                .session_agents
+                .read()
+                .await
+                .contains_key(&replacement_owner),
             "old removal effects must not stop the replacement's agent"
         );
+        assert_eq!(
+            state.session_agents.read().await[&replacement_owner].owner,
+            replacement_owner,
+            "the exact-owner entry must remain bound to the replacement incarnation"
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_rename_preserves_both_renamed_and_reused_id_agents() {
+        let state = AppState::new_for_test();
+        proto_register(&state, "worker", Some("%1")).await;
+        let old_owner = state.protocol.read().await.sessions["worker"].owner();
+
+        let rename_effects = {
+            let mut protocol = state.protocol.write().await;
+            protocol.apply(crate::daemon_protocol::Event::Rename {
+                old_id: "worker".into(),
+                new_id: "renamed".into(),
+            })
+        };
+        let renamed_owner = state.protocol.read().await.sessions["renamed"].owner();
+        proto_register(&state, "worker", Some("%2")).await;
+        let replacement_owner = state.protocol.read().await.sessions["worker"].owner();
+
+        state.execute_effects(&rename_effects).await;
+
+        let agents = state.session_agents.read().await;
+        assert!(agents.contains_key(&renamed_owner));
+        assert!(agents.contains_key(&replacement_owner));
+        assert!(!agents.contains_key(&old_owner));
     }
 
     #[tokio::test]
