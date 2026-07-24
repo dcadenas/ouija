@@ -3159,12 +3159,45 @@ impl AppState {
             .map(|agent| agent.actor.clone())
     }
 
+    async fn current_owned_session_agent(
+        &self,
+        owner: &crate::daemon_protocol::ResourceOwner,
+    ) -> Option<ActorRef<crate::session_agent::SessionMsg>> {
+        let protocol = self.protocol.read().await;
+        if protocol
+            .sessions
+            .get(&owner.session_id)
+            .is_none_or(|session| session.owner() != *owner)
+        {
+            return None;
+        }
+        self.session_agents
+            .read()
+            .await
+            .get(owner)
+            .map(|agent| agent.actor.clone())
+    }
+
     /// Send a message to a session's agent (if it exists).
     pub async fn notify_agent(&self, session_id: &str, msg: crate::session_agent::SessionMsg) {
         let agent = self.current_session_agent(session_id).await;
         if let Some(agent) = agent {
             let _ = agent.cast(msg);
         }
+    }
+
+    /// Send a message only to the agent for the exact lifecycle owner.
+    ///
+    /// Returns false when the session was replaced after the caller resolved
+    /// its owner or when that owner has no live agent.
+    pub async fn notify_agent_owned(
+        &self,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        msg: crate::session_agent::SessionMsg,
+    ) -> bool {
+        self.current_owned_session_agent(owner)
+            .await
+            .is_some_and(|agent| agent.cast(msg).is_ok())
     }
 
     /// Query a session agent for its pending replies (RPC).
@@ -3184,6 +3217,22 @@ impl AppState {
     /// Returns None if the agent has no pending continuation or the session has no agent.
     pub async fn drain_agent_compact_continuation(&self, session_id: &str) -> Option<String> {
         if let Some(agent) = self.current_session_agent(session_id).await {
+            ractor::call!(
+                agent,
+                crate::session_agent::SessionMsg::DrainPendingCompactContinuation
+            )
+            .unwrap_or(None)
+        } else {
+            None
+        }
+    }
+
+    /// Drain a compact continuation only from the exact lifecycle owner's agent.
+    pub async fn drain_agent_compact_continuation_owned(
+        &self,
+        owner: &crate::daemon_protocol::ResourceOwner,
+    ) -> Option<String> {
+        if let Some(agent) = self.current_owned_session_agent(owner).await {
             ractor::call!(
                 agent,
                 crate::session_agent::SessionMsg::DrainPendingCompactContinuation

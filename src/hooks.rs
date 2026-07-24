@@ -78,12 +78,12 @@ async fn session_end_inner(
     json!({ "removed": id })
 }
 
-async fn exact_hook_session_id(
+async fn exact_hook_session_owner(
     state: &std::sync::Arc<crate::state::AppState>,
     pane: Option<&str>,
     backend_session_id: Option<&str>,
     incarnation: Option<crate::daemon_protocol::SessionIncarnation>,
-) -> Option<String> {
+) -> Option<crate::daemon_protocol::ResourceOwner> {
     let incarnation = incarnation?;
     let proto = state.protocol.read().await;
     proto
@@ -96,7 +96,7 @@ async fn exact_hook_session_id(
                         session.metadata.backend_session_id.as_deref() == Some(backend_session_id)
                     }))
         })
-        .map(|session| session.id.clone())
+        .map(crate::daemon_protocol::SessionEntry::owner)
 }
 
 /// POST /api/hooks/stop
@@ -109,7 +109,7 @@ pub async fn hook_stop(
 }
 
 async fn hook_stop_inner(state: &std::sync::Arc<crate::state::AppState>, body: PaneBody) -> Value {
-    if let Some(id) = exact_hook_session_id(
+    if let Some(owner) = exact_hook_session_owner(
         state,
         body.pane.as_deref(),
         body.backend_session_id.as_deref(),
@@ -118,7 +118,7 @@ async fn hook_stop_inner(state: &std::sync::Arc<crate::state::AppState>, body: P
     .await
     {
         state
-            .notify_agent(&id, crate::session_agent::SessionMsg::Stopped)
+            .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Stopped)
             .await;
     }
     json!({ "ok": true })
@@ -140,7 +140,7 @@ async fn prompt_submit_inner(
     // The prompt-submit hook no longer injects mesh state into the LLM
     // context window. We still notify the session agent that the session
     // is active (to reset idle / watchdog timers).
-    if let Some(id) = exact_hook_session_id(
+    if let Some(owner) = exact_hook_session_owner(
         state,
         body.pane.as_deref(),
         body.backend_session_id.as_deref(),
@@ -149,7 +149,7 @@ async fn prompt_submit_inner(
     .await
     {
         state
-            .notify_agent(&id, crate::session_agent::SessionMsg::Active)
+            .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Active)
             .await;
     }
     json!({ "output": "" })
@@ -187,7 +187,7 @@ async fn pre_tool_use_inner(
     // Treat any tool invocation as session activity: cancel the idle timer
     // so long sequences of tool calls within a single turn don't trigger
     // spurious idle-check nudges.
-    if let Some(id) = exact_hook_session_id(
+    if let Some(owner) = exact_hook_session_owner(
         state,
         body.pane.as_deref(),
         body.backend_session_id.as_deref(),
@@ -196,7 +196,7 @@ async fn pre_tool_use_inner(
     .await
     {
         state
-            .notify_agent(&id, crate::session_agent::SessionMsg::Active)
+            .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Active)
             .await;
     }
     // TODO: check injection marker state on the session to decide blocking.
@@ -217,7 +217,7 @@ async fn post_compact_inner(
     state: &std::sync::Arc<crate::state::AppState>,
     body: PaneBody,
 ) -> Value {
-    let session_id = match exact_hook_session_id(
+    let owner = match exact_hook_session_owner(
         state,
         body.pane.as_deref(),
         body.backend_session_id.as_deref(),
@@ -230,7 +230,7 @@ async fn post_compact_inner(
     };
 
     // Drain the pending continuation from the agent (RPC — atomically take + clear)
-    let continuation = state.drain_agent_compact_continuation(&session_id).await;
+    let continuation = state.drain_agent_compact_continuation_owned(&owner).await;
 
     let Some(continuation) = continuation else {
         return json!({ "ok": true, "continuation_injected": false });
@@ -239,17 +239,22 @@ async fn post_compact_inner(
     // Look up pane for injection
     let pane = {
         let proto = state.protocol.read().await;
-        proto.sessions.get(&session_id).and_then(|s| s.pane.clone())
+        proto
+            .sessions
+            .get(&owner.session_id)
+            .filter(|session| session.owner() == owner)
+            .and_then(|session| session.pane.clone())
     };
     let Some(pane) = pane else {
         return json!({ "ok": true, "continuation_injected": false, "error": "no pane" });
     };
 
     if let Err(e) =
-        crate::tmux::locked_inject(state, &session_id, &pane, &continuation, false).await
+        crate::tmux::locked_inject_owned(state, &owner, &pane, &continuation, false).await
     {
         tracing::warn!(
-            session = %session_id,
+            session = %owner.session_id,
+            incarnation = %owner.incarnation,
             "post-compact continuation injection failed: {e}"
         );
         return json!({ "ok": false, "error": e.to_string() });
@@ -907,6 +912,26 @@ async fn resolve_opencode_session_id(
 mod tests {
     use super::*;
 
+    async fn replace_session_on_same_pane(
+        state: &std::sync::Arc<crate::state::AppState>,
+        session_id: &str,
+        pane: &str,
+    ) {
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Remove {
+                id: session_id.into(),
+                keep_worktree: true,
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: session_id.into(),
+                pane: Some(pane.into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+    }
+
     async fn session_incarnation(
         state: &std::sync::Arc<crate::state::AppState>,
         session_id: &str,
@@ -1309,6 +1334,56 @@ mod tests {
         };
         let result = hook_stop_inner(&state, body).await;
         assert_eq!(result, json!({ "ok": true }));
+    }
+
+    #[tokio::test]
+    async fn hook_stop_does_not_notify_replacement_after_authorization() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%42".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        let incarnation = session_incarnation(&state, "worker").await;
+        let owner = exact_hook_session_owner(&state, Some("%42"), None, Some(incarnation))
+            .await
+            .expect("the original hook must authorize");
+
+        replace_session_on_same_pane(&state, "worker", "%42").await;
+
+        assert!(
+            !state
+                .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Stopped)
+                .await,
+            "a stop hook authorized for the old incarnation must not reach the replacement agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_hook_does_not_notify_replacement_after_authorization() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%42".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        let incarnation = session_incarnation(&state, "worker").await;
+        let owner = exact_hook_session_owner(&state, Some("%42"), None, Some(incarnation))
+            .await
+            .expect("the original hook must authorize");
+
+        replace_session_on_same_pane(&state, "worker", "%42").await;
+
+        assert!(
+            !state
+                .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Active)
+                .await,
+            "activity authorized for the old incarnation must not reach the replacement agent"
+        );
     }
 
     #[tokio::test]
@@ -2297,5 +2372,74 @@ mod tests {
         // Second drain should return None (one-shot)
         let continuation = state.drain_agent_compact_continuation("drain-test").await;
         assert_eq!(continuation, None);
+    }
+
+    #[tokio::test]
+    async fn post_compact_does_not_drain_replacement_after_authorization() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%77".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        let incarnation = session_incarnation(&state, "worker").await;
+        let owner = exact_hook_session_owner(&state, Some("%77"), None, Some(incarnation))
+            .await
+            .expect("the original hook must authorize");
+
+        replace_session_on_same_pane(&state, "worker", "%77").await;
+        assert!(
+            state
+                .try_set_pending_compact_continuation("worker", "replacement turn".into())
+                .await
+        );
+
+        assert_eq!(
+            state.drain_agent_compact_continuation_owned(&owner).await,
+            None,
+            "the stale hook must not drain the replacement agent"
+        );
+        assert_eq!(
+            state.drain_agent_compact_continuation("worker").await,
+            Some("replacement turn".into()),
+            "the replacement continuation must remain available"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_compact_does_not_deliver_after_owner_is_replaced() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%77".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        let incarnation = session_incarnation(&state, "worker").await;
+        let owner = exact_hook_session_owner(&state, Some("%77"), None, Some(incarnation))
+            .await
+            .expect("the original hook must authorize");
+        assert!(
+            state
+                .try_set_pending_compact_continuation("worker", "old turn".into())
+                .await
+        );
+        let continuation = state
+            .drain_agent_compact_continuation_owned(&owner)
+            .await
+            .expect("the original owner must drain its continuation");
+
+        replace_session_on_same_pane(&state, "worker", "%77").await;
+
+        let error = crate::tmux::locked_inject_owned(&state, &owner, "%77", &continuation, false)
+            .await
+            .expect_err("delivery must recheck exact ownership");
+        assert!(
+            error.to_string().contains("no longer owns pane"),
+            "unexpected stale-delivery error: {error}"
+        );
     }
 }
