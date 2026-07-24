@@ -835,11 +835,16 @@ pub fn close_shell_after(command: &str) -> String {
 ///   3. Sessions launched outside tmux (future non-tmux backends) have no
 ///      pane var to read at all.
 ///
-/// `OUIJA_SESSION_START_CREDENTIAL`, when supplied for a managed Codex launch,
-/// authorizes only its first backend-thread binding. `HISTFILE=/dev/null` and
-/// `fish_history=` suppress history writes so ouija commands don't pollute the
-/// user's shell history.
-pub fn pane_env_args(session_id: &str, session_start_credential: Option<&str>) -> Vec<String> {
+/// `OUIJA_SESSION_INCARNATION`, when supplied, identifies the exact lifecycle
+/// owner of the managed launch. `OUIJA_SESSION_START_CREDENTIAL`, when supplied
+/// for a managed Codex launch, authorizes only its first backend-thread
+/// binding. `HISTFILE=/dev/null` and `fish_history=` suppress history writes so
+/// ouija commands don't pollute the user's shell history.
+pub fn pane_env_args(
+    session_id: &str,
+    session_start_credential: Option<&str>,
+    session_incarnation: Option<crate::daemon_protocol::SessionIncarnation>,
+) -> Vec<String> {
     let mut args = vec![
         "-e".into(),
         format!("OUIJA_SESSION_ID={session_id}"),
@@ -854,7 +859,90 @@ pub fn pane_env_args(session_id: &str, session_start_credential: Option<&str>) -
             format!("OUIJA_SESSION_START_CREDENTIAL={credential}"),
         ]);
     }
+    if let Some(incarnation) = session_incarnation {
+        args.extend([
+            "-e".into(),
+            format!("OUIJA_SESSION_INCARNATION={incarnation}"),
+        ]);
+    }
     args
+}
+
+fn process_environment_value(environment: &[u8], name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    environment.split(|byte| *byte == 0).find_map(|entry| {
+        let entry = std::str::from_utf8(entry).ok()?;
+        entry.strip_prefix(&prefix).map(String::from)
+    })
+}
+
+/// Inspect the exact lifecycle owner exported into a live managed pane.
+///
+/// `Ok(None)` means the pane is absent, unmanaged, or belongs to another
+/// launch shape. Unexpected tmux inspection failures remain errors so startup
+/// recovery can retain the lease and fail closed.
+pub fn inspect_pane_owner(
+    pane: &str,
+) -> anyhow::Result<Option<crate::daemon_protocol::ResourceOwner>> {
+    let inspection = std::process::Command::new("tmux")
+        .args(["display-message", "-p", "-t", pane, "#{pane_pid}"])
+        .output();
+    let pane_pid = match inspection {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("can't find pane")
+                || stderr.contains("no server running")
+                || stderr.contains("failed to connect to server")
+            {
+                return Ok(None);
+            } else {
+                anyhow::bail!("tmux pane inspection failed for {pane}: {}", stderr.trim());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+
+    #[cfg(target_os = "linux")]
+    let environment = std::fs::read(format!("/proc/{pane_pid}/environ"))
+        .with_context(|| format!("failed to inspect environment for pane {pane} pid {pane_pid}"))?;
+    #[cfg(not(target_os = "linux"))]
+    let environment = {
+        let output = std::process::Command::new("ps")
+            .args(["eww", "-p", &pane_pid, "-o", "command="])
+            .output()?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "failed to inspect environment for pane {pane} pid {pane_pid}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        output
+            .stdout
+            .split(|byte| byte.is_ascii_whitespace())
+            .flat_map(|entry| entry.iter().copied().chain(std::iter::once(0)))
+            .collect::<Vec<_>>()
+    };
+
+    let Some(session_id) = process_environment_value(&environment, "OUIJA_SESSION_ID") else {
+        return Ok(None);
+    };
+    let Some(incarnation) = process_environment_value(&environment, "OUIJA_SESSION_INCARNATION")
+    else {
+        return Ok(None);
+    };
+    let incarnation = incarnation.parse::<u64>().map_err(|error| {
+        anyhow::anyhow!(
+            "invalid OUIJA_SESSION_INCARNATION in pane {pane}: {incarnation:?}: {error}"
+        )
+    })?;
+    Ok(Some(crate::daemon_protocol::ResourceOwner {
+        session_id,
+        incarnation: crate::daemon_protocol::SessionIncarnation(incarnation),
+    }))
 }
 
 /// Derive a tmux session name from a project directory path.
@@ -897,7 +985,7 @@ mod tests {
 
     #[test]
     fn pane_env_args_includes_ouija_session_id() {
-        let args = pane_env_args("feat/442-chunk-4", None);
+        let args = pane_env_args("feat/442-chunk-4", None, None);
         // Flat -e KEY=VALUE pairs, in order, suitable for splatting into tmux argv
         assert!(
             args.windows(2)
@@ -908,7 +996,7 @@ mod tests {
 
     #[test]
     fn pane_env_args_includes_managed_launch_credential_when_supplied() {
-        let args = pane_env_args("feat/442", Some("credential"));
+        let args = pane_env_args("feat/442", Some("credential"), None);
         assert!(
             args.windows(2)
                 .any(|w| { w[0] == "-e" && w[1] == "OUIJA_SESSION_START_CREDENTIAL=credential" }),
@@ -917,8 +1005,22 @@ mod tests {
     }
 
     #[test]
+    fn pane_env_args_includes_session_incarnation() {
+        let args = pane_env_args(
+            "feat/1952",
+            None,
+            Some(crate::daemon_protocol::SessionIncarnation(42)),
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "OUIJA_SESSION_INCARNATION=42"),
+            "expected session incarnation in pane env, got {args:?}"
+        );
+    }
+
+    #[test]
     fn pane_env_args_preserves_history_suppression() {
-        let args = pane_env_args("x", None);
+        let args = pane_env_args("x", None, None);
         assert!(
             args.windows(2)
                 .any(|w| w[0] == "-e" && w[1] == "HISTFILE=/dev/null"),
@@ -936,7 +1038,7 @@ mod tests {
         // Every VALUE must be immediately preceded by a "-e" flag — no
         // bare values sneaking in that would otherwise be interpreted as
         // the shell-command positional arg to new-window/new-session.
-        let args = pane_env_args("abc", None);
+        let args = pane_env_args("abc", None, None);
         let mut i = 0;
         while i < args.len() {
             assert_eq!(args[i], "-e", "arg {i} should be -e, got {args:?}");
@@ -948,6 +1050,18 @@ mod tests {
             );
             i += 2;
         }
+    }
+
+    #[test]
+    fn process_environment_value_extracts_nul_delimited_variable() {
+        assert_eq!(
+            process_environment_value(
+                b"OTHER=x\0OUIJA_SESSION_INCARNATION=42\0",
+                "OUIJA_SESSION_INCARNATION"
+            )
+            .as_deref(),
+            Some("42")
+        );
     }
 
     #[test]

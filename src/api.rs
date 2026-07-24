@@ -2657,18 +2657,70 @@ pub async fn start_session(
         return response;
     }
 
-    // Return 202 immediately — all work (registration + boot) happens in background.
+    // Decide start ownership before returning or spawning any directory,
+    // worktree, tmux, process, or network work. A second same-ID request sees
+    // the durable lease and cannot reach the backend launch boundary.
+    let disposition =
+        match crate::nostr_transport::reserve_start_for_launch(&state, &body.name).await {
+            Ok(disposition) => disposition,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": format!(
+                            "failed to reserve session '{}' for launch: {error}",
+                            body.name
+                        )
+                    })),
+                );
+            }
+        };
+    let (existing_owner, reserved_owner) = match disposition {
+        crate::daemon_protocol::StartDisposition::Reserved(owner) => (None, Some(owner)),
+        crate::daemon_protocol::StartDisposition::Existing(owner) => {
+            match state.claim_existing_start(&owner).await {
+                Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {
+                    (Some(owner), None)
+                }
+                Ok(_) => {
+                    return (
+                        StatusCode::ACCEPTED,
+                        Json(json!({
+                            "session": body.name,
+                            "status": "start_in_progress"
+                        })),
+                    );
+                }
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "error": format!(
+                                "failed to claim existing session '{}' for restart: {error}",
+                                body.name
+                            )
+                        })),
+                    );
+                }
+            }
+        }
+        crate::daemon_protocol::StartDisposition::InProgress(_) => {
+            return (
+                StatusCode::ACCEPTED,
+                Json(json!({
+                    "session": body.name,
+                    "status": "start_in_progress"
+                })),
+            );
+        }
+    };
+
+    // Return 202 immediately — all boot work happens in background.
     let name = body.name.clone();
     let state2 = state.clone();
     tokio::spawn(async move {
         // If session already exists, restart with fresh context instead of failing.
-        let exists = state2
-            .protocol
-            .read()
-            .await
-            .sessions
-            .contains_key(&body.name);
-        if exists {
+        if let Some(existing_owner) = existing_owner {
             tracing::info!(
                 "session '{}' exists, restarting with fresh context",
                 body.name
@@ -2676,8 +2728,9 @@ pub async fn start_session(
             if let Some(msg) = restart_drops_destructive_intent(&body) {
                 tracing::warn!("{msg}");
             }
-            let (_result, _msg_id, _) = crate::nostr_transport::restart_session(
+            let (_result, _msg_id, _) = crate::nostr_transport::restart_session_for_start(
                 &state2,
+                &existing_owner,
                 &body.name,
                 true, // fresh
                 None,
@@ -2717,6 +2770,7 @@ pub async fn start_session(
             body.branch.as_deref(),
             body.base_branch.as_deref(),
             body.force_reset.unwrap_or(false),
+            reserved_owner,
         )
         .await;
 
@@ -5055,6 +5109,44 @@ mod tests {
         .await;
 
         assert_unknown_backend_response(status, &body);
+    }
+
+    #[tokio::test]
+    async fn start_session_does_not_spawn_when_same_id_lease_is_in_progress() {
+        let state = crate::state::AppState::new_for_test();
+        let reserved = state.reserve_start("same-id").await.unwrap();
+        assert!(matches!(
+            reserved,
+            crate::daemon_protocol::StartDisposition::Reserved(_)
+        ));
+
+        let (status, Json(body)) = start_session(
+            State(state.clone()),
+            Json(SessionNameBody {
+                name: "same-id".into(),
+                fresh: None,
+                worktree: None,
+                project_dir: None,
+                prompt: None,
+                from: None,
+                backend: None,
+                model: None,
+                effort: None,
+                reminder: None,
+                parent_session: None,
+                no_parent_session: Some(true),
+                idle_policy: Some(crate::daemon_protocol::IdlePolicy::KeepOpen),
+                branch: None,
+                base_branch: None,
+                keep_worktree: None,
+                force_reset: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["status"], "start_in_progress");
+        assert!(state.protocol.read().await.sessions.is_empty());
     }
 
     #[tokio::test]

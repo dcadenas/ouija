@@ -46,6 +46,7 @@ pub struct ResourceOwner {
 #[serde(rename_all = "snake_case")]
 pub enum LifecyclePhase {
     Starting,
+    Restarting,
 }
 
 /// Durable in-flight lifecycle authority for one public session ID.
@@ -53,6 +54,15 @@ pub enum LifecyclePhase {
 pub struct LifecycleLease {
     pub owner: ResourceOwner,
     pub phase: LifecyclePhase,
+    /// Pane created before the backend command is sent. On daemon restart it
+    /// is safe to remove because an accepted backend command releases this
+    /// lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inert_pane: Option<String>,
+    /// Exact owner exported into `inert_pane`. Fresh restart targets can have
+    /// a newer incarnation than the lease claimant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inert_pane_owner: Option<ResourceOwner>,
 }
 
 /// Atomic result of trying to reserve a new same-ID start.
@@ -1395,9 +1405,57 @@ impl DaemonState {
             LifecycleLease {
                 owner: owner.clone(),
                 phase: LifecyclePhase::Starting,
+                inert_pane: None,
+                inert_pane_owner: None,
             },
         );
         Ok(StartDisposition::Reserved(owner))
+    }
+
+    /// Record the inert pane created for an exact pre-launch lease.
+    pub fn record_inert_start_pane(
+        &mut self,
+        lease_owner: &ResourceOwner,
+        pane_owner: ResourceOwner,
+        pane: String,
+    ) -> LifecycleMutationOutcome {
+        let Some(lease) = self.lifecycle_leases.get_mut(&lease_owner.session_id) else {
+            return LifecycleMutationOutcome::NotFound;
+        };
+        if lease.owner != *lease_owner {
+            return LifecycleMutationOutcome::Superseded;
+        }
+        if pane_owner.session_id != lease_owner.session_id {
+            return LifecycleMutationOutcome::Rejected;
+        }
+        lease.inert_pane = Some(pane);
+        lease.inert_pane_owner = Some(pane_owner);
+        LifecycleMutationOutcome::Applied
+    }
+
+    /// Claim an existing exact owner for the restart behavior of `/start`.
+    pub fn claim_existing_start(&mut self, owner: &ResourceOwner) -> LifecycleMutationOutcome {
+        if self.lifecycle_leases.contains_key(&owner.session_id) {
+            return LifecycleMutationOutcome::Rejected;
+        }
+        let Some(session) = self.sessions.get(&owner.session_id) else {
+            return LifecycleMutationOutcome::NotFound;
+        };
+        if !matches!(session.origin, Origin::Local)
+            || session.metadata.session_incarnation != owner.incarnation
+        {
+            return LifecycleMutationOutcome::Superseded;
+        }
+        self.lifecycle_leases.insert(
+            owner.session_id.clone(),
+            LifecycleLease {
+                owner: owner.clone(),
+                phase: LifecyclePhase::Restarting,
+                inert_pane: None,
+                inert_pane_owner: None,
+            },
+        );
+        LifecycleMutationOutcome::Applied
     }
 
     /// Commit a reserved start into the active session map with the exact
@@ -1839,9 +1897,6 @@ impl DaemonState {
             registered_at: now.timestamp(),
         };
         self.sessions.insert(id.clone(), session);
-        if reserved_owner.is_some() {
-            self.lifecycle_leases.remove(&id);
-        }
         effects.push(Effect::Persist);
 
         // Tmux effects
@@ -3923,7 +3978,11 @@ mod tests {
                 .outcome,
             LifecycleMutationOutcome::Applied
         );
-        assert!(!state.lifecycle_leases.contains_key("worker"));
+        assert_eq!(state.lifecycle_leases["worker"].owner, replacement.clone());
+        assert_eq!(
+            state.abort_lifecycle(&replacement),
+            LifecycleMutationOutcome::Applied
+        );
         assert_eq!(
             state.sessions["worker"].metadata.session_incarnation,
             replacement.incarnation

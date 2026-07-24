@@ -955,9 +955,46 @@ impl AppState {
         Ok(disposition)
     }
 
-    /// Commit a reserved start only after the active owner and released lease
-    /// have been durably written. Non-persistence effects run afterward.
-    #[allow(dead_code)] // Introduced in Chunk 1; launch callers adopt it in Chunk 2.
+    /// Durably associate an inert pre-launch pane with its exact lease so a
+    /// daemon restart can remove only that abandoned resource.
+    pub async fn record_inert_start_pane(
+        self: &Arc<Self>,
+        lease_owner: &crate::daemon_protocol::ResourceOwner,
+        pane_owner: crate::daemon_protocol::ResourceOwner,
+        pane: String,
+    ) -> anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome> {
+        let mut proto = self.protocol.write().await;
+        let before = proto.clone();
+        let outcome = proto.record_inert_start_pane(lease_owner, pane_owner, pane);
+        if outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied
+            && let Err(error) = self.persist_protocol_state(&proto)
+        {
+            *proto = before;
+            return Err(error);
+        }
+        Ok(outcome)
+    }
+
+    /// Durably claim the exact incumbent for `/start`'s existing-session
+    /// restart behavior before the background task can perform external work.
+    pub async fn claim_existing_start(
+        self: &Arc<Self>,
+        owner: &crate::daemon_protocol::ResourceOwner,
+    ) -> anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome> {
+        let mut proto = self.protocol.write().await;
+        let before = proto.clone();
+        let outcome = proto.claim_existing_start(owner);
+        if outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied
+            && let Err(error) = self.persist_protocol_state(&proto)
+        {
+            *proto = before;
+            return Err(error);
+        }
+        Ok(outcome)
+    }
+
+    /// Publish a reserved start's active owner while retaining its pre-launch
+    /// lease through the external backend-command boundary.
     pub async fn commit_reserved_start(
         self: &Arc<Self>,
         owner: &crate::daemon_protocol::ResourceOwner,
@@ -981,8 +1018,214 @@ impl AppState {
                 .collect();
             (result.outcome, effects)
         };
-        self.execute_effects(&effects).await;
+        self.execute_launch_registration_effects(&effects).await;
         Ok(outcome)
+    }
+
+    /// Execute the bounded effect set emitted by an exact-owner start commit.
+    ///
+    /// This deliberately does not call the general effect executor: that
+    /// executor can receive another remote StartSession, which would make the
+    /// start future recursively contain itself. `commit_reserved_start`
+    /// emits only ordinary registration effects.
+    async fn execute_launch_registration_effects(
+        self: &Arc<Self>,
+        effects: &[crate::daemon_protocol::Effect],
+    ) {
+        use crate::daemon_protocol::Effect;
+
+        for effect in effects {
+            match effect {
+                Effect::Broadcast(message) => {
+                    crate::transport::broadcast(self, message).await;
+                }
+                Effect::BroadcastSessionList => {
+                    crate::transport::broadcast_local_sessions(self).await;
+                }
+                Effect::SetTmuxVar { pane, name, value } => {
+                    let pane = pane.clone();
+                    let name = name.clone();
+                    let value = value.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::tmux_var::set(&pane, &name, &value);
+                    });
+                }
+                Effect::ClearTmuxVar { pane, name } => {
+                    let pane = pane.clone();
+                    let name = name.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::tmux_var::clear(&pane, &name);
+                    });
+                }
+                Effect::HoldAutoregister { pane } => {
+                    self.autoregister_suppressed_panes
+                        .lock()
+                        .expect("autoregister suppression mutex poisoned")
+                        .insert(
+                            pane.clone(),
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(AUTOREGISTER_REMOVE_GRACE_SECS),
+                        );
+                }
+                Effect::EnableAutoRename { pane } => {
+                    let pane = pane.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::tmux::enable_automatic_rename(&pane);
+                    });
+                }
+                Effect::SpawnAgent { session_id, pane } => {
+                    self.spawn_session_agent(session_id, pane).await;
+                }
+                Effect::StopAgent { session_id } => {
+                    if let Some(agent) = self
+                        .session_agents
+                        .write()
+                        .await
+                        .remove(session_id.as_str())
+                    {
+                        agent.stop(None);
+                    }
+                }
+                Effect::ClearPendingReplies { removed_ids } => {
+                    self.clear_orphaned_pending_replies(removed_ids).await;
+                }
+                Effect::ProvisionalRollbackOk { pane } => {
+                    if !cfg!(test) {
+                        let pane = pane.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let _ = std::process::Command::new("tmux")
+                                .args(["kill-pane", "-t", &pane])
+                                .status();
+                        });
+                    }
+                }
+                Effect::Log { level, message } => match level {
+                    crate::daemon_protocol::LogLevel::Debug => tracing::debug!("{message}"),
+                    crate::daemon_protocol::LogLevel::Info => tracing::info!("{message}"),
+                    crate::daemon_protocol::LogLevel::Warn => tracing::warn!("{message}"),
+                },
+                Effect::RegisterOk { .. } | Effect::RemoveOk { .. } => {}
+                unexpected => {
+                    tracing::warn!(
+                        ?unexpected,
+                        "unexpected effect emitted by reserved start commit"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Durably apply final launch metadata only while `owner` still owns the
+    /// public session ID.
+    pub async fn finalize_reserved_start(
+        self: &Arc<Self>,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        pane: Option<String>,
+        metadata: crate::daemon_protocol::SessionMeta,
+    ) -> anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome> {
+        let effects = {
+            let mut proto = self.protocol.write().await;
+            let Some(current) = proto.sessions.get(&owner.session_id) else {
+                return Ok(crate::daemon_protocol::LifecycleMutationOutcome::NotFound);
+            };
+            if !matches!(current.origin, crate::daemon_protocol::Origin::Local) {
+                return Ok(crate::daemon_protocol::LifecycleMutationOutcome::Rejected);
+            }
+            if current.metadata.session_incarnation != owner.incarnation {
+                return Ok(crate::daemon_protocol::LifecycleMutationOutcome::Superseded);
+            }
+
+            let before = proto.clone();
+            let effects = proto.apply(crate::daemon_protocol::Event::RefreshLaunchMetadata {
+                id: owner.session_id.clone(),
+                expected_incarnation: owner.incarnation,
+                pane,
+                metadata,
+            });
+            if let Err(error) = self.persist_protocol_state(&proto) {
+                *proto = before;
+                return Err(error);
+            }
+            effects
+                .into_iter()
+                .filter(|effect| !matches!(effect, crate::daemon_protocol::Effect::Persist))
+                .collect::<Vec<_>>()
+        };
+        self.execute_launch_registration_effects(&effects).await;
+        Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied)
+    }
+
+    /// Durably remove a failed start only while `owner` still owns the exact
+    /// pane and launch credential.
+    pub async fn rollback_reserved_start(
+        self: &Arc<Self>,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        pane: &str,
+        credential: Option<&str>,
+    ) -> anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome> {
+        self.rollback_launch(owner, Some(pane), credential, None, Some(pane))
+            .await
+    }
+
+    /// Durably restore a failed launch's previous entry under an exact target
+    /// owner. The caller must first remove any provisional pane by exact owner;
+    /// this transition only clears the matching recovery record.
+    pub async fn rollback_launch(
+        self: &Arc<Self>,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        pane: Option<&str>,
+        credential: Option<&str>,
+        previous: Option<crate::daemon_protocol::SessionEntry>,
+        provisional_pane: Option<&str>,
+    ) -> anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome> {
+        let effects = {
+            let mut proto = self.protocol.write().await;
+            let Some(current) = proto.sessions.get(&owner.session_id) else {
+                return Ok(crate::daemon_protocol::LifecycleMutationOutcome::NotFound);
+            };
+            if !matches!(current.origin, crate::daemon_protocol::Origin::Local) {
+                return Ok(crate::daemon_protocol::LifecycleMutationOutcome::Rejected);
+            }
+            if current.metadata.session_incarnation != owner.incarnation
+                || current.pane.as_deref() != pane
+                || current.metadata.session_start_credential.as_deref() != credential
+            {
+                return Ok(crate::daemon_protocol::LifecycleMutationOutcome::Superseded);
+            }
+
+            let before = proto.clone();
+            let effects = proto.apply(crate::daemon_protocol::Event::RollbackFreshLaunch {
+                id: owner.session_id.clone(),
+                pane: pane.map(String::from),
+                credential: credential.map(String::from),
+                staged_incarnation: owner.incarnation,
+                previous,
+                provisional_pane: provisional_pane.map(String::from),
+            });
+            if let Some(lease) = proto.lifecycle_leases.get_mut(&owner.session_id)
+                && lease.inert_pane.as_deref() == provisional_pane
+                && lease.inert_pane_owner.as_ref() == Some(owner)
+            {
+                lease.inert_pane = None;
+                lease.inert_pane_owner = None;
+            }
+            if let Err(error) = self.persist_protocol_state(&proto) {
+                *proto = before;
+                return Err(error);
+            }
+            effects
+                .into_iter()
+                .filter(|effect| {
+                    !matches!(
+                        effect,
+                        crate::daemon_protocol::Effect::Persist
+                            | crate::daemon_protocol::Effect::ProvisionalRollbackOk { .. }
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        self.execute_launch_registration_effects(&effects).await;
+        Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied)
     }
 
     /// Release an exact lifecycle lease only after the removal is durable.
@@ -1297,6 +1540,7 @@ impl AppState {
                             None,  // branch
                             None,  // base_branch
                             false, // force_reset — remote /start never resets (hub#528 guard)
+                            None,  // reserve inside the transport start boundary
                         )
                         .await;
                         let reply = crate::protocol::WireMessage::CommandResult {
@@ -2665,13 +2909,20 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn durable_start_commit_persists_the_exact_reserved_owner() {
+    async fn durable_start_commit_persists_the_exact_owner_and_prelaunch_lease() {
         let config = test_config();
         let state = AppState::new(config.clone());
         let owner = match state.reserve_start("worker").await.unwrap() {
             crate::daemon_protocol::StartDisposition::Reserved(owner) => owner,
             other => panic!("expected reservation, got {other:?}"),
         };
+        assert_eq!(
+            state
+                .record_inert_start_pane(&owner, owner.clone(), "%1".into())
+                .await
+                .unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
 
         let outcome = state
             .commit_reserved_start(
@@ -2687,7 +2938,11 @@ pub(crate) mod tests {
             crate::daemon_protocol::LifecycleMutationOutcome::Applied
         );
         let persisted = crate::persistence::load_sessions(&config.data_dir).unwrap();
-        assert!(persisted.lifecycle_leases.is_empty());
+        assert_eq!(persisted.lifecycle_leases["worker"].owner, owner);
+        assert_eq!(
+            persisted.lifecycle_leases["worker"].inert_pane.as_deref(),
+            Some("%1")
+        );
         assert_eq!(
             persisted.sessions[0].metadata.session_incarnation,
             owner.incarnation
@@ -2716,6 +2971,35 @@ pub(crate) mod tests {
         let proto = state.protocol.read().await;
         assert_eq!(proto.lifecycle_leases["worker"].owner, owner);
         assert!(!proto.sessions.contains_key("worker"));
+    }
+
+    #[tokio::test]
+    async fn durable_start_failure_rollback_restores_state_when_snapshot_write_fails() {
+        let config = test_config();
+        let state = AppState::new(config.clone());
+        let owner = match state.reserve_start("worker").await.unwrap() {
+            crate::daemon_protocol::StartDisposition::Reserved(owner) => owner,
+            other => panic!("expected reservation, got {other:?}"),
+        };
+        state
+            .commit_reserved_start(
+                &owner,
+                Some("%1".into()),
+                crate::daemon_protocol::SessionMeta::default(),
+            )
+            .await
+            .unwrap();
+        std::fs::create_dir(config.data_dir.join("sessions.tmp")).unwrap();
+
+        let result = state.rollback_reserved_start(&owner, "%1", None).await;
+
+        assert!(result.is_err());
+        let proto = state.protocol.read().await;
+        assert_eq!(
+            proto.sessions["worker"].metadata.session_incarnation,
+            owner.incarnation
+        );
+        assert_eq!(proto.sessions["worker"].pane.as_deref(), Some("%1"));
     }
 
     #[tokio::test]

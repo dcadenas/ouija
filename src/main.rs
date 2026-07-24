@@ -1352,15 +1352,52 @@ async fn setup_nostr_transport(
     transport::broadcast_local_sessions(state).await;
 }
 
+fn abandoned_lease_owns_staged_row(
+    session: &persistence::PersistedSession,
+    lease: &crate::daemon_protocol::LifecycleLease,
+) -> bool {
+    if lease.owner.session_id != session.id {
+        return false;
+    }
+    match lease.phase {
+        crate::daemon_protocol::LifecyclePhase::Starting => {
+            session.metadata.session_incarnation == lease.owner.incarnation
+        }
+        crate::daemon_protocol::LifecyclePhase::Restarting => {
+            let owns_recorded_inert_pane = lease.inert_pane.is_some()
+                && lease.inert_pane.as_ref() == session.pane.as_ref()
+                && lease.inert_pane_owner.as_ref().is_some_and(|owner| {
+                    owner.session_id == session.id
+                        && owner.incarnation == session.metadata.session_incarnation
+                });
+            owns_recorded_inert_pane
+                || session.metadata.session_incarnation != lease.owner.incarnation
+        }
+    }
+}
+
+fn lifecycle_lease_pane_owners(
+    lease: &crate::daemon_protocol::LifecycleLease,
+) -> Vec<crate::daemon_protocol::ResourceOwner> {
+    let mut owners = vec![lease.owner.clone()];
+    if let Some(owner) = &lease.inert_pane_owner
+        && !owners.contains(owner)
+    {
+        owners.push(owner.clone());
+    }
+    owners
+}
+
 async fn restore_persisted_sessions(state: &state::AppState) -> anyhow::Result<()> {
     let persisted = persistence::load_sessions(&state.config.data_dir)
         .context("failed to restore lifecycle authority from sessions.json")?;
     let persistence::PersistedLifecycleState {
-        sessions,
+        mut sessions,
         incarnation_high_water,
         lifecycle_leases,
         ..
     } = persisted;
+    let abandoned_leases: Vec<_> = lifecycle_leases.values().cloned().collect();
 
     // Restore allocator authority even when every persisted session is dead or
     // has since been removed. Reusing one of those tokens would let delayed
@@ -1369,6 +1406,79 @@ async fn restore_persisted_sessions(state: &state::AppState) -> anyhow::Result<(
         let mut proto = state.protocol.write().await;
         proto.restore_incarnation_high_water(incarnation_high_water);
         proto.lifecycle_leases = lifecycle_leases;
+    }
+
+    // A persisted lifecycle lease proves the daemon stopped before the
+    // backend-command boundary completed. Remove only its exact inert pane,
+    // discard only the staged session row owned by that lease, then durably
+    // release the public ID. A Restarting lease whose row still has the
+    // incumbent incarnation stopped before staging and therefore preserves it.
+    // Worktree recovery is handled separately once leases carry owned
+    // filesystem claims.
+    if !abandoned_leases.is_empty() {
+        let inert_panes: Vec<_> = abandoned_leases
+            .iter()
+            .filter_map(|lease| {
+                lease
+                    .inert_pane
+                    .clone()
+                    .map(|pane| (pane, lifecycle_lease_pane_owners(lease)))
+            })
+            .collect();
+        if !inert_panes.is_empty() {
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                for (pane, expected_owners) in inert_panes {
+                    let live_owner = crate::tmux::inspect_pane_owner(&pane)?;
+                    if !live_owner
+                        .as_ref()
+                        .is_some_and(|owner| expected_owners.contains(owner))
+                    {
+                        continue;
+                    }
+                    let status = std::process::Command::new("tmux")
+                        .args(["kill-pane", "-t", &pane])
+                        .status()
+                        .with_context(|| format!("failed to kill abandoned pane {pane}"))?;
+                    let remaining_owner = crate::tmux::inspect_pane_owner(&pane)?;
+                    if !status.success()
+                        && remaining_owner
+                            .as_ref()
+                            .is_some_and(|owner| expected_owners.contains(owner))
+                    {
+                        anyhow::bail!(
+                            "failed to remove abandoned pane {pane} for lifecycle owner {remaining_owner:?}"
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .context("abandoned start pane reconciliation task failed")?
+            .context("failed to reconcile abandoned start panes")?;
+        }
+
+        sessions.retain(|session| {
+            !abandoned_leases
+                .iter()
+                .find(|lease| lease.owner.session_id == session.id)
+                .is_some_and(|lease| abandoned_lease_owns_staged_row(session, lease))
+        });
+
+        {
+            let mut proto = state.protocol.write().await;
+            for lease in &abandoned_leases {
+                proto.abort_lifecycle(&lease.owner);
+            }
+        }
+        persistence::save_sessions(
+            &state.config.data_dir,
+            &persistence::PersistedLifecycleState::new(
+                sessions.clone(),
+                incarnation_high_water,
+                std::collections::BTreeMap::new(),
+            ),
+        )
+        .context("failed to persist reconciled lifecycle authority")?;
     }
 
     if sessions.is_empty() {
@@ -3480,20 +3590,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_persisted_sessions_retains_removed_high_water_and_inflight_lease() {
+    async fn restore_persisted_sessions_releases_abandoned_lease_without_reusing_high_water() {
         let dir = tempfile::tempdir().unwrap();
         let owner = crate::daemon_protocol::ResourceOwner {
             session_id: "pending".into(),
             incarnation: crate::daemon_protocol::SessionIncarnation(49),
         };
         let snapshot = crate::persistence::PersistedLifecycleState::new(
-            vec![],
+            vec![crate::persistence::PersistedSession {
+                id: "live".into(),
+                pane: None,
+                registered_at: chrono::Utc::now(),
+                last_activity_at: chrono::Utc::now(),
+                metadata: crate::state::SessionMetadata {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_live".into()),
+                    session_incarnation: crate::daemon_protocol::SessionIncarnation(48),
+                    ..Default::default()
+                },
+            }],
             crate::daemon_protocol::SessionIncarnation(50),
             std::collections::BTreeMap::from([(
                 owner.session_id.clone(),
                 crate::daemon_protocol::LifecycleLease {
                     owner: owner.clone(),
                     phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                    inert_pane: None,
+                    inert_pane_owner: None,
                 },
             )]),
         );
@@ -3508,10 +3631,19 @@ mod tests {
 
         restore_persisted_sessions(&state).await.unwrap();
 
-        let mut proto = state.protocol.write().await;
+        let restored_snapshot = crate::persistence::load_sessions(dir.path()).unwrap();
+        assert!(restored_snapshot.lifecycle_leases.is_empty());
+        assert_eq!(restored_snapshot.sessions.len(), 1);
+        assert_eq!(restored_snapshot.sessions[0].id, "live");
         assert_eq!(
-            proto.lifecycle_leases["pending"].owner, owner,
-            "restart must retain in-flight lifecycle authority"
+            restored_snapshot.incarnation_high_water,
+            crate::daemon_protocol::SessionIncarnation(50)
+        );
+        let mut proto = state.protocol.write().await;
+        assert!(proto.sessions.contains_key("live"));
+        assert!(
+            proto.lifecycle_leases.is_empty(),
+            "restart must release abandoned pre-launch authority"
         );
         assert_eq!(
             proto.reserve_start("next").unwrap(),
@@ -3523,6 +3655,182 @@ mod tests {
             ),
             "the first post-restart token must exceed removed persisted owners"
         );
+    }
+
+    #[tokio::test]
+    async fn restore_persisted_sessions_removes_unlaunched_http_start_before_releasing_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "pending".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(49),
+        };
+        let snapshot = crate::persistence::PersistedLifecycleState::new(
+            vec![crate::persistence::PersistedSession {
+                id: owner.session_id.clone(),
+                pane: None,
+                registered_at: chrono::Utc::now(),
+                last_activity_at: chrono::Utc::now(),
+                metadata: crate::state::SessionMetadata {
+                    backend: Some("opencode".into()),
+                    session_incarnation: owner.incarnation,
+                    ..Default::default()
+                },
+            }],
+            owner.incarnation,
+            std::collections::BTreeMap::from([(
+                owner.session_id.clone(),
+                crate::daemon_protocol::LifecycleLease {
+                    owner: owner.clone(),
+                    phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                    inert_pane: None,
+                    inert_pane_owner: None,
+                },
+            )]),
+        );
+        crate::persistence::save_sessions(dir.path(), &snapshot).unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: 0,
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+
+        restore_persisted_sessions(&state).await.unwrap();
+
+        let restored_snapshot = crate::persistence::load_sessions(dir.path()).unwrap();
+        assert!(restored_snapshot.sessions.is_empty());
+        assert!(restored_snapshot.lifecycle_leases.is_empty());
+        let mut proto = state.protocol.write().await;
+        assert!(!proto.sessions.contains_key("pending"));
+        assert!(matches!(
+            proto.reserve_start("pending").unwrap(),
+            crate::daemon_protocol::StartDisposition::Reserved(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn restore_persisted_sessions_distinguishes_unstaged_and_staged_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let incumbent_owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "incumbent".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(40),
+        };
+        let staged_lease_owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "staged".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(41),
+        };
+        let snapshot = crate::persistence::PersistedLifecycleState::new(
+            vec![
+                crate::persistence::PersistedSession {
+                    id: incumbent_owner.session_id.clone(),
+                    pane: None,
+                    registered_at: chrono::Utc::now(),
+                    last_activity_at: chrono::Utc::now(),
+                    metadata: crate::state::SessionMetadata {
+                        backend: Some("opencode".into()),
+                        session_incarnation: incumbent_owner.incarnation,
+                        ..Default::default()
+                    },
+                },
+                crate::persistence::PersistedSession {
+                    id: staged_lease_owner.session_id.clone(),
+                    pane: None,
+                    registered_at: chrono::Utc::now(),
+                    last_activity_at: chrono::Utc::now(),
+                    metadata: crate::state::SessionMetadata {
+                        backend: Some("opencode".into()),
+                        session_incarnation: crate::daemon_protocol::SessionIncarnation(42),
+                        ..Default::default()
+                    },
+                },
+            ],
+            crate::daemon_protocol::SessionIncarnation(42),
+            std::collections::BTreeMap::from([
+                (
+                    incumbent_owner.session_id.clone(),
+                    crate::daemon_protocol::LifecycleLease {
+                        owner: incumbent_owner.clone(),
+                        phase: crate::daemon_protocol::LifecyclePhase::Restarting,
+                        inert_pane: None,
+                        inert_pane_owner: None,
+                    },
+                ),
+                (
+                    staged_lease_owner.session_id.clone(),
+                    crate::daemon_protocol::LifecycleLease {
+                        owner: staged_lease_owner,
+                        phase: crate::daemon_protocol::LifecyclePhase::Restarting,
+                        inert_pane: None,
+                        inert_pane_owner: None,
+                    },
+                ),
+            ]),
+        );
+        crate::persistence::save_sessions(dir.path(), &snapshot).unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: 0,
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+
+        restore_persisted_sessions(&state).await.unwrap();
+
+        let restored_snapshot = crate::persistence::load_sessions(dir.path()).unwrap();
+        assert_eq!(restored_snapshot.sessions.len(), 1);
+        assert_eq!(restored_snapshot.sessions[0].id, "incumbent");
+        let proto = state.protocol.read().await;
+        assert!(proto.sessions.contains_key("incumbent"));
+        assert!(!proto.sessions.contains_key("staged"));
+        assert!(proto.lifecycle_leases.is_empty());
+    }
+
+    #[test]
+    fn restart_reconciliation_removes_same_incarnation_inert_fallback_row() {
+        let owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "resumed".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(43),
+        };
+        let session = crate::persistence::PersistedSession {
+            id: owner.session_id.clone(),
+            pane: Some("%fallback".into()),
+            registered_at: chrono::Utc::now(),
+            last_activity_at: chrono::Utc::now(),
+            metadata: crate::state::SessionMetadata {
+                session_incarnation: owner.incarnation,
+                ..Default::default()
+            },
+        };
+        let lease = crate::daemon_protocol::LifecycleLease {
+            owner: owner.clone(),
+            phase: crate::daemon_protocol::LifecyclePhase::Restarting,
+            inert_pane: Some("%fallback".into()),
+            inert_pane_owner: Some(owner),
+        };
+
+        assert!(abandoned_lease_owns_staged_row(&session, &lease));
+    }
+
+    #[test]
+    fn direct_respawn_recovery_accepts_incumbent_and_staged_pane_owners() {
+        let incumbent = crate::daemon_protocol::ResourceOwner {
+            session_id: "resumed".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(43),
+        };
+        let staged = crate::daemon_protocol::ResourceOwner {
+            session_id: "resumed".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(44),
+        };
+        let lease = crate::daemon_protocol::LifecycleLease {
+            owner: incumbent.clone(),
+            phase: crate::daemon_protocol::LifecyclePhase::Restarting,
+            inert_pane: Some("%existing".into()),
+            inert_pane_owner: Some(staged.clone()),
+        };
+
+        assert_eq!(lifecycle_lease_pane_owners(&lease), vec![incumbent, staged]);
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use anyhow::Context;
 use nostr_sdk::prelude::*;
 use tokio::sync::RwLock;
 
@@ -155,6 +156,7 @@ fn cleanup_failed_opencode_attach_pane(pane_id: &str) {
     });
 }
 
+#[cfg(test)]
 async fn cleanup_provisional_start(
     state: &std::sync::Arc<AppState>,
     session_id: &str,
@@ -185,6 +187,51 @@ async fn cleanup_provisional_start(
                 .status()
         })
         .await;
+    }
+}
+
+async fn cleanup_reserved_start(
+    state: &std::sync::Arc<AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    pane_id: &str,
+    credential: Option<&str>,
+) {
+    if let Err(error) = remove_inert_start_pane(owner, pane_id).await {
+        tracing::warn!(
+            session_id = %owner.session_id,
+            incarnation = %owner.incarnation,
+            "failed to remove exact reserved-start pane; retaining recovery authority: {error}"
+        );
+        return;
+    }
+    match state
+        .rollback_reserved_start(owner, pane_id, credential)
+        .await
+    {
+        Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {
+            if let Err(error) = state.abort_lifecycle(owner).await {
+                tracing::warn!(
+                    session_id = %owner.session_id,
+                    incarnation = %owner.incarnation,
+                    "failed to release rolled-back start reservation: {error}"
+                );
+            }
+        }
+        Ok(outcome) => {
+            tracing::warn!(
+                session_id = %owner.session_id,
+                incarnation = %owner.incarnation,
+                ?outcome,
+                "reserved start rollback no longer owned the launch"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                session_id = %owner.session_id,
+                incarnation = %owner.incarnation,
+                "failed to durably roll back reserved start: {error}"
+            );
+        }
     }
 }
 
@@ -1306,7 +1353,7 @@ pub async fn handle_human_command(state: &std::sync::Arc<AppState>, cmd: &str) -
         // /start chat-command never resets — no base_branch supplied anyway.
         start_session(
             state, name, None, None, None, None, None, None, None, None, None, None, None, None,
-            None, false,
+            None, false, None,
         )
         .await
         .0
@@ -1603,6 +1650,67 @@ async fn kill_session_inner(
 }
 
 /// Start a new session in a tmux pane, optionally in a worktree.
+pub(crate) async fn reserve_start_for_launch(
+    state: &std::sync::Arc<AppState>,
+    name: &str,
+) -> anyhow::Result<crate::daemon_protocol::StartDisposition> {
+    state.reserve_start(name).await
+}
+
+async fn fail_reserved_start(
+    state: &std::sync::Arc<AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    message: String,
+) -> (String, Option<u64>) {
+    match state.abort_lifecycle(owner).await {
+        Ok(_) => (message, None),
+        Err(error) => (
+            format!("{message}; failed to release lifecycle reservation: {error}"),
+            None,
+        ),
+    }
+}
+
+async fn remove_inert_start_pane(
+    owner: &crate::daemon_protocol::ResourceOwner,
+    pane: &str,
+) -> anyhow::Result<()> {
+    if cfg!(test) {
+        return Ok(());
+    }
+    let owner = owner.clone();
+    let pane = pane.to_string();
+    tokio::task::spawn_blocking(move || {
+        if crate::tmux::inspect_pane_owner(&pane)?.as_ref() != Some(&owner) {
+            return Ok(());
+        }
+        let status = std::process::Command::new("tmux")
+            .args(["kill-pane", "-t", &pane])
+            .status()
+            .with_context(|| format!("failed to kill inert start pane {pane}"))?;
+        if !status.success() && crate::tmux::inspect_pane_owner(&pane)?.as_ref() == Some(&owner) {
+            anyhow::bail!(
+                "failed to remove inert pane {pane} for {} incarnation {}",
+                owner.session_id,
+                owner.incarnation
+            );
+        }
+        Ok(())
+    })
+    .await
+    .context("inert start pane cleanup task failed")?
+}
+
+async fn finalize_reserved_start(
+    state: &std::sync::Arc<AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    pane: Option<String>,
+    metadata: crate::daemon_protocol::SessionMeta,
+) -> anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome> {
+    state.finalize_reserved_start(owner, pane, metadata).await
+}
+
+/// Start a new session in a tmux pane, optionally in a worktree.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_session(
     state: &std::sync::Arc<AppState>,
@@ -1621,11 +1729,50 @@ pub async fn start_session(
     branch: Option<&str>,
     base_branch: Option<&str>,
     force_reset: bool,
+    reserved_owner: Option<crate::daemon_protocol::ResourceOwner>,
 ) -> (String, Option<u64>) {
-    // Check if already exists
-    if state.protocol.read().await.sessions.contains_key(name) {
-        return (format!("session '{name}' already exists"), None);
-    }
+    let backend = match backend {
+        Some(b) => match state.backends.get_required(b) {
+            Ok(backend) => backend,
+            Err(message) => return (message, None),
+        },
+        None => state.backends.default(),
+    };
+    let backend_name = backend.name().to_string();
+
+    let owner = match reserved_owner {
+        Some(owner) => {
+            let owns_lease = state
+                .protocol
+                .read()
+                .await
+                .lifecycle_leases
+                .get(name)
+                .is_some_and(|lease| lease.owner == owner);
+            if !owns_lease || owner.session_id != name {
+                return (
+                    format!("start for session '{name}' was superseded before launch"),
+                    None,
+                );
+            }
+            owner
+        }
+        None => match reserve_start_for_launch(state, name).await {
+            Ok(crate::daemon_protocol::StartDisposition::Reserved(owner)) => owner,
+            Ok(crate::daemon_protocol::StartDisposition::Existing(_)) => {
+                return (format!("session '{name}' already exists"), None);
+            }
+            Ok(crate::daemon_protocol::StartDisposition::InProgress(_)) => {
+                return (format!("session '{name}' start already in progress"), None);
+            }
+            Err(error) => {
+                return (
+                    format!("failed to reserve session '{name}' for launch: {error}"),
+                    None,
+                );
+            }
+        },
+    };
 
     let mut dir = if let Some(pd) = project_dir {
         pd.to_string()
@@ -1664,7 +1811,7 @@ pub async fn start_session(
 
     // Create directory if it doesn't exist
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        return (format!("failed to create {dir}: {e}"), None);
+        return fail_reserved_start(state, &owner, format!("failed to create {dir}: {e}")).await;
     }
 
     // If worktree requested, ouija creates it in .ouija/worktrees/<name>.
@@ -1686,21 +1833,18 @@ pub async fn start_session(
                 dir = wt_dir;
             }
             Err(e) => {
-                return (format!("failed to create worktree: {e}"), None);
+                return fail_reserved_start(
+                    state,
+                    &owner,
+                    format!("failed to create worktree: {e}"),
+                )
+                .await;
             }
         }
     }
 
     let tmux_session = crate::tmux::tmux_session_name(&dir);
     let window_name = name.to_string();
-    let backend = match backend {
-        Some(b) => match state.backends.get_required(b) {
-            Ok(backend) => backend,
-            Err(message) => return (message, None),
-        },
-        None => state.backends.default(),
-    };
-    let backend_name = backend.name().to_string();
     let settings = state.settings.read().await;
     let claude_permission_mode = settings.claude_permission_mode.clone();
     let launch_model = crate::backend::resolve_launch_model_config(
@@ -1732,10 +1876,12 @@ pub async fn start_session(
         ) {
             Ok(command) => command,
             Err(error) => {
-                return (
+                return fail_reserved_start(
+                    state,
+                    &owner,
                     format!("could not stage Codex launch credential: {error}"),
-                    None,
-                );
+                )
+                .await;
             }
         },
         None => backend_cmd,
@@ -1805,6 +1951,7 @@ pub async fn start_session(
         let tmux_session = tmux_session.clone();
         let window_name = window_name.clone();
         let pane_credential = session_start_credential.clone();
+        let pane_incarnation = owner.incarnation;
         move || -> anyhow::Result<String> {
             use std::process::Command;
 
@@ -1818,7 +1965,11 @@ pub async fn start_session(
             // `pane_env_args` sets OUIJA_SESSION_ID (primary session-id
             // signal for the ouija CLI) plus HISTFILE/fish_history to
             // suppress shell history writes.
-            let env_args = crate::tmux::pane_env_args(&window_name, pane_credential.as_deref());
+            let env_args = crate::tmux::pane_env_args(
+                &window_name,
+                pane_credential.as_deref(),
+                Some(pane_incarnation),
+            );
             let pane_id = if tmux_session_exists {
                 let target = format!("{tmux_session}:");
                 let mut args: Vec<&str> = vec!["new-window", "-d"];
@@ -1869,43 +2020,103 @@ pub async fn start_session(
 
     match start_result {
         Ok(Ok(pane_id)) => {
-            // A fresh Codex process can call SessionStart immediately. Make
-            // its complete, credentialed session record visible before the
-            // backend command is sent so that hook cannot auto-register a
-            // competing session or observe an uncredentialed slot.
-            let staged_incarnation =
-                if let Some(session_start_credential) = session_start_credential.clone() {
-                    let proto_meta = crate::daemon_protocol::SessionMeta {
-                        project_dir: Some(dir.clone()),
-                        worktree,
-                        backend: Some(backend_name.clone()),
-                        session_start_credential: Some(session_start_credential),
-                        model: model.map(String::from),
-                        effort: effort.map(String::from),
-                        codex_home: launch_model.codex_home.clone(),
-                        reminder: reminder.map(String::from),
-                        parent_session: parent_session.map(String::from),
-                        idle_policy: idle_policy.clone(),
-                        prompt: prompt.map(String::from),
-                        ..Default::default()
-                    };
-                    state
-                        .apply_and_execute(crate::daemon_protocol::Event::Register {
-                            id: name.to_string(),
-                            pane: Some(pane_id.clone()),
-                            metadata: proto_meta,
-                        })
-                        .await;
-                    state
-                        .protocol
-                        .read()
-                        .await
-                        .sessions
-                        .get(name)
-                        .map(|session| session.metadata.session_incarnation)
-                } else {
-                    None
-                };
+            match state
+                .record_inert_start_pane(&owner, owner.clone(), pane_id.clone())
+                .await
+            {
+                Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
+                Ok(outcome) => {
+                    let cleanup = remove_inert_start_pane(&owner, &pane_id).await;
+                    if cleanup.is_ok() {
+                        let _ = state.abort_lifecycle(&owner).await;
+                    }
+                    return (
+                        format!(
+                            "start for session '{name}' was superseded before pane registration ({outcome:?}){}",
+                            cleanup
+                                .err()
+                                .map(|error| format!("; inert pane cleanup failed: {error}"))
+                                .unwrap_or_default()
+                        ),
+                        None,
+                    );
+                }
+                Err(error) => {
+                    let cleanup = remove_inert_start_pane(&owner, &pane_id).await;
+                    if cleanup.is_ok() {
+                        let _ = state.abort_lifecycle(&owner).await;
+                    }
+                    return (
+                        format!(
+                            "failed to persist inert pane for session '{name}': {error}{}",
+                            cleanup
+                                .err()
+                                .map(|cleanup_error| {
+                                    format!("; inert pane cleanup failed: {cleanup_error}")
+                                })
+                                .unwrap_or_default()
+                        ),
+                        None,
+                    );
+                }
+            }
+
+            // Publish the exact reserved owner for every backend before its
+            // command can run. Hooks and delayed launch results therefore
+            // observe one authoritative incarnation.
+            let initial_meta = crate::daemon_protocol::SessionMeta {
+                project_dir: Some(dir.clone()),
+                worktree,
+                backend: Some(backend_name.clone()),
+                session_start_credential: session_start_credential.clone(),
+                model: model.map(String::from),
+                effort: effort.map(String::from),
+                codex_home: launch_model.codex_home.clone(),
+                reminder: reminder.map(String::from),
+                parent_session: parent_session.map(String::from),
+                idle_policy: idle_policy.clone(),
+                prompt: prompt.map(String::from),
+                ..Default::default()
+            };
+            match Box::pin(state.commit_reserved_start(&owner, Some(pane_id.clone()), initial_meta))
+                .await
+            {
+                Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
+                Ok(outcome) => {
+                    let cleanup = remove_inert_start_pane(&owner, &pane_id).await;
+                    if cleanup.is_ok() {
+                        let _ = state.abort_lifecycle(&owner).await;
+                    }
+                    return (
+                        format!(
+                            "start for session '{name}' was superseded before launch commit ({outcome:?}){}",
+                            cleanup
+                                .err()
+                                .map(|error| format!("; inert pane cleanup failed: {error}"))
+                                .unwrap_or_default()
+                        ),
+                        None,
+                    );
+                }
+                Err(error) => {
+                    let cleanup = remove_inert_start_pane(&owner, &pane_id).await;
+                    if cleanup.is_ok() {
+                        let _ = state.abort_lifecycle(&owner).await;
+                    }
+                    return (
+                        format!(
+                            "failed to persist session '{name}' before launch: {error}{}",
+                            cleanup
+                                .err()
+                                .map(|cleanup_error| {
+                                    format!("; inert pane cleanup failed: {cleanup_error}")
+                                })
+                                .unwrap_or_default()
+                        ),
+                        None,
+                    );
+                }
+            }
 
             let pane_for_launch = pane_id.clone();
             let command = if is_http_api {
@@ -1928,13 +2139,48 @@ pub async fn start_session(
             })
             .await;
             match launch_result {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    if let Err(error) = state.abort_lifecycle(&owner).await {
+                        let cleanup = remove_inert_start_pane(&owner, &pane_id).await;
+                        cleanup_reserved_start(
+                            state,
+                            &owner,
+                            &pane_id,
+                            session_start_credential.as_deref(),
+                        )
+                        .await;
+                        return (
+                            format!(
+                                "start failed to persist launch completion: {error}{}",
+                                cleanup
+                                    .err()
+                                    .map(|cleanup_error| {
+                                        format!("; launched pane cleanup failed: {cleanup_error}")
+                                    })
+                                    .unwrap_or_default()
+                            ),
+                            None,
+                        );
+                    }
+                }
                 Ok(Err(error)) => {
-                    cleanup_provisional_start(state, name, &pane_id).await;
+                    cleanup_reserved_start(
+                        state,
+                        &owner,
+                        &pane_id,
+                        session_start_credential.as_deref(),
+                    )
+                    .await;
                     return (format!("start failed: {error}"), None);
                 }
                 Err(error) => {
-                    cleanup_provisional_start(state, name, &pane_id).await;
+                    cleanup_reserved_start(
+                        state,
+                        &owner,
+                        &pane_id,
+                        session_start_credential.as_deref(),
+                    )
+                    .await;
                     return (format!("start failed: {error}"), None);
                 }
             }
@@ -1963,7 +2209,13 @@ pub async fn start_session(
                     "start_session: not registering {name} because OpenCode attach setup failed"
                 );
                 if should_cleanup_failed_opencode_attach_pane(is_http_api, None) {
-                    cleanup_failed_opencode_attach_pane(&pane_id);
+                    cleanup_reserved_start(
+                        state,
+                        &owner,
+                        &pane_id,
+                        session_start_credential.as_deref(),
+                    )
+                    .await;
                 }
                 return (
                     format!(
@@ -1991,22 +2243,30 @@ pub async fn start_session(
                 prompt: prompt.map(String::from),
                 ..Default::default()
             };
-            let final_registration = match staged_incarnation {
-                Some(expected_incarnation) => {
-                    crate::daemon_protocol::Event::RefreshLaunchMetadata {
-                        id: name.to_string(),
-                        expected_incarnation,
-                        pane: registration_pane,
-                        metadata: proto_meta,
-                    }
+            match finalize_reserved_start(state, &owner, registration_pane, proto_meta).await {
+                Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
+                Ok(outcome) => {
+                    return (
+                        format!(
+                            "start for session '{name}' was superseded during finalization ({outcome:?})"
+                        ),
+                        None,
+                    );
                 }
-                None => crate::daemon_protocol::Event::Register {
-                    id: name.to_string(),
-                    pane: registration_pane,
-                    metadata: proto_meta,
-                },
-            };
-            state.apply_and_execute(final_registration).await;
+                Err(error) => {
+                    cleanup_reserved_start(
+                        state,
+                        &owner,
+                        &pane_id,
+                        session_start_credential.as_deref(),
+                    )
+                    .await;
+                    return (
+                        format!("failed to persist final metadata for session '{name}': {error}"),
+                        None,
+                    );
+                }
+            }
             let prompt_delivery = pre_queued_prompt
                 .as_ref()
                 .map(|_| start_prompt_delivery(is_http_api, oc_session_id.as_deref()));
@@ -2151,8 +2411,8 @@ pub async fn start_session(
                 )
             }
         }
-        Ok(Err(e)) => (format!("start failed: {e}"), None),
-        Err(e) => (format!("start failed: {e}"), None),
+        Ok(Err(e)) => fail_reserved_start(state, &owner, format!("start failed: {e}")).await,
+        Err(e) => fail_reserved_start(state, &owner, format!("start failed: {e}")).await,
     }
 }
 
@@ -2164,6 +2424,26 @@ pub enum RestartOutcome {
     Restarted,
     Failed,
     Superseded,
+}
+
+fn restart_recovery_pending(
+    proto: &crate::daemon_protocol::DaemonState,
+    owner: &crate::daemon_protocol::ResourceOwner,
+) -> bool {
+    proto
+        .lifecycle_leases
+        .get(&owner.session_id)
+        .is_some_and(|lease| {
+            lease.owner == *owner
+                && lease.phase == crate::daemon_protocol::LifecyclePhase::Restarting
+                && (lease.inert_pane.is_some()
+                    || proto
+                        .sessions
+                        .get(&owner.session_id)
+                        .is_some_and(|session| {
+                            session.metadata.session_incarnation != lease.owner.incarnation
+                        }))
+        })
 }
 
 /// Recover an interactive fresh launch that definitely failed before the
@@ -2178,20 +2458,105 @@ async fn recover_failed_fresh_launch(
     staged_incarnation: Option<crate::daemon_protocol::SessionIncarnation>,
     previous: Option<crate::daemon_protocol::SessionEntry>,
     provisional_pane: Option<String>,
-) {
+) -> anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome> {
     let Some(staged_incarnation) = staged_incarnation else {
-        return;
+        return Ok(crate::daemon_protocol::LifecycleMutationOutcome::NotFound);
     };
+    let owner = crate::daemon_protocol::ResourceOwner {
+        session_id: id.to_string(),
+        incarnation: staged_incarnation,
+    };
+    if let Some(ref provisional_pane) = provisional_pane {
+        remove_inert_start_pane(&owner, provisional_pane).await?;
+    }
     state
-        .apply_and_execute(crate::daemon_protocol::Event::RollbackFreshLaunch {
-            id: id.to_string(),
-            pane,
-            credential,
-            staged_incarnation,
+        .rollback_launch(
+            &owner,
+            pane.as_deref(),
+            credential.as_deref(),
             previous,
-            provisional_pane,
+            provisional_pane.as_deref(),
+        )
+        .await
+}
+
+/// Execute `/start`'s existing-session restart only while the synchronously
+/// claimed incumbent still owns both the session and its durable restart
+/// lease. The claim is released after every terminal result.
+#[allow(clippy::too_many_arguments)]
+pub async fn restart_session_for_start(
+    state: &std::sync::Arc<AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    name: &str,
+    fresh: bool,
+    repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
+    prompt: Option<&str>,
+    from: Option<&str>,
+    expects_reply: Option<bool>,
+    backend: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    reminder: Option<&str>,
+    parent_session_override: ParentSessionOverride,
+    idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
+) -> (String, Option<u64>, RestartOutcome) {
+    let still_claimed = {
+        let proto = state.protocol.read().await;
+        proto.sessions.get(name).is_some_and(|session| {
+            matches!(session.origin, crate::daemon_protocol::Origin::Local)
+                && session.metadata.session_incarnation == owner.incarnation
+        }) && proto.lifecycle_leases.get(name).is_some_and(|lease| {
+            lease.owner == *owner
+                && lease.phase == crate::daemon_protocol::LifecyclePhase::Restarting
         })
-        .await;
+    };
+    if !still_claimed || owner.session_id != name {
+        let _ = state.abort_lifecycle(owner).await;
+        return (
+            "restart superseded before external work".into(),
+            None,
+            RestartOutcome::Superseded,
+        );
+    }
+
+    let result = restart_session(
+        state,
+        name,
+        fresh,
+        repair_reservation,
+        prompt,
+        from,
+        expects_reply,
+        backend,
+        model,
+        effort,
+        reminder,
+        parent_session_override,
+        idle_policy,
+    )
+    .await;
+    let retain_recovery_lease = result.2 == RestartOutcome::Failed && {
+        let proto = state.protocol.read().await;
+        restart_recovery_pending(&proto, owner)
+    };
+    if retain_recovery_lease {
+        return (
+            format!("{}; durable restart recovery authority retained", result.0),
+            result.1,
+            result.2,
+        );
+    }
+    if let Err(error) = state.abort_lifecycle(owner).await {
+        return (
+            format!(
+                "{}; failed to release existing-session restart claim: {error}",
+                result.0
+            ),
+            result.1,
+            RestartOutcome::Failed,
+        );
+    }
+    result
 }
 
 /// Kill and restart a session, preserving metadata unless `fresh`.
@@ -2486,11 +2851,58 @@ pub async fn restart_session(
         crate::backend::DeliveryMode::HttpApi { .. }
     );
 
+    // Direct fresh respawn recovery can safely recognize only managed panes
+    // that already export the incumbent incarnation. Refuse legacy/unverified
+    // panes before staging a replacement; otherwise a crash before
+    // `respawn-pane` could orphan the incumbent after releasing its ID.
+    if fresh && let Some(existing_pane) = existing_pane.as_ref() {
+        let restart_lease_owner = {
+            let proto = state.protocol.read().await;
+            proto.lifecycle_leases.get(name).and_then(|lease| {
+                (lease.phase == crate::daemon_protocol::LifecyclePhase::Restarting)
+                    .then(|| lease.owner.clone())
+            })
+        };
+        if let Some(restart_lease_owner) = restart_lease_owner {
+            let pane = existing_pane.clone();
+            let live_owner =
+                tokio::task::spawn_blocking(move || crate::tmux::inspect_pane_owner(&pane)).await;
+            match live_owner {
+                Ok(Ok(Some(live_owner))) if live_owner == restart_lease_owner => {}
+                Ok(Ok(live_owner)) => {
+                    return (
+                        format!(
+                            "restart refused unverified incumbent pane {existing_pane}: expected {restart_lease_owner:?}, found {live_owner:?}"
+                        ),
+                        None,
+                        RestartOutcome::Failed,
+                    );
+                }
+                Ok(Err(error)) => {
+                    return (
+                        format!("restart could not verify incumbent pane {existing_pane}: {error}"),
+                        None,
+                        RestartOutcome::Failed,
+                    );
+                }
+                Err(error) => {
+                    return (
+                        format!(
+                            "restart incumbent pane verification task failed for {existing_pane}: {error}"
+                        ),
+                        None,
+                        RestartOutcome::Failed,
+                    );
+                }
+            }
+        }
+    }
+
     // Every fresh hard restart gets a new incarnation before tmux respawns
     // the backend. This clears the old native identity and leaves only the
     // intended backend plus an optional Codex launch credential for the new
     // process to claim.
-    if fresh && prev_metadata.is_some() && existing_pane.is_some() {
+    if fresh && prev_metadata.is_some() {
         match state
             .stage_fresh_launch(
                 name,
@@ -2521,6 +2933,80 @@ pub async fn restart_session(
         }
     }
 
+    // A fresh direct respawn repurposes an existing pane in place. Record the
+    // pane and its staged owner before `respawn-pane`; restore accepts either
+    // the incumbent (crash before replacement) or staged owner (crash after
+    // replacement) and removes only that exact managed pane.
+    let direct_restart_lease_owner = if fresh
+        && let (Some(existing_pane), Some(expected_incarnation)) =
+            (existing_pane.as_ref(), staged_incarnation)
+    {
+        let restart_lease_owner = {
+            let proto = state.protocol.read().await;
+            proto.lifecycle_leases.get(name).and_then(|lease| {
+                (lease.phase == crate::daemon_protocol::LifecyclePhase::Restarting)
+                    .then(|| lease.owner.clone())
+            })
+        };
+        if let Some(ref lease_owner) = restart_lease_owner {
+            let pane_owner = crate::daemon_protocol::ResourceOwner {
+                session_id: name.to_string(),
+                incarnation: expected_incarnation,
+            };
+            match state
+                .record_inert_start_pane(lease_owner, pane_owner, existing_pane.clone())
+                .await
+            {
+                Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
+                Ok(outcome) => {
+                    let _ = recover_failed_fresh_launch(
+                        state,
+                        name,
+                        Some(existing_pane.clone()),
+                        session_start_credential.clone(),
+                        fresh_launch_staged_incarnation,
+                        session.clone(),
+                        None,
+                    )
+                    .await;
+                    return (
+                        format!("restart superseded before direct respawn ({outcome:?})"),
+                        None,
+                        RestartOutcome::Superseded,
+                    );
+                }
+                Err(error) => {
+                    let rollback = recover_failed_fresh_launch(
+                        state,
+                        name,
+                        Some(existing_pane.clone()),
+                        session_start_credential.clone(),
+                        fresh_launch_staged_incarnation,
+                        session.clone(),
+                        None,
+                    )
+                    .await;
+                    return (
+                        format!(
+                            "restart failed to persist direct respawn authority: {error}{}",
+                            rollback
+                                .err()
+                                .map(|rollback_error| {
+                                    format!("; durable rollback failed: {rollback_error}")
+                                })
+                                .unwrap_or_default()
+                        ),
+                        None,
+                        RestartOutcome::Failed,
+                    );
+                }
+            }
+        }
+        restart_lease_owner
+    } else {
+        None
+    };
+
     // For TuiInjection: pass prompt as CLI arg (same as start_session).
     // This ensures CLAUDE.md and rules load before the prompt is processed.
     let full_cmd = if !is_http_api {
@@ -2541,6 +3027,8 @@ pub async fn restart_session(
         let tmux_session = tmux_session.clone();
         let existing_pane = existing_pane.clone();
         let pane_credential = session_start_credential.clone();
+        let pane_incarnation = staged_incarnation;
+        let direct_restart_lease_owner = direct_restart_lease_owner.clone();
         let respawn_cmd = full_cmd.clone();
         move || -> anyhow::Result<(String, bool)> {
             use std::process::Command;
@@ -2554,7 +3042,11 @@ pub async fn restart_session(
             if let Some(ref pane) = existing_pane {
                 // See `pane_env_args` docs for why OUIJA_SESSION_ID must
                 // be set on every pane spawn (including respawn-pane).
-                let env_args = crate::tmux::pane_env_args(&window_name, pane_credential.as_deref());
+                let env_args = crate::tmux::pane_env_args(
+                    &window_name,
+                    pane_credential.as_deref(),
+                    pane_incarnation,
+                );
                 let mut respawn_args: Vec<&str> = vec!["respawn-pane", "-k"];
                 respawn_args.extend(env_args.iter().map(String::as_str));
                 respawn_args.extend_from_slice(&["-t", pane]);
@@ -2569,9 +3061,14 @@ pub async fn restart_session(
                             // Give the fresh shell a moment to initialise
                             std::thread::sleep(std::time::Duration::from_millis(300));
                             let hidden = format!(" {respawn_cmd}");
-                            let _ = Command::new("tmux")
+                            let status = Command::new("tmux")
                                 .args(["send-keys", "-t", pane, &hidden, "Enter"])
-                                .status();
+                                .status()?;
+                            if !status.success() {
+                                anyhow::bail!(
+                                    "tmux send-keys failed for direct respawn pane {pane}"
+                                );
+                            }
                         }
                         tracing::info!("restart: respawn-pane {pane} succeeded");
                         return Ok((pane.clone(), false));
@@ -2586,6 +3083,36 @@ pub async fn restart_session(
                         tracing::info!("restart: respawn-pane {pane} error: {e}");
                     }
                 }
+
+                // A failed respawn can be ambiguous about whether tmux
+                // replaced the process before reporting failure. Remove the
+                // exact incumbent/staged managed pane before creating a
+                // fallback, otherwise overwriting the lease record would
+                // strand an unregistered backend.
+                if let Some(ref lease_owner) = direct_restart_lease_owner {
+                    let live_owner = crate::tmux::inspect_pane_owner(pane)?;
+                    let staged_owner =
+                        pane_incarnation.map(|incarnation| crate::daemon_protocol::ResourceOwner {
+                            session_id: window_name.clone(),
+                            incarnation,
+                        });
+                    let owned = live_owner.as_ref().is_some_and(|owner| {
+                        owner == lease_owner || staged_owner.as_ref() == Some(owner)
+                    });
+                    if owned {
+                        let status = Command::new("tmux")
+                            .args(["kill-pane", "-t", pane])
+                            .status()?;
+                        let remaining_owner = crate::tmux::inspect_pane_owner(pane)?;
+                        if !status.success()
+                            && remaining_owner.as_ref().is_some_and(|owner| {
+                                owner == lease_owner || staged_owner.as_ref() == Some(owner)
+                            })
+                        {
+                            anyhow::bail!("failed to remove ambiguous direct respawn pane {pane}");
+                        }
+                    }
+                }
             }
 
             // Fallback: add window to existing tmux session, or create new one
@@ -2595,7 +3122,11 @@ pub async fn restart_session(
                 .is_ok_and(|o| o.status.success());
 
             let target = format!("{tmux_session}:");
-            let env_args = crate::tmux::pane_env_args(&window_name, pane_credential.as_deref());
+            let env_args = crate::tmux::pane_env_args(
+                &window_name,
+                pane_credential.as_deref(),
+                pane_incarnation,
+            );
             let output = if tmux_session_exists {
                 let mut args: Vec<&str> = vec!["new-window", "-d"];
                 args.extend(env_args.iter().map(String::as_str));
@@ -2637,63 +3168,149 @@ pub async fn restart_session(
 
     match start_result {
         Ok(Ok((pane_id, launch_after_registration))) => {
-            // With no existing pane, tmux has now created an inert pane but
-            // has not received the backend command yet. Stage only at this
-            // point so a creation failure cannot consume repair authority.
-            if fresh && prev_metadata.is_some() && existing_pane.is_none() {
-                match state
-                    .stage_fresh_launch(
-                        name,
-                        backend_name.clone(),
-                        session_start_credential.clone(),
-                        repair_reservation.clone(),
-                    )
-                    .await
-                {
-                    crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
-                        staged_incarnation = Some(incarnation);
-                        fresh_launch_staged_incarnation = Some(incarnation);
-                    }
-                    crate::daemon_protocol::StageFreshLaunchOutcome::Rejected => {
-                        cleanup_provisional_start(state, name, &pane_id).await;
-                        return (
-                            "restart superseded before backend launch".into(),
-                            None,
-                            RestartOutcome::Superseded,
-                        );
-                    }
-                    crate::daemon_protocol::StageFreshLaunchOutcome::PersistenceFailed => {
-                        cleanup_provisional_start(state, name, &pane_id).await;
-                        return (
-                            "restart failed to persist lifecycle authority".into(),
-                            None,
-                            RestartOutcome::Failed,
-                        );
-                    }
-                }
-            }
             if launch_after_registration {
-                // A fallback window has a new pane ID. Register that pane and
-                // its credential before starting Codex so the hook resolves
-                // the managed session rather than auto-registering a sibling.
-                if let Some(session_start_credential) = session_start_credential.clone() {
+                // A fallback window has a new inert pane. Publish that pane
+                // durably under the exact staged/current incarnation before
+                // any backend command can run. This path must not use ordinary
+                // Register because `/start` existing-session restarts hold a
+                // Restarting lease that intentionally rejects unowned writes.
+                if let Some(expected_incarnation) = staged_incarnation {
                     let metadata = {
                         let proto = state.protocol.read().await;
                         proto.sessions.get(name).map(|session| {
                             let mut metadata = session.metadata.clone();
-                            metadata.backend = Some("codex-cli".into());
-                            metadata.backend_session_id = None;
-                            metadata.session_start_credential =
-                                Some(session_start_credential.clone());
+                            metadata.backend = Some(backend_name.clone());
+                            if fresh {
+                                metadata.backend_session_id = None;
+                            }
+                            metadata.session_start_credential = session_start_credential.clone();
                             metadata
                         })
                     }
                     .unwrap_or(crate::daemon_protocol::SessionMeta {
                         project_dir: Some(dir.clone()),
-                        backend: Some("codex-cli".into()),
-                        session_start_credential: Some(session_start_credential.clone()),
+                        backend: Some(backend_name.clone()),
+                        session_start_credential: session_start_credential.clone(),
                         ..Default::default()
                     });
+                    let pane_owner = crate::daemon_protocol::ResourceOwner {
+                        session_id: name.to_string(),
+                        incarnation: expected_incarnation,
+                    };
+                    let restart_lease_owner = {
+                        let proto = state.protocol.read().await;
+                        proto.lifecycle_leases.get(name).and_then(|lease| {
+                            (lease.phase == crate::daemon_protocol::LifecyclePhase::Restarting)
+                                .then(|| lease.owner.clone())
+                        })
+                    };
+                    if let Some(ref lease_owner) = restart_lease_owner {
+                        match state
+                            .record_inert_start_pane(
+                                lease_owner,
+                                pane_owner.clone(),
+                                pane_id.clone(),
+                            )
+                            .await
+                        {
+                            Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
+                            Ok(outcome) => {
+                                let cleanup = remove_inert_start_pane(&pane_owner, &pane_id).await;
+                                return (
+                                    format!(
+                                        "restart superseded before fallback pane registration ({outcome:?}){}",
+                                        cleanup
+                                            .err()
+                                            .map(|error| format!(
+                                                "; inert pane cleanup failed: {error}"
+                                            ))
+                                            .unwrap_or_default()
+                                    ),
+                                    None,
+                                    RestartOutcome::Superseded,
+                                );
+                            }
+                            Err(error) => {
+                                let cleanup = remove_inert_start_pane(&pane_owner, &pane_id).await;
+                                return (
+                                    format!(
+                                        "restart failed to persist inert fallback pane: {error}{}",
+                                        cleanup
+                                            .err()
+                                            .map(|cleanup_error| format!(
+                                                "; inert pane cleanup failed: {cleanup_error}"
+                                            ))
+                                            .unwrap_or_default()
+                                    ),
+                                    None,
+                                    RestartOutcome::Failed,
+                                );
+                            }
+                        }
+                    }
+                    match state
+                        .finalize_reserved_start(&pane_owner, Some(pane_id.clone()), metadata)
+                        .await
+                    {
+                        Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
+                        Ok(outcome) => {
+                            let cleanup = remove_inert_start_pane(&pane_owner, &pane_id).await;
+                            return (
+                                format!(
+                                    "restart superseded before backend launch ({outcome:?}){}",
+                                    cleanup
+                                        .err()
+                                        .map(|error| format!(
+                                            "; inert pane cleanup failed: {error}"
+                                        ))
+                                        .unwrap_or_default()
+                                ),
+                                None,
+                                RestartOutcome::Superseded,
+                            );
+                        }
+                        Err(error) => {
+                            let cleanup = remove_inert_start_pane(&pane_owner, &pane_id).await;
+                            if let Err(rollback_error) = recover_failed_fresh_launch(
+                                state,
+                                name,
+                                Some(pane_id.clone()),
+                                session_start_credential.clone(),
+                                staged_incarnation,
+                                session.clone(),
+                                Some(pane_id.clone()),
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    "failed to durably roll back restart for {name}: {rollback_error}"
+                                );
+                            }
+                            return (
+                                format!(
+                                    "restart failed to persist fallback pane authority: {error}{}",
+                                    cleanup
+                                        .err()
+                                        .map(|cleanup_error| format!(
+                                            "; inert pane cleanup failed: {cleanup_error}"
+                                        ))
+                                        .unwrap_or_default()
+                                ),
+                                None,
+                                RestartOutcome::Failed,
+                            );
+                        }
+                    }
+                } else {
+                    // Legacy restart of an absent session has no incumbent
+                    // owner to compare. Chunk 8 moves that path onto a restart
+                    // lease; keep its existing registration behavior here.
+                    let metadata = crate::daemon_protocol::SessionMeta {
+                        project_dir: Some(dir.clone()),
+                        backend: Some(backend_name.clone()),
+                        session_start_credential: session_start_credential.clone(),
+                        ..Default::default()
+                    };
                     state
                         .apply_and_execute(crate::daemon_protocol::Event::Register {
                             id: name.to_string(),
@@ -2701,14 +3318,6 @@ pub async fn restart_session(
                             metadata,
                         })
                         .await;
-                    staged_incarnation = state
-                        .protocol
-                        .read()
-                        .await
-                        .sessions
-                        .get(name)
-                        .map(|session| session.metadata.session_incarnation);
-                    fresh_launch_staged_incarnation = staged_incarnation;
                 }
 
                 let pane_for_launch = pane_id.clone();
@@ -2730,22 +3339,77 @@ pub async fn restart_session(
                 })
                 .await;
                 match launch_result {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => {
+                        let restart_lease_owner = {
+                            let proto = state.protocol.read().await;
+                            proto.lifecycle_leases.get(name).and_then(|lease| {
+                                (lease.phase == crate::daemon_protocol::LifecyclePhase::Restarting)
+                                    .then(|| lease.owner.clone())
+                            })
+                        };
+                        if let Some(lease_owner) = restart_lease_owner
+                            && let Err(error) = state.abort_lifecycle(&lease_owner).await
+                        {
+                            let pane_owner = staged_incarnation.map(|incarnation| {
+                                crate::daemon_protocol::ResourceOwner {
+                                    session_id: name.to_string(),
+                                    incarnation,
+                                }
+                            });
+                            let cleanup = if let Some(ref pane_owner) = pane_owner {
+                                remove_inert_start_pane(pane_owner, &pane_id).await
+                            } else {
+                                Ok(())
+                            };
+                            if let Err(rollback_error) = recover_failed_fresh_launch(
+                                state,
+                                name,
+                                Some(pane_id.clone()),
+                                session_start_credential.clone(),
+                                staged_incarnation,
+                                session.clone(),
+                                Some(pane_id.clone()),
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    "failed to durably roll back restart for {name}: {rollback_error}"
+                                );
+                            }
+                            return (
+                                format!(
+                                    "restart failed to persist launch completion: {error}{}",
+                                    cleanup
+                                        .err()
+                                        .map(|cleanup_error| format!(
+                                            "; launched pane cleanup failed: {cleanup_error}"
+                                        ))
+                                        .unwrap_or_default()
+                                ),
+                                None,
+                                RestartOutcome::Failed,
+                            );
+                        }
+                    }
                     Ok(Err(error)) => {
-                        let staged_pane = session_start_credential
-                            .as_ref()
+                        let staged_pane = staged_incarnation
                             .map(|_| pane_id.clone())
                             .or_else(|| existing_pane.clone());
-                        recover_failed_fresh_launch(
+                        if let Err(rollback_error) = recover_failed_fresh_launch(
                             state,
                             name,
                             staged_pane,
                             session_start_credential.clone(),
-                            fresh_launch_staged_incarnation,
+                            staged_incarnation,
                             session.clone(),
                             Some(pane_id.clone()),
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::warn!(
+                                "failed to durably roll back restart for {name}: {rollback_error}"
+                            );
+                        }
                         return (
                             format!("restart failed: {error}"),
                             None,
@@ -2753,20 +3417,24 @@ pub async fn restart_session(
                         );
                     }
                     Err(error) => {
-                        let staged_pane = session_start_credential
-                            .as_ref()
+                        let staged_pane = staged_incarnation
                             .map(|_| pane_id.clone())
                             .or_else(|| existing_pane.clone());
-                        recover_failed_fresh_launch(
+                        if let Err(rollback_error) = recover_failed_fresh_launch(
                             state,
                             name,
                             staged_pane,
                             session_start_credential.clone(),
-                            fresh_launch_staged_incarnation,
+                            staged_incarnation,
                             session.clone(),
                             Some(pane_id.clone()),
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::warn!(
+                                "failed to durably roll back restart for {name}: {rollback_error}"
+                            );
+                        }
                         return (
                             format!("restart failed: {error}"),
                             None,
@@ -3042,29 +3710,39 @@ pub async fn restart_session(
             )
         }
         Ok(Err(e)) => {
-            recover_failed_fresh_launch(
+            let provisional_pane =
+                fresh_launch_staged_incarnation.and_then(|_| existing_pane.clone());
+            if let Err(rollback_error) = recover_failed_fresh_launch(
                 state,
                 name,
                 existing_pane,
                 session_start_credential,
                 fresh_launch_staged_incarnation,
                 session,
-                None,
+                provisional_pane,
             )
-            .await;
+            .await
+            {
+                tracing::warn!("failed to durably roll back restart for {name}: {rollback_error}");
+            }
             (format!("restart failed: {e}"), None, RestartOutcome::Failed)
         }
         Err(e) => {
-            recover_failed_fresh_launch(
+            let provisional_pane =
+                fresh_launch_staged_incarnation.and_then(|_| existing_pane.clone());
+            if let Err(rollback_error) = recover_failed_fresh_launch(
                 state,
                 name,
                 existing_pane,
                 session_start_credential,
                 fresh_launch_staged_incarnation,
                 session,
-                None,
+                provisional_pane,
             )
-            .await;
+            .await
+            {
+                tracing::warn!("failed to durably roll back restart for {name}: {rollback_error}");
+            }
             (format!("restart failed: {e}"), None, RestartOutcome::Failed)
         }
     }
@@ -3928,7 +4606,7 @@ async fn respawn_pane_opencode_attach_skew_notice(
     // Keep the pane alive after the notice prints so the operator can read it.
     let command = format!("{notice}; exec \"${{SHELL:-/bin/sh}}\"");
     let pane = pane_id.to_string();
-    let env_args = crate::tmux::pane_env_args(ouija_session_id, None);
+    let env_args = crate::tmux::pane_env_args(ouija_session_id, None, None);
     tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
         let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
         args.extend(env_args.iter().map(String::as_str));
@@ -3978,7 +4656,7 @@ async fn respawn_opencode_attach_for_session(
     let attach_cmd = opencode_attach_command(port, session_id, project_dir);
     let pane = pane_id.to_string();
     let wait_pane = pane_id.to_string();
-    let env_args = crate::tmux::pane_env_args(ouija_session_id, None);
+    let env_args = crate::tmux::pane_env_args(ouija_session_id, None, None);
     tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
         let mut args: Vec<&str> = vec!["respawn-pane", "-k"];
         args.extend(env_args.iter().map(String::as_str));
@@ -5070,6 +5748,262 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn concurrent_same_id_starts_cross_the_launch_boundary_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Barrier;
+
+        let state = AppState::new_for_test();
+        let ready = Arc::new(Barrier::new(3));
+        let launch_count = Arc::new(AtomicUsize::new(0));
+        let mut attempts = Vec::new();
+
+        for _ in 0..2 {
+            let state = state.clone();
+            let ready = ready.clone();
+            let launch_count = launch_count.clone();
+            attempts.push(tokio::spawn(async move {
+                ready.wait().await;
+                let disposition = reserve_start_for_launch(&state, "same-id")
+                    .await
+                    .expect("reservation must persist");
+                if matches!(
+                    disposition,
+                    crate::daemon_protocol::StartDisposition::Reserved(_)
+                ) {
+                    launch_count.fetch_add(1, Ordering::SeqCst);
+                }
+                disposition
+            }));
+        }
+
+        ready.wait().await;
+        let first = attempts.remove(0).await.unwrap();
+        let second = attempts.remove(0).await.unwrap();
+
+        assert_eq!(launch_count.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(
+                (&first, &second),
+                (
+                    crate::daemon_protocol::StartDisposition::Reserved(_),
+                    crate::daemon_protocol::StartDisposition::InProgress(_)
+                ) | (
+                    crate::daemon_protocol::StartDisposition::InProgress(_),
+                    crate::daemon_protocol::StartDisposition::Reserved(_)
+                )
+            ),
+            "exactly one attempt must own launch authority: {first:?}, {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_start_success_cannot_finalize_replacement_metadata() {
+        let state = AppState::new_for_test();
+        let owner = match reserve_start_for_launch(&state, "same-id").await.unwrap() {
+            crate::daemon_protocol::StartDisposition::Reserved(owner) => owner,
+            other => panic!("expected reservation, got {other:?}"),
+        };
+        state
+            .commit_reserved_start(
+                &owner,
+                Some("%old".into()),
+                crate::daemon_protocol::SessionMeta::default(),
+            )
+            .await
+            .unwrap();
+        state.abort_lifecycle(&owner).await.unwrap();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "same-id".into(),
+                pane: Some("%winner".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    bulletin: Some("winner".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let outcome = finalize_reserved_start(
+            &state,
+            &owner,
+            Some("%old".into()),
+            crate::daemon_protocol::SessionMeta {
+                bulletin: Some("stale".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            crate::daemon_protocol::LifecycleMutationOutcome::Superseded
+        );
+        let winner = &state.protocol.read().await.sessions["same-id"];
+        assert_eq!(winner.pane.as_deref(), Some("%winner"));
+        assert_eq!(winner.metadata.bulletin.as_deref(), Some("winner"));
+    }
+
+    #[tokio::test]
+    async fn stale_start_failure_cannot_remove_same_pane_replacement() {
+        let state = AppState::new_for_test();
+        let owner = match reserve_start_for_launch(&state, "same-id").await.unwrap() {
+            crate::daemon_protocol::StartDisposition::Reserved(owner) => owner,
+            other => panic!("expected reservation, got {other:?}"),
+        };
+        state
+            .commit_reserved_start(
+                &owner,
+                Some("%shared".into()),
+                crate::daemon_protocol::SessionMeta::default(),
+            )
+            .await
+            .unwrap();
+        state.abort_lifecycle(&owner).await.unwrap();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "same-id".into(),
+                pane: Some("%shared".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    bulletin: Some("winner".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        cleanup_reserved_start(&state, &owner, "%shared", None).await;
+
+        let winner = &state.protocol.read().await.sessions["same-id"];
+        assert_ne!(winner.metadata.session_incarnation, owner.incarnation);
+        assert_eq!(winner.metadata.bulletin.as_deref(), Some("winner"));
+    }
+
+    #[tokio::test]
+    async fn existing_start_claim_is_revalidated_before_restart_io() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "same-id".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        let owner = match reserve_start_for_launch(&state, "same-id").await.unwrap() {
+            crate::daemon_protocol::StartDisposition::Existing(owner) => owner,
+            other => panic!("expected existing owner, got {other:?}"),
+        };
+        assert_eq!(
+            state.claim_existing_start(&owner).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        state.protocol.write().await.sessions.remove("same-id");
+
+        let (_, _, outcome) = restart_session_for_start(
+            &state,
+            &owner,
+            "same-id",
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ParentSessionOverride::PreservePrevious,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, RestartOutcome::Superseded);
+        assert!(state.protocol.read().await.lifecycle_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_staged_restart_without_a_pane_still_retains_recovery_lease() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "same-id".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        let owner = match reserve_start_for_launch(&state, "same-id").await.unwrap() {
+            crate::daemon_protocol::StartDisposition::Existing(owner) => owner,
+            other => panic!("expected existing owner, got {other:?}"),
+        };
+        assert_eq!(
+            state.claim_existing_start(&owner).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        assert!(matches!(
+            state
+                .stage_fresh_launch("same-id", "claude-code".into(), None, None)
+                .await,
+            crate::daemon_protocol::StageFreshLaunchOutcome::Staged { .. }
+        ));
+
+        let proto = state.protocol.read().await;
+        assert!(restart_recovery_pending(&proto, &owner));
+    }
+
+    #[tokio::test]
+    async fn fresh_direct_restart_refuses_an_unverified_incumbent_before_staging() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "same-id".into(),
+                pane: Some("%definitely-not-a-live-managed-pane".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let previous = state.protocol.read().await.sessions["same-id"].clone();
+        let owner = match reserve_start_for_launch(&state, "same-id").await.unwrap() {
+            crate::daemon_protocol::StartDisposition::Existing(owner) => owner,
+            other => panic!("expected existing owner, got {other:?}"),
+        };
+        assert_eq!(
+            state.claim_existing_start(&owner).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+
+        let (message, _, outcome) = restart_session_for_start(
+            &state,
+            &owner,
+            "same-id",
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ParentSessionOverride::PreservePrevious,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, RestartOutcome::Failed);
+        assert!(
+            message.contains("unverified incumbent")
+                || message.contains("could not verify incumbent")
+                || message.contains("verification task failed"),
+            "unexpected failure: {message}"
+        );
+        let proto = state.protocol.read().await;
+        assert_eq!(proto.sessions["same-id"], previous);
+        assert!(proto.lifecycle_leases.is_empty());
+    }
+
+    #[tokio::test]
     async fn failed_respawn_and_fallback_creation_restore_the_staged_identity() {
         let state = AppState::new_for_test();
         state
@@ -5102,7 +6036,8 @@ mod tests {
             Some(previous.clone()),
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(state.protocol.read().await.sessions["restart"], previous);
     }
@@ -5140,9 +6075,82 @@ mod tests {
             Some(previous.clone()),
             Some("%fallback".into()),
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(state.protocol.read().await.sessions["restart"], previous);
+    }
+
+    #[tokio::test]
+    async fn failed_fallback_launch_restores_previous_owner_and_clears_inert_record() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "restart".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    backend_session_id: Some("thread-old".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let previous = state.protocol.read().await.sessions["restart"].clone();
+        let lease_owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "restart".into(),
+            incarnation: previous.metadata.session_incarnation,
+        };
+        assert_eq!(
+            state.claim_existing_start(&lease_owner).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        let crate::daemon_protocol::StageFreshLaunchOutcome::Staged {
+            incarnation: staged_incarnation,
+        } = state
+            .stage_fresh_launch("restart", "claude-code".into(), None, None)
+            .await
+        else {
+            panic!("stage must be accepted");
+        };
+        let pane_owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "restart".into(),
+            incarnation: staged_incarnation,
+        };
+        assert_eq!(
+            state
+                .record_inert_start_pane(&lease_owner, pane_owner.clone(), "%fallback".into(),)
+                .await
+                .unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        let staged_metadata = state.protocol.read().await.sessions["restart"]
+            .metadata
+            .clone();
+        assert_eq!(
+            state
+                .finalize_reserved_start(&pane_owner, Some("%fallback".into()), staged_metadata,)
+                .await
+                .unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+
+        recover_failed_fresh_launch(
+            &state,
+            "restart",
+            Some("%fallback".into()),
+            None,
+            Some(staged_incarnation),
+            Some(previous.clone()),
+            Some("%fallback".into()),
+        )
+        .await
+        .unwrap();
+
+        let proto = state.protocol.read().await;
+        assert_eq!(proto.sessions["restart"], previous);
+        assert_eq!(proto.lifecycle_leases["restart"].owner, lease_owner);
+        assert!(proto.lifecycle_leases["restart"].inert_pane.is_none());
+        assert!(proto.lifecycle_leases["restart"].inert_pane_owner.is_none());
     }
 
     #[tokio::test]
@@ -5169,7 +6177,8 @@ mod tests {
             Some(previous.clone()),
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(state.protocol.read().await.sessions["restart"], previous);
     }
@@ -5228,7 +6237,8 @@ mod tests {
             Some(previous),
             Some("%fallback".into()),
         )
-        .await;
+        .await
+        .unwrap();
 
         let retained = state.protocol.read().await.sessions["restart"].clone();
         assert_eq!(retained.pane.as_deref(), Some("%fallback"));

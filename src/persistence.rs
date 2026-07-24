@@ -89,7 +89,14 @@ impl PersistedLifecycleState {
         let lease_max = self
             .lifecycle_leases
             .values()
-            .map(|lease| lease.owner.incarnation)
+            .flat_map(|lease| {
+                std::iter::once(lease.owner.incarnation).chain(
+                    lease
+                        .inert_pane_owner
+                        .as_ref()
+                        .map(|owner| owner.incarnation),
+                )
+            })
             .max()
             .unwrap_or_default();
         self.incarnation_high_water = self.incarnation_high_water.max(session_max).max(lease_max);
@@ -169,6 +176,15 @@ pub fn load_sessions(data_dir: &Path) -> Result<PersistedLifecycleState> {
                 "lifecycle lease key '{}' does not match owner '{}'",
                 session_id,
                 lease.owner.session_id
+            );
+        }
+        if let Some(inert_owner) = &lease.inert_pane_owner
+            && inert_owner.session_id != *session_id
+        {
+            anyhow::bail!(
+                "lifecycle lease key '{}' does not match inert pane owner '{}'",
+                session_id,
+                inert_owner.session_id
             );
         }
     }
@@ -492,6 +508,8 @@ mod tests {
                 crate::daemon_protocol::LifecycleLease {
                     owner: owner.clone(),
                     phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                    inert_pane: Some("%42".into()),
+                    inert_pane_owner: Some(owner.clone()),
                 },
             )]),
         );
@@ -503,6 +521,14 @@ mod tests {
             crate::daemon_protocol::SessionIncarnation(31)
         );
         assert_eq!(loaded.lifecycle_leases["pending"].owner, owner);
+        assert_eq!(
+            loaded.lifecycle_leases["pending"].inert_pane.as_deref(),
+            Some("%42")
+        );
+        assert_eq!(
+            loaded.lifecycle_leases["pending"].inert_pane_owner.as_ref(),
+            Some(&owner)
+        );
         assert_eq!(loaded.sessions.len(), 2);
         assert_eq!(loaded.sessions[0].id, "a");
         assert_eq!(loaded.sessions[1].id, "b");
@@ -558,6 +584,40 @@ mod tests {
                         incarnation: crate::daemon_protocol::SessionIncarnation(5),
                     },
                     phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                    inert_pane: None,
+                    inert_pane_owner: None,
+                },
+            )]),
+        };
+        std::fs::write(
+            dir.path().join("sessions.json"),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        assert!(load_sessions(dir.path()).is_err());
+    }
+
+    #[test]
+    fn load_sessions_rejects_mismatched_inert_pane_owner_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = PersistedLifecycleState {
+            version: SESSION_STATE_VERSION,
+            sessions: vec![],
+            incarnation_high_water: crate::daemon_protocol::SessionIncarnation(6),
+            lifecycle_leases: BTreeMap::from([(
+                "pending".into(),
+                crate::daemon_protocol::LifecycleLease {
+                    owner: crate::daemon_protocol::ResourceOwner {
+                        session_id: "pending".into(),
+                        incarnation: crate::daemon_protocol::SessionIncarnation(5),
+                    },
+                    phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                    inert_pane: Some("%1".into()),
+                    inert_pane_owner: Some(crate::daemon_protocol::ResourceOwner {
+                        session_id: "other".into(),
+                        incarnation: crate::daemon_protocol::SessionIncarnation(6),
+                    }),
                 },
             )]),
         };
