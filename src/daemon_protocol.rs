@@ -377,7 +377,6 @@ impl SessionMeta {
         self.reminder
             .as_deref()
             .is_some_and(|r| !r.trim().is_empty())
-            || self.idle_policy.is_some()
     }
 
     pub fn effective_reminder(&self, session_id: &str, clearing_id: Option<u64>) -> Option<String> {
@@ -4060,6 +4059,39 @@ mod tests {
 
         meta.reminder = Some("   \t\n".into());
         assert!(!meta.has_active_reminder(), "whitespace-only is not active");
+    }
+
+    #[test]
+    fn lifecycle_only_metadata_does_not_activate_recurring_reminders_for_any_backend() {
+        for backend in ["claude-code", "codex-cli", "opencode"] {
+            let meta = SessionMeta {
+                backend: Some(backend.into()),
+                idle_policy: Some(IdlePolicy::KeepOpen),
+                ..Default::default()
+            };
+
+            assert!(
+                !meta.has_active_reminder(),
+                "{backend} lifecycle metadata must not opt into recurring reminders"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_nonblank_reminders_activate_recurrence_for_any_backend() {
+        for backend in ["claude-code", "codex-cli", "opencode"] {
+            let meta = SessionMeta {
+                backend: Some(backend.into()),
+                reminder: Some("resume the assigned task".into()),
+                idle_policy: Some(IdlePolicy::KeepOpen),
+                ..Default::default()
+            };
+
+            assert!(
+                meta.has_active_reminder(),
+                "{backend} explicit reminders must opt into recurrence"
+            );
+        }
     }
 
     #[test]

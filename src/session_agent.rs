@@ -153,12 +153,12 @@ impl Actor for SessionAgent {
                 if let Some(h) = state.watchdog_timer.take() {
                     h.abort();
                 }
-                // Check if there's a reason to arm the idle timer:
-                // pending replies or a configured reminder. Without either,
-                // the idle-check would just create a nudge loop (the session
-                // responds to clear it, which triggers Active→Stopped→repeat).
-                // "Configured reminder" means a non-empty reminder body —
-                // see SessionMeta::has_active_reminder.
+                // Check if there's a reason to arm the idle timer: pending
+                // replies or an explicit, non-empty manual reminder. Lifecycle
+                // policy metadata alone does not opt a session into recurring
+                // nudges. Without either reason, the idle-check would just
+                // create a nudge loop (the session responds to clear it, which
+                // triggers Active→Stopped→repeat).
                 let (has_pending, has_reminder) = {
                     let proto = self.app_state.protocol.read().await;
                     let pending = proto
@@ -217,7 +217,7 @@ impl Actor for SessionAgent {
                     h.abort();
                 }
                 // Cancel watchdog — it will be re-armed in Stopped only if
-                // there is pending work (replies or configured reminder).
+                // there is pending work (replies or an explicit reminder).
                 if let Some(h) = state.watchdog_timer.take() {
                     h.abort();
                 }
@@ -374,9 +374,9 @@ impl Actor for SessionAgent {
                         "idle timeout fired"
                     );
 
-                    // Inject configured reminder text if present. Sessions
-                    // without a configured reminder get no default nudge —
-                    // the transport is not a nag service.
+                    // Inject explicit reminder text if present. Lifecycle
+                    // policy metadata is appended to an opted-in reminder, but
+                    // does not create a recurring nudge on its own.
                     if let Some(ref reminder_text) = reminder {
                         let reminder_body = if has_lifecycle_policy {
                             reminder_text.clone()
@@ -524,7 +524,95 @@ impl SessionAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::State as AxumState;
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use axum::{Json, Router};
     use ractor::Actor;
+    use std::sync::Arc as StdArc;
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
+
+    async fn prompt_async_recorder(
+        AxumState(messages): AxumState<StdArc<Mutex<Vec<String>>>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> StatusCode {
+        messages.lock().await.push(
+            body["parts"][0]["text"]
+                .as_str()
+                .expect("prompt text")
+                .to_string(),
+        );
+        StatusCode::NO_CONTENT
+    }
+
+    async fn opencode_reminder_test_state(
+        session_id: &str,
+        reminder: Option<&str>,
+        idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
+    ) -> (
+        Arc<AppState>,
+        StdArc<Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let messages = StdArc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route(
+                "/session/{session_id}/prompt_async",
+                post(prompt_async_recorder),
+            )
+            .with_state(messages.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let data_dir = tempfile::tempdir().unwrap().keep();
+        let state = AppState::new(crate::config::OuijaConfig {
+            name: "session-agent-reminder-test".into(),
+            npub: "npub1test".into(),
+            port: port - 320,
+            data_dir: data_dir.clone(),
+            config_dir: data_dir,
+        });
+        state
+            .protocol
+            .write()
+            .await
+            .apply(crate::daemon_protocol::Event::Register {
+                id: session_id.into(),
+                pane: Some("%99".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some(format!("{session_id}-backend")),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    reminder: reminder.map(Into::into),
+                    idle_policy,
+                    ..Default::default()
+                },
+            });
+        state.settings.write().await.idle_timeout_secs = 1;
+
+        (state, messages, server)
+    }
+
+    async fn run_stopped_agent_for_one_idle_timeout(state: Arc<AppState>, session_id: &str) {
+        let agent = SessionAgent {
+            app_state: state.clone(),
+        };
+        let args = SessionAgentArgs {
+            session_id: session_id.into(),
+            pane: "%99".into(),
+        };
+        let (actor, handle) = Actor::spawn(None, agent, args).await.expect("spawn failed");
+
+        actor.cast(SessionMsg::Stopped).expect("send");
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        actor.stop(None);
+        handle.await.expect("actor failed");
+    }
 
     #[test]
     fn agent_state_starts_not_idle() {
@@ -667,6 +755,71 @@ mod tests {
         assert!(!handle.is_finished());
         actor.stop(None);
         handle.await.expect("actor failed");
+    }
+
+    #[tokio::test]
+    async fn lifecycle_only_metadata_does_not_arm_idle_recurrence() {
+        let (state, messages, server) = opencode_reminder_test_state(
+            "lifecycle-only",
+            None,
+            Some(crate::daemon_protocol::IdlePolicy::KeepOpen),
+        )
+        .await;
+
+        run_stopped_agent_for_one_idle_timeout(state, "lifecycle-only").await;
+
+        assert!(
+            messages.lock().await.is_empty(),
+            "lifecycle-only metadata must not inject a recurring idle reminder"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn explicit_reminder_injects_the_generated_clearing_id() {
+        let (state, messages, server) = opencode_reminder_test_state(
+            "manual-reminder",
+            Some("resume the assigned task"),
+            Some(crate::daemon_protocol::IdlePolicy::KeepOpen),
+        )
+        .await;
+
+        run_stopped_agent_for_one_idle_timeout(state, "manual-reminder").await;
+
+        let messages = messages.lock().await;
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].starts_with("<ouija-status type=\"reminder\" clearing_id=\"1\">"));
+        assert!(messages[0].contains("resume the assigned task"));
+        assert!(messages[0].contains("ouija clear-reminder 1"));
+        assert!(!messages[0].contains("ouija clear-reminder 0"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn pending_reply_arms_idle_recurrence_without_a_manual_reminder() {
+        let (state, messages, server) =
+            opencode_reminder_test_state("pending-only", None, None).await;
+        state.protocol.write().await.pending_replies.insert(
+            "pending-only".into(),
+            vec![PendingReplyEntry {
+                msg_id: 73,
+                from: "requester".into(),
+                message: "what is the result?".into(),
+                received_at: Utc::now().timestamp(),
+                last_activity: Utc::now().timestamp(),
+                in_progress: false,
+            }],
+        );
+
+        run_stopped_agent_for_one_idle_timeout(state, "pending-only").await;
+
+        let messages = messages.lock().await;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0],
+            "<ouija-status type=\"reminder\" clearing_id=\"1\">Pending reply owed: msg #73 from requester</ouija-status>"
+        );
+        server.abort();
     }
 
     #[test]
