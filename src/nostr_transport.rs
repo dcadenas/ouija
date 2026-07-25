@@ -134,6 +134,31 @@ fn should_cleanup_failed_opencode_attach_pane(
     is_http_api && backend_session_id.is_none()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IncumbentPaneDisposition {
+    Respawn,
+    Recreate,
+    Refuse,
+}
+
+fn classify_incumbent_pane(
+    inspection: &crate::tmux::ManagedPaneInspection,
+    lease_owner: &crate::daemon_protocol::ResourceOwner,
+    restart_target_owner: &crate::daemon_protocol::ResourceOwner,
+) -> IncumbentPaneDisposition {
+    match inspection {
+        crate::tmux::ManagedPaneInspection::Missing => IncumbentPaneDisposition::Recreate,
+        crate::tmux::ManagedPaneInspection::Managed(observed)
+            if crate::tmux::physical_owner_matches(observed, lease_owner)
+                || crate::tmux::physical_owner_matches(observed, restart_target_owner) =>
+        {
+            IncumbentPaneDisposition::Respawn
+        }
+        crate::tmux::ManagedPaneInspection::Managed(_)
+        | crate::tmux::ManagedPaneInspection::Unmanaged => IncumbentPaneDisposition::Refuse,
+    }
+}
+
 fn should_remove_session_after_failed_restart(
     is_http_api: bool,
     backend_session_id: Option<&str>,
@@ -3128,8 +3153,12 @@ async fn restart_session_claimed(
             RestartOutcome::Superseded,
         );
     }
-    // Capture existing pane before killing
-    let existing_pane = session.as_ref().and_then(|s| s.pane.clone());
+    // Capture existing pane before killing. Keep the original ID separately:
+    // recovery may clear `existing_pane` to select the recreate path, but
+    // attach-failure cleanup still needs to distinguish the incumbent from a
+    // newly-created placeholder pane.
+    let incumbent_pane = session.as_ref().and_then(|s| s.pane.clone());
+    let mut existing_pane = incumbent_pane.clone();
 
     let backend = match backend {
         Some(b) => match state.backends.get_required(b) {
@@ -3412,29 +3441,39 @@ async fn restart_session_claimed(
         crate::backend::DeliveryMode::HttpApi { .. }
     );
 
-    // Direct fresh respawn recovery can safely recognize only managed panes
-    // that already export the incumbent incarnation. Refuse legacy/unverified
-    // panes before staging a replacement; otherwise a crash before
-    // `respawn-pane` could orphan the incumbent after releasing its ID.
-    if let Some(existing_pane) = existing_pane.as_ref() {
-        let pane = existing_pane.clone();
-        let live_owner =
-            tokio::task::spawn_blocking(move || crate::tmux::inspect_pane_owner(&pane)).await;
-        let verification_error = match live_owner {
-            Ok(Ok(Some(live_owner)))
-                if crate::tmux::physical_owner_matches(&live_owner, lease_owner)
-                    || crate::tmux::physical_owner_matches(&live_owner, &restart_target_owner) =>
-            {
-                None
+    // Direct respawn recovery can safely recognize only managed panes that
+    // already export the incumbent or staged incarnation. A missing pane can
+    // use the new-window fallback; refuse live legacy/unverified panes before
+    // staging a replacement.
+    if let Some(incumbent_pane_id) = existing_pane.clone() {
+        let pane = incumbent_pane_id.clone();
+        let inspected =
+            tokio::task::spawn_blocking(move || crate::tmux::inspect_managed_pane(&pane)).await;
+        let verification_error = match inspected {
+            Ok(Ok(inspection)) => {
+                match classify_incumbent_pane(&inspection, lease_owner, &restart_target_owner) {
+                    IncumbentPaneDisposition::Respawn => None,
+                    IncumbentPaneDisposition::Recreate => {
+                        existing_pane = None;
+                        None
+                    }
+                    IncumbentPaneDisposition::Refuse => {
+                        let live_owner = match &inspection {
+                            crate::tmux::ManagedPaneInspection::Managed(owner) => Some(owner),
+                            crate::tmux::ManagedPaneInspection::Missing
+                            | crate::tmux::ManagedPaneInspection::Unmanaged => None,
+                        };
+                        Some(format!(
+                            "restart refused unverified incumbent pane {incumbent_pane_id}: expected {lease_owner:?} or {restart_target_owner:?}, found {live_owner:?}"
+                        ))
+                    }
+                }
             }
-            Ok(Ok(live_owner)) => Some(format!(
-                "restart refused unverified incumbent pane {existing_pane}: expected {lease_owner:?} or {restart_target_owner:?}, found {live_owner:?}"
-            )),
             Ok(Err(error)) => Some(format!(
-                "restart could not verify incumbent pane {existing_pane}: {error}"
+                "restart could not verify incumbent pane {incumbent_pane_id}: {error}"
             )),
             Err(error) => Some(format!(
-                "restart incumbent pane verification task failed for {existing_pane}: {error}"
+                "restart incumbent pane verification task failed for {incumbent_pane_id}: {error}"
             )),
         };
         if let Some(error) = verification_error {
@@ -4015,7 +4054,7 @@ async fn restart_session_claimed(
                     is_http_api,
                     None,
                     &pane_id,
-                    existing_pane.as_deref(),
+                    incumbent_pane.as_deref(),
                 ) {
                     state
                         .apply_and_execute(crate::daemon_protocol::Event::Remove {
@@ -7049,7 +7088,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_direct_restart_refuses_an_unverified_incumbent_before_staging() {
+    async fn missing_incumbent_pane_restarts_through_recreate_path() {
         let state = AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -7089,15 +7128,15 @@ mod tests {
         )
         .await;
 
-        assert_eq!(outcome, RestartOutcome::Failed);
-        assert!(
-            message.contains("unverified incumbent")
-                || message.contains("could not verify incumbent")
-                || message.contains("verification task failed"),
-            "unexpected failure: {message}"
-        );
+        assert_eq!(outcome, RestartOutcome::Restarted, "{message}");
         let proto = state.protocol.read().await;
-        assert_eq!(proto.sessions["same-id"], previous);
+        let restarted = &proto.sessions["same-id"];
+        assert_ne!(restarted.owner(), previous.owner());
+        assert_ne!(
+            restarted.pane.as_deref(),
+            previous.pane.as_deref(),
+            "a missing incumbent must select the new-pane fallback"
+        );
         assert!(proto.lifecycle_leases.is_empty());
     }
 
@@ -8177,6 +8216,96 @@ mod tests {
             "%original",
             Some("%original"),
         ));
+    }
+
+    fn incumbent_test_owners() -> (
+        crate::daemon_protocol::ResourceOwner,
+        crate::daemon_protocol::ResourceOwner,
+    ) {
+        (
+            crate::daemon_protocol::ResourceOwner {
+                session_id: "worker".into(),
+                incarnation: crate::daemon_protocol::SessionIncarnation(10),
+            },
+            crate::daemon_protocol::ResourceOwner {
+                session_id: "worker".into(),
+                incarnation: crate::daemon_protocol::SessionIncarnation(11),
+            },
+        )
+    }
+
+    #[test]
+    fn missing_incumbent_pane_is_recreated() {
+        let (lease_owner, restart_target_owner) = incumbent_test_owners();
+
+        assert_eq!(
+            classify_incumbent_pane(
+                &crate::tmux::ManagedPaneInspection::Missing,
+                &lease_owner,
+                &restart_target_owner,
+            ),
+            IncumbentPaneDisposition::Recreate
+        );
+    }
+
+    #[test]
+    fn unmanaged_incumbent_pane_is_refused() {
+        let (lease_owner, restart_target_owner) = incumbent_test_owners();
+
+        assert_eq!(
+            classify_incumbent_pane(
+                &crate::tmux::ManagedPaneInspection::Unmanaged,
+                &lease_owner,
+                &restart_target_owner,
+            ),
+            IncumbentPaneDisposition::Refuse
+        );
+    }
+
+    #[test]
+    fn lease_owned_incumbent_pane_is_respawned() {
+        let (lease_owner, restart_target_owner) = incumbent_test_owners();
+
+        assert_eq!(
+            classify_incumbent_pane(
+                &crate::tmux::ManagedPaneInspection::Managed(lease_owner.clone()),
+                &lease_owner,
+                &restart_target_owner,
+            ),
+            IncumbentPaneDisposition::Respawn
+        );
+    }
+
+    #[test]
+    fn restart_target_owned_incumbent_pane_is_respawned() {
+        let (lease_owner, restart_target_owner) = incumbent_test_owners();
+
+        assert_eq!(
+            classify_incumbent_pane(
+                &crate::tmux::ManagedPaneInspection::Managed(restart_target_owner.clone()),
+                &lease_owner,
+                &restart_target_owner,
+            ),
+            IncumbentPaneDisposition::Respawn
+        );
+    }
+
+    #[test]
+    fn stranger_owned_incumbent_pane_is_refused() {
+        let (lease_owner, restart_target_owner) = incumbent_test_owners();
+        let stranger_owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "stranger".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(12),
+        };
+
+        assert_eq!(
+            classify_incumbent_pane(
+                &crate::tmux::ManagedPaneInspection::Managed(stranger_owner),
+                &lease_owner,
+                &restart_target_owner,
+            ),
+            IncumbentPaneDisposition::Refuse
+        );
     }
 
     #[test]
