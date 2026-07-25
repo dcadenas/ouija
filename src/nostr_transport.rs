@@ -2850,6 +2850,29 @@ fn previous_http_restart_fallback_id(
     select_restart_resume_id(fresh, selected_backend, previous_metadata, None)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HttpRestartBackendPlan {
+    Reuse(String),
+    Create,
+}
+
+fn select_http_restart_backend_plan(
+    is_http_api: bool,
+    fresh: bool,
+    selected_backend: &str,
+    previous_metadata: Option<&crate::daemon_protocol::SessionMeta>,
+) -> Option<HttpRestartBackendPlan> {
+    if !is_http_api {
+        return None;
+    }
+
+    Some(
+        previous_http_restart_fallback_id(fresh, selected_backend, previous_metadata)
+            .map(HttpRestartBackendPlan::Reuse)
+            .unwrap_or(HttpRestartBackendPlan::Create),
+    )
+}
+
 /// Recover an interactive fresh launch that definitely failed before the
 /// backend command could start. The protocol guards make this a no-op when a
 /// concurrent SessionStart has already consumed the credential and bound the
@@ -3912,12 +3935,85 @@ async fn restart_session_claimed(
                 }
             }
 
-            // For HttpApi backends, use the shared opencode serve instance
             let mut reused_previous_backend_session = false;
-            let mut backend_session_id = if matches!(
-                backend.delivery_mode(),
-                crate::backend::DeliveryMode::HttpApi { .. }
-            ) {
+            let backend_plan = select_http_restart_backend_plan(
+                is_http_api,
+                fresh,
+                &backend_name,
+                prev_metadata.as_ref(),
+            );
+            let mut backend_session_id = None;
+
+            // A non-fresh HttpApi restart preserves history by trying the
+            // stored session before creating a new one. Reuse deliberately
+            // does not record a restart backend claim: this restart did not
+            // create the session and therefore must not delete it on rollback.
+            if let Some(HttpRestartBackendPlan::Reuse(prev_sid)) = backend_plan {
+                let port = state.opencode_serve_port();
+                let check_url = format!("http://127.0.0.1:{port}/session/{prev_sid}");
+                match state
+                    .http_client
+                    .get(&check_url)
+                    .timeout(std::time::Duration::from_secs(2))
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => {
+                        // Guard reuse against serve/attach-client version
+                        // skew: a mismatched attach TUI crashes to a bare
+                        // pane. Show the notice and keep the reused session
+                        // registered API-only instead (mirrors the
+                        // fresh-create guard in setup_shared_serve_session).
+                        if let Some((serve_v, client_v)) =
+                            opencode_attach_skew(&state.http_client, port).await
+                        {
+                            tracing::warn!(
+                                port,
+                                pane = %pane_id,
+                                backend_session_id = %prev_sid,
+                                serve_version = %serve_v,
+                                attach_client_version = %client_v,
+                                "opencode attach client/serve version skew on reuse; skipping attach TUI (would crash). Session remains functional via HTTP API."
+                            );
+                            notify_pane_opencode_attach_skew(&pane_id, &serve_v, &client_v, port)
+                                .await;
+                            backend_session_id = Some(prev_sid);
+                            reused_previous_backend_session = true;
+                        } else {
+                            match launch_opencode_attach_for_session(
+                                &pane_id, &dir, &prev_sid, port,
+                            )
+                            .await
+                            .and_then(|attach_ready| {
+                                previous_backend_session_after_attach(
+                                    prev_sid.clone(),
+                                    attach_ready,
+                                    &pane_id,
+                                )
+                            }) {
+                                Ok(sid) => {
+                                    backend_session_id = Some(sid);
+                                    reused_previous_backend_session = true;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "previous backend_session_id {prev_sid} is reachable but attach failed: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "previous backend_session_id {prev_sid} is stale, creating new session"
+                        );
+                    }
+                }
+            }
+
+            // Fresh restarts and failed/unavailable reuse create a new session
+            // on the shared OpenCode serve.
+            if is_http_api && backend_session_id.is_none() {
                 let setup_owner = state
                     .protocol
                     .read()
@@ -3935,7 +4031,7 @@ async fn restart_session_claimed(
                         "restart owner changed before OpenCode session setup"
                     )),
                 };
-                match setup_result {
+                backend_session_id = match setup_result {
                     Ok(sid) => Some(sid),
                     Err(e) => {
                         tracing::warn!("shared serve session setup failed: {e}");
@@ -3956,81 +4052,7 @@ async fn restart_session_claimed(
                         }
                         None
                     }
-                }
-            } else {
-                None
-            };
-
-            // Fall back to the previous session ID when not fresh,
-            // but only if the serve is reachable (the old ID may be stale
-            // if serve was restarted externally).
-            if backend_session_id.is_none() {
-                if let Some(prev_sid) =
-                    previous_http_restart_fallback_id(fresh, &backend_name, prev_metadata.as_ref())
-                {
-                    let port = state.opencode_serve_port();
-                    let check_url = format!("http://127.0.0.1:{port}/session/{prev_sid}");
-                    match state
-                        .http_client
-                        .get(&check_url)
-                        .timeout(std::time::Duration::from_secs(2))
-                        .send()
-                        .await
-                    {
-                        Ok(r) if r.status().is_success() => {
-                            // Guard reuse against serve/attach-client version
-                            // skew: a mismatched attach TUI crashes to a bare
-                            // pane. Show the notice and keep the reused session
-                            // registered API-only instead (mirrors the
-                            // fresh-create guard in setup_shared_serve_session).
-                            if let Some((serve_v, client_v)) =
-                                opencode_attach_skew(&state.http_client, port).await
-                            {
-                                tracing::warn!(
-                                    port,
-                                    pane = %pane_id,
-                                    backend_session_id = %prev_sid,
-                                    serve_version = %serve_v,
-                                    attach_client_version = %client_v,
-                                    "opencode attach client/serve version skew on reuse; skipping attach TUI (would crash). Session remains functional via HTTP API."
-                                );
-                                notify_pane_opencode_attach_skew(
-                                    &pane_id, &serve_v, &client_v, port,
-                                )
-                                .await;
-                                backend_session_id = Some(prev_sid);
-                                reused_previous_backend_session = true;
-                            } else {
-                                match launch_opencode_attach_for_session(
-                                    &pane_id, &dir, &prev_sid, port,
-                                )
-                                .await
-                                .and_then(|attach_ready| {
-                                    previous_backend_session_after_attach(
-                                        prev_sid.clone(),
-                                        attach_ready,
-                                        &pane_id,
-                                    )
-                                }) {
-                                    Ok(sid) => {
-                                        backend_session_id = Some(sid);
-                                        reused_previous_backend_session = true;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "previous backend_session_id {prev_sid} is reachable but attach failed: {e}"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        _ => {
-                            tracing::warn!(
-                                "previous backend_session_id {prev_sid} is stale, creating new session"
-                            );
-                        }
-                    }
-                }
+                };
             }
 
             if is_http_api && backend_session_id.is_none() {
@@ -8135,6 +8157,48 @@ mod tests {
             previous_http_restart_fallback_id(false, "opencode", Some(&previous)),
             None,
             "a reachable Codex thread ID must never be probed or adopted as an OpenCode session"
+        );
+    }
+
+    #[test]
+    fn non_fresh_http_restart_prefers_stored_backend_session() {
+        let previous = crate::daemon_protocol::SessionMeta {
+            backend: Some("opencode".into()),
+            backend_session_id: Some("ses_preserved".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            select_http_restart_backend_plan(true, false, "opencode", Some(&previous)),
+            Some(HttpRestartBackendPlan::Reuse("ses_preserved".into()))
+        );
+    }
+
+    #[test]
+    fn fresh_http_restart_creates_new_backend_session() {
+        let previous = crate::daemon_protocol::SessionMeta {
+            backend: Some("opencode".into()),
+            backend_session_id: Some("ses_previous".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            select_http_restart_backend_plan(true, true, "opencode", Some(&previous)),
+            Some(HttpRestartBackendPlan::Create)
+        );
+    }
+
+    #[test]
+    fn non_http_restart_has_no_opencode_backend_plan() {
+        let previous = crate::daemon_protocol::SessionMeta {
+            backend: Some("codex-cli".into()),
+            backend_session_id: Some("thread_previous".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            select_http_restart_backend_plan(false, false, "codex-cli", Some(&previous)),
+            None
         );
     }
 
