@@ -205,11 +205,53 @@ so the register/activity/stop hooks can run. Automated tests bypass this with
 For a fresh managed launch, Ouija also supplies a per-launch `SessionStart` hook
 through Codex's supported `-c` session-flags layer. Its command presents the
 public Ouija launch id and a one-time credential; the matching handler hash is
-provided in the same invocation's `hooks.state` override. This is intentional:
-a shared Codex app-server may have neither the managed pane nor its environment.
+provided in the same invocation's `hooks.state` override, which must be written
+as one inline table (see "Session-flags trust must be an inline table" below).
+This is intentional: a shared Codex app-server may have neither the managed pane
+nor its environment.
 The static installed hook continues to support ordinary and resumed sessions,
 but a paneless first bind without that launch proof fails closed. Resume commands
 do not receive a new credential or replace an established native binding.
+
+### Session-flags trust must be an inline table (2026-07-25)
+
+Codex splits a `-c` key on `.` before honoring quotes, so the dotted form
+
+```
+-c 'hooks.state."/<session-flags>/config.toml:session_start:0:0".trusted_hash="sha256:..."'
+```
+
+is torn apart at the `.` in `config.toml`. It parses cleanly — it even passes
+`--strict-config` — but the trust entry lands at a path Codex never reads, so the
+launch hook stays untrusted and the TUI blocks on "Hooks need review". Ouija now
+assigns the whole table instead, which keeps the key literal:
+
+```
+-c 'hooks.state={"/<session-flags>/config.toml:session_start:0:0"={trusted_hash="sha256:..."}}'
+```
+
+`hook_states_from_stack` merges hook state field-by-field across layers and
+accepts both `User` and `SessionFlags` layers, so this override does not clobber
+the trust the user already granted to `~/.codex/hooks.json` or plugin hooks.
+
+Verify with a read-only `hooks/list` app-server probe rather than by launching a
+session — it reports `trustStatus` and `currentHash` per hook without executing
+anything:
+
+```bash
+{ echo '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"clientInfo":{"name":"probe","title":"probe","version":"0.0.1"}}}'
+  sleep 1
+  echo '{"jsonrpc":"2.0","id":1,"method":"hooks/list","params":{"cwds":["<repo>"]}}'
+  sleep 2; } | codex app-server -c "<hook flags>" -c "<state flags>"
+```
+
+On Codex CLI 0.145.0 that probe reported all seven local hooks `trusted`,
+including `sessionFlags`, and its `currentHash` matched Ouija's computed hash
+byte-for-byte. `session_flags_trusted_hash_matches_codex_0_145` pins that value.
+
+A stale `[hooks.state."/<session-flags>/config.toml:session_start:0:0"]` entry
+left in `~/.codex/config.toml` by an earlier "Trust all and continue" is inert:
+it records a hash from one dead launch, and the session-flags layer wins.
 
 ### Shared-app-server isolation probe (2026-07-14)
 
@@ -275,10 +317,11 @@ survives native-thread rollover and missing, not-found, or incomplete backend
 evidence, while sibling pane/environment/backend conflicts and non-Local claims
 are rejected. The suite also retains the Claude tmux-path regression checks;
 `tests/e2e/run-e2e.sh opencode` remains the focused HTTP-backend regression
-suite. On 2026-07-13, installed `codex-cli
-0.144.1` accepted the generated `hooks.SessionStart` and matching
-`hooks.state."<session-flags>/config.toml:session_start:0:0".trusted_hash`
-configuration under `--strict-config`.
+suite. On 2026-07-25, installed `codex-cli 0.145.0` reported the generated
+`hooks.SessionStart` hook as `trusted` under a `hooks/list` probe when its
+`hooks.state` companion was passed as an inline table. `--strict-config`
+acceptance is not sufficient evidence here: the earlier dotted form parsed
+cleanly and still left the hook untrusted.
 
 ## Availability detection
 

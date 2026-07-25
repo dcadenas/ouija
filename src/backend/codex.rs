@@ -429,6 +429,28 @@ fn format_codex_home_prefix(codex_home: Option<&str>) -> String {
 // trusted state key must match it byte-for-byte or the hook is suppressed.
 const SESSION_FLAGS_HOOK_KEY: &str = "/<session-flags>/config.toml:session_start:0:0";
 
+/// Reproduce the trust hash Codex computes for a session-flags SessionStart hook.
+///
+/// Codex hashes a TOML-normalized handler identity rather than the source text.
+/// Optional TOML fields serialize as absent, while the hook engine fills in
+/// `timeout = 600` and `async = false`. The digest is SHA-256 over the canonical
+/// (recursively key-sorted, compact) JSON form of that identity.
+fn session_flags_trusted_hash(command: &str) -> String {
+    let normalized = serde_json::json!({
+        "event_name": "session_start",
+        "hooks": [{
+            "async": false,
+            "command": command,
+            "timeout": 600,
+            "type": "command",
+        }],
+    });
+    let canonical = canonical_json(&normalized);
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(&canonical).expect("JSON value serializes"));
+    format!("sha256:{:x}", hasher.finalize())
+}
+
 /// Build the two session-flags overrides for a fresh managed Codex launch.
 ///
 /// The first declares one extra SessionStart command which presents Ouija's
@@ -450,27 +472,20 @@ pub(crate) fn format_session_start_hook_flags(
         crate::scheduler::shell_escape(&launch_credential_file.to_string_lossy()),
         session_incarnation,
     );
-    // Codex hashes the TOML-normalized command handler. Optional TOML fields
-    // are absent, while the hook engine supplies timeout=600 and async=false.
-    let normalized = serde_json::json!({
-        "event_name": "session_start",
-        "hooks": [{
-            "async": false,
-            "command": command,
-            "timeout": 600,
-            "type": "command",
-        }],
-    });
-    let canonical = canonical_json(&normalized);
-    let mut hasher = Sha256::new();
-    hasher.update(serde_json::to_vec(&canonical).expect("JSON value serializes"));
-    let trusted_hash = format!("sha256:{:x}", hasher.finalize());
-
+    let trusted_hash = session_flags_trusted_hash(&command);
     let handler = toml_basic_string_escape(&command);
     let hook_config =
         format!("hooks.SessionStart=[{{hooks=[{{type=\"command\",command=\"{handler}\"}}]}}]");
+    // The state key must be assigned as one inline table, not through a dotted
+    // `-c hooks.state."<key>".trusted_hash=...` path. Codex splits a `-c` key on
+    // `.` before honoring quotes, so the `config.toml` inside the key is torn
+    // into two path segments and the trust entry lands somewhere Codex never
+    // reads, leaving the hook untrusted and the TUI blocked on "Hooks need
+    // review". Assigning `hooks.state` wholesale keeps the key literal; Codex
+    // merges hook state field-by-field across layers, so the user layer's own
+    // trusted hooks survive this session-flags override.
     let state_config =
-        format!("hooks.state.\"{SESSION_FLAGS_HOOK_KEY}\".trusted_hash=\"{trusted_hash}\"");
+        format!("hooks.state={{\"{SESSION_FLAGS_HOOK_KEY}\"={{trusted_hash=\"{trusted_hash}\"}}}}");
     format!(
         " -c {} -c {}",
         crate::scheduler::shell_escape(&hook_config),
@@ -759,13 +774,33 @@ mod tests {
         );
         assert!(
             flags.contains(
-                "hooks.state.\"/<session-flags>/config.toml:session_start:0:0\".trusted_hash="
+                "hooks.state={\"/<session-flags>/config.toml:session_start:0:0\"={trusted_hash="
             ),
-            "session-flags hook needs Codex's exact trusted state key: {flags}"
+            "session-flags trust must be one inline table under Codex's exact state key: {flags}"
+        );
+        assert!(
+            !flags.contains("hooks.state.\""),
+            "a dotted -c state path is split on the `.` in `config.toml` and never trusts the hook: {flags}"
         );
         assert!(
             !flags.contains("CODEX_THREAD_ID"),
             "native identity must stay inside the Codex adapter/hook payload: {flags}"
+        );
+    }
+
+    /// Golden hash captured from Codex CLI 0.145.0. The value is the `currentHash`
+    /// that a real `hooks/list` app-server probe reported for this exact handler,
+    /// so a drift here means Codex changed its normalized hook identity and every
+    /// managed launch will block on "Hooks need review" until this is regenerated.
+    #[test]
+    fn session_flags_trusted_hash_matches_codex_0_145() {
+        let command = "'/home/daniel/.codex/ouija-hooks/codex-register.sh' \
+             --launch-session-id 'feat/1980-resolve-worker-base-branches-without-guessing-main-posture-2-0-codex-cli-gpt-5-6-sol' \
+             --launch-credential-file '/home/daniel/.codex/ouija-launch-credentials/launch-30c9dd674603719f9e3d909e1ef0a29e' \
+             --session-incarnation 1784923380514536163";
+        assert_eq!(
+            session_flags_trusted_hash(command),
+            "sha256:4f541846dfb8fcdbac25659ea2530fdbeca4dbb6c6ad114a4eb0c809207d043f"
         );
     }
 
