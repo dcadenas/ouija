@@ -77,6 +77,43 @@ ids=$(session_ids "$BASE")
 assert_contains "new name exists" "$ids" "sess-a2"
 assert_not_contains "old name gone" "$ids" "sess-a-renamed"
 
+log "Test 4b: Marker-only orphan is reclaimed and explicit CLI rename succeeds"
+MARKER_RECLAIM_PANE=$(create_claude_pane "$FAKE_BIN")
+MARKER_RECLAIM_ID="marker-reclaim"
+MARKER_RECLAIM_RENAMED="marker-reclaim-renamed"
+cleanup_marker_reclaim_fixture() {
+    api "$BASE" POST /api/remove -d "{\"id\":\"$MARKER_RECLAIM_ID\"}" >/dev/null 2>&1 || true
+    api "$BASE" POST /api/remove -d "{\"id\":\"$MARKER_RECLAIM_RENAMED\"}" >/dev/null 2>&1 || true
+    tmux kill-pane -t "$MARKER_RECLAIM_PANE" 2>/dev/null || true
+}
+trap cleanup_marker_reclaim_fixture EXIT
+
+api "$BASE" POST /api/register \
+    -d "{\"id\":\"$MARKER_RECLAIM_ID\",\"pane\":\"$MARKER_RECLAIM_PANE\"}" >/dev/null
+tmux set-option -p -t "$MARKER_RECLAIM_PANE" @ouija_session "removed-owner"
+tmux set-option -p -t "$MARKER_RECLAIM_PANE" @ouija_id "removed-owner"
+tmux set-option -p -t "$MARKER_RECLAIM_PANE" @ouija_incarnation "1"
+
+api "$BASE" POST /api/register \
+    -d "{\"id\":\"$MARKER_RECLAIM_ID\",\"pane\":\"$MARKER_RECLAIM_PANE\"}" >/dev/null
+MARKER_RECLAIM_INCARNATION=$(persisted_session_incarnation "$MARKER_RECLAIM_ID")
+assert_eq "4b: orphan marker id reclaimed" \
+    "$(tmux display-message -t "$MARKER_RECLAIM_PANE" -p '#{@ouija_id}')" \
+    "$MARKER_RECLAIM_ID"
+assert_eq "4b: orphan marker incarnation reclaimed" \
+    "$(tmux display-message -t "$MARKER_RECLAIM_PANE" -p '#{@ouija_incarnation}')" \
+    "$MARKER_RECLAIM_INCARNATION"
+
+result=$(env -u TMUX_PANE -u OUIJA_SESSION_ID OUIJA_PORT=$PORT \
+    ouija rename "$MARKER_RECLAIM_RENAMED" --from "$MARKER_RECLAIM_ID")
+assert_contains "4b: explicit CLI rename succeeds" "$result" '"renamed"'
+assert_eq "4b: renamed marker follows public id" \
+    "$(tmux display-message -t "$MARKER_RECLAIM_PANE" -p '#{@ouija_id}')" \
+    "$MARKER_RECLAIM_RENAMED"
+
+cleanup_marker_reclaim_fixture
+trap - EXIT
+
 log "Test 5: Remove via API"
 api "$BASE" POST /api/register -d '{"id":"doomed"}' >/dev/null
 count_before=$(session_count "$BASE")

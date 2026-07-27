@@ -1622,12 +1622,14 @@ async fn kill_session_inner(
                     }
                     match crate::tmux::inspect_managed_pane(&pane_for_kill)? {
                         crate::tmux::ManagedPaneInspection::Missing => Ok(false),
-                        crate::tmux::ManagedPaneInspection::Managed(observed)
+                        crate::tmux::ManagedPaneInspection::ProcessOwner(observed)
+                        | crate::tmux::ManagedPaneInspection::MarkerOwner(observed)
                             if crate::tmux::physical_owner_matches(&observed, &pane_owner) =>
                         {
                             Ok(true)
                         }
-                        crate::tmux::ManagedPaneInspection::Managed(_)
+                        crate::tmux::ManagedPaneInspection::ProcessOwner(_)
+                        | crate::tmux::ManagedPaneInspection::MarkerOwner(_)
                         | crate::tmux::ManagedPaneInspection::Unmanaged => {
                             anyhow::bail!("pane owner changed before backend exit");
                         }
@@ -1648,7 +1650,8 @@ async fn kill_session_inner(
                         .status()?;
                     match crate::tmux::inspect_managed_pane(&pane_for_kill)? {
                         crate::tmux::ManagedPaneInspection::Missing => {}
-                        crate::tmux::ManagedPaneInspection::Managed(observed)
+                        crate::tmux::ManagedPaneInspection::ProcessOwner(observed)
+                        | crate::tmux::ManagedPaneInspection::MarkerOwner(observed)
                             if crate::tmux::physical_owner_matches(
                                 &observed,
                                 &pane_owner,
@@ -1658,7 +1661,8 @@ async fn kill_session_inner(
                                 "tmux kill-pane left the owned pane alive (status {status})"
                             );
                         }
-                        crate::tmux::ManagedPaneInspection::Managed(_)
+                        crate::tmux::ManagedPaneInspection::ProcessOwner(_)
+                        | crate::tmux::ManagedPaneInspection::MarkerOwner(_)
                         | crate::tmux::ManagedPaneInspection::Unmanaged => {
                             anyhow::bail!("pane owner changed during backend exit");
                         }

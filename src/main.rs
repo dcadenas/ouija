@@ -154,7 +154,12 @@ enum Command {
     /// Inject directly into a tmux pane
     Inject { pane: String, message: String },
     /// Rename current session
-    Rename { new_id: String },
+    Rename {
+        new_id: String,
+        /// Session ID to rename: the exact Local id supplied by trusted context or the operator
+        #[arg(long)]
+        from: Option<String>,
+    },
     /// Unregister a session (without killing it)
     Unregister { id: String },
     /// Start a new session
@@ -848,9 +853,13 @@ async fn main() -> anyhow::Result<()> {
             let body = serde_json::json!({ "pane": pane, "message": message });
             cli_post("/api/inject", &body).await?;
         }
-        Command::Rename { new_id } => {
-            let old_id = require_my_session_id().await?;
-            let body = serde_json::json!({ "old_id": old_id, "new_id": new_id });
+        Command::Rename { new_id, from } => {
+            let sender = resolve_sender(from).await?;
+            let body = serde_json::json!({
+                "old_id": sender.id,
+                "new_id": new_id,
+                "sender_ctx": sender.context,
+            });
             cli_post("/api/rename", &body).await?;
         }
         Command::Unregister { id } => {
@@ -3448,6 +3457,19 @@ mod tests {
                 );
             }
             _ => panic!("expected clear-reminder command"),
+        }
+    }
+
+    #[test]
+    fn rename_parses_explicit_from_option() {
+        let cli = Cli::try_parse_from(["ouija", "rename", "hub-cx", "--from", "hub"]).unwrap();
+
+        match cli.command {
+            Command::Rename { new_id, from } => {
+                assert_eq!(new_id, "hub-cx");
+                assert_eq!(from.as_deref(), Some("hub"));
+            }
+            _ => panic!("expected rename command"),
         }
     }
 

@@ -165,6 +165,7 @@ Two ways to provide the public Ouija sender id explicitly:
 ouija ask target-id "question" --from public-ouija-id
 ouija tell target-id "fyi" --from public-ouija-id
 ouija reply target-id 47 "result" --from public-ouija-id
+ouija rename new-public-id --from current-public-ouija-id
 
 # Or set once for the shell:
 export OUIJA_SESSION_ID=public-ouija-id

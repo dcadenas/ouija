@@ -703,6 +703,18 @@ const MAX_NAME_SUFFIX: u32 = 100;
 const RECIPROCATE_DEBOUNCE_SECS: u64 = 30;
 const AUTOREGISTER_REMOVE_GRACE_SECS: u64 = 10;
 
+fn autoregister_accepts_pane_inspection(
+    inspection: &crate::tmux::ManagedPaneInspection,
+    marker_owner_is_referenced: bool,
+) -> bool {
+    match inspection {
+        crate::tmux::ManagedPaneInspection::Unmanaged => true,
+        crate::tmux::ManagedPaneInspection::MarkerOwner(_) => !marker_owner_is_referenced,
+        crate::tmux::ManagedPaneInspection::Missing
+        | crate::tmux::ManagedPaneInspection::ProcessOwner(_) => false,
+    }
+}
+
 fn wait_for_tmux_owner_convergence<Inspect, Wait>(
     expected_owner: &crate::daemon_protocol::ResourceOwner,
     attempts: usize,
@@ -729,7 +741,10 @@ where
             Ok(crate::tmux::ManagedPaneInspection::Missing) => {
                 last_error = "pane is not visible yet".into();
             }
-            Ok(crate::tmux::ManagedPaneInspection::Managed(observed)) => {
+            Ok(
+                crate::tmux::ManagedPaneInspection::ProcessOwner(observed)
+                | crate::tmux::ManagedPaneInspection::MarkerOwner(observed),
+            ) => {
                 last_error = format!(
                     "pane still exposes incarnation {}, expected {}",
                     observed.incarnation, expected_owner.incarnation
@@ -3314,41 +3329,108 @@ impl AppState {
         let owner_for_guard = owner.clone();
         let _ = self
             .with_owned_pane_claim(&owner_for_guard, &pane_for_guard, move || async move {
-                let _ =
-                    tokio::task::spawn_blocking(move || {
-                        match crate::tmux::inspect_managed_pane(&pane) {
-                            Ok(inspection)
-                                if crate::tmux::pane_accepts_owner_marker(&inspection, &owner) =>
-                            {
-                                if let Err(error) = crate::tmux_var::set(&pane, &name, &value) {
-                                    tracing::warn!(
-                                        %pane,
-                                        %name,
-                                        %error,
-                                        "failed to set owned tmux variable"
-                                    );
-                                }
-                            }
-                            Ok(inspection) => {
-                                tracing::warn!(
-                                    %pane,
-                                    %name,
-                                    ?inspection,
-                                    expected_owner = ?owner,
-                                    "refused tmux variable write for conflicting pane owner"
-                                );
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    %pane,
-                                    %name,
-                                    %error,
-                                    "failed to inspect owner before tmux variable write"
-                                );
-                            }
+                let pane_for_inspection = pane.clone();
+                let inspection = match tokio::task::spawn_blocking(move || {
+                    crate::tmux::inspect_managed_pane(&pane_for_inspection)
+                })
+                .await
+                {
+                    Ok(Ok(inspection)) => inspection,
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            %pane,
+                            %name,
+                            %error,
+                            "failed to inspect owner before tmux variable write"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %pane,
+                            %name,
+                            %error,
+                            "pane owner inspection task failed before tmux variable write"
+                        );
+                        return;
+                    }
+                };
+
+                let observed_owner_is_referenced = match &inspection {
+                    crate::tmux::ManagedPaneInspection::MarkerOwner(observed)
+                        if !crate::tmux::physical_owner_matches(observed, &owner) =>
+                    {
+                        self.protocol
+                            .read()
+                            .await
+                            .references_resource_owner(observed)
+                    }
+                    _ => false,
+                };
+                if !crate::tmux::pane_marker_write_is_authorized(
+                    &inspection,
+                    &owner,
+                    observed_owner_is_referenced,
+                ) {
+                    tracing::warn!(
+                        %pane,
+                        %name,
+                        ?inspection,
+                        expected_owner = ?owner,
+                        "refused tmux variable write for conflicting pane owner"
+                    );
+                    return;
+                }
+
+                let reclaimable_marker = match inspection {
+                    crate::tmux::ManagedPaneInspection::MarkerOwner(observed)
+                        if !crate::tmux::physical_owner_matches(&observed, &owner) =>
+                    {
+                        Some(observed)
+                    }
+                    _ => None,
+                };
+                let _ = tokio::task::spawn_blocking(move || {
+                    let current = match crate::tmux::inspect_managed_pane(&pane) {
+                        Ok(current) => current,
+                        Err(error) => {
+                            tracing::warn!(
+                                %pane,
+                                %name,
+                                %error,
+                                "failed to re-inspect owner before tmux variable write"
+                            );
+                            return;
                         }
-                    })
-                    .await;
+                    };
+                    let still_authorized = crate::tmux::pane_accepts_owner_marker(&current, &owner)
+                        || matches!(
+                            (&current, reclaimable_marker.as_ref()),
+                            (
+                                crate::tmux::ManagedPaneInspection::MarkerOwner(current),
+                                Some(reclaimable),
+                            ) if current == reclaimable
+                        );
+                    if !still_authorized {
+                        tracing::warn!(
+                            %pane,
+                            %name,
+                            ?current,
+                            expected_owner = ?owner,
+                            "pane owner changed before tmux variable write"
+                        );
+                        return;
+                    }
+                    if let Err(error) = crate::tmux_var::set(&pane, &name, &value) {
+                        tracing::warn!(
+                            %pane,
+                            %name,
+                            %error,
+                            "failed to set owned tmux variable"
+                        );
+                    }
+                })
+                .await;
             })
             .await;
     }
@@ -3769,6 +3851,48 @@ impl AppState {
                 continue;
             }
 
+            let inspection = if cfg!(test) {
+                Ok(crate::tmux::ManagedPaneInspection::Unmanaged)
+            } else {
+                let pane_id = pane.pane_id.clone();
+                tokio::task::spawn_blocking(move || crate::tmux::inspect_managed_pane(&pane_id))
+                    .await
+                    .unwrap_or_else(|error| Err(error.into()))
+            };
+            let expected_orphaned_marker_owner = match &inspection {
+                Ok(crate::tmux::ManagedPaneInspection::MarkerOwner(owner)) => Some(owner.clone()),
+                _ => None,
+            };
+            let marker_owner_is_referenced =
+                if let Some(owner) = expected_orphaned_marker_owner.as_ref() {
+                    self.protocol.read().await.references_resource_owner(owner)
+                } else {
+                    false
+                };
+            match inspection {
+                Ok(inspection)
+                    if autoregister_accepts_pane_inspection(
+                        &inspection,
+                        marker_owner_is_referenced,
+                    ) => {}
+                Ok(inspection) => {
+                    tracing::warn!(
+                        pane = %pane.pane_id,
+                        ?inspection,
+                        "skipping auto-registration for pane with non-reclaimable owner evidence"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        pane = %pane.pane_id,
+                        %error,
+                        "skipping auto-registration after pane owner inspection failed"
+                    );
+                    continue;
+                }
+            }
+
             // An @ouija_id marker is not durable ownership evidence. A live
             // daemon session is already covered by registered_panes above;
             // otherwise this is a legacy orphan and must be allowed to claim
@@ -3810,9 +3934,11 @@ impl AppState {
             };
 
             tracing::info!("auto-registering pane {} as '{id}'", pane.pane_id);
-            self.apply_and_execute(crate::daemon_protocol::Event::Register {
+            self.apply_and_execute(crate::daemon_protocol::Event::RegisterIfPaneUnbound {
                 id: id.clone(),
-                pane: Some(pane.pane_id.clone()),
+                pane: pane.pane_id.clone(),
+                expected_backend_session_id: None,
+                expected_orphaned_marker_owner,
                 metadata: proto_meta,
             })
             .await;
@@ -4145,9 +4271,9 @@ pub(crate) mod tests {
             incarnation: crate::daemon_protocol::SessionIncarnation(42),
         };
         let mut observations = std::collections::VecDeque::from([
-            crate::tmux::ManagedPaneInspection::Managed(incumbent.clone()),
-            crate::tmux::ManagedPaneInspection::Managed(incumbent),
-            crate::tmux::ManagedPaneInspection::Managed(replacement.clone()),
+            crate::tmux::ManagedPaneInspection::ProcessOwner(incumbent.clone()),
+            crate::tmux::ManagedPaneInspection::ProcessOwner(incumbent),
+            crate::tmux::ManagedPaneInspection::ProcessOwner(replacement.clone()),
         ]);
         let mut inspection_count = 0;
         let mut wait_count = 0;
@@ -4187,7 +4313,7 @@ pub(crate) mod tests {
             3,
             || {
                 inspection_count += 1;
-                Ok(crate::tmux::ManagedPaneInspection::Managed(
+                Ok(crate::tmux::ManagedPaneInspection::ProcessOwner(
                     incumbent.clone(),
                 ))
             },
@@ -4198,6 +4324,35 @@ pub(crate) mod tests {
         assert!(error.to_string().contains("expected 42"), "{error}");
         assert_eq!(inspection_count, 3);
         assert_eq!(wait_count, 2);
+    }
+
+    #[test]
+    fn autoregister_skips_complete_process_owners_but_allows_marker_orphans() {
+        let owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "old".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(42),
+        };
+
+        assert!(!autoregister_accepts_pane_inspection(
+            &crate::tmux::ManagedPaneInspection::ProcessOwner(owner.clone()),
+            false,
+        ));
+        assert!(autoregister_accepts_pane_inspection(
+            &crate::tmux::ManagedPaneInspection::MarkerOwner(owner.clone()),
+            false,
+        ));
+        assert!(!autoregister_accepts_pane_inspection(
+            &crate::tmux::ManagedPaneInspection::MarkerOwner(owner),
+            true,
+        ));
+        assert!(autoregister_accepts_pane_inspection(
+            &crate::tmux::ManagedPaneInspection::Unmanaged,
+            false,
+        ));
+        assert!(!autoregister_accepts_pane_inspection(
+            &crate::tmux::ManagedPaneInspection::Missing,
+            false,
+        ));
     }
 
     #[tokio::test]
@@ -4948,6 +5103,32 @@ pub(crate) mod tests {
             .await;
 
         assert_eq!(allowed, Some("launched"));
+    }
+
+    #[tokio::test]
+    async fn superseded_session_owner_cannot_claim_reused_pane() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%reused".into()),
+                metadata: Default::default(),
+            })
+            .await;
+        let superseded = state.protocol.read().await.sessions["worker"].owner();
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%reused".into()),
+                metadata: Default::default(),
+            })
+            .await;
+
+        let touched = state
+            .with_owned_pane_claim(&superseded, "%reused", || async { true })
+            .await;
+        assert_eq!(touched, None);
     }
 
     #[tokio::test]

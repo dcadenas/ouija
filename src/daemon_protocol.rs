@@ -735,6 +735,10 @@ pub enum Event {
         id: String,
         pane: String,
         expected_backend_session_id: Option<String>,
+        /// Marker-only owner observed before this guarded registration. It
+        /// must remain absent from every session and lifecycle lease when the
+        /// state owner applies the event.
+        expected_orphaned_marker_owner: Option<ResourceOwner>,
         metadata: SessionMeta,
     },
     /// Establish the next incarnation before a fresh hard launch performs any
@@ -1571,6 +1575,26 @@ impl DaemonState {
         Some(incarnation)
     }
 
+    /// Whether an exact lifecycle owner still has any authority in protocol
+    /// state. Marker-only pane ownership may be reclaimed only when this is
+    /// false; public IDs and pane IDs are intentionally insufficient.
+    pub(crate) fn references_resource_owner(&self, owner: &ResourceOwner) -> bool {
+        self.sessions
+            .values()
+            .any(|session| session.owner() == *owner)
+            || self.lifecycle_leases.values().any(|lease| {
+                lease.owner == *owner
+                    || lease.backend_session_owner.as_ref() == Some(owner)
+                    || lease.restart_target_owner.as_ref() == Some(owner)
+                    || lease
+                        .restart_previous
+                        .as_deref()
+                        .is_some_and(|session| session.owner() == *owner)
+                    || lease.project_dir_owner.as_ref() == Some(owner)
+                    || lease.inert_pane_owner.as_ref() == Some(owner)
+            })
+    }
+
     fn has_stopping_lease(&self, session_id: &str) -> bool {
         self.lifecycle_leases
             .get(session_id)
@@ -1894,10 +1918,15 @@ impl DaemonState {
                 id,
                 pane,
                 expected_backend_session_id,
+                expected_orphaned_marker_owner,
                 metadata,
-            } => {
-                self.apply_register_if_pane_unbound(id, pane, expected_backend_session_id, metadata)
-            }
+            } => self.apply_register_if_pane_unbound(
+                id,
+                pane,
+                expected_backend_session_id,
+                expected_orphaned_marker_owner,
+                metadata,
+            ),
             Event::StageFreshLaunch {
                 id,
                 backend,
@@ -2818,8 +2847,28 @@ impl DaemonState {
         id: String,
         pane: String,
         expected_backend_session_id: Option<String>,
+        expected_orphaned_marker_owner: Option<ResourceOwner>,
         metadata: SessionMeta,
     ) -> Vec<Effect> {
+        if let Some(owner) = expected_orphaned_marker_owner.as_ref()
+            && self.references_resource_owner(owner)
+        {
+            let reason = format!(
+                "pane {pane} marker owner {}/{} is still active or reserved",
+                owner.session_id, owner.incarnation
+            );
+            return vec![
+                Effect::Log {
+                    level: LogLevel::Warn,
+                    message: format!("refusing guarded registration for '{id}': {reason}"),
+                },
+                Effect::RegisterFailed {
+                    session_id: id,
+                    reason,
+                },
+            ];
+        }
+
         if let Some(expected_backend_session_id) = expected_backend_session_id.as_deref()
             && let Some(existing) = self.sessions.get(&id)
             && existing.metadata.backend_session_id.as_deref() != Some(expected_backend_session_id)
@@ -6516,6 +6565,55 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::SpawnAgent { .. }))
         );
+    }
+
+    #[test]
+    fn resource_owner_reference_includes_sessions_and_nested_lifecycle_claims() {
+        let mut state = DaemonState::new("npub1abc".into(), "myhost".into());
+        state.apply(Event::Register {
+            id: "active".into(),
+            pane: Some("%1".into()),
+            metadata: Default::default(),
+        });
+        let active = state.sessions["active"].owner();
+        let orphan = ResourceOwner {
+            session_id: active.session_id.clone(),
+            incarnation: SessionIncarnation(active.incarnation.0 + 100),
+        };
+
+        assert!(state.references_resource_owner(&active));
+        assert!(!state.references_resource_owner(&orphan));
+
+        let reserved = match state.reserve_start("reserved").unwrap() {
+            StartDisposition::Reserved(owner) => owner,
+            other => panic!("expected reserved owner, got {other:?}"),
+        };
+        assert!(state.references_resource_owner(&reserved));
+
+        let staged = ResourceOwner {
+            session_id: "reserved".into(),
+            incarnation: SessionIncarnation(reserved.incarnation.0 + 1),
+        };
+        let previous = SessionEntry {
+            id: "reserved".into(),
+            pane: Some("%old".into()),
+            origin: Origin::Local,
+            metadata: SessionMeta {
+                session_incarnation: SessionIncarnation(reserved.incarnation.0 + 2),
+                ..Default::default()
+            },
+            registered_at: 0,
+        };
+        let previous_owner = previous.owner();
+        let lease = state.lifecycle_leases.get_mut("reserved").unwrap();
+        lease.restart_target_owner = Some(staged.clone());
+        lease.backend_session_owner = Some(staged.clone());
+        lease.project_dir_owner = Some(staged.clone());
+        lease.inert_pane_owner = Some(staged.clone());
+        lease.restart_previous = Some(Box::new(previous));
+
+        assert!(state.references_resource_owner(&staged));
+        assert!(state.references_resource_owner(&previous_owner));
     }
 
     #[test]
@@ -10788,6 +10886,53 @@ mod tests {
     }
 
     #[test]
+    fn register_if_pane_unbound_requires_marker_owner_to_remain_orphaned() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "active-owner".into(),
+            pane: Some("%1".into()),
+            metadata: Default::default(),
+        });
+        let active_owner = state.sessions["active-owner"].owner();
+
+        let effects = state.apply(Event::RegisterIfPaneUnbound {
+            id: "candidate".into(),
+            pane: "%2".into(),
+            expected_backend_session_id: None,
+            expected_orphaned_marker_owner: Some(active_owner),
+            metadata: Default::default(),
+        });
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::RegisterFailed { session_id, reason }
+                    if session_id == "candidate" && reason.contains("still active or reserved")
+            )),
+            "referenced marker owner must fail atomically, got: {effects:?}"
+        );
+        assert!(!state.sessions.contains_key("candidate"));
+
+        let orphan = ResourceOwner {
+            session_id: "removed-owner".into(),
+            incarnation: SessionIncarnation(999),
+        };
+        let effects = state.apply(Event::RegisterIfPaneUnbound {
+            id: "candidate".into(),
+            pane: "%2".into(),
+            expected_backend_session_id: None,
+            expected_orphaned_marker_owner: Some(orphan),
+            metadata: Default::default(),
+        });
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::RegisterOk { session_id, .. } if session_id == "candidate"
+            )),
+            "unreferenced marker owner should remain reclaimable, got: {effects:?}"
+        );
+    }
+
+    #[test]
     fn register_if_pane_unbound_rejects_duplicate_backend_session_id() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
         state.apply(Event::Register {
@@ -10804,6 +10949,7 @@ mod tests {
             id: "intruder".into(),
             pane: "%2".into(),
             expected_backend_session_id: Some("ses_dup".into()),
+            expected_orphaned_marker_owner: None,
             metadata: SessionMeta {
                 backend: Some("opencode".into()),
                 backend_session_id: Some("ses_dup".into()),
@@ -10920,6 +11066,7 @@ mod tests {
             id: "intruder".into(),
             pane: "%2".into(),
             expected_backend_session_id: Some("ses_expected".into()),
+            expected_orphaned_marker_owner: None,
             metadata: SessionMeta {
                 backend: Some("opencode".into()),
                 backend_session_id: Some("ses_dup".into()),
@@ -10955,6 +11102,7 @@ mod tests {
             id: "local-oc".into(),
             pane: "%2".into(),
             expected_backend_session_id: Some("ses_new".into()),
+            expected_orphaned_marker_owner: None,
             metadata: SessionMeta {
                 backend: Some("opencode".into()),
                 backend_session_id: Some("ses_new".into()),
@@ -11000,6 +11148,7 @@ mod tests {
             id: "local-oc".into(),
             pane: "%2".into(),
             expected_backend_session_id: Some("ses_same".into()),
+            expected_orphaned_marker_owner: None,
             metadata: SessionMeta {
                 backend: Some("opencode".into()),
                 backend_session_id: Some("ses_same".into()),

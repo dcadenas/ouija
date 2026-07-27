@@ -1249,6 +1249,8 @@ async fn deliver_http_message_outcome(
 pub struct RenameBody {
     old_id: String,
     new_id: String,
+    #[serde(default)]
+    sender_ctx: Option<crate::daemon_protocol::SenderContext>,
 }
 
 /// Rename an existing session.
@@ -1256,6 +1258,22 @@ pub async fn rename(
     State(state): State<SharedState>,
     Json(body): Json<RenameBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Some(ctx) = &body.sender_ctx {
+        let proto = state.protocol.read().await;
+        if let Err(reason) =
+            crate::daemon_protocol::validate_sender_claim(&proto, &body.old_id, ctx)
+        {
+            return (StatusCode::FORBIDDEN, Json(json!({ "error": reason })));
+        }
+    } else {
+        tracing::warn!(
+            old_id = %body.old_id,
+            new_id = %body.new_id,
+            "rename accepted without sender context (legacy compatibility); \
+             Local session claim unverified"
+        );
+    }
+
     let effects = state
         .apply_and_execute(crate::daemon_protocol::Event::Rename {
             old_id: body.old_id.clone(),
@@ -4372,6 +4390,7 @@ async fn register_auto_provisioned_session(
             id: id.clone(),
             pane: pane_id.to_string(),
             expected_backend_session_id: Some(backend_sid.to_string()),
+            expected_orphaned_marker_owner: None,
             metadata,
         })
         .await;
@@ -5989,6 +6008,110 @@ mod tests {
             "trusted_local_claim": true,
         }))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rename_accepts_trusted_local_claim_when_backend_identity_is_not_found() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "hub".into(),
+                pane: Some("%hub".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("codex-cli".into()),
+                    backend_session_id: Some("old-thread".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (status, body) = rename(
+            State(state.clone()),
+            Json(RenameBody {
+                old_id: "hub".into(),
+                new_id: "hub-cx".into(),
+                sender_ctx: Some(trusted_local_sender_context(
+                    None,
+                    None,
+                    Some(crate::backend::BackendSessionIdentity {
+                        backend: "codex-cli".into(),
+                        session_id: "replacement-thread".into(),
+                    }),
+                )),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body: {:?}", body.0);
+        let proto = state.protocol.read().await;
+        assert!(!proto.sessions.contains_key("hub"));
+        assert!(proto.sessions.contains_key("hub-cx"));
+    }
+
+    #[tokio::test]
+    async fn rename_rejects_trusted_local_claim_resolving_to_sibling() {
+        let state = crate::state::AppState::new_for_test();
+        for (id, pane, backend_session_id) in [
+            ("hub", "%hub", "hub-thread"),
+            ("sibling", "%sibling", "sibling-thread"),
+        ] {
+            state
+                .apply_and_execute(crate::daemon_protocol::Event::Register {
+                    id: id.into(),
+                    pane: Some(pane.into()),
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        backend: Some("codex-cli".into()),
+                        backend_session_id: Some(backend_session_id.into()),
+                        ..Default::default()
+                    },
+                })
+                .await;
+        }
+
+        let (status, body) = rename(
+            State(state.clone()),
+            Json(RenameBody {
+                old_id: "hub".into(),
+                new_id: "hub-cx".into(),
+                sender_ctx: Some(trusted_local_sender_context(
+                    None,
+                    None,
+                    Some(crate::backend::BackendSessionIdentity {
+                        backend: "codex-cli".into(),
+                        session_id: "sibling-thread".into(),
+                    }),
+                )),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN, "body: {:?}", body.0);
+        let proto = state.protocol.read().await;
+        assert!(proto.sessions.contains_key("hub"));
+        assert!(!proto.sessions.contains_key("hub-cx"));
+    }
+
+    #[tokio::test]
+    async fn rename_accepts_legacy_body_without_sender_context() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "legacy".into(),
+                pane: Some("%legacy".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+
+        let body: RenameBody = serde_json::from_value(serde_json::json!({
+            "old_id": "legacy",
+            "new_id": "legacy-renamed"
+        }))
+        .expect("legacy rename body must remain compatible");
+        let (status, response) = rename(State(state.clone()), Json(body)).await;
+
+        assert_eq!(status, StatusCode::OK, "body: {:?}", response.0);
+        let proto = state.protocol.read().await;
+        assert!(proto.sessions.contains_key("legacy-renamed"));
     }
 
     #[tokio::test]

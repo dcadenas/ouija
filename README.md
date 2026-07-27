@@ -173,6 +173,7 @@ ouija ask <to> "msg" # send a message expecting a reply
 ouija tell <to> "msg" # fire-and-forget message
 ouija reply <to> <id> "msg" # reply to a message
 ouija reply <to> <id> --stdin < reply.txt # safer for generated/multiline text
+ouija rename <new-id> --from <current-id> # rename an exact Local session
 ouija announce --role "..." --bulletin "..." # update your metadata
 ouija spawn-session <name> --no-parent-session --when-done keep-open --prompt "..." # start a new session
 ouija nodes          # list connected nodes
@@ -196,7 +197,7 @@ wake a session without a manual reminder. Ouija supplies the concrete
 `clear-reminder` command and current ID in each injected nudge, so manual
 reminder text must not include its own clearing command.
 
-Outside tmux, such as an OpenCode HTTP/API tool process, run `ouija whoami` to resolve your own session id. Implicit resolution remains fail-closed when no pane, environment, or complete backend pair proves one Local owner. For an explicit local send, an exact public Local id from injected context or the operator remains authoritative despite missing, not-found, or incomplete backend evidence: `ouija ask <to> "msg" --from <public-ouija-id>`. The daemon rejects absent, Remote/Human, and sibling-conflicted claims. Never guess a sender id (project directory name, branch name, or an `ouija ls` entry), and never use a backend label or opaque backend session id as `--from`.
+Outside tmux, such as an OpenCode HTTP/API tool process, run `ouija whoami` to resolve your own session id. Implicit resolution remains fail-closed when no pane, environment, or complete backend pair proves one Local owner. For an explicit local send or rename, an exact public Local id from injected context or the operator remains authoritative despite missing, not-found, or incomplete backend evidence: `ouija ask <to> "msg" --from <public-ouija-id>` or `ouija rename <new-id> --from <current-public-id>`. The daemon rejects absent, Remote/Human, and sibling-conflicted claims. Never guess a sender id (project directory name, branch name, or an `ouija ls` entry), and never use a backend label or opaque backend session id as `--from`.
 
 Run `ouija --help` for the full command list.
 

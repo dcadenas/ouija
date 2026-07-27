@@ -171,6 +171,7 @@ Codex learns the mesh two complementary ways:
    ouija ask <target> "question" --from <your-public-id>
    ouija tell <target> "note" --from <your-public-id>
    ouija reply <target> <msg-id> "answer" --from <your-public-id>
+   ouija rename <new-public-id> --from <your-public-id>
    ```
 
    For generated or multi-line text, use `--stdin` or `--message-file` instead
