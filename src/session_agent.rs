@@ -1279,9 +1279,11 @@ mod tests {
         assert!(message.contains("stored prompt"));
         assert!(message.contains("will be replayed"));
         assert!(message.contains("<<'OUIJA_CONTINUATION'"));
-        assert!(message.contains(
-            "ouija restart-session \"feature-worker\" --fresh --one-shot-file /dev/stdin"
-        ));
+        assert!(
+            message.contains(
+                "ouija restart-session 'feature-worker' --fresh --one-shot-file /dev/stdin"
+            )
+        );
         server.abort();
     }
 
