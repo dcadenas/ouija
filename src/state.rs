@@ -21,6 +21,32 @@ struct OwnedSessionAgent {
     actor: ActorRef<crate::session_agent::SessionMsg>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RestartTestCheckpoint {
+    HardBeforeCompletion,
+    SoftAfterBackendClaim,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct RestartTestControl {
+    pub checkpoint: RestartTestCheckpoint,
+    pub reached: Arc<tokio::sync::Notify>,
+    pub release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl RestartTestControl {
+    pub(crate) fn new(checkpoint: RestartTestCheckpoint) -> Self {
+        Self {
+            checkpoint,
+            reached: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+}
+
 /// Sanitize a name into a valid session ID (lowercase alphanumeric + dashes).
 pub fn sanitize_session_id(name: &str) -> String {
     name.to_lowercase()
@@ -682,6 +708,8 @@ pub struct AppState {
     last_reciprocated: std::sync::Mutex<HashMap<String, std::time::Instant>>,
     /// Active session agents keyed by exact lifecycle owner.
     session_agents: RwLock<HashMap<crate::daemon_protocol::ResourceOwner, OwnedSessionAgent>>,
+    #[cfg(test)]
+    restart_test_control: std::sync::Mutex<Option<RestartTestControl>>,
     /// Per-resource async gates serialize external pane/backend claims and cleanup
     /// without holding the protocol lock across tmux, process, or HTTP I/O.
     resource_gates:
@@ -1095,6 +1123,7 @@ impl AppState {
             connected_npubs: std::sync::Mutex::new(HashMap::new()),
             last_reciprocated: std::sync::Mutex::new(HashMap::new()),
             session_agents: RwLock::new(HashMap::new()),
+            restart_test_control: std::sync::Mutex::new(None),
             resource_gates: std::sync::Mutex::new(HashMap::new()),
             project_index: RwLock::new(HashMap::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
@@ -1132,6 +1161,8 @@ impl AppState {
             connected_npubs: std::sync::Mutex::new(HashMap::new()),
             last_reciprocated: std::sync::Mutex::new(HashMap::new()),
             session_agents: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            restart_test_control: std::sync::Mutex::new(None),
             resource_gates: std::sync::Mutex::new(HashMap::new()),
             project_index: RwLock::new(HashMap::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
@@ -1145,6 +1176,28 @@ impl AppState {
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
             compact_in_progress: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_restart_test_control(&self, control: RestartTestControl) {
+        *self
+            .restart_test_control
+            .lock()
+            .expect("restart test control mutex poisoned") = Some(control);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_restart_test_checkpoint(&self, checkpoint: RestartTestCheckpoint) {
+        let control = self
+            .restart_test_control
+            .lock()
+            .expect("restart test control mutex poisoned")
+            .clone()
+            .filter(|control| control.checkpoint == checkpoint);
+        if let Some(control) = control {
+            control.reached.notify_one();
+            control.release.notified().await;
+        }
     }
 
     fn resource_gate(&self, key: ResourceGateKey) -> Arc<tokio::sync::Mutex<()>> {
@@ -2137,17 +2190,63 @@ impl AppState {
                 session_start_credential,
                 expected_repair_reservation,
             );
-            if matches!(
-                result.outcome,
-                crate::daemon_protocol::StageFreshLaunchOutcome::Staged { .. }
-            ) && let Err(error) = self.persist_protocol_state(&state)
+            let target_owner = match result.outcome {
+                crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
+                    Some(crate::daemon_protocol::ResourceOwner {
+                        session_id: lease_owner.session_id.clone(),
+                        incarnation,
+                    })
+                }
+                _ => None,
+            };
+            let target_pane = target_owner.as_ref().and_then(|owner| {
+                state
+                    .session_agent_pane_for_owner(owner)
+                    .map(|pane| pane.map(str::to_owned))
+            });
+            let prepared = if let (Some(owner), Some(pane)) =
+                (target_owner.as_ref(), target_pane.as_ref())
             {
+                match self
+                    .prepare_session_agent(owner.clone(), pane.clone())
+                    .await
+                {
+                    Ok(agent) => Some(agent),
+                    Err(error) => {
+                        *state = before;
+                        tracing::warn!(
+                            session_id = %lease_owner.session_id,
+                            "failed to prepare restart target receiver: {error}"
+                        );
+                        return crate::daemon_protocol::StageFreshLaunchOutcome::PersistenceFailed;
+                    }
+                }
+            } else {
+                None
+            };
+            if target_owner.is_some()
+                && let Err(error) = self.persist_protocol_state(&state)
+            {
+                if let Some(agent) = prepared {
+                    agent.actor.stop(None);
+                }
                 *state = before;
                 tracing::warn!(
                     session_id = %lease_owner.session_id,
                     "failed to persist restart target authority: {error}"
                 );
                 return crate::daemon_protocol::StageFreshLaunchOutcome::PersistenceFailed;
+            }
+            if let Some(target_owner) = target_owner {
+                let mut agents = self.session_agents.write().await;
+                if let Some(incumbent) = agents.remove(&lease_owner) {
+                    incumbent.actor.stop(None);
+                }
+                if let Some(prepared) = prepared {
+                    if let Some(displaced) = agents.insert(target_owner, prepared) {
+                        displaced.actor.stop(None);
+                    }
+                }
             }
             let effects = result
                 .effects
@@ -2252,11 +2351,58 @@ impl AppState {
                     },
                 ));
             }
+            let target_pane = (result.outcome
+                == crate::daemon_protocol::LifecycleMutationOutcome::Applied)
+                .then(|| {
+                    state
+                        .session_agent_pane_for_owner(&target_owner)
+                        .map(|pane| pane.map(str::to_owned))
+                })
+                .flatten();
+            let needs_prepared = if let Some(pane) = target_pane.as_ref() {
+                self.session_agents
+                    .read()
+                    .await
+                    .get(&target_owner)
+                    .is_none_or(|agent| agent.pane != *pane)
+            } else {
+                false
+            };
+            let prepared = if needs_prepared {
+                match self
+                    .prepare_session_agent(
+                        target_owner.clone(),
+                        target_pane
+                            .clone()
+                            .expect("completion receiver pane was selected"),
+                    )
+                    .await
+                {
+                    Ok(agent) => Some(agent),
+                    Err(error) => {
+                        *state = before;
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
             if result.outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied
                 && let Err(error) = self.persist_protocol_state(&state)
             {
+                if let Some(agent) = prepared {
+                    agent.actor.stop(None);
+                }
                 *state = before;
                 return Err(error);
+            }
+            if result.outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied {
+                let mut agents = self.session_agents.write().await;
+                if let Some(prepared) = prepared
+                    && let Some(displaced) = agents.insert(target_owner.clone(), prepared)
+                {
+                    displaced.actor.stop(None);
+                }
             }
             let effects = result
                 .effects
@@ -2271,7 +2417,7 @@ impl AppState {
     }
 
     pub async fn record_restart_backend_claim(
-        &self,
+        self: &Arc<Self>,
         lease_owner: &crate::daemon_protocol::ResourceOwner,
         target_owner: &crate::daemon_protocol::ResourceOwner,
         backend: String,
@@ -2287,11 +2433,57 @@ impl AppState {
             backend,
             backend_session_id,
         );
+        let target_pane = (outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied)
+            .then(|| {
+                state
+                    .session_agent_pane_for_owner(target_owner)
+                    .map(|pane| pane.map(str::to_owned))
+            })
+            .flatten();
+        let needs_prepared = if let Some(pane) = target_pane.as_ref() {
+            self.session_agents
+                .read()
+                .await
+                .get(target_owner)
+                .is_none_or(|agent| agent.pane != *pane)
+        } else {
+            false
+        };
+        let prepared = if needs_prepared {
+            match self
+                .prepare_session_agent(
+                    target_owner.clone(),
+                    target_pane
+                        .clone()
+                        .expect("backend claim receiver pane was selected"),
+                )
+                .await
+            {
+                Ok(agent) => Some(agent),
+                Err(error) => {
+                    *state = before;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         if outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied
             && let Err(error) = self.persist_protocol_state(&state)
         {
+            if let Some(agent) = prepared {
+                agent.actor.stop(None);
+            }
             *state = before;
             return Err(error);
+        }
+        if outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied
+            && let Some(prepared) = prepared
+        {
+            let mut agents = self.session_agents.write().await;
+            if let Some(displaced) = agents.insert(target_owner.clone(), prepared) {
+                displaced.actor.stop(None);
+            }
         }
         Ok(outcome)
     }
@@ -2366,11 +2558,44 @@ impl AppState {
         let before = state.clone();
         let result =
             state.rollback_restart_launch(&lease_owner, &target_owner, provisional_pane.as_deref());
+        let incumbent_pane = (result.outcome
+            == crate::daemon_protocol::LifecycleMutationOutcome::Applied)
+            .then(|| {
+                state
+                    .session_agent_pane_for_owner(&lease_owner)
+                    .map(|pane| pane.map(str::to_owned))
+            })
+            .flatten();
+        let prepared = if let Some(pane) = incumbent_pane {
+            match self.prepare_session_agent(lease_owner.clone(), pane).await {
+                Ok(agent) => Some(agent),
+                Err(error) => {
+                    *state = before;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         if result.outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied
             && let Err(error) = self.persist_protocol_state(&state)
         {
+            if let Some(agent) = prepared {
+                agent.actor.stop(None);
+            }
             *state = before;
             return Err(error);
+        }
+        if result.outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied {
+            let mut agents = self.session_agents.write().await;
+            if let Some(target) = agents.remove(&target_owner) {
+                target.actor.stop(None);
+            }
+            if let Some(prepared) = prepared
+                && let Some(displaced) = agents.insert(lease_owner.clone(), prepared)
+            {
+                displaced.actor.stop(None);
+            }
         }
         let effects = result
             .effects
@@ -2418,12 +2643,58 @@ impl AppState {
         let _resource = pane_gate.lock().await;
         let mut proto = self.protocol.write().await;
         let before = proto.clone();
-        let outcome = proto.record_inert_start_pane(lease_owner, pane_owner, pane);
+        let outcome = proto.record_inert_start_pane(lease_owner, pane_owner.clone(), pane);
+        let target_pane = (outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied)
+            .then(|| {
+                proto
+                    .session_agent_pane_for_owner(&pane_owner)
+                    .map(|pane| pane.map(str::to_owned))
+            })
+            .flatten();
+        let needs_prepared = if let Some(pane) = target_pane.as_ref() {
+            self.session_agents
+                .read()
+                .await
+                .get(&pane_owner)
+                .is_none_or(|agent| agent.pane != *pane)
+        } else {
+            false
+        };
+        let prepared = if needs_prepared {
+            match self
+                .prepare_session_agent(
+                    pane_owner.clone(),
+                    target_pane
+                        .clone()
+                        .expect("inert pane receiver claim was selected"),
+                )
+                .await
+            {
+                Ok(agent) => Some(agent),
+                Err(error) => {
+                    *proto = before;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         if outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied
             && let Err(error) = self.persist_protocol_state(&proto)
         {
+            if let Some(agent) = prepared {
+                agent.actor.stop(None);
+            }
             *proto = before;
             return Err(error);
+        }
+        if outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied
+            && let Some(prepared) = prepared
+        {
+            let mut agents = self.session_agents.write().await;
+            if let Some(displaced) = agents.insert(pane_owner, prepared) {
+                displaced.actor.stop(None);
+            }
         }
         Ok(outcome)
     }
@@ -3515,6 +3786,25 @@ impl AppState {
             .insert(t.transport_name().to_string(), t);
     }
 
+    /// Prepare a receiver without publishing it in the owner registry.
+    async fn prepare_session_agent(
+        self: &Arc<Self>,
+        owner: crate::daemon_protocol::ResourceOwner,
+        pane: Option<String>,
+    ) -> anyhow::Result<OwnedSessionAgent> {
+        let agent = crate::session_agent::SessionAgent {
+            app_state: Arc::clone(self),
+        };
+        let args = crate::session_agent::SessionAgentArgs {
+            owner: owner.clone(),
+            pane: pane.clone(),
+        };
+        let (actor, _handle) = Actor::spawn(None, agent, args)
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to spawn session agent: {error}"))?;
+        Ok(OwnedSessionAgent { owner, pane, actor })
+    }
+
     /// Spawn an agent only while the exact owner and optional pane are current.
     pub async fn spawn_session_agent(
         self: &Arc<Self>,
@@ -3522,37 +3812,36 @@ impl AppState {
         pane: Option<&str>,
     ) {
         let protocol = self.protocol.read().await;
-        if protocol
-            .sessions
-            .get(&owner.session_id)
-            .is_none_or(|session| {
-                session.owner() != *owner || session.session_agent_pane() != Some(pane)
-            })
-        {
+        if protocol.session_agent_pane_for_owner(owner) != Some(pane) {
             return;
         }
 
-        let mut agents = self.session_agents.write().await;
-        if let Some(old) = agents.remove(owner) {
-            old.actor.stop(None);
+        {
+            let agents = self.session_agents.read().await;
+            if agents
+                .get(owner)
+                .is_some_and(|agent| agent.pane.as_deref() == pane)
+            {
+                return;
+            }
         }
-        let agent = crate::session_agent::SessionAgent {
-            app_state: Arc::clone(self),
-        };
-        let args = crate::session_agent::SessionAgentArgs {
-            owner: owner.clone(),
-            pane: pane.map(String::from),
-        };
-        match Actor::spawn(None, agent, args).await {
-            Ok((actor_ref, _handle)) => {
-                agents.insert(
-                    owner.clone(),
-                    OwnedSessionAgent {
-                        owner: owner.clone(),
-                        pane: pane.map(String::from),
-                        actor: actor_ref,
-                    },
-                );
+
+        match self
+            .prepare_session_agent(owner.clone(), pane.map(String::from))
+            .await
+        {
+            Ok(prepared) => {
+                let mut agents = self.session_agents.write().await;
+                if agents
+                    .get(owner)
+                    .is_some_and(|agent| agent.pane.as_deref() == pane)
+                {
+                    prepared.actor.stop(None);
+                    return;
+                }
+                if let Some(old) = agents.insert(owner.clone(), prepared) {
+                    old.actor.stop(None);
+                }
                 tracing::info!(
                     session = %owner.session_id,
                     incarnation = %owner.incarnation,
@@ -3635,18 +3924,70 @@ impl AppState {
         owner: &crate::daemon_protocol::ResourceOwner,
     ) -> Option<ActorRef<crate::session_agent::SessionMsg>> {
         let protocol = self.protocol.read().await;
-        if protocol
-            .sessions
-            .get(&owner.session_id)
-            .is_none_or(|session| session.owner() != *owner)
-        {
-            return None;
-        }
+        let pane = protocol.session_agent_pane_for_owner(owner)?;
         self.session_agents
             .read()
             .await
             .get(owner)
+            .filter(|agent| agent.pane.as_deref() == pane)
             .map(|agent| agent.actor.clone())
+    }
+
+    /// Resolve hook evidence only when the exact current owner also has its
+    /// matching optional-pane receiver published.
+    pub(crate) async fn exact_hook_session_owner(
+        &self,
+        pane: Option<&str>,
+        backend_session_id: Option<&str>,
+        incarnation: crate::daemon_protocol::SessionIncarnation,
+    ) -> Option<crate::daemon_protocol::ResourceOwner> {
+        if pane.is_none() && backend_session_id.is_none() {
+            return None;
+        }
+        let protocol = self.protocol.read().await;
+        let session = protocol
+            .sessions
+            .values()
+            .find(|session| session.metadata.session_incarnation == incarnation)?;
+        let owner = session.owner();
+        let staged_lease = protocol
+            .lifecycle_leases
+            .get(&owner.session_id)
+            .filter(|lease| {
+                lease.phase == crate::daemon_protocol::LifecyclePhase::Restarting
+                    && lease.restart_target_owner.as_ref() == Some(&owner)
+                    && lease.restart_previous.is_some()
+            });
+        let pane_matches = pane.is_none_or(|pane| {
+            staged_lease
+                .and_then(|lease| {
+                    (lease.inert_pane_owner.as_ref() == Some(&owner))
+                        .then_some(lease.inert_pane.as_deref())
+                        .flatten()
+                })
+                .map_or_else(
+                    || session.pane.as_deref() == Some(pane),
+                    |claimed| claimed == pane,
+                )
+        });
+        let backend_matches = backend_session_id.is_none_or(|backend_session_id| {
+            session.metadata.backend_session_id.as_deref() == Some(backend_session_id)
+                || staged_lease.is_some_and(|lease| {
+                    lease.backend_session_owner.as_ref() == Some(&owner)
+                        && lease.backend_session_id.as_deref() == Some(backend_session_id)
+                })
+        });
+        if !pane_matches || !backend_matches {
+            return None;
+        }
+
+        let receiver_pane = protocol.session_agent_pane_for_owner(&owner)?;
+        self.session_agents
+            .read()
+            .await
+            .get(&owner)
+            .filter(|agent| agent.pane.as_deref() == receiver_pane)
+            .map(|_| owner)
     }
 
     /// Send a message to a session's agent (if it exists).
@@ -6164,6 +6505,46 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn restart_stage_persistence_failure_keeps_incumbent_receiver() {
+        // Break caught: failed stage persistence must not publish either half
+        // of the protocol/receiver ownership swap.
+        let config = test_config();
+        let state = AppState::new(config.clone());
+        proto_register(&state, "worker", Some("%1")).await;
+        let incumbent = state.protocol.read().await.sessions["worker"].owner();
+        let incumbent_actor = state.session_agents.read().await[&incumbent].actor.clone();
+        assert_eq!(
+            state.claim_existing_start(&incumbent).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        std::fs::create_dir(config.data_dir.join("sessions.tmp")).unwrap();
+
+        let outcome = state
+            .stage_restart_launch(
+                &incumbent,
+                "claude-code".into(),
+                true,
+                true,
+                Some(60),
+                None,
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            outcome,
+            crate::daemon_protocol::StageFreshLaunchOutcome::PersistenceFailed
+        );
+        assert_eq!(
+            state.protocol.read().await.sessions["worker"].owner(),
+            incumbent
+        );
+        let agents = state.session_agents.read().await;
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[&incumbent].actor, incumbent_actor);
+    }
+
+    #[tokio::test]
     async fn fresh_restart_completion_persistence_failure_preserves_active_context_accounting() {
         // Break caught: a persistence error after fresh completion must keep
         // the durable provisional target intact so exact rollback can restore
@@ -6256,6 +6637,290 @@ pub(crate) mod tests {
             state.protocol.read().await.sessions["worker"],
             literal_incumbent
         );
+    }
+
+    #[tokio::test]
+    async fn restart_stage_atomically_replaces_incumbent_activity_receiver() {
+        // Break caught: publishing the target protocol owner without swapping
+        // the exact-owner receiver loses hooks during staged backend work.
+        let state = AppState::new_for_test();
+        proto_register(&state, "worker", Some("%1")).await;
+        let incumbent = state.protocol.read().await.sessions["worker"].owner();
+        assert_eq!(
+            state.claim_existing_start(&incumbent).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+
+        let target = match state
+            .stage_restart_launch(
+                &incumbent,
+                "claude-code".into(),
+                true,
+                true,
+                Some(60),
+                None,
+                None,
+            )
+            .await
+        {
+            crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
+                crate::daemon_protocol::ResourceOwner {
+                    session_id: "worker".into(),
+                    incarnation,
+                }
+            }
+            other => panic!("expected staged restart, got {other:?}"),
+        };
+
+        let protocol = state.protocol.read().await;
+        let agents = state.session_agents.read().await;
+        assert_eq!(protocol.sessions["worker"].owner(), target);
+        assert!(
+            !agents.contains_key(&incumbent),
+            "the incumbent receiver must disappear in the same publication"
+        );
+        assert_eq!(
+            agents.get(&target).and_then(|agent| agent.pane.as_deref()),
+            Some("%1"),
+            "the staged target must own the exact current pane receiver"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_completion_reuses_staged_activity_receiver() {
+        // Break caught: completion must not replace the staged mailbox and
+        // discard actor-local timers or queued continuation state.
+        let state = AppState::new_for_test();
+        proto_register(&state, "worker", Some("%1")).await;
+        let incumbent = state.protocol.read().await.sessions["worker"].owner();
+        assert_eq!(
+            state.claim_existing_start(&incumbent).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        let target = match state
+            .stage_restart_launch(
+                &incumbent,
+                "claude-code".into(),
+                true,
+                true,
+                Some(60),
+                None,
+                None,
+            )
+            .await
+        {
+            crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
+                crate::daemon_protocol::ResourceOwner {
+                    session_id: "worker".into(),
+                    incarnation,
+                }
+            }
+            other => panic!("expected staged restart, got {other:?}"),
+        };
+        assert!(
+            state
+                .try_set_pending_compact_continuation("worker", "staged mailbox value".into())
+                .await
+        );
+        let staged_actor = state.session_agents.read().await[&target].actor.clone();
+        let metadata = state.protocol.read().await.sessions["worker"]
+            .metadata
+            .clone();
+
+        assert_eq!(
+            state
+                .complete_requested_restart_launch(
+                    &incumbent,
+                    &target,
+                    Some("%1".into()),
+                    metadata,
+                    false,
+                    true,
+                )
+                .await
+                .unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+
+        let completed_actor = state.session_agents.read().await[&target].actor.clone();
+        assert_eq!(completed_actor, staged_actor);
+        assert_eq!(
+            state.drain_agent_compact_continuation_owned(&target).await,
+            Some("staged mailbox value".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_rollback_rejects_target_and_restores_incumbent_receiver() {
+        // Break caught: rollback must swap receiver authority with the literal
+        // incumbent instead of leaving either a dead incumbent or live target.
+        let state = AppState::new_for_test();
+        proto_register(&state, "worker", Some("%1")).await;
+        let incumbent = state.protocol.read().await.sessions["worker"].owner();
+        assert_eq!(
+            state.claim_existing_start(&incumbent).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        let target = match state
+            .stage_restart_launch(
+                &incumbent,
+                "claude-code".into(),
+                true,
+                true,
+                Some(60),
+                None,
+                None,
+            )
+            .await
+        {
+            crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
+                crate::daemon_protocol::ResourceOwner {
+                    session_id: "worker".into(),
+                    incarnation,
+                }
+            }
+            other => panic!("expected staged restart, got {other:?}"),
+        };
+        assert!(
+            state
+                .notify_agent_owned(&target, crate::session_agent::SessionMsg::Active)
+                .await
+        );
+
+        assert_eq!(
+            state
+                .rollback_restart_launch(&incumbent, &target, None)
+                .await
+                .unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        assert!(
+            !state
+                .notify_agent_owned(&target, crate::session_agent::SessionMsg::Active)
+                .await
+        );
+        assert!(
+            state
+                .notify_agent_owned(&incumbent, crate::session_agent::SessionMsg::Active)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_rollback_persistence_failure_keeps_target_receiver() {
+        // Break caught: a failed rollback write must retain the staged target
+        // protocol owner and receiver rather than publishing an incumbent
+        // receiver against the still-durable target row.
+        let config = test_config();
+        let state = AppState::new(config.clone());
+        proto_register(&state, "worker", Some("%1")).await;
+        let incumbent = state.protocol.read().await.sessions["worker"].owner();
+        assert_eq!(
+            state.claim_existing_start(&incumbent).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        let target = match state
+            .stage_restart_launch(
+                &incumbent,
+                "claude-code".into(),
+                true,
+                true,
+                Some(60),
+                None,
+                None,
+            )
+            .await
+        {
+            crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
+                crate::daemon_protocol::ResourceOwner {
+                    session_id: "worker".into(),
+                    incarnation,
+                }
+            }
+            other => panic!("expected staged restart, got {other:?}"),
+        };
+        let target_actor = state.session_agents.read().await[&target].actor.clone();
+        std::fs::create_dir(config.data_dir.join("sessions.tmp")).unwrap();
+
+        assert!(
+            state
+                .rollback_restart_launch(&incumbent, &target, None)
+                .await
+                .is_err()
+        );
+
+        assert_eq!(
+            state.protocol.read().await.sessions["worker"].owner(),
+            target
+        );
+        let agents = state.session_agents.read().await;
+        assert!(!agents.contains_key(&incumbent));
+        assert_eq!(agents[&target].actor, target_actor);
+    }
+
+    #[tokio::test]
+    async fn staged_paneless_receiver_processes_existing_activity_messages() {
+        // Break caught: the optional-pane target receiver must treat its exact
+        // staged lease as current even before the new backend binding commits.
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_old".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    fresh_context_after_active_secs: Some(60),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let incumbent = state.protocol.read().await.sessions["worker"].owner();
+        assert_eq!(
+            state.claim_existing_start(&incumbent).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        let target = match state
+            .stage_restart_launch(
+                &incumbent,
+                "opencode".into(),
+                true,
+                true,
+                Some(60),
+                None,
+                None,
+            )
+            .await
+        {
+            crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
+                crate::daemon_protocol::ResourceOwner {
+                    session_id: "worker".into(),
+                    incarnation,
+                }
+            }
+            other => panic!("expected staged restart, got {other:?}"),
+        };
+
+        assert!(
+            state
+                .notify_agent_owned(&target, crate::session_agent::SessionMsg::Active)
+                .await
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.protocol.read().await.sessions["worker"]
+                    .metadata
+                    .active_context_segment_started_at
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the staged paneless receiver must process Active");
     }
 
     /// Config whose opencode serve port (`config.port + 320` = 320) is

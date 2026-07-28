@@ -149,8 +149,8 @@ impl SessionAgentState {
         }
     }
 
-    fn owns(&self, session: &crate::daemon_protocol::SessionEntry) -> bool {
-        session.owner() == self.owner && session.session_agent_pane() == Some(self.pane.as_deref())
+    fn owns(&self, protocol: &crate::daemon_protocol::DaemonState) -> bool {
+        protocol.session_agent_pane_for_owner(&self.owner) == Some(self.pane.as_deref())
     }
 }
 
@@ -206,12 +206,8 @@ impl Actor for SessionAgent {
                     .protocol
                     .read()
                     .await
-                    .sessions
-                    .get(&new_owner.session_id)
-                    .is_some_and(|session| {
-                        session.owner() == *new_owner
-                            && session.session_agent_pane() == Some(state.pane.as_deref())
-                    });
+                    .session_agent_pane_for_owner(new_owner)
+                    == Some(state.pane.as_deref());
             if renamed_is_current {
                 tracing::info!(
                     old = %old_owner.session_id,
@@ -252,10 +248,10 @@ impl Actor for SessionAgent {
                 // triggers Active→Stopped→repeat).
                 let (has_pending, has_reminder) = {
                     let proto = self.app_state.protocol.read().await;
-                    let session = proto
-                        .sessions
-                        .get(&state.owner.session_id)
-                        .filter(|session| state.owns(session));
+                    let session = state
+                        .owns(&proto)
+                        .then(|| proto.sessions.get(&state.owner.session_id))
+                        .flatten();
                     let pending = session.is_some()
                         && proto
                             .pending_replies
@@ -284,11 +280,7 @@ impl Actor for SessionAgent {
                     let cutoff = Utc::now().timestamp() - timeout as i64;
                     let pending = {
                         let protocol = self.app_state.protocol.read().await;
-                        if protocol
-                            .sessions
-                            .get(&state.owner.session_id)
-                            .is_some_and(|session| state.owns(session))
-                        {
+                        if state.owns(&protocol) {
                             protocol
                                 .pending_replies
                                 .get(&state.owner.session_id)
@@ -338,11 +330,7 @@ impl Actor for SessionAgent {
             SessionMsg::GetPendingReplies(reply) => {
                 if !reply.is_closed() {
                     let protocol = self.app_state.protocol.read().await;
-                    let pending = if protocol
-                        .sessions
-                        .get(&state.owner.session_id)
-                        .is_some_and(|session| state.owns(session))
-                    {
+                    let pending = if state.owns(&protocol) {
                         protocol
                             .pending_replies
                             .get(&state.owner.session_id)
@@ -364,10 +352,10 @@ impl Actor for SessionAgent {
                 // Compute average interval from iteration_log
                 let avg = {
                     let proto = self.app_state.protocol.read().await;
-                    proto
-                        .sessions
-                        .get(&state.owner.session_id)
-                        .filter(|session| state.owns(session))
+                    state
+                        .owns(&proto)
+                        .then(|| proto.sessions.get(&state.owner.session_id))
+                        .flatten()
                         .map(|s| compute_average_loop_interval(&s.metadata.iteration_log))
                         .unwrap_or(None)
                 };
@@ -430,10 +418,7 @@ impl Actor for SessionAgent {
             }
             SessionMsg::DrainPendingCompactContinuation(reply) => {
                 let protocol = self.app_state.protocol.read().await;
-                let current = protocol
-                    .sessions
-                    .get(&state.owner.session_id)
-                    .is_some_and(|session| state.owns(session));
+                let current = state.owns(&protocol);
                 if !reply.is_closed() {
                     let value = current
                         .then(|| state.pending_compact_continuation.take())
@@ -474,10 +459,10 @@ impl Actor for SessionAgent {
                     // is ever bypassed (watchdog, future caller).
                     let (reminder, has_lifecycle_policy, vim_mode, pending) = {
                         let proto = self.app_state.protocol.read().await;
-                        let session = proto
-                            .sessions
-                            .get(&state.owner.session_id)
-                            .filter(|session| state.owns(session));
+                        let session = state
+                            .owns(&proto)
+                            .then(|| proto.sessions.get(&state.owner.session_id))
+                            .flatten();
                         let reminder = session
                             .filter(|s| s.metadata.has_active_reminder())
                             .and_then(|s| {
@@ -590,11 +575,7 @@ impl SessionAgent {
     /// local alias only when incarnation and pane are unchanged.
     async fn refresh_renamed_owner(&self, state: &mut SessionAgentState) -> bool {
         let protocol = self.app_state.protocol.read().await;
-        if protocol
-            .sessions
-            .get(&state.owner.session_id)
-            .is_some_and(|session| state.owns(session))
-        {
+        if state.owns(&protocol) {
             return true;
         }
         let Some(new_id) = protocol.aliases.get(&state.owner.session_id) else {
@@ -603,8 +584,9 @@ impl SessionAgent {
         let Some(session) = protocol.sessions.get(new_id) else {
             return false;
         };
-        if session.metadata.session_incarnation != state.owner.incarnation
-            || session.session_agent_pane() != Some(state.pane.as_deref())
+        let new_owner = session.owner();
+        if new_owner.incarnation != state.owner.incarnation
+            || protocol.session_agent_pane_for_owner(&new_owner) != Some(state.pane.as_deref())
         {
             return false;
         }
@@ -613,16 +595,7 @@ impl SessionAgent {
     }
 
     async fn is_current(&self, state: &SessionAgentState) -> bool {
-        self.app_state
-            .protocol
-            .read()
-            .await
-            .sessions
-            .get(&state.owner.session_id)
-            .is_some_and(|session| {
-                session.owner() == state.owner
-                    && session.session_agent_pane() == Some(state.pane.as_deref())
-            })
+        state.owns(&*self.app_state.protocol.read().await)
     }
 
     fn reject_stale_message(message: SessionMsg) {
@@ -655,10 +628,7 @@ impl SessionAgent {
         reply: ractor::RpcReplyPort<bool>,
     ) -> bool {
         let protocol = self.app_state.protocol.read().await;
-        let current = protocol
-            .sessions
-            .get(&state.owner.session_id)
-            .is_some_and(|session| state.owns(session));
+        let current = state.owns(&protocol);
         if reply.is_closed() {
             return current;
         }
@@ -675,17 +645,12 @@ impl SessionAgent {
         let Some(pane) = state.pane.as_deref() else {
             return;
         };
-        let vim_mode = self
-            .app_state
-            .protocol
-            .read()
-            .await
-            .sessions
-            .get(&state.owner.session_id)
-            .filter(|session| {
-                session.owner() == state.owner && session.session_agent_pane() == Some(Some(pane))
-            })
-            .map(|s| s.metadata.vim_mode)
+        let vim_mode = self.app_state.protocol.read().await;
+        let vim_mode = vim_mode
+            .session_agent_pane_for_owner(&state.owner)
+            .filter(|claimed| *claimed == Some(pane))
+            .and_then(|_| vim_mode.sessions.get(&state.owner.session_id))
+            .map(|session| session.metadata.vim_mode)
             .unwrap_or(false);
 
         for p in entries {
@@ -715,12 +680,9 @@ impl SessionAgent {
         let meta = {
             let proto = self.app_state.protocol.read().await;
             proto
-                .sessions
-                .get(&state.owner.session_id)
-                .filter(|session| {
-                    session.owner() == state.owner
-                        && session.session_agent_pane() == Some(Some(pane))
-                })
+                .session_agent_pane_for_owner(&state.owner)
+                .filter(|claimed| *claimed == Some(pane))
+                .and_then(|_| proto.sessions.get(&state.owner.session_id))
                 .map(|s| s.metadata.clone())
         };
 

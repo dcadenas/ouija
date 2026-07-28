@@ -231,6 +231,51 @@ impl SessionEntry {
     }
 }
 
+impl DaemonState {
+    /// Resolve the exact optional-pane claim for an owner's activity receiver.
+    ///
+    /// A staged restart may temporarily own a fallback pane or a newly
+    /// created paneless OpenCode backend only through its matching durable
+    /// lease. Those claims take precedence over the incumbent row copied into
+    /// the staged session so hooks and the receiver agree on one owner.
+    pub(crate) fn session_agent_pane_for_owner(
+        &self,
+        owner: &ResourceOwner,
+    ) -> Option<Option<&str>> {
+        let session = self.sessions.get(&owner.session_id)?;
+        if session.owner() != *owner || !matches!(session.origin, Origin::Local) {
+            return None;
+        }
+
+        let staged_lease = self
+            .lifecycle_leases
+            .get(&owner.session_id)
+            .filter(|lease| {
+                lease.phase == LifecyclePhase::Restarting
+                    && lease.restart_target_owner.as_ref() == Some(owner)
+                    && lease.restart_previous.is_some()
+            });
+        if let Some(lease) = staged_lease
+            && lease.inert_pane_owner.as_ref() == Some(owner)
+            && let Some(pane) = lease.inert_pane.as_deref()
+        {
+            return Some(Some(pane));
+        }
+
+        if let Some(pane) = session.session_agent_pane() {
+            return Some(pane);
+        }
+
+        if staged_lease.is_some()
+            && session.pane.is_none()
+            && session.metadata.backend.as_deref() == Some("opencode")
+        {
+            return Some(None);
+        }
+        None
+    }
+}
+
 /// Where a session originates: local, remote peer, or human operator.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Origin {

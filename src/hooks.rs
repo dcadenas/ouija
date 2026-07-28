@@ -85,18 +85,9 @@ async fn exact_hook_session_owner(
     incarnation: Option<crate::daemon_protocol::SessionIncarnation>,
 ) -> Option<crate::daemon_protocol::ResourceOwner> {
     let incarnation = incarnation?;
-    let proto = state.protocol.read().await;
-    proto
-        .sessions
-        .values()
-        .find(|session| {
-            session.metadata.session_incarnation == incarnation
-                && (pane.is_some_and(|pane| session.pane.as_deref() == Some(pane))
-                    || backend_session_id.is_some_and(|backend_session_id| {
-                        session.metadata.backend_session_id.as_deref() == Some(backend_session_id)
-                    }))
-        })
-        .map(crate::daemon_protocol::SessionEntry::owner)
+    state
+        .exact_hook_session_owner(pane, backend_session_id, incarnation)
+        .await
 }
 
 /// POST /api/hooks/stop
@@ -1137,6 +1128,149 @@ mod tests {
                 .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Active)
                 .await,
             "activity authorized for the old incarnation must not reach the replacement agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_hook_requires_exact_fallback_pane_and_receiver() {
+        // Break caught: a staged incarnation must not authorize the stale
+        // incumbent pane once the lease publishes a different inert pane.
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%old".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        let incumbent = state.protocol.read().await.sessions["worker"].owner();
+        assert_eq!(
+            state.claim_existing_start(&incumbent).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        let target = match state
+            .stage_restart_launch(
+                &incumbent,
+                "claude-code".into(),
+                true,
+                true,
+                Some(60),
+                None,
+                None,
+            )
+            .await
+        {
+            crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
+                crate::daemon_protocol::ResourceOwner {
+                    session_id: "worker".into(),
+                    incarnation,
+                }
+            }
+            other => panic!("expected staged restart, got {other:?}"),
+        };
+        assert_eq!(
+            state
+                .record_inert_start_pane(&incumbent, target.clone(), "%fallback".into())
+                .await
+                .unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+
+        assert_eq!(
+            exact_hook_session_owner(&state, Some("%fallback"), None, Some(target.incarnation))
+                .await,
+            Some(target.clone())
+        );
+        assert_eq!(
+            exact_hook_session_owner(&state, Some("%old"), None, Some(target.incarnation)).await,
+            None
+        );
+        assert!(
+            state
+                .notify_agent_owned(&target, crate::session_agent::SessionMsg::Active)
+                .await,
+            "the exact fallback-pane hook must have a matching receiver"
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_paneless_hook_requires_exact_backend_lease_claim_and_receiver() {
+        // Break caught: a soft OpenCode target cannot authorize hooks from its
+        // incarnation or backend ID independently of the exact lease claim.
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_old".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let incumbent = state.protocol.read().await.sessions["worker"].owner();
+        assert_eq!(
+            state.claim_existing_start(&incumbent).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        let target = match state
+            .stage_restart_launch(
+                &incumbent,
+                "opencode".into(),
+                true,
+                true,
+                Some(60),
+                None,
+                None,
+            )
+            .await
+        {
+            crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
+                crate::daemon_protocol::ResourceOwner {
+                    session_id: "worker".into(),
+                    incarnation,
+                }
+            }
+            other => panic!("expected staged restart, got {other:?}"),
+        };
+
+        assert_eq!(
+            exact_hook_session_owner(&state, None, Some("ses_new"), Some(target.incarnation)).await,
+            None,
+            "the target incarnation alone must not authorize an unclaimed backend"
+        );
+        assert_eq!(
+            state
+                .record_restart_backend_claim(
+                    &incumbent,
+                    &target,
+                    "opencode".into(),
+                    "ses_new".into(),
+                )
+                .await
+                .unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        assert_eq!(
+            exact_hook_session_owner(&state, None, Some("ses_new"), Some(target.incarnation)).await,
+            Some(target.clone())
+        );
+        assert_eq!(
+            exact_hook_session_owner(&state, None, Some("ses_old"), Some(target.incarnation)).await,
+            None
+        );
+        assert_eq!(
+            exact_hook_session_owner(&state, None, Some("ses_new"), Some(incumbent.incarnation))
+                .await,
+            None
+        );
+        assert!(
+            state
+                .notify_agent_owned(&target, crate::session_agent::SessionMsg::Active)
+                .await,
+            "the exact backend-claim hook must have a paneless target receiver"
         );
     }
 

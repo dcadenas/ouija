@@ -3221,11 +3221,8 @@ async fn rollback_claimed_restart(
     if restart_backend_cleanup_pending(state, lease_owner, target_owner).await {
         anyhow::bail!("restart backend cleanup is still pending for target {target_owner:?}");
     }
-    if let Some(provisional_pane) = provisional_pane {
-        remove_inert_start_pane(state, target_owner, provisional_pane).await?;
-    }
     state
-        .rollback_restart_launch(lease_owner, target_owner, None)
+        .rollback_restart_launch(lease_owner, target_owner, provisional_pane)
         .await
 }
 
@@ -4658,6 +4655,12 @@ async fn restart_session_claimed(
                     ..Default::default()
                 },
             };
+            #[cfg(test)]
+            state
+                .wait_restart_test_checkpoint(
+                    crate::state::RestartTestCheckpoint::HardBeforeCompletion,
+                )
+                .await;
             match state
                 .complete_requested_restart_launch(
                     lease_owner,
@@ -4965,6 +4968,10 @@ async fn soft_restart_session_claimed(
             return Err(());
         }
     }
+    #[cfg(test)]
+    state
+        .wait_restart_test_checkpoint(crate::state::RestartTestCheckpoint::SoftAfterBackendClaim)
+        .await;
 
     tracing::info!(
         "soft restart: created new opencode session {new_session_id} for '{name}' (port {port})"
@@ -7945,6 +7952,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hard_restart_preserves_staged_hook_activity_and_due_boundary() {
+        // Break caught: the production hard-restart path must not expose a
+        // staged owner whose real Active/Stopped hooks have no receiver, nor
+        // replace that receiver at completion.
+        use axum::Json;
+        use axum::extract::State as AxumState;
+
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "hard-staged".into(),
+                pane: Some("%old".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    fresh_context_after_active_secs: Some(1),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let control = crate::state::RestartTestControl::new(
+            crate::state::RestartTestCheckpoint::HardBeforeCompletion,
+        );
+        state.set_restart_test_control(control.clone());
+        let restart_state = state.clone();
+        let restart = tokio::spawn(async move {
+            restart_session_with_prompt_controls(
+                &restart_state,
+                "hard-staged",
+                true,
+                Some(1),
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                Some("claude-code"),
+                None,
+                None,
+                None,
+                ParentSessionOverride::PreservePrevious,
+                None,
+            )
+            .await
+        });
+        control.reached.notified().await;
+
+        let (target, pane) = {
+            let protocol = state.protocol.read().await;
+            let target = protocol.sessions["hard-staged"].owner();
+            let lease = &protocol.lifecycle_leases["hard-staged"];
+            (
+                target,
+                lease
+                    .inert_pane
+                    .clone()
+                    .expect("hard restart must publish its fallback pane"),
+            )
+        };
+        let _ = crate::hooks::prompt_submit(
+            AxumState(state.clone()),
+            Json(crate::hooks::PaneBody {
+                pane: Some(pane.clone()),
+                backend_session_id: None,
+                session_incarnation: Some(target.incarnation),
+            }),
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.protocol.read().await.sessions["hard-staged"]
+                    .metadata
+                    .active_context_segment_started_at
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("staged hard Active hook must reach the target receiver");
+        state
+            .protocol
+            .write()
+            .await
+            .sessions
+            .get_mut("hard-staged")
+            .expect("staged hard owner must remain current")
+            .metadata
+            .active_context_segment_started_at = Some(chrono::Utc::now().timestamp() - 2);
+        let _ = crate::hooks::hook_stop(
+            AxumState(state.clone()),
+            Json(crate::hooks::PaneBody {
+                pane: Some(pane),
+                backend_session_id: None,
+                session_incarnation: Some(target.incarnation),
+            }),
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.protocol.read().await.sessions["hard-staged"]
+                    .metadata
+                    .active_context_restart_due
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("staged hard Stopped hook must record the due boundary");
+        assert!(
+            state
+                .try_set_pending_compact_continuation("hard-staged", "hard staged mailbox".into())
+                .await
+        );
+
+        control.release.notify_one();
+        let (message, _, outcome) = restart.await.unwrap();
+        assert_eq!(outcome, RestartOutcome::Restarted, "{message}");
+        let protocol = state.protocol.read().await;
+        let metadata = &protocol.sessions["hard-staged"].metadata;
+        assert_eq!(protocol.sessions["hard-staged"].owner(), target);
+        assert!(metadata.active_context_accumulated_secs >= 2);
+        assert!(metadata.active_context_restart_due);
+        assert!(!metadata.active_context_accounting_provisional);
+        drop(protocol);
+        assert_eq!(
+            state.drain_agent_compact_continuation_owned(&target).await,
+            Some("hard staged mailbox".into())
+        );
+    }
+
+    #[tokio::test]
     async fn rolled_back_fresh_completion_preserves_active_context_policy_and_accounting() {
         // Break caught: a stale success finalizer after rollback must not apply
         // the requested policy or reset the restored incumbent's accounting.
@@ -10372,6 +10515,164 @@ mod tests {
         assert!(!metadata.active_context_restart_due);
         assert!(!metadata.active_context_accounting_provisional);
         assert_eq!(metadata.prompt.as_deref(), Some("stored continuation"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn paneless_soft_restart_preserves_staged_backend_hook_activity_and_due_boundary() {
+        // Break caught: the production paneless soft path must route the
+        // newly claimed backend's real hooks before prompt acceptance and
+        // retain the same target mailbox through completion.
+        use axum::Json;
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+
+        async fn create_session() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "id": "ses_new" }))
+        }
+
+        async fn prompt_async() -> StatusCode {
+            StatusCode::NO_CONTENT
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session", post(create_session))
+            .route("/session/{session_id}/prompt_async", post(prompt_async));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = AppState::new(config);
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "soft-staged".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some(dir.path().display().to_string()),
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_old".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    fresh_context_after_active_secs: Some(1),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let control = crate::state::RestartTestControl::new(
+            crate::state::RestartTestCheckpoint::SoftAfterBackendClaim,
+        );
+        state.set_restart_test_control(control.clone());
+        let restart_state = state.clone();
+        let restart = tokio::spawn(async move {
+            restart_session_with_prompt_controls(
+                &restart_state,
+                "soft-staged",
+                true,
+                Some(1),
+                None,
+                Some("continue"),
+                false,
+                None,
+                None,
+                None,
+                Some("opencode"),
+                None,
+                None,
+                None,
+                ParentSessionOverride::PreservePrevious,
+                None,
+            )
+            .await
+        });
+        control.reached.notified().await;
+
+        let target = state.protocol.read().await.sessions["soft-staged"].owner();
+        let _ = crate::hooks::prompt_submit(
+            AxumState(state.clone()),
+            Json(crate::hooks::PaneBody {
+                pane: None,
+                backend_session_id: Some("ses_new".into()),
+                session_incarnation: Some(target.incarnation),
+            }),
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.protocol.read().await.sessions["soft-staged"]
+                    .metadata
+                    .active_context_segment_started_at
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("staged paneless Active hook must reach the target receiver");
+        state
+            .protocol
+            .write()
+            .await
+            .sessions
+            .get_mut("soft-staged")
+            .expect("staged soft owner must remain current")
+            .metadata
+            .active_context_segment_started_at = Some(chrono::Utc::now().timestamp() - 2);
+        let _ = crate::hooks::hook_stop(
+            AxumState(state.clone()),
+            Json(crate::hooks::PaneBody {
+                pane: None,
+                backend_session_id: Some("ses_new".into()),
+                session_incarnation: Some(target.incarnation),
+            }),
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.protocol.read().await.sessions["soft-staged"]
+                    .metadata
+                    .active_context_restart_due
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("staged paneless Stopped hook must record the due boundary");
+        assert!(
+            state
+                .try_set_pending_compact_continuation("soft-staged", "soft staged mailbox".into())
+                .await
+        );
+
+        control.release.notify_one();
+        let (message, _, outcome) = restart.await.unwrap();
+        assert_eq!(outcome, RestartOutcome::Restarted, "{message}");
+        let protocol = state.protocol.read().await;
+        let metadata = &protocol.sessions["soft-staged"].metadata;
+        assert_eq!(protocol.sessions["soft-staged"].owner(), target);
+        assert_eq!(metadata.backend_session_id.as_deref(), Some("ses_new"));
+        assert!(metadata.active_context_accumulated_secs >= 2);
+        assert!(metadata.active_context_restart_due);
+        assert!(!metadata.active_context_accounting_provisional);
+        drop(protocol);
+        assert_eq!(
+            state.drain_agent_compact_continuation_owned(&target).await,
+            Some("soft staged mailbox".into())
+        );
         server.abort();
     }
 
