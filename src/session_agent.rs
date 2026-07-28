@@ -229,12 +229,6 @@ impl Actor for SessionAgent {
             SessionMsg::Stopped => {
                 let now = Utc::now();
                 state.last_stopped_at = Some(now);
-                self.app_state
-                    .apply_and_execute(crate::daemon_protocol::Event::ActiveContextStopped {
-                        owner: state.owner.clone(),
-                        at: now.timestamp(),
-                    })
-                    .await;
                 if let Some(h) = state.idle_timer.take() {
                     h.abort();
                 }
@@ -306,18 +300,19 @@ impl Actor for SessionAgent {
                         self.send_reminders(&overdue, state).await;
                     }
                 }
+
+                self.app_state
+                    .apply_and_execute(crate::daemon_protocol::Event::ActiveContextStopped {
+                        owner: state.owner.clone(),
+                        at: now.timestamp(),
+                    })
+                    .await;
             }
             SessionMsg::Active => {
                 state.idle = false;
                 state.reminder_cleared = false;
                 let now = Utc::now();
                 state.last_active_at = Some(now);
-                self.app_state
-                    .apply_and_execute(crate::daemon_protocol::Event::ActiveContextActive {
-                        owner: state.owner.clone(),
-                        at: now.timestamp(),
-                    })
-                    .await;
                 if let Some(h) = state.idle_timer.take() {
                     h.abort();
                 }
@@ -326,6 +321,12 @@ impl Actor for SessionAgent {
                 if let Some(h) = state.watchdog_timer.take() {
                     h.abort();
                 }
+                self.app_state
+                    .apply_and_execute(crate::daemon_protocol::Event::ActiveContextActive {
+                        owner: state.owner.clone(),
+                        at: now.timestamp(),
+                    })
+                    .await;
             }
             SessionMsg::GetPendingReplies(reply) => {
                 if !reply.is_closed() {
@@ -771,6 +772,34 @@ mod tests {
         StatusCode::NO_CONTENT
     }
 
+    struct BlockedDueDelivery {
+        messages: StdArc<Mutex<Vec<String>>>,
+        first_delivery_started: StdArc<tokio::sync::Notify>,
+        release_first_delivery: StdArc<tokio::sync::Notify>,
+        delivery_count: std::sync::atomic::AtomicUsize,
+    }
+
+    async fn blocked_first_prompt_async_recorder(
+        AxumState(blocked): AxumState<StdArc<BlockedDueDelivery>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> StatusCode {
+        blocked.messages.lock().await.push(
+            body["parts"][0]["text"]
+                .as_str()
+                .expect("prompt text")
+                .to_string(),
+        );
+        if blocked
+            .delivery_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            blocked.first_delivery_started.notify_one();
+            blocked.release_first_delivery.notified().await;
+        }
+        StatusCode::NO_CONTENT
+    }
+
     async fn opencode_reminder_test_state(
         session_id: &str,
         reminder: Option<&str>,
@@ -820,6 +849,60 @@ mod tests {
         state.settings.write().await.idle_timeout_secs = 1;
 
         (state, messages, server)
+    }
+
+    async fn blocked_due_delivery_test_state(
+        session_id: &str,
+    ) -> (
+        Arc<AppState>,
+        StdArc<BlockedDueDelivery>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let blocked = StdArc::new(BlockedDueDelivery {
+            messages: StdArc::new(Mutex::new(Vec::new())),
+            first_delivery_started: StdArc::new(tokio::sync::Notify::new()),
+            release_first_delivery: StdArc::new(tokio::sync::Notify::new()),
+            delivery_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route(
+                "/session/{session_id}/prompt_async",
+                post(blocked_first_prompt_async_recorder),
+            )
+            .with_state(blocked.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let data_dir = tempfile::tempdir().unwrap().keep();
+        let state = AppState::new(crate::config::OuijaConfig {
+            name: "session-agent-blocked-due-test".into(),
+            npub: "npub1test".into(),
+            port: port - 320,
+            data_dir: data_dir.clone(),
+            config_dir: data_dir,
+        });
+        state
+            .protocol
+            .write()
+            .await
+            .apply(crate::daemon_protocol::Event::Register {
+                id: session_id.into(),
+                pane: Some("%99".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some(format!("{session_id}-backend")),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    reminder: Some("continue the task".into()),
+                    fresh_context_after_active_secs: Some(60),
+                    ..Default::default()
+                },
+            });
+        state.settings.write().await.idle_timeout_secs = 2;
+
+        (state, blocked, server)
     }
 
     async fn run_stopped_agent_for_one_idle_timeout(state: Arc<AppState>, session_id: &str) {
@@ -965,6 +1048,131 @@ mod tests {
 
         actor.stop(None);
         handle.await.expect("actor failed");
+    }
+
+    #[tokio::test]
+    async fn active_cancels_replaced_idle_timer_while_due_delivery_blocks() {
+        // Break caught: cancelling a timer after slow due delivery leaves an
+        // already-expired idle timeout queued ahead of Active.
+        let (state, blocked, server) = blocked_due_delivery_test_state("active-cancel").await;
+        let owner = state.protocol.read().await.sessions["active-cancel"].owner();
+        let agent = SessionAgent {
+            app_state: state.clone(),
+        };
+        let args = SessionAgentArgs {
+            owner,
+            pane: "%99".into(),
+        };
+        let (actor, handle) = Actor::spawn(None, agent, args).await.expect("spawn failed");
+
+        actor
+            .cast(SessionMsg::Stopped)
+            .expect("arm initial idle timer");
+        let _ = ractor::call!(actor, SessionMsg::GetPendingReplies).expect("flush first stop");
+        tokio::time::sleep(std::time::Duration::from_millis(1250)).await;
+        state
+            .protocol
+            .write()
+            .await
+            .sessions
+            .get_mut("active-cancel")
+            .expect("registered session")
+            .metadata
+            .active_context_restart_due = true;
+
+        actor.cast(SessionMsg::Stopped).expect("enter due boundary");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            blocked.first_delivery_started.notified(),
+        )
+        .await
+        .expect("due delivery must enter its controlled block");
+        tokio::time::sleep(std::time::Duration::from_millis(950)).await;
+        actor
+            .cast(SessionMsg::Active)
+            .expect("queue active cancellation");
+        blocked.release_first_delivery.notify_one();
+        let _ = ractor::call!(actor, SessionMsg::GetPendingReplies).expect("flush active");
+
+        assert!(
+            !blocked
+                .messages
+                .lock()
+                .await
+                .iter()
+                .any(|message| message.contains("type=\"reminder\"")),
+            "the cancelled pre-boundary idle timer must not inject a reminder"
+        );
+        actor.stop(None);
+        handle.await.expect("actor failed");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn repeated_stopped_replaces_idle_timer_before_due_delivery_blocks() {
+        // Break caught: a queued timeout from the prior stopped boundary must
+        // not run before a repeated stopped boundary replaces its timers.
+        let (state, blocked, server) = blocked_due_delivery_test_state("repeat-stop").await;
+        let owner = state.protocol.read().await.sessions["repeat-stop"].owner();
+        let agent = SessionAgent {
+            app_state: state.clone(),
+        };
+        let args = SessionAgentArgs {
+            owner,
+            pane: "%99".into(),
+        };
+        let (actor, handle) = Actor::spawn(None, agent, args).await.expect("spawn failed");
+
+        actor
+            .cast(SessionMsg::Stopped)
+            .expect("arm initial idle timer");
+        let _ = ractor::call!(actor, SessionMsg::GetPendingReplies).expect("flush first stop");
+        tokio::time::sleep(std::time::Duration::from_millis(1250)).await;
+        state
+            .protocol
+            .write()
+            .await
+            .sessions
+            .get_mut("repeat-stop")
+            .expect("registered session")
+            .metadata
+            .active_context_restart_due = true;
+
+        actor
+            .cast(SessionMsg::Stopped)
+            .expect("enter first due boundary");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            blocked.first_delivery_started.notified(),
+        )
+        .await
+        .expect("due delivery must enter its controlled block");
+        tokio::time::sleep(std::time::Duration::from_millis(950)).await;
+        actor
+            .cast(SessionMsg::Stopped)
+            .expect("queue repeated stopped boundary");
+        blocked.release_first_delivery.notify_one();
+        let _ = ractor::call!(actor, SessionMsg::GetPendingReplies).expect("flush repeated stop");
+
+        let messages = blocked.messages.lock().await;
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.contains("active-context-restart-due"))
+                .count(),
+            2,
+            "every due stopped boundary must still notify"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.contains("type=\"reminder\"")),
+            "the replaced pre-boundary idle timer must not inject a reminder"
+        );
+        drop(messages);
+        actor.stop(None);
+        handle.await.expect("actor failed");
+        server.abort();
     }
 
     #[tokio::test]
