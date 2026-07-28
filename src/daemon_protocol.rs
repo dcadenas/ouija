@@ -717,6 +717,19 @@ impl SessionMeta {
         self.active_context_segment_started_at = source.active_context_segment_started_at;
         self.active_context_restart_due = source.active_context_restart_due;
     }
+
+    /// Merge a fresh-launch finalizer with its live staged owner. Omission (or
+    /// an invalid zero) preserves the current policy because v1 has no disable
+    /// operation; only a positive supplied limit replaces it.
+    fn inherit_active_context_from_fresh_finalizer(&mut self, source: &SessionMeta) {
+        if self
+            .fresh_context_after_active_secs
+            .is_none_or(|limit| limit == 0)
+        {
+            self.fresh_context_after_active_secs = source.fresh_context_after_active_secs;
+        }
+        self.inherit_active_context_accounting_from(source);
+    }
 }
 
 impl Default for SessionMeta {
@@ -2955,7 +2968,7 @@ impl DaemonState {
         // may carry a newly configured policy, but it must never erase active
         // accounting accumulated by the live staged owner. Successful fresh
         // launches reset only through FreshContextRestartSucceeded.
-        metadata.inherit_active_context_accounting_from(&existing.metadata);
+        metadata.inherit_active_context_from_fresh_finalizer(&existing.metadata);
 
         let old_pane = existing.pane.clone();
         let owner = existing.owner();
@@ -6177,6 +6190,71 @@ mod tests {
         );
         let metadata = &state.sessions["worker"].metadata;
         assert_eq!(metadata.fresh_context_after_active_secs, Some(120));
+        assert_eq!(metadata.active_context_accumulated_secs, 0);
+        assert_eq!(metadata.active_context_segment_started_at, None);
+        assert!(!metadata.active_context_restart_due);
+        assert_eq!(metadata.last_metadata_update, Some(777));
+    }
+
+    #[test]
+    fn leased_restart_finalizer_omitting_policy_preserves_it_until_exact_success() {
+        // Break caught: fresh restart has no v1 disable operation. Omitting a
+        // replacement policy must preserve the live limit and accounting,
+        // while exact success resets accounting only.
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("claude-code".into()),
+                fresh_context_after_active_secs: Some(60),
+                active_context_accumulated_secs: 41,
+                active_context_segment_started_at: Some(100),
+                active_context_restart_due: true,
+                last_metadata_update: Some(777),
+                ..Default::default()
+            },
+        });
+        let incumbent = state.sessions["worker"].owner();
+        assert_eq!(
+            state.claim_existing_start(&incumbent),
+            LifecycleMutationOutcome::Applied
+        );
+        let StageFreshLaunchOutcome::Staged { incarnation } = state
+            .stage_restart_launch(&incumbent, "claude-code".into(), true, None, None)
+            .outcome
+        else {
+            panic!("leased restart must stage");
+        };
+        let target = ResourceOwner {
+            session_id: "worker".into(),
+            incarnation,
+        };
+        let mut final_metadata = state.sessions["worker"].metadata.clone();
+        final_metadata.fresh_context_after_active_secs = None;
+        let completed = state.complete_restart_launch(
+            &incumbent,
+            &target,
+            Some("%1".into()),
+            final_metadata,
+            false,
+        );
+        assert_eq!(completed.outcome, LifecycleMutationOutcome::Applied);
+        let metadata = &state.sessions["worker"].metadata;
+        assert_eq!(metadata.fresh_context_after_active_secs, Some(60));
+        assert_eq!(metadata.active_context_accumulated_secs, 41);
+        assert_eq!(metadata.active_context_segment_started_at, Some(100));
+        assert!(metadata.active_context_restart_due);
+        assert_eq!(metadata.last_metadata_update, Some(777));
+
+        let effects = state.apply(Event::FreshContextRestartSucceeded { owner: target });
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Persist))
+        );
+        let metadata = &state.sessions["worker"].metadata;
+        assert_eq!(metadata.fresh_context_after_active_secs, Some(60));
         assert_eq!(metadata.active_context_accumulated_secs, 0);
         assert_eq!(metadata.active_context_segment_started_at, None);
         assert!(!metadata.active_context_restart_due);
