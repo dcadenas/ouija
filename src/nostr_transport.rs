@@ -150,52 +150,16 @@ impl PreparedLaunchCommand {
         self.prompt_path.as_deref()
     }
 
-    /// Transfer prompt-file cleanup to the shell command after tmux accepts
-    /// the launch. Before this point, dropping the guard removes the file.
-    fn mark_handed_off(&mut self) -> anyhow::Result<()> {
-        self.mark_handed_off_with_cleanup_delay(std::time::Duration::from_secs(30))
-    }
-
-    fn mark_handed_off_with_cleanup_delay(
-        &mut self,
-        cleanup_delay: std::time::Duration,
-    ) -> anyhow::Result<()> {
-        let Some(path) = self.prompt_path.as_ref() else {
-            self.cleanup_on_drop = false;
-            return Ok(());
-        };
-        if !path.exists() {
-            self.prompt_path = None;
-            self.cleanup_on_drop = false;
-            return Ok(());
-        }
-
-        let cleanup_path = path.clone();
-        std::thread::Builder::new()
-            .name("ouija-prompt-cleanup".into())
-            .spawn(move || {
-                std::thread::sleep(cleanup_delay);
-                match std::fs::remove_file(&cleanup_path) {
-                    Ok(()) => {
-                        tracing::warn!(
-                            path = %cleanup_path.display(),
-                            "removed launch prompt that the accepted backend command did not consume"
-                        );
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            path = %cleanup_path.display(),
-                            "failed to remove handed-off launch prompt: {error}"
-                        );
-                    }
-                }
-            })
-            .context("failed to schedule handed-off launch prompt cleanup")?;
-
+    /// Relinquish cleanup after tmux accepts the launch command.
+    ///
+    /// This transition is deliberately infallible and irreversible: tmux may
+    /// already be starting the backend when it returns success. The shell
+    /// command reads and unlinks the file before exec, which is the only safe
+    /// consumption acknowledgement. A time-based cleanup here could race a
+    /// slow login shell and destroy its launch prompt.
+    fn mark_handed_off(&mut self) {
         self.prompt_path = None;
         self.cleanup_on_drop = false;
-        Ok(())
     }
 }
 
@@ -2749,7 +2713,7 @@ async fn start_session_with_prompt_storage(
                 if !status.success() {
                     anyhow::bail!("tmux send-keys failed for pane {pane_for_launch}");
                 }
-                prepared_command.mark_handed_off()?;
+                prepared_command.mark_handed_off();
                 Ok(())
             })
             .await;
@@ -4005,7 +3969,7 @@ async fn restart_session_claimed(
                                     );
                                 }
                             }
-                            prepared_command.mark_handed_off()?;
+                            prepared_command.mark_handed_off();
                             tracing::info!("restart: respawn-pane {pane} succeeded");
                             return Ok((pane.clone(), false));
                         }
@@ -4237,7 +4201,7 @@ async fn restart_session_claimed(
                     if !status.success() {
                         anyhow::bail!("tmux send-keys failed for pane {pane_for_launch}");
                     }
-                    prepared_command.mark_handed_off()?;
+                    prepared_command.mark_handed_off();
                     Ok(())
                 })
                 .await;
@@ -8646,27 +8610,31 @@ mod tests {
     }
 
     #[test]
-    fn accepted_but_unconsumed_absent_and_existing_launches_are_eventually_cleaned() {
+    fn handed_off_prompt_survives_arbitrary_delay_until_shell_consumes_it() {
         let dir = tempfile::tempdir().unwrap();
 
         for path_kind in ["absent-session start", "existing-session restart"] {
             let mut prepared =
-                prepare_tui_launch_command_in(dir.path(), "backend", Some(path_kind)).unwrap();
+                prepare_tui_launch_command_in(dir.path(), "printf '%s'", Some(path_kind)).unwrap();
             let prompt_path = prepared.prompt_path().unwrap().to_path_buf();
+            let command = prepared.command().to_string();
 
-            prepared
-                .mark_handed_off_with_cleanup_delay(std::time::Duration::ZERO)
-                .unwrap();
-            for _ in 0..50 {
-                if !prompt_path.exists() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
+            // Tmux acceptance is irreversible. No wall-clock cleanup may race
+            // a shell that has accepted the command but has not read it yet.
+            let _: () = prepared.mark_handed_off();
+            drop(prepared);
             assert!(
-                !prompt_path.exists(),
-                "{path_kind} retained a prompt after its accepted launch never consumed it"
+                prompt_path.exists(),
+                "{path_kind} lost its prompt before delayed consumption"
             );
+
+            let output = std::process::Command::new("sh")
+                .args(["-c", &command])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, path_kind.as_bytes());
+            assert!(!prompt_path.exists());
         }
     }
 
@@ -8687,7 +8655,7 @@ mod tests {
 
         // Mirrors a successful tmux handoff. It remains harmless if the shell
         // already consumed and unlinked the file before tmux returned.
-        prepared.mark_handed_off().unwrap();
+        let _: () = prepared.mark_handed_off();
     }
 
     #[test]
