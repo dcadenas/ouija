@@ -555,6 +555,16 @@ pub trait CodingAssistant: Send + Sync + std::fmt::Debug + 'static {
 
 #[cfg(test)]
 pub(crate) fn assert_shared_task_reminder_guidance(skill: &str) {
+    let active_context_section = skill
+        .split("## 5. Active-context refresh")
+        .nth(1)
+        .and_then(|section| section.split("## 6.").next())
+        .expect("shared skill must contain the active-context refresh section");
+    let active_context = active_context_section
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
     assert!(
         skill.contains("`--reminder` alone opts the session into recurring recovery nudges."),
         "skill must make recurring reminders explicitly opt in"
@@ -598,36 +608,40 @@ pub(crate) fn assert_shared_task_reminder_guidance(skill: &str) {
         "shared skill must preserve the native-subagent boundary"
     );
     assert!(
-        skill.contains("`--fresh-context-after-active DURATION` is an opt-in policy")
-            && skill.contains("`spawn-session` and fresh `restart-session` launches"),
+        active_context.contains("`--fresh-context-after-active DURATION` is an opt-in policy")
+            && active_context.contains("`spawn-session` and fresh `restart-session` launches"),
         "shared skill must teach opt-in active-context refresh on manual lifecycle commands"
     );
     assert!(
-        skill.contains(
+        active_context.contains(
             "counts accumulated active work, not wall-clock time: the counter pauses while"
-        ) && skill.contains("the session is parked"),
+        ) && active_context.contains("the session is parked"),
         "shared skill must explain that active-context accounting pauses while parked"
     );
     assert!(
-        skill.contains("mandatory refresh notice only at a")
-            && skill.contains("safe `Stopped` boundary")
-            && skill.contains("Each later stopped boundary repeats the notice until a fresh")
-            && skill.contains("restart successfully completes"),
+        active_context.contains("mandatory refresh notice only at a")
+            && active_context.contains("safe `Stopped` boundary")
+            && active_context
+                .contains("Each later stopped boundary repeats the notice until a fresh")
+            && active_context.contains("restart successfully completes"),
         "shared skill must keep refresh notices at stopped boundaries until fresh restart success"
     );
     assert!(
-        skill.contains("--one-shot-file /dev/stdin")
-            && skill.contains(
+        active_context_section.contains(
+            r#"ouija restart-session "worker" --fresh --one-shot-file /dev/stdin <<'OUIJA_CONTINUATION'"#
+        ) && active_context.contains(
                 "stored prompt exists, Ouija replays it before the one-shot continuation"
             )
-            && skill.contains(
+            && active_context.contains(
                 "Without a stored prompt, the one-shot continuation must be complete enough"
             ),
-        "shared skill must explain fresh one-shot continuation composition"
+        "shared skill must require the quoted fresh-restart heredoc and explain one-shot composition"
     );
     assert!(
-        skill.contains("does not create\na scheduler task")
-            && skill.contains("does not discover children, traverse\nchild relationships, enroll child sessions, or inspect native subagents"),
+        active_context.contains("does not create a scheduler task")
+            && active_context.contains(
+                "does not discover children, traverse child relationships, enroll child sessions, or inspect native subagents"
+            ),
         "shared skill must keep active-context refresh free of scheduler enrollment and child traversal"
     );
     assert!(
