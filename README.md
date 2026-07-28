@@ -176,6 +176,7 @@ ouija reply <to> <id> --stdin < reply.txt # safer for generated/multiline text
 ouija rename <new-id> --from <current-id> # rename an exact Local session
 ouija announce --role "..." --bulletin "..." # update your metadata
 ouija spawn-session <name> --no-parent-session --when-done keep-open --prompt "..." # start a new session
+ouija restart-session <name> --fresh --prompt "..." --backend codex-cli # replace stored prompt and restart
 ouija nodes          # list connected nodes
 ouija config ...     # manage settings, Nostr DM users, router
 ```
@@ -189,6 +190,12 @@ backticks, `$()`, quotes, and JSON before `ouija` receives the message.
 `--when-done keep-open`, `--when-done ask-parent`, or `--when-done close`.
 The legacy `--idle-policy` flag remains available for compatibility but is
 deprecated.
+
+On `restart-session`, `--prompt` replaces the stored startup prompt.
+`--suppress-stored-prompt` skips that stored prompt for one launch without
+erasing it, while `--one-shot-file <PATH>` appends UTF-8 content that is
+delivered only on that launch and is never persisted. `--backend` explicitly
+selects `claude-code`, `opencode`, or `codex-cli`.
 
 Task reminders are opt-in and independent of completion behavior. Supplying
 `--reminder` enables recurring recovery nudges; omitting it prevents

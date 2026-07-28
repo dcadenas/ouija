@@ -95,6 +95,44 @@ impl ParentSessionOverride {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct RestartPromptInput<'a> {
+    replacement: Option<&'a str>,
+    suppress_stored: bool,
+    one_shot: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ResolvedRestartPrompt {
+    /// Prompt delivered to this backend launch.
+    launch: Option<String>,
+    /// Persistent base prompt recorded in session metadata.
+    stored: Option<String>,
+}
+
+fn resolve_restart_prompt(
+    stored: Option<&str>,
+    input: RestartPromptInput<'_>,
+) -> ResolvedRestartPrompt {
+    let persistent = input.replacement.or(stored).map(String::from);
+    let base = input.replacement.map(String::from).or_else(|| {
+        (!input.suppress_stored)
+            .then(|| stored.map(String::from))
+            .flatten()
+    });
+    let launch = match (base, input.one_shot) {
+        (Some(base), Some(one_shot)) => Some(format!("{base}\n\n{one_shot}")),
+        (Some(base), None) => Some(base),
+        (None, Some(one_shot)) => Some(one_shot.to_string()),
+        (None, None) => None,
+    };
+
+    ResolvedRestartPrompt {
+        launch,
+        stored: persistent,
+    }
+}
+
 fn start_registration_metadata(
     is_http_api: bool,
     pane_id: &str,
@@ -2003,6 +2041,50 @@ pub async fn start_session(
     force_reset: bool,
     reserved_owner: Option<crate::daemon_protocol::ResourceOwner>,
 ) -> (String, Option<u64>) {
+    start_session_with_prompt_storage(
+        state,
+        name,
+        worktree,
+        project_dir,
+        prompt,
+        prompt,
+        from,
+        expects_reply,
+        backend,
+        model,
+        effort,
+        reminder,
+        parent_session,
+        idle_policy,
+        branch,
+        base_branch,
+        force_reset,
+        reserved_owner,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_session_with_prompt_storage(
+    state: &std::sync::Arc<AppState>,
+    name: &str,
+    worktree: Option<bool>,
+    project_dir: Option<&str>,
+    prompt: Option<&str>,
+    stored_prompt: Option<&str>,
+    from: Option<&str>,
+    expects_reply: Option<bool>,
+    backend: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    reminder: Option<&str>,
+    parent_session: Option<&str>,
+    idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
+    branch: Option<&str>,
+    base_branch: Option<&str>,
+    force_reset: bool,
+    reserved_owner: Option<crate::daemon_protocol::ResourceOwner>,
+) -> (String, Option<u64>) {
     let backend = match backend {
         Some(b) => match state.backends.get_required(b) {
             Ok(backend) => backend,
@@ -2407,7 +2489,7 @@ pub async fn start_session(
                 reminder: reminder.map(String::from),
                 parent_session: parent_session.map(String::from),
                 idle_policy: idle_policy.clone(),
-                prompt: prompt.map(String::from),
+                prompt: stored_prompt.map(String::from),
                 ..Default::default()
             };
             match Box::pin(state.commit_reserved_start(&owner, Some(pane_id.clone()), initial_meta))
@@ -2549,7 +2631,7 @@ pub async fn start_session(
                 reminder: reminder.map(String::from),
                 parent_session: parent_session.map(String::from),
                 idle_policy,
-                prompt: prompt.map(String::from),
+                prompt: stored_prompt.map(String::from),
                 ..Default::default()
             };
             match finalize_reserved_start(state, &owner, registration_pane, proto_meta).await {
@@ -2901,6 +2983,46 @@ pub async fn restart_session_for_start(
     parent_session_override: ParentSessionOverride,
     idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
 ) -> (String, Option<u64>, RestartOutcome) {
+    restart_session_for_start_with_prompt_controls(
+        state,
+        owner,
+        name,
+        fresh,
+        repair_reservation,
+        prompt,
+        false,
+        None,
+        from,
+        expects_reply,
+        backend,
+        model,
+        effort,
+        reminder,
+        parent_session_override,
+        idle_policy,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn restart_session_for_start_with_prompt_controls(
+    state: &std::sync::Arc<AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    name: &str,
+    fresh: bool,
+    repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
+    prompt: Option<&str>,
+    suppress_stored_prompt: bool,
+    one_shot_prompt: Option<&str>,
+    from: Option<&str>,
+    expects_reply: Option<bool>,
+    backend: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    reminder: Option<&str>,
+    parent_session_override: ParentSessionOverride,
+    idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
+) -> (String, Option<u64>, RestartOutcome) {
     let still_claimed = {
         let proto = state.protocol.read().await;
         proto.sessions.get(name).is_some_and(|session| {
@@ -2927,6 +3049,8 @@ pub async fn restart_session_for_start(
         fresh,
         repair_reservation,
         prompt,
+        suppress_stored_prompt,
+        one_shot_prompt,
         from,
         expects_reply,
         backend,
@@ -2978,6 +3102,44 @@ pub async fn restart_session(
     parent_session_override: ParentSessionOverride,
     idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
 ) -> (String, Option<u64>, RestartOutcome) {
+    restart_session_with_prompt_controls(
+        state,
+        name,
+        fresh,
+        repair_reservation,
+        prompt,
+        false,
+        None,
+        from,
+        expects_reply,
+        backend,
+        model,
+        effort,
+        reminder,
+        parent_session_override,
+        idle_policy,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn restart_session_with_prompt_controls(
+    state: &std::sync::Arc<AppState>,
+    name: &str,
+    fresh: bool,
+    repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
+    prompt: Option<&str>,
+    suppress_stored_prompt: bool,
+    one_shot_prompt: Option<&str>,
+    from: Option<&str>,
+    expects_reply: Option<bool>,
+    backend: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    reminder: Option<&str>,
+    parent_session_override: ParentSessionOverride,
+    idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
+) -> (String, Option<u64>, RestartOutcome) {
     let disposition = match reserve_start_for_launch(state, name).await {
         Ok(disposition) => disposition,
         Err(error) => {
@@ -3003,12 +3165,21 @@ pub async fn restart_session(
                 );
             }
             let parent_session = parent_session_override.resolve(None);
-            let result = start_session(
+            let resolved_prompt = resolve_restart_prompt(
+                None,
+                RestartPromptInput {
+                    replacement: prompt,
+                    suppress_stored: suppress_stored_prompt,
+                    one_shot: one_shot_prompt,
+                },
+            );
+            let result = start_session_with_prompt_storage(
                 state,
                 name,
                 None,
                 None,
-                prompt,
+                resolved_prompt.launch.as_deref(),
+                resolved_prompt.stored.as_deref(),
                 from,
                 expects_reply,
                 backend,
@@ -3059,13 +3230,15 @@ pub async fn restart_session(
             }
         }
     };
-    restart_session_for_start(
+    restart_session_for_start_with_prompt_controls(
         state,
         &owner,
         name,
         fresh,
         repair_reservation,
         prompt,
+        suppress_stored_prompt,
+        one_shot_prompt,
         from,
         expects_reply,
         backend,
@@ -3086,6 +3259,8 @@ async fn restart_session_claimed(
     fresh: bool,
     repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
     prompt: Option<&str>,
+    suppress_stored_prompt: bool,
+    one_shot_prompt: Option<&str>,
     from: Option<&str>,
     expects_reply: Option<bool>,
     backend: Option<&str>,
@@ -3185,6 +3360,16 @@ async fn restart_session_claimed(
         Some(m) => idle_policy.clone().or_else(|| m.idle_policy.clone()),
         None => idle_policy.clone(),
     };
+    let resolved_prompt = resolve_restart_prompt(
+        prev_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.prompt.as_deref()),
+        RestartPromptInput {
+            replacement: prompt,
+            suppress_stored: suppress_stored_prompt,
+            one_shot: one_shot_prompt,
+        },
+    );
     let projects_dir = state.settings.read().await.projects_dir.clone();
     let base = match projects_dir {
         Some(dir) => crate::state::expand_tilde(&dir),
@@ -3271,6 +3456,7 @@ async fn restart_session_claimed(
                 name,
                 existing_pane.as_deref(),
                 &dir,
+                resolved_prompt.launch.as_deref(),
                 prompt,
                 from,
                 expects_reply,
@@ -3371,11 +3557,9 @@ async fn restart_session_claimed(
             })
     };
 
-    // Pre-compute effective prompt/reminder from metadata and function args
-    let effective_prompt = match &prev_metadata {
-        Some(m) => m.prompt.clone().or_else(|| prompt.map(String::from)),
-        None => prompt.map(String::from),
-    };
+    // Prompt resolution is computed exactly once above and shared by both the
+    // OpenCode soft path and this hard fallback.
+    let effective_prompt = resolved_prompt.launch.clone();
     let reminder_meta = crate::daemon_protocol::SessionMeta {
         reminder: effective_manual_reminder.clone(),
         parent_session: effective_parent_session.clone(),
@@ -4094,7 +4278,7 @@ async fn restart_session_claimed(
                     reminder: effective_manual_reminder.clone(),
                     parent_session: effective_parent_session.clone(),
                     idle_policy: effective_idle_policy.clone(),
-                    prompt: effective_prompt.clone(),
+                    prompt: resolved_prompt.stored.clone(),
                     iteration: m.iteration,
                     iteration_log: m.iteration_log.clone(),
                     last_iteration_at: m.last_iteration_at,
@@ -4117,7 +4301,7 @@ async fn restart_session_claimed(
                     reminder: effective_manual_reminder.clone(),
                     parent_session: effective_parent_session.clone(),
                     idle_policy: effective_idle_policy.clone(),
-                    prompt: effective_prompt.clone(),
+                    prompt: resolved_prompt.stored.clone(),
                     ..Default::default()
                 },
             };
@@ -4317,6 +4501,7 @@ async fn soft_restart_session_claimed(
     pane: Option<&str>,
     project_dir: &str,
     prompt: Option<&str>,
+    prompt_replacement: Option<&str>,
     from: Option<&str>,
     expects_reply: Option<bool>,
     reminder: Option<&str>,
@@ -4502,6 +4687,7 @@ async fn soft_restart_session_claimed(
                         &new_session_id,
                         restart_generation,
                         SoftRestartMetadataUpdate {
+                            prompt_replacement,
                             reminder,
                             parent_session: parent_session_override.clone(),
                             idle_policy: idle_policy.clone(),
@@ -4669,6 +4855,7 @@ async fn soft_restart_session_claimed(
             &new_session_id,
             restart_generation,
             SoftRestartMetadataUpdate {
+                prompt_replacement,
                 reminder,
                 parent_session: parent_session_override,
                 idle_policy,
@@ -4750,6 +4937,7 @@ async fn soft_restart_session(
         pane,
         project_dir,
         prompt,
+        None,
         from,
         expects_reply,
         reminder,
@@ -4824,6 +5012,9 @@ async fn complete_soft_restart_metadata(
     }
     if let Some(reminder) = update.reminder {
         metadata.reminder = Some(reminder.to_string());
+    }
+    if let Some(prompt) = update.prompt_replacement {
+        metadata.prompt = Some(prompt.to_string());
     }
     match update.parent_session {
         ParentSessionOverride::PreservePrevious => {}
@@ -4912,6 +5103,9 @@ async fn apply_soft_restart_metadata(
             if let Some(r) = update.reminder {
                 session.metadata.reminder = Some(r.to_string());
             }
+            if let Some(prompt) = update.prompt_replacement {
+                session.metadata.prompt = Some(prompt.to_string());
+            }
             match update.parent_session {
                 ParentSessionOverride::PreservePrevious => {}
                 ParentSessionOverride::SetParent(parent) => {
@@ -4940,6 +5134,7 @@ async fn apply_soft_restart_metadata(
 
 #[derive(Default)]
 struct SoftRestartMetadataUpdate<'a> {
+    prompt_replacement: Option<&'a str>,
     reminder: Option<&'a str>,
     parent_session: ParentSessionOverride,
     idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
@@ -8040,6 +8235,136 @@ mod tests {
         assert_eq!(
             ParentSessionOverride::NoParent.resolve(Some(&previous)),
             None
+        );
+    }
+
+    #[test]
+    fn restart_prompt_resolution_has_one_persistent_base_and_launch_only_suffix() {
+        struct Case {
+            stored: Option<&'static str>,
+            replacement: Option<&'static str>,
+            suppress: bool,
+            one_shot: Option<&'static str>,
+            expected_launch: Option<&'static str>,
+            expected_stored: Option<&'static str>,
+        }
+
+        let cases = [
+            Case {
+                stored: Some("stored"),
+                replacement: None,
+                suppress: false,
+                one_shot: None,
+                expected_launch: Some("stored"),
+                expected_stored: Some("stored"),
+            },
+            Case {
+                stored: Some("stored"),
+                replacement: Some("replacement"),
+                suppress: false,
+                one_shot: None,
+                expected_launch: Some("replacement"),
+                expected_stored: Some("replacement"),
+            },
+            Case {
+                stored: Some("stored"),
+                replacement: None,
+                suppress: true,
+                one_shot: None,
+                expected_launch: None,
+                expected_stored: Some("stored"),
+            },
+            Case {
+                stored: Some("stored"),
+                replacement: None,
+                suppress: false,
+                one_shot: Some("launch only"),
+                expected_launch: Some("stored\n\nlaunch only"),
+                expected_stored: Some("stored"),
+            },
+            Case {
+                stored: Some("stored"),
+                replacement: None,
+                suppress: true,
+                one_shot: Some("launch only"),
+                expected_launch: Some("launch only"),
+                expected_stored: Some("stored"),
+            },
+            Case {
+                stored: Some("stored"),
+                replacement: Some("replacement"),
+                suppress: true,
+                one_shot: Some("launch only"),
+                expected_launch: Some("replacement\n\nlaunch only"),
+                expected_stored: Some("replacement"),
+            },
+            Case {
+                stored: None,
+                replacement: None,
+                suppress: true,
+                one_shot: Some("launch only"),
+                expected_launch: Some("launch only"),
+                expected_stored: None,
+            },
+        ];
+
+        for case in cases {
+            let resolved = resolve_restart_prompt(
+                case.stored,
+                RestartPromptInput {
+                    replacement: case.replacement,
+                    suppress_stored: case.suppress,
+                    one_shot: case.one_shot,
+                },
+            );
+            assert_eq!(resolved.launch.as_deref(), case.expected_launch);
+            assert_eq!(resolved.stored.as_deref(), case.expected_stored);
+        }
+    }
+
+    #[tokio::test]
+    async fn soft_restart_metadata_persists_replacement_but_not_one_shot_suffix() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    prompt: Some("stored".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let owner = {
+            let proto = state.protocol.read().await;
+            SoftRestartOwnerSnapshot {
+                session_id: "oc".into(),
+                incarnation: proto.sessions["oc"].metadata.session_incarnation,
+            }
+        };
+
+        apply_soft_restart_metadata(
+            &state,
+            &owner,
+            "ses_new",
+            0,
+            SoftRestartMetadataUpdate {
+                prompt_replacement: Some("replacement"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let proto = state.protocol.read().await;
+        assert_eq!(
+            proto.sessions["oc"].metadata.prompt.as_deref(),
+            Some("replacement")
+        );
+        assert_ne!(
+            proto.sessions["oc"].metadata.prompt.as_deref(),
+            Some("replacement\n\nlaunch only")
         );
     }
 

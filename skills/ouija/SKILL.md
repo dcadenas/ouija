@@ -98,7 +98,12 @@ ouija spawn-session worker --project-dir /path --worktree --branch feature --bas
 
 # Restart with fresh context:
 ouija restart-session worker --fresh --prompt "new task" --reminder "when done, report back"
-# prompt/reminder optional — if omitted, reuses previous values
+# --prompt replaces the stored startup prompt. If omitted, the stored prompt is reused.
+
+# Launch once without replaying the stored prompt. The CLI reads the file as UTF-8;
+# its contents are delivered on this launch only and are never stored by Ouija.
+ouija restart-session worker --fresh --suppress-stored-prompt \
+  --one-shot-file /tmp/verify-and-adopt.txt --backend codex-cli
 
 # Kill:
 ouija kill-session worker
@@ -109,6 +114,7 @@ Key fields:
 - `--when-done keep-open|ask-parent|close` — required completion behavior, independent of recurring reminders. Ouija generates the stay-open/ask-parent/close instructions
 - `--idle-policy` is deprecated; legacy scripts may still use `keep-open|ask-parent-when-done|close-when-done`
 - `--reminder` alone opts the session into recurring recovery nudges. Omit it for no task-reminder recurrence
+- On restart, `--prompt` is a persistent replacement; `--suppress-stored-prompt` only suppresses fallback for that launch; `--one-shot-file` appends launch-only UTF-8 content. `--backend` explicitly selects the restart backend
 - Pending replies can still wake a session without `--reminder`.
 - Never put `ouija clear-reminder` in manual reminder text. Ouija adds the concrete clearing command and ID to each injected nudge
 - `--worktree` — isolate in a git worktree at `~/.ouija/worktrees/<repo>/<session>`

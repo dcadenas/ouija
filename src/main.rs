@@ -223,10 +223,20 @@ enum Command {
         name: String,
         #[arg(long)]
         fresh: bool,
+        /// Replace the stored startup prompt and use it for this launch.
         #[arg(long)]
         prompt: Option<String>,
+        /// Do not reuse the stored startup prompt for this launch.
+        #[arg(long)]
+        suppress_stored_prompt: bool,
+        /// Append UTF-8 file contents for this launch only.
+        #[arg(long)]
+        one_shot_file: Option<PathBuf>,
         #[arg(long, value_parser = parse_manual_reminder)]
         reminder: Option<String>,
+        /// Override the coding-assistant backend on restart.
+        #[arg(long)]
+        backend: Option<String>,
         /// Override the LLM model on restart (defaults to the previous model).
         #[arg(long)]
         model: Option<String>,
@@ -1021,15 +1031,25 @@ async fn main() -> anyhow::Result<()> {
             name,
             fresh,
             prompt,
+            suppress_stored_prompt,
+            one_shot_file,
             reminder,
+            backend,
             model,
             effort,
         } => {
+            let one_shot_prompt = one_shot_file
+                .as_deref()
+                .map(read_one_shot_file)
+                .transpose()?;
             let body = serde_json::json!({
                 "name": name,
                 "fresh": fresh,
                 "prompt": prompt,
+                "suppress_stored_prompt": suppress_stored_prompt,
+                "one_shot_prompt": one_shot_prompt,
                 "reminder": reminder,
+                "backend": backend,
                 "model": model,
                 "effort": effort,
             });
@@ -3138,6 +3158,15 @@ fn encode_path_segment(segment: &str) -> String {
     percent_encoding::utf8_percent_encode(segment, PATH_SEGMENT).to_string()
 }
 
+fn read_one_shot_file(path: &std::path::Path) -> anyhow::Result<String> {
+    std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "failed to read UTF-8 one-shot prompt from {}",
+            path.display()
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3195,6 +3224,59 @@ mod tests {
             }
             _ => panic!("expected spawn-session command"),
         }
+    }
+
+    #[test]
+    fn restart_session_cli_accepts_scoped_prompt_controls_and_backend() {
+        let cli = Cli::try_parse_from([
+            "ouija",
+            "restart-session",
+            "worker",
+            "--prompt",
+            "replacement",
+            "--suppress-stored-prompt",
+            "--one-shot-file",
+            "/tmp/adopt.txt",
+            "--backend",
+            "codex-cli",
+        ])
+        .expect("restart prompt controls must parse");
+
+        match cli.command {
+            Command::RestartSession {
+                prompt,
+                suppress_stored_prompt,
+                one_shot_file,
+                backend,
+                ..
+            } => {
+                assert_eq!(prompt.as_deref(), Some("replacement"));
+                assert!(suppress_stored_prompt);
+                assert_eq!(
+                    one_shot_file.as_deref(),
+                    Some(std::path::Path::new("/tmp/adopt.txt"))
+                );
+                assert_eq!(backend.as_deref(), Some("codex-cli"));
+            }
+            _ => panic!("expected restart-session command"),
+        }
+    }
+
+    #[test]
+    fn one_shot_file_reader_accepts_utf8_and_rejects_invalid_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = dir.path().join("valid.txt");
+        std::fs::write(&valid, "verify live state").unwrap();
+        assert_eq!(read_one_shot_file(&valid).unwrap(), "verify live state");
+
+        let invalid = dir.path().join("invalid.txt");
+        std::fs::write(&invalid, [0xff, 0xfe]).unwrap();
+        let error = read_one_shot_file(&invalid).unwrap_err().to_string();
+        assert!(error.contains("UTF-8 one-shot prompt"));
+
+        let missing = dir.path().join("missing.txt");
+        let error = read_one_shot_file(&missing).unwrap_err().to_string();
+        assert!(error.contains(missing.to_string_lossy().as_ref()));
     }
 
     #[test]

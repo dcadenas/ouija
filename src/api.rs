@@ -2482,6 +2482,18 @@ pub struct SessionNameBody {
     force_reset: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RestartSessionBody {
+    #[serde(flatten)]
+    session: SessionNameBody,
+    /// Suppress the stored startup prompt for this launch without clearing it.
+    #[serde(default)]
+    suppress_stored_prompt: bool,
+    /// Already-read launch-only content. This value is never persisted.
+    #[serde(default)]
+    one_shot_prompt: Option<String>,
+}
+
 /// Return a warning message when the caller's request carries
 /// destructive intent (`force_reset=true` or a `base_branch` override)
 /// that the restart path cannot honor.
@@ -2822,13 +2834,18 @@ pub async fn start_session(
 /// Kill and restart a session, optionally with a fresh conversation.
 pub async fn restart_session(
     State(state): State<SharedState>,
-    Json(body): Json<SessionNameBody>,
+    Json(body): Json<RestartSessionBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Normalize at the boundary; see start_session for rationale.
-    let mut body = body;
-    body.model = normalize_optional_string(body.model);
-    body.effort = normalize_optional_string(body.effort);
-    body.backend = normalize_optional_string(body.backend);
+    let RestartSessionBody {
+        mut session,
+        suppress_stored_prompt,
+        one_shot_prompt,
+    } = body;
+    let body = &mut session;
+    body.model = normalize_optional_string(body.model.take());
+    body.effort = normalize_optional_string(body.effort.take());
+    body.backend = normalize_optional_string(body.backend.take());
     if let Err(error) = crate::daemon_protocol::validate_spawn_reminder(body.reminder.as_deref()) {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
     }
@@ -2844,17 +2861,19 @@ pub async fn restart_session(
     // so the caller's opt-in is visible in daemon logs. Same predicate
     // and same rationale as the /api/sessions/start exists branch
     // (hub#528 review).
-    if let Some(msg) = restart_drops_destructive_intent(&body) {
+    if let Some(msg) = restart_drops_destructive_intent(body) {
         tracing::warn!("{msg}");
     }
 
     let fresh = body.fresh.unwrap_or(false);
-    let (result, _prompt_msg_id, _) = crate::nostr_transport::restart_session(
+    let (result, _prompt_msg_id, _) = crate::nostr_transport::restart_session_with_prompt_controls(
         &state,
         &body.name,
         fresh,
         None,
         body.prompt.as_deref(),
+        suppress_stored_prompt,
+        one_shot_prompt.as_deref(),
         body.from.as_deref(),
         None, // expects_reply not used for session restart
         body.backend.as_deref(),
@@ -5412,24 +5431,28 @@ mod tests {
         let state = crate::state::AppState::new_for_test();
         let (status, Json(body)) = restart_session(
             State(state),
-            Json(SessionNameBody {
-                name: "wrong-codex".into(),
-                fresh: Some(true),
-                worktree: None,
-                project_dir: None,
-                prompt: None,
-                from: None,
-                backend: Some("codex".into()),
-                model: None,
-                effort: None,
-                reminder: None,
-                parent_session: None,
-                no_parent_session: None,
-                idle_policy: None,
-                branch: None,
-                base_branch: None,
-                keep_worktree: None,
-                force_reset: None,
+            Json(RestartSessionBody {
+                session: SessionNameBody {
+                    name: "wrong-codex".into(),
+                    fresh: Some(true),
+                    worktree: None,
+                    project_dir: None,
+                    prompt: None,
+                    from: None,
+                    backend: Some("codex".into()),
+                    model: None,
+                    effort: None,
+                    reminder: None,
+                    parent_session: None,
+                    no_parent_session: None,
+                    idle_policy: None,
+                    branch: None,
+                    base_branch: None,
+                    keep_worktree: None,
+                    force_reset: None,
+                },
+                suppress_stored_prompt: false,
+                one_shot_prompt: None,
             }),
         )
         .await;
@@ -5437,29 +5460,51 @@ mod tests {
         assert_unknown_backend_response(status, &body);
     }
 
+    #[test]
+    fn restart_request_accepts_launch_scoped_prompt_fields() {
+        let body: RestartSessionBody = serde_json::from_value(json!({
+            "name": "worker",
+            "fresh": true,
+            "prompt": "replacement",
+            "suppress_stored_prompt": true,
+            "one_shot_prompt": "adopt token",
+            "backend": "codex-cli"
+        }))
+        .unwrap();
+
+        assert_eq!(body.session.prompt.as_deref(), Some("replacement"));
+        assert!(body.suppress_stored_prompt);
+        assert_eq!(body.one_shot_prompt.as_deref(), Some("adopt token"));
+        assert_eq!(body.session.backend.as_deref(), Some("codex-cli"));
+    }
+
     #[tokio::test]
     async fn restart_session_rejects_manual_clear_reminder_before_restart() {
         let state = crate::state::AppState::new_for_test();
         let (status, Json(body)) = restart_session(
             State(state),
-            Json(SessionNameBody {
-                name: "restart-clear-reminder".into(),
-                fresh: Some(true),
-                worktree: None,
-                project_dir: None,
-                prompt: None,
-                from: None,
-                backend: None,
-                model: None,
-                effort: None,
-                reminder: Some("When done, run ouija clear-reminder 7".into()),
-                parent_session: None,
-                no_parent_session: None,
-                idle_policy: None,
-                branch: None,
-                base_branch: None,
-                keep_worktree: None,
-                force_reset: None,
+            Json(RestartSessionBody {
+                session: SessionNameBody {
+                    name: "restart-clear-reminder".into(),
+                    fresh: Some(true),
+                    worktree: None,
+                    project_dir: None,
+                    prompt: None,
+                    from: None,
+                    backend: None,
+                    model: None,
+                    effort: None,
+                    reminder: Some("When done, run ouija clear-reminder 7".into()),
+                    parent_session: None,
+                    no_parent_session: None,
+                    idle_policy: None,
+                    branch: None,
+                    base_branch: None,
+                    keep_worktree: None,
+                    force_reset: None,
+                },
+                suppress_stored_prompt: false,
+                one_shot_prompt: None,
             }),
         )
         .await;
