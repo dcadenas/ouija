@@ -499,6 +499,101 @@ pub(crate) async fn deliver_owned_inject_message_effect(
         })
 }
 
+fn human_active_context_limit(limit_secs: u64) -> String {
+    let hours = limit_secs / 3600;
+    let minutes = (limit_secs % 3600) / 60;
+    let seconds = limit_secs % 60;
+    let mut parts = Vec::new();
+    if hours > 0 {
+        parts.push(format!(
+            "{hours} {}",
+            if hours == 1 { "hour" } else { "hours" }
+        ));
+    }
+    if minutes > 0 {
+        parts.push(format!(
+            "{minutes} {}",
+            if minutes == 1 { "minute" } else { "minutes" }
+        ));
+    }
+    if seconds > 0 || parts.is_empty() {
+        parts.push(format!(
+            "{seconds} {}",
+            if seconds == 1 { "second" } else { "seconds" }
+        ));
+    }
+    parts.join(" ")
+}
+
+fn active_context_restart_due_message(
+    session_id: &str,
+    limit_secs: u64,
+    has_stored_prompt: bool,
+) -> String {
+    let prompt_guidance = if has_stored_prompt {
+        "This session has a stored prompt; it will be replayed before the one-shot continuation."
+    } else {
+        "This session has no stored prompt; make the one-shot continuation complete enough to finish the work on its own."
+    };
+    format!(
+        r#"<ouija-status type="active-context-restart-due">
+Active context refresh is due for session "{session_id}" after {limit} of active work.
+
+At this stopped safe boundary, prepare a concise, self-contained continuation. Include the goal, completed work, remaining work, decisions, blockers, and exact next steps. Verify live state (files, tests, and current session/task status) before writing it.
+
+{prompt_guidance}
+
+Run this quoted heredoc to start the fresh session:
+ouija restart-session "{session_id}" --fresh --one-shot-file /dev/stdin <<'OUIJA_CONTINUATION'
+Write the verified continuation here.
+OUIJA_CONTINUATION
+</ouija-status>"#,
+        limit = human_active_context_limit(limit_secs),
+    )
+}
+
+async fn notify_active_context_restart_due(
+    state: &Arc<AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
+) {
+    let notification = {
+        let protocol = state.protocol.read().await;
+        protocol
+            .sessions
+            .get(&owner.session_id)
+            .and_then(|session| {
+                if session.owner() != *owner || !session.metadata.active_context_restart_due {
+                    return None;
+                }
+                let limit_secs = session.metadata.fresh_context_after_active_secs?;
+                if limit_secs == 0 {
+                    return None;
+                }
+                Some((
+                    session.pane.clone()?,
+                    session.metadata.vim_mode,
+                    limit_secs,
+                    session.metadata.prompt.is_some(),
+                ))
+            })
+    };
+    let Some((pane, vim_mode, limit_secs, has_stored_prompt)) = notification else {
+        return;
+    };
+
+    let message =
+        active_context_restart_due_message(&owner.session_id, limit_secs, has_stored_prompt);
+    if let Err(error) =
+        crate::tmux::locked_inject_owned(state, owner, &pane, &message, vim_mode).await
+    {
+        tracing::warn!(
+            session = %owner.session_id,
+            incarnation = %owner.incarnation,
+            "active-context restart notification delivery skipped: {error}"
+        );
+    }
+}
+
 /// Central daemon state holding sessions, nodes, and transports.
 pub struct AppState {
     pub config: OuijaConfig,
@@ -2687,9 +2782,9 @@ impl AppState {
                 Effect::StopAgent { owner, pane } => {
                     self.stop_session_agent(owner, pane).await;
                 }
-                // Task 2 owns safe-boundary notification delivery. Task 1
-                // persists and emits the pure protocol signal only.
-                Effect::ActiveContextRestartDue { .. } => {}
+                Effect::ActiveContextRestartDue { owner } => {
+                    notify_active_context_restart_due(self, owner).await;
+                }
                 Effect::RenameAgent {
                     old_owner,
                     new_owner,

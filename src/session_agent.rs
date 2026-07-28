@@ -227,7 +227,14 @@ impl Actor for SessionAgent {
 
         match message {
             SessionMsg::Stopped => {
-                state.last_stopped_at = Some(Utc::now());
+                let now = Utc::now();
+                state.last_stopped_at = Some(now);
+                self.app_state
+                    .apply_and_execute(crate::daemon_protocol::Event::ActiveContextStopped {
+                        owner: state.owner.clone(),
+                        at: now.timestamp(),
+                    })
+                    .await;
                 if let Some(h) = state.idle_timer.take() {
                     h.abort();
                 }
@@ -303,7 +310,14 @@ impl Actor for SessionAgent {
             SessionMsg::Active => {
                 state.idle = false;
                 state.reminder_cleared = false;
-                state.last_active_at = Some(Utc::now());
+                let now = Utc::now();
+                state.last_active_at = Some(now);
+                self.app_state
+                    .apply_and_execute(crate::daemon_protocol::Event::ActiveContextActive {
+                        owner: state.owner.clone(),
+                        at: now.timestamp(),
+                    })
+                    .await;
                 if let Some(h) = state.idle_timer.take() {
                     h.abort();
                 }
@@ -902,6 +916,166 @@ mod tests {
 
         actor.stop(None);
         handle.await.expect("actor failed");
+    }
+
+    #[tokio::test]
+    async fn activity_messages_update_the_active_context_policy_at_safe_boundaries() {
+        // Break caught: bypassing the protocol accounting events would leave an
+        // opted-in session without an active segment, or would keep charging it
+        // after its stopped boundary.
+        let state = crate::state::AppState::new_for_test();
+        let owner = register_test_session(&state, "active-context", "%99").await;
+        state
+            .protocol
+            .write()
+            .await
+            .sessions
+            .get_mut("active-context")
+            .expect("registered session")
+            .metadata
+            .fresh_context_after_active_secs = Some(60);
+        let agent = SessionAgent {
+            app_state: state.clone(),
+        };
+        let args = SessionAgentArgs {
+            owner,
+            pane: "%99".into(),
+        };
+        let (actor, handle) = Actor::spawn(None, agent, args).await.expect("spawn failed");
+
+        actor.cast(SessionMsg::Active).expect("send active");
+        let _ = ractor::call!(actor, SessionMsg::GetPendingReplies).expect("flush active");
+        assert!(
+            state.protocol.read().await.sessions["active-context"]
+                .metadata
+                .active_context_segment_started_at
+                .is_some(),
+            "Active must open the existing policy's accounting segment"
+        );
+
+        actor.cast(SessionMsg::Stopped).expect("send stopped");
+        let _ = ractor::call!(actor, SessionMsg::GetPendingReplies).expect("flush stopped");
+        assert!(
+            state.protocol.read().await.sessions["active-context"]
+                .metadata
+                .active_context_segment_started_at
+                .is_none(),
+            "Stopped must close the accounting segment at the safe boundary"
+        );
+
+        actor.stop(None);
+        handle.await.expect("actor failed");
+    }
+
+    #[tokio::test]
+    async fn due_refresh_notification_contains_a_complete_fresh_continuation_command() {
+        // Break caught: a due boundary that omits the concrete continuation
+        // command or prompt semantics leaves the next context unable to resume.
+        let (state, messages, server) =
+            opencode_reminder_test_state("feature-worker", None, None).await;
+        let owner = {
+            let mut protocol = state.protocol.write().await;
+            let metadata = &mut protocol
+                .sessions
+                .get_mut("feature-worker")
+                .expect("registered session")
+                .metadata;
+            metadata.fresh_context_after_active_secs = Some(5400);
+            metadata.active_context_restart_due = true;
+            metadata.prompt = Some("finish the active task".into());
+            protocol.sessions["feature-worker"].owner()
+        };
+
+        state
+            .execute_effects(&[crate::daemon_protocol::Effect::ActiveContextRestartDue { owner }])
+            .await;
+
+        let messages = messages.lock().await;
+        assert_eq!(messages.len(), 1);
+        let message = &messages[0];
+        assert!(message.contains("feature-worker"));
+        assert!(message.contains("1 hour 30 minutes"));
+        assert!(message.contains("concise, self-contained continuation"));
+        assert!(message.contains("Verify live state"));
+        assert!(message.contains("stored prompt"));
+        assert!(message.contains("will be replayed"));
+        assert!(message.contains("<<'OUIJA_CONTINUATION'"));
+        assert!(message.contains(
+            "ouija restart-session \"feature-worker\" --fresh --one-shot-file /dev/stdin"
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn due_refresh_notification_requires_a_complete_promptless_continuation() {
+        // Break caught: promptless sessions that receive a terse notice lose
+        // the only instructions available to their fresh context.
+        let (state, messages, server) =
+            opencode_reminder_test_state("promptless-worker", None, None).await;
+        let owner = {
+            let mut protocol = state.protocol.write().await;
+            let metadata = &mut protocol
+                .sessions
+                .get_mut("promptless-worker")
+                .expect("registered session")
+                .metadata;
+            metadata.fresh_context_after_active_secs = Some(60);
+            metadata.active_context_restart_due = true;
+            protocol.sessions["promptless-worker"].owner()
+        };
+
+        state
+            .execute_effects(&[crate::daemon_protocol::Effect::ActiveContextRestartDue { owner }])
+            .await;
+
+        let messages = messages.lock().await;
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("has no stored prompt"));
+        assert!(messages[0].contains("complete enough to finish the work on its own"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn due_refresh_notification_skips_a_same_pane_replacement() {
+        // Break caught: identifying a delayed notification by public ID or pane
+        // alone would inject the old session's instruction into its replacement.
+        let (state, messages, server) =
+            opencode_reminder_test_state("replacement-worker", None, None).await;
+        let stale_owner = {
+            let mut protocol = state.protocol.write().await;
+            let metadata = &mut protocol
+                .sessions
+                .get_mut("replacement-worker")
+                .expect("registered session")
+                .metadata;
+            metadata.fresh_context_after_active_secs = Some(60);
+            metadata.active_context_restart_due = true;
+            protocol.sessions["replacement-worker"].owner()
+        };
+        {
+            let mut protocol = state.protocol.write().await;
+            protocol.apply(crate::daemon_protocol::Event::Remove {
+                id: "replacement-worker".into(),
+                keep_worktree: true,
+            });
+            protocol.apply(crate::daemon_protocol::Event::Register {
+                id: "replacement-worker".into(),
+                pane: Some("%99".into()),
+                metadata: Default::default(),
+            });
+        }
+
+        state
+            .execute_effects(&[crate::daemon_protocol::Effect::ActiveContextRestartDue {
+                owner: stale_owner,
+            }])
+            .await;
+
+        assert!(
+            messages.lock().await.is_empty(),
+            "a stale due effect must not reach the same-pane replacement"
+        );
+        server.abort();
     }
 
     #[tokio::test]
