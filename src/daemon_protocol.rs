@@ -213,6 +213,22 @@ impl SessionEntry {
             incarnation: self.metadata.session_incarnation,
         }
     }
+
+    /// The pane claim owned by this session's activity receiver.
+    ///
+    /// Pane-backed local sessions retain their existing receiver. A paneless
+    /// receiver is eligible only after OpenCode has a strong managed binding,
+    /// so weak/adopted backend observations cannot drive owner activity.
+    pub(crate) fn session_agent_pane(&self) -> Option<Option<&str>> {
+        if !matches!(self.origin, Origin::Local) {
+            return None;
+        }
+        match self.pane.as_deref() {
+            Some(pane) => Some(Some(pane)),
+            None if self.metadata.is_strong_opencode_binding() => Some(None),
+            None => None,
+        }
+    }
 }
 
 /// Where a session originates: local, remote peer, or human operator.
@@ -1040,11 +1056,11 @@ pub enum Effect {
     // Agents
     SpawnAgent {
         owner: ResourceOwner,
-        pane: String,
+        pane: Option<String>,
     },
     StopAgent {
         owner: ResourceOwner,
-        pane: String,
+        pane: Option<String>,
     },
     /// The runtime must notify this exact session at its stopped boundary that
     /// its active-context refresh is due.
@@ -2284,10 +2300,6 @@ impl DaemonState {
                                 owner: old_owner.clone(),
                                 pane: old_pane.clone(),
                             });
-                            effects.push(Effect::StopAgent {
-                                owner: old_owner,
-                                pane: old_pane.clone(),
-                            });
                         }
                     }
                 }
@@ -2417,6 +2429,11 @@ impl DaemonState {
             };
             incarnation
         };
+        let replaced_same_id_agent = self.sessions.get(&id).and_then(|session| {
+            session
+                .session_agent_pane()
+                .map(|pane| (session.owner(), pane.map(std::string::ToString::to_string)))
+        });
 
         // Pane dedup: same pane registered under different ID. This mutates
         // session ownership, so all registration-level validation and
@@ -2443,13 +2460,16 @@ impl DaemonState {
                 self.sessions.remove(old_key);
                 effects.push(Effect::StopAgent {
                     owner: old_owner.clone(),
-                    pane: pane_id.clone(),
+                    pane: Some(pane_id.clone()),
                 });
             }
             replaced_owner.map(|(key, _)| key)
         } else {
             None
         };
+        if let Some((owner, pane)) = replaced_same_id_agent {
+            effects.push(Effect::StopAgent { owner, pane });
+        }
 
         let now = chrono::Utc::now();
         metadata.session_incarnation = incarnation;
@@ -2498,10 +2518,10 @@ impl DaemonState {
         }
 
         // Agent
-        if let Some(ref pane_id) = pane {
+        if let Some(agent_pane) = self.sessions[&id].session_agent_pane() {
             effects.push(Effect::SpawnAgent {
                 owner: self.sessions[&id].owner(),
-                pane: pane_id.clone(),
+                pane: agent_pane.map(std::string::ToString::to_string),
             });
         }
 
@@ -2971,12 +2991,18 @@ impl DaemonState {
         metadata.inherit_active_context_from_fresh_finalizer(&existing.metadata);
 
         let old_pane = existing.pane.clone();
+        let old_agent_pane = existing
+            .session_agent_pane()
+            .map(|pane| pane.map(std::string::ToString::to_string));
         let owner = existing.owner();
         let networked = existing.metadata.networked;
         metadata.session_incarnation = expected_incarnation;
         let session = self.sessions.get_mut(&id).expect("session checked above");
         session.metadata = metadata;
         session.pane = pane.clone();
+        let new_agent_pane = session
+            .session_agent_pane()
+            .map(|pane| pane.map(std::string::ToString::to_string));
 
         let mut effects = vec![Effect::Persist];
         if old_pane != pane {
@@ -2985,10 +3011,6 @@ impl DaemonState {
                     owner: owner.clone(),
                     pane: old_pane.clone(),
                     name: "@ouija_session".into(),
-                });
-                effects.push(Effect::StopAgent {
-                    owner: owner.clone(),
-                    pane: old_pane.clone(),
                 });
                 effects.push(Effect::EnableAutoRename {
                     owner: owner.clone(),
@@ -3015,6 +3037,16 @@ impl DaemonState {
                 name: "@ouija_incarnation".into(),
                 value: owner.incarnation.to_string(),
             });
+        }
+        if old_agent_pane != new_agent_pane
+            && let Some(pane) = old_agent_pane
+        {
+            effects.push(Effect::StopAgent {
+                owner: owner.clone(),
+                pane,
+            });
+        }
+        if let Some(pane) = new_agent_pane {
             effects.push(Effect::SpawnAgent { owner, pane });
         }
         if networked {
@@ -3348,6 +3380,9 @@ impl DaemonState {
             .remove(id)
             .expect("session must exist after origin guard");
         let owner = session.owner();
+        let agent_pane = session
+            .session_agent_pane()
+            .map(|pane| pane.map(std::string::ToString::to_string));
         effects.push(Effect::Persist);
 
         if let Some(ref pane_id) = session.pane {
@@ -3363,9 +3398,11 @@ impl DaemonState {
                 owner: owner.clone(),
                 pane: pane_id.clone(),
             });
+        }
+        if let Some(pane) = agent_pane {
             effects.push(Effect::StopAgent {
                 owner: owner.clone(),
-                pane: pane_id.clone(),
+                pane,
             });
         }
 
@@ -3800,6 +3837,9 @@ impl DaemonState {
                 effects: vec![],
             };
         };
+        let old_agent_pane = target
+            .session_agent_pane()
+            .map(|pane| pane.map(std::string::ToString::to_string));
         if !matches!(target.origin, Origin::Local) {
             return BackendIdentityBindResult {
                 outcome: BackendIdentityBindOutcome::TargetNotLocal,
@@ -3900,7 +3940,25 @@ impl DaemonState {
         {
             session.metadata.backend_repair_reservation = None;
         }
+        let owner = session.owner();
+        let new_agent_pane = session
+            .session_agent_pane()
+            .map(|pane| pane.map(std::string::ToString::to_string));
         let mut effects = vec![Effect::Persist];
+        if old_agent_pane != new_agent_pane {
+            if let Some(pane) = old_agent_pane {
+                effects.push(Effect::StopAgent {
+                    owner: owner.clone(),
+                    pane,
+                });
+            }
+            if let Some(pane) = new_agent_pane {
+                effects.push(Effect::SpawnAgent {
+                    owner: owner.clone(),
+                    pane,
+                });
+            }
+        }
         if session.metadata.networked {
             effects.push(Effect::BroadcastSessionList);
         }
@@ -3932,6 +3990,11 @@ impl DaemonState {
                 ),
                 _ => return vec![],
             };
+        let old_agent_pane = self.sessions.get(id).and_then(|session| {
+            session
+                .session_agent_pane()
+                .map(|pane| pane.map(std::string::ToString::to_string))
+        });
 
         if expected_backend_session_id.as_deref() != current_backend_session_id.as_deref() {
             return vec![];
@@ -3968,7 +4031,25 @@ impl DaemonState {
         if expected_session_start_credential.is_some() {
             session.metadata.session_start_credential = None;
         }
+        let owner = session.owner();
+        let new_agent_pane = session
+            .session_agent_pane()
+            .map(|pane| pane.map(std::string::ToString::to_string));
         let mut effects = vec![Effect::Persist];
+        if old_agent_pane != new_agent_pane {
+            if let Some(pane) = old_agent_pane {
+                effects.push(Effect::StopAgent {
+                    owner: owner.clone(),
+                    pane,
+                });
+            }
+            if let Some(pane) = new_agent_pane {
+                effects.push(Effect::SpawnAgent {
+                    owner: owner.clone(),
+                    pane,
+                });
+            }
+        }
         if session.metadata.networked {
             effects.push(Effect::BroadcastSessionList);
         }
@@ -4070,7 +4151,7 @@ impl DaemonState {
                 });
                 effects.push(Effect::StopAgent {
                     owner: owner.clone(),
-                    pane: pane_id.clone(),
+                    pane: Some(pane_id.clone()),
                 });
             }
 

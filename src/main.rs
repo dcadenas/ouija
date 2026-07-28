@@ -1928,12 +1928,18 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
                         value: entry.id.clone(),
                     },
                     crate::daemon_protocol::Effect::SetTmuxVar {
-                        owner,
+                        owner: owner.clone(),
                         pane: pane.clone(),
                         name: "@ouija_incarnation".into(),
                         value: entry.metadata.session_incarnation.to_string(),
                     },
                 ]);
+            }
+            if let Some(pane) = entry.session_agent_pane() {
+                marker_effects.push(crate::daemon_protocol::Effect::SpawnAgent {
+                    owner,
+                    pane: pane.map(String::from),
+                });
             }
             proto.sessions.insert(ps.id.clone(), entry);
         }
@@ -1941,9 +1947,10 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
     };
 
     // Startup rehydration bypasses Event::Register so it can preserve the
-    // durable incarnation exactly. Re-emit only Register's pane markers after
-    // the rows are visible; the normal pane resource gate and physical-owner
-    // check reject a conflicting live incarnation.
+    // durable incarnation exactly. Re-emit Register's pane markers and exact
+    // eligible activity receivers after the rows are visible; the normal pane
+    // resource gate and physical-owner check reject a conflicting live
+    // incarnation.
     let _ = state.execute_effects(&marker_effects).await;
     tracing::info!("restored {} persisted sessions", alive.len());
     Ok(())
@@ -4519,6 +4526,55 @@ mod tests {
         assert_eq!(
             restored.active_context_restart_due,
             metadata.active_context_restart_due
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_persisted_paneless_strong_opencode_session_spawns_activity_receiver() {
+        // Break caught: startup rehydration bypasses Event::Register, so it
+        // must explicitly recreate the exact optional-pane activity receiver.
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = crate::persistence::PersistedLifecycleState::new(
+            vec![crate::persistence::PersistedSession {
+                id: "restored-paneless".into(),
+                pane: None,
+                registered_at: chrono::Utc::now(),
+                last_activity_at: chrono::Utc::now(),
+                metadata: crate::state::SessionMetadata {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_restored_paneless".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    session_incarnation: crate::daemon_protocol::SessionIncarnation(42),
+                    fresh_context_after_active_secs: Some(60),
+                    ..Default::default()
+                },
+            }],
+            crate::daemon_protocol::SessionIncarnation(42),
+            std::collections::BTreeMap::new(),
+        );
+        crate::persistence::save_sessions(dir.path(), &snapshot).unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "restore-paneless-agent-test".into(),
+            npub: "npub1test".into(),
+            port: 0,
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+
+        restore_persisted_sessions(&state).await.unwrap();
+        let owner = state.protocol.read().await.sessions["restored-paneless"].owner();
+        assert!(
+            state
+                .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Active)
+                .await,
+            "restored paneless owner must have a live activity receiver"
+        );
+        state.query_agent_pending_replies("restored-paneless").await;
+        assert!(
+            state.protocol.read().await.sessions["restored-paneless"]
+                .metadata
+                .active_context_segment_started_at
+                .is_some()
         );
     }
 

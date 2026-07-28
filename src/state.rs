@@ -17,7 +17,7 @@ use crate::transport::Transport;
 #[derive(Clone)]
 struct OwnedSessionAgent {
     owner: crate::daemon_protocol::ResourceOwner,
-    pane: String,
+    pane: Option<String>,
     actor: ActorRef<crate::session_agent::SessionMsg>,
 }
 
@@ -552,6 +552,40 @@ OUIJA_CONTINUATION
     )
 }
 
+enum ActiveContextDueDelivery {
+    Pane { pane: String, vim_mode: bool },
+    PanelessHttp(crate::daemon_protocol::HttpDeliverySnapshot),
+}
+
+async fn deliver_paneless_active_context_restart_due(
+    state: &Arc<AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    delivery: &crate::daemon_protocol::HttpDeliverySnapshot,
+    message: &str,
+) {
+    let outcome = state
+        .with_owned_paneless_strong_opencode_claim(owner, &delivery.backend_session_id, || async {
+            crate::tmux::deliver_via_http(
+                state,
+                &delivery.backend_session_id,
+                delivery.project_dir.as_deref(),
+                message,
+                delivery.model.as_deref(),
+                delivery.effort.as_deref(),
+            )
+            .await
+        })
+        .await;
+    if let Some(Err(decision)) = outcome {
+        tracing::warn!(
+            session = %owner.session_id,
+            incarnation = %owner.incarnation,
+            ?decision,
+            "paneless active-context restart notification delivery failed"
+        );
+    }
+}
+
 async fn notify_active_context_restart_due(
     state: &Arc<AppState>,
     owner: &crate::daemon_protocol::ResourceOwner,
@@ -569,28 +603,39 @@ async fn notify_active_context_restart_due(
                 if limit_secs == 0 {
                     return None;
                 }
-                Some((
-                    session.pane.clone()?,
-                    session.metadata.vim_mode,
-                    limit_secs,
-                    session.metadata.prompt.is_some(),
-                ))
+                let delivery = match session.pane.clone() {
+                    Some(pane) => ActiveContextDueDelivery::Pane {
+                        pane,
+                        vim_mode: session.metadata.vim_mode,
+                    },
+                    None => ActiveContextDueDelivery::PanelessHttp(
+                        session.metadata.http_delivery_snapshot()?,
+                    ),
+                };
+                Some((delivery, limit_secs, session.metadata.prompt.is_some()))
             })
     };
-    let Some((pane, vim_mode, limit_secs, has_stored_prompt)) = notification else {
+    let Some((delivery, limit_secs, has_stored_prompt)) = notification else {
         return;
     };
 
     let message =
         active_context_restart_due_message(&owner.session_id, limit_secs, has_stored_prompt);
-    if let Err(error) =
-        crate::tmux::locked_inject_owned(state, owner, &pane, &message, vim_mode).await
-    {
-        tracing::warn!(
-            session = %owner.session_id,
-            incarnation = %owner.incarnation,
-            "active-context restart notification delivery skipped: {error}"
-        );
+    match delivery {
+        ActiveContextDueDelivery::Pane { pane, vim_mode } => {
+            if let Err(error) =
+                crate::tmux::locked_inject_owned(state, owner, &pane, &message, vim_mode).await
+            {
+                tracing::warn!(
+                    session = %owner.session_id,
+                    incarnation = %owner.incarnation,
+                    "active-context restart notification delivery skipped: {error}"
+                );
+            }
+        }
+        ActiveContextDueDelivery::PanelessHttp(delivery) => {
+            deliver_paneless_active_context_restart_due(state, owner, &delivery, &message).await;
+        }
     }
 }
 
@@ -1483,6 +1528,33 @@ impl AppState {
             .get(&owner.session_id)
             .is_some_and(|session| {
                 session.owner() == *owner
+                    && session.metadata.backend_session_id.as_deref() == Some(backend_session_id)
+            });
+        if current { Some(action().await) } else { None }
+    }
+
+    async fn with_owned_paneless_strong_opencode_claim<F, Fut, T>(
+        &self,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        backend_session_id: &str,
+        action: F,
+    ) -> Option<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let gate = self.backend_resource_gate(backend_session_id);
+        let _resource = gate.lock().await;
+        let current = self
+            .protocol
+            .read()
+            .await
+            .sessions
+            .get(&owner.session_id)
+            .is_some_and(|session| {
+                session.owner() == *owner
+                    && session.pane.is_none()
+                    && session.metadata.is_strong_opencode_binding()
                     && session.metadata.backend_session_id.as_deref() == Some(backend_session_id)
             });
         if current { Some(action().await) } else { None }
@@ -2473,10 +2545,10 @@ impl AppState {
                     self.enable_owned_auto_rename(owner, pane).await;
                 }
                 Effect::SpawnAgent { owner, pane } => {
-                    self.spawn_session_agent(owner, pane).await;
+                    self.spawn_session_agent(owner, pane.as_deref()).await;
                 }
                 Effect::StopAgent { owner, pane } => {
-                    self.stop_session_agent(owner, pane).await;
+                    self.stop_session_agent(owner, pane.as_deref()).await;
                 }
                 Effect::ClearPendingReplies { removed_ids } => {
                     self.clear_orphaned_pending_replies(removed_ids).await;
@@ -2836,10 +2908,10 @@ impl AppState {
                     self.enable_owned_auto_rename(owner, pane).await;
                 }
                 Effect::SpawnAgent { owner, pane } => {
-                    self.spawn_session_agent(owner, pane).await;
+                    self.spawn_session_agent(owner, pane.as_deref()).await;
                 }
                 Effect::StopAgent { owner, pane } => {
-                    self.stop_session_agent(owner, pane).await;
+                    self.stop_session_agent(owner, pane.as_deref()).await;
                 }
                 Effect::ActiveContextRestartDue { owner } => {
                     spawn_owned_active_context_restart_due_delivery(self, owner);
@@ -3425,18 +3497,18 @@ impl AppState {
             .insert(t.transport_name().to_string(), t);
     }
 
-    /// Spawn an agent only while the exact owner and pane are current.
+    /// Spawn an agent only while the exact owner and optional pane are current.
     pub async fn spawn_session_agent(
         self: &Arc<Self>,
         owner: &crate::daemon_protocol::ResourceOwner,
-        pane: &str,
+        pane: Option<&str>,
     ) {
         let protocol = self.protocol.read().await;
         if protocol
             .sessions
             .get(&owner.session_id)
             .is_none_or(|session| {
-                session.owner() != *owner || session.pane.as_deref() != Some(pane)
+                session.owner() != *owner || session.session_agent_pane() != Some(pane)
             })
         {
             return;
@@ -3451,7 +3523,7 @@ impl AppState {
         };
         let args = crate::session_agent::SessionAgentArgs {
             owner: owner.clone(),
-            pane: pane.to_string(),
+            pane: pane.map(String::from),
         };
         match Actor::spawn(None, agent, args).await {
             Ok((actor_ref, _handle)) => {
@@ -3459,7 +3531,7 @@ impl AppState {
                     owner.clone(),
                     OwnedSessionAgent {
                         owner: owner.clone(),
-                        pane: pane.to_string(),
+                        pane: pane.map(String::from),
                         actor: actor_ref,
                     },
                 );
@@ -3479,9 +3551,15 @@ impl AppState {
         }
     }
 
-    async fn stop_session_agent(&self, owner: &crate::daemon_protocol::ResourceOwner, pane: &str) {
+    async fn stop_session_agent(
+        &self,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        pane: Option<&str>,
+    ) {
         let mut agents = self.session_agents.write().await;
-        if agents.get(owner).is_some_and(|agent| agent.pane == pane)
+        if agents
+            .get(owner)
+            .is_some_and(|agent| agent.pane.as_deref() == pane)
             && let Some(agent) = agents.remove(owner)
         {
             agent.actor.stop(None);
@@ -3505,7 +3583,9 @@ impl AppState {
         let Some(mut agent) = agents.get(old_owner).cloned() else {
             return;
         };
-        if protocol.sessions[&new_owner.session_id].pane.as_deref() != Some(agent.pane.as_str()) {
+        if protocol.sessions[&new_owner.session_id].session_agent_pane()
+            != Some(agent.pane.as_deref())
+        {
             return;
         }
         agents.remove(old_owner);
@@ -4564,6 +4644,323 @@ impl FailedEffectSendRollback {
 pub(crate) mod tests {
     use super::*;
     use crate::daemon_protocol::Origin;
+    use axum::extract::State as AxumState;
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use tokio::net::TcpListener;
+
+    async fn paneless_prompt_async_recorder(
+        AxumState(messages): AxumState<Arc<tokio::sync::Mutex<Vec<String>>>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> StatusCode {
+        messages.lock().await.push(
+            body["parts"][0]["text"]
+                .as_str()
+                .expect("prompt text")
+                .to_string(),
+        );
+        StatusCode::NO_CONTENT
+    }
+
+    fn strong_paneless_opencode_metadata(
+        backend_session_id: Option<&str>,
+    ) -> crate::daemon_protocol::SessionMeta {
+        crate::daemon_protocol::SessionMeta {
+            backend: Some("opencode".into()),
+            backend_session_id: backend_session_id.map(String::from),
+            opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+            ..Default::default()
+        }
+    }
+
+    async fn wait_for_recorded_messages(
+        messages: &Arc<tokio::sync::Mutex<Vec<String>>>,
+        expected: usize,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if messages.lock().await.len() >= expected {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("expected paneless HTTP delivery");
+    }
+
+    #[tokio::test]
+    async fn paneless_strong_opencode_activity_crosses_limit_and_delivers_due_notice() {
+        // Break caught: accepting active-context policy on a supported
+        // paneless OpenCode session must not leave it without the existing
+        // Active/Stopped receiver or mandatory stopped-boundary notice.
+        let messages = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route(
+                "/session/{session_id}/prompt_async",
+                post(paneless_prompt_async_recorder),
+            )
+            .with_state(messages.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let data_dir = tempfile::tempdir().unwrap().keep();
+        let state = AppState::new(crate::config::OuijaConfig {
+            name: "paneless-active-context-test".into(),
+            npub: "npub1test".into(),
+            port: port - 320,
+            data_dir: data_dir.clone(),
+            config_dir: data_dir,
+        });
+        let mut metadata = strong_paneless_opencode_metadata(Some("ses_paneless"));
+        metadata.fresh_context_after_active_secs = Some(1);
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "paneless-worker".into(),
+                pane: None,
+                metadata,
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["paneless-worker"].owner();
+
+        assert!(
+            state
+                .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Active)
+                .await,
+            "paneless strong OpenCode owner must have the existing activity receiver"
+        );
+        state.query_agent_pending_replies("paneless-worker").await;
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert!(
+            state
+                .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Stopped)
+                .await
+        );
+        state.query_agent_pending_replies("paneless-worker").await;
+        wait_for_recorded_messages(&messages, 1).await;
+
+        let protocol = state.protocol.read().await;
+        let metadata = &protocol.sessions["paneless-worker"].metadata;
+        assert!(metadata.active_context_accumulated_secs >= 1);
+        assert!(metadata.active_context_restart_due);
+        drop(protocol);
+        let messages = messages.lock().await;
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("Ouija active-context refresh is due"));
+        assert!(messages[0].contains("paneless-worker"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn delayed_paneless_due_delivery_skips_superseded_owner() {
+        // Break caught: a detached due task can hold an old HTTP snapshot
+        // after the public ID and backend ID have both been reused. Delivery
+        // must recheck the exact owner under the backend gate.
+        let messages = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route(
+                "/session/{session_id}/prompt_async",
+                post(paneless_prompt_async_recorder),
+            )
+            .with_state(messages.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let data_dir = tempfile::tempdir().unwrap().keep();
+        let state = AppState::new(crate::config::OuijaConfig {
+            name: "paneless-due-supersession-test".into(),
+            npub: "npub1test".into(),
+            port: port - 320,
+            data_dir: data_dir.clone(),
+            config_dir: data_dir,
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "paneless-reused".into(),
+                pane: None,
+                metadata: strong_paneless_opencode_metadata(Some("ses_reused")),
+            })
+            .await;
+        let (stale_owner, stale_delivery) = {
+            let protocol = state.protocol.read().await;
+            let session = &protocol.sessions["paneless-reused"];
+            (
+                session.owner(),
+                session
+                    .metadata
+                    .http_delivery_snapshot()
+                    .expect("strong HTTP snapshot"),
+            )
+        };
+        let gate = state.backend_resource_gate("ses_reused");
+        let held = gate.lock().await;
+        let delivery_state = state.clone();
+        let delivery_owner = stale_owner.clone();
+        let delivery_snapshot = stale_delivery.clone();
+        let delivery_task = tokio::spawn(async move {
+            deliver_paneless_active_context_restart_due(
+                &delivery_state,
+                &delivery_owner,
+                &delivery_snapshot,
+                "stale due notice",
+            )
+            .await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            !delivery_task.is_finished(),
+            "paneless delivery must wait behind the backend resource gate"
+        );
+        {
+            let mut protocol = state.protocol.write().await;
+            protocol.apply(crate::daemon_protocol::Event::Remove {
+                id: "paneless-reused".into(),
+                keep_worktree: true,
+            });
+            protocol.apply(crate::daemon_protocol::Event::Register {
+                id: "paneless-reused".into(),
+                pane: None,
+                metadata: strong_paneless_opencode_metadata(Some("ses_reused")),
+            });
+            assert_ne!(protocol.sessions["paneless-reused"].owner(), stale_owner);
+        }
+        drop(held);
+        delivery_task.await.expect("delivery task failed");
+
+        assert!(
+            messages.lock().await.is_empty(),
+            "a delayed old-owner notice must not reach the replacement backend binding"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn paneless_agent_follows_registration_rename_and_removal() {
+        // Break caught: exact optional-pane receiver ownership must move with a
+        // local rename and disappear with the removed owner.
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "paneless-old".into(),
+                pane: None,
+                metadata: strong_paneless_opencode_metadata(Some("ses_paneless_lifecycle")),
+            })
+            .await;
+        let old_owner = state.protocol.read().await.sessions["paneless-old"].owner();
+        assert!(
+            state
+                .notify_agent_owned(&old_owner, crate::session_agent::SessionMsg::Active)
+                .await
+        );
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Rename {
+                old_id: "paneless-old".into(),
+                new_id: "paneless-new".into(),
+            })
+            .await;
+        let new_owner = state.protocol.read().await.sessions["paneless-new"].owner();
+        assert!(
+            !state
+                .notify_agent_owned(&old_owner, crate::session_agent::SessionMsg::Active)
+                .await
+        );
+        assert!(
+            state
+                .notify_agent_owned(&new_owner, crate::session_agent::SessionMsg::Active)
+                .await
+        );
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Remove {
+                id: "paneless-new".into(),
+                keep_worktree: true,
+            })
+            .await;
+        assert!(
+            !state
+                .notify_agent_owned(&new_owner, crate::session_agent::SessionMsg::Active)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn paneless_agent_spawns_when_managed_binding_becomes_strong() {
+        // Break caught: a paneless managed launch registered before its
+        // backend identity arrives must gain the activity receiver at bind.
+        let state = AppState::new_for_test();
+        let mut metadata = strong_paneless_opencode_metadata(None);
+        metadata.session_start_credential = Some("launch-proof".into());
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "paneless-bind".into(),
+                pane: None,
+                metadata,
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["paneless-bind"].owner();
+        assert!(
+            !state
+                .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Active)
+                .await
+        );
+
+        let result = state
+            .bind_backend_identity(
+                "paneless-bind",
+                &crate::backend::BackendSessionIdentity {
+                    backend: "opencode".into(),
+                    session_id: "ses_paneless_bind".into(),
+                },
+                Some("launch-proof"),
+                Some(owner.incarnation),
+            )
+            .await;
+        assert!(matches!(
+            result.outcome,
+            crate::daemon_protocol::BackendIdentityBindOutcome::Bound { .. }
+        ));
+        assert!(
+            state
+                .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Active)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn paneless_agent_spawns_on_launch_metadata_refresh() {
+        // Break caught: paneless restart completion must install the exact
+        // target receiver when final metadata establishes a strong binding.
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "paneless-refresh".into(),
+                pane: None,
+                metadata: strong_paneless_opencode_metadata(None),
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["paneless-refresh"].owner();
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::RefreshLaunchMetadata {
+                id: owner.session_id.clone(),
+                expected_incarnation: owner.incarnation,
+                pane: None,
+                metadata: strong_paneless_opencode_metadata(Some("ses_paneless_refresh")),
+            })
+            .await;
+
+        assert!(
+            state
+                .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Active)
+                .await
+        );
+    }
 
     #[test]
     fn active_context_restart_command_shell_escapes_arbitrary_session_ids() {

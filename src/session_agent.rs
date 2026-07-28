@@ -70,7 +70,7 @@ pub enum SessionMsg {
 /// Per-session behavioral state owned by the agent.
 pub struct SessionAgentState {
     pub owner: ResourceOwner,
-    pub pane: String,
+    pub pane: Option<String>,
     pub idle: bool,
     pub last_stopped_at: Option<DateTime<Utc>>,
     pub last_active_at: Option<DateTime<Utc>>,
@@ -127,8 +127,13 @@ async fn claim_hard_stall_restart(
 }
 
 impl SessionAgentState {
-    /// Create initial agent state for a session and pane.
+    /// Create initial agent state for a pane-backed session.
+    #[cfg(test)]
     pub fn new(owner: ResourceOwner, pane: String) -> Self {
+        Self::new_with_optional_pane(owner, Some(pane))
+    }
+
+    fn new_with_optional_pane(owner: ResourceOwner, pane: Option<String>) -> Self {
         Self {
             owner,
             pane,
@@ -145,7 +150,7 @@ impl SessionAgentState {
     }
 
     fn owns(&self, session: &crate::daemon_protocol::SessionEntry) -> bool {
-        session.owner() == self.owner && session.pane.as_deref() == Some(self.pane.as_str())
+        session.owner() == self.owner && session.session_agent_pane() == Some(self.pane.as_deref())
     }
 }
 
@@ -160,7 +165,7 @@ pub struct SessionAgent {
 #[derive(Debug)]
 pub struct SessionAgentArgs {
     pub owner: ResourceOwner,
-    pub pane: String,
+    pub pane: Option<String>,
 }
 
 #[ractor::async_trait]
@@ -179,7 +184,9 @@ impl Actor for SessionAgent {
             incarnation = %args.owner.incarnation,
             "session agent started"
         );
-        Ok(SessionAgentState::new(args.owner, args.pane))
+        Ok(SessionAgentState::new_with_optional_pane(
+            args.owner, args.pane,
+        ))
     }
 
     async fn handle(
@@ -203,7 +210,7 @@ impl Actor for SessionAgent {
                     .get(&new_owner.session_id)
                     .is_some_and(|session| {
                         session.owner() == *new_owner
-                            && session.pane.as_deref() == Some(state.pane.as_str())
+                            && session.session_agent_pane() == Some(state.pane.as_deref())
                     });
             if renamed_is_current {
                 tracing::info!(
@@ -514,11 +521,13 @@ impl Actor for SessionAgent {
                         let wrapped = format!(
                             "<ouija-status type=\"reminder\" clearing_id=\"{clearing_id}\">{reminder_body}</ouija-status>"
                         );
-                        if self.is_current(state).await {
+                        if self.is_current(state).await
+                            && let Some(pane) = state.pane.as_deref()
+                        {
                             let _ = crate::tmux::locked_inject_owned(
                                 &self.app_state,
                                 &state.owner,
-                                &state.pane,
+                                pane,
                                 &wrapped,
                                 vim_mode,
                             )
@@ -537,6 +546,9 @@ impl Actor for SessionAgent {
                             if !self.is_current(state).await {
                                 break;
                             }
+                            let Some(pane) = state.pane.as_deref() else {
+                                break;
+                            };
                             let msg = format!(
                                 "<ouija-status type=\"reminder\" clearing_id=\"{clearing_id}\">Pending reply owed: msg #{} from {}</ouija-status>",
                                 p.msg_id, p.from
@@ -544,7 +556,7 @@ impl Actor for SessionAgent {
                             let _ = crate::tmux::locked_inject_owned(
                                 &self.app_state,
                                 &state.owner,
-                                &state.pane,
+                                pane,
                                 &msg,
                                 vim_mode,
                             )
@@ -592,7 +604,7 @@ impl SessionAgent {
             return false;
         };
         if session.metadata.session_incarnation != state.owner.incarnation
-            || session.pane.as_deref() != Some(state.pane.as_str())
+            || session.session_agent_pane() != Some(state.pane.as_deref())
         {
             return false;
         }
@@ -609,7 +621,7 @@ impl SessionAgent {
             .get(&state.owner.session_id)
             .is_some_and(|session| {
                 session.owner() == state.owner
-                    && session.pane.as_deref() == Some(state.pane.as_str())
+                    && session.session_agent_pane() == Some(state.pane.as_deref())
             })
     }
 
@@ -660,6 +672,9 @@ impl SessionAgent {
 
     /// Inject pending-reply reminders into the session's pane.
     async fn send_reminders(&self, entries: &[&PendingReplyEntry], state: &SessionAgentState) {
+        let Some(pane) = state.pane.as_deref() else {
+            return;
+        };
         let vim_mode = self
             .app_state
             .protocol
@@ -668,8 +683,7 @@ impl SessionAgent {
             .sessions
             .get(&state.owner.session_id)
             .filter(|session| {
-                session.owner() == state.owner
-                    && session.pane.as_deref() == Some(state.pane.as_str())
+                session.owner() == state.owner && session.session_agent_pane() == Some(Some(pane))
             })
             .map(|s| s.metadata.vim_mode)
             .unwrap_or(false);
@@ -685,7 +699,7 @@ impl SessionAgent {
             let _ = crate::tmux::locked_inject_owned(
                 &self.app_state,
                 &state.owner,
-                &state.pane,
+                pane,
                 &reminder,
                 vim_mode,
             )
@@ -695,6 +709,9 @@ impl SessionAgent {
 
     /// Hard stall: force restart with clean context.
     async fn handle_hard_stall(&self, state: &SessionAgentState) {
+        let Some(pane) = state.pane.as_deref() else {
+            return;
+        };
         let meta = {
             let proto = self.app_state.protocol.read().await;
             proto
@@ -702,7 +719,7 @@ impl SessionAgent {
                 .get(&state.owner.session_id)
                 .filter(|session| {
                     session.owner() == state.owner
-                        && session.pane.as_deref() == Some(state.pane.as_str())
+                        && session.session_agent_pane() == Some(Some(pane))
                 })
                 .map(|s| s.metadata.clone())
         };
@@ -718,7 +735,7 @@ impl SessionAgent {
         let reminder = meta.reminder.clone();
         let app_state = self.app_state.clone();
         let owner = state.owner.clone();
-        let pane = state.pane.clone();
+        let pane = pane.to_string();
         let sid = owner.session_id.clone();
 
         if !claim_hard_stall_restart(&app_state, &owner, &pane).await {
@@ -925,7 +942,7 @@ mod tests {
         let owner = state.protocol.read().await.sessions[session_id].owner();
         let args = SessionAgentArgs {
             owner,
-            pane: "%99".into(),
+            pane: Some("%99".into()),
         };
         let (actor, handle) = Actor::spawn(None, agent, args).await.expect("spawn failed");
 
@@ -972,7 +989,7 @@ mod tests {
         let owner = register_test_session(&state, "test-idle", "%99").await;
         let args = SessionAgentArgs {
             owner,
-            pane: "%99".into(),
+            pane: Some("%99".into()),
         };
 
         state.settings.write().await.idle_timeout_secs = 1;
@@ -997,7 +1014,7 @@ mod tests {
         let owner = register_test_session(&state, "test-active", "%99").await;
         let args = SessionAgentArgs {
             owner,
-            pane: "%99".into(),
+            pane: Some("%99".into()),
         };
         state.settings.write().await.idle_timeout_secs = 1;
 
@@ -1035,7 +1052,7 @@ mod tests {
         };
         let args = SessionAgentArgs {
             owner,
-            pane: "%99".into(),
+            pane: Some("%99".into()),
         };
         let (actor, handle) = Actor::spawn(None, agent, args).await.expect("spawn failed");
 
@@ -1074,7 +1091,7 @@ mod tests {
         };
         let args = SessionAgentArgs {
             owner,
-            pane: "%99".into(),
+            pane: Some("%99".into()),
         };
         let (actor, handle) = Actor::spawn(None, agent, args).await.expect("spawn failed");
 
@@ -1159,7 +1176,7 @@ mod tests {
         };
         let args = SessionAgentArgs {
             owner,
-            pane: "%99".into(),
+            pane: Some("%99".into()),
         };
         let (actor, handle) = Actor::spawn(None, agent, args).await.expect("spawn failed");
 
@@ -1376,7 +1393,7 @@ mod tests {
         };
         let args = SessionAgentArgs {
             owner: old_owner.clone(),
-            pane: "%99".into(),
+            pane: Some("%99".into()),
         };
         let (actor, handle) = Actor::spawn(None, agent, args).await.expect("spawn failed");
 
@@ -1418,7 +1435,7 @@ mod tests {
         };
         let args = SessionAgentArgs {
             owner: old_owner.clone(),
-            pane: "%99".into(),
+            pane: Some("%99".into()),
         };
         let (actor, handle) = Actor::spawn(None, agent, args).await.expect("spawn failed");
         let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
@@ -1470,7 +1487,7 @@ mod tests {
         };
         let args = SessionAgentArgs {
             owner: old_owner.clone(),
-            pane: "%99".into(),
+            pane: Some("%99".into()),
         };
         let (actor, handle) = Actor::spawn(None, agent, args).await.expect("spawn failed");
         let new_owner = {
@@ -1611,7 +1628,7 @@ mod tests {
         let owner = state.protocol.read().await.sessions["test-reminder"].owner();
         let args = SessionAgentArgs {
             owner,
-            pane: "%99".into(),
+            pane: Some("%99".into()),
         };
         state.settings.write().await.idle_timeout_secs = 1;
 
@@ -1705,7 +1722,7 @@ mod tests {
         let owner = register_test_session(&state, "test-clear", "%99").await;
         let args = SessionAgentArgs {
             owner,
-            pane: "%99".into(),
+            pane: Some("%99".into()),
         };
         state.settings.write().await.idle_timeout_secs = 60;
 
@@ -1734,7 +1751,7 @@ mod tests {
         let owner = register_test_session(&state, "test-wrong-id", "%99").await;
         let args = SessionAgentArgs {
             owner,
-            pane: "%99".into(),
+            pane: Some("%99".into()),
         };
         state.settings.write().await.idle_timeout_secs = 60;
 
