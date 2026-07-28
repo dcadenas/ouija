@@ -576,6 +576,23 @@ pub(crate) fn assert_shared_task_reminder_guidance(skill: &str) {
         !skill.contains(&placeholder_command),
         "skill must not contain a copyable placeholder clearing command"
     );
+    assert!(
+        skill.contains("ouija rollover prepare --stdin"),
+        "shared skill must teach session-owned rollover preparation"
+    );
+    assert!(
+        skill.contains("ouija rollover adopt"),
+        "shared skill must teach verified adoption"
+    );
+    assert!(
+        skill.contains("Repository, git, test, and GitHub")
+            && skill.contains("evidence remains authoritative"),
+        "shared skill must keep continuation records non-authoritative"
+    );
+    assert!(
+        skill.contains("Native subagents are not Ouija sessions"),
+        "shared skill must preserve the native-subagent boundary"
+    );
 }
 
 #[cfg(test)]

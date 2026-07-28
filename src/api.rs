@@ -122,6 +122,7 @@ pub async fn get_session(
                     "id": s.id,
                     "pane": s.pane,
                     "origin": s.origin.label(),
+                    "session_incarnation": s.metadata.session_incarnation.to_string(),
                     "vim_mode": s.metadata.vim_mode,
                     "project_dir": s.metadata.project_dir,
                     "role": s.metadata.role,
@@ -165,6 +166,7 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
                 "id": s.id,
                 "pane": s.pane,
                 "origin": s.origin.label(),
+                "session_incarnation": s.metadata.session_incarnation.to_string(),
                 "vim_mode": s.metadata.vim_mode,
                 "project_dir": s.metadata.project_dir,
                 "role": s.metadata.role,
@@ -4751,6 +4753,33 @@ pub async fn clear_reminder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn status_and_single_session_expose_incarnation_as_decimal_string() {
+        let state = crate::state::AppState::new_for_test();
+        state.protocol.write().await.sessions.insert(
+            "worker".into(),
+            crate::daemon_protocol::SessionEntry {
+                id: "worker".into(),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    session_incarnation: crate::daemon_protocol::SessionIncarnation(u64::MAX),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let Json(all) = status(State(state.clone())).await;
+        assert_eq!(
+            all["sessions"][0]["session_incarnation"],
+            u64::MAX.to_string()
+        );
+
+        let (code, Json(one)) =
+            get_session(State(state), axum::extract::Path("worker".to_string())).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(one["session_incarnation"], u64::MAX.to_string());
+    }
 
     fn backend_identity_request(backend: &str, session_id: &str) -> BackendIdentityRequest {
         BackendIdentityRequest {

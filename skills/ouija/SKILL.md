@@ -120,7 +120,58 @@ Key fields:
 - `--worktree` — isolate in a git worktree at `~/.ouija/worktrees/<repo>/<session>`
 - `--branch` / `--base-branch` — git branch control for worktrees
 
-## 5. Task scheduling
+## 5. Intentional context rollover
+
+Use rollover only at a safe work boundary. The running session, not the Ouija
+daemon, decides when a bounded slice can stop. Prepare a concise continuation
+directly on stdin:
+
+```bash
+token="$(ouija rollover prepare --stdin <<'JSON'
+{
+  "version": 1,
+  "objective": "finish the authorized feature",
+  "current_slice": "wire the local helper CLI",
+  "confirmed_evidence": ["focused helper tests pass"],
+  "blockers_decisions": ["semantic policy stays outside the daemon"],
+  "next_actions": ["verify live git state", "run cargo test"],
+  "forbidden_scope": ["do not push or alter production sessions"],
+  "verification_commands": ["git status --short", "cargo test"],
+  "explicitly_known_ouija_descendants": ["exact-child-id"]
+}
+JSON
+)"
+instruction_file="$(mktemp)"
+printf '%s\n' \
+  "Verify live identity and repository state, then run: ouija rollover adopt $token" \
+  > "$instruction_file"
+session="$(ouija whoami)"
+ouija restart-session "$session" --fresh \
+  --suppress-stored-prompt --one-shot-file "$instruction_file"
+```
+
+The fresh incarnation runs `ouija rollover adopt TOKEN`. Adoption prints only
+the semantic continuation JSON after verifying the exact public Local session
+ID, a strictly newer incarnation, canonical cwd/repository/common directory,
+branch, HEAD, and tracked/untracked dirty state. It refuses expired records or
+any mismatch without changing the pending record. Retrying adoption from the
+same adopting incarnation is idempotent. Use
+`ouija rollover prepare --stdin --replace-expired` only after inspecting an
+expired pending record and intentionally replacing it.
+
+Continuation records live privately under Ouija's per-user data directory,
+outside repositories. `ouija rollover cleanup` removes an adopted or expired
+record; removing a live pending record requires the explicit
+`--force-pending` override. Cleanup is a deliberate CLI action, never a
+scheduled daemon job.
+
+Do not create handoff drafts in a repository. Repository, git, test, and GitHub
+evidence remains authoritative; the continuation is disposable working context
+and must be checked against live state. Native subagents are not Ouija sessions:
+never list, enroll, restart, or include them as Ouija descendants. Include only
+exact, explicitly managed Ouija child IDs.
+
+## 6. Task scheduling
 
 ```bash
 # Create a scheduled task (cron in UTC):
@@ -136,7 +187,7 @@ ouija task trigger TASK_ID
 ouija task remove TASK_ID
 ```
 
-## 6. Housekeeping
+## 7. Housekeeping
 
 **Update your metadata** when your focus changes:
 ```bash
@@ -152,7 +203,7 @@ do not invent an ID or place a clearing command in `--reminder`.
 ouija clear-reply SENDER_ID
 ```
 
-## 7. Non-tmux contexts (opencode HTTP API, etc.)
+## 8. Non-tmux contexts (opencode HTTP API, etc.)
 
 The CLI infers your session ID from `$TMUX_PANE`. In engines whose bash tool runs outside tmux, that variable may be unset and implicit `ouija ask/tell/reply` cannot always resolve a sender automatically.
 
@@ -180,7 +231,7 @@ ouija ask target-id "question"
 
 If implicit resolution fails and you do not have an exact injected or operator-provided public Local id, run `ouija whoami` and relay its diagnostics. **Never run `ouija register` to "fix" this** — it would create a duplicate session entry, not register the caller.
 
-## 8. Patterns
+## 9. Patterns
 
 Recurring recovery and completion are separate. Supplying `--reminder` opts into idle-cycle recovery nudges; `--when-done` controls what the session does after completion. Pending replies remain an independent reason to wake a session.
 
