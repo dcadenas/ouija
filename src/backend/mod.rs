@@ -593,6 +593,23 @@ pub(crate) fn assert_shared_task_reminder_guidance(skill: &str) {
         skill.contains("Native subagents are not Ouija sessions"),
         "shared skill must preserve the native-subagent boundary"
     );
+    assert!(
+        skill.contains("--target hub-cx --inject-only")
+            && skill.contains("one recurring exact-target task"),
+        "shared skill must teach explicit root enrollment with inject-only tasks"
+    );
+    assert!(
+        skill.contains("fails closed")
+            && skill.contains("never creates, revives, restarts")
+            && skill.contains("respawns a session"),
+        "shared skill must preserve inject-only's non-lifecycle contract"
+    );
+    assert!(
+        skill.contains("Do not create per-child schedules")
+            && skill.contains("infer enrollment from names/roles/paths")
+            && skill.contains("OuijaCP lifecycle semantics are unrelated"),
+        "shared skill must keep child policy outside the daemon and native backends"
+    );
 }
 
 #[cfg(test)]

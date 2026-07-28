@@ -379,6 +379,9 @@ enum TaskAction {
         /// Inject into this existing session (continue_session mode only)
         #[arg(long)]
         target: Option<String>,
+        /// Inject only into the exact currently live Local target; never revive it
+        #[arg(long, requires = "target")]
+        inject_only: bool,
         /// Override project dir for session revival
         #[arg(long)]
         project_dir: Option<String>,
@@ -1310,10 +1313,11 @@ async fn main() -> anyhow::Result<()> {
                 match tasks {
                     Some(list) if !list.is_empty() => {
                         println!(
-                            "{:<10} {:<16} {:<16} {:<10} {:<10} {:<12} {:<8} {:<20} RUNS",
+                            "{:<10} {:<16} {:<16} {:<12} {:<10} {:<10} {:<12} {:<8} {:<20} RUNS",
                             "ID",
                             "NAME",
                             "CRON",
+                            "MODE",
                             "TARGET",
                             "BACKEND",
                             "MODEL",
@@ -1324,6 +1328,7 @@ async fn main() -> anyhow::Result<()> {
                             let id = t["id"].as_str().unwrap_or("-");
                             let name = t["name"].as_str().unwrap_or("-");
                             let cron = t["cron"].as_str().unwrap_or("-");
+                            let mode = t["on_fire"]["mode"].as_str().unwrap_or("-");
                             let target = t["target_session"].as_str().unwrap_or("—");
                             let backend = t["backend"].as_str().unwrap_or("—");
                             let model = t["model"].as_str().unwrap_or("—");
@@ -1331,8 +1336,8 @@ async fn main() -> anyhow::Result<()> {
                             let next = t["next_run"].as_str().unwrap_or("-");
                             let runs = t["run_count"].as_u64().unwrap_or(0);
                             println!(
-                                "{:<10} {:<16} {:<16} {:<10} {:<10} {:<12} {:<8} {:<20} {}",
-                                id, name, cron, target, backend, model, enabled, next, runs
+                                "{:<10} {:<16} {:<16} {:<12} {:<10} {:<10} {:<12} {:<8} {:<20} {}",
+                                id, name, cron, mode, target, backend, model, enabled, next, runs
                             );
                         }
                     }
@@ -1344,6 +1349,7 @@ async fn main() -> anyhow::Result<()> {
                 cron,
                 target,
                 message,
+                inject_only,
                 project_dir,
                 backend,
                 model,
@@ -1355,6 +1361,7 @@ async fn main() -> anyhow::Result<()> {
                     "cron": cron,
                     "target_session": target,
                     "message": message,
+                    "on_fire": inject_only.then_some(crate::scheduler::OnFire::InjectOnly),
                     "project_dir": project_dir,
                     "backend": backend,
                     "model": model,
@@ -3219,6 +3226,13 @@ fn project_session_list(status: &serde_json::Value) -> serde_json::Value {
                             serde_json::Value::String(incarnation.to_string()),
                         );
                     }
+                    projected.insert(
+                        "parent_session".to_string(),
+                        session
+                            .get("parent_session")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                    );
 
                     if let Some(project) = session
                         .get("project_dir")
@@ -3406,6 +3420,48 @@ mod tests {
                 );
             }
             _ => panic!("expected spawn-session command"),
+        }
+    }
+
+    #[test]
+    fn inject_only_task_cli_requires_and_preserves_exact_target() {
+        let missing_target = Cli::try_parse_from([
+            "ouija",
+            "task",
+            "add",
+            "context-audit",
+            "*/15 * * * *",
+            "audit",
+            "--inject-only",
+        ]);
+        assert!(missing_target.is_err());
+
+        let cli = Cli::try_parse_from([
+            "ouija",
+            "task",
+            "add",
+            "context-audit",
+            "*/15 * * * *",
+            "audit",
+            "--target",
+            "manual-root",
+            "--inject-only",
+        ])
+        .expect("inject-only task parses with exact target");
+
+        match cli.command {
+            Command::Task {
+                action:
+                    TaskAction::Add {
+                        target,
+                        inject_only,
+                        ..
+                    },
+            } => {
+                assert_eq!(target.as_deref(), Some("manual-root"));
+                assert!(inject_only);
+            }
+            _ => panic!("expected task add command"),
         }
     }
 
@@ -4175,6 +4231,7 @@ mod tests {
                 "id": "ouija-next-issue",
                 "origin": "local",
                 "session_incarnation": "42",
+                "parent_session": "hub-cx",
                 "project_dir": "/home/daniel/code/ouija",
                 "role": "working on ouija",
                 "bulletin": "ready",
@@ -4196,6 +4253,7 @@ mod tests {
                     "id": "ouija-next-issue",
                     "origin": "local",
                     "session_incarnation": "42",
+                    "parent_session": "hub-cx",
                     "project": "ouija",
                     "role": "working on ouija",
                     "bulletin": "ready"
@@ -4230,7 +4288,8 @@ mod tests {
             serde_json::json!({
                 "sessions": [{
                     "id": "quiet-session",
-                    "origin": "remote:locota"
+                    "origin": "remote:locota",
+                    "parent_session": null
                 }]
             })
         );

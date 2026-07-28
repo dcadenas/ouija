@@ -123,6 +123,7 @@ pub async fn get_session(
                     "pane": s.pane,
                     "origin": s.origin.label(),
                     "session_incarnation": s.metadata.session_incarnation.to_string(),
+                    "parent_session": s.metadata.parent_session,
                     "vim_mode": s.metadata.vim_mode,
                     "project_dir": s.metadata.project_dir,
                     "role": s.metadata.role,
@@ -167,6 +168,7 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
                 "pane": s.pane,
                 "origin": s.origin.label(),
                 "session_incarnation": s.metadata.session_incarnation.to_string(),
+                "parent_session": s.metadata.parent_session,
                 "vim_mode": s.metadata.vim_mode,
                 "project_dir": s.metadata.project_dir,
                 "role": s.metadata.role,
@@ -2143,15 +2145,26 @@ pub async fn create_task(
         );
     }
 
+    let target_session = normalize_optional_string(body.target_session);
+    let on_fire = body.on_fire.unwrap_or_default();
+    if matches!(on_fire, crate::scheduler::OnFire::InjectOnly) && target_session.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "inject_only tasks require an explicit target_session"
+            })),
+        );
+    }
+
     let mut task = scheduler::new_task(
         body.name,
         body.cron,
-        body.target_session,
+        target_session,
         body.prompt.or(body.message),
         body.reminder,
         body.once.unwrap_or(false),
         body.backend_session_id,
-        body.on_fire.unwrap_or_default(),
+        on_fire,
     );
     task.project_dir = body.project_dir;
     task.backend = normalize_optional_string(body.backend);
@@ -4755,7 +4768,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn status_and_single_session_expose_incarnation_as_decimal_string() {
+    async fn status_and_single_session_expose_incarnation_and_parent_observability() {
         let state = crate::state::AppState::new_for_test();
         state.protocol.write().await.sessions.insert(
             "worker".into(),
@@ -4763,6 +4776,7 @@ mod tests {
                 id: "worker".into(),
                 metadata: crate::daemon_protocol::SessionMeta {
                     session_incarnation: crate::daemon_protocol::SessionIncarnation(u64::MAX),
+                    parent_session: Some("manual-root".into()),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -4774,11 +4788,13 @@ mod tests {
             all["sessions"][0]["session_incarnation"],
             u64::MAX.to_string()
         );
+        assert_eq!(all["sessions"][0]["parent_session"], "manual-root");
 
         let (code, Json(one)) =
             get_session(State(state), axum::extract::Path("worker".to_string())).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(one["session_incarnation"], u64::MAX.to_string());
+        assert_eq!(one["parent_session"], "manual-root");
     }
 
     fn backend_identity_request(backend: &str, session_id: &str) -> BackendIdentityRequest {
@@ -5714,6 +5730,76 @@ mod tests {
                 .is_some_and(|error| error.contains("ouija clear-reminder"))
         );
         assert!(state.scheduled_tasks.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_inject_only_task_requires_explicit_target() {
+        let state = crate::state::AppState::new_for_test();
+        let (status, Json(body)) = create_task(
+            State(state.clone()),
+            Json(CreateTaskBody {
+                name: "context-audit".into(),
+                cron: "*/15 * * * *".into(),
+                target_session: Some("   ".into()),
+                message: Some("audit at your next safe boundary".into()),
+                prompt: None,
+                reminder: None,
+                project_dir: None,
+                backend: None,
+                model: None,
+                effort: None,
+                once: None,
+                backend_session_id: None,
+                on_fire: Some(crate::scheduler::OnFire::InjectOnly),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("explicit target_session"))
+        );
+        assert!(state.scheduled_tasks.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_inject_only_task_persists_exact_target_and_mode() {
+        let state = crate::state::AppState::new_for_test();
+        let (status, Json(body)) = create_task(
+            State(state.clone()),
+            Json(CreateTaskBody {
+                name: "context-audit".into(),
+                cron: "*/15 * * * *".into(),
+                target_session: Some("manual-root".into()),
+                message: Some("audit at your next safe boundary".into()),
+                prompt: None,
+                reminder: None,
+                project_dir: None,
+                backend: None,
+                model: None,
+                effort: None,
+                once: None,
+                backend_session_id: None,
+                on_fire: Some(crate::scheduler::OnFire::InjectOnly),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let tasks = state.scheduled_tasks.read().await;
+        let task = tasks.values().next().expect("task persisted");
+        assert_eq!(task.target_session.as_deref(), Some("manual-root"));
+        assert_eq!(task.on_fire, crate::scheduler::OnFire::InjectOnly);
+        drop(tasks);
+
+        let Json(listed) = list_tasks(State(state)).await;
+        assert_eq!(listed["tasks"][0]["on_fire"]["mode"], "inject_only");
+        assert_eq!(
+            listed["tasks"][0]["target_session"],
+            serde_json::json!("manual-root")
+        );
     }
 
     #[test]

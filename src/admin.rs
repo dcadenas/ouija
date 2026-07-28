@@ -199,21 +199,8 @@ pub async fn dashboard(State(state): State<SharedState>) -> Html<String> {
         if let Some(ref dir) = t.project_dir {
             task_flags.push(format!("dir: {}", html_escape(dir)));
         }
-        match &t.on_fire {
-            crate::scheduler::OnFire::ContinueSession => {}
-            crate::scheduler::OnFire::NewSession => {
-                task_flags.push("new session each fire".to_string());
-            }
-            crate::scheduler::OnFire::PersistentWorktree { clear_context } => {
-                if *clear_context {
-                    task_flags.push("persistent worktree, clear context".to_string());
-                } else {
-                    task_flags.push("persistent worktree".to_string());
-                }
-            }
-            crate::scheduler::OnFire::DisposableWorktree => {
-                task_flags.push("disposable worktree".to_string());
-            }
+        if let Some(flag) = task_mode_flag(&t.on_fire) {
+            task_flags.push(flag);
         }
         if t.once {
             task_flags.push("once".to_string());
@@ -1500,6 +1487,22 @@ setInterval(async () => {{
     Html(html)
 }
 
+fn task_mode_flag(on_fire: &crate::scheduler::OnFire) -> Option<String> {
+    match on_fire {
+        crate::scheduler::OnFire::InjectOnly => Some("inject only (exact live target)".to_string()),
+        crate::scheduler::OnFire::ContinueSession => None,
+        crate::scheduler::OnFire::NewSession => Some("new session each fire".to_string()),
+        crate::scheduler::OnFire::PersistentWorktree { clear_context } => {
+            if *clear_context {
+                Some("persistent worktree, clear context".to_string())
+            } else {
+                Some("persistent worktree".to_string())
+            }
+        }
+        crate::scheduler::OnFire::DisposableWorktree => Some("disposable worktree".to_string()),
+    }
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -1513,5 +1516,16 @@ fn truncate_npub(npub: &str) -> String {
         format!("{}...{}", &npub[..12], &npub[npub.len() - 6..])
     } else {
         npub.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn inject_only_task_mode_is_visible_in_admin() {
+        assert_eq!(
+            super::task_mode_flag(&crate::scheduler::OnFire::InjectOnly).as_deref(),
+            Some("inject only (exact live target)")
+        );
     }
 }

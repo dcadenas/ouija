@@ -22,6 +22,8 @@ const REVIVAL_POLL_SECS: u64 = 2;
 )]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum OnFire {
+    /// Inject into an exact currently live Local session; never revive it.
+    InjectOnly,
     /// Inject into live session; revive with --continue if dead.
     #[default]
     ContinueSession,
@@ -43,7 +45,7 @@ impl OnFire {
     /// Whether this mode clears conversation context on each fire.
     pub fn clears_context(&self) -> bool {
         match self {
-            Self::ContinueSession => false,
+            Self::InjectOnly | Self::ContinueSession => false,
             Self::NewSession => true,
             Self::PersistentWorktree { clear_context } => *clear_context,
             Self::DisposableWorktree => true,
@@ -68,7 +70,7 @@ impl OnFire {
     /// Non-clearing modes keep the alive process and inject any configured prompt.
     pub fn kills_alive(&self) -> bool {
         match self {
-            Self::ContinueSession | Self::NewSession => false,
+            Self::InjectOnly | Self::ContinueSession | Self::NewSession => false,
             Self::PersistentWorktree { clear_context } => *clear_context,
             Self::DisposableWorktree => true,
         }
@@ -138,9 +140,10 @@ pub struct ScheduledTask {
 impl ScheduledTask {
     /// The ouija session name to look up or create.
     /// For ContinueSession, prefer target_session if set; otherwise use the task name.
+    /// InjectOnly tasks are API-validated to have an exact target.
     /// For all other OnFire variants, always use the task name.
     pub fn session_name(&self) -> &str {
-        if matches!(self.on_fire, OnFire::ContinueSession) {
+        if matches!(self.on_fire, OnFire::ContinueSession | OnFire::InjectOnly) {
             self.target_session.as_deref().unwrap_or(&self.name)
         } else {
             &self.name
@@ -382,6 +385,10 @@ pub async fn execute_task(state: &SharedState, task_id: &str) {
 
 /// Try to inject into the target session, reviving if needed.
 async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun {
+    if matches!(task.on_fire, OnFire::InjectOnly) {
+        return execute_inject_only(state, task).await;
+    }
+
     let session_name = task.session_name();
 
     // Look up session
@@ -524,6 +531,80 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
         launch.backend_name,
     )
     .await
+}
+
+/// Deliver an InjectOnly task to one exact live Local owner.
+///
+/// This path deliberately stops before every scheduler lifecycle primitive:
+/// it cannot reserve a lease, create or revive a session, choose a backend, or
+/// touch a worktree. The final delivery uses the captured ResourceOwner so a
+/// replacement incarnation cannot receive a delayed audit.
+async fn execute_inject_only(state: &SharedState, task: &ScheduledTask) -> TaskRun {
+    let Some(session_name) = task.target_session.as_deref() else {
+        return TaskRun::failed(
+            task,
+            "inject-only task has no explicit target session".into(),
+        );
+    };
+    let session = {
+        let proto = state.protocol.read().await;
+        proto.sessions.get(session_name).cloned()
+    };
+    let Some(session) = session else {
+        return TaskRun::failed(
+            task,
+            format!("inject-only target session '{session_name}' not found"),
+        );
+    };
+    execute_inject_only_snapshot(state, task, session).await
+}
+
+async fn execute_inject_only_snapshot(
+    state: &SharedState,
+    task: &ScheduledTask,
+    session: crate::daemon_protocol::SessionEntry,
+) -> TaskRun {
+    let session_name = task.session_name();
+    if !matches!(session.origin, crate::daemon_protocol::Origin::Local) {
+        return TaskRun::failed(
+            task,
+            "inject-only tasks cannot target remote sessions".into(),
+        );
+    }
+    let Some(pane) = session.pane.as_deref() else {
+        return TaskRun::failed(
+            task,
+            format!("inject-only target session '{session_name}' has no pane"),
+        );
+    };
+    if !task_pane_alive(state, pane).await {
+        return TaskRun::failed(
+            task,
+            format!("inject-only target session '{session_name}' is not live"),
+        );
+    }
+
+    let owner = session.owner();
+    if !scheduled_snapshot_is_current(state, &owner, Some(pane)).await {
+        return TaskRun::failed(
+            task,
+            format!("inject-only target session '{session_name}' was superseded"),
+        );
+    }
+    if let Err(error) = inject_alive_session_prompt(
+        state,
+        task,
+        &owner,
+        session_name,
+        pane,
+        session.metadata.vim_mode,
+    )
+    .await
+    {
+        return TaskRun::failed(task, error);
+    }
+
+    TaskRun::ok(task, None)
 }
 
 async fn scheduled_snapshot_is_current(
@@ -2310,6 +2391,7 @@ mod tests {
     #[test]
     fn on_fire_serialization_round_trip() {
         let variants = vec![
+            OnFire::InjectOnly,
             OnFire::ContinueSession,
             OnFire::NewSession,
             OnFire::PersistentWorktree {
@@ -2363,6 +2445,7 @@ mod tests {
 
     #[test]
     fn on_fire_kills_alive() {
+        assert!(!OnFire::InjectOnly.kills_alive());
         assert!(!OnFire::ContinueSession.kills_alive());
         assert!(!OnFire::NewSession.kills_alive());
         assert!(
@@ -2378,6 +2461,196 @@ mod tests {
             .kills_alive()
         );
         assert!(OnFire::DisposableWorktree.kills_alive());
+    }
+
+    fn inject_only_task(target: &str) -> ScheduledTask {
+        new_task(
+            "context-audit".into(),
+            "*/15 * * * *".into(),
+            Some(target.into()),
+            Some("audit at your next safe boundary".into()),
+            None,
+            false,
+            None,
+            OnFire::InjectOnly,
+        )
+    }
+
+    async fn seed_live_pane(state: &SharedState, pane: &str) {
+        *state.cached_assistant_panes.write().await = vec![crate::tmux::TmuxPane {
+            pane_id: pane.into(),
+            session_name: "test".into(),
+            pane_current_path: Some("/tmp".into()),
+            process_name: Some("claude".into()),
+        }];
+    }
+
+    #[tokio::test]
+    async fn inject_only_delivers_to_exact_live_local_owner_without_lifecycle_effects() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "manual-root".into(),
+                pane: Some("%audit".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        seed_live_pane(&state, "%audit").await;
+        let before = state.protocol.read().await.sessions.clone();
+
+        let run = execute_injection(&state, &inject_only_task("manual-root")).await;
+
+        assert_eq!(run.status, TaskRunStatus::Ok);
+        let protocol = state.protocol.read().await;
+        assert_eq!(protocol.sessions, before);
+        assert!(protocol.lifecycle_leases.is_empty());
+        assert!(state.perfire_worktree_panes.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inject_only_missing_target_fails_without_creating_session_or_lease() {
+        let state = crate::state::AppState::new_for_test();
+        let run = execute_injection(&state, &inject_only_task("missing")).await;
+
+        assert_eq!(run.status, TaskRunStatus::Failed);
+        assert!(
+            run.error
+                .as_deref()
+                .is_some_and(|e| e.contains("not found"))
+        );
+        let protocol = state.protocol.read().await;
+        assert!(protocol.sessions.is_empty());
+        assert!(protocol.lifecycle_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inject_only_persisted_without_explicit_target_never_falls_back_to_task_name() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "context-audit".into(),
+                pane: Some("%same-as-task-name".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        seed_live_pane(&state, "%same-as-task-name").await;
+        let mut task = inject_only_task("context-audit");
+        task.target_session = None;
+        let before = state.protocol.read().await.sessions.clone();
+
+        let run = execute_injection(&state, &task).await;
+
+        assert_eq!(run.status, TaskRunStatus::Failed);
+        assert!(
+            run.error
+                .as_deref()
+                .is_some_and(|e| e.contains("no explicit target"))
+        );
+        let protocol = state.protocol.read().await;
+        assert_eq!(protocol.sessions, before);
+        assert!(protocol.lifecycle_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inject_only_paneless_target_fails_without_revival() {
+        let state = crate::state::AppState::new_for_test();
+        state.protocol.write().await.sessions.insert(
+            "paneless".into(),
+            crate::daemon_protocol::SessionEntry {
+                id: "paneless".into(),
+                ..Default::default()
+            },
+        );
+        let before = state.protocol.read().await.sessions.clone();
+
+        let run = execute_injection(&state, &inject_only_task("paneless")).await;
+
+        assert_eq!(run.status, TaskRunStatus::Failed);
+        assert!(run.error.as_deref().is_some_and(|e| e.contains("no pane")));
+        let protocol = state.protocol.read().await;
+        assert_eq!(protocol.sessions, before);
+        assert!(protocol.lifecycle_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inject_only_dead_target_fails_without_revival() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "dead".into(),
+                pane: Some("%dead".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        let before = state.protocol.read().await.sessions.clone();
+
+        let run = execute_injection(&state, &inject_only_task("dead")).await;
+
+        assert_eq!(run.status, TaskRunStatus::Failed);
+        assert!(run.error.as_deref().is_some_and(|e| e.contains("not live")));
+        let protocol = state.protocol.read().await;
+        assert_eq!(protocol.sessions, before);
+        assert!(protocol.lifecycle_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inject_only_remote_target_fails_without_delivery_or_lifecycle_action() {
+        let state = crate::state::AppState::new_for_test();
+        state.protocol.write().await.sessions.insert(
+            "remote".into(),
+            crate::daemon_protocol::SessionEntry {
+                id: "remote".into(),
+                pane: Some("%remote".into()),
+                origin: crate::daemon_protocol::Origin::Remote("npub1peer".into()),
+                ..Default::default()
+            },
+        );
+        seed_live_pane(&state, "%remote").await;
+        let before = state.protocol.read().await.sessions.clone();
+
+        let run = execute_injection(&state, &inject_only_task("remote")).await;
+
+        assert_eq!(run.status, TaskRunStatus::Failed);
+        assert!(run.error.as_deref().is_some_and(|e| e.contains("remote")));
+        let protocol = state.protocol.read().await;
+        assert_eq!(protocol.sessions, before);
+        assert!(protocol.lifecycle_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inject_only_stale_snapshot_cannot_reach_replacement_incarnation() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "manual-root".into(),
+                pane: Some("%same".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        let stale = state.protocol.read().await.sessions["manual-root"].clone();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "manual-root".into(),
+                pane: Some("%same".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+        seed_live_pane(&state, "%same").await;
+        let replacement = state.protocol.read().await.sessions["manual-root"].clone();
+        assert_ne!(stale.owner(), replacement.owner());
+
+        let run =
+            execute_inject_only_snapshot(&state, &inject_only_task("manual-root"), stale).await;
+
+        assert_eq!(run.status, TaskRunStatus::Failed);
+        assert!(
+            run.error
+                .as_deref()
+                .is_some_and(|e| e.contains("superseded"))
+        );
+        let protocol = state.protocol.read().await;
+        assert_eq!(protocol.sessions["manual-root"], replacement);
+        assert!(protocol.lifecycle_leases.is_empty());
     }
 
     #[test]

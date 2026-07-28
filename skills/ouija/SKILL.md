@@ -193,6 +193,32 @@ ouija task trigger TASK_ID
 ouija task remove TASK_ID
 ```
 
+For production context audits, the operator enrolls each intended manual root
+with one recurring exact-target task:
+
+```bash
+ouija task add context-audit "*/15 * * * *" \
+  "At your next safe boundary, audit your context. Exact Ouija child allowlist: turnero, review-plugin-cx. Send each at most one ordinary audit message." \
+  --target hub-cx --inject-only
+```
+
+`--inject-only` requires an exact target and fails closed unless that exact
+Local Ouija session is currently live. It never creates, revives, restarts, or
+respawns a session and never touches a worktree or stored prompt. An audit is a
+safe-boundary request, not a forced rollover; the session still owns the
+semantic decision to continue or roll over.
+
+The task message is the operator-owned enrollment record. It must carry the
+exact allowlist of explicitly managed Ouija children. The root may corroborate
+each allowlisted ID with `parent_session` from `ouija ls` or `ouija status`,
+then send that exact live child at most one ordinary `ouija tell` audit. A null
+or missing parent never discovers a child and never de-enrolls an explicit
+operator choice. Do not create per-child schedules, recurse through children,
+inspect processes, infer enrollment from names/roles/paths, or add a daemon
+enrollment graph. Native subagents are not Ouija sessions and must remain
+invisible. OuijaCP lifecycle semantics are unrelated and must not be inferred
+from this procedure.
+
 ## 7. Housekeeping
 
 **Update your metadata** when your focus changes:
