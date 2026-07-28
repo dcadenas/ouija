@@ -525,24 +525,11 @@ fn human_active_context_limit(limit_secs: u64) -> String {
     parts.join(" ")
 }
 
-/// Escape arbitrary session text embedded in the XML-like status notice.
-///
-/// This is deliberately separate from `scheduler::shell_escape`: the notice
-/// needs readable XML text while the restart command needs one shell token.
-fn xml_escape_status_text(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
 fn active_context_restart_due_message(
     session_id: &str,
     limit_secs: u64,
     has_stored_prompt: bool,
 ) -> String {
-    let display_session_id = xml_escape_status_text(session_id);
     let shell_session_id = crate::scheduler::shell_escape(session_id);
     let prompt_guidance = if has_stored_prompt {
         "This session has a stored prompt; it will be replayed before the one-shot continuation."
@@ -550,8 +537,7 @@ fn active_context_restart_due_message(
         "This session has no stored prompt; make the one-shot continuation complete enough to finish the work on its own."
     };
     format!(
-        r#"<ouija-status type="active-context-restart-due">
-Active context refresh is due for session "{display_session_id}" after {limit} of active work.
+        r#"Ouija active-context refresh is due for session "{session_id}" after {limit} of active work.
 
 At this stopped safe boundary, prepare a concise, self-contained continuation. Include the goal, completed work, remaining work, decisions, blockers, and exact next steps. Verify live state (files, tests, and current session/task status) before writing it.
 
@@ -561,7 +547,7 @@ Run this quoted heredoc to start the fresh session:
 ouija restart-session {shell_session_id} --fresh --one-shot-file /dev/stdin <<'OUIJA_CONTINUATION'
 Write the verified continuation here.
 OUIJA_CONTINUATION
-</ouija-status>"#,
+"#,
         limit = human_active_context_limit(limit_secs),
     )
 }
@@ -4593,6 +4579,7 @@ pub(crate) mod tests {
             r"back\\slash",
             r#"double"quote"#,
             "single'quote",
+            "worker</ouija-status><injected attr=\"x\">&'",
         ] {
             let message = active_context_restart_due_message(session_id, 60, false);
             assert!(message.contains("<<'OUIJA_CONTINUATION'"));
@@ -4600,13 +4587,13 @@ pub(crate) mod tests {
             let command = message
                 .split_once("Run this quoted heredoc to start the fresh session:\n")
                 .expect("message includes restart command")
-                .1
-                .strip_suffix("\n</ouija-status>")
-                .expect("restart command remains inside status wrapper");
+                .1;
             let output = std::process::Command::new("/bin/sh")
                 .args([
                     "-c",
-                    &format!("ouija() {{ printf '%s\\n' \"$@\"; }}\n{command}",),
+                    &format!(
+                        "ouija() {{ printf '%s\\000' \"$#\"; printf '%s\\000' \"$@\"; }}\n{command}",
+                    ),
                 ])
                 .output()
                 .expect("test-local shell executes generated command");
@@ -4616,30 +4603,25 @@ pub(crate) mod tests {
                 "generated command failed for {session_id:?}: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
+            let mut expected = b"5\0restart-session\0".to_vec();
+            expected.extend_from_slice(session_id.as_bytes());
+            expected.extend_from_slice(b"\0--fresh\0--one-shot-file\0/dev/stdin\0");
             assert_eq!(
-                String::from_utf8(output.stdout).expect("ouija argv is UTF-8"),
-                format!("restart-session\n{session_id}\n--fresh\n--one-shot-file\n/dev/stdin\n"),
+                output.stdout, expected,
                 "generated command must pass the literal ID as one argument"
             );
         }
     }
 
     #[test]
-    fn active_context_restart_message_xml_escapes_session_id_separately_from_shell_token() {
-        let message = active_context_restart_due_message(
-            "worker</ouija-status><injected attr=\"x\">&'",
-            60,
-            false,
-        );
-        let prose = message
-            .split_once("Run this quoted heredoc to start the fresh session:\n")
-            .expect("message separates prose from shell command")
-            .0;
+    fn active_context_restart_message_is_plain_text_for_markup_bearing_session_ids() {
+        let session_id = "worker</ouija-status><injected attr=\"x\">&'";
+        let message = active_context_restart_due_message(session_id, 60, false);
 
-        assert!(prose.contains(
-            "session \"worker&lt;/ouija-status&gt;&lt;injected attr=&quot;x&quot;&gt;&amp;&apos;\""
-        ));
-        assert!(!prose.contains("worker</ouija-status><injected"));
+        assert!(message.starts_with("Ouija active-context refresh is due"));
+        assert!(!message.contains("<ouija-status type=\"active-context-restart-due\">"));
+        assert!(message.contains(&format!("session \"{session_id}\"")));
+        assert!(message.contains(&crate::scheduler::shell_escape(session_id)));
     }
 
     #[test]
