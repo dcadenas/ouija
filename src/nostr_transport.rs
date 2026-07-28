@@ -2212,6 +2212,52 @@ pub async fn start_session(
     force_reset: bool,
     reserved_owner: Option<crate::daemon_protocol::ResourceOwner>,
 ) -> (String, Option<u64>) {
+    start_session_with_active_context_policy(
+        state,
+        name,
+        worktree,
+        project_dir,
+        prompt,
+        from,
+        expects_reply,
+        backend,
+        model,
+        effort,
+        reminder,
+        parent_session,
+        idle_policy,
+        branch,
+        base_branch,
+        force_reset,
+        None,
+        reserved_owner,
+    )
+    .await
+}
+
+/// Start a new session while carrying an API-validated active-context policy
+/// to the lifecycle boundary. Applying it is intentionally deferred to Task 4.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_session_with_active_context_policy(
+    state: &std::sync::Arc<AppState>,
+    name: &str,
+    worktree: Option<bool>,
+    project_dir: Option<&str>,
+    prompt: Option<&str>,
+    from: Option<&str>,
+    expects_reply: Option<bool>,
+    backend: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    reminder: Option<&str>,
+    parent_session: Option<&str>,
+    idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
+    branch: Option<&str>,
+    base_branch: Option<&str>,
+    force_reset: bool,
+    fresh_context_after_active_secs: Option<u64>,
+    reserved_owner: Option<crate::daemon_protocol::ResourceOwner>,
+) -> (String, Option<u64>) {
     start_session_with_prompt_storage(
         state,
         name,
@@ -2230,6 +2276,7 @@ pub async fn start_session(
         branch,
         base_branch,
         force_reset,
+        fresh_context_after_active_secs,
         reserved_owner,
     )
     .await
@@ -2254,8 +2301,12 @@ async fn start_session_with_prompt_storage(
     branch: Option<&str>,
     base_branch: Option<&str>,
     force_reset: bool,
+    fresh_context_after_active_secs: Option<u64>,
     reserved_owner: Option<crate::daemon_protocol::ResourceOwner>,
 ) -> (String, Option<u64>) {
+    // Task 3 validates and carries the requested policy to the lifecycle
+    // boundary. Task 4 owns applying it to durable metadata and accounting.
+    let _ = fresh_context_after_active_secs;
     let backend = match backend {
         Some(b) => match state.backends.get_required(b) {
             Ok(backend) => backend,
@@ -3180,11 +3231,53 @@ pub async fn restart_session_for_start(
     parent_session_override: ParentSessionOverride,
     idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
 ) -> (String, Option<u64>, RestartOutcome) {
+    restart_session_for_start_with_active_context_policy(
+        state,
+        owner,
+        name,
+        fresh,
+        None,
+        repair_reservation,
+        prompt,
+        from,
+        expects_reply,
+        backend,
+        model,
+        effort,
+        reminder,
+        parent_session_override,
+        idle_policy,
+    )
+    .await
+}
+
+/// Restart a claimed session while carrying an API-validated active-context
+/// policy to the lifecycle boundary. Applying it is intentionally deferred to
+/// Task 4.
+#[allow(clippy::too_many_arguments)]
+pub async fn restart_session_for_start_with_active_context_policy(
+    state: &std::sync::Arc<AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    name: &str,
+    fresh: bool,
+    fresh_context_after_active_secs: Option<u64>,
+    repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
+    prompt: Option<&str>,
+    from: Option<&str>,
+    expects_reply: Option<bool>,
+    backend: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    reminder: Option<&str>,
+    parent_session_override: ParentSessionOverride,
+    idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
+) -> (String, Option<u64>, RestartOutcome) {
     restart_session_for_start_with_prompt_controls(
         state,
         owner,
         name,
         fresh,
+        fresh_context_after_active_secs,
         repair_reservation,
         prompt,
         false,
@@ -3207,6 +3300,7 @@ async fn restart_session_for_start_with_prompt_controls(
     owner: &crate::daemon_protocol::ResourceOwner,
     name: &str,
     fresh: bool,
+    fresh_context_after_active_secs: Option<u64>,
     repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
     prompt: Option<&str>,
     suppress_stored_prompt: bool,
@@ -3244,6 +3338,7 @@ async fn restart_session_for_start_with_prompt_controls(
         owner,
         name,
         fresh,
+        fresh_context_after_active_secs,
         repair_reservation,
         prompt,
         suppress_stored_prompt,
@@ -3303,6 +3398,7 @@ pub async fn restart_session(
         state,
         name,
         fresh,
+        None,
         repair_reservation,
         prompt,
         false,
@@ -3324,6 +3420,7 @@ pub async fn restart_session_with_prompt_controls(
     state: &std::sync::Arc<AppState>,
     name: &str,
     fresh: bool,
+    fresh_context_after_active_secs: Option<u64>,
     repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
     prompt: Option<&str>,
     suppress_stored_prompt: bool,
@@ -3388,6 +3485,7 @@ pub async fn restart_session_with_prompt_controls(
                 None,
                 None,
                 false,
+                fresh_context_after_active_secs,
                 Some(owner.clone()),
             )
             .await;
@@ -3432,6 +3530,7 @@ pub async fn restart_session_with_prompt_controls(
         &owner,
         name,
         fresh,
+        fresh_context_after_active_secs,
         repair_reservation,
         prompt,
         suppress_stored_prompt,
@@ -3454,6 +3553,7 @@ async fn restart_session_claimed(
     lease_owner: &crate::daemon_protocol::ResourceOwner,
     name: &str,
     fresh: bool,
+    fresh_context_after_active_secs: Option<u64>,
     repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
     prompt: Option<&str>,
     suppress_stored_prompt: bool,
@@ -3467,6 +3567,9 @@ async fn restart_session_claimed(
     parent_session_override: ParentSessionOverride,
     idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
 ) -> (String, Option<u64>, RestartOutcome) {
+    // Task 3 validates and carries the requested policy to the lifecycle
+    // boundary. Task 4 owns applying it to durable metadata and accounting.
+    let _ = fresh_context_after_active_secs;
     // Snapshot only while the exact incumbent and durable restart claim still
     // agree. Every public caller claims this authority before reaching any
     // HTTP, tmux, process, attach, readiness, or prompt work.

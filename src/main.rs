@@ -205,6 +205,9 @@ enum Command {
         /// Reasoning effort / variant (claude: --effort; codex: model_reasoning_effort; opencode: prompt variant).
         #[arg(long)]
         effort: Option<String>,
+        /// Restart with a fresh context after this much accumulated active work (e.g. 1h, 90m, 3600s).
+        #[arg(long, value_parser = parse_fresh_context_after_active)]
+        fresh_context_after_active: Option<u64>,
         #[arg(long)]
         backend: Option<String>,
         #[arg(long)]
@@ -230,6 +233,13 @@ enum Command {
         name: String,
         #[arg(long)]
         fresh: bool,
+        /// Restart with a fresh context after this much accumulated active work (e.g. 1h, 90m, 3600s).
+        #[arg(
+            long,
+            requires = "fresh",
+            value_parser = parse_fresh_context_after_active
+        )]
+        fresh_context_after_active: Option<u64>,
         /// Replace the stored startup prompt and use it for this launch.
         #[arg(long)]
         prompt: Option<String>,
@@ -438,6 +448,31 @@ fn parse_idle_policy(value: &str) -> Result<IdlePolicy, String> {
 fn parse_manual_reminder(value: &str) -> Result<String, String> {
     daemon_protocol::validate_spawn_reminder(Some(value))?;
     Ok(value.to_string())
+}
+
+fn parse_fresh_context_after_active(value: &str) -> Result<u64, String> {
+    let Some(unit) = value.chars().last() else {
+        return Err("duration must be a positive whole number followed by h, m, or s".into());
+    };
+    let multiplier = match unit {
+        'h' => 3_600,
+        'm' => 60,
+        's' => 1,
+        _ => return Err("duration must end with h, m, or s".into()),
+    };
+    let amount = &value[..value.len() - unit.len_utf8()];
+    if amount.is_empty() || !amount.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("duration must be a positive whole number followed by h, m, or s".into());
+    }
+    let amount = amount
+        .parse::<u64>()
+        .map_err(|_| "duration value is too large".to_string())?;
+    if amount == 0 {
+        return Err("duration must be greater than zero".into());
+    }
+    amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| "duration overflows seconds".to_string())
 }
 
 fn validate_spawn_lifecycle(
@@ -954,6 +989,7 @@ async fn main() -> anyhow::Result<()> {
             base_branch,
             model,
             effort,
+            fresh_context_after_active,
             backend,
             from,
         } => {
@@ -978,6 +1014,7 @@ async fn main() -> anyhow::Result<()> {
                 "base_branch": base_branch,
                 "model": model,
                 "effort": effort,
+                "fresh_context_after_active_secs": fresh_context_after_active,
                 "backend": backend,
                 "from": from,
             });
@@ -1094,6 +1131,7 @@ async fn main() -> anyhow::Result<()> {
         Command::RestartSession {
             name,
             fresh,
+            fresh_context_after_active,
             prompt,
             suppress_stored_prompt,
             one_shot_file,
@@ -1109,6 +1147,7 @@ async fn main() -> anyhow::Result<()> {
             let body = serde_json::json!({
                 "name": name,
                 "fresh": fresh,
+                "fresh_context_after_active_secs": fresh_context_after_active,
                 "prompt": prompt,
                 "suppress_stored_prompt": suppress_stored_prompt,
                 "one_shot_prompt": one_shot_prompt,
@@ -3425,6 +3464,87 @@ mod tests {
             }
             _ => panic!("expected spawn-session command"),
         }
+    }
+
+    #[test]
+    fn spawn_session_cli_accepts_a_positive_active_context_duration() {
+        // Break caught: spawn-session must accept the opt-in active-context
+        // policy instead of treating it as an unknown CLI argument.
+        let parsed = Cli::try_parse_from([
+            "ouija",
+            "spawn-session",
+            "worker",
+            "--fresh-context-after-active",
+            "1h",
+            "--no-parent-session",
+            "--when-done",
+            "keep-open",
+        ]);
+
+        match parsed
+            .expect("a positive active-context duration must parse")
+            .command
+        {
+            Command::SpawnSession {
+                fresh_context_after_active,
+                ..
+            } => assert_eq!(fresh_context_after_active, Some(3_600)),
+            _ => panic!("expected spawn-session command"),
+        }
+    }
+
+    #[test]
+    fn active_context_duration_parser_normalizes_supported_units() {
+        // Break caught: changing a unit multiplier or passing the raw text to
+        // the API would configure a different active-time limit than requested.
+        assert_eq!(parse_fresh_context_after_active("1h"), Ok(3_600));
+        assert_eq!(parse_fresh_context_after_active("90m"), Ok(5_400));
+        assert_eq!(parse_fresh_context_after_active("3600s"), Ok(3_600));
+    }
+
+    #[test]
+    fn active_context_duration_parser_rejects_invalid_or_non_positive_values() {
+        // Break caught: malformed, zero, unitless, and overflowing values
+        // must never enter the numeric API contract.
+        assert_eq!(
+            parse_fresh_context_after_active(""),
+            Err("duration must be a positive whole number followed by h, m, or s".into())
+        );
+        assert_eq!(
+            parse_fresh_context_after_active("0h"),
+            Err("duration must be greater than zero".into())
+        );
+        assert_eq!(
+            parse_fresh_context_after_active("1"),
+            Err("duration must end with h, m, or s".into())
+        );
+        assert_eq!(
+            parse_fresh_context_after_active("1.5h"),
+            Err("duration must be a positive whole number followed by h, m, or s".into())
+        );
+        assert_eq!(
+            parse_fresh_context_after_active("18446744073709551616s"),
+            Err("duration value is too large".into())
+        );
+        assert_eq!(
+            parse_fresh_context_after_active("5124095576030432h"),
+            Err("duration overflows seconds".into())
+        );
+    }
+
+    #[test]
+    fn restart_session_cli_requires_fresh_for_active_context_duration() {
+        // Break caught: the CLI must not send a policy-changing restart that
+        // omits the required fresh context transition.
+        let parsed = Cli::try_parse_from([
+            "ouija",
+            "restart-session",
+            "worker",
+            "--fresh-context-after-active",
+            "1h",
+        ]);
+
+        assert!(parsed.is_err());
     }
 
     #[test]

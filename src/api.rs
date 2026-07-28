@@ -2441,6 +2441,9 @@ pub struct SessionNameBody {
     name: String,
     #[serde(default)]
     fresh: Option<bool>,
+    /// Positive accumulated active time in seconds before a fresh context is due.
+    #[serde(default)]
+    fresh_context_after_active_secs: Option<u64>,
     #[serde(default)]
     worktree: Option<bool>,
     #[serde(default)]
@@ -2554,6 +2557,21 @@ fn validate_start_lifecycle(body: &mut SessionNameBody) -> Result<(), String> {
         body.idle_policy.as_ref(),
     )?;
     crate::daemon_protocol::validate_spawn_reminder(body.reminder.as_deref())
+}
+
+fn validate_fresh_context_after_active_secs(seconds: Option<u64>) -> Result<(), String> {
+    if seconds == Some(0) {
+        return Err("fresh_context_after_active_secs must be greater than zero".into());
+    }
+    Ok(())
+}
+
+fn validate_fresh_context_restart_request(body: &SessionNameBody) -> Result<(), String> {
+    validate_fresh_context_after_active_secs(body.fresh_context_after_active_secs)?;
+    if body.fresh_context_after_active_secs.is_some() && body.fresh != Some(true) {
+        return Err("fresh_context_after_active_secs requires fresh=true (CLI: --fresh)".into());
+    }
+    Ok(())
 }
 
 /// Kill the coding assistant process in a session's tmux pane.
@@ -2710,6 +2728,11 @@ pub async fn start_session(
     body.model = normalize_optional_string(body.model);
     body.effort = normalize_optional_string(body.effort);
     body.backend = normalize_optional_string(body.backend);
+    if let Err(error) =
+        validate_fresh_context_after_active_secs(body.fresh_context_after_active_secs)
+    {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
+    }
     if let Err(error) = validate_start_lifecycle(&mut body) {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
     }
@@ -2738,6 +2761,9 @@ pub async fn start_session(
     let (existing_owner, reserved_owner) = match disposition {
         crate::daemon_protocol::StartDisposition::Reserved(owner) => (None, Some(owner)),
         crate::daemon_protocol::StartDisposition::Existing(owner) => {
+            if let Err(error) = validate_fresh_context_restart_request(&body) {
+                return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
+            }
             match state.claim_existing_start(&owner).await {
                 Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {
                     (Some(owner), None)
@@ -2788,12 +2814,39 @@ pub async fn start_session(
             if let Some(msg) = restart_drops_destructive_intent(&body) {
                 tracing::warn!("{msg}");
             }
-            let (_result, _msg_id, _) = crate::nostr_transport::restart_session_for_start(
+            let (_result, _msg_id, _) =
+                crate::nostr_transport::restart_session_for_start_with_active_context_policy(
+                    &state2,
+                    &existing_owner,
+                    &body.name,
+                    true, // fresh
+                    body.fresh_context_after_active_secs,
+                    None,
+                    body.prompt.as_deref(),
+                    body.from.as_deref(),
+                    None, // expects_reply not used for session start
+                    body.backend.as_deref(),
+                    body.model.as_deref(),
+                    body.effort.as_deref(),
+                    body.reminder.as_deref(),
+                    crate::nostr_transport::ParentSessionOverride::from_request(
+                        body.parent_session.as_deref(),
+                        body.no_parent_session.unwrap_or(false),
+                    ),
+                    body.idle_policy.clone(),
+                )
+                .await;
+
+            tracing::info!("async session restart complete: {}", body.name);
+            return;
+        }
+
+        let (result, _prompt_msg_id) =
+            crate::nostr_transport::start_session_with_active_context_policy(
                 &state2,
-                &existing_owner,
                 &body.name,
-                true, // fresh
-                None,
+                body.worktree,
+                body.project_dir.as_deref(),
                 body.prompt.as_deref(),
                 body.from.as_deref(),
                 None, // expects_reply not used for session start
@@ -2801,38 +2854,15 @@ pub async fn start_session(
                 body.model.as_deref(),
                 body.effort.as_deref(),
                 body.reminder.as_deref(),
-                crate::nostr_transport::ParentSessionOverride::from_request(
-                    body.parent_session.as_deref(),
-                    body.no_parent_session.unwrap_or(false),
-                ),
+                body.parent_session.as_deref(),
                 body.idle_policy.clone(),
+                body.branch.as_deref(),
+                body.base_branch.as_deref(),
+                body.force_reset.unwrap_or(false),
+                body.fresh_context_after_active_secs,
+                reserved_owner,
             )
             .await;
-
-            tracing::info!("async session restart complete: {}", body.name);
-            return;
-        }
-
-        let (result, _prompt_msg_id) = crate::nostr_transport::start_session(
-            &state2,
-            &body.name,
-            body.worktree,
-            body.project_dir.as_deref(),
-            body.prompt.as_deref(),
-            body.from.as_deref(),
-            None, // expects_reply not used for session start
-            body.backend.as_deref(),
-            body.model.as_deref(),
-            body.effort.as_deref(),
-            body.reminder.as_deref(),
-            body.parent_session.as_deref(),
-            body.idle_policy.clone(),
-            body.branch.as_deref(),
-            body.base_branch.as_deref(),
-            body.force_reset.unwrap_or(false),
-            reserved_owner,
-        )
-        .await;
 
         tracing::info!(
             "async session start complete: {}, result: {result}",
@@ -2861,6 +2891,9 @@ pub async fn restart_session(
     body.model = normalize_optional_string(body.model.take());
     body.effort = normalize_optional_string(body.effort.take());
     body.backend = normalize_optional_string(body.backend.take());
+    if let Err(error) = validate_fresh_context_restart_request(body) {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
+    }
     if let Err(error) = crate::daemon_protocol::validate_spawn_reminder(body.reminder.as_deref()) {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
     }
@@ -2885,6 +2918,7 @@ pub async fn restart_session(
         &state,
         &body.name,
         fresh,
+        body.fresh_context_after_active_secs,
         None,
         body.prompt.as_deref(),
         suppress_stored_prompt,
@@ -5324,6 +5358,7 @@ mod tests {
             Json(SessionNameBody {
                 name: "wrong-codex".into(),
                 fresh: None,
+                fresh_context_after_active_secs: None,
                 worktree: None,
                 project_dir: None,
                 prompt: None,
@@ -5360,6 +5395,7 @@ mod tests {
             Json(SessionNameBody {
                 name: "same-id".into(),
                 fresh: None,
+                fresh_context_after_active_secs: None,
                 worktree: None,
                 project_dir: None,
                 prompt: None,
@@ -5385,6 +5421,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_session_rejects_zero_active_context_duration_at_api_ingress() {
+        // Break caught: non-CLI callers must not create the v1 disable value
+        // while a launch reservation hides the session from normal start work.
+        let state = crate::state::AppState::new_for_test();
+        state.reserve_start("same-id").await.unwrap();
+        let body: SessionNameBody = serde_json::from_value(json!({
+            "name": "same-id",
+            "fresh_context_after_active_secs": 0,
+            "no_parent_session": true,
+            "idle_policy": "keep-open"
+        }))
+        .unwrap();
+
+        let (status, Json(response)) = start_session(State(state), Json(body)).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(response["error"].as_str().is_some_and(|error| {
+            error.contains("fresh_context_after_active_secs") && error.contains("greater than zero")
+        }));
+    }
+
+    #[tokio::test]
+    async fn restart_session_requires_fresh_for_active_context_duration_at_api_ingress() {
+        // Break caught: a raw API caller must not bypass the CLI's --fresh
+        // requirement when it supplies an active-context policy.
+        let state = crate::state::AppState::new_for_test();
+        state.reserve_start("same-id").await.unwrap();
+        let body: RestartSessionBody = serde_json::from_value(json!({
+            "name": "same-id",
+            "fresh": false,
+            "fresh_context_after_active_secs": 60
+        }))
+        .unwrap();
+
+        let (status, Json(response)) = restart_session(State(state), Json(body)).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(response["error"].as_str().is_some_and(|error| {
+            error.contains("fresh_context_after_active_secs") && error.contains("--fresh")
+        }));
+    }
+
+    #[tokio::test]
+    async fn start_session_requires_fresh_for_an_existing_active_context_policy_change() {
+        // Break caught: spawn-session has no --fresh flag, so routing an
+        // existing session through start must not silently authorize an
+        // initial policy set or a changed limit.
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "same-id".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    fresh_context_after_active_secs: Some(60),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let body: SessionNameBody = serde_json::from_value(json!({
+            "name": "same-id",
+            "fresh_context_after_active_secs": 120,
+            "no_parent_session": true,
+            "idle_policy": "keep-open"
+        }))
+        .unwrap();
+
+        let (status, Json(response)) = start_session(State(state), Json(body)).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(response["error"].as_str().is_some_and(|error| {
+            error.contains("fresh_context_after_active_secs") && error.contains("--fresh")
+        }));
+    }
+
+    #[tokio::test]
     async fn kill_session_response_exposes_typed_outcome() {
         let state = crate::state::AppState::new_for_test();
 
@@ -5393,6 +5504,7 @@ mod tests {
             Json(SessionNameBody {
                 name: "missing".into(),
                 fresh: None,
+                fresh_context_after_active_secs: None,
                 worktree: None,
                 project_dir: None,
                 prompt: None,
@@ -5442,6 +5554,7 @@ mod tests {
             Json(SessionNameBody {
                 name: "worker".into(),
                 fresh: None,
+                fresh_context_after_active_secs: None,
                 worktree: None,
                 project_dir: None,
                 prompt: None,
@@ -5480,6 +5593,7 @@ mod tests {
                 session: SessionNameBody {
                     name: "wrong-codex".into(),
                     fresh: Some(true),
+                    fresh_context_after_active_secs: None,
                     worktree: None,
                     project_dir: None,
                     prompt: None,
@@ -5523,6 +5637,18 @@ mod tests {
         assert_eq!(body.session.backend.as_deref(), Some("codex-cli"));
     }
 
+    #[test]
+    fn restart_request_deserializes_active_context_seconds() {
+        let body: RestartSessionBody = serde_json::from_value(json!({
+            "name": "worker",
+            "fresh": true,
+            "fresh_context_after_active_secs": 5400
+        }))
+        .unwrap();
+
+        assert_eq!(body.session.fresh_context_after_active_secs, Some(5_400));
+    }
+
     #[tokio::test]
     async fn restart_session_rejects_manual_clear_reminder_before_restart() {
         let state = crate::state::AppState::new_for_test();
@@ -5532,6 +5658,7 @@ mod tests {
                 session: SessionNameBody {
                     name: "restart-clear-reminder".into(),
                     fresh: Some(true),
+                    fresh_context_after_active_secs: None,
                     worktree: None,
                     project_dir: None,
                     prompt: None,
@@ -5628,6 +5755,7 @@ mod tests {
             Json(SessionNameBody {
                 name: "oc".into(),
                 fresh: None,
+                fresh_context_after_active_secs: None,
                 worktree: None,
                 project_dir: Some(dir.path().to_string_lossy().into_owned()),
                 prompt: Some("queued prompt".into()),
