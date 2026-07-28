@@ -905,6 +905,19 @@ mod tests {
         (state, blocked, server)
     }
 
+    async fn wait_for_message_count(messages: &StdArc<Mutex<Vec<String>>>, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if messages.lock().await.len() >= expected {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("expected delivery must complete");
+    }
+
     async fn run_stopped_agent_for_one_idle_timeout(state: Arc<AppState>, session_id: &str) {
         let agent = SessionAgent {
             app_state: state.clone(),
@@ -1091,6 +1104,10 @@ mod tests {
         actor
             .cast(SessionMsg::Active)
             .expect("queue active cancellation");
+        // Keep the due request blocked past the replacement timer's deadline.
+        // A detached delivery lets Active cancel that timer immediately; a
+        // synchronous delivery leaves its IdleTimeout queued behind this turn.
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
         blocked.release_first_delivery.notify_one();
         let _ = ractor::call!(actor, SessionMsg::GetPendingReplies).expect("flush active");
 
@@ -1151,8 +1168,12 @@ mod tests {
         actor
             .cast(SessionMsg::Stopped)
             .expect("queue repeated stopped boundary");
+        // The repeated boundary must replace the first boundary's timer while
+        // its due request remains blocked past that first timer's deadline.
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
         blocked.release_first_delivery.notify_one();
         let _ = ractor::call!(actor, SessionMsg::GetPendingReplies).expect("flush repeated stop");
+        wait_for_message_count(&blocked.messages, 2).await;
 
         let messages = blocked.messages.lock().await;
         assert_eq!(
@@ -1198,6 +1219,7 @@ mod tests {
             .execute_effects(&[crate::daemon_protocol::Effect::ActiveContextRestartDue { owner }])
             .await;
 
+        wait_for_message_count(&messages, 1).await;
         let messages = messages.lock().await;
         assert_eq!(messages.len(), 1);
         let message = &messages[0];
@@ -1236,6 +1258,7 @@ mod tests {
             .execute_effects(&[crate::daemon_protocol::Effect::ActiveContextRestartDue { owner }])
             .await;
 
+        wait_for_message_count(&messages, 1).await;
         let messages = messages.lock().await;
         assert_eq!(messages.len(), 1);
         assert!(messages[0].contains("has no stored prompt"));

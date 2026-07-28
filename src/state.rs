@@ -594,6 +594,19 @@ async fn notify_active_context_restart_due(
     }
 }
 
+fn spawn_owned_active_context_restart_due_delivery(
+    state: &Arc<AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
+) {
+    let state = Arc::clone(state);
+    let owner = owner.clone();
+    tokio::spawn(async move {
+        // The delivery remains owned by this exact incarnation: the initial
+        // snapshot and `locked_inject_owned` both reject a superseded owner.
+        notify_active_context_restart_due(&state, &owner).await;
+    });
+}
+
 /// Central daemon state holding sessions, nodes, and transports.
 pub struct AppState {
     pub config: OuijaConfig,
@@ -2783,7 +2796,7 @@ impl AppState {
                     self.stop_session_agent(owner, pane).await;
                 }
                 Effect::ActiveContextRestartDue { owner } => {
-                    notify_active_context_restart_due(self, owner).await;
+                    spawn_owned_active_context_restart_due_delivery(self, owner);
                 }
                 Effect::RenameAgent {
                     old_owner,
