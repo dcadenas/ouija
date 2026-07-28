@@ -1228,7 +1228,7 @@ mod tests {
         assert_eq!(
             messages
                 .iter()
-                .filter(|message| message.contains("active-context-restart-due"))
+                .filter(|message| message.contains("Ouija active-context refresh is due"))
                 .count(),
             2,
             "every due stopped boundary must still notify"
