@@ -142,6 +142,10 @@ pub async fn get_session(
                     "iteration_log": s.metadata.iteration_log,
                     "last_iteration_at": s.metadata.last_iteration_at,
                     "worktree_present": s.metadata.worktree_present,
+                    "fresh_context_after_active_secs": s.metadata.fresh_context_after_active_secs,
+                    "active_context_accumulated_secs": s.metadata.active_context_accumulated_secs,
+                    "active_context_segment_open": s.metadata.active_context_segment_started_at.is_some(),
+                    "active_context_restart_due": s.metadata.active_context_restart_due,
                 })),
             )
         }
@@ -187,6 +191,10 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
                 "iteration_log": s.metadata.iteration_log,
                 "last_iteration_at": s.metadata.last_iteration_at,
                 "worktree_present": s.metadata.worktree_present,
+                "fresh_context_after_active_secs": s.metadata.fresh_context_after_active_secs,
+                "active_context_accumulated_secs": s.metadata.active_context_accumulated_secs,
+                "active_context_segment_open": s.metadata.active_context_segment_started_at.is_some(),
+                "active_context_restart_due": s.metadata.active_context_restart_due,
             })
         })
         .collect();
@@ -4811,6 +4819,10 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     session_incarnation: crate::daemon_protocol::SessionIncarnation(u64::MAX),
                     parent_session: Some("manual-root".into()),
+                    fresh_context_after_active_secs: Some(3_600),
+                    active_context_accumulated_secs: 1_234,
+                    active_context_segment_started_at: Some(1_700_000_000),
+                    active_context_restart_due: true,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -4823,12 +4835,20 @@ mod tests {
             u64::MAX.to_string()
         );
         assert_eq!(all["sessions"][0]["parent_session"], "manual-root");
+        assert_eq!(all["sessions"][0]["fresh_context_after_active_secs"], 3_600);
+        assert_eq!(all["sessions"][0]["active_context_accumulated_secs"], 1_234);
+        assert_eq!(all["sessions"][0]["active_context_segment_open"], true);
+        assert_eq!(all["sessions"][0]["active_context_restart_due"], true);
 
         let (code, Json(one)) =
             get_session(State(state), axum::extract::Path("worker".to_string())).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(one["session_incarnation"], u64::MAX.to_string());
         assert_eq!(one["parent_session"], "manual-root");
+        assert_eq!(one["fresh_context_after_active_secs"], 3_600);
+        assert_eq!(one["active_context_accumulated_secs"], 1_234);
+        assert_eq!(one["active_context_segment_open"], true);
+        assert_eq!(one["active_context_restart_due"], true);
     }
 
     fn backend_identity_request(backend: &str, session_id: &str) -> BackendIdentityRequest {

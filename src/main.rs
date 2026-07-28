@@ -4361,6 +4361,10 @@ mod tests {
                 "bulletin": "ready",
                 "stale": true,
                 "worktree_present": true,
+                "fresh_context_after_active_secs": 3600,
+                "active_context_accumulated_secs": 1234,
+                "active_context_segment_open": true,
+                "active_context_restart_due": true,
                 "prompt": "internal prompt that should not be listed",
                 "reminder": "internal reminder that should not be listed",
                 "backend_session_id": "ses_secret_internal",
@@ -4391,6 +4395,26 @@ mod tests {
         assert!(projected["sessions"][0].get("prompt").is_none());
         assert!(projected["sessions"][0].get("reminder").is_none());
         assert!(projected["sessions"][0].get("backend_session_id").is_none());
+        assert!(
+            projected["sessions"][0]
+                .get("fresh_context_after_active_secs")
+                .is_none()
+        );
+        assert!(
+            projected["sessions"][0]
+                .get("active_context_accumulated_secs")
+                .is_none()
+        );
+        assert!(
+            projected["sessions"][0]
+                .get("active_context_segment_open")
+                .is_none()
+        );
+        assert!(
+            projected["sessions"][0]
+                .get("active_context_restart_due")
+                .is_none()
+        );
     }
 
     #[test]

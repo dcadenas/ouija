@@ -60,7 +60,7 @@ EOF
 ouija ls
 ```
 
-Shows a compact discovery list for choosing message targets. Each session includes `id` and `origin`, plus `project` (basename only), `role`, and `bulletin` when available. Use `ouija status` for full debug metadata such as absolute project paths, stale metadata, and worktree state.
+Shows a compact discovery list for choosing message targets. Each session includes `id` and `origin`, plus `project` (basename only), `role`, and `bulletin` when available. Use `ouija status` for full JSON status, including absolute project paths, stale metadata, worktree state, and active-context fields: `fresh_context_after_active_secs`, `active_context_accumulated_secs`, `active_context_segment_open` (`true` means active; `false` means parked), and `active_context_restart_due`.
 
 ## 3. Sending messages proactively
 
@@ -96,9 +96,18 @@ ouija spawn-session worker --project-dir /path --worktree --branch feature --bas
   --parent-session hub --when-done ask-parent \
   --prompt "task"
 
+# Opt in to a fresh context after four accumulated active hours:
+ouija spawn-session worker --project-dir /path \
+  --parent-session hub --when-done ask-parent \
+  --fresh-context-after-active 4h --prompt "task"
+
 # Restart with fresh context:
 ouija restart-session worker --fresh --prompt "new task" --reminder "when done, report back"
 # --prompt replaces the stored startup prompt. If omitted, the stored prompt is reused.
+
+# Set or change this policy only with a fresh restart:
+ouija restart-session worker --fresh --fresh-context-after-active 4h \
+  --one-shot-file /tmp/verified-continuation.txt
 
 # Launch once without replaying the stored prompt. The CLI reads the file as UTF-8;
 # its contents are delivered on this launch only and are never stored by Ouija.
@@ -120,11 +129,43 @@ Key fields:
 - `--worktree` — isolate in a git worktree at `~/.ouija/worktrees/<repo>/<session>`
 - `--branch` / `--base-branch` — git branch control for worktrees
 
-## 5. Intentional context rollover
+## 5. Active-context refresh
 
-Use rollover only at a safe work boundary. The running session, not the Ouija
-daemon, decides when a bounded slice can stop. Prepare a concise continuation
-directly on stdin:
+`--fresh-context-after-active DURATION` is an opt-in policy for manual
+`spawn-session` and fresh `restart-session` launches. `DURATION` is a positive
+whole number of `h`, `m`, or `s` (for example `4h`, `90m`, or `3600s`). It
+counts accumulated active work, not wall-clock time: the counter pauses while
+the session is parked.
+
+Once the limit is reached, Ouija injects its mandatory refresh notice only at a
+safe `Stopped` boundary. It never interrupts active work and it does not create
+a scheduler task. Each later stopped boundary repeats the notice until a fresh
+restart successfully completes; failed or superseded restarts do not clear it.
+
+The notice asks for a concise, self-contained, live-state-verified
+continuation (goal, completed and remaining work, decisions, blockers, and
+exact next steps), then provides this command:
+
+```bash
+ouija restart-session "worker" --fresh --one-shot-file /dev/stdin <<'OUIJA_CONTINUATION'
+Write the verified continuation here.
+OUIJA_CONTINUATION
+```
+
+When a stored prompt exists, Ouija replays it before the one-shot continuation.
+Without a stored prompt, the one-shot continuation must be complete enough to
+finish the work on its own. The policy does not discover children, traverse
+child relationships, enroll child sessions, or inspect native subagents.
+Native subagents are not Ouija sessions.
+
+## 6. Legacy manual rollover
+
+`ouija rollover` remains a separate legacy/manual continuation facility. It is
+not used by active-context refresh and should not be used as its production
+path. Use it only when an operator intentionally needs its explicit prepared
+record and adoption checks at a safe work boundary.
+
+Prepare a concise continuation directly on stdin:
 
 ```bash
 token="$(ouija rollover prepare --stdin <<'JSON'
@@ -177,7 +218,7 @@ and must be checked against live state. Native subagents are not Ouija sessions:
 never list, enroll, restart, or include them as Ouija descendants. Include only
 exact, explicitly managed Ouija child IDs.
 
-## 6. Task scheduling
+## 7. Task scheduling
 
 ```bash
 # Create a scheduled task (cron in UTC):
@@ -193,33 +234,12 @@ ouija task trigger TASK_ID
 ouija task remove TASK_ID
 ```
 
-For production context audits, the operator enrolls each intended manual root
-with one recurring exact-target task:
+Tasks are for independent periodic work, not active-context refresh. Do not
+schedule context audits or use `--inject-only` as a rollover/refresh mechanism.
+The active-context policy above has no scheduler enrollment, child traversal,
+or native-subagent discovery.
 
-```bash
-ouija task add context-audit "*/15 * * * *" \
-  "At your next safe boundary, audit your context. Exact Ouija child allowlist: turnero, review-plugin-cx. Send each at most one ordinary audit message." \
-  --target hub-cx --inject-only
-```
-
-`--inject-only` requires an exact target and fails closed unless that exact
-Local Ouija session is currently live. It never creates, revives, restarts, or
-respawns a session and never touches a worktree or stored prompt. An audit is a
-safe-boundary request, not a forced rollover; the session still owns the
-semantic decision to continue or roll over.
-
-The task message is the operator-owned enrollment record. It must carry the
-exact allowlist of explicitly managed Ouija children. The root may corroborate
-each allowlisted ID with `parent_session` from `ouija ls` or `ouija status`,
-then send that exact live child at most one ordinary `ouija tell` audit. A null
-or missing parent never discovers a child and never de-enrolls an explicit
-operator choice. Do not create per-child schedules, recurse through children,
-inspect processes, infer enrollment from names/roles/paths, or add a daemon
-enrollment graph. Native subagents are not Ouija sessions and must remain
-invisible. OuijaCP lifecycle semantics are unrelated and must not be inferred
-from this procedure.
-
-## 7. Housekeeping
+## 8. Housekeeping
 
 **Update your metadata** when your focus changes:
 ```bash
@@ -235,7 +255,7 @@ do not invent an ID or place a clearing command in `--reminder`.
 ouija clear-reply SENDER_ID
 ```
 
-## 8. Non-tmux contexts (opencode HTTP API, etc.)
+## 9. Non-tmux contexts (opencode HTTP API, etc.)
 
 The CLI infers your session ID from `$TMUX_PANE`. In engines whose bash tool runs outside tmux, that variable may be unset and implicit `ouija ask/tell/reply` cannot always resolve a sender automatically.
 
