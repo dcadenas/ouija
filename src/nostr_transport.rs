@@ -348,13 +348,15 @@ fn classify_incumbent_pane(
 ) -> IncumbentPaneDisposition {
     match inspection {
         crate::tmux::ManagedPaneInspection::Missing => IncumbentPaneDisposition::Recreate,
-        crate::tmux::ManagedPaneInspection::Managed(observed)
+        crate::tmux::ManagedPaneInspection::ProcessOwner(observed)
+        | crate::tmux::ManagedPaneInspection::MarkerOwner(observed)
             if crate::tmux::physical_owner_matches(observed, lease_owner)
                 || crate::tmux::physical_owner_matches(observed, restart_target_owner) =>
         {
             IncumbentPaneDisposition::Respawn
         }
-        crate::tmux::ManagedPaneInspection::Managed(_)
+        crate::tmux::ManagedPaneInspection::ProcessOwner(_)
+        | crate::tmux::ManagedPaneInspection::MarkerOwner(_)
         | crate::tmux::ManagedPaneInspection::Unmanaged => IncumbentPaneDisposition::Refuse,
     }
 }
@@ -3813,11 +3815,7 @@ async fn restart_session_claimed(
                         None
                     }
                     IncumbentPaneDisposition::Refuse => {
-                        let live_owner = match &inspection {
-                            crate::tmux::ManagedPaneInspection::Managed(owner) => Some(owner),
-                            crate::tmux::ManagedPaneInspection::Missing
-                            | crate::tmux::ManagedPaneInspection::Unmanaged => None,
-                        };
+                        let live_owner = inspection.owner();
                         Some(format!(
                             "restart refused unverified incumbent pane {incumbent_pane_id}: expected {lease_owner:?} or {restart_target_owner:?}, found {live_owner:?}"
                         ))
@@ -9037,12 +9035,12 @@ mod tests {
     }
 
     #[test]
-    fn lease_owned_incumbent_pane_is_respawned() {
+    fn process_lease_owned_incumbent_pane_is_respawned() {
         let (lease_owner, restart_target_owner) = incumbent_test_owners();
 
         assert_eq!(
             classify_incumbent_pane(
-                &crate::tmux::ManagedPaneInspection::Managed(lease_owner.clone()),
+                &crate::tmux::ManagedPaneInspection::ProcessOwner(lease_owner.clone()),
                 &lease_owner,
                 &restart_target_owner,
             ),
@@ -9051,12 +9049,12 @@ mod tests {
     }
 
     #[test]
-    fn restart_target_owned_incumbent_pane_is_respawned() {
+    fn marker_lease_owned_incumbent_pane_is_respawned() {
         let (lease_owner, restart_target_owner) = incumbent_test_owners();
 
         assert_eq!(
             classify_incumbent_pane(
-                &crate::tmux::ManagedPaneInspection::Managed(restart_target_owner.clone()),
+                &crate::tmux::ManagedPaneInspection::MarkerOwner(lease_owner.clone()),
                 &lease_owner,
                 &restart_target_owner,
             ),
@@ -9065,7 +9063,35 @@ mod tests {
     }
 
     #[test]
-    fn stranger_owned_incumbent_pane_is_refused() {
+    fn process_restart_target_owned_incumbent_pane_is_respawned() {
+        let (lease_owner, restart_target_owner) = incumbent_test_owners();
+
+        assert_eq!(
+            classify_incumbent_pane(
+                &crate::tmux::ManagedPaneInspection::ProcessOwner(restart_target_owner.clone(),),
+                &lease_owner,
+                &restart_target_owner,
+            ),
+            IncumbentPaneDisposition::Respawn
+        );
+    }
+
+    #[test]
+    fn marker_restart_target_owned_incumbent_pane_is_respawned() {
+        let (lease_owner, restart_target_owner) = incumbent_test_owners();
+
+        assert_eq!(
+            classify_incumbent_pane(
+                &crate::tmux::ManagedPaneInspection::MarkerOwner(restart_target_owner.clone(),),
+                &lease_owner,
+                &restart_target_owner,
+            ),
+            IncumbentPaneDisposition::Respawn
+        );
+    }
+
+    #[test]
+    fn stranger_process_owned_incumbent_pane_is_refused() {
         let (lease_owner, restart_target_owner) = incumbent_test_owners();
         let stranger_owner = crate::daemon_protocol::ResourceOwner {
             session_id: "stranger".into(),
@@ -9074,7 +9100,25 @@ mod tests {
 
         assert_eq!(
             classify_incumbent_pane(
-                &crate::tmux::ManagedPaneInspection::Managed(stranger_owner),
+                &crate::tmux::ManagedPaneInspection::ProcessOwner(stranger_owner),
+                &lease_owner,
+                &restart_target_owner,
+            ),
+            IncumbentPaneDisposition::Refuse
+        );
+    }
+
+    #[test]
+    fn stranger_marker_owned_incumbent_pane_is_refused() {
+        let (lease_owner, restart_target_owner) = incumbent_test_owners();
+        let stranger_owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "stranger".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(12),
+        };
+
+        assert_eq!(
+            classify_incumbent_pane(
+                &crate::tmux::ManagedPaneInspection::MarkerOwner(stranger_owner),
                 &lease_owner,
                 &restart_target_owner,
             ),
