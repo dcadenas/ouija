@@ -3075,17 +3075,30 @@ async fn cli_list_sessions() -> anyhow::Result<()> {
 }
 
 async fn rollover_live_caller() -> anyhow::Result<rollover::LiveCaller> {
-    let id = require_my_session_id().await?;
-    let before = fetch_rollover_incarnation(&id).await?;
-    if let Some(hint) = local_incarnation_hint()? {
-        if hint != before {
-            anyhow::bail!(
-                "local session incarnation {hint} does not match daemon incarnation {before}"
-            );
+    let (id, backend_owned) = match whoami_outcome().await {
+        WhoamiOutcome::Resolved {
+            id,
+            source,
+            backend_identity,
+            ..
+        } => {
+            verify_resolved_id_registered(&id, &source).await?;
+            (
+                id,
+                source == IdentitySource::BackendIdentity && backend_identity.is_some(),
+            )
         }
-    }
+        WhoamiOutcome::Unresolved(_) => anyhow::bail!(unresolved_sender_error()),
+        WhoamiOutcome::Conflict(conflict) => anyhow::bail!(format_identity_conflict(&conflict)),
+        WhoamiOutcome::BackendResolutionFailed(error) => anyhow::bail!(
+            "backend identity was discovered but could not be resolved safely: {error}"
+        ),
+    };
+    let before = fetch_rollover_incarnation(&id).await?;
+    let incarnation =
+        verify_rollover_incarnation_evidence(local_incarnation_hint()?, backend_owned, before)?;
     let cwd = std::env::current_dir().context("reading current directory for rollover")?;
-    let caller = rollover::capture_live_caller(id.clone(), before, &cwd)?;
+    let caller = rollover::capture_live_caller(id.clone(), incarnation, &cwd)?;
     let after = fetch_rollover_incarnation(&id).await?;
     if after != before {
         anyhow::bail!(
@@ -3093,6 +3106,24 @@ async fn rollover_live_caller() -> anyhow::Result<rollover::LiveCaller> {
         );
     }
     Ok(caller)
+}
+
+fn verify_rollover_incarnation_evidence(
+    local_hint: Option<u64>,
+    backend_owned: bool,
+    daemon_incarnation: u64,
+) -> anyhow::Result<u64> {
+    match local_hint {
+        Some(local) if local == daemon_incarnation => Ok(local),
+        Some(local) => anyhow::bail!(
+            "local session incarnation {local} does not match daemon incarnation {daemon_incarnation}"
+        ),
+        None if backend_owned => Ok(daemon_incarnation),
+        None => anyhow::bail!(
+            "rollover requires exact caller-owned incarnation evidence from the pane marker, \
+             OUIJA_SESSION_INCARNATION, or a bound backend identity"
+        ),
+    }
 }
 
 async fn fetch_rollover_incarnation(id: &str) -> anyhow::Result<u64> {
@@ -3508,6 +3539,34 @@ mod tests {
         let mut numeric = session;
         numeric["session_incarnation"] = serde_json::json!(7);
         assert!(rollover_incarnation_from_session(&numeric, "worker").is_err());
+    }
+
+    #[test]
+    fn rollover_incarnation_evidence_rejects_absent_unbound_caller() {
+        let error = verify_rollover_incarnation_evidence(None, false, 9)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("caller-owned incarnation evidence"));
+    }
+
+    #[test]
+    fn rollover_incarnation_evidence_rejects_stale_hint() {
+        let error = verify_rollover_incarnation_evidence(Some(8), false, 9)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not match"));
+    }
+
+    #[test]
+    fn rollover_incarnation_evidence_accepts_exact_hint_or_bound_backend() {
+        assert_eq!(
+            verify_rollover_incarnation_evidence(Some(9), false, 9).unwrap(),
+            9
+        );
+        assert_eq!(
+            verify_rollover_incarnation_evidence(None, true, 9).unwrap(),
+            9
+        );
     }
 
     #[test]

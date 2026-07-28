@@ -3,7 +3,9 @@ use fs2::FileExt;
 use rand::distr::{Alphanumeric, SampleString};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -122,6 +124,7 @@ pub fn prepare(
     now: i64,
 ) -> anyhow::Result<String> {
     validate_continuation(&payload)?;
+    verify_live_binding(caller)?;
     let store = Store::open(data_dir, caller)?;
     let _lock = store.lock()?;
     if let Some(existing) = store.read_record()? {
@@ -162,6 +165,7 @@ pub fn adopt(
     token: &str,
     now: i64,
 ) -> anyhow::Result<Continuation> {
+    verify_live_binding(caller)?;
     let store = Store::open(data_dir, caller)?;
     let _lock = store.lock()?;
     let mut record = store
@@ -212,6 +216,18 @@ pub fn adopt(
     Ok(record.continuation)
 }
 
+fn verify_live_binding(caller: &LiveCaller) -> anyhow::Result<()> {
+    let live = capture_live_caller(
+        caller.session_id.clone(),
+        caller.incarnation,
+        &caller.binding.cwd,
+    )?;
+    if live.binding != caller.binding {
+        bail!("live working state changed after rollover state was captured");
+    }
+    Ok(())
+}
+
 pub fn cleanup(
     data_dir: &Path,
     caller: &LiveCaller,
@@ -226,9 +242,9 @@ pub fn cleanup(
     if record.state == RecordState::Pending && now <= record.expires_at && !force_pending {
         bail!("continuation is still pending; pass --force-pending to remove it");
     }
-    fs::remove_file(&store.record_path)
-        .with_context(|| format!("removing {}", store.record_path.display()))?;
-    File::open(&store.dir)?.sync_all()?;
+    unlink_private(&store, &store.record_name)
+        .with_context(|| format!("removing {}", store.dir.join(&store.record_name).display()))?;
+    store.dir_handle.sync_all()?;
     Ok(true)
 }
 
@@ -265,38 +281,47 @@ struct Record {
 
 struct Store {
     dir: PathBuf,
-    record_path: PathBuf,
-    lock_path: PathBuf,
+    dir_handle: File,
+    record_name: String,
+    lock_name: String,
 }
 
 impl Store {
     fn open(data_dir: &Path, caller: &LiveCaller) -> anyhow::Result<Self> {
         let absolute_data_dir = absolute_path(data_dir)?;
         refuse_repository_local_storage(&absolute_data_dir, &caller.binding)?;
-        let dir = absolute_data_dir.join("rollovers");
-        create_private_dir(&dir)?;
+        fs::create_dir_all(&absolute_data_dir)
+            .with_context(|| format!("creating {}", absolute_data_dir.display()))?;
+        let canonical_data_dir = absolute_data_dir
+            .canonicalize()
+            .with_context(|| format!("canonicalizing {}", absolute_data_dir.display()))?;
+        refuse_repository_local_storage(&canonical_data_dir, &caller.binding)?;
+        let (dir, dir_handle) =
+            ensure_private_rollover_dir(&canonical_data_dir.join("rollovers"), &caller.binding)?;
         let key = session_key(&caller.session_id);
         Ok(Self {
-            record_path: dir.join(format!("{key}.json")),
-            lock_path: dir.join(format!("{key}.lock")),
+            dir_handle,
+            record_name: format!("{key}.json"),
+            lock_name: format!("{key}.lock"),
             dir,
         })
     }
 
     fn lock(&self) -> anyhow::Result<File> {
-        let file = open_private(&self.lock_path)?;
+        let file = open_private_lock(self)?;
         file.lock_exclusive()
-            .with_context(|| format!("locking {}", self.lock_path.display()))?;
+            .with_context(|| format!("locking {}", self.dir.join(&self.lock_name).display()))?;
         Ok(file)
     }
 
     fn read_record(&self) -> anyhow::Result<Option<Record>> {
-        let file = match File::open(&self.record_path) {
+        let file = match open_existing_private(self, &self.record_name, false) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("opening {}", self.record_path.display()));
+                return Err(error).with_context(|| {
+                    format!("opening {}", self.dir.join(&self.record_name).display())
+                });
             }
         };
         let mut bytes = Vec::new();
@@ -306,34 +331,55 @@ impl Store {
             bail!("stored continuation is unexpectedly large");
         }
         serde_json::from_slice(&bytes)
-            .with_context(|| format!("parsing {}", self.record_path.display()))
+            .with_context(|| format!("parsing {}", self.dir.join(&self.record_name).display()))
             .map(Some)
     }
 
     fn write_record(&self, record: &Record) -> anyhow::Result<()> {
+        reject_symlink_or_non_file(self, &self.record_name)?;
         let suffix = Alphanumeric.sample_string(&mut rand::rng(), 16);
-        let temp_path = self.dir.join(format!(".{suffix}.tmp"));
+        let temp_name = format!(".{suffix}.tmp");
         let result = (|| -> anyhow::Result<()> {
-            let mut temp = create_new_private(&temp_path)?;
+            let mut temp = create_new_private(self, &temp_name)?;
             serde_json::to_writer(&mut temp, record)?;
             temp.write_all(b"\n")?;
             temp.sync_all()?;
-            fs::rename(&temp_path, &self.record_path).with_context(|| {
+            rename_private(self, &temp_name, &self.record_name).with_context(|| {
                 format!(
                     "atomically replacing {} with {}",
-                    self.record_path.display(),
-                    temp_path.display()
+                    self.dir.join(&self.record_name).display(),
+                    self.dir.join(&temp_name).display()
                 )
             })?;
-            set_private_file_permissions(&self.record_path)?;
-            File::open(&self.dir)?.sync_all()?;
+            self.dir_handle.sync_all()?;
             Ok(())
         })();
         if result.is_err() {
-            let _ = fs::remove_file(&temp_path);
+            let _ = unlink_private(self, &temp_name);
         }
         result
     }
+}
+
+fn ensure_private_rollover_dir(
+    path: &Path,
+    binding: &StateBinding,
+) -> anyhow::Result<(PathBuf, File)> {
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("creating {}", path.display()));
+        }
+    }
+    let directory = open_directory_nofollow(path)?;
+    set_private_permissions(&directory, 0o700)?;
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", path.display()))?;
+    refuse_repository_local_storage(&canonical, binding)?;
+    verify_path_still_names_directory(path, &directory)?;
+    Ok((canonical, directory))
 }
 
 fn absolute_path(path: &Path) -> anyhow::Result<PathBuf> {
@@ -389,6 +435,7 @@ fn capture_git_binding(cwd: &Path) -> anyhow::Result<Option<GitBinding>> {
         .to_string();
     let branch = git_output(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"])?
         .map(|value| value.trim().to_string());
+    require_clean_initialized_submodules(&repository_root)?;
     let dirty_digest = git_dirty_digest(&repository_root)?;
     Ok(Some(GitBinding {
         repository_root,
@@ -397,6 +444,47 @@ fn capture_git_binding(cwd: &Path) -> anyhow::Result<Option<GitBinding>> {
         head,
         dirty_digest,
     }))
+}
+
+fn require_clean_initialized_submodules(repository_root: &Path) -> anyhow::Result<()> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repository_root)
+        .args(["submodule", "status", "--recursive"])
+        .output()
+        .context("checking submodule gitlink state")?;
+    if !status.status.success() {
+        bail!("git submodule status failed while binding rollover state");
+    }
+    if status
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| line.first())
+        .any(|prefix| matches!(prefix, b'+' | b'U'))
+    {
+        bail!(
+            "rollover refuses initialized submodules checked out beyond the recorded gitlink state"
+        );
+    }
+
+    let worktrees = Command::new("git")
+        .arg("-C")
+        .arg(repository_root)
+        .args([
+            "submodule",
+            "foreach",
+            "--quiet",
+            "--recursive",
+            r#"test -z "$(git status --porcelain=v2 --untracked-files=all)""#,
+        ])
+        .output()
+        .context("checking initialized submodule worktrees")?;
+    if !worktrees.status.success() {
+        bail!(
+            "rollover refuses dirty or untracked state in initialized submodules; clean or commit each submodule first"
+        );
+    }
+    Ok(())
 }
 
 fn canonical_existing_path(value: &str, description: &str) -> anyhow::Result<PathBuf> {
@@ -564,70 +652,201 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
 }
 
 #[cfg(unix)]
-fn create_private_dir(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)
-        .with_context(|| format!("creating {}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn create_private_dir(path: &Path) -> anyhow::Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))
-}
-
-#[cfg(unix)]
-fn open_private(path: &Path) -> anyhow::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(path)?;
-    set_private_file_permissions(path)?;
+fn open_private_lock(store: &Store) -> anyhow::Result<File> {
+    use rustix::fs::{Mode, OFlags, openat};
+    let created = openat(
+        &store.dir_handle,
+        store.lock_name.as_str(),
+        OFlags::CREATE | OFlags::EXCL | OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    );
+    let file: File = match created {
+        Ok(file) => file.into(),
+        Err(rustix::io::Errno::EXIST) => open_existing_private(store, &store.lock_name, true)?,
+        Err(error) => {
+            return Err(std::io::Error::from(error)).with_context(|| {
+                format!("opening {}", store.dir.join(&store.lock_name).display())
+            });
+        }
+    };
+    if !file.metadata()?.file_type().is_file() {
+        bail!(
+            "rollover lock {} is not a regular file",
+            store.dir.join(&store.lock_name).display()
+        );
+    }
+    set_private_permissions(&file, 0o600)?;
     Ok(file)
 }
 
 #[cfg(not(unix))]
-fn open_private(path: &Path) -> anyhow::Result<File> {
-    Ok(OpenOptions::new()
-        .create(true)
+fn open_private_lock(store: &Store) -> anyhow::Result<File> {
+    let path = store.dir.join(&store.lock_name);
+    let file = match OpenOptions::new()
+        .create_new(true)
         .read(true)
         .write(true)
-        .truncate(false)
-        .open(path)?)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            open_existing_private(store, &store.lock_name, true)?
+        }
+        Err(error) => return Err(error).with_context(|| format!("opening {}", path.display())),
+    };
+    if !file.metadata()?.file_type().is_file() {
+        bail!("rollover lock {} is not a regular file", path.display());
+    }
+    Ok(file)
 }
 
 #[cfg(unix)]
-fn create_new_private(path: &Path) -> anyhow::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    Ok(OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)?)
+fn open_existing_private(store: &Store, name: &str, writable: bool) -> std::io::Result<File> {
+    use rustix::fs::{Mode, OFlags, openat};
+    let access = if writable {
+        OFlags::RDWR
+    } else {
+        OFlags::RDONLY
+    };
+    openat(
+        &store.dir_handle,
+        name,
+        access | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(std::io::Error::from)
 }
 
 #[cfg(not(unix))]
-fn create_new_private(path: &Path) -> anyhow::Result<File> {
+fn open_existing_private(store: &Store, name: &str, writable: bool) -> std::io::Result<File> {
+    let path = store.dir.join(name);
+    if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+        return Err(std::io::Error::other("refusing symlink"));
+    }
+    OpenOptions::new().read(true).write(writable).open(path)
+}
+
+#[cfg(unix)]
+fn create_new_private(store: &Store, name: &str) -> anyhow::Result<File> {
+    use rustix::fs::{Mode, OFlags, openat};
+    openat(
+        &store.dir_handle,
+        name,
+        OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map(File::from)
+    .map_err(std::io::Error::from)
+    .with_context(|| format!("creating {}", store.dir.join(name).display()))
+}
+
+#[cfg(not(unix))]
+fn create_new_private(store: &Store, name: &str) -> anyhow::Result<File> {
+    let path = store.dir.join(name);
     Ok(OpenOptions::new().create_new(true).write(true).open(path)?)
 }
 
 #[cfg(unix)]
-fn set_private_file_permissions(path: &Path) -> anyhow::Result<()> {
+fn open_directory_nofollow(path: &Path) -> anyhow::Result<File> {
+    use rustix::fs::{Mode, OFlags, open};
+    let directory: File = open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(std::io::Error::from)
+    .with_context(|| format!("opening private rollover directory {}", path.display()))?;
+    if !directory.metadata()?.is_dir() {
+        bail!("rollover path {} is not a directory", path.display());
+    }
+    Ok(directory)
+}
+
+#[cfg(not(unix))]
+fn open_directory_nofollow(path: &Path) -> anyhow::Result<File> {
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        bail!(
+            "rollover directory {} must not be a symlink",
+            path.display()
+        );
+    }
+    let directory = File::open(path)?;
+    if !directory.metadata()?.is_dir() {
+        bail!("rollover path {} is not a directory", path.display());
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn set_private_permissions(file: &File, mode: u32) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    file.set_permissions(fs::Permissions::from_mode(mode))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_private_file_permissions(_path: &Path) -> anyhow::Result<()> {
+fn set_private_permissions(_file: &File, _mode: u32) -> anyhow::Result<()> {
+    Ok(())
+}
+
+fn reject_symlink_or_non_file(store: &Store, name: &str) -> anyhow::Result<()> {
+    match open_existing_private(store, name, false) {
+        Ok(file) if !file.metadata()?.file_type().is_file() => {
+            bail!(
+                "rollover record {} is not a regular file",
+                store.dir.join(name).display()
+            )
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("inspecting {}", store.dir.join(name).display()))
+        }
+    }
+}
+
+#[cfg(unix)]
+fn rename_private(store: &Store, from: &str, to: &str) -> anyhow::Result<()> {
+    rustix::fs::renameat(&store.dir_handle, from, &store.dir_handle, to)
+        .map_err(std::io::Error::from)
+        .context("renaming private rollover record")
+}
+
+#[cfg(not(unix))]
+fn rename_private(store: &Store, from: &str, to: &str) -> anyhow::Result<()> {
+    fs::rename(store.dir.join(from), store.dir.join(to)).context("renaming rollover record")
+}
+
+#[cfg(unix)]
+fn unlink_private(store: &Store, name: &str) -> anyhow::Result<()> {
+    rustix::fs::unlinkat(&store.dir_handle, name, rustix::fs::AtFlags::empty())
+        .map_err(std::io::Error::from)
+        .context("unlinking private rollover record")
+}
+
+#[cfg(not(unix))]
+fn unlink_private(store: &Store, name: &str) -> anyhow::Result<()> {
+    fs::remove_file(store.dir.join(name)).context("unlinking rollover record")
+}
+
+#[cfg(unix)]
+fn verify_path_still_names_directory(path: &Path, directory: &File) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let path_metadata = fs::metadata(path)?;
+    let fd_metadata = directory.metadata()?;
+    if path_metadata.dev() != fd_metadata.dev() || path_metadata.ino() != fd_metadata.ino() {
+        bail!(
+            "rollover directory {} changed while it was being opened",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_path_still_names_directory(_path: &Path, _directory: &File) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -671,6 +890,11 @@ mod tests {
             .current_dir(path)
             .status()
             .unwrap();
+        Command::new("git")
+            .args(["config", "commit.gpgsign", "false"])
+            .current_dir(path)
+            .status()
+            .unwrap();
         fs::write(path.join("tracked.txt"), "base\n").unwrap();
         Command::new("git")
             .args(["add", "tracked.txt"])
@@ -682,6 +906,28 @@ mod tests {
             .current_dir(path)
             .status()
             .unwrap();
+    }
+
+    fn add_clean_submodule(parent: &Path, child: &Path) {
+        init_git(child);
+        assert!(
+            Command::new("git")
+                .args(["-c", "protocol.file.allow=always", "submodule", "add", "-q",])
+                .arg(child)
+                .arg("dependency")
+                .current_dir(parent)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["commit", "-qam", "add submodule"])
+                .current_dir(parent)
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     #[test]
@@ -738,6 +984,109 @@ mod tests {
         fs::write(dir.path().join("new.txt"), "two\n").unwrap();
         let untracked_two = capture_live_caller("worker".into(), 1, dir.path()).unwrap();
         assert_ne!(untracked_one.binding, untracked_two.binding);
+    }
+
+    #[test]
+    fn clean_pinned_submodule_may_prepare_and_adopt() {
+        let parent = tempfile::tempdir().unwrap();
+        let child = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_git(parent.path());
+        add_clean_submodule(parent.path(), child.path());
+
+        let source = capture_live_caller("worker".into(), 1, parent.path()).unwrap();
+        let token = prepare(data.path(), &source, payload(), false, 100).unwrap();
+        let adopter = capture_live_caller("worker".into(), 2, parent.path()).unwrap();
+        assert_eq!(
+            adopt(data.path(), &adopter, &token, 101).unwrap(),
+            payload()
+        );
+    }
+
+    #[test]
+    fn dirty_submodule_refuses_prepare_and_distinct_dirty_contents_cannot_adopt() {
+        let parent = tempfile::tempdir().unwrap();
+        let child = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_git(parent.path());
+        add_clean_submodule(parent.path(), child.path());
+        let source = capture_live_caller("worker".into(), 1, parent.path()).unwrap();
+        let token = prepare(data.path(), &source, payload(), false, 100).unwrap();
+        let adopter = capture_live_caller("worker".into(), 2, parent.path()).unwrap();
+        let record_path = record_path_for_test(data.path(), "worker");
+        let before = fs::read(&record_path).unwrap();
+
+        let dependency_file = parent.path().join("dependency/tracked.txt");
+        for contents in ["dirty state one\n", "dirty state two\n"] {
+            fs::write(&dependency_file, contents).unwrap();
+            let error = capture_live_caller("worker".into(), 2, parent.path())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("dirty or untracked state"));
+            let replacement_data = tempfile::tempdir().unwrap();
+            assert!(
+                prepare(replacement_data.path(), &source, payload(), false, 101)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("dirty or untracked state")
+            );
+            assert!(
+                adopt(data.path(), &adopter, &token, 101)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("dirty or untracked state")
+            );
+            assert_eq!(fs::read(&record_path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn untracked_submodule_state_is_refused() {
+        let parent = tempfile::tempdir().unwrap();
+        let child = tempfile::tempdir().unwrap();
+        init_git(parent.path());
+        add_clean_submodule(parent.path(), child.path());
+        fs::write(
+            parent.path().join("dependency/untracked.txt"),
+            "untracked\n",
+        )
+        .unwrap();
+
+        let error = capture_live_caller("worker".into(), 1, parent.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("dirty or untracked state"));
+    }
+
+    #[test]
+    fn submodule_checked_out_beyond_recorded_gitlink_is_refused() {
+        let parent = tempfile::tempdir().unwrap();
+        let child = tempfile::tempdir().unwrap();
+        init_git(parent.path());
+        add_clean_submodule(parent.path(), child.path());
+        let dependency = parent.path().join("dependency");
+        fs::write(dependency.join("tracked.txt"), "next commit\n").unwrap();
+        assert!(
+            Command::new("git")
+                .args(["add", "tracked.txt"])
+                .current_dir(&dependency)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["-c", "commit.gpgsign=false", "commit", "-qm", "next"])
+                .current_dir(&dependency)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let error = capture_live_caller("worker".into(), 1, parent.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("recorded gitlink state"));
     }
 
     #[test]
@@ -937,6 +1286,60 @@ mod tests {
         let caller = capture_live_caller("worker".into(), 1, repo.path()).unwrap();
         assert!(prepare(&link, &caller, payload(), false, 100).is_err());
         assert!(!repo.path().join("rollovers").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_rollovers_directory_symlinked_into_repository_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_git(repo.path());
+        symlink(repo.path(), data.path().join("rollovers")).unwrap();
+        let caller = capture_live_caller("worker".into(), 1, repo.path()).unwrap();
+
+        assert!(prepare(data.path(), &caller, payload(), false, 100).is_err());
+        assert!(
+            !repo
+                .path()
+                .join(format!("{}.json", session_key("worker")))
+                .exists()
+        );
+        assert!(
+            !repo
+                .path()
+                .join(format!("{}.lock", session_key("worker")))
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_and_record_symlinks_are_refused_without_touching_targets() {
+        use std::os::unix::fs::symlink;
+
+        for extension in ["lock", "json"] {
+            let repo = tempfile::tempdir().unwrap();
+            let data = tempfile::tempdir().unwrap();
+            init_git(repo.path());
+            let rollovers = data.path().join("rollovers");
+            fs::create_dir(&rollovers).unwrap();
+            let victim = repo.path().join(format!("{extension}-victim"));
+            fs::write(&victim, "do not touch").unwrap();
+            let endpoint = rollovers.join(format!("{}.{}", session_key("worker"), extension));
+            symlink(&victim, &endpoint).unwrap();
+            let caller = capture_live_caller("worker".into(), 1, repo.path()).unwrap();
+
+            assert!(prepare(data.path(), &caller, payload(), false, 100).is_err());
+            assert_eq!(fs::read_to_string(victim).unwrap(), "do not touch");
+            assert!(
+                fs::symlink_metadata(endpoint)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
     }
 
     fn record_path_for_test(data_dir: &Path, session_id: &str) -> PathBuf {

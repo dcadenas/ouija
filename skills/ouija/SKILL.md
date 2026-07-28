@@ -159,6 +159,12 @@ same adopting incarnation is idempotent. Use
 `ouija rollover prepare --stdin --replace-expired` only after inspecting an
 expired pending record and intentionally replacing it.
 
+Initialized submodules must be clean and checked out at their recorded gitlink.
+Ouija refuses rollover preparation or adoption when an initialized submodule
+has modified/untracked content or a different checked-out commit; clean or
+commit that submodule first. Uninitialized submodules remain bound by the
+superproject gitlink.
+
 Continuation records live privately under Ouija's per-user data directory,
 outside repositories. `ouija rollover cleanup` removes an adopted or expired
 record; removing a live pending record requires the explicit
