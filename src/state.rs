@@ -266,20 +266,36 @@ async fn deliver_raw_tmux_for_session(
     request: &InjectDeliveryRequest<'_>,
     inject_config: Option<crate::backend::InjectConfig>,
     tui_pattern: Option<String>,
+    assistant_guard: Option<(
+        crate::daemon_protocol::ResourceOwner,
+        OwnedAssistantDeliveryEvidence,
+    )>,
 ) -> DeliveryOutcome {
     if let Err(reason) = session_owns_pane(state, request.session_id, request.pane).await {
         return DeliveryOutcome::Rejected(reason);
     }
+    if let Some((owner, evidence)) = assistant_guard.as_ref()
+        && let Err(reason) = evidence.validate(state, owner, request.pane).await
+    {
+        return DeliveryOutcome::Rejected(reason);
+    }
+    let assistant_process_evidence = assistant_guard.as_ref().map(|(owner, evidence)| {
+        crate::tmux::OwnedAssistantProcessEvidence {
+            owner: owner.clone(),
+            process_names: evidence.process_names.clone(),
+        }
+    });
 
     let result = match inject_config {
         Some(inject_config) => {
-            crate::tmux::locked_inject_raw_tmux_with_config(
+            crate::tmux::locked_inject_raw_tmux_with_config_and_evidence(
                 state,
                 request.pane,
                 request.message,
                 request.vim_mode,
                 inject_config,
                 tui_pattern,
+                assistant_process_evidence,
             )
             .await
         }
@@ -303,10 +319,19 @@ async fn deliver_raw_tmux_for_session(
 async fn deliver_by_current_session_plan(
     state: &AppState,
     request: &InjectDeliveryRequest<'_>,
+    assistant_guard: Option<(
+        crate::daemon_protocol::ResourceOwner,
+        OwnedAssistantDeliveryEvidence,
+    )>,
 ) -> DeliveryOutcome {
     match crate::tmux::session_delivery_plan(state, request.session_id, request.pane).await {
         crate::tmux::SessionDeliveryPlan::Http(delivery) => {
             if let Err(reason) = session_owns_pane(state, request.session_id, request.pane).await {
+                return DeliveryOutcome::Rejected(reason);
+            }
+            if let Some((owner, evidence)) = assistant_guard.as_ref()
+                && let Err(reason) = evidence.validate(state, owner, request.pane).await
+            {
                 return DeliveryOutcome::Rejected(reason);
             }
 
@@ -325,7 +350,16 @@ async fn deliver_by_current_session_plan(
         crate::tmux::SessionDeliveryPlan::RawTmux {
             inject_config,
             tui_pattern,
-        } => deliver_raw_tmux_for_session(state, request, Some(inject_config), tui_pattern).await,
+        } => {
+            deliver_raw_tmux_for_session(
+                state,
+                request,
+                Some(inject_config),
+                tui_pattern,
+                assistant_guard,
+            )
+            .await
+        }
         crate::tmux::SessionDeliveryPlan::Unavailable(reason) => DeliveryOutcome::Rejected(reason),
     }
 }
@@ -339,21 +373,109 @@ pub(crate) struct InjectDeliveryRequest<'a> {
     pub recorded_method: Option<&'a str>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct OwnedAssistantDeliveryEvidence {
+    pub backend: Option<String>,
+    pub backend_session_id: Option<String>,
+    pub process_names: Vec<String>,
+}
+
+impl OwnedAssistantDeliveryEvidence {
+    async fn validate(
+        &self,
+        state: &AppState,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        pane: &str,
+    ) -> Result<(), String> {
+        let metadata_matches = state
+            .protocol
+            .read()
+            .await
+            .sessions
+            .get(&owner.session_id)
+            .is_some_and(|session| {
+                session.owner() == *owner
+                    && session.pane.as_deref() == Some(pane)
+                    && session.metadata.backend == self.backend
+                    && session.metadata.backend_session_id == self.backend_session_id
+            });
+        if !metadata_matches {
+            return Err(format!(
+                "scheduled delivery evidence changed for session {}",
+                owner.session_id
+            ));
+        }
+
+        if cfg!(test) {
+            let live = state
+                .cached_assistant_panes
+                .read()
+                .await
+                .iter()
+                .any(|candidate| {
+                    candidate.pane_id == pane
+                        && candidate.process_name.as_deref().is_some_and(|process| {
+                            self.process_names.iter().any(|name| name == process)
+                        })
+                });
+            return live.then_some(()).ok_or_else(|| {
+                format!(
+                    "scheduled delivery target {} is no longer running its assistant process",
+                    owner.session_id
+                )
+            });
+        }
+
+        let pane = pane.to_string();
+        let owner = owner.clone();
+        let process_names = self.process_names.clone();
+        tokio::task::spawn_blocking(move || {
+            let observed = crate::tmux::inspect_pane_owner(&pane)
+                .map_err(|error| format!("failed to inspect scheduled pane owner: {error}"))?
+                .ok_or_else(|| "scheduled pane has no physical owner".to_string())?;
+            if !crate::tmux::physical_owner_matches(&observed, &owner) {
+                return Err("scheduled pane physical owner changed".to_string());
+            }
+            let names = process_names.iter().map(String::as_str).collect::<Vec<_>>();
+            if !crate::tmux::pane_alive(&pane, &names) {
+                return Err("scheduled pane is no longer running its assistant process".to_string());
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| format!("scheduled pane validation task failed: {error}"))?
+    }
+}
+
 pub(crate) async fn deliver_inject_message_effect(
     state: &Arc<AppState>,
     request: InjectDeliveryRequest<'_>,
 ) -> DeliveryOutcome {
+    deliver_inject_message_effect_with_evidence(state, request, None).await
+}
+
+async fn deliver_inject_message_effect_with_evidence(
+    state: &Arc<AppState>,
+    request: InjectDeliveryRequest<'_>,
+    assistant_guard: Option<(
+        crate::daemon_protocol::ResourceOwner,
+        OwnedAssistantDeliveryEvidence,
+    )>,
+) -> DeliveryOutcome {
     let method = request.delivery_method.or(request.recorded_method);
     match method {
-        Some("http") => deliver_by_current_session_plan(state, &request).await,
-        Some("tmux") => deliver_raw_tmux_for_session(state, &request, None, None).await,
-        _ => deliver_by_current_session_plan(state, &request).await,
+        Some("http") => deliver_by_current_session_plan(state, &request, assistant_guard).await,
+        Some("tmux") => {
+            deliver_raw_tmux_for_session(state, &request, None, None, assistant_guard).await
+        }
+        _ => deliver_by_current_session_plan(state, &request, assistant_guard).await,
     }
 }
 
 pub(crate) async fn deliver_owned_inject_message_effect(
     state: &Arc<AppState>,
     owner: &crate::daemon_protocol::ResourceOwner,
+    assistant_evidence: Option<OwnedAssistantDeliveryEvidence>,
     request: InjectDeliveryRequest<'_>,
 ) -> DeliveryOutcome {
     if owner.session_id != request.session_id {
@@ -364,8 +486,9 @@ pub(crate) async fn deliver_owned_inject_message_effect(
     }
     let pane = request.pane.to_string();
     state
-        .with_owned_pane_claim(owner, &pane, || {
-            deliver_inject_message_effect(state, request)
+        .with_owned_pane_claim(owner, &pane, || async {
+            let assistant_guard = assistant_evidence.map(|evidence| (owner.clone(), evidence));
+            deliver_inject_message_effect_with_evidence(state, request, assistant_guard).await
         })
         .await
         .unwrap_or_else(|| {
@@ -5540,6 +5663,7 @@ pub(crate) mod tests {
         let outcome = deliver_owned_inject_message_effect(
             &state,
             &stale_owner,
+            None,
             InjectDeliveryRequest {
                 session_id: "target",
                 pane: "%same",

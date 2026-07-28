@@ -50,6 +50,8 @@ An existing-pane `SessionStart` may adopt a backend binding only through the com
 
 Starts, restarts, kills, scheduler revivals, and hard-stall recovery must persist a `LifecycleLease` before filesystem, tmux, process, or HTTP work. Delayed success, failure, readiness, prompt, attach, cleanup, and reaper results compare the exact owner and no-op when superseded. Resource gates serialize the comparison and side effect without holding the protocol lock across I/O. Reaping preserves worktrees; only an explicit, exact-owner cleanup may remove one.
 
+When a hard restart inspects its incumbent pane, `Missing` selects the new-pane fallback, while `Unmanaged`, a foreign managed owner, and inspection failures still fail closed. A non-fresh HTTP restart tries the stored backend session before creating one; reuse preserves history and must not record cleanup ownership for a backend session the restart did not create.
+
 ### Key modules
 
 - **`daemon_protocol.rs`** — `DaemonState`, `Event` enum, `Effect` enum, all session logic. The heart of ouija.

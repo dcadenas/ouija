@@ -43,6 +43,8 @@ ractor = { version = "0.15", default-features = false, features = ["async-trait"
 nostr-sdk = { version = "0.44", features = ["nip59"] }
 percent-encoding = "2"
 sha2 = "0.10"
+fs2 = "0.4"
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 stateright = "0.31.0"

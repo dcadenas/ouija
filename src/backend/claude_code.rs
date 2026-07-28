@@ -11,6 +11,10 @@ pub struct ClaudeCode;
 /// directory, and also ensures the `~/.claude/projects/<escaped>/` session
 /// data directory exists.
 pub fn pre_trust_workspace(dir: &str) {
+    if cfg!(test) {
+        return;
+    }
+
     let Ok(home) = std::env::var("HOME") else {
         return;
     };

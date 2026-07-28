@@ -49,6 +49,7 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 
 - **Loops** -- the session drives itself. Simple — the session's prompt and reminder tell it what to do and how to signal completion. The daemon handles the restart cycle.
 - **Tasks** (cron) -- the daemon drives the session. Good for periodic checks, daily reports, scheduled maintenance. If the target session is dead, the daemon revives it with the task's prompt + reminder.
+- **Inject-only tasks** -- a cron message targets one exact currently live Local session and fails closed otherwise. This mode never creates, revives, restarts, or respawns a session, so policy such as safe-boundary context auditing can remain session-owned.
 
 **Peer-to-peer collaboration.** No hierarchy. Two long-running sessions can message each other directly — one optimizing a skill while the other evaluates results, or one migrating files while the other reviews the diffs. They coordinate through the ouija skill's send capability, not through a central orchestrator.
 
@@ -71,6 +72,13 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 **Receiving sessions can drop information.** Even when a message arrives intact, the receiver may fail to integrate it with its existing context. This is a property of LLMs, not ouija. Treat inter-session messaging as persuasion, not injection: explicit, cited, and verifiable against shared artifacts.
 
 **Stale claims transfer invisibly.** If session A tells session B "the database is sharded by tenant," and A's mental model is actually outdated, B will treat the claim as fact. Prefer pointers to ground truth over assertions whenever it matters.
+
+For intentional context rollover, use one `--inject-only` task per explicitly
+enrolled manual root. Put any exact Ouija child allowlist in the task message;
+do not infer children from names, roles, paths, processes, or native subagents.
+The audit message requests a safe-boundary decision—it does not force a
+rollover. See the installed Ouija skill for the bounded continuation and
+verified adoption procedure.
 
 ## Connecting machines
 
@@ -176,6 +184,7 @@ ouija reply <to> <id> --stdin < reply.txt # safer for generated/multiline text
 ouija rename <new-id> --from <current-id> # rename an exact Local session
 ouija announce --role "..." --bulletin "..." # update your metadata
 ouija spawn-session <name> --no-parent-session --when-done keep-open --prompt "..." # start a new session
+ouija restart-session <name> --fresh --prompt "..." --backend codex-cli # replace stored prompt and restart
 ouija nodes          # list connected nodes
 ouija config ...     # manage settings, Nostr DM users, router
 ```
@@ -189,6 +198,12 @@ backticks, `$()`, quotes, and JSON before `ouija` receives the message.
 `--when-done keep-open`, `--when-done ask-parent`, or `--when-done close`.
 The legacy `--idle-policy` flag remains available for compatibility but is
 deprecated.
+
+On `restart-session`, `--prompt` replaces the stored startup prompt.
+`--suppress-stored-prompt` skips that stored prompt for one launch without
+erasing it, while `--one-shot-file <PATH>` appends UTF-8 content that is
+delivered only on that launch and is never persisted. `--backend` explicitly
+selects `claude-code`, `opencode`, or `codex-cli`.
 
 Task reminders are opt-in and independent of completion behavior. Supplying
 `--reminder` enables recurring recovery nudges; omitting it prevents

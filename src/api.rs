@@ -122,6 +122,8 @@ pub async fn get_session(
                     "id": s.id,
                     "pane": s.pane,
                     "origin": s.origin.label(),
+                    "session_incarnation": s.metadata.session_incarnation.to_string(),
+                    "parent_session": s.metadata.parent_session,
                     "vim_mode": s.metadata.vim_mode,
                     "project_dir": s.metadata.project_dir,
                     "role": s.metadata.role,
@@ -165,6 +167,8 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
                 "id": s.id,
                 "pane": s.pane,
                 "origin": s.origin.label(),
+                "session_incarnation": s.metadata.session_incarnation.to_string(),
+                "parent_session": s.metadata.parent_session,
                 "vim_mode": s.metadata.vim_mode,
                 "project_dir": s.metadata.project_dir,
                 "role": s.metadata.role,
@@ -2141,15 +2145,26 @@ pub async fn create_task(
         );
     }
 
+    let target_session = normalize_optional_string(body.target_session);
+    let on_fire = body.on_fire.unwrap_or_default();
+    if matches!(on_fire, crate::scheduler::OnFire::InjectOnly) && target_session.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "inject_only tasks require an explicit target_session"
+            })),
+        );
+    }
+
     let mut task = scheduler::new_task(
         body.name,
         body.cron,
-        body.target_session,
+        target_session,
         body.prompt.or(body.message),
         body.reminder,
         body.once.unwrap_or(false),
         body.backend_session_id,
-        body.on_fire.unwrap_or_default(),
+        on_fire,
     );
     task.project_dir = body.project_dir;
     task.backend = normalize_optional_string(body.backend);
@@ -2480,6 +2495,18 @@ pub struct SessionNameBody {
     /// so the intent is explicit and auditable.
     #[serde(default)]
     force_reset: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RestartSessionBody {
+    #[serde(flatten)]
+    session: SessionNameBody,
+    /// Suppress the stored startup prompt for this launch without clearing it.
+    #[serde(default)]
+    suppress_stored_prompt: bool,
+    /// Already-read launch-only content. This value is never persisted.
+    #[serde(default)]
+    one_shot_prompt: Option<String>,
 }
 
 /// Return a warning message when the caller's request carries
@@ -2822,13 +2849,18 @@ pub async fn start_session(
 /// Kill and restart a session, optionally with a fresh conversation.
 pub async fn restart_session(
     State(state): State<SharedState>,
-    Json(body): Json<SessionNameBody>,
+    Json(body): Json<RestartSessionBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Normalize at the boundary; see start_session for rationale.
-    let mut body = body;
-    body.model = normalize_optional_string(body.model);
-    body.effort = normalize_optional_string(body.effort);
-    body.backend = normalize_optional_string(body.backend);
+    let RestartSessionBody {
+        mut session,
+        suppress_stored_prompt,
+        one_shot_prompt,
+    } = body;
+    let body = &mut session;
+    body.model = normalize_optional_string(body.model.take());
+    body.effort = normalize_optional_string(body.effort.take());
+    body.backend = normalize_optional_string(body.backend.take());
     if let Err(error) = crate::daemon_protocol::validate_spawn_reminder(body.reminder.as_deref()) {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": error })));
     }
@@ -2844,17 +2876,19 @@ pub async fn restart_session(
     // so the caller's opt-in is visible in daemon logs. Same predicate
     // and same rationale as the /api/sessions/start exists branch
     // (hub#528 review).
-    if let Some(msg) = restart_drops_destructive_intent(&body) {
+    if let Some(msg) = restart_drops_destructive_intent(body) {
         tracing::warn!("{msg}");
     }
 
     let fresh = body.fresh.unwrap_or(false);
-    let (result, _prompt_msg_id, _) = crate::nostr_transport::restart_session(
+    let (result, _prompt_msg_id, _) = crate::nostr_transport::restart_session_with_prompt_controls(
         &state,
         &body.name,
         fresh,
         None,
         body.prompt.as_deref(),
+        suppress_stored_prompt,
+        one_shot_prompt.as_deref(),
         body.from.as_deref(),
         None, // expects_reply not used for session restart
         body.backend.as_deref(),
@@ -4733,6 +4767,36 @@ pub async fn clear_reminder(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn status_and_single_session_expose_incarnation_and_parent_observability() {
+        let state = crate::state::AppState::new_for_test();
+        state.protocol.write().await.sessions.insert(
+            "worker".into(),
+            crate::daemon_protocol::SessionEntry {
+                id: "worker".into(),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    session_incarnation: crate::daemon_protocol::SessionIncarnation(u64::MAX),
+                    parent_session: Some("manual-root".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let Json(all) = status(State(state.clone())).await;
+        assert_eq!(
+            all["sessions"][0]["session_incarnation"],
+            u64::MAX.to_string()
+        );
+        assert_eq!(all["sessions"][0]["parent_session"], "manual-root");
+
+        let (code, Json(one)) =
+            get_session(State(state), axum::extract::Path("worker".to_string())).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(one["session_incarnation"], u64::MAX.to_string());
+        assert_eq!(one["parent_session"], "manual-root");
+    }
+
     fn backend_identity_request(backend: &str, session_id: &str) -> BackendIdentityRequest {
         BackendIdentityRequest {
             backend: backend.into(),
@@ -5412,24 +5476,28 @@ mod tests {
         let state = crate::state::AppState::new_for_test();
         let (status, Json(body)) = restart_session(
             State(state),
-            Json(SessionNameBody {
-                name: "wrong-codex".into(),
-                fresh: Some(true),
-                worktree: None,
-                project_dir: None,
-                prompt: None,
-                from: None,
-                backend: Some("codex".into()),
-                model: None,
-                effort: None,
-                reminder: None,
-                parent_session: None,
-                no_parent_session: None,
-                idle_policy: None,
-                branch: None,
-                base_branch: None,
-                keep_worktree: None,
-                force_reset: None,
+            Json(RestartSessionBody {
+                session: SessionNameBody {
+                    name: "wrong-codex".into(),
+                    fresh: Some(true),
+                    worktree: None,
+                    project_dir: None,
+                    prompt: None,
+                    from: None,
+                    backend: Some("codex".into()),
+                    model: None,
+                    effort: None,
+                    reminder: None,
+                    parent_session: None,
+                    no_parent_session: None,
+                    idle_policy: None,
+                    branch: None,
+                    base_branch: None,
+                    keep_worktree: None,
+                    force_reset: None,
+                },
+                suppress_stored_prompt: false,
+                one_shot_prompt: None,
             }),
         )
         .await;
@@ -5437,29 +5505,51 @@ mod tests {
         assert_unknown_backend_response(status, &body);
     }
 
+    #[test]
+    fn restart_request_accepts_launch_scoped_prompt_fields() {
+        let body: RestartSessionBody = serde_json::from_value(json!({
+            "name": "worker",
+            "fresh": true,
+            "prompt": "replacement",
+            "suppress_stored_prompt": true,
+            "one_shot_prompt": "adopt token",
+            "backend": "codex-cli"
+        }))
+        .unwrap();
+
+        assert_eq!(body.session.prompt.as_deref(), Some("replacement"));
+        assert!(body.suppress_stored_prompt);
+        assert_eq!(body.one_shot_prompt.as_deref(), Some("adopt token"));
+        assert_eq!(body.session.backend.as_deref(), Some("codex-cli"));
+    }
+
     #[tokio::test]
     async fn restart_session_rejects_manual_clear_reminder_before_restart() {
         let state = crate::state::AppState::new_for_test();
         let (status, Json(body)) = restart_session(
             State(state),
-            Json(SessionNameBody {
-                name: "restart-clear-reminder".into(),
-                fresh: Some(true),
-                worktree: None,
-                project_dir: None,
-                prompt: None,
-                from: None,
-                backend: None,
-                model: None,
-                effort: None,
-                reminder: Some("When done, run ouija clear-reminder 7".into()),
-                parent_session: None,
-                no_parent_session: None,
-                idle_policy: None,
-                branch: None,
-                base_branch: None,
-                keep_worktree: None,
-                force_reset: None,
+            Json(RestartSessionBody {
+                session: SessionNameBody {
+                    name: "restart-clear-reminder".into(),
+                    fresh: Some(true),
+                    worktree: None,
+                    project_dir: None,
+                    prompt: None,
+                    from: None,
+                    backend: None,
+                    model: None,
+                    effort: None,
+                    reminder: Some("When done, run ouija clear-reminder 7".into()),
+                    parent_session: None,
+                    no_parent_session: None,
+                    idle_policy: None,
+                    branch: None,
+                    base_branch: None,
+                    keep_worktree: None,
+                    force_reset: None,
+                },
+                suppress_stored_prompt: false,
+                one_shot_prompt: None,
             }),
         )
         .await;
@@ -5640,6 +5730,76 @@ mod tests {
                 .is_some_and(|error| error.contains("ouija clear-reminder"))
         );
         assert!(state.scheduled_tasks.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_inject_only_task_requires_explicit_target() {
+        let state = crate::state::AppState::new_for_test();
+        let (status, Json(body)) = create_task(
+            State(state.clone()),
+            Json(CreateTaskBody {
+                name: "context-audit".into(),
+                cron: "*/15 * * * *".into(),
+                target_session: Some("   ".into()),
+                message: Some("audit at your next safe boundary".into()),
+                prompt: None,
+                reminder: None,
+                project_dir: None,
+                backend: None,
+                model: None,
+                effort: None,
+                once: None,
+                backend_session_id: None,
+                on_fire: Some(crate::scheduler::OnFire::InjectOnly),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("explicit target_session"))
+        );
+        assert!(state.scheduled_tasks.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_inject_only_task_persists_exact_target_and_mode() {
+        let state = crate::state::AppState::new_for_test();
+        let (status, Json(body)) = create_task(
+            State(state.clone()),
+            Json(CreateTaskBody {
+                name: "context-audit".into(),
+                cron: "*/15 * * * *".into(),
+                target_session: Some("manual-root".into()),
+                message: Some("audit at your next safe boundary".into()),
+                prompt: None,
+                reminder: None,
+                project_dir: None,
+                backend: None,
+                model: None,
+                effort: None,
+                once: None,
+                backend_session_id: None,
+                on_fire: Some(crate::scheduler::OnFire::InjectOnly),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let tasks = state.scheduled_tasks.read().await;
+        let task = tasks.values().next().expect("task persisted");
+        assert_eq!(task.target_session.as_deref(), Some("manual-root"));
+        assert_eq!(task.on_fire, crate::scheduler::OnFire::InjectOnly);
+        drop(tasks);
+
+        let Json(listed) = list_tasks(State(state)).await;
+        assert_eq!(listed["tasks"][0]["on_fire"]["mode"], "inject_only");
+        assert_eq!(
+            listed["tasks"][0]["target_session"],
+            serde_json::json!("manual-root")
+        );
     }
 
     #[test]

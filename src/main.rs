@@ -8,6 +8,7 @@ mod nostr_transport;
 mod persistence;
 mod project_index;
 mod protocol;
+mod rollover;
 mod router;
 mod scheduler;
 mod server;
@@ -22,6 +23,7 @@ use backend::CodingAssistant;
 use clap::{Parser, Subcommand, ValueEnum};
 use daemon_protocol::IdlePolicy;
 use nostr_sdk::ToBech32;
+use std::io::Read;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -144,6 +146,11 @@ enum Command {
     Ls,
     /// Print this session's Ouija id (same resolution path as ask/tell/reply)
     Whoami,
+    /// Prepare or adopt a session-owned context rollover.
+    Rollover {
+        #[command(subcommand)]
+        action: RolloverAction,
+    },
     /// Update session metadata
     Announce {
         #[arg(long)]
@@ -223,10 +230,20 @@ enum Command {
         name: String,
         #[arg(long)]
         fresh: bool,
+        /// Replace the stored startup prompt and use it for this launch.
         #[arg(long)]
         prompt: Option<String>,
+        /// Do not reuse the stored startup prompt for this launch.
+        #[arg(long)]
+        suppress_stored_prompt: bool,
+        /// Append UTF-8 file contents for this launch only.
+        #[arg(long)]
+        one_shot_file: Option<PathBuf>,
         #[arg(long, value_parser = parse_manual_reminder)]
         reminder: Option<String>,
+        /// Override the coding-assistant backend on restart.
+        #[arg(long)]
+        backend: Option<String>,
         /// Override the LLM model on restart (defaults to the previous model).
         #[arg(long)]
         model: Option<String>,
@@ -268,6 +285,27 @@ enum Command {
     Task {
         #[command(subcommand)]
         action: TaskAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum RolloverAction {
+    /// Store a bounded continuation for a future incarnation.
+    Prepare {
+        /// Read the continuation JSON from stdin.
+        #[arg(long, required = true)]
+        stdin: bool,
+        /// Replace a pending record only when it is already expired.
+        #[arg(long)]
+        replace_expired: bool,
+    },
+    /// Verify and adopt a prepared continuation.
+    Adopt { token: String },
+    /// Remove an adopted or expired continuation.
+    Cleanup {
+        /// Also remove a live pending continuation.
+        #[arg(long)]
+        force_pending: bool,
     },
 }
 
@@ -341,6 +379,9 @@ enum TaskAction {
         /// Inject into this existing session (continue_session mode only)
         #[arg(long)]
         target: Option<String>,
+        /// Inject only into the exact currently live Local target; never revive it
+        #[arg(long, requires = "target")]
+        inject_only: bool,
         /// Override project dir for session revival
         #[arg(long)]
         project_dir: Option<String>,
@@ -837,6 +878,39 @@ async fn main() -> anyhow::Result<()> {
         Command::Whoami => {
             cli_whoami().await?;
         }
+        Command::Rollover { action } => {
+            let caller = rollover_live_caller().await?;
+            let data_dir = config::OuijaConfig::default_data_dir();
+            let now = chrono::Utc::now().timestamp();
+            match action {
+                RolloverAction::Prepare {
+                    stdin: _,
+                    replace_expired,
+                } => {
+                    let mut input = Vec::new();
+                    std::io::Read::read_to_end(
+                        &mut std::io::stdin().take(16 * 1024 + 1),
+                        &mut input,
+                    )
+                    .context("failed to read continuation JSON from stdin")?;
+                    let payload = rollover::parse_continuation(&input)?;
+                    let token =
+                        rollover::prepare(&data_dir, &caller, payload, replace_expired, now)?;
+                    println!("{token}");
+                }
+                RolloverAction::Adopt { token } => {
+                    let payload = rollover::adopt(&data_dir, &caller, &token, now)?;
+                    println!("{}", serde_json::to_string_pretty(&payload)?);
+                }
+                RolloverAction::Cleanup { force_pending } => {
+                    if rollover::cleanup(&data_dir, &caller, force_pending, now)? {
+                        println!("continuation removed");
+                    } else {
+                        println!("no continuation for this session");
+                    }
+                }
+            }
+        }
         Command::Announce { role, bulletin } => {
             if role.is_none() && bulletin.is_none() {
                 anyhow::bail!("at least one of --role or --bulletin is required");
@@ -1021,15 +1095,25 @@ async fn main() -> anyhow::Result<()> {
             name,
             fresh,
             prompt,
+            suppress_stored_prompt,
+            one_shot_file,
             reminder,
+            backend,
             model,
             effort,
         } => {
+            let one_shot_prompt = one_shot_file
+                .as_deref()
+                .map(read_one_shot_file)
+                .transpose()?;
             let body = serde_json::json!({
                 "name": name,
                 "fresh": fresh,
                 "prompt": prompt,
+                "suppress_stored_prompt": suppress_stored_prompt,
+                "one_shot_prompt": one_shot_prompt,
                 "reminder": reminder,
+                "backend": backend,
                 "model": model,
                 "effort": effort,
             });
@@ -1229,10 +1313,11 @@ async fn main() -> anyhow::Result<()> {
                 match tasks {
                     Some(list) if !list.is_empty() => {
                         println!(
-                            "{:<10} {:<16} {:<16} {:<10} {:<10} {:<12} {:<8} {:<20} RUNS",
+                            "{:<10} {:<16} {:<16} {:<12} {:<10} {:<10} {:<12} {:<8} {:<20} RUNS",
                             "ID",
                             "NAME",
                             "CRON",
+                            "MODE",
                             "TARGET",
                             "BACKEND",
                             "MODEL",
@@ -1243,6 +1328,7 @@ async fn main() -> anyhow::Result<()> {
                             let id = t["id"].as_str().unwrap_or("-");
                             let name = t["name"].as_str().unwrap_or("-");
                             let cron = t["cron"].as_str().unwrap_or("-");
+                            let mode = t["on_fire"]["mode"].as_str().unwrap_or("-");
                             let target = t["target_session"].as_str().unwrap_or("—");
                             let backend = t["backend"].as_str().unwrap_or("—");
                             let model = t["model"].as_str().unwrap_or("—");
@@ -1250,8 +1336,8 @@ async fn main() -> anyhow::Result<()> {
                             let next = t["next_run"].as_str().unwrap_or("-");
                             let runs = t["run_count"].as_u64().unwrap_or(0);
                             println!(
-                                "{:<10} {:<16} {:<16} {:<10} {:<10} {:<12} {:<8} {:<20} {}",
-                                id, name, cron, target, backend, model, enabled, next, runs
+                                "{:<10} {:<16} {:<16} {:<12} {:<10} {:<10} {:<12} {:<8} {:<20} {}",
+                                id, name, cron, mode, target, backend, model, enabled, next, runs
                             );
                         }
                     }
@@ -1263,6 +1349,7 @@ async fn main() -> anyhow::Result<()> {
                 cron,
                 target,
                 message,
+                inject_only,
                 project_dir,
                 backend,
                 model,
@@ -1274,6 +1361,7 @@ async fn main() -> anyhow::Result<()> {
                     "cron": cron,
                     "target_session": target,
                     "message": message,
+                    "on_fire": inject_only.then_some(crate::scheduler::OnFire::InjectOnly),
                     "project_dir": project_dir,
                     "backend": backend,
                     "model": model,
@@ -2993,6 +3081,119 @@ async fn cli_list_sessions() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn rollover_live_caller() -> anyhow::Result<rollover::LiveCaller> {
+    let (id, backend_owned) = match whoami_outcome().await {
+        WhoamiOutcome::Resolved {
+            id,
+            source,
+            backend_identity,
+            ..
+        } => {
+            verify_resolved_id_registered(&id, &source).await?;
+            (
+                id,
+                source == IdentitySource::BackendIdentity && backend_identity.is_some(),
+            )
+        }
+        WhoamiOutcome::Unresolved(_) => anyhow::bail!(unresolved_sender_error()),
+        WhoamiOutcome::Conflict(conflict) => anyhow::bail!(format_identity_conflict(&conflict)),
+        WhoamiOutcome::BackendResolutionFailed(error) => anyhow::bail!(
+            "backend identity was discovered but could not be resolved safely: {error}"
+        ),
+    };
+    let before = fetch_rollover_incarnation(&id).await?;
+    let incarnation =
+        verify_rollover_incarnation_evidence(local_incarnation_hint()?, backend_owned, before)?;
+    let cwd = std::env::current_dir().context("reading current directory for rollover")?;
+    let caller = rollover::capture_live_caller(id.clone(), incarnation, &cwd)?;
+    let after = fetch_rollover_incarnation(&id).await?;
+    if after != before {
+        anyhow::bail!(
+            "session incarnation changed while capturing rollover state ({before} -> {after})"
+        );
+    }
+    Ok(caller)
+}
+
+fn verify_rollover_incarnation_evidence(
+    local_hint: Option<u64>,
+    backend_owned: bool,
+    daemon_incarnation: u64,
+) -> anyhow::Result<u64> {
+    match local_hint {
+        Some(local) if local == daemon_incarnation => Ok(local),
+        Some(local) => anyhow::bail!(
+            "local session incarnation {local} does not match daemon incarnation {daemon_incarnation}"
+        ),
+        None if backend_owned => Ok(daemon_incarnation),
+        None => anyhow::bail!(
+            "rollover requires exact caller-owned incarnation evidence from the pane marker, \
+             OUIJA_SESSION_INCARNATION, or a bound backend identity"
+        ),
+    }
+}
+
+async fn fetch_rollover_incarnation(id: &str) -> anyhow::Result<u64> {
+    let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
+    let url = format!(
+        "http://localhost:{port}/api/sessions/{}",
+        encode_path_segment(id)
+    );
+    let response = reqwest::get(&url).await?;
+    let status = response.status();
+    let text = response.text().await?;
+    let body = classify_http_response(status, &text)?;
+    let session: serde_json::Value =
+        serde_json::from_str(&body).context("parsing live Ouija session metadata")?;
+    rollover_incarnation_from_session(&session, id)
+}
+
+fn rollover_incarnation_from_session(
+    session: &serde_json::Value,
+    expected_id: &str,
+) -> anyhow::Result<u64> {
+    if session["id"].as_str() != Some(expected_id) {
+        anyhow::bail!("daemon returned a different session while preparing rollover");
+    }
+    if session["origin"].as_str() != Some("local") {
+        anyhow::bail!("rollover is available only to local Ouija sessions");
+    }
+    session["session_incarnation"]
+        .as_str()
+        .context("daemon status does not expose session_incarnation")
+        .and_then(|value| {
+            value
+                .parse()
+                .context("daemon returned a non-decimal session_incarnation")
+        })
+}
+
+fn local_incarnation_hint() -> anyhow::Result<Option<u64>> {
+    let marker = std::env::var("TMUX_PANE").ok().and_then(|pane| {
+        std::process::Command::new("tmux")
+            .args([
+                "display",
+                "-p",
+                "-t",
+                pane.as_str(),
+                "#{@ouija_incarnation}",
+            ])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    });
+    let hint = marker.or_else(|| std::env::var("OUIJA_SESSION_INCARNATION").ok());
+    hint.map(|value| {
+        value
+            .parse()
+            .with_context(|| format!("invalid local session incarnation {value:?}"))
+    })
+    .transpose()
+}
+
 fn project_session_list(status: &serde_json::Value) -> serde_json::Value {
     let sessions = status
         .get("sessions")
@@ -3013,6 +3214,22 @@ fn project_session_list(status: &serde_json::Value) -> serde_json::Value {
                         "origin".to_string(),
                         session
                             .get("origin")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                    );
+                    if let Some(incarnation) = session
+                        .get("session_incarnation")
+                        .and_then(|value| value.as_str())
+                    {
+                        projected.insert(
+                            "session_incarnation".to_string(),
+                            serde_json::Value::String(incarnation.to_string()),
+                        );
+                    }
+                    projected.insert(
+                        "parent_session".to_string(),
+                        session
+                            .get("parent_session")
                             .cloned()
                             .unwrap_or(serde_json::Value::Null),
                     );
@@ -3138,6 +3355,15 @@ fn encode_path_segment(segment: &str) -> String {
     percent_encoding::utf8_percent_encode(segment, PATH_SEGMENT).to_string()
 }
 
+fn read_one_shot_file(path: &std::path::Path) -> anyhow::Result<String> {
+    std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "failed to read UTF-8 one-shot prompt from {}",
+            path.display()
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3195,6 +3421,208 @@ mod tests {
             }
             _ => panic!("expected spawn-session command"),
         }
+    }
+
+    #[test]
+    fn inject_only_task_cli_requires_and_preserves_exact_target() {
+        let missing_target = Cli::try_parse_from([
+            "ouija",
+            "task",
+            "add",
+            "context-audit",
+            "*/15 * * * *",
+            "audit",
+            "--inject-only",
+        ]);
+        assert!(missing_target.is_err());
+
+        let cli = Cli::try_parse_from([
+            "ouija",
+            "task",
+            "add",
+            "context-audit",
+            "*/15 * * * *",
+            "audit",
+            "--target",
+            "manual-root",
+            "--inject-only",
+        ])
+        .expect("inject-only task parses with exact target");
+
+        match cli.command {
+            Command::Task {
+                action:
+                    TaskAction::Add {
+                        target,
+                        inject_only,
+                        ..
+                    },
+            } => {
+                assert_eq!(target.as_deref(), Some("manual-root"));
+                assert!(inject_only);
+            }
+            _ => panic!("expected task add command"),
+        }
+    }
+
+    #[test]
+    fn restart_session_cli_accepts_scoped_prompt_controls_and_backend() {
+        let cli = Cli::try_parse_from([
+            "ouija",
+            "restart-session",
+            "worker",
+            "--prompt",
+            "replacement",
+            "--suppress-stored-prompt",
+            "--one-shot-file",
+            "/tmp/adopt.txt",
+            "--backend",
+            "codex-cli",
+        ])
+        .expect("restart prompt controls must parse");
+
+        match cli.command {
+            Command::RestartSession {
+                prompt,
+                suppress_stored_prompt,
+                one_shot_file,
+                backend,
+                ..
+            } => {
+                assert_eq!(prompt.as_deref(), Some("replacement"));
+                assert!(suppress_stored_prompt);
+                assert_eq!(
+                    one_shot_file.as_deref(),
+                    Some(std::path::Path::new("/tmp/adopt.txt"))
+                );
+                assert_eq!(backend.as_deref(), Some("codex-cli"));
+            }
+            _ => panic!("expected restart-session command"),
+        }
+    }
+
+    #[test]
+    fn one_shot_file_reader_accepts_utf8_and_rejects_invalid_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = dir.path().join("valid.txt");
+        std::fs::write(&valid, "verify live state").unwrap();
+        assert_eq!(read_one_shot_file(&valid).unwrap(), "verify live state");
+
+        let invalid = dir.path().join("invalid.txt");
+        std::fs::write(&invalid, [0xff, 0xfe]).unwrap();
+        let error = read_one_shot_file(&invalid).unwrap_err().to_string();
+        assert!(error.contains("UTF-8 one-shot prompt"));
+
+        let missing = dir.path().join("missing.txt");
+        let error = read_one_shot_file(&missing).unwrap_err().to_string();
+        assert!(error.contains(missing.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn compact_session_list_preserves_decimal_incarnation() {
+        let projected = project_session_list(&serde_json::json!({
+            "sessions": [{
+                "id": "worker",
+                "origin": "local",
+                "session_incarnation": "18446744073709551615"
+            }]
+        }));
+        assert_eq!(
+            projected["sessions"][0]["session_incarnation"],
+            "18446744073709551615"
+        );
+    }
+
+    #[test]
+    fn rollover_cli_requires_stdin_and_accepts_expired_replacement() {
+        assert!(Cli::try_parse_from(["ouija", "rollover", "prepare"]).is_err());
+        let cli = Cli::try_parse_from([
+            "ouija",
+            "rollover",
+            "prepare",
+            "--stdin",
+            "--replace-expired",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Rollover {
+                action:
+                    RolloverAction::Prepare {
+                        stdin,
+                        replace_expired,
+                    },
+            } => {
+                assert!(stdin);
+                assert!(replace_expired);
+            }
+            _ => panic!("expected rollover prepare"),
+        }
+
+        let cli = Cli::try_parse_from(["ouija", "rollover", "adopt", "opaque-token"]).unwrap();
+        match cli.command {
+            Command::Rollover {
+                action: RolloverAction::Adopt { token },
+            } => assert_eq!(token, "opaque-token"),
+            _ => panic!("expected rollover adopt"),
+        }
+
+        let cli = Cli::try_parse_from(["ouija", "rollover", "cleanup", "--force-pending"]).unwrap();
+        match cli.command {
+            Command::Rollover {
+                action: RolloverAction::Cleanup { force_pending },
+            } => assert!(force_pending),
+            _ => panic!("expected rollover cleanup"),
+        }
+    }
+
+    #[test]
+    fn rollover_owner_parser_requires_exact_local_string_incarnation() {
+        let session = serde_json::json!({
+            "id": "worker",
+            "origin": "local",
+            "session_incarnation": "18446744073709551615",
+        });
+        assert_eq!(
+            rollover_incarnation_from_session(&session, "worker").unwrap(),
+            u64::MAX
+        );
+        assert!(rollover_incarnation_from_session(&session, "other").is_err());
+
+        let mut remote = session.clone();
+        remote["origin"] = serde_json::json!("remote");
+        assert!(rollover_incarnation_from_session(&remote, "worker").is_err());
+
+        let mut numeric = session;
+        numeric["session_incarnation"] = serde_json::json!(7);
+        assert!(rollover_incarnation_from_session(&numeric, "worker").is_err());
+    }
+
+    #[test]
+    fn rollover_incarnation_evidence_rejects_absent_unbound_caller() {
+        let error = verify_rollover_incarnation_evidence(None, false, 9)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("caller-owned incarnation evidence"));
+    }
+
+    #[test]
+    fn rollover_incarnation_evidence_rejects_stale_hint() {
+        let error = verify_rollover_incarnation_evidence(Some(8), false, 9)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not match"));
+    }
+
+    #[test]
+    fn rollover_incarnation_evidence_accepts_exact_hint_or_bound_backend() {
+        assert_eq!(
+            verify_rollover_incarnation_evidence(Some(9), false, 9).unwrap(),
+            9
+        );
+        assert_eq!(
+            verify_rollover_incarnation_evidence(None, true, 9).unwrap(),
+            9
+        );
     }
 
     #[test]
@@ -3802,6 +4230,8 @@ mod tests {
             "sessions": [{
                 "id": "ouija-next-issue",
                 "origin": "local",
+                "session_incarnation": "42",
+                "parent_session": "hub-cx",
                 "project_dir": "/home/daniel/code/ouija",
                 "role": "working on ouija",
                 "bulletin": "ready",
@@ -3822,6 +4252,8 @@ mod tests {
                 "sessions": [{
                     "id": "ouija-next-issue",
                     "origin": "local",
+                    "session_incarnation": "42",
+                    "parent_session": "hub-cx",
                     "project": "ouija",
                     "role": "working on ouija",
                     "bulletin": "ready"
@@ -3856,7 +4288,8 @@ mod tests {
             serde_json::json!({
                 "sessions": [{
                     "id": "quiet-session",
-                    "origin": "remote:locota"
+                    "origin": "remote:locota",
+                    "parent_session": null
                 }]
             })
         );

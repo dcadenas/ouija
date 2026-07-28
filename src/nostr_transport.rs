@@ -95,6 +95,206 @@ impl ParentSessionOverride {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct RestartPromptInput<'a> {
+    replacement: Option<&'a str>,
+    suppress_stored: bool,
+    one_shot: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ResolvedRestartPrompt {
+    /// Prompt delivered to this backend launch.
+    launch: Option<String>,
+    /// Persistent base prompt recorded in session metadata.
+    stored: Option<String>,
+}
+
+fn resolve_restart_prompt(
+    stored: Option<&str>,
+    input: RestartPromptInput<'_>,
+) -> ResolvedRestartPrompt {
+    let persistent = input.replacement.or(stored).map(String::from);
+    let base = input.replacement.map(String::from).or_else(|| {
+        (!input.suppress_stored)
+            .then(|| stored.map(String::from))
+            .flatten()
+    });
+    let launch = match (base, input.one_shot) {
+        (Some(base), Some(one_shot)) => Some(format!("{base}\n\n{one_shot}")),
+        (Some(base), None) => Some(base),
+        (None, Some(one_shot)) => Some(one_shot.to_string()),
+        (None, None) => None,
+    };
+
+    ResolvedRestartPrompt {
+        launch,
+        stored: persistent,
+    }
+}
+
+#[derive(Debug)]
+struct PreparedLaunchCommand {
+    command: String,
+    prompt_path: Option<PathBuf>,
+    cleanup_on_drop: bool,
+}
+
+impl PreparedLaunchCommand {
+    fn command(&self) -> &str {
+        &self.command
+    }
+
+    #[cfg(test)]
+    fn prompt_path(&self) -> Option<&Path> {
+        self.prompt_path.as_deref()
+    }
+
+    /// Relinquish cleanup after tmux accepts the launch command.
+    ///
+    /// This transition is deliberately infallible and irreversible: tmux may
+    /// already be starting the backend when it returns success. The shell
+    /// command reads and unlinks the file before exec, which is the only safe
+    /// consumption acknowledgement. A time-based cleanup here could race a
+    /// slow login shell and destroy its launch prompt.
+    fn mark_handed_off(&mut self) {
+        self.prompt_path = None;
+        self.cleanup_on_drop = false;
+    }
+}
+
+impl Drop for PreparedLaunchCommand {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop
+            && let Some(path) = self.prompt_path.as_deref()
+        {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "failed to remove unhanded launch prompt: {error}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn prepare_tui_launch_command(
+    backend_command: &str,
+    prompt: Option<&str>,
+) -> anyhow::Result<PreparedLaunchCommand> {
+    prepare_tui_launch_command_in(&std::env::temp_dir(), backend_command, prompt)
+}
+
+fn prepare_backend_launch_command(
+    is_http_api: bool,
+    backend_command: &str,
+    prompt: Option<&str>,
+) -> anyhow::Result<PreparedLaunchCommand> {
+    if is_http_api {
+        Ok(PreparedLaunchCommand {
+            command: backend_command.to_string(),
+            prompt_path: None,
+            cleanup_on_drop: false,
+        })
+    } else {
+        prepare_tui_launch_command(backend_command, prompt)
+    }
+}
+
+fn prepare_tui_launch_command_in(
+    temp_dir: &Path,
+    backend_command: &str,
+    prompt: Option<&str>,
+) -> anyhow::Result<PreparedLaunchCommand> {
+    let Some(prompt) = prompt else {
+        return Ok(PreparedLaunchCommand {
+            command: backend_command.to_string(),
+            prompt_path: None,
+            cleanup_on_drop: false,
+        });
+    };
+    prepare_tui_launch_command_in_with_writer(temp_dir, backend_command, prompt, |file, prompt| {
+        use std::io::Write;
+        file.write_all(prompt.as_bytes())
+    })
+}
+
+fn prepare_tui_launch_command_in_with_writer(
+    temp_dir: &Path,
+    backend_command: &str,
+    prompt: &str,
+    writer: impl FnOnce(&mut std::fs::File, &str) -> std::io::Result<()>,
+) -> anyhow::Result<PreparedLaunchCommand> {
+    let (path, mut file) = (0..16)
+        .find_map(|_| {
+            let path = temp_dir.join(format!(
+                "ouija-launch-prompt-{}-{:032x}",
+                std::process::id(),
+                rand::random::<u128>()
+            ));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(file) => Some(Ok((path, file))),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .transpose()
+        .with_context(|| {
+            format!(
+                "failed to create private launch prompt in {}",
+                temp_dir.display()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to create unique private launch prompt in {}",
+                temp_dir.display()
+            )
+        })?;
+
+    if let Err(error) = writer(&mut file, prompt) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(error)
+            .with_context(|| format!("failed to write private launch prompt {}", path.display()));
+    }
+    drop(file);
+
+    let Some(path_text) = path.to_str() else {
+        let cleanup_error = std::fs::remove_file(&path).err();
+        anyhow::bail!(
+            "private launch prompt path is not valid UTF-8{}",
+            cleanup_error
+                .map(|error| format!("; cleanup failed: {error}"))
+                .unwrap_or_default()
+        );
+    };
+    let escaped_path = crate::scheduler::shell_escape(path_text);
+    let command = format!(
+        "ouija_launch_prompt=\"$(cat {escaped_path})\"; \
+         ouija_prompt_status=$?; rm -f {escaped_path} || exit $?; \
+         [ \"$ouija_prompt_status\" -eq 0 ] || exit \"$ouija_prompt_status\"; \
+         {backend_command} \"$ouija_launch_prompt\""
+    );
+
+    Ok(PreparedLaunchCommand {
+        command,
+        prompt_path: Some(path),
+        cleanup_on_drop: true,
+    })
+}
+
 fn start_registration_metadata(
     is_http_api: bool,
     pane_id: &str,
@@ -134,22 +334,31 @@ fn should_cleanup_failed_opencode_attach_pane(
     is_http_api && backend_session_id.is_none()
 }
 
-fn should_remove_session_after_failed_restart(
-    is_http_api: bool,
-    backend_session_id: Option<&str>,
-    failed_pane_id: &str,
-    existing_pane_id: Option<&str>,
-) -> bool {
-    should_cleanup_failed_opencode_attach_pane(is_http_api, backend_session_id)
-        && existing_pane_id.is_none_or(|existing| existing == failed_pane_id)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IncumbentPaneDisposition {
+    Respawn,
+    Recreate,
+    Refuse,
 }
 
-async fn cleanup_failed_opencode_attach_pane(
-    state: &std::sync::Arc<AppState>,
-    owner: &crate::daemon_protocol::ResourceOwner,
-    pane_id: &str,
-) {
-    state.kill_owned_pane(owner, pane_id).await;
+fn classify_incumbent_pane(
+    inspection: &crate::tmux::ManagedPaneInspection,
+    lease_owner: &crate::daemon_protocol::ResourceOwner,
+    restart_target_owner: &crate::daemon_protocol::ResourceOwner,
+) -> IncumbentPaneDisposition {
+    match inspection {
+        crate::tmux::ManagedPaneInspection::Missing => IncumbentPaneDisposition::Recreate,
+        crate::tmux::ManagedPaneInspection::ProcessOwner(observed)
+        | crate::tmux::ManagedPaneInspection::MarkerOwner(observed)
+            if crate::tmux::physical_owner_matches(observed, lease_owner)
+                || crate::tmux::physical_owner_matches(observed, restart_target_owner) =>
+        {
+            IncumbentPaneDisposition::Respawn
+        }
+        crate::tmux::ManagedPaneInspection::ProcessOwner(_)
+        | crate::tmux::ManagedPaneInspection::MarkerOwner(_)
+        | crate::tmux::ManagedPaneInspection::Unmanaged => IncumbentPaneDisposition::Refuse,
+    }
 }
 
 #[cfg(test)]
@@ -2003,6 +2212,50 @@ pub async fn start_session(
     force_reset: bool,
     reserved_owner: Option<crate::daemon_protocol::ResourceOwner>,
 ) -> (String, Option<u64>) {
+    start_session_with_prompt_storage(
+        state,
+        name,
+        worktree,
+        project_dir,
+        prompt,
+        prompt,
+        from,
+        expects_reply,
+        backend,
+        model,
+        effort,
+        reminder,
+        parent_session,
+        idle_policy,
+        branch,
+        base_branch,
+        force_reset,
+        reserved_owner,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_session_with_prompt_storage(
+    state: &std::sync::Arc<AppState>,
+    name: &str,
+    worktree: Option<bool>,
+    project_dir: Option<&str>,
+    prompt: Option<&str>,
+    stored_prompt: Option<&str>,
+    from: Option<&str>,
+    expects_reply: Option<bool>,
+    backend: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    reminder: Option<&str>,
+    parent_session: Option<&str>,
+    idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
+    branch: Option<&str>,
+    base_branch: Option<&str>,
+    force_reset: bool,
+    reserved_owner: Option<crate::daemon_protocol::ResourceOwner>,
+) -> (String, Option<u64>) {
     let backend = match backend {
         Some(b) => match state.backends.get_required(b) {
             Ok(backend) => backend,
@@ -2259,26 +2512,6 @@ pub async fn start_session(
     crate::backend::claude_code::pre_trust_workspace(&dir);
     crate::backend::pre_trust_mise(&dir);
 
-    // For TuiInjection: pass prompt as CLI arg via temp file.  This ensures
-    // CLAUDE.md and rules load before the prompt is processed (tmux injection
-    // can race with context loading).
-    //
-    // HttpApi backends receive prompts via HTTP (prompt_async), so we must NOT
-    // append the file to the command — otherwise the prompt text becomes an
-    // argument to `echo` and gets dumped to the terminal.
-    let full_cmd = if !is_http_api {
-        if let Some((ref prompt_text, _)) = pre_queued_prompt {
-            let prompt_path = format!("/tmp/ouija-prompt-{}.txt", name.replace('/', "-"));
-            std::fs::write(&prompt_path, prompt_text).ok();
-            let escaped_pf = crate::scheduler::shell_escape(&prompt_path);
-            format!("{backend_cmd} \"$(cat {escaped_pf})\" ; rm -f {escaped_pf}")
-        } else {
-            backend_cmd.clone()
-        }
-    } else {
-        backend_cmd.clone()
-    };
-
     let start_result = tokio::task::spawn_blocking({
         let tmux_session = tmux_session.clone();
         let window_name = window_name.clone();
@@ -2407,7 +2640,7 @@ pub async fn start_session(
                 reminder: reminder.map(String::from),
                 parent_session: parent_session.map(String::from),
                 idle_policy: idle_policy.clone(),
-                prompt: prompt.map(String::from),
+                prompt: stored_prompt.map(String::from),
                 ..Default::default()
             };
             match Box::pin(state.commit_reserved_start(&owner, Some(pane_id.clone()), initial_meta))
@@ -2451,10 +2684,32 @@ pub async fn start_session(
             }
 
             let pane_for_launch = pane_id.clone();
+            let mut prepared_command = match prepare_backend_launch_command(
+                is_http_api,
+                &backend_cmd,
+                pre_queued_prompt
+                    .as_ref()
+                    .map(|(prompt_text, _)| prompt_text.as_str()),
+            ) {
+                Ok(command) => command,
+                Err(error) => {
+                    cleanup_reserved_start(
+                        state,
+                        &owner,
+                        &pane_id,
+                        session_start_credential.as_deref(),
+                    )
+                    .await;
+                    return (
+                        format!("start failed to prepare launch prompt: {error}"),
+                        None,
+                    );
+                }
+            };
             let command = if is_http_api {
-                full_cmd.clone()
+                prepared_command.command().to_string()
             } else {
-                crate::tmux::close_shell_after(&full_cmd)
+                crate::tmux::close_shell_after(prepared_command.command())
             };
             let launch_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 crate::tmux::configure_managed_pane(&pane_for_launch);
@@ -2467,6 +2722,7 @@ pub async fn start_session(
                 if !status.success() {
                     anyhow::bail!("tmux send-keys failed for pane {pane_for_launch}");
                 }
+                prepared_command.mark_handed_off();
                 Ok(())
             })
             .await;
@@ -2549,7 +2805,7 @@ pub async fn start_session(
                 reminder: reminder.map(String::from),
                 parent_session: parent_session.map(String::from),
                 idle_policy,
-                prompt: prompt.map(String::from),
+                prompt: stored_prompt.map(String::from),
                 ..Default::default()
             };
             match finalize_reserved_start(state, &owner, registration_pane, proto_meta).await {
@@ -2829,6 +3085,29 @@ fn previous_http_restart_fallback_id(
     select_restart_resume_id(fresh, selected_backend, previous_metadata, None)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HttpRestartBackendPlan {
+    Reuse(String),
+    Create,
+}
+
+fn select_http_restart_backend_plan(
+    is_http_api: bool,
+    fresh: bool,
+    selected_backend: &str,
+    previous_metadata: Option<&crate::daemon_protocol::SessionMeta>,
+) -> Option<HttpRestartBackendPlan> {
+    if !is_http_api {
+        return None;
+    }
+
+    Some(
+        previous_http_restart_fallback_id(fresh, selected_backend, previous_metadata)
+            .map(HttpRestartBackendPlan::Reuse)
+            .unwrap_or(HttpRestartBackendPlan::Create),
+    )
+}
+
 /// Recover an interactive fresh launch that definitely failed before the
 /// backend command could start. The protocol guards make this a no-op when a
 /// concurrent SessionStart has already consumed the credential and bound the
@@ -2901,6 +3180,46 @@ pub async fn restart_session_for_start(
     parent_session_override: ParentSessionOverride,
     idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
 ) -> (String, Option<u64>, RestartOutcome) {
+    restart_session_for_start_with_prompt_controls(
+        state,
+        owner,
+        name,
+        fresh,
+        repair_reservation,
+        prompt,
+        false,
+        None,
+        from,
+        expects_reply,
+        backend,
+        model,
+        effort,
+        reminder,
+        parent_session_override,
+        idle_policy,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn restart_session_for_start_with_prompt_controls(
+    state: &std::sync::Arc<AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    name: &str,
+    fresh: bool,
+    repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
+    prompt: Option<&str>,
+    suppress_stored_prompt: bool,
+    one_shot_prompt: Option<&str>,
+    from: Option<&str>,
+    expects_reply: Option<bool>,
+    backend: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    reminder: Option<&str>,
+    parent_session_override: ParentSessionOverride,
+    idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
+) -> (String, Option<u64>, RestartOutcome) {
     let still_claimed = {
         let proto = state.protocol.read().await;
         proto.sessions.get(name).is_some_and(|session| {
@@ -2927,6 +3246,8 @@ pub async fn restart_session_for_start(
         fresh,
         repair_reservation,
         prompt,
+        suppress_stored_prompt,
+        one_shot_prompt,
         from,
         expects_reply,
         backend,
@@ -2978,6 +3299,44 @@ pub async fn restart_session(
     parent_session_override: ParentSessionOverride,
     idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
 ) -> (String, Option<u64>, RestartOutcome) {
+    restart_session_with_prompt_controls(
+        state,
+        name,
+        fresh,
+        repair_reservation,
+        prompt,
+        false,
+        None,
+        from,
+        expects_reply,
+        backend,
+        model,
+        effort,
+        reminder,
+        parent_session_override,
+        idle_policy,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn restart_session_with_prompt_controls(
+    state: &std::sync::Arc<AppState>,
+    name: &str,
+    fresh: bool,
+    repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
+    prompt: Option<&str>,
+    suppress_stored_prompt: bool,
+    one_shot_prompt: Option<&str>,
+    from: Option<&str>,
+    expects_reply: Option<bool>,
+    backend: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    reminder: Option<&str>,
+    parent_session_override: ParentSessionOverride,
+    idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
+) -> (String, Option<u64>, RestartOutcome) {
     let disposition = match reserve_start_for_launch(state, name).await {
         Ok(disposition) => disposition,
         Err(error) => {
@@ -3003,12 +3362,21 @@ pub async fn restart_session(
                 );
             }
             let parent_session = parent_session_override.resolve(None);
-            let result = start_session(
+            let resolved_prompt = resolve_restart_prompt(
+                None,
+                RestartPromptInput {
+                    replacement: prompt,
+                    suppress_stored: suppress_stored_prompt,
+                    one_shot: one_shot_prompt,
+                },
+            );
+            let result = start_session_with_prompt_storage(
                 state,
                 name,
                 None,
                 None,
-                prompt,
+                resolved_prompt.launch.as_deref(),
+                resolved_prompt.stored.as_deref(),
                 from,
                 expects_reply,
                 backend,
@@ -3059,13 +3427,15 @@ pub async fn restart_session(
             }
         }
     };
-    restart_session_for_start(
+    restart_session_for_start_with_prompt_controls(
         state,
         &owner,
         name,
         fresh,
         repair_reservation,
         prompt,
+        suppress_stored_prompt,
+        one_shot_prompt,
         from,
         expects_reply,
         backend,
@@ -3086,6 +3456,8 @@ async fn restart_session_claimed(
     fresh: bool,
     repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
     prompt: Option<&str>,
+    suppress_stored_prompt: bool,
+    one_shot_prompt: Option<&str>,
     from: Option<&str>,
     expects_reply: Option<bool>,
     backend: Option<&str>,
@@ -3132,8 +3504,9 @@ async fn restart_session_claimed(
             RestartOutcome::Superseded,
         );
     }
-    // Capture existing pane before killing
-    let existing_pane = session.as_ref().and_then(|s| s.pane.clone());
+    // Capture the incumbent pane before staging so a verified live owner can
+    // be respawned in place. Recovery clears this to select the recreate path.
+    let mut existing_pane = session.as_ref().and_then(|s| s.pane.clone());
 
     let backend = match backend {
         Some(b) => match state.backends.get_required(b) {
@@ -3185,6 +3558,16 @@ async fn restart_session_claimed(
         Some(m) => idle_policy.clone().or_else(|| m.idle_policy.clone()),
         None => idle_policy.clone(),
     };
+    let resolved_prompt = resolve_restart_prompt(
+        prev_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.prompt.as_deref()),
+        RestartPromptInput {
+            replacement: prompt,
+            suppress_stored: suppress_stored_prompt,
+            one_shot: one_shot_prompt,
+        },
+    );
     let projects_dir = state.settings.read().await.projects_dir.clone();
     let base = match projects_dir {
         Some(dir) => crate::state::expand_tilde(&dir),
@@ -3271,6 +3654,7 @@ async fn restart_session_claimed(
                 name,
                 existing_pane.as_deref(),
                 &dir,
+                resolved_prompt.launch.as_deref(),
                 prompt,
                 from,
                 expects_reply,
@@ -3371,11 +3755,9 @@ async fn restart_session_claimed(
             })
     };
 
-    // Pre-compute effective prompt/reminder from metadata and function args
-    let effective_prompt = match &prev_metadata {
-        Some(m) => m.prompt.clone().or_else(|| prompt.map(String::from)),
-        None => prompt.map(String::from),
-    };
+    // Prompt resolution is computed exactly once above and shared by both the
+    // OpenCode soft path and this hard fallback.
+    let effective_prompt = resolved_prompt.launch.clone();
     let reminder_meta = crate::daemon_protocol::SessionMeta {
         reminder: effective_manual_reminder.clone(),
         parent_session: effective_parent_session.clone(),
@@ -3416,29 +3798,35 @@ async fn restart_session_claimed(
         crate::backend::DeliveryMode::HttpApi { .. }
     );
 
-    // Direct fresh respawn recovery can safely recognize only managed panes
-    // that already export the incumbent incarnation. Refuse legacy/unverified
-    // panes before staging a replacement; otherwise a crash before
-    // `respawn-pane` could orphan the incumbent after releasing its ID.
-    if let Some(existing_pane) = existing_pane.as_ref() {
-        let pane = existing_pane.clone();
-        let live_owner =
-            tokio::task::spawn_blocking(move || crate::tmux::inspect_pane_owner(&pane)).await;
-        let verification_error = match live_owner {
-            Ok(Ok(Some(live_owner)))
-                if crate::tmux::physical_owner_matches(&live_owner, lease_owner)
-                    || crate::tmux::physical_owner_matches(&live_owner, &restart_target_owner) =>
-            {
-                None
+    // Direct respawn recovery can safely recognize only managed panes that
+    // already export the incumbent or staged incarnation. A missing pane can
+    // use the new-window fallback; refuse live legacy/unverified panes before
+    // staging a replacement.
+    if let Some(incumbent_pane_id) = existing_pane.clone() {
+        let pane = incumbent_pane_id.clone();
+        let inspected =
+            tokio::task::spawn_blocking(move || crate::tmux::inspect_managed_pane(&pane)).await;
+        let verification_error = match inspected {
+            Ok(Ok(inspection)) => {
+                match classify_incumbent_pane(&inspection, lease_owner, &restart_target_owner) {
+                    IncumbentPaneDisposition::Respawn => None,
+                    IncumbentPaneDisposition::Recreate => {
+                        existing_pane = None;
+                        None
+                    }
+                    IncumbentPaneDisposition::Refuse => {
+                        let live_owner = inspection.owner();
+                        Some(format!(
+                            "restart refused unverified incumbent pane {incumbent_pane_id}: expected {lease_owner:?} or {restart_target_owner:?}, found {live_owner:?}"
+                        ))
+                    }
+                }
             }
-            Ok(Ok(live_owner)) => Some(format!(
-                "restart refused unverified incumbent pane {existing_pane}: expected {lease_owner:?} or {restart_target_owner:?}, found {live_owner:?}"
-            )),
             Ok(Err(error)) => Some(format!(
-                "restart could not verify incumbent pane {existing_pane}: {error}"
+                "restart could not verify incumbent pane {incumbent_pane_id}: {error}"
             )),
             Err(error) => Some(format!(
-                "restart incumbent pane verification task failed for {existing_pane}: {error}"
+                "restart incumbent pane verification task failed for {incumbent_pane_id}: {error}"
             )),
         };
         if let Some(error) = verification_error {
@@ -3535,21 +3923,6 @@ async fn restart_session_claimed(
         None => claude_cmd,
     };
 
-    // For TuiInjection: pass prompt as CLI arg (same as start_session).
-    // This ensures CLAUDE.md and rules load before the prompt is processed.
-    let full_cmd = if !is_http_api {
-        if let Some(ref prompt_text) = formatted_prompt {
-            let prompt_path = format!("/tmp/ouija-prompt-{}.txt", name.replace('/', "-"));
-            std::fs::write(&prompt_path, prompt_text).ok();
-            let escaped_pf = crate::scheduler::shell_escape(&prompt_path);
-            format!("{claude_cmd} \"$(cat {escaped_pf})\" ; rm -f {escaped_pf}")
-        } else {
-            claude_cmd.clone()
-        }
-    } else {
-        claude_cmd.clone()
-    };
-
     let start_gate = if let Some(pane) = existing_pane.as_deref() {
         state
             .protocol
@@ -3564,7 +3937,8 @@ async fn restart_session_claimed(
     };
     let start_existing_pane = existing_pane.clone();
     let start_session_credential = session_start_credential.clone();
-    let start_full_cmd = full_cmd.clone();
+    let start_backend_cmd = claude_cmd.clone();
+    let start_prompt = formatted_prompt.clone();
     let start_operation = move || {
         tokio::task::spawn_blocking({
             let window_name = window_name.clone();
@@ -3573,9 +3947,14 @@ async fn restart_session_claimed(
             let pane_credential = start_session_credential;
             let pane_incarnation = staged_incarnation;
             let direct_restart_lease_owner = direct_restart_lease_owner.clone();
-            let respawn_cmd = start_full_cmd;
+            let backend_cmd = start_backend_cmd;
+            let prompt = start_prompt;
             move || -> anyhow::Result<(String, bool)> {
                 use std::process::Command;
+
+                if cfg!(test) {
+                    return Ok((format!("%test-restart-{window_name}"), true));
+                }
 
                 // Try respawn-pane on existing pane — kills the process and restarts
                 // in-place, keeping the same pane ID and tmux session intact.
@@ -3584,6 +3963,12 @@ async fn restart_session_claimed(
                 // we respawn with a bare shell and then send-keys instead of letting
                 // respawn-pane run the command directly (which would exit immediately).
                 if let Some(ref pane) = existing_pane {
+                    let mut prepared_command = prepare_backend_launch_command(
+                        is_http_api,
+                        &backend_cmd,
+                        prompt.as_deref(),
+                    )?;
+                    let respawn_cmd = prepared_command.command().to_string();
                     // See `pane_env_args` docs for why OUIJA_SESSION_ID must
                     // be set on every pane spawn (including respawn-pane).
                     let env_args = crate::tmux::pane_env_args(
@@ -3627,6 +4012,7 @@ async fn restart_session_claimed(
                                     );
                                 }
                             }
+                            prepared_command.mark_handed_off();
                             tracing::info!("restart: respawn-pane {pane} succeeded");
                             return Ok((pane.clone(), false));
                         }
@@ -3640,6 +4026,7 @@ async fn restart_session_claimed(
                             tracing::info!("restart: respawn-pane {pane} error: {e}");
                         }
                     }
+                    drop(prepared_command);
 
                     // A failed respawn can be ambiguous about whether tmux
                     // replaced the process before reporting failure. Remove the
@@ -3817,12 +4204,42 @@ async fn restart_session_claimed(
                 }
 
                 let pane_for_launch = pane_id.clone();
+                let mut prepared_command = match prepare_backend_launch_command(
+                    is_http_api,
+                    &claude_cmd,
+                    formatted_prompt.as_deref(),
+                ) {
+                    Ok(command) => command,
+                    Err(error) => {
+                        if let Err(rollback_error) = rollback_claimed_restart(
+                            state,
+                            lease_owner,
+                            &restart_target_owner,
+                            Some(&pane_id),
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "failed to durably roll back restart for {name}: {rollback_error}"
+                            );
+                        }
+                        return (
+                            format!("restart failed to prepare launch prompt: {error}"),
+                            None,
+                            RestartOutcome::Failed,
+                        );
+                    }
+                };
                 let command = if is_http_api {
-                    full_cmd.clone()
+                    prepared_command.command().to_string()
                 } else {
-                    crate::tmux::close_shell_after(&full_cmd)
+                    crate::tmux::close_shell_after(prepared_command.command())
                 };
                 let launch_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    if cfg!(test) {
+                        return Ok(());
+                    }
+
                     crate::tmux::configure_managed_pane(&pane_for_launch);
                     let hidden_cmd = format!(" {command}");
                     let status = std::process::Command::new("tmux")
@@ -3831,6 +4248,7 @@ async fn restart_session_claimed(
                     if !status.success() {
                         anyhow::bail!("tmux send-keys failed for pane {pane_for_launch}");
                     }
+                    prepared_command.mark_handed_off();
                     Ok(())
                 })
                 .await;
@@ -3877,30 +4295,101 @@ async fn restart_session_claimed(
                 }
             }
 
-            // For HttpApi backends, use the shared opencode serve instance
             let mut reused_previous_backend_session = false;
-            let mut backend_session_id = if matches!(
-                backend.delivery_mode(),
-                crate::backend::DeliveryMode::HttpApi { .. }
-            ) {
-                let setup_owner = state
-                    .protocol
-                    .read()
+            let backend_plan = select_http_restart_backend_plan(
+                is_http_api,
+                fresh,
+                &backend_name,
+                prev_metadata.as_ref(),
+            );
+            let mut backend_session_id = None;
+
+            // A non-fresh HttpApi restart preserves history by trying the
+            // stored session before creating a new one. Reuse deliberately
+            // does not record a restart backend claim: this restart did not
+            // create the session and therefore must not delete it on rollback.
+            if let Some(HttpRestartBackendPlan::Reuse(prev_sid)) = backend_plan {
+                let port = state.opencode_serve_port();
+                let check_url = format!("http://127.0.0.1:{port}/session/{prev_sid}");
+                match state
+                    .http_client
+                    .get(&check_url)
+                    .timeout(std::time::Duration::from_secs(2))
+                    .send()
                     .await
-                    .sessions
-                    .get(name)
-                    .filter(|session| session.pane.as_deref() == Some(pane_id.as_str()))
-                    .map(crate::daemon_protocol::SessionEntry::owner);
-                let setup_result = match setup_owner {
-                    Some(owner) => {
-                        setup_shared_serve_session(state, &owner, Some(lease_owner), &pane_id, &dir)
+                {
+                    Ok(r) if r.status().is_success() => {
+                        // Guard reuse against serve/attach-client version
+                        // skew: a mismatched attach TUI crashes to a bare
+                        // pane. Show the notice and keep the reused session
+                        // registered API-only instead (mirrors the
+                        // fresh-create guard in setup_shared_serve_session).
+                        if let Some((serve_v, client_v)) =
+                            opencode_attach_skew(&state.http_client, port).await
+                        {
+                            tracing::warn!(
+                                port,
+                                pane = %pane_id,
+                                backend_session_id = %prev_sid,
+                                serve_version = %serve_v,
+                                attach_client_version = %client_v,
+                                "opencode attach client/serve version skew on reuse; skipping attach TUI (would crash). Session remains functional via HTTP API."
+                            );
+                            notify_pane_opencode_attach_skew(&pane_id, &serve_v, &client_v, port)
+                                .await;
+                            backend_session_id = Some(prev_sid);
+                            reused_previous_backend_session = true;
+                        } else {
+                            match launch_opencode_attach_for_session(
+                                &pane_id, &dir, &prev_sid, port,
+                            )
                             .await
+                            .and_then(|attach_ready| {
+                                previous_backend_session_after_attach(
+                                    prev_sid.clone(),
+                                    attach_ready,
+                                    &pane_id,
+                                )
+                            }) {
+                                Ok(sid) => {
+                                    backend_session_id = Some(sid);
+                                    reused_previous_backend_session = true;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "previous backend_session_id {prev_sid} is reachable but attach failed: {e}"
+                                    );
+                                }
+                            }
+                        }
                     }
-                    None => Err(anyhow::anyhow!(
-                        "restart owner changed before OpenCode session setup"
-                    )),
-                };
-                match setup_result {
+                    _ => {
+                        tracing::warn!(
+                            "previous backend_session_id {prev_sid} is stale, creating new session"
+                        );
+                    }
+                }
+            }
+
+            // Fresh restarts and failed/unavailable reuse create a new session
+            // on the shared OpenCode serve.
+            if is_http_api && backend_session_id.is_none() {
+                let setup_result =
+                    if restart_target_is_current(state, lease_owner, &restart_target_owner).await {
+                        setup_shared_serve_session(
+                            state,
+                            &restart_target_owner,
+                            Some(lease_owner),
+                            &pane_id,
+                            &dir,
+                        )
+                        .await
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "restart owner changed before OpenCode session setup"
+                        ))
+                    };
+                backend_session_id = match setup_result {
                     Ok(sid) => Some(sid),
                     Err(e) => {
                         tracing::warn!("shared serve session setup failed: {e}");
@@ -3921,112 +4410,24 @@ async fn restart_session_claimed(
                         }
                         None
                     }
-                }
-            } else {
-                None
-            };
-
-            // Fall back to the previous session ID when not fresh,
-            // but only if the serve is reachable (the old ID may be stale
-            // if serve was restarted externally).
-            if backend_session_id.is_none() {
-                if let Some(prev_sid) =
-                    previous_http_restart_fallback_id(fresh, &backend_name, prev_metadata.as_ref())
-                {
-                    let port = state.opencode_serve_port();
-                    let check_url = format!("http://127.0.0.1:{port}/session/{prev_sid}");
-                    match state
-                        .http_client
-                        .get(&check_url)
-                        .timeout(std::time::Duration::from_secs(2))
-                        .send()
-                        .await
-                    {
-                        Ok(r) if r.status().is_success() => {
-                            // Guard reuse against serve/attach-client version
-                            // skew: a mismatched attach TUI crashes to a bare
-                            // pane. Show the notice and keep the reused session
-                            // registered API-only instead (mirrors the
-                            // fresh-create guard in setup_shared_serve_session).
-                            if let Some((serve_v, client_v)) =
-                                opencode_attach_skew(&state.http_client, port).await
-                            {
-                                tracing::warn!(
-                                    port,
-                                    pane = %pane_id,
-                                    backend_session_id = %prev_sid,
-                                    serve_version = %serve_v,
-                                    attach_client_version = %client_v,
-                                    "opencode attach client/serve version skew on reuse; skipping attach TUI (would crash). Session remains functional via HTTP API."
-                                );
-                                notify_pane_opencode_attach_skew(
-                                    &pane_id, &serve_v, &client_v, port,
-                                )
-                                .await;
-                                backend_session_id = Some(prev_sid);
-                                reused_previous_backend_session = true;
-                            } else {
-                                match launch_opencode_attach_for_session(
-                                    &pane_id, &dir, &prev_sid, port,
-                                )
-                                .await
-                                .and_then(|attach_ready| {
-                                    previous_backend_session_after_attach(
-                                        prev_sid.clone(),
-                                        attach_ready,
-                                        &pane_id,
-                                    )
-                                }) {
-                                    Ok(sid) => {
-                                        backend_session_id = Some(sid);
-                                        reused_previous_backend_session = true;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "previous backend_session_id {prev_sid} is reachable but attach failed: {e}"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        _ => {
-                            tracing::warn!(
-                                "previous backend_session_id {prev_sid} is stale, creating new session"
-                            );
-                        }
-                    }
-                }
+                };
             }
 
             if is_http_api && backend_session_id.is_none() {
                 tracing::warn!(
                     "restart_session: not registering {name} because OpenCode attach setup failed"
                 );
-                if should_cleanup_failed_opencode_attach_pane(is_http_api, None) {
-                    let owner = state
-                        .protocol
-                        .read()
-                        .await
-                        .sessions
-                        .get(name)
-                        .filter(|session| session.pane.as_deref() == Some(pane_id.as_str()))
-                        .map(crate::daemon_protocol::SessionEntry::owner);
-                    if let Some(owner) = owner {
-                        cleanup_failed_opencode_attach_pane(state, &owner, &pane_id).await;
-                    }
-                }
-                if should_remove_session_after_failed_restart(
-                    is_http_api,
-                    None,
-                    &pane_id,
-                    existing_pane.as_deref(),
-                ) {
-                    state
-                        .apply_and_execute(crate::daemon_protocol::Event::Remove {
-                            id: name.to_string(),
-                            keep_worktree: true,
-                        })
-                        .await;
+                if let Err(rollback_error) = rollback_claimed_restart(
+                    state,
+                    lease_owner,
+                    &restart_target_owner,
+                    Some(&pane_id),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        "failed to durably roll back restart for {name}: {rollback_error}"
+                    );
                 }
                 return (
                     format!(
@@ -4094,7 +4495,7 @@ async fn restart_session_claimed(
                     reminder: effective_manual_reminder.clone(),
                     parent_session: effective_parent_session.clone(),
                     idle_policy: effective_idle_policy.clone(),
-                    prompt: effective_prompt.clone(),
+                    prompt: resolved_prompt.stored.clone(),
                     iteration: m.iteration,
                     iteration_log: m.iteration_log.clone(),
                     last_iteration_at: m.last_iteration_at,
@@ -4117,7 +4518,7 @@ async fn restart_session_claimed(
                     reminder: effective_manual_reminder.clone(),
                     parent_session: effective_parent_session.clone(),
                     idle_policy: effective_idle_policy.clone(),
-                    prompt: effective_prompt.clone(),
+                    prompt: resolved_prompt.stored.clone(),
                     ..Default::default()
                 },
             };
@@ -4317,6 +4718,7 @@ async fn soft_restart_session_claimed(
     pane: Option<&str>,
     project_dir: &str,
     prompt: Option<&str>,
+    prompt_replacement: Option<&str>,
     from: Option<&str>,
     expects_reply: Option<bool>,
     reminder: Option<&str>,
@@ -4502,6 +4904,7 @@ async fn soft_restart_session_claimed(
                         &new_session_id,
                         restart_generation,
                         SoftRestartMetadataUpdate {
+                            prompt_replacement,
                             reminder,
                             parent_session: parent_session_override.clone(),
                             idle_policy: idle_policy.clone(),
@@ -4669,6 +5072,7 @@ async fn soft_restart_session_claimed(
             &new_session_id,
             restart_generation,
             SoftRestartMetadataUpdate {
+                prompt_replacement,
                 reminder,
                 parent_session: parent_session_override,
                 idle_policy,
@@ -4750,6 +5154,7 @@ async fn soft_restart_session(
         pane,
         project_dir,
         prompt,
+        None,
         from,
         expects_reply,
         reminder,
@@ -4824,6 +5229,9 @@ async fn complete_soft_restart_metadata(
     }
     if let Some(reminder) = update.reminder {
         metadata.reminder = Some(reminder.to_string());
+    }
+    if let Some(prompt) = update.prompt_replacement {
+        metadata.prompt = Some(prompt.to_string());
     }
     match update.parent_session {
         ParentSessionOverride::PreservePrevious => {}
@@ -4912,6 +5320,9 @@ async fn apply_soft_restart_metadata(
             if let Some(r) = update.reminder {
                 session.metadata.reminder = Some(r.to_string());
             }
+            if let Some(prompt) = update.prompt_replacement {
+                session.metadata.prompt = Some(prompt.to_string());
+            }
             match update.parent_session {
                 ParentSessionOverride::PreservePrevious => {}
                 ParentSessionOverride::SetParent(parent) => {
@@ -4940,6 +5351,7 @@ async fn apply_soft_restart_metadata(
 
 #[derive(Default)]
 struct SoftRestartMetadataUpdate<'a> {
+    prompt_replacement: Option<&'a str>,
     reminder: Option<&'a str>,
     parent_session: ParentSessionOverride,
     idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
@@ -7053,7 +7465,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_direct_restart_refuses_an_unverified_incumbent_before_staging() {
+    async fn missing_incumbent_pane_restarts_through_recreate_path() {
         let state = AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -7093,16 +7505,106 @@ mod tests {
         )
         .await;
 
+        assert_eq!(outcome, RestartOutcome::Restarted, "{message}");
+        let proto = state.protocol.read().await;
+        let restarted = &proto.sessions["same-id"];
+        assert_ne!(restarted.owner(), previous.owner());
+        assert_ne!(
+            restarted.pane.as_deref(),
+            previous.pane.as_deref(),
+            "a missing incumbent must select the new-pane fallback"
+        );
+        assert!(proto.lifecycle_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_opencode_recreate_restores_incumbent() {
+        use axum::Json;
+        use axum::Router;
+        use axum::extract::State;
+        use axum::http::StatusCode;
+        use axum::routing::{get, post};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn health(State(reached): State<Arc<AtomicBool>>) -> Json<serde_json::Value> {
+            reached.store(true, Ordering::SeqCst);
+            Json(serde_json::json!({}))
+        }
+
+        async fn fail_create() -> StatusCode {
+            StatusCode::BAD_GATEWAY
+        }
+
+        let setup_reached = Arc::new(AtomicBool::new(false));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/global/health", get(health))
+            .route("/session", post(fail_create))
+            .with_state(setup_reached.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = AppState::new(config);
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "same-id".into(),
+                pane: Some("%definitely-not-a-live-managed-pane".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some(dir.path().to_string_lossy().into_owned()),
+                    backend: Some("opencode".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let previous = state.protocol.read().await.sessions["same-id"].clone();
+        let owner = match reserve_start_for_launch(&state, "same-id").await.unwrap() {
+            crate::daemon_protocol::StartDisposition::Existing(owner) => owner,
+            other => panic!("expected existing owner, got {other:?}"),
+        };
+        assert_eq!(
+            state.claim_existing_start(&owner).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+
+        let (_, _, outcome) = restart_session_for_start(
+            &state,
+            &owner,
+            "same-id",
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ParentSessionOverride::PreservePrevious,
+            None,
+        )
+        .await;
+
         assert_eq!(outcome, RestartOutcome::Failed);
         assert!(
-            message.contains("unverified incumbent")
-                || message.contains("could not verify incumbent")
-                || message.contains("verification task failed"),
-            "unexpected failure: {message}"
+            setup_reached.load(Ordering::SeqCst),
+            "the staged restart owner must authorize shared-serve setup"
         );
         let proto = state.protocol.read().await;
         assert_eq!(proto.sessions["same-id"], previous);
         assert!(proto.lifecycle_leases.is_empty());
+        server.abort();
     }
 
     #[tokio::test]
@@ -8044,6 +8546,294 @@ mod tests {
     }
 
     #[test]
+    fn restart_prompt_resolution_has_one_persistent_base_and_launch_only_suffix() {
+        struct Case {
+            stored: Option<&'static str>,
+            replacement: Option<&'static str>,
+            suppress: bool,
+            one_shot: Option<&'static str>,
+            expected_launch: Option<&'static str>,
+            expected_stored: Option<&'static str>,
+        }
+
+        let cases = [
+            Case {
+                stored: Some("stored"),
+                replacement: None,
+                suppress: false,
+                one_shot: None,
+                expected_launch: Some("stored"),
+                expected_stored: Some("stored"),
+            },
+            Case {
+                stored: Some("stored"),
+                replacement: Some("replacement"),
+                suppress: false,
+                one_shot: None,
+                expected_launch: Some("replacement"),
+                expected_stored: Some("replacement"),
+            },
+            Case {
+                stored: Some("stored"),
+                replacement: None,
+                suppress: true,
+                one_shot: None,
+                expected_launch: None,
+                expected_stored: Some("stored"),
+            },
+            Case {
+                stored: Some("stored"),
+                replacement: None,
+                suppress: false,
+                one_shot: Some("launch only"),
+                expected_launch: Some("stored\n\nlaunch only"),
+                expected_stored: Some("stored"),
+            },
+            Case {
+                stored: Some("stored"),
+                replacement: None,
+                suppress: true,
+                one_shot: Some("launch only"),
+                expected_launch: Some("launch only"),
+                expected_stored: Some("stored"),
+            },
+            Case {
+                stored: Some("stored"),
+                replacement: Some("replacement"),
+                suppress: true,
+                one_shot: Some("launch only"),
+                expected_launch: Some("replacement\n\nlaunch only"),
+                expected_stored: Some("replacement"),
+            },
+            Case {
+                stored: None,
+                replacement: None,
+                suppress: true,
+                one_shot: Some("launch only"),
+                expected_launch: Some("launch only"),
+                expected_stored: None,
+            },
+        ];
+
+        for case in cases {
+            let resolved = resolve_restart_prompt(
+                case.stored,
+                RestartPromptInput {
+                    replacement: case.replacement,
+                    suppress_stored: case.suppress,
+                    one_shot: case.one_shot,
+                },
+            );
+            assert_eq!(resolved.launch.as_deref(), case.expected_launch);
+            assert_eq!(resolved.stored.as_deref(), case.expected_stored);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tui_launch_prompt_files_are_unique_private_and_drop_cleaned() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first =
+            prepare_tui_launch_command_in(dir.path(), "backend", Some("first prompt")).unwrap();
+        let second =
+            prepare_tui_launch_command_in(dir.path(), "backend", Some("second prompt")).unwrap();
+        let first_path = first.prompt_path().unwrap().to_path_buf();
+        let second_path = second.prompt_path().unwrap().to_path_buf();
+
+        assert_ne!(first_path, second_path);
+        assert_eq!(
+            std::fs::metadata(&first_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&second_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        drop(first);
+        drop(second);
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
+    }
+
+    #[test]
+    fn tui_launch_prompt_preparation_propagates_creation_errors_without_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_directory = dir.path().join("plain-file");
+        std::fs::write(&not_a_directory, "occupied").unwrap();
+
+        let error =
+            prepare_tui_launch_command_in(&not_a_directory, "backend", Some("secret")).unwrap_err();
+
+        assert!(error.to_string().contains("launch prompt"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn tui_launch_prompt_preparation_cleans_partial_file_after_write_error() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let error = prepare_tui_launch_command_in_with_writer(
+            dir.path(),
+            "backend",
+            "secret",
+            |file, _| {
+                file.write_all(b"partial")?;
+                Err(std::io::Error::other("injected write failure"))
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("write private launch prompt"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tui_launch_prompt_rejects_non_utf8_temp_path_without_leaking_file() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let non_utf8 = root
+            .path()
+            .join(std::ffi::OsString::from_vec(b"non-utf8-\xff".to_vec()));
+        std::fs::create_dir(&non_utf8).unwrap();
+
+        let error =
+            prepare_tui_launch_command_in(&non_utf8, "backend", Some("secret")).unwrap_err();
+
+        assert!(error.to_string().contains("UTF-8"));
+        assert_eq!(std::fs::read_dir(&non_utf8).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn failed_absent_and_existing_tui_launch_guards_leave_no_prompt_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        for path_kind in ["absent-session start", "existing-session restart"] {
+            let prepared =
+                prepare_tui_launch_command_in(dir.path(), "backend", Some(path_kind)).unwrap();
+            let prompt_path = prepared.prompt_path().unwrap().to_path_buf();
+            assert!(prompt_path.exists());
+
+            // A failed tmux launch never hands ownership to the shell.
+            drop(prepared);
+            assert!(!prompt_path.exists(), "{path_kind} leaked its prompt file");
+        }
+    }
+
+    #[test]
+    fn handed_off_prompt_survives_arbitrary_delay_until_shell_consumes_it() {
+        let dir = tempfile::tempdir().unwrap();
+
+        for path_kind in ["absent-session start", "existing-session restart"] {
+            let mut prepared =
+                prepare_tui_launch_command_in(dir.path(), "printf '%s'", Some(path_kind)).unwrap();
+            let prompt_path = prepared.prompt_path().unwrap().to_path_buf();
+            let command = prepared.command().to_string();
+
+            // Tmux acceptance is irreversible. No wall-clock cleanup may race
+            // a shell that has accepted the command but has not read it yet.
+            let _: () = prepared.mark_handed_off();
+            drop(prepared);
+            assert!(
+                prompt_path.exists(),
+                "{path_kind} lost its prompt before delayed consumption"
+            );
+
+            let output = std::process::Command::new("sh")
+                .args(["-c", &command])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, path_kind.as_bytes());
+            assert!(!prompt_path.exists());
+        }
+    }
+
+    #[test]
+    fn accepted_tui_launch_unlinks_prompt_before_backend_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut prepared =
+            prepare_tui_launch_command_in(dir.path(), "printf '%s'", Some("secret")).unwrap();
+        let prompt_path = prepared.prompt_path().unwrap().to_path_buf();
+
+        let output = std::process::Command::new("sh")
+            .args(["-c", prepared.command()])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"secret");
+        assert!(!prompt_path.exists());
+
+        // Mirrors a successful tmux handoff. It remains harmless if the shell
+        // already consumed and unlinked the file before tmux returned.
+        let _: () = prepared.mark_handed_off();
+    }
+
+    #[test]
+    fn http_backend_launch_remains_file_free_and_does_not_embed_prompt() {
+        let prepared =
+            prepare_backend_launch_command(true, "opencode serve", Some("launch only")).unwrap();
+
+        assert_eq!(prepared.command(), "opencode serve");
+        assert!(prepared.prompt_path().is_none());
+    }
+
+    #[tokio::test]
+    async fn soft_restart_metadata_persists_replacement_but_not_one_shot_suffix() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "oc".into(),
+                pane: Some("%17".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    prompt: Some("stored".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let owner = {
+            let proto = state.protocol.read().await;
+            SoftRestartOwnerSnapshot {
+                session_id: "oc".into(),
+                incarnation: proto.sessions["oc"].metadata.session_incarnation,
+            }
+        };
+
+        apply_soft_restart_metadata(
+            &state,
+            &owner,
+            "ses_new",
+            0,
+            SoftRestartMetadataUpdate {
+                prompt_replacement: Some("replacement"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let proto = state.protocol.read().await;
+        assert_eq!(
+            proto.sessions["oc"].metadata.prompt.as_deref(),
+            Some("replacement")
+        );
+        assert_ne!(
+            proto.sessions["oc"].metadata.prompt.as_deref(),
+            Some("replacement\n\nlaunch only")
+        );
+    }
+
+    #[test]
     fn restart_reusing_previous_backend_session_preserves_weak_opencode_binding() {
         assert_eq!(
             opencode_binding_for_restart_session(
@@ -8104,6 +8894,48 @@ mod tests {
     }
 
     #[test]
+    fn non_fresh_http_restart_prefers_stored_backend_session() {
+        let previous = crate::daemon_protocol::SessionMeta {
+            backend: Some("opencode".into()),
+            backend_session_id: Some("ses_preserved".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            select_http_restart_backend_plan(true, false, "opencode", Some(&previous)),
+            Some(HttpRestartBackendPlan::Reuse("ses_preserved".into()))
+        );
+    }
+
+    #[test]
+    fn fresh_http_restart_creates_new_backend_session() {
+        let previous = crate::daemon_protocol::SessionMeta {
+            backend: Some("opencode".into()),
+            backend_session_id: Some("ses_previous".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            select_http_restart_backend_plan(true, true, "opencode", Some(&previous)),
+            Some(HttpRestartBackendPlan::Create)
+        );
+    }
+
+    #[test]
+    fn non_http_restart_has_no_opencode_backend_plan() {
+        let previous = crate::daemon_protocol::SessionMeta {
+            backend: Some("codex-cli".into()),
+            backend_session_id: Some("thread_previous".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            select_http_restart_backend_plan(false, false, "codex-cli", Some(&previous)),
+            None
+        );
+    }
+
+    #[test]
     fn restart_final_refresh_preserves_selected_codex_resume_id() {
         assert_eq!(
             final_restart_backend_binding(
@@ -8158,29 +8990,140 @@ mod tests {
         assert!(should_cleanup_failed_opencode_attach_pane(true, None));
     }
 
-    #[test]
-    fn failed_restart_placeholder_cleanup_required_without_backend_session() {
-        assert!(should_cleanup_failed_opencode_attach_pane(true, None));
+    fn incumbent_test_owners() -> (
+        crate::daemon_protocol::ResourceOwner,
+        crate::daemon_protocol::ResourceOwner,
+    ) {
+        (
+            crate::daemon_protocol::ResourceOwner {
+                session_id: "worker".into(),
+                incarnation: crate::daemon_protocol::SessionIncarnation(10),
+            },
+            crate::daemon_protocol::ResourceOwner {
+                session_id: "worker".into(),
+                incarnation: crate::daemon_protocol::SessionIncarnation(11),
+            },
+        )
     }
 
     #[test]
-    fn failed_restart_placeholder_does_not_remove_original_session() {
-        assert!(!should_remove_session_after_failed_restart(
-            true,
-            None,
-            "%new-placeholder",
-            Some("%original"),
-        ));
+    fn missing_incumbent_pane_is_recreated() {
+        let (lease_owner, restart_target_owner) = incumbent_test_owners();
+
+        assert_eq!(
+            classify_incumbent_pane(
+                &crate::tmux::ManagedPaneInspection::Missing,
+                &lease_owner,
+                &restart_target_owner,
+            ),
+            IncumbentPaneDisposition::Recreate
+        );
     }
 
     #[test]
-    fn failed_restart_respawned_pane_removes_session() {
-        assert!(should_remove_session_after_failed_restart(
-            true,
-            None,
-            "%original",
-            Some("%original"),
-        ));
+    fn unmanaged_incumbent_pane_is_refused() {
+        let (lease_owner, restart_target_owner) = incumbent_test_owners();
+
+        assert_eq!(
+            classify_incumbent_pane(
+                &crate::tmux::ManagedPaneInspection::Unmanaged,
+                &lease_owner,
+                &restart_target_owner,
+            ),
+            IncumbentPaneDisposition::Refuse
+        );
+    }
+
+    #[test]
+    fn process_lease_owned_incumbent_pane_is_respawned() {
+        let (lease_owner, restart_target_owner) = incumbent_test_owners();
+
+        assert_eq!(
+            classify_incumbent_pane(
+                &crate::tmux::ManagedPaneInspection::ProcessOwner(lease_owner.clone()),
+                &lease_owner,
+                &restart_target_owner,
+            ),
+            IncumbentPaneDisposition::Respawn
+        );
+    }
+
+    #[test]
+    fn marker_lease_owned_incumbent_pane_is_respawned() {
+        let (lease_owner, restart_target_owner) = incumbent_test_owners();
+
+        assert_eq!(
+            classify_incumbent_pane(
+                &crate::tmux::ManagedPaneInspection::MarkerOwner(lease_owner.clone()),
+                &lease_owner,
+                &restart_target_owner,
+            ),
+            IncumbentPaneDisposition::Respawn
+        );
+    }
+
+    #[test]
+    fn process_restart_target_owned_incumbent_pane_is_respawned() {
+        let (lease_owner, restart_target_owner) = incumbent_test_owners();
+
+        assert_eq!(
+            classify_incumbent_pane(
+                &crate::tmux::ManagedPaneInspection::ProcessOwner(restart_target_owner.clone(),),
+                &lease_owner,
+                &restart_target_owner,
+            ),
+            IncumbentPaneDisposition::Respawn
+        );
+    }
+
+    #[test]
+    fn marker_restart_target_owned_incumbent_pane_is_respawned() {
+        let (lease_owner, restart_target_owner) = incumbent_test_owners();
+
+        assert_eq!(
+            classify_incumbent_pane(
+                &crate::tmux::ManagedPaneInspection::MarkerOwner(restart_target_owner.clone(),),
+                &lease_owner,
+                &restart_target_owner,
+            ),
+            IncumbentPaneDisposition::Respawn
+        );
+    }
+
+    #[test]
+    fn stranger_process_owned_incumbent_pane_is_refused() {
+        let (lease_owner, restart_target_owner) = incumbent_test_owners();
+        let stranger_owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "stranger".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(12),
+        };
+
+        assert_eq!(
+            classify_incumbent_pane(
+                &crate::tmux::ManagedPaneInspection::ProcessOwner(stranger_owner),
+                &lease_owner,
+                &restart_target_owner,
+            ),
+            IncumbentPaneDisposition::Refuse
+        );
+    }
+
+    #[test]
+    fn stranger_marker_owned_incumbent_pane_is_refused() {
+        let (lease_owner, restart_target_owner) = incumbent_test_owners();
+        let stranger_owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "stranger".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(12),
+        };
+
+        assert_eq!(
+            classify_incumbent_pane(
+                &crate::tmux::ManagedPaneInspection::MarkerOwner(stranger_owner),
+                &lease_owner,
+                &restart_target_owner,
+            ),
+            IncumbentPaneDisposition::Refuse
+        );
     }
 
     #[test]

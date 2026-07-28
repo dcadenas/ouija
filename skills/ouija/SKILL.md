@@ -98,7 +98,12 @@ ouija spawn-session worker --project-dir /path --worktree --branch feature --bas
 
 # Restart with fresh context:
 ouija restart-session worker --fresh --prompt "new task" --reminder "when done, report back"
-# prompt/reminder optional — if omitted, reuses previous values
+# --prompt replaces the stored startup prompt. If omitted, the stored prompt is reused.
+
+# Launch once without replaying the stored prompt. The CLI reads the file as UTF-8;
+# its contents are delivered on this launch only and are never stored by Ouija.
+ouija restart-session worker --fresh --suppress-stored-prompt \
+  --one-shot-file /tmp/verify-and-adopt.txt --backend codex-cli
 
 # Kill:
 ouija kill-session worker
@@ -109,12 +114,70 @@ Key fields:
 - `--when-done keep-open|ask-parent|close` — required completion behavior, independent of recurring reminders. Ouija generates the stay-open/ask-parent/close instructions
 - `--idle-policy` is deprecated; legacy scripts may still use `keep-open|ask-parent-when-done|close-when-done`
 - `--reminder` alone opts the session into recurring recovery nudges. Omit it for no task-reminder recurrence
+- On restart, `--prompt` is a persistent replacement; `--suppress-stored-prompt` only suppresses fallback for that launch; `--one-shot-file` appends launch-only UTF-8 content. `--backend` explicitly selects the restart backend
 - Pending replies can still wake a session without `--reminder`.
 - Never put `ouija clear-reminder` in manual reminder text. Ouija adds the concrete clearing command and ID to each injected nudge
 - `--worktree` — isolate in a git worktree at `~/.ouija/worktrees/<repo>/<session>`
 - `--branch` / `--base-branch` — git branch control for worktrees
 
-## 5. Task scheduling
+## 5. Intentional context rollover
+
+Use rollover only at a safe work boundary. The running session, not the Ouija
+daemon, decides when a bounded slice can stop. Prepare a concise continuation
+directly on stdin:
+
+```bash
+token="$(ouija rollover prepare --stdin <<'JSON'
+{
+  "version": 1,
+  "objective": "finish the authorized feature",
+  "current_slice": "wire the local helper CLI",
+  "confirmed_evidence": ["focused helper tests pass"],
+  "blockers_decisions": ["semantic policy stays outside the daemon"],
+  "next_actions": ["verify live git state", "run cargo test"],
+  "forbidden_scope": ["do not push or alter production sessions"],
+  "verification_commands": ["git status --short", "cargo test"],
+  "explicitly_known_ouija_descendants": ["exact-child-id"]
+}
+JSON
+)"
+instruction_file="$(mktemp)"
+printf '%s\n' \
+  "Verify live identity and repository state, then run: ouija rollover adopt $token" \
+  > "$instruction_file"
+session="$(ouija whoami)"
+ouija restart-session "$session" --fresh \
+  --suppress-stored-prompt --one-shot-file "$instruction_file"
+```
+
+The fresh incarnation runs `ouija rollover adopt TOKEN`. Adoption prints only
+the semantic continuation JSON after verifying the exact public Local session
+ID, a strictly newer incarnation, canonical cwd/repository/common directory,
+branch, HEAD, and tracked/untracked dirty state. It refuses expired records or
+any mismatch without changing the pending record. Retrying adoption from the
+same adopting incarnation is idempotent. Use
+`ouija rollover prepare --stdin --replace-expired` only after inspecting an
+expired pending record and intentionally replacing it.
+
+Initialized submodules must be clean and checked out at their recorded gitlink.
+Ouija refuses rollover preparation or adoption when an initialized submodule
+has modified/untracked content or a different checked-out commit; clean or
+commit that submodule first. Uninitialized submodules remain bound by the
+superproject gitlink.
+
+Continuation records live privately under Ouija's per-user data directory,
+outside repositories. `ouija rollover cleanup` removes an adopted or expired
+record; removing a live pending record requires the explicit
+`--force-pending` override. Cleanup is a deliberate CLI action, never a
+scheduled daemon job.
+
+Do not create handoff drafts in a repository. Repository, git, test, and GitHub
+evidence remains authoritative; the continuation is disposable working context
+and must be checked against live state. Native subagents are not Ouija sessions:
+never list, enroll, restart, or include them as Ouija descendants. Include only
+exact, explicitly managed Ouija child IDs.
+
+## 6. Task scheduling
 
 ```bash
 # Create a scheduled task (cron in UTC):
@@ -130,7 +193,33 @@ ouija task trigger TASK_ID
 ouija task remove TASK_ID
 ```
 
-## 6. Housekeeping
+For production context audits, the operator enrolls each intended manual root
+with one recurring exact-target task:
+
+```bash
+ouija task add context-audit "*/15 * * * *" \
+  "At your next safe boundary, audit your context. Exact Ouija child allowlist: turnero, review-plugin-cx. Send each at most one ordinary audit message." \
+  --target hub-cx --inject-only
+```
+
+`--inject-only` requires an exact target and fails closed unless that exact
+Local Ouija session is currently live. It never creates, revives, restarts, or
+respawns a session and never touches a worktree or stored prompt. An audit is a
+safe-boundary request, not a forced rollover; the session still owns the
+semantic decision to continue or roll over.
+
+The task message is the operator-owned enrollment record. It must carry the
+exact allowlist of explicitly managed Ouija children. The root may corroborate
+each allowlisted ID with `parent_session` from `ouija ls` or `ouija status`,
+then send that exact live child at most one ordinary `ouija tell` audit. A null
+or missing parent never discovers a child and never de-enrolls an explicit
+operator choice. Do not create per-child schedules, recurse through children,
+inspect processes, infer enrollment from names/roles/paths, or add a daemon
+enrollment graph. Native subagents are not Ouija sessions and must remain
+invisible. OuijaCP lifecycle semantics are unrelated and must not be inferred
+from this procedure.
+
+## 7. Housekeeping
 
 **Update your metadata** when your focus changes:
 ```bash
@@ -146,7 +235,7 @@ do not invent an ID or place a clearing command in `--reminder`.
 ouija clear-reply SENDER_ID
 ```
 
-## 7. Non-tmux contexts (opencode HTTP API, etc.)
+## 8. Non-tmux contexts (opencode HTTP API, etc.)
 
 The CLI infers your session ID from `$TMUX_PANE`. In engines whose bash tool runs outside tmux, that variable may be unset and implicit `ouija ask/tell/reply` cannot always resolve a sender automatically.
 
@@ -174,7 +263,7 @@ ouija ask target-id "question"
 
 If implicit resolution fails and you do not have an exact injected or operator-provided public Local id, run `ouija whoami` and relay its diagnostics. **Never run `ouija register` to "fix" this** — it would create a duplicate session entry, not register the caller.
 
-## 8. Patterns
+## 9. Patterns
 
 Recurring recovery and completion are separate. Supplying `--reminder` opts into idle-cycle recovery nudges; `--when-done` controls what the session does after completion. Pending replies remain an independent reason to wake a session.
 
