@@ -700,16 +700,19 @@ impl SessionMeta {
         if self.restart_generation == 0 && source.restart_generation > 0 {
             self.restart_generation = source.restart_generation;
         }
+        self.inherit_active_context_from_registration(source);
+    }
+
+    /// Carry all active-context state across an ordinary registration. Generic
+    /// registration is never authority to initialize or change this policy.
+    fn inherit_active_context_from_registration(&mut self, source: &SessionMeta) {
+        self.fresh_context_after_active_secs = source.fresh_context_after_active_secs;
         self.inherit_active_context_accounting_from(source);
     }
 
-    /// Carry active-context policy and accounting across blank hook metadata.
-    /// A configured policy in the incoming metadata may be a fresh-launch
-    /// update, but ordinary registration must retain all existing accounting.
+    /// Carry only active-context accounting from a live staged owner. A fresh
+    /// finalizer may supply a new policy, but must not erase its accounting.
     fn inherit_active_context_accounting_from(&mut self, source: &SessionMeta) {
-        if self.fresh_context_after_active_secs.is_none() {
-            self.fresh_context_after_active_secs = source.fresh_context_after_active_secs;
-        }
         self.active_context_accumulated_secs = source.active_context_accumulated_secs;
         self.active_context_segment_started_at = source.active_context_segment_started_at;
         self.active_context_restart_due = source.active_context_restart_due;
@@ -934,7 +937,8 @@ pub enum Event {
     },
     /// Mark a conclusively successful fresh launch for its exact owner and
     /// reset the active-context accounting. Failed or superseded launches use
-    /// no event and therefore retain their accounting.
+    /// no event and therefore retain their accounting. This is internal
+    /// accounting and deliberately does not bump `last_metadata_update`.
     FreshContextRestartSucceeded {
         owner: ResourceOwner,
     },
@@ -2139,7 +2143,9 @@ impl DaemonState {
 
         let mut changed = false;
         if let Some(started_at) = session.metadata.active_context_segment_started_at.take() {
-            let elapsed_secs = at.saturating_sub(started_at).max(0) as u64;
+            // The ordered i64 timestamp range spans `u64::MAX` seconds, so
+            // subtract in i128 before converting the non-negative interval.
+            let elapsed_secs = u64::try_from(i128::from(at) - i128::from(started_at)).unwrap_or(0);
             session.metadata.active_context_accumulated_secs = session
                 .metadata
                 .active_context_accumulated_secs
@@ -5831,6 +5837,7 @@ mod tests {
                 fresh_context_after_active_secs: Some(10),
                 active_context_accumulated_secs: 12,
                 active_context_restart_due: true,
+                last_metadata_update: Some(777),
                 ..Default::default()
             },
         });
@@ -5865,6 +5872,11 @@ mod tests {
                 .active_context_accumulated_secs,
             12,
             "a superseded owner must not reset accounting"
+        );
+        assert_eq!(
+            state.sessions["worker"].metadata.last_metadata_update,
+            Some(777),
+            "a stale reset must not change metadata freshness"
         );
 
         state.apply(Event::RollbackFreshLaunch {
@@ -5912,6 +5924,11 @@ mod tests {
         assert_eq!(metadata.active_context_accumulated_secs, 0);
         assert_eq!(metadata.active_context_segment_started_at, None);
         assert!(!metadata.active_context_restart_due);
+        assert_eq!(
+            metadata.last_metadata_update,
+            Some(777),
+            "fresh-success accounting reset must not change metadata freshness"
+        );
     }
 
     #[test]
@@ -5945,6 +5962,335 @@ mod tests {
             Some(1_700_000_000)
         );
         assert!(metadata.active_context_restart_due);
+    }
+
+    #[test]
+    fn ordinary_registration_cannot_initialize_or_change_active_context_policy() {
+        // Break caught: only a fresh launch finalizer may set or change the
+        // policy of an existing session; generic Register must retain every
+        // active-context field supplied by the live session.
+        let mut absent_policy = DaemonState::new("d1".into(), "host1".into());
+        absent_policy.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta::default(),
+        });
+        absent_policy.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                fresh_context_after_active_secs: Some(60),
+                active_context_accumulated_secs: 41,
+                active_context_segment_started_at: Some(100),
+                active_context_restart_due: true,
+                ..Default::default()
+            },
+        });
+        let metadata = &absent_policy.sessions["worker"].metadata;
+        assert_eq!(metadata.fresh_context_after_active_secs, None);
+        assert_eq!(metadata.active_context_accumulated_secs, 0);
+        assert_eq!(metadata.active_context_segment_started_at, None);
+        assert!(!metadata.active_context_restart_due);
+
+        let mut configured_policy = DaemonState::new("d1".into(), "host1".into());
+        configured_policy.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                fresh_context_after_active_secs: Some(60),
+                active_context_accumulated_secs: 41,
+                active_context_segment_started_at: Some(100),
+                active_context_restart_due: true,
+                ..Default::default()
+            },
+        });
+        configured_policy.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                fresh_context_after_active_secs: Some(120),
+                ..Default::default()
+            },
+        });
+        let metadata = &configured_policy.sessions["worker"].metadata;
+        assert_eq!(metadata.fresh_context_after_active_secs, Some(60));
+        assert_eq!(metadata.active_context_accumulated_secs, 41);
+        assert_eq!(metadata.active_context_segment_started_at, Some(100));
+        assert!(metadata.active_context_restart_due);
+
+        let owner = configured_policy.sessions["worker"].owner();
+        let StageFreshLaunchOutcome::Staged { incarnation } = configured_policy
+            .stage_fresh_launch("worker", "codex-cli".into(), Some("proof".into()), None)
+            .outcome
+        else {
+            panic!("fresh launch must stage");
+        };
+        let mut fresh_metadata = configured_policy.sessions["worker"].metadata.clone();
+        fresh_metadata.fresh_context_after_active_secs = Some(120);
+        configured_policy.apply(Event::RefreshLaunchMetadata {
+            id: "worker".into(),
+            expected_incarnation: incarnation,
+            pane: Some("%1".into()),
+            metadata: fresh_metadata,
+        });
+        assert_ne!(configured_policy.sessions["worker"].owner(), owner);
+        assert_eq!(
+            configured_policy.sessions["worker"]
+                .metadata
+                .fresh_context_after_active_secs,
+            Some(120),
+            "fresh finalization may carry the new policy"
+        );
+    }
+
+    #[test]
+    fn leased_restart_rollback_and_stale_completion_preserve_active_context_accounting() {
+        // Break caught: the manual-restart lease path must preserve durable
+        // accounting through staging, stale completion, and failed rollback.
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("claude-code".into()),
+                fresh_context_after_active_secs: Some(60),
+                active_context_accumulated_secs: 41,
+                active_context_segment_started_at: Some(100),
+                active_context_restart_due: true,
+                last_metadata_update: Some(777),
+                ..Default::default()
+            },
+        });
+        let incumbent = state.sessions["worker"].owner();
+        assert_eq!(
+            state.claim_existing_start(&incumbent),
+            LifecycleMutationOutcome::Applied
+        );
+        let StageFreshLaunchOutcome::Staged { incarnation } = state
+            .stage_restart_launch(&incumbent, "claude-code".into(), true, None, None)
+            .outcome
+        else {
+            panic!("leased restart must stage");
+        };
+        let target = ResourceOwner {
+            session_id: "worker".into(),
+            incarnation,
+        };
+        let staged = state.sessions["worker"].metadata.clone();
+        assert_eq!(staged.fresh_context_after_active_secs, Some(60));
+        assert_eq!(staged.active_context_accumulated_secs, 41);
+        assert_eq!(staged.active_context_segment_started_at, Some(100));
+        assert!(staged.active_context_restart_due);
+        assert_eq!(staged.last_metadata_update, Some(777));
+
+        let stale_target = ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: SessionIncarnation(incarnation.0 + 1),
+        };
+        let stale = state.complete_restart_launch(
+            &incumbent,
+            &stale_target,
+            Some("%1".into()),
+            staged.clone(),
+            false,
+        );
+        assert_eq!(stale.outcome, LifecycleMutationOutcome::Superseded);
+        assert!(stale.effects.is_empty());
+        assert_eq!(state.sessions["worker"].metadata, staged);
+
+        let rollback = state.rollback_restart_launch(&incumbent, &target, None);
+        assert_eq!(rollback.outcome, LifecycleMutationOutcome::Applied);
+        let restored = &state.sessions["worker"].metadata;
+        assert_eq!(restored.fresh_context_after_active_secs, Some(60));
+        assert_eq!(restored.active_context_accumulated_secs, 41);
+        assert_eq!(restored.active_context_segment_started_at, Some(100));
+        assert!(restored.active_context_restart_due);
+        assert_eq!(restored.last_metadata_update, Some(777));
+    }
+
+    #[test]
+    fn leased_restart_finalizer_can_change_policy_and_exact_success_resets_accounting() {
+        // Break caught: the successful manual-restart route must retain the
+        // fresh policy update until its exact owner conclusively succeeds,
+        // then reset only accounting without changing metadata freshness.
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("claude-code".into()),
+                fresh_context_after_active_secs: Some(60),
+                active_context_accumulated_secs: 41,
+                active_context_segment_started_at: Some(100),
+                active_context_restart_due: true,
+                last_metadata_update: Some(777),
+                ..Default::default()
+            },
+        });
+        let incumbent = state.sessions["worker"].owner();
+        assert_eq!(
+            state.claim_existing_start(&incumbent),
+            LifecycleMutationOutcome::Applied
+        );
+        let StageFreshLaunchOutcome::Staged { incarnation } = state
+            .stage_restart_launch(&incumbent, "claude-code".into(), true, None, None)
+            .outcome
+        else {
+            panic!("leased restart must stage");
+        };
+        let target = ResourceOwner {
+            session_id: "worker".into(),
+            incarnation,
+        };
+        let mut final_metadata = state.sessions["worker"].metadata.clone();
+        final_metadata.fresh_context_after_active_secs = Some(120);
+        let completed = state.complete_restart_launch(
+            &incumbent,
+            &target,
+            Some("%1".into()),
+            final_metadata,
+            false,
+        );
+        assert_eq!(completed.outcome, LifecycleMutationOutcome::Applied);
+        let metadata = &state.sessions["worker"].metadata;
+        assert_eq!(metadata.fresh_context_after_active_secs, Some(120));
+        assert_eq!(metadata.active_context_accumulated_secs, 41);
+        assert_eq!(metadata.active_context_segment_started_at, Some(100));
+        assert!(metadata.active_context_restart_due);
+        assert_eq!(metadata.last_metadata_update, Some(777));
+
+        assert!(
+            state
+                .apply(Event::FreshContextRestartSucceeded { owner: incumbent })
+                .is_empty()
+        );
+        assert_eq!(
+            state.sessions["worker"].metadata.last_metadata_update,
+            Some(777)
+        );
+
+        let effects = state.apply(Event::FreshContextRestartSucceeded { owner: target });
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Persist))
+        );
+        let metadata = &state.sessions["worker"].metadata;
+        assert_eq!(metadata.fresh_context_after_active_secs, Some(120));
+        assert_eq!(metadata.active_context_accumulated_secs, 0);
+        assert_eq!(metadata.active_context_segment_started_at, None);
+        assert!(!metadata.active_context_restart_due);
+        assert_eq!(metadata.last_metadata_update, Some(777));
+    }
+
+    #[test]
+    fn stale_active_context_events_are_noops() {
+        // Break caught: delayed Active/Stopped events must not persist, emit a
+        // due effect, or mutate a replacement incarnation using the same ID.
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                fresh_context_after_active_secs: Some(60),
+                active_context_accumulated_secs: 41,
+                active_context_segment_started_at: Some(100),
+                active_context_restart_due: true,
+                ..Default::default()
+            },
+        });
+        let owner = state.sessions["worker"].owner();
+        let stale_owner = ResourceOwner {
+            session_id: owner.session_id.clone(),
+            incarnation: SessionIncarnation(owner.incarnation.0 + 1),
+        };
+        let before = state.sessions["worker"].clone();
+
+        assert!(
+            state
+                .apply(Event::ActiveContextActive {
+                    owner: stale_owner.clone(),
+                    at: 200,
+                })
+                .is_empty()
+        );
+        assert!(
+            state
+                .apply(Event::ActiveContextStopped {
+                    owner: stale_owner,
+                    at: 200,
+                })
+                .is_empty()
+        );
+        assert_eq!(state.sessions["worker"], before);
+    }
+
+    #[test]
+    fn active_context_elapsed_arithmetic_handles_full_timestamp_range_and_saturation() {
+        // Break caught: elapsed active time is a non-negative u64 interval,
+        // including the complete ordered i64 timestamp range, and the total
+        // must saturate rather than wrap.
+        let mut backwards = DaemonState::new("d1".into(), "host1".into());
+        backwards.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                fresh_context_after_active_secs: Some(u64::MAX),
+                active_context_accumulated_secs: 10,
+                active_context_segment_started_at: Some(5),
+                ..Default::default()
+            },
+        });
+        let owner = backwards.sessions["worker"].owner();
+        backwards.apply(Event::ActiveContextStopped { owner, at: 4 });
+        assert_eq!(
+            backwards.sessions["worker"]
+                .metadata
+                .active_context_accumulated_secs,
+            10
+        );
+
+        let mut full_range = DaemonState::new("d1".into(), "host1".into());
+        full_range.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                fresh_context_after_active_secs: Some(u64::MAX),
+                active_context_segment_started_at: Some(i64::MIN),
+                ..Default::default()
+            },
+        });
+        let owner = full_range.sessions["worker"].owner();
+        full_range.apply(Event::ActiveContextStopped {
+            owner,
+            at: i64::MAX,
+        });
+        assert_eq!(
+            full_range.sessions["worker"]
+                .metadata
+                .active_context_accumulated_secs,
+            u64::MAX
+        );
+
+        let mut saturation = DaemonState::new("d1".into(), "host1".into());
+        saturation.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                fresh_context_after_active_secs: Some(u64::MAX),
+                active_context_accumulated_secs: u64::MAX - 1,
+                active_context_segment_started_at: Some(0),
+                ..Default::default()
+            },
+        });
+        let owner = saturation.sessions["worker"].owner();
+        saturation.apply(Event::ActiveContextStopped { owner, at: 2 });
+        assert_eq!(
+            saturation.sessions["worker"]
+                .metadata
+                .active_context_accumulated_secs,
+            u64::MAX
+        );
     }
 
     #[test]
