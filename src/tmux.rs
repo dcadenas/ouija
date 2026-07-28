@@ -493,7 +493,37 @@ pub struct InjectRequest {
     pub vim_mode: bool,
     pub inject_config: crate::backend::InjectConfig,
     pub tui_pattern: Option<String>,
+    pub(crate) owned_assistant_process: Option<OwnedAssistantProcessEvidence>,
     pub result_tx: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OwnedAssistantProcessEvidence {
+    pub owner: crate::daemon_protocol::ResourceOwner,
+    pub process_names: Vec<String>,
+}
+
+fn validate_owned_assistant_process(
+    pane: &str,
+    evidence: &OwnedAssistantProcessEvidence,
+) -> anyhow::Result<()> {
+    if cfg!(test) {
+        return Ok(());
+    }
+    let observed = inspect_pane_owner(pane)?
+        .ok_or_else(|| anyhow::anyhow!("scheduled pane has no physical owner"))?;
+    if !physical_owner_matches(&observed, &evidence.owner) {
+        anyhow::bail!("scheduled pane physical owner changed");
+    }
+    let names = evidence
+        .process_names
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if !pane_alive(pane, &names) {
+        anyhow::bail!("scheduled pane is no longer running its assistant process");
+    }
+    Ok(())
 }
 
 /// Background worker that drains the FIFO queue for a single pane.
@@ -504,6 +534,11 @@ pub async fn pane_inject_loop(mut rx: tokio::sync::mpsc::UnboundedReceiver<Injec
     while let Some(req) = rx.recv().await {
         let mut attempts = 0u32;
         let result = loop {
+            if let Some(evidence) = req.owned_assistant_process.as_ref()
+                && let Err(error) = validate_owned_assistant_process(&req.pane, evidence)
+            {
+                break Err(error);
+            }
             let pane = req.pane.clone();
             let message = req.message.clone();
             let vim_mode = req.vim_mode;
@@ -708,6 +743,7 @@ pub async fn locked_inject(
                 vim_mode,
                 inject_config,
                 tui_pattern,
+                owned_assistant_process: None,
                 result_tx,
             };
             state.enqueue_inject(req);
@@ -751,6 +787,27 @@ pub async fn locked_inject_raw_tmux_with_config(
     inject_config: crate::backend::InjectConfig,
     tui_pattern: Option<String>,
 ) -> anyhow::Result<()> {
+    locked_inject_raw_tmux_with_config_and_evidence(
+        state,
+        pane,
+        message,
+        vim_mode,
+        inject_config,
+        tui_pattern,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn locked_inject_raw_tmux_with_config_and_evidence(
+    state: &crate::state::AppState,
+    pane: &str,
+    message: &str,
+    vim_mode: bool,
+    inject_config: crate::backend::InjectConfig,
+    tui_pattern: Option<String>,
+    owned_assistant_process: Option<OwnedAssistantProcessEvidence>,
+) -> anyhow::Result<()> {
     if cfg!(test) {
         return Ok(());
     }
@@ -762,6 +819,7 @@ pub async fn locked_inject_raw_tmux_with_config(
         vim_mode,
         inject_config,
         tui_pattern,
+        owned_assistant_process,
         result_tx,
     };
     state.enqueue_inject(req);

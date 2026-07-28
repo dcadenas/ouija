@@ -213,12 +213,21 @@ impl<'de> serde::Deserialize<'de> for ScheduledTask {
                 _ => OnFire::ContinueSession,
             }
         });
+        let target_session = raw
+            .target_session
+            .map(|target| target.trim().to_string())
+            .filter(|target| !target.is_empty());
+        if matches!(on_fire, OnFire::InjectOnly) && target_session.is_none() {
+            return Err(serde::de::Error::custom(
+                "inject_only task requires a non-empty target_session",
+            ));
+        }
 
         Ok(ScheduledTask {
             id: raw.id,
             name: raw.name,
             cron: raw.cron,
-            target_session: raw.target_session,
+            target_session,
             prompt: raw.prompt,
             reminder: raw.reminder,
             enabled: raw.enabled,
@@ -507,6 +516,7 @@ async fn execute_injection(state: &SharedState, task: &ScheduledTask) -> TaskRun
             session_name,
             pane,
             session.metadata.vim_mode,
+            None,
         )
         .await
         {
@@ -591,6 +601,7 @@ async fn execute_inject_only_snapshot(
             format!("inject-only target session '{session_name}' was superseded"),
         );
     }
+    let assistant_evidence = assistant_delivery_evidence(state, &session);
     if let Err(error) = inject_alive_session_prompt(
         state,
         task,
@@ -598,6 +609,7 @@ async fn execute_inject_only_snapshot(
         session_name,
         pane,
         session.metadata.vim_mode,
+        Some(assistant_evidence),
     )
     .await
     {
@@ -605,6 +617,27 @@ async fn execute_inject_only_snapshot(
     }
 
     TaskRun::ok(task, None)
+}
+
+fn assistant_delivery_evidence(
+    state: &SharedState,
+    session: &crate::daemon_protocol::SessionEntry,
+) -> crate::state::OwnedAssistantDeliveryEvidence {
+    let backend = session
+        .metadata
+        .backend
+        .as_deref()
+        .and_then(|name| state.backends.get(name))
+        .unwrap_or_else(|| state.backends.default());
+    crate::state::OwnedAssistantDeliveryEvidence {
+        backend: session.metadata.backend.clone(),
+        backend_session_id: session.metadata.backend_session_id.clone(),
+        process_names: backend
+            .process_names()
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+    }
 }
 
 async fn scheduled_snapshot_is_current(
@@ -678,6 +711,7 @@ async fn inject_alive_session_prompt(
     session_name: &str,
     pane: &str,
     vim_mode: bool,
+    assistant_evidence: Option<crate::state::OwnedAssistantDeliveryEvidence>,
 ) -> Result<(), String> {
     let Some(message) = task_prompt_text(task) else {
         return Ok(());
@@ -686,6 +720,7 @@ async fn inject_alive_session_prompt(
     match crate::state::deliver_owned_inject_message_effect(
         state,
         owner,
+        assistant_evidence,
         crate::state::InjectDeliveryRequest {
             session_id: session_name,
             pane,
@@ -2384,6 +2419,57 @@ mod tests {
     }
 
     #[test]
+    fn inject_only_deserialization_rejects_missing_or_blank_target() {
+        for json in [
+            r#"{"id":"x","name":"n","cron":"* * * * *","enabled":true,"created_at":"2026-01-01T00:00:00Z","run_count":0,"on_fire":{"mode":"inject_only"}}"#,
+            r#"{"id":"x","name":"n","cron":"* * * * *","target_session":"   ","enabled":true,"created_at":"2026-01-01T00:00:00Z","run_count":0,"on_fire":{"mode":"inject_only"}}"#,
+        ] {
+            let error = serde_json::from_str::<ScheduledTask>(json).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires a non-empty target_session"),
+                "unexpected error for {json}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_inject_only_tasks_round_trip_and_malformed_files_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = inject_only_task(" manual-root ");
+        let mut tasks = HashMap::new();
+        tasks.insert(task.id.clone(), task);
+        crate::persistence::save_tasks(dir.path(), &tasks).unwrap();
+
+        let loaded = crate::persistence::load_tasks(dir.path()).unwrap();
+        let loaded_task = loaded.values().next().unwrap();
+        assert_eq!(loaded_task.target_session.as_deref(), Some("manual-root"));
+        assert_eq!(loaded_task.on_fire, OnFire::InjectOnly);
+
+        let malformed = serde_json::json!([{
+            "id": "bad",
+            "name": "context-audit",
+            "cron": "*/15 * * * *",
+            "enabled": true,
+            "created_at": "2026-01-01T00:00:00Z",
+            "run_count": 0,
+            "on_fire": {"mode": "inject_only"}
+        }]);
+        std::fs::write(
+            dir.path().join("tasks.json"),
+            serde_json::to_vec(&malformed).unwrap(),
+        )
+        .unwrap();
+        let error = crate::persistence::load_tasks(dir.path()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires a non-empty target_session")
+        );
+    }
+
+    #[test]
     fn on_fire_default_is_continue_session() {
         assert_eq!(OnFire::default(), OnFire::ContinueSession);
     }
@@ -2505,6 +2591,115 @@ mod tests {
         assert_eq!(protocol.sessions, before);
         assert!(protocol.lifecycle_leases.is_empty());
         assert!(state.perfire_worktree_panes.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inject_only_revalidates_tui_process_after_initial_liveness_snapshot() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "manual-root".into(),
+                pane: Some("%audit".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        seed_live_pane(&state, "%audit").await;
+        let session = state.protocol.read().await.sessions["manual-root"].clone();
+        assert!(task_pane_alive(&state, "%audit").await);
+        state.cached_assistant_panes.write().await.clear();
+
+        let result = inject_alive_session_prompt(
+            &state,
+            &inject_only_task("manual-root"),
+            &session.owner(),
+            "manual-root",
+            "%audit",
+            false,
+            Some(assistant_delivery_evidence(&state, &session)),
+        )
+        .await;
+
+        assert!(result.is_err_and(|error| error.contains("no longer running")));
+        assert!(state.protocol.read().await.lifecycle_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inject_only_revalidates_http_process_before_request() {
+        use axum::Router;
+        use axum::extract::State;
+        use axum::routing::post;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn count_request(State(count): State<Arc<AtomicUsize>>) -> &'static str {
+            count.fetch_add(1, Ordering::SeqCst);
+            "ok"
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_port = listener.local_addr().unwrap().port();
+        assert!(serve_port >= 320);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/session/{id}/prompt_async", post(count_request))
+                    .with_state(server_requests),
+            )
+            .await
+            .unwrap();
+        });
+        let data_dir = tempfile::tempdir().unwrap().keep();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: serve_port - 320,
+            data_dir: data_dir.clone(),
+            config_dir: data_dir,
+        });
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "manual-http".into(),
+                pane: Some("%http".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_audit".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    ..Default::default()
+                },
+            })
+            .await;
+        *state.cached_assistant_panes.write().await = vec![crate::tmux::TmuxPane {
+            pane_id: "%http".into(),
+            session_name: "test".into(),
+            pane_current_path: Some("/tmp".into()),
+            process_name: Some("opencode".into()),
+        }];
+        let session = state.protocol.read().await.sessions["manual-http"].clone();
+        assert!(task_pane_alive(&state, "%http").await);
+        state.cached_assistant_panes.write().await.clear();
+
+        let result = inject_alive_session_prompt(
+            &state,
+            &inject_only_task("manual-http"),
+            &session.owner(),
+            "manual-http",
+            "%http",
+            false,
+            Some(assistant_delivery_evidence(&state, &session)),
+        )
+        .await;
+
+        assert!(result.is_err_and(|error| error.contains("no longer running")));
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        assert!(state.protocol.read().await.lifecycle_leases.is_empty());
+        server.abort();
     }
 
     #[tokio::test]
