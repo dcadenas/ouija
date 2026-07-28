@@ -670,6 +670,22 @@ mod tests {
     }
 
     #[test]
+    fn active_context_provisional_marker_is_backward_compatible_and_round_trips() {
+        // Break caught: sessions.json written before provisional accounting
+        // must restore as finalized, while staged targets must remain marked.
+        let legacy: SessionMetadata = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.active_context_accounting_provisional);
+
+        let staged = SessionMetadata {
+            active_context_accounting_provisional: true,
+            ..Default::default()
+        };
+        let decoded: SessionMetadata =
+            serde_json::from_str(&serde_json::to_string(&staged).unwrap()).unwrap();
+        assert!(decoded.active_context_accounting_provisional);
+    }
+
+    #[test]
     fn load_sessions_migrates_legacy_array_and_derives_high_water() {
         let dir = tempfile::tempdir().unwrap();
         let legacy = vec![PersistedSession {

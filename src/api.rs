@@ -146,6 +146,7 @@ pub async fn get_session(
                     "active_context_accumulated_secs": s.metadata.active_context_accumulated_secs,
                     "active_context_segment_open": s.metadata.active_context_segment_started_at.is_some(),
                     "active_context_restart_due": s.metadata.active_context_restart_due,
+                    "active_context_accounting_provisional": s.metadata.active_context_accounting_provisional,
                 })),
             )
         }
@@ -195,6 +196,7 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
                 "active_context_accumulated_secs": s.metadata.active_context_accumulated_secs,
                 "active_context_segment_open": s.metadata.active_context_segment_started_at.is_some(),
                 "active_context_restart_due": s.metadata.active_context_restart_due,
+                "active_context_accounting_provisional": s.metadata.active_context_accounting_provisional,
             })
         })
         .collect();
@@ -4823,6 +4825,7 @@ mod tests {
                     active_context_accumulated_secs: 1_234,
                     active_context_segment_started_at: Some(1_700_000_000),
                     active_context_restart_due: true,
+                    active_context_accounting_provisional: true,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -4839,6 +4842,10 @@ mod tests {
         assert_eq!(all["sessions"][0]["active_context_accumulated_secs"], 1_234);
         assert_eq!(all["sessions"][0]["active_context_segment_open"], true);
         assert_eq!(all["sessions"][0]["active_context_restart_due"], true);
+        assert_eq!(
+            all["sessions"][0]["active_context_accounting_provisional"],
+            true
+        );
 
         let (code, Json(one)) =
             get_session(State(state), axum::extract::Path("worker".to_string())).await;
@@ -4849,6 +4856,7 @@ mod tests {
         assert_eq!(one["active_context_accumulated_secs"], 1_234);
         assert_eq!(one["active_context_segment_open"], true);
         assert_eq!(one["active_context_restart_due"], true);
+        assert_eq!(one["active_context_accounting_provisional"], true);
     }
 
     fn backend_identity_request(backend: &str, session_id: &str) -> BackendIdentityRequest {

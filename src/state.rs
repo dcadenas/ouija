@@ -596,7 +596,10 @@ async fn notify_active_context_restart_due(
             .sessions
             .get(&owner.session_id)
             .and_then(|session| {
-                if session.owner() != *owner || !session.metadata.active_context_restart_due {
+                if session.owner() != *owner
+                    || !session.metadata.active_context_restart_due
+                    || session.metadata.active_context_accounting_provisional
+                {
                     return None;
                 }
                 let limit_secs = session.metadata.fresh_context_after_active_secs?;
@@ -904,6 +907,10 @@ pub struct SessionMetadata {
     /// Whether the fresh-context active-time threshold has been reached.
     #[serde(default)]
     pub active_context_restart_due: bool,
+    /// Whether active-context accounting belongs to an uncompleted fresh
+    /// restart target and may still roll back to the incumbent snapshot.
+    #[serde(default)]
+    pub active_context_accounting_provisional: bool,
 }
 
 fn default_true() -> bool {
@@ -943,6 +950,7 @@ impl Default for SessionMetadata {
             active_context_accumulated_secs: 0,
             active_context_segment_started_at: None,
             active_context_restart_due: false,
+            active_context_accounting_provisional: false,
         }
     }
 }
@@ -2078,6 +2086,8 @@ impl AppState {
         lease_owner: &crate::daemon_protocol::ResourceOwner,
         backend: String,
         replace_backend_identity: bool,
+        fresh: bool,
+        fresh_context_after_active_secs: Option<u64>,
         session_start_credential: Option<String>,
         expected_repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
     ) -> std::pin::Pin<
@@ -2091,6 +2101,8 @@ impl AppState {
             lease_owner.clone(),
             backend,
             replace_backend_identity,
+            fresh,
+            fresh_context_after_active_secs,
             session_start_credential,
             expected_repair_reservation,
         ))
@@ -2101,6 +2113,8 @@ impl AppState {
         lease_owner: crate::daemon_protocol::ResourceOwner,
         backend: String,
         replace_backend_identity: bool,
+        fresh: bool,
+        fresh_context_after_active_secs: Option<u64>,
         session_start_credential: Option<String>,
         expected_repair_reservation: Option<crate::daemon_protocol::BackendRepairReservation>,
     ) -> crate::daemon_protocol::StageFreshLaunchOutcome {
@@ -2118,6 +2132,8 @@ impl AppState {
                 &lease_owner,
                 backend,
                 replace_backend_identity,
+                fresh,
+                fresh_context_after_active_secs,
                 session_start_credential,
                 expected_repair_reservation,
             );
@@ -2170,7 +2186,7 @@ impl AppState {
         ))
     }
 
-    /// Complete a requested restart and reset active accounting only when fresh.
+    /// Complete a requested restart and finalize staged accounting only when fresh.
     pub(crate) fn complete_requested_restart_launch(
         self: &Arc<Self>,
         lease_owner: &crate::daemon_protocol::ResourceOwner,
@@ -2226,7 +2242,7 @@ impl AppState {
             if fresh && result.outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied
             {
                 // Completion removes the restart lease and accepts the exact
-                // target owner before the Task 1 success event can reset
+                // target owner before the success event finalizes provisional
                 // accounting. Keeping both transitions under this lock also
                 // makes persistence failure roll back policy and accounting
                 // together.
@@ -3311,6 +3327,8 @@ impl AppState {
                         active_context_accumulated_secs: m.active_context_accumulated_secs,
                         active_context_segment_started_at: m.active_context_segment_started_at,
                         active_context_restart_due: m.active_context_restart_due,
+                        active_context_accounting_provisional: m
+                            .active_context_accounting_provisional,
                     },
                 };
                 (k.clone(), session)
@@ -4755,6 +4773,64 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn provisional_active_context_due_delivery_waits_for_completion() {
+        // Break caught: even a stale or manually replayed due effect must not
+        // deliver while the target's accounting can still roll back.
+        let messages = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route(
+                "/session/{session_id}/prompt_async",
+                post(paneless_prompt_async_recorder),
+            )
+            .with_state(messages.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let data_dir = tempfile::tempdir().unwrap().keep();
+        let state = AppState::new(crate::config::OuijaConfig {
+            name: "provisional-active-context-test".into(),
+            npub: "npub1test".into(),
+            port: port - 320,
+            data_dir: data_dir.clone(),
+            config_dir: data_dir,
+        });
+        let mut metadata = strong_paneless_opencode_metadata(Some("ses_provisional"));
+        metadata.fresh_context_after_active_secs = Some(60);
+        metadata.active_context_accumulated_secs = 60;
+        metadata.active_context_restart_due = true;
+        metadata.active_context_accounting_provisional = true;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "provisional-worker".into(),
+                pane: None,
+                metadata,
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["provisional-worker"].owner();
+
+        notify_active_context_restart_due(&state, &owner).await;
+        assert!(
+            messages.lock().await.is_empty(),
+            "provisional target must not receive a due notice"
+        );
+
+        state
+            .protocol
+            .write()
+            .await
+            .sessions
+            .get_mut("provisional-worker")
+            .unwrap()
+            .metadata
+            .active_context_accounting_provisional = false;
+        notify_active_context_restart_due(&state, &owner).await;
+        assert_eq!(messages.lock().await.len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn delayed_paneless_due_delivery_skips_superseded_owner() {
         // Break caught: a detached due task can hold an old HTTP snapshot
         // after the public ID and backend ID have both been reused. Delivery
@@ -6040,9 +6116,58 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_restart_stage_persistence_failure_restores_literal_active_context_incumbent() {
+        // Break caught: provisional zeroing must not escape memory when the
+        // target row and rollback snapshot cannot be made durable together.
+        let config = test_config();
+        let state = AppState::new(config.clone());
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    fresh_context_after_active_secs: Some(60),
+                    active_context_accumulated_secs: 61,
+                    active_context_segment_started_at: Some(100),
+                    active_context_restart_due: true,
+                    last_metadata_update: Some(777),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let lease_owner = state.protocol.read().await.sessions["worker"].owner();
+        assert_eq!(
+            state.claim_existing_start(&lease_owner).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        let before_stage = state.protocol.read().await.clone();
+        std::fs::create_dir(config.data_dir.join("sessions.tmp")).unwrap();
+
+        let outcome = state
+            .stage_restart_launch(
+                &lease_owner,
+                "claude-code".into(),
+                true,
+                true,
+                Some(120),
+                None,
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            outcome,
+            crate::daemon_protocol::StageFreshLaunchOutcome::PersistenceFailed
+        );
+        assert_eq!(*state.protocol.read().await, before_stage);
+    }
+
+    #[tokio::test]
     async fn fresh_restart_completion_persistence_failure_preserves_active_context_accounting() {
-        // Break caught: a persistence error after fresh completion must roll
-        // back the requested policy and success reset as one state mutation.
+        // Break caught: a persistence error after fresh completion must keep
+        // the durable provisional target intact so exact rollback can restore
+        // the literal incumbent.
         let config = test_config();
         let state = AppState::new(config.clone());
         state
@@ -6059,13 +6184,22 @@ pub(crate) mod tests {
                 },
             })
             .await;
+        let literal_incumbent = state.protocol.read().await.sessions["worker"].clone();
         let lease_owner = state.protocol.read().await.sessions["worker"].owner();
         assert_eq!(
             state.claim_existing_start(&lease_owner).await.unwrap(),
             crate::daemon_protocol::LifecycleMutationOutcome::Applied
         );
         let target_owner = match state
-            .stage_restart_launch(&lease_owner, "claude-code".into(), true, None, None)
+            .stage_restart_launch(
+                &lease_owner,
+                "claude-code".into(),
+                true,
+                true,
+                Some(120),
+                None,
+                None,
+            )
             .await
         {
             crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
@@ -6097,15 +6231,30 @@ pub(crate) mod tests {
         let protocol = state.protocol.read().await;
         assert_eq!(protocol.sessions["worker"].owner(), target_owner);
         let metadata = &protocol.sessions["worker"].metadata;
-        assert_eq!(metadata.fresh_context_after_active_secs, Some(60));
-        assert_eq!(metadata.active_context_accumulated_secs, 61);
-        assert_eq!(metadata.active_context_segment_started_at, Some(100));
-        assert!(metadata.active_context_restart_due);
+        assert_eq!(metadata.fresh_context_after_active_secs, Some(120));
+        assert_eq!(metadata.active_context_accumulated_secs, 0);
+        assert_eq!(metadata.active_context_segment_started_at, None);
+        assert!(!metadata.active_context_restart_due);
+        assert!(metadata.active_context_accounting_provisional);
         assert_eq!(
             protocol.lifecycle_leases["worker"]
                 .restart_target_owner
                 .as_ref(),
             Some(&target_owner)
+        );
+        drop(protocol);
+
+        std::fs::remove_dir(config.data_dir.join("sessions.tmp")).unwrap();
+        assert_eq!(
+            state
+                .rollback_restart_launch(&lease_owner, &target_owner, None)
+                .await
+                .unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        assert_eq!(
+            state.protocol.read().await.sessions["worker"],
+            literal_incumbent
         );
     }
 
@@ -7754,6 +7903,7 @@ pub(crate) mod tests {
             active_context_accumulated_secs: 1_234,
             active_context_segment_started_at: Some(1_700_000_050),
             active_context_restart_due: true,
+            active_context_accounting_provisional: true,
         };
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -7898,6 +8048,7 @@ pub(crate) mod tests {
             Some(1_700_000_050)
         );
         assert!(hydrated.active_context_restart_due);
+        assert!(hydrated.active_context_accounting_provisional);
     }
 
     #[tokio::test]
@@ -7916,6 +8067,7 @@ pub(crate) mod tests {
                     active_context_accumulated_secs: 1_234,
                     active_context_segment_started_at: Some(1_700_000_000),
                     active_context_restart_due: true,
+                    active_context_accounting_provisional: true,
                     ..Default::default()
                 },
             })
@@ -7941,6 +8093,7 @@ pub(crate) mod tests {
             Some(1_700_000_000)
         );
         assert!(hydrated.active_context_restart_due);
+        assert!(hydrated.active_context_accounting_provisional);
     }
 
     #[tokio::test]

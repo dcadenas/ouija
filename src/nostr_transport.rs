@@ -3719,6 +3719,8 @@ async fn restart_session_claimed(
             lease_owner,
             backend_name.clone(),
             launches_new_backend_identity,
+            fresh,
+            fresh_context_after_active_secs,
             session_start_credential.clone(),
             repair_reservation.clone(),
         )
@@ -4622,9 +4624,9 @@ async fn restart_session_claimed(
                     // presence rather than carrying a stale bit across
                     // restart (the dir may have been recreated out of band).
                     worktree_present: None,
-                    // Task 1 adds durable active-context accounting. This
-                    // finalizer must preserve it; only the explicit exact-
-                    // owner fresh-success event may reset it.
+                    // The finalizer must preserve the live target's durable
+                    // accounting. Exact fresh success only finalizes its
+                    // provisional reset; it must not zero target work again.
                     fresh_context_after_active_secs: active_context_policy_for_launch(
                         m.fresh_context_after_active_secs,
                         fresh_context_after_active_secs,
@@ -4633,6 +4635,7 @@ async fn restart_session_claimed(
                     active_context_accumulated_secs: m.active_context_accumulated_secs,
                     active_context_segment_started_at: m.active_context_segment_started_at,
                     active_context_restart_due: m.active_context_restart_due,
+                    active_context_accounting_provisional: m.active_context_accounting_provisional,
                 },
                 None => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),
@@ -5268,7 +5271,15 @@ async fn soft_restart_session(
         return Err(());
     }
     let target_owner = match state
-        .stage_restart_launch(&lease_owner, "opencode".to_string(), true, None, None)
+        .stage_restart_launch(
+            &lease_owner,
+            "opencode".to_string(),
+            true,
+            true,
+            None,
+            None,
+            None,
+        )
         .await
     {
         crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
@@ -7561,6 +7572,11 @@ mod tests {
                 .active_context_accumulated_secs,
             0
         );
+        assert!(
+            !protocol.sessions["initial-policy"]
+                .metadata
+                .active_context_accounting_provisional
+        );
     }
 
     #[tokio::test]
@@ -7769,6 +7785,7 @@ mod tests {
         assert_eq!(metadata.active_context_accumulated_secs, 0);
         assert_eq!(metadata.active_context_segment_started_at, None);
         assert!(!metadata.active_context_restart_due);
+        assert!(!metadata.active_context_accounting_provisional);
         assert_eq!(metadata.prompt.as_deref(), Some("stored continuation"));
     }
 
@@ -7825,6 +7842,7 @@ mod tests {
         assert_eq!(metadata.active_context_accumulated_secs, 41);
         assert_eq!(metadata.active_context_segment_started_at, Some(100));
         assert!(metadata.active_context_restart_due);
+        assert!(!metadata.active_context_accounting_provisional);
     }
 
     #[tokio::test]
@@ -7874,6 +7892,7 @@ mod tests {
         assert_eq!(metadata.active_context_accumulated_secs, 0);
         assert_eq!(metadata.active_context_segment_started_at, None);
         assert!(!metadata.active_context_restart_due);
+        assert!(!metadata.active_context_accounting_provisional);
     }
 
     #[tokio::test]
@@ -7921,6 +7940,7 @@ mod tests {
         assert_eq!(metadata.fresh_context_after_active_secs, Some(120));
         assert_eq!(metadata.active_context_accumulated_secs, 0);
         assert!(!metadata.active_context_restart_due);
+        assert!(!metadata.active_context_accounting_provisional);
         assert_eq!(metadata.prompt, None);
     }
 
@@ -7949,7 +7969,15 @@ mod tests {
             crate::daemon_protocol::LifecycleMutationOutcome::Applied
         );
         let target_owner = match state
-            .stage_restart_launch(&lease_owner, "claude-code".into(), true, None, None)
+            .stage_restart_launch(
+                &lease_owner,
+                "claude-code".into(),
+                true,
+                true,
+                Some(120),
+                None,
+                None,
+            )
             .await
         {
             crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
@@ -7994,6 +8022,7 @@ mod tests {
         assert_eq!(metadata.active_context_accumulated_secs, 61);
         assert_eq!(metadata.active_context_segment_started_at, Some(100));
         assert!(metadata.active_context_restart_due);
+        assert!(!metadata.active_context_accounting_provisional);
     }
 
     #[tokio::test]
@@ -8092,6 +8121,7 @@ mod tests {
         assert_eq!(metadata.active_context_accumulated_secs, 61);
         assert_eq!(metadata.active_context_segment_started_at, Some(100));
         assert!(metadata.active_context_restart_due);
+        assert!(!metadata.active_context_accounting_provisional);
         assert!(proto.lifecycle_leases.is_empty());
         server.abort();
     }
@@ -10340,6 +10370,7 @@ mod tests {
         assert_eq!(metadata.active_context_accumulated_secs, 0);
         assert_eq!(metadata.active_context_segment_started_at, None);
         assert!(!metadata.active_context_restart_due);
+        assert!(!metadata.active_context_accounting_provisional);
         assert_eq!(metadata.prompt.as_deref(), Some("stored continuation"));
         server.abort();
     }

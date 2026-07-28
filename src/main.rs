@@ -1586,6 +1586,7 @@ fn persisted_session_from_entry(
             active_context_accumulated_secs: metadata.active_context_accumulated_secs,
             active_context_segment_started_at: metadata.active_context_segment_started_at,
             active_context_restart_due: metadata.active_context_restart_due,
+            active_context_accounting_provisional: metadata.active_context_accounting_provisional,
         },
     })
 }
@@ -4483,6 +4484,7 @@ mod tests {
             active_context_accumulated_secs: 1_234,
             active_context_segment_started_at: Some(1_700_000_003),
             active_context_restart_due: true,
+            active_context_accounting_provisional: true,
         };
 
         let restored = metadata_for_restored_session(&metadata);
@@ -4526,6 +4528,10 @@ mod tests {
         assert_eq!(
             restored.active_context_restart_due,
             metadata.active_context_restart_due
+        );
+        assert_eq!(
+            restored.active_context_accounting_provisional,
+            metadata.active_context_accounting_provisional
         );
     }
 
@@ -5550,6 +5556,11 @@ mod tests {
                             crate::daemon_protocol::OpenCodeBinding::StrongManaged,
                         ),
                         model: Some("incumbent-model".into()),
+                        fresh_context_after_active_secs: Some(60),
+                        active_context_accumulated_secs: 61,
+                        active_context_segment_started_at: Some(100),
+                        active_context_restart_due: true,
+                        last_metadata_update: Some(777),
                         session_incarnation: incumbent_owner.incarnation,
                         ..Default::default()
                     },
@@ -5563,13 +5574,30 @@ mod tests {
             crate::daemon_protocol::LifecycleMutationOutcome::Applied
         );
         let target_incarnation = match state
-            .stage_restart_launch(&incumbent_owner, "opencode".into(), true, None, None)
+            .stage_restart_launch(
+                &incumbent_owner,
+                "opencode".into(),
+                true,
+                true,
+                Some(120),
+                None,
+                None,
+            )
             .await
         {
             crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => incarnation,
             outcome => panic!("expected staged restart target, got {outcome:?}"),
         };
         assert_ne!(target_incarnation, incumbent_owner.incarnation);
+        {
+            let protocol = state.protocol.read().await;
+            let staged = &protocol.sessions["pending-restart"].metadata;
+            assert_eq!(staged.fresh_context_after_active_secs, Some(120));
+            assert_eq!(staged.active_context_accumulated_secs, 0);
+            assert_eq!(staged.active_context_segment_started_at, None);
+            assert!(!staged.active_context_restart_due);
+            assert!(staged.active_context_accounting_provisional);
+        }
         let target_owner = crate::daemon_protocol::ResourceOwner {
             session_id: incumbent_owner.session_id.clone(),
             incarnation: target_incarnation,
@@ -5604,6 +5632,21 @@ mod tests {
             Some("ses_incumbent")
         );
         assert_eq!(restored.metadata.model.as_deref(), Some("incumbent-model"));
+        assert_eq!(restored.metadata.fresh_context_after_active_secs, Some(60));
+        assert_eq!(restored.metadata.active_context_accumulated_secs, 61);
+        assert_eq!(
+            restored.metadata.active_context_segment_started_at,
+            Some(100)
+        );
+        assert!(restored.metadata.active_context_restart_due);
+        assert!(!restored.metadata.active_context_accounting_provisional);
+        assert_eq!(
+            restored
+                .metadata
+                .last_metadata_update
+                .map(|timestamp| timestamp.timestamp()),
+            Some(777)
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         server.abort();
     }

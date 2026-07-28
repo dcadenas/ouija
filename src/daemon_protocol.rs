@@ -404,6 +404,12 @@ pub struct SessionMeta {
     /// Whether the accumulated active time has reached the configured limit.
     #[serde(default)]
     pub active_context_restart_due: bool,
+    /// Whether this row contains a fresh restart target's staged accounting.
+    ///
+    /// The reset is externally final only after exact restart completion.
+    /// Rollback and daemon recovery restore the literal incumbent instead.
+    #[serde(default)]
+    pub active_context_accounting_provisional: bool,
 }
 
 /// In-memory authority for one explicit legacy-backend repair. The phase
@@ -732,6 +738,7 @@ impl SessionMeta {
         self.active_context_accumulated_secs = source.active_context_accumulated_secs;
         self.active_context_segment_started_at = source.active_context_segment_started_at;
         self.active_context_restart_due = source.active_context_restart_due;
+        self.active_context_accounting_provisional = source.active_context_accounting_provisional;
     }
 
     /// Merge a fresh-launch finalizer with its live staged owner. Omission (or
@@ -782,6 +789,7 @@ impl Default for SessionMeta {
             active_context_accumulated_secs: 0,
             active_context_segment_started_at: None,
             active_context_restart_due: false,
+            active_context_accounting_provisional: false,
         }
     }
 }
@@ -964,10 +972,15 @@ pub enum Event {
         owner: ResourceOwner,
         at: i64,
     },
-    /// Mark a conclusively successful fresh launch for its exact owner and
-    /// reset the active-context accounting. Failed or superseded launches use
-    /// no event and therefore retain their accounting. This is internal
-    /// accounting and deliberately does not bump `last_metadata_update`.
+    /// Mark a conclusively successful fresh launch for its exact owner.
+    ///
+    /// New restart targets finalize their already-reset provisional
+    /// accounting without erasing target work recorded after staging. A
+    /// serde-defaulted legacy target without that marker retains the older
+    /// completion-time reset behavior. Failed or superseded launches use no
+    /// event and therefore retain or roll back their accounting. This is
+    /// internal accounting and deliberately does not bump
+    /// `last_metadata_update`.
     FreshContextRestartSucceeded {
         owner: ResourceOwner,
     },
@@ -1321,6 +1334,7 @@ pub(crate) fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>
             active_context_accumulated_secs: m.active_context_accumulated_secs,
             active_context_segment_started_at: m.active_context_segment_started_at,
             active_context_restart_due: m.active_context_restart_due,
+            active_context_accounting_provisional: m.active_context_accounting_provisional,
         },
         None => SessionMeta::default(),
     }
@@ -2197,7 +2211,9 @@ impl DaemonState {
         if changed {
             effects.push(Effect::Persist);
         }
-        if session.metadata.active_context_restart_due {
+        if session.metadata.active_context_restart_due
+            && !session.metadata.active_context_accounting_provisional
+        {
             effects.push(Effect::ActiveContextRestartDue {
                 owner: owner.clone(),
             });
@@ -2206,6 +2222,7 @@ impl DaemonState {
     }
 
     fn apply_fresh_context_restart_succeeded(&mut self, owner: &ResourceOwner) -> Vec<Effect> {
+        let has_lifecycle_lease = self.lifecycle_leases.contains_key(&owner.session_id);
         let Some(session) = self.sessions.get_mut(&owner.session_id) else {
             return vec![];
         };
@@ -2213,6 +2230,20 @@ impl DaemonState {
             || session.metadata.session_incarnation != owner.incarnation
         {
             return vec![];
+        }
+
+        if session.metadata.active_context_accounting_provisional {
+            if has_lifecycle_lease {
+                return vec![];
+            }
+            session.metadata.active_context_accounting_provisional = false;
+            let mut effects = vec![Effect::Persist];
+            if session.metadata.active_context_restart_due {
+                effects.push(Effect::ActiveContextRestartDue {
+                    owner: owner.clone(),
+                });
+            }
+            return effects;
         }
 
         let changed = session.metadata.active_context_accumulated_secs != 0
@@ -2569,6 +2600,8 @@ impl DaemonState {
         lease_owner: &ResourceOwner,
         backend: String,
         replace_backend_identity: bool,
+        fresh: bool,
+        fresh_context_after_active_secs: Option<u64>,
         session_start_credential: Option<String>,
         expected_repair_reservation: Option<BackendRepairReservation>,
     ) -> StageFreshLaunchResult {
@@ -2630,6 +2663,17 @@ impl DaemonState {
             session.metadata.backend_session_id = None;
             session.metadata.session_start_credential = session_start_credential;
             session.metadata.opencode_binding = None;
+        }
+        if fresh {
+            if let Some(limit) = fresh_context_after_active_secs.filter(|limit| *limit > 0) {
+                session.metadata.fresh_context_after_active_secs = Some(limit);
+            }
+            session.metadata.active_context_accumulated_secs = 0;
+            session.metadata.active_context_segment_started_at = None;
+            session.metadata.active_context_restart_due = false;
+            session.metadata.active_context_accounting_provisional = true;
+        } else {
+            session.metadata.active_context_accounting_provisional = false;
         }
         session.metadata.restart_generation = session.metadata.restart_generation.saturating_add(1);
         session.metadata.session_incarnation = incarnation;
@@ -2987,7 +3031,8 @@ impl DaemonState {
         // A launch finalizer is built from an earlier metadata snapshot. It
         // may carry a newly configured policy, but it must never erase active
         // accounting accumulated by the live staged owner. Successful fresh
-        // launches reset only through FreshContextRestartSucceeded.
+        // launches only finalize the provisional reset through
+        // FreshContextRestartSucceeded.
         metadata.inherit_active_context_from_fresh_finalizer(&existing.metadata);
 
         let old_pane = existing.pane.clone();
@@ -6139,8 +6184,8 @@ mod tests {
 
     #[test]
     fn leased_restart_rollback_and_stale_completion_preserve_active_context_accounting() {
-        // Break caught: the manual-restart lease path must preserve durable
-        // accounting through staging, stale completion, and failed rollback.
+        // Break caught: stale completion must leave the provisional target
+        // untouched, while rollback restores the literal incumbent debt.
         let mut state = DaemonState::new("d1".into(), "host1".into());
         state.apply(Event::Register {
             id: "worker".into(),
@@ -6161,7 +6206,15 @@ mod tests {
             LifecycleMutationOutcome::Applied
         );
         let StageFreshLaunchOutcome::Staged { incarnation } = state
-            .stage_restart_launch(&incumbent, "claude-code".into(), true, None, None)
+            .stage_restart_launch(
+                &incumbent,
+                "claude-code".into(),
+                true,
+                true,
+                None,
+                None,
+                None,
+            )
             .outcome
         else {
             panic!("leased restart must stage");
@@ -6172,9 +6225,10 @@ mod tests {
         };
         let staged = state.sessions["worker"].metadata.clone();
         assert_eq!(staged.fresh_context_after_active_secs, Some(60));
-        assert_eq!(staged.active_context_accumulated_secs, 41);
-        assert_eq!(staged.active_context_segment_started_at, Some(100));
-        assert!(staged.active_context_restart_due);
+        assert_eq!(staged.active_context_accumulated_secs, 0);
+        assert_eq!(staged.active_context_segment_started_at, None);
+        assert!(!staged.active_context_restart_due);
+        assert!(staged.active_context_accounting_provisional);
         assert_eq!(staged.last_metadata_update, Some(777));
 
         let stale_target = ResourceOwner {
@@ -6199,14 +6253,15 @@ mod tests {
         assert_eq!(restored.active_context_accumulated_secs, 41);
         assert_eq!(restored.active_context_segment_started_at, Some(100));
         assert!(restored.active_context_restart_due);
+        assert!(!restored.active_context_accounting_provisional);
         assert_eq!(restored.last_metadata_update, Some(777));
     }
 
     #[test]
     fn leased_restart_finalizer_can_change_policy_and_exact_success_resets_accounting() {
-        // Break caught: the successful manual-restart route must retain the
-        // fresh policy update until its exact owner conclusively succeeds,
-        // then reset only accounting without changing metadata freshness.
+        // Break caught: the successful manual-restart route must stage the
+        // requested policy and zeroed accounting, then make that reset final
+        // without changing metadata freshness.
         let mut state = DaemonState::new("d1".into(), "host1".into());
         state.apply(Event::Register {
             id: "worker".into(),
@@ -6227,7 +6282,15 @@ mod tests {
             LifecycleMutationOutcome::Applied
         );
         let StageFreshLaunchOutcome::Staged { incarnation } = state
-            .stage_restart_launch(&incumbent, "claude-code".into(), true, None, None)
+            .stage_restart_launch(
+                &incumbent,
+                "claude-code".into(),
+                true,
+                true,
+                Some(120),
+                None,
+                None,
+            )
             .outcome
         else {
             panic!("leased restart must stage");
@@ -6248,9 +6311,10 @@ mod tests {
         assert_eq!(completed.outcome, LifecycleMutationOutcome::Applied);
         let metadata = &state.sessions["worker"].metadata;
         assert_eq!(metadata.fresh_context_after_active_secs, Some(120));
-        assert_eq!(metadata.active_context_accumulated_secs, 41);
-        assert_eq!(metadata.active_context_segment_started_at, Some(100));
-        assert!(metadata.active_context_restart_due);
+        assert_eq!(metadata.active_context_accumulated_secs, 0);
+        assert_eq!(metadata.active_context_segment_started_at, None);
+        assert!(!metadata.active_context_restart_due);
+        assert!(metadata.active_context_accounting_provisional);
         assert_eq!(metadata.last_metadata_update, Some(777));
 
         assert!(
@@ -6274,14 +6338,15 @@ mod tests {
         assert_eq!(metadata.active_context_accumulated_secs, 0);
         assert_eq!(metadata.active_context_segment_started_at, None);
         assert!(!metadata.active_context_restart_due);
+        assert!(!metadata.active_context_accounting_provisional);
         assert_eq!(metadata.last_metadata_update, Some(777));
     }
 
     #[test]
     fn leased_restart_finalizer_omitting_policy_preserves_it_until_exact_success() {
         // Break caught: fresh restart has no v1 disable operation. Omitting a
-        // replacement policy must preserve the live limit and accounting,
-        // while exact success resets accounting only.
+        // replacement policy must preserve the incumbent limit while exact
+        // success finalizes the staged accounting reset.
         let mut state = DaemonState::new("d1".into(), "host1".into());
         state.apply(Event::Register {
             id: "worker".into(),
@@ -6302,7 +6367,15 @@ mod tests {
             LifecycleMutationOutcome::Applied
         );
         let StageFreshLaunchOutcome::Staged { incarnation } = state
-            .stage_restart_launch(&incumbent, "claude-code".into(), true, None, None)
+            .stage_restart_launch(
+                &incumbent,
+                "claude-code".into(),
+                true,
+                true,
+                None,
+                None,
+                None,
+            )
             .outcome
         else {
             panic!("leased restart must stage");
@@ -6323,9 +6396,10 @@ mod tests {
         assert_eq!(completed.outcome, LifecycleMutationOutcome::Applied);
         let metadata = &state.sessions["worker"].metadata;
         assert_eq!(metadata.fresh_context_after_active_secs, Some(60));
-        assert_eq!(metadata.active_context_accumulated_secs, 41);
-        assert_eq!(metadata.active_context_segment_started_at, Some(100));
-        assert!(metadata.active_context_restart_due);
+        assert_eq!(metadata.active_context_accumulated_secs, 0);
+        assert_eq!(metadata.active_context_segment_started_at, None);
+        assert!(!metadata.active_context_restart_due);
+        assert!(metadata.active_context_accounting_provisional);
         assert_eq!(metadata.last_metadata_update, Some(777));
 
         let effects = state.apply(Event::FreshContextRestartSucceeded { owner: target });
@@ -6339,6 +6413,7 @@ mod tests {
         assert_eq!(metadata.active_context_accumulated_secs, 0);
         assert_eq!(metadata.active_context_segment_started_at, None);
         assert!(!metadata.active_context_restart_due);
+        assert!(!metadata.active_context_accounting_provisional);
         assert_eq!(metadata.last_metadata_update, Some(777));
     }
 
@@ -6461,12 +6536,14 @@ mod tests {
         assert_eq!(legacy.active_context_accumulated_secs, 0);
         assert_eq!(legacy.active_context_segment_started_at, None);
         assert!(!legacy.active_context_restart_due);
+        assert!(!legacy.active_context_accounting_provisional);
 
         let configured = SessionMeta {
             fresh_context_after_active_secs: Some(3_600),
             active_context_accumulated_secs: 1_234,
             active_context_segment_started_at: Some(1_700_000_000),
             active_context_restart_due: true,
+            active_context_accounting_provisional: true,
             ..Default::default()
         };
         let json = serde_json::to_string(&configured).unwrap();
@@ -6478,6 +6555,320 @@ mod tests {
             Some(1_700_000_000)
         );
         assert!(decoded.active_context_restart_due);
+        assert!(decoded.active_context_accounting_provisional);
+    }
+
+    #[test]
+    fn fresh_restart_stages_provisional_accounting_and_finalizes_without_erasing_target_work() {
+        // Break caught: resetting only at final completion erases any target
+        // Active/Stopped accounting recorded between stage and completion.
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("claude-code".into()),
+                fresh_context_after_active_secs: Some(60),
+                active_context_accumulated_secs: 41,
+                active_context_segment_started_at: Some(100),
+                active_context_restart_due: true,
+                last_metadata_update: Some(777),
+                ..Default::default()
+            },
+        });
+        let incumbent = state.sessions["worker"].owner();
+        let literal_incumbent = state.sessions["worker"].clone();
+        assert_eq!(
+            state.claim_existing_start(&incumbent),
+            LifecycleMutationOutcome::Applied
+        );
+
+        let StageFreshLaunchOutcome::Staged { incarnation } = state
+            .stage_restart_launch(
+                &incumbent,
+                "claude-code".into(),
+                true,
+                true,
+                Some(120),
+                None,
+                None,
+            )
+            .outcome
+        else {
+            panic!("fresh restart must stage");
+        };
+        let target = ResourceOwner {
+            session_id: "worker".into(),
+            incarnation,
+        };
+        assert_eq!(
+            state.lifecycle_leases["worker"].restart_previous.as_deref(),
+            Some(&literal_incumbent),
+            "rollback authority must retain the literal incumbent row"
+        );
+        let staged = &state.sessions["worker"].metadata;
+        assert_eq!(staged.fresh_context_after_active_secs, Some(120));
+        assert_eq!(staged.active_context_accumulated_secs, 0);
+        assert_eq!(staged.active_context_segment_started_at, None);
+        assert!(!staged.active_context_restart_due);
+        assert!(staged.active_context_accounting_provisional);
+        assert_eq!(staged.last_metadata_update, Some(777));
+
+        assert!(
+            state
+                .apply(Event::FreshContextRestartSucceeded {
+                    owner: target.clone(),
+                })
+                .is_empty(),
+            "success cannot finalize accounting before exact restart completion"
+        );
+
+        assert!(matches!(
+            state
+                .apply(Event::ActiveContextActive {
+                    owner: target.clone(),
+                    at: 200,
+                })
+                .as_slice(),
+            [Effect::Persist]
+        ));
+        let stopped = state.apply(Event::ActiveContextStopped {
+            owner: target.clone(),
+            at: 325,
+        });
+        assert!(
+            stopped
+                .iter()
+                .any(|effect| matches!(effect, Effect::Persist))
+        );
+        assert!(
+            !stopped
+                .iter()
+                .any(|effect| matches!(effect, Effect::ActiveContextRestartDue { .. })),
+            "an uncompleted provisional target cannot receive its due notice"
+        );
+
+        let mut stale_finalizer = literal_incumbent.metadata.clone();
+        stale_finalizer.fresh_context_after_active_secs = Some(120);
+        let completed = state.complete_restart_launch(
+            &incumbent,
+            &target,
+            Some("%1".into()),
+            stale_finalizer,
+            false,
+        );
+        assert_eq!(completed.outcome, LifecycleMutationOutcome::Applied);
+        let completed_metadata = &state.sessions["worker"].metadata;
+        assert_eq!(completed_metadata.active_context_accumulated_secs, 125);
+        assert_eq!(completed_metadata.active_context_segment_started_at, None);
+        assert!(completed_metadata.active_context_restart_due);
+        assert!(completed_metadata.active_context_accounting_provisional);
+
+        let finalized = state.apply(Event::FreshContextRestartSucceeded {
+            owner: target.clone(),
+        });
+        assert!(
+            finalized
+                .iter()
+                .any(|effect| matches!(effect, Effect::Persist))
+        );
+        assert!(finalized.iter().any(
+            |effect| matches!(effect, Effect::ActiveContextRestartDue { owner } if owner == &target)
+        ));
+        let metadata = &state.sessions["worker"].metadata;
+        assert_eq!(metadata.fresh_context_after_active_secs, Some(120));
+        assert_eq!(metadata.active_context_accumulated_secs, 125);
+        assert_eq!(metadata.active_context_segment_started_at, None);
+        assert!(metadata.active_context_restart_due);
+        assert!(!metadata.active_context_accounting_provisional);
+        assert_eq!(metadata.last_metadata_update, Some(777));
+    }
+
+    #[test]
+    fn fresh_restart_completion_preserves_an_open_target_segment() {
+        // Break caught: a pre-completion Active event must not be overwritten
+        // by stale finalizer metadata or by the success-only finalization.
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("claude-code".into()),
+                fresh_context_after_active_secs: Some(60),
+                active_context_accumulated_secs: 41,
+                ..Default::default()
+            },
+        });
+        let incumbent = state.sessions["worker"].owner();
+        assert_eq!(
+            state.claim_existing_start(&incumbent),
+            LifecycleMutationOutcome::Applied
+        );
+        let StageFreshLaunchOutcome::Staged { incarnation } = state
+            .stage_restart_launch(
+                &incumbent,
+                "claude-code".into(),
+                true,
+                true,
+                None,
+                None,
+                None,
+            )
+            .outcome
+        else {
+            panic!("fresh restart must stage");
+        };
+        let target = ResourceOwner {
+            session_id: "worker".into(),
+            incarnation,
+        };
+        state.apply(Event::ActiveContextActive {
+            owner: target.clone(),
+            at: 500,
+        });
+        let finalizer = SessionMeta {
+            backend: Some("claude-code".into()),
+            fresh_context_after_active_secs: Some(60),
+            ..Default::default()
+        };
+        assert_eq!(
+            state
+                .complete_restart_launch(&incumbent, &target, Some("%1".into()), finalizer, false,)
+                .outcome,
+            LifecycleMutationOutcome::Applied
+        );
+
+        state.apply(Event::FreshContextRestartSucceeded { owner: target });
+        let metadata = &state.sessions["worker"].metadata;
+        assert_eq!(metadata.active_context_accumulated_secs, 0);
+        assert_eq!(metadata.active_context_segment_started_at, Some(500));
+        assert!(!metadata.active_context_restart_due);
+        assert!(!metadata.active_context_accounting_provisional);
+    }
+
+    #[test]
+    fn fresh_restart_rollback_restores_literal_incumbent_after_target_activity() {
+        // Break caught: rollback must restore the snapshot, not merge the
+        // provisional target's policy or accounting into the incumbent.
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("claude-code".into()),
+                fresh_context_after_active_secs: Some(60),
+                active_context_accumulated_secs: 41,
+                active_context_segment_started_at: Some(100),
+                active_context_restart_due: true,
+                last_metadata_update: Some(777),
+                ..Default::default()
+            },
+        });
+        let incumbent = state.sessions["worker"].owner();
+        let literal_incumbent = state.sessions["worker"].clone();
+        assert_eq!(
+            state.claim_existing_start(&incumbent),
+            LifecycleMutationOutcome::Applied
+        );
+        let StageFreshLaunchOutcome::Staged { incarnation } = state
+            .stage_restart_launch(
+                &incumbent,
+                "claude-code".into(),
+                true,
+                true,
+                Some(120),
+                None,
+                None,
+            )
+            .outcome
+        else {
+            panic!("fresh restart must stage");
+        };
+        let target = ResourceOwner {
+            session_id: "worker".into(),
+            incarnation,
+        };
+        state.apply(Event::ActiveContextActive {
+            owner: target.clone(),
+            at: 200,
+        });
+        state.apply(Event::ActiveContextStopped {
+            owner: target.clone(),
+            at: 325,
+        });
+
+        assert_eq!(
+            state
+                .rollback_restart_launch(&incumbent, &target, None)
+                .outcome,
+            LifecycleMutationOutcome::Applied
+        );
+        assert_eq!(state.sessions["worker"], literal_incumbent);
+        assert!(!state.lifecycle_leases.contains_key("worker"));
+    }
+
+    #[test]
+    fn nonfresh_restart_preserves_accounting_and_emits_due_effect_before_completion() {
+        // Break caught: backend replacement is not freshness. A nonfresh
+        // restart must keep debt and continue notifying at safe boundaries.
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                fresh_context_after_active_secs: Some(60),
+                active_context_accumulated_secs: 59,
+                active_context_segment_started_at: Some(100),
+                ..Default::default()
+            },
+        });
+        let incumbent = state.sessions["worker"].owner();
+        assert_eq!(
+            state.claim_existing_start(&incumbent),
+            LifecycleMutationOutcome::Applied
+        );
+        let StageFreshLaunchOutcome::Staged { incarnation } = state
+            .stage_restart_launch(
+                &incumbent,
+                "codex-cli".into(),
+                true,
+                false,
+                Some(120),
+                Some("proof".into()),
+                None,
+            )
+            .outcome
+        else {
+            panic!("nonfresh restart must stage");
+        };
+        let target = ResourceOwner {
+            session_id: "worker".into(),
+            incarnation,
+        };
+        let staged = &state.sessions["worker"].metadata;
+        assert_eq!(staged.fresh_context_after_active_secs, Some(60));
+        assert_eq!(staged.active_context_accumulated_secs, 59);
+        assert_eq!(staged.active_context_segment_started_at, Some(100));
+        assert!(!staged.active_context_restart_due);
+        assert!(!staged.active_context_accounting_provisional);
+
+        let effects = state.apply(Event::ActiveContextStopped {
+            owner: target.clone(),
+            at: 101,
+        });
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Persist))
+        );
+        assert!(effects.iter().any(
+            |effect| matches!(effect, Effect::ActiveContextRestartDue { owner } if owner == &target)
+        ));
+        let staged = &state.sessions["worker"].metadata;
+        assert_eq!(staged.active_context_accumulated_secs, 60);
+        assert!(staged.active_context_restart_due);
+        assert!(!staged.active_context_accounting_provisional);
     }
 
     #[test]
@@ -7818,7 +8209,7 @@ mod tests {
         );
         assert!(matches!(
             state
-                .stage_restart_launch(&owner, "claude-code".into(), true, None, None)
+                .stage_restart_launch(&owner, "claude-code".into(), true, false, None, None, None,)
                 .outcome,
             StageFreshLaunchOutcome::Staged { .. }
         ));
@@ -8415,7 +8806,15 @@ mod tests {
             LifecycleMutationOutcome::Applied
         );
 
-        let staged = state.stage_restart_launch(&incumbent, "opencode".into(), false, None, None);
+        let staged = state.stage_restart_launch(
+            &incumbent,
+            "opencode".into(),
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
         let StageFreshLaunchOutcome::Staged {
             incarnation: target_incarnation,
         } = staged.outcome
@@ -8453,7 +8852,15 @@ mod tests {
         ));
         assert!(matches!(
             state
-                .stage_restart_launch(&incumbent, "opencode".into(), false, None, None)
+                .stage_restart_launch(
+                    &incumbent,
+                    "opencode".into(),
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                )
                 .outcome,
             StageFreshLaunchOutcome::Rejected
         ));
@@ -8481,6 +8888,8 @@ mod tests {
             &incumbent,
             "codex-cli".into(),
             true,
+            false,
+            None,
             Some("restart-proof".into()),
             None,
         );
@@ -8537,7 +8946,15 @@ mod tests {
             state.claim_existing_start(&incumbent),
             LifecycleMutationOutcome::Applied
         );
-        let staged = state.stage_restart_launch(&incumbent, "claude-code".into(), true, None, None);
+        let staged = state.stage_restart_launch(
+            &incumbent,
+            "claude-code".into(),
+            true,
+            false,
+            None,
+            None,
+            None,
+        );
         let StageFreshLaunchOutcome::Staged { incarnation } = staged.outcome else {
             panic!("restart target was not staged");
         };
@@ -8597,7 +9014,15 @@ mod tests {
             state.claim_existing_start(&incumbent),
             LifecycleMutationOutcome::Applied
         );
-        let staged = state.stage_restart_launch(&incumbent, "codex-cli".into(), true, None, None);
+        let staged = state.stage_restart_launch(
+            &incumbent,
+            "codex-cli".into(),
+            true,
+            false,
+            None,
+            None,
+            None,
+        );
         let StageFreshLaunchOutcome::Staged { incarnation } = staged.outcome else {
             panic!("restart target was not staged");
         };
@@ -8647,7 +9072,15 @@ mod tests {
             state.claim_existing_start(&incumbent),
             LifecycleMutationOutcome::Applied
         );
-        let staged = state.stage_restart_launch(&incumbent, "opencode".into(), true, None, None);
+        let staged = state.stage_restart_launch(
+            &incumbent,
+            "opencode".into(),
+            true,
+            false,
+            None,
+            None,
+            None,
+        );
         let StageFreshLaunchOutcome::Staged { incarnation } = staged.outcome else {
             panic!("restart target was not staged");
         };
@@ -8689,7 +9122,15 @@ mod tests {
             state.claim_existing_start(&incumbent),
             LifecycleMutationOutcome::Applied
         );
-        let staged = state.stage_restart_launch(&incumbent, "opencode".into(), true, None, None);
+        let staged = state.stage_restart_launch(
+            &incumbent,
+            "opencode".into(),
+            true,
+            false,
+            None,
+            None,
+            None,
+        );
         let StageFreshLaunchOutcome::Staged { incarnation } = staged.outcome else {
             panic!("restart target was not staged");
         };
@@ -12848,6 +13289,8 @@ mod stateright_model {
                                         &owner,
                                         "codex-cli".into(),
                                         true,
+                                        false,
+                                        None,
                                         Some("model-proof".into()),
                                         None,
                                     )

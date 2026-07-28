@@ -921,6 +921,8 @@ async fn stage_claimed_scheduled_existing_launch(
             expected_owner,
             backend_name.to_string(),
             replace_backend_identity,
+            false,
+            None,
             session_start_credential,
             None,
         )
