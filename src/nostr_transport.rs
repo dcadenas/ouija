@@ -133,6 +133,204 @@ fn resolve_restart_prompt(
     }
 }
 
+#[derive(Debug)]
+struct PreparedLaunchCommand {
+    command: String,
+    prompt_path: Option<PathBuf>,
+    cleanup_on_drop: bool,
+}
+
+impl PreparedLaunchCommand {
+    fn command(&self) -> &str {
+        &self.command
+    }
+
+    #[cfg(test)]
+    fn prompt_path(&self) -> Option<&Path> {
+        self.prompt_path.as_deref()
+    }
+
+    /// Transfer prompt-file cleanup to the shell command after tmux accepts
+    /// the launch. Before this point, dropping the guard removes the file.
+    fn mark_handed_off(&mut self) -> anyhow::Result<()> {
+        self.mark_handed_off_with_cleanup_delay(std::time::Duration::from_secs(30))
+    }
+
+    fn mark_handed_off_with_cleanup_delay(
+        &mut self,
+        cleanup_delay: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        let Some(path) = self.prompt_path.as_ref() else {
+            self.cleanup_on_drop = false;
+            return Ok(());
+        };
+        if !path.exists() {
+            self.prompt_path = None;
+            self.cleanup_on_drop = false;
+            return Ok(());
+        }
+
+        let cleanup_path = path.clone();
+        std::thread::Builder::new()
+            .name("ouija-prompt-cleanup".into())
+            .spawn(move || {
+                std::thread::sleep(cleanup_delay);
+                match std::fs::remove_file(&cleanup_path) {
+                    Ok(()) => {
+                        tracing::warn!(
+                            path = %cleanup_path.display(),
+                            "removed launch prompt that the accepted backend command did not consume"
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %cleanup_path.display(),
+                            "failed to remove handed-off launch prompt: {error}"
+                        );
+                    }
+                }
+            })
+            .context("failed to schedule handed-off launch prompt cleanup")?;
+
+        self.prompt_path = None;
+        self.cleanup_on_drop = false;
+        Ok(())
+    }
+}
+
+impl Drop for PreparedLaunchCommand {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop
+            && let Some(path) = self.prompt_path.as_deref()
+        {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "failed to remove unhanded launch prompt: {error}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn prepare_tui_launch_command(
+    backend_command: &str,
+    prompt: Option<&str>,
+) -> anyhow::Result<PreparedLaunchCommand> {
+    prepare_tui_launch_command_in(&std::env::temp_dir(), backend_command, prompt)
+}
+
+fn prepare_backend_launch_command(
+    is_http_api: bool,
+    backend_command: &str,
+    prompt: Option<&str>,
+) -> anyhow::Result<PreparedLaunchCommand> {
+    if is_http_api {
+        Ok(PreparedLaunchCommand {
+            command: backend_command.to_string(),
+            prompt_path: None,
+            cleanup_on_drop: false,
+        })
+    } else {
+        prepare_tui_launch_command(backend_command, prompt)
+    }
+}
+
+fn prepare_tui_launch_command_in(
+    temp_dir: &Path,
+    backend_command: &str,
+    prompt: Option<&str>,
+) -> anyhow::Result<PreparedLaunchCommand> {
+    let Some(prompt) = prompt else {
+        return Ok(PreparedLaunchCommand {
+            command: backend_command.to_string(),
+            prompt_path: None,
+            cleanup_on_drop: false,
+        });
+    };
+    prepare_tui_launch_command_in_with_writer(temp_dir, backend_command, prompt, |file, prompt| {
+        use std::io::Write;
+        file.write_all(prompt.as_bytes())
+    })
+}
+
+fn prepare_tui_launch_command_in_with_writer(
+    temp_dir: &Path,
+    backend_command: &str,
+    prompt: &str,
+    writer: impl FnOnce(&mut std::fs::File, &str) -> std::io::Result<()>,
+) -> anyhow::Result<PreparedLaunchCommand> {
+    let (path, mut file) = (0..16)
+        .find_map(|_| {
+            let path = temp_dir.join(format!(
+                "ouija-launch-prompt-{}-{:032x}",
+                std::process::id(),
+                rand::random::<u128>()
+            ));
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(file) => Some(Ok((path, file))),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .transpose()
+        .with_context(|| {
+            format!(
+                "failed to create private launch prompt in {}",
+                temp_dir.display()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "failed to create unique private launch prompt in {}",
+                temp_dir.display()
+            )
+        })?;
+
+    if let Err(error) = writer(&mut file, prompt) {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(error)
+            .with_context(|| format!("failed to write private launch prompt {}", path.display()));
+    }
+    drop(file);
+
+    let Some(path_text) = path.to_str() else {
+        let cleanup_error = std::fs::remove_file(&path).err();
+        anyhow::bail!(
+            "private launch prompt path is not valid UTF-8{}",
+            cleanup_error
+                .map(|error| format!("; cleanup failed: {error}"))
+                .unwrap_or_default()
+        );
+    };
+    let escaped_path = crate::scheduler::shell_escape(path_text);
+    let command = format!(
+        "ouija_launch_prompt=\"$(cat {escaped_path})\"; \
+         ouija_prompt_status=$?; rm -f {escaped_path} || exit $?; \
+         [ \"$ouija_prompt_status\" -eq 0 ] || exit \"$ouija_prompt_status\"; \
+         {backend_command} \"$ouija_launch_prompt\""
+    );
+
+    Ok(PreparedLaunchCommand {
+        command,
+        prompt_path: Some(path),
+        cleanup_on_drop: true,
+    })
+}
+
 fn start_registration_metadata(
     is_http_api: bool,
     pane_id: &str,
@@ -2341,26 +2539,6 @@ async fn start_session_with_prompt_storage(
     crate::backend::claude_code::pre_trust_workspace(&dir);
     crate::backend::pre_trust_mise(&dir);
 
-    // For TuiInjection: pass prompt as CLI arg via temp file.  This ensures
-    // CLAUDE.md and rules load before the prompt is processed (tmux injection
-    // can race with context loading).
-    //
-    // HttpApi backends receive prompts via HTTP (prompt_async), so we must NOT
-    // append the file to the command — otherwise the prompt text becomes an
-    // argument to `echo` and gets dumped to the terminal.
-    let full_cmd = if !is_http_api {
-        if let Some((ref prompt_text, _)) = pre_queued_prompt {
-            let prompt_path = format!("/tmp/ouija-prompt-{}.txt", name.replace('/', "-"));
-            std::fs::write(&prompt_path, prompt_text).ok();
-            let escaped_pf = crate::scheduler::shell_escape(&prompt_path);
-            format!("{backend_cmd} \"$(cat {escaped_pf})\" ; rm -f {escaped_pf}")
-        } else {
-            backend_cmd.clone()
-        }
-    } else {
-        backend_cmd.clone()
-    };
-
     let start_result = tokio::task::spawn_blocking({
         let tmux_session = tmux_session.clone();
         let window_name = window_name.clone();
@@ -2533,10 +2711,32 @@ async fn start_session_with_prompt_storage(
             }
 
             let pane_for_launch = pane_id.clone();
+            let mut prepared_command = match prepare_backend_launch_command(
+                is_http_api,
+                &backend_cmd,
+                pre_queued_prompt
+                    .as_ref()
+                    .map(|(prompt_text, _)| prompt_text.as_str()),
+            ) {
+                Ok(command) => command,
+                Err(error) => {
+                    cleanup_reserved_start(
+                        state,
+                        &owner,
+                        &pane_id,
+                        session_start_credential.as_deref(),
+                    )
+                    .await;
+                    return (
+                        format!("start failed to prepare launch prompt: {error}"),
+                        None,
+                    );
+                }
+            };
             let command = if is_http_api {
-                full_cmd.clone()
+                prepared_command.command().to_string()
             } else {
-                crate::tmux::close_shell_after(&full_cmd)
+                crate::tmux::close_shell_after(prepared_command.command())
             };
             let launch_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 crate::tmux::configure_managed_pane(&pane_for_launch);
@@ -2549,6 +2749,7 @@ async fn start_session_with_prompt_storage(
                 if !status.success() {
                     anyhow::bail!("tmux send-keys failed for pane {pane_for_launch}");
                 }
+                prepared_command.mark_handed_off()?;
                 Ok(())
             })
             .await;
@@ -3719,21 +3920,6 @@ async fn restart_session_claimed(
         None => claude_cmd,
     };
 
-    // For TuiInjection: pass prompt as CLI arg (same as start_session).
-    // This ensures CLAUDE.md and rules load before the prompt is processed.
-    let full_cmd = if !is_http_api {
-        if let Some(ref prompt_text) = formatted_prompt {
-            let prompt_path = format!("/tmp/ouija-prompt-{}.txt", name.replace('/', "-"));
-            std::fs::write(&prompt_path, prompt_text).ok();
-            let escaped_pf = crate::scheduler::shell_escape(&prompt_path);
-            format!("{claude_cmd} \"$(cat {escaped_pf})\" ; rm -f {escaped_pf}")
-        } else {
-            claude_cmd.clone()
-        }
-    } else {
-        claude_cmd.clone()
-    };
-
     let start_gate = if let Some(pane) = existing_pane.as_deref() {
         state
             .protocol
@@ -3748,7 +3934,8 @@ async fn restart_session_claimed(
     };
     let start_existing_pane = existing_pane.clone();
     let start_session_credential = session_start_credential.clone();
-    let start_full_cmd = full_cmd.clone();
+    let start_backend_cmd = claude_cmd.clone();
+    let start_prompt = formatted_prompt.clone();
     let start_operation = move || {
         tokio::task::spawn_blocking({
             let window_name = window_name.clone();
@@ -3757,7 +3944,8 @@ async fn restart_session_claimed(
             let pane_credential = start_session_credential;
             let pane_incarnation = staged_incarnation;
             let direct_restart_lease_owner = direct_restart_lease_owner.clone();
-            let respawn_cmd = start_full_cmd;
+            let backend_cmd = start_backend_cmd;
+            let prompt = start_prompt;
             move || -> anyhow::Result<(String, bool)> {
                 use std::process::Command;
 
@@ -3768,6 +3956,12 @@ async fn restart_session_claimed(
                 // we respawn with a bare shell and then send-keys instead of letting
                 // respawn-pane run the command directly (which would exit immediately).
                 if let Some(ref pane) = existing_pane {
+                    let mut prepared_command = prepare_backend_launch_command(
+                        is_http_api,
+                        &backend_cmd,
+                        prompt.as_deref(),
+                    )?;
+                    let respawn_cmd = prepared_command.command().to_string();
                     // See `pane_env_args` docs for why OUIJA_SESSION_ID must
                     // be set on every pane spawn (including respawn-pane).
                     let env_args = crate::tmux::pane_env_args(
@@ -3811,6 +4005,7 @@ async fn restart_session_claimed(
                                     );
                                 }
                             }
+                            prepared_command.mark_handed_off()?;
                             tracing::info!("restart: respawn-pane {pane} succeeded");
                             return Ok((pane.clone(), false));
                         }
@@ -3824,6 +4019,7 @@ async fn restart_session_claimed(
                             tracing::info!("restart: respawn-pane {pane} error: {e}");
                         }
                     }
+                    drop(prepared_command);
 
                     // A failed respawn can be ambiguous about whether tmux
                     // replaced the process before reporting failure. Remove the
@@ -4001,10 +4197,36 @@ async fn restart_session_claimed(
                 }
 
                 let pane_for_launch = pane_id.clone();
+                let mut prepared_command = match prepare_backend_launch_command(
+                    is_http_api,
+                    &claude_cmd,
+                    formatted_prompt.as_deref(),
+                ) {
+                    Ok(command) => command,
+                    Err(error) => {
+                        if let Err(rollback_error) = rollback_claimed_restart(
+                            state,
+                            lease_owner,
+                            &restart_target_owner,
+                            Some(&pane_id),
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "failed to durably roll back restart for {name}: {rollback_error}"
+                            );
+                        }
+                        return (
+                            format!("restart failed to prepare launch prompt: {error}"),
+                            None,
+                            RestartOutcome::Failed,
+                        );
+                    }
+                };
                 let command = if is_http_api {
-                    full_cmd.clone()
+                    prepared_command.command().to_string()
                 } else {
-                    crate::tmux::close_shell_after(&full_cmd)
+                    crate::tmux::close_shell_after(prepared_command.command())
                 };
                 let launch_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                     crate::tmux::configure_managed_pane(&pane_for_launch);
@@ -4015,6 +4237,7 @@ async fn restart_session_claimed(
                     if !status.success() {
                         anyhow::bail!("tmux send-keys failed for pane {pane_for_launch}");
                     }
+                    prepared_command.mark_handed_off()?;
                     Ok(())
                 })
                 .await;
@@ -8320,6 +8543,160 @@ mod tests {
             assert_eq!(resolved.launch.as_deref(), case.expected_launch);
             assert_eq!(resolved.stored.as_deref(), case.expected_stored);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tui_launch_prompt_files_are_unique_private_and_drop_cleaned() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first =
+            prepare_tui_launch_command_in(dir.path(), "backend", Some("first prompt")).unwrap();
+        let second =
+            prepare_tui_launch_command_in(dir.path(), "backend", Some("second prompt")).unwrap();
+        let first_path = first.prompt_path().unwrap().to_path_buf();
+        let second_path = second.prompt_path().unwrap().to_path_buf();
+
+        assert_ne!(first_path, second_path);
+        assert_eq!(
+            std::fs::metadata(&first_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&second_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        drop(first);
+        drop(second);
+        assert!(!first_path.exists());
+        assert!(!second_path.exists());
+    }
+
+    #[test]
+    fn tui_launch_prompt_preparation_propagates_creation_errors_without_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_directory = dir.path().join("plain-file");
+        std::fs::write(&not_a_directory, "occupied").unwrap();
+
+        let error =
+            prepare_tui_launch_command_in(&not_a_directory, "backend", Some("secret")).unwrap_err();
+
+        assert!(error.to_string().contains("launch prompt"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn tui_launch_prompt_preparation_cleans_partial_file_after_write_error() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let error = prepare_tui_launch_command_in_with_writer(
+            dir.path(),
+            "backend",
+            "secret",
+            |file, _| {
+                file.write_all(b"partial")?;
+                Err(std::io::Error::other("injected write failure"))
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("write private launch prompt"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tui_launch_prompt_rejects_non_utf8_temp_path_without_leaking_file() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let non_utf8 = root
+            .path()
+            .join(std::ffi::OsString::from_vec(b"non-utf8-\xff".to_vec()));
+        std::fs::create_dir(&non_utf8).unwrap();
+
+        let error =
+            prepare_tui_launch_command_in(&non_utf8, "backend", Some("secret")).unwrap_err();
+
+        assert!(error.to_string().contains("UTF-8"));
+        assert_eq!(std::fs::read_dir(&non_utf8).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn failed_absent_and_existing_tui_launch_guards_leave_no_prompt_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        for path_kind in ["absent-session start", "existing-session restart"] {
+            let prepared =
+                prepare_tui_launch_command_in(dir.path(), "backend", Some(path_kind)).unwrap();
+            let prompt_path = prepared.prompt_path().unwrap().to_path_buf();
+            assert!(prompt_path.exists());
+
+            // A failed tmux launch never hands ownership to the shell.
+            drop(prepared);
+            assert!(!prompt_path.exists(), "{path_kind} leaked its prompt file");
+        }
+    }
+
+    #[test]
+    fn accepted_but_unconsumed_absent_and_existing_launches_are_eventually_cleaned() {
+        let dir = tempfile::tempdir().unwrap();
+
+        for path_kind in ["absent-session start", "existing-session restart"] {
+            let mut prepared =
+                prepare_tui_launch_command_in(dir.path(), "backend", Some(path_kind)).unwrap();
+            let prompt_path = prepared.prompt_path().unwrap().to_path_buf();
+
+            prepared
+                .mark_handed_off_with_cleanup_delay(std::time::Duration::ZERO)
+                .unwrap();
+            for _ in 0..50 {
+                if !prompt_path.exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                !prompt_path.exists(),
+                "{path_kind} retained a prompt after its accepted launch never consumed it"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_tui_launch_unlinks_prompt_before_backend_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut prepared =
+            prepare_tui_launch_command_in(dir.path(), "printf '%s'", Some("secret")).unwrap();
+        let prompt_path = prepared.prompt_path().unwrap().to_path_buf();
+
+        let output = std::process::Command::new("sh")
+            .args(["-c", prepared.command()])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"secret");
+        assert!(!prompt_path.exists());
+
+        // Mirrors a successful tmux handoff. It remains harmless if the shell
+        // already consumed and unlinked the file before tmux returned.
+        prepared.mark_handed_off().unwrap();
+    }
+
+    #[test]
+    fn http_backend_launch_remains_file_free_and_does_not_embed_prompt() {
+        let prepared =
+            prepare_backend_launch_command(true, "opencode serve", Some("launch only")).unwrap();
+
+        assert_eq!(prepared.command(), "opencode serve");
+        assert!(prepared.prompt_path().is_none());
     }
 
     #[tokio::test]
