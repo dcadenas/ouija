@@ -2094,6 +2094,34 @@ impl AppState {
             pane,
             metadata,
             physical_respawned,
+            false,
+        ))
+    }
+
+    /// Complete a requested restart and reset active accounting only when fresh.
+    pub(crate) fn complete_requested_restart_launch(
+        self: &Arc<Self>,
+        lease_owner: &crate::daemon_protocol::ResourceOwner,
+        target_owner: &crate::daemon_protocol::ResourceOwner,
+        pane: Option<String>,
+        metadata: crate::daemon_protocol::SessionMeta,
+        physical_respawned: bool,
+        fresh: bool,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(self._complete_restart_launch(
+            lease_owner.clone(),
+            target_owner.clone(),
+            pane,
+            metadata,
+            physical_respawned,
+            fresh,
         ))
     }
 
@@ -2104,6 +2132,7 @@ impl AppState {
         pane: Option<String>,
         metadata: crate::daemon_protocol::SessionMeta,
         physical_respawned: bool,
+        fresh: bool,
     ) -> anyhow::Result<crate::daemon_protocol::LifecycleMutationOutcome> {
         let resource_event = crate::daemon_protocol::Event::RefreshLaunchMetadata {
             id: target_owner.session_id.clone(),
@@ -2115,13 +2144,26 @@ impl AppState {
         let (outcome, effects) = {
             let mut state = self.protocol.write().await;
             let before = state.clone();
-            let result = state.complete_restart_launch(
+            let mut result = state.complete_restart_launch(
                 &lease_owner,
                 &target_owner,
                 pane,
                 metadata,
                 physical_respawned,
             );
+            if fresh && result.outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied
+            {
+                // Completion removes the restart lease and accepts the exact
+                // target owner before the Task 1 success event can reset
+                // accounting. Keeping both transitions under this lock also
+                // makes persistence failure roll back policy and accounting
+                // together.
+                result.effects.extend(state.apply(
+                    crate::daemon_protocol::Event::FreshContextRestartSucceeded {
+                        owner: target_owner.clone(),
+                    },
+                ));
+            }
             if result.outcome == crate::daemon_protocol::LifecycleMutationOutcome::Applied
                 && let Err(error) = self.persist_protocol_state(&state)
             {
@@ -5539,6 +5581,76 @@ pub(crate) mod tests {
             crate::daemon_protocol::StageFreshLaunchOutcome::PersistenceFailed
         );
         assert_eq!(*state.protocol.read().await, before);
+    }
+
+    #[tokio::test]
+    async fn fresh_restart_completion_persistence_failure_preserves_active_context_accounting() {
+        // Break caught: a persistence error after fresh completion must roll
+        // back the requested policy and success reset as one state mutation.
+        let config = test_config();
+        let state = AppState::new(config.clone());
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    fresh_context_after_active_secs: Some(60),
+                    active_context_accumulated_secs: 61,
+                    active_context_segment_started_at: Some(100),
+                    active_context_restart_due: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+        let lease_owner = state.protocol.read().await.sessions["worker"].owner();
+        assert_eq!(
+            state.claim_existing_start(&lease_owner).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        let target_owner = match state
+            .stage_restart_launch(&lease_owner, "claude-code".into(), true, None, None)
+            .await
+        {
+            crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
+                crate::daemon_protocol::ResourceOwner {
+                    session_id: "worker".into(),
+                    incarnation,
+                }
+            }
+            other => panic!("expected staged restart, got {other:?}"),
+        };
+        let mut final_metadata = state.protocol.read().await.sessions["worker"]
+            .metadata
+            .clone();
+        final_metadata.fresh_context_after_active_secs = Some(120);
+        std::fs::create_dir(config.data_dir.join("sessions.tmp")).unwrap();
+
+        let result = state
+            .complete_requested_restart_launch(
+                &lease_owner,
+                &target_owner,
+                None,
+                final_metadata,
+                false,
+                true,
+            )
+            .await;
+
+        assert!(result.is_err());
+        let protocol = state.protocol.read().await;
+        assert_eq!(protocol.sessions["worker"].owner(), target_owner);
+        let metadata = &protocol.sessions["worker"].metadata;
+        assert_eq!(metadata.fresh_context_after_active_secs, Some(60));
+        assert_eq!(metadata.active_context_accumulated_secs, 61);
+        assert_eq!(metadata.active_context_segment_started_at, Some(100));
+        assert!(metadata.active_context_restart_due);
+        assert_eq!(
+            protocol.lifecycle_leases["worker"]
+                .restart_target_owner
+                .as_ref(),
+            Some(&target_owner)
+        );
     }
 
     /// Config whose opencode serve port (`config.port + 320` = 320) is

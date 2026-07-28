@@ -133,6 +133,18 @@ fn resolve_restart_prompt(
     }
 }
 
+fn active_context_policy_for_launch(
+    previous: Option<u64>,
+    requested: Option<u64>,
+    fresh: bool,
+) -> Option<u64> {
+    if fresh {
+        requested.or(previous)
+    } else {
+        previous
+    }
+}
+
 #[derive(Debug)]
 struct PreparedLaunchCommand {
     command: String,
@@ -2235,8 +2247,7 @@ pub async fn start_session(
     .await
 }
 
-/// Start a new session while carrying an API-validated active-context policy
-/// to the lifecycle boundary. Applying it is intentionally deferred to Task 4.
+/// Start a new session with an API-validated active-context policy.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_session_with_active_context_policy(
     state: &std::sync::Arc<AppState>,
@@ -2304,9 +2315,6 @@ async fn start_session_with_prompt_storage(
     fresh_context_after_active_secs: Option<u64>,
     reserved_owner: Option<crate::daemon_protocol::ResourceOwner>,
 ) -> (String, Option<u64>) {
-    // Task 3 validates and carries the requested policy to the lifecycle
-    // boundary. Task 4 owns applying it to durable metadata and accounting.
-    let _ = fresh_context_after_active_secs;
     let backend = match backend {
         Some(b) => match state.backends.get_required(b) {
             Ok(backend) => backend,
@@ -2692,6 +2700,11 @@ async fn start_session_with_prompt_storage(
                 parent_session: parent_session.map(String::from),
                 idle_policy: idle_policy.clone(),
                 prompt: stored_prompt.map(String::from),
+                fresh_context_after_active_secs: active_context_policy_for_launch(
+                    None,
+                    fresh_context_after_active_secs,
+                    true,
+                ),
                 ..Default::default()
             };
             match Box::pin(state.commit_reserved_start(&owner, Some(pane_id.clone()), initial_meta))
@@ -2857,6 +2870,11 @@ async fn start_session_with_prompt_storage(
                 parent_session: parent_session.map(String::from),
                 idle_policy,
                 prompt: stored_prompt.map(String::from),
+                fresh_context_after_active_secs: active_context_policy_for_launch(
+                    None,
+                    fresh_context_after_active_secs,
+                    true,
+                ),
                 ..Default::default()
             };
             match finalize_reserved_start(state, &owner, registration_pane, proto_meta).await {
@@ -3251,9 +3269,7 @@ pub async fn restart_session_for_start(
     .await
 }
 
-/// Restart a claimed session while carrying an API-validated active-context
-/// policy to the lifecycle boundary. Applying it is intentionally deferred to
-/// Task 4.
+/// Restart a claimed session with an API-validated active-context policy.
 #[allow(clippy::too_many_arguments)]
 pub async fn restart_session_for_start_with_active_context_policy(
     state: &std::sync::Arc<AppState>,
@@ -3567,9 +3583,6 @@ async fn restart_session_claimed(
     parent_session_override: ParentSessionOverride,
     idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
 ) -> (String, Option<u64>, RestartOutcome) {
-    // Task 3 validates and carries the requested policy to the lifecycle
-    // boundary. Task 4 owns applying it to durable metadata and accounting.
-    let _ = fresh_context_after_active_secs;
     // Snapshot only while the exact incumbent and durable restart claim still
     // agree. Every public caller claims this authority before reaching any
     // HTTP, tmux, process, attach, readiness, or prompt work.
@@ -3759,6 +3772,7 @@ async fn restart_session_claimed(
                 &dir,
                 resolved_prompt.launch.as_deref(),
                 prompt,
+                fresh_context_after_active_secs,
                 from,
                 expects_reply,
                 effective_manual_reminder.as_deref(),
@@ -4611,7 +4625,11 @@ async fn restart_session_claimed(
                     // Task 1 adds durable active-context accounting. This
                     // finalizer must preserve it; only the explicit exact-
                     // owner fresh-success event may reset it.
-                    fresh_context_after_active_secs: m.fresh_context_after_active_secs,
+                    fresh_context_after_active_secs: active_context_policy_for_launch(
+                        m.fresh_context_after_active_secs,
+                        fresh_context_after_active_secs,
+                        fresh,
+                    ),
                     active_context_accumulated_secs: m.active_context_accumulated_secs,
                     active_context_segment_started_at: m.active_context_segment_started_at,
                     active_context_restart_due: m.active_context_restart_due,
@@ -4629,16 +4647,22 @@ async fn restart_session_claimed(
                     parent_session: effective_parent_session.clone(),
                     idle_policy: effective_idle_policy.clone(),
                     prompt: resolved_prompt.stored.clone(),
+                    fresh_context_after_active_secs: active_context_policy_for_launch(
+                        None,
+                        fresh_context_after_active_secs,
+                        fresh,
+                    ),
                     ..Default::default()
                 },
             };
             match state
-                .complete_restart_launch(
+                .complete_requested_restart_launch(
                     lease_owner,
                     &restart_target_owner,
                     Some(pane_id.clone()),
                     proto_meta,
                     true,
+                    fresh,
                 )
                 .await
             {
@@ -4829,6 +4853,7 @@ async fn soft_restart_session_claimed(
     project_dir: &str,
     prompt: Option<&str>,
     prompt_replacement: Option<&str>,
+    fresh_context_after_active_secs: Option<u64>,
     from: Option<&str>,
     expects_reply: Option<bool>,
     reminder: Option<&str>,
@@ -5015,6 +5040,7 @@ async fn soft_restart_session_claimed(
                         restart_generation,
                         SoftRestartMetadataUpdate {
                             prompt_replacement,
+                            fresh_context_after_active_secs,
                             reminder,
                             parent_session: parent_session_override.clone(),
                             idle_policy: idle_policy.clone(),
@@ -5183,6 +5209,7 @@ async fn soft_restart_session_claimed(
             restart_generation,
             SoftRestartMetadataUpdate {
                 prompt_replacement,
+                fresh_context_after_active_secs,
                 reminder,
                 parent_session: parent_session_override,
                 idle_policy,
@@ -5265,6 +5292,7 @@ async fn soft_restart_session(
         project_dir,
         prompt,
         None,
+        None,
         from,
         expects_reply,
         reminder,
@@ -5343,6 +5371,9 @@ async fn complete_soft_restart_metadata(
     if let Some(prompt) = update.prompt_replacement {
         metadata.prompt = Some(prompt.to_string());
     }
+    if let Some(limit) = update.fresh_context_after_active_secs {
+        metadata.fresh_context_after_active_secs = Some(limit);
+    }
     match update.parent_session {
         ParentSessionOverride::PreservePrevious => {}
         ParentSessionOverride::SetParent(parent) => {
@@ -5362,12 +5393,13 @@ async fn complete_soft_restart_metadata(
         metadata.effort = Some(effort.to_string());
     }
     match state
-        .complete_restart_launch(
+        .complete_requested_restart_launch(
             lease_owner,
             target_owner,
             pane.map(str::to_owned),
             metadata,
             false,
+            true,
         )
         .await
     {
@@ -5433,6 +5465,9 @@ async fn apply_soft_restart_metadata(
             if let Some(prompt) = update.prompt_replacement {
                 session.metadata.prompt = Some(prompt.to_string());
             }
+            if let Some(limit) = update.fresh_context_after_active_secs {
+                session.metadata.fresh_context_after_active_secs = Some(limit);
+            }
             match update.parent_session {
                 ParentSessionOverride::PreservePrevious => {}
                 ParentSessionOverride::SetParent(parent) => {
@@ -5462,6 +5497,7 @@ async fn apply_soft_restart_metadata(
 #[derive(Default)]
 struct SoftRestartMetadataUpdate<'a> {
     prompt_replacement: Option<&'a str>,
+    fresh_context_after_active_secs: Option<u64>,
     reminder: Option<&'a str>,
     parent_session: ParentSessionOverride,
     idle_policy: Option<crate::daemon_protocol::IdlePolicy>,
@@ -7470,6 +7506,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reserved_initial_start_retains_requested_active_context_policy() {
+        // Break caught: the initial reserved start and its later launch
+        // finalizer must both retain the policy selected from API ingress.
+        let state = AppState::new_for_test();
+        let owner = match reserve_start_for_launch(&state, "initial-policy")
+            .await
+            .unwrap()
+        {
+            crate::daemon_protocol::StartDisposition::Reserved(owner) => owner,
+            other => panic!("expected reservation, got {other:?}"),
+        };
+        let selected_policy = active_context_policy_for_launch(None, Some(120), true);
+        assert_eq!(
+            state
+                .commit_reserved_start(
+                    &owner,
+                    None,
+                    crate::daemon_protocol::SessionMeta {
+                        fresh_context_after_active_secs: selected_policy,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        assert_eq!(
+            finalize_reserved_start(
+                &state,
+                &owner,
+                None,
+                crate::daemon_protocol::SessionMeta {
+                    fresh_context_after_active_secs: selected_policy,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        state.abort_lifecycle(&owner).await.unwrap();
+
+        let protocol = state.protocol.read().await;
+        assert_eq!(
+            protocol.sessions["initial-policy"]
+                .metadata
+                .fresh_context_after_active_secs,
+            Some(120)
+        );
+        assert_eq!(
+            protocol.sessions["initial-policy"]
+                .metadata
+                .active_context_accumulated_secs,
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn stale_start_failure_cannot_remove_same_pane_replacement() {
         let state = AppState::new_for_test();
         let owner = match reserve_start_for_launch(&state, "same-id").await.unwrap() {
@@ -7628,6 +7722,281 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hard_fresh_restart_applies_active_context_policy_only_after_completion() {
+        // Break caught: a successful hard fresh restart must apply the requested
+        // limit and reset the previous incarnation's active-time accounting.
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "hard-fresh".into(),
+                pane: Some("%definitely-not-a-live-managed-pane".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    prompt: Some("stored continuation".into()),
+                    fresh_context_after_active_secs: Some(60),
+                    active_context_accumulated_secs: 61,
+                    active_context_segment_started_at: Some(100),
+                    active_context_restart_due: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (message, _, outcome) = restart_session_with_prompt_controls(
+            &state,
+            "hard-fresh",
+            true,
+            Some(120),
+            None,
+            None,
+            false,
+            Some("one-shot continuation"),
+            None,
+            None,
+            Some("claude-code"),
+            None,
+            None,
+            None,
+            ParentSessionOverride::PreservePrevious,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, RestartOutcome::Restarted, "{message}");
+        let protocol = state.protocol.read().await;
+        let metadata = &protocol.sessions["hard-fresh"].metadata;
+        assert_eq!(metadata.fresh_context_after_active_secs, Some(120));
+        assert_eq!(metadata.active_context_accumulated_secs, 0);
+        assert_eq!(metadata.active_context_segment_started_at, None);
+        assert!(!metadata.active_context_restart_due);
+        assert_eq!(metadata.prompt.as_deref(), Some("stored continuation"));
+    }
+
+    #[tokio::test]
+    async fn nonfresh_restart_with_new_backend_identity_preserves_active_context() {
+        // Break caught: backend-identity replacement is not itself a fresh
+        // context restart and must not reset or replace active-time state.
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "nonfresh-recovery".into(),
+                pane: Some("%definitely-not-a-live-managed-pane".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    backend_session_id: None,
+                    fresh_context_after_active_secs: Some(60),
+                    active_context_accumulated_secs: 41,
+                    active_context_segment_started_at: Some(100),
+                    active_context_restart_due: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let owner = state.protocol.read().await.sessions["nonfresh-recovery"].owner();
+        assert_eq!(
+            state.claim_existing_start(&owner).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        let (message, _, outcome) = restart_session_for_start_with_active_context_policy(
+            &state,
+            &owner,
+            "nonfresh-recovery",
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("claude-code"),
+            None,
+            None,
+            None,
+            ParentSessionOverride::PreservePrevious,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, RestartOutcome::Restarted, "{message}");
+        let protocol = state.protocol.read().await;
+        let metadata = &protocol.sessions["nonfresh-recovery"].metadata;
+        assert_ne!(metadata.session_incarnation, owner.incarnation);
+        assert_eq!(metadata.fresh_context_after_active_secs, Some(60));
+        assert_eq!(metadata.active_context_accumulated_secs, 41);
+        assert_eq!(metadata.active_context_segment_started_at, Some(100));
+        assert!(metadata.active_context_restart_due);
+    }
+
+    #[tokio::test]
+    async fn hard_fresh_restart_omission_preserves_active_context_policy_and_resets_accounting() {
+        // Break caught: omitting the policy on an authorized fresh restart
+        // preserves the incumbent limit while still resetting elapsed state.
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "fresh-omission".into(),
+                pane: Some("%definitely-not-a-live-managed-pane".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    fresh_context_after_active_secs: Some(60),
+                    active_context_accumulated_secs: 61,
+                    active_context_segment_started_at: Some(100),
+                    active_context_restart_due: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (message, _, outcome) = restart_session_with_prompt_controls(
+            &state,
+            "fresh-omission",
+            true,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some("claude-code"),
+            None,
+            None,
+            None,
+            ParentSessionOverride::PreservePrevious,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, RestartOutcome::Restarted, "{message}");
+        let protocol = state.protocol.read().await;
+        let metadata = &protocol.sessions["fresh-omission"].metadata;
+        assert_eq!(metadata.fresh_context_after_active_secs, Some(60));
+        assert_eq!(metadata.active_context_accumulated_secs, 0);
+        assert_eq!(metadata.active_context_segment_started_at, None);
+        assert!(!metadata.active_context_restart_due);
+    }
+
+    #[tokio::test]
+    async fn hard_fresh_promptless_one_shot_applies_active_context_policy_without_storing_prompt() {
+        // Break caught: a one-shot-only continuation must not become the
+        // stored base prompt while fresh-policy completion still resets state.
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "promptless-one-shot".into(),
+                pane: Some("%definitely-not-a-live-managed-pane".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    fresh_context_after_active_secs: Some(60),
+                    active_context_accumulated_secs: 61,
+                    active_context_restart_due: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let (message, _, outcome) = restart_session_with_prompt_controls(
+            &state,
+            "promptless-one-shot",
+            true,
+            Some(120),
+            None,
+            None,
+            false,
+            Some("one-shot continuation"),
+            None,
+            None,
+            Some("claude-code"),
+            None,
+            None,
+            None,
+            ParentSessionOverride::PreservePrevious,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, RestartOutcome::Restarted, "{message}");
+        let protocol = state.protocol.read().await;
+        let metadata = &protocol.sessions["promptless-one-shot"].metadata;
+        assert_eq!(metadata.fresh_context_after_active_secs, Some(120));
+        assert_eq!(metadata.active_context_accumulated_secs, 0);
+        assert!(!metadata.active_context_restart_due);
+        assert_eq!(metadata.prompt, None);
+    }
+
+    #[tokio::test]
+    async fn rolled_back_fresh_completion_preserves_active_context_policy_and_accounting() {
+        // Break caught: a stale success finalizer after rollback must not apply
+        // the requested policy or reset the restored incumbent's accounting.
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "rolled-back".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    fresh_context_after_active_secs: Some(60),
+                    active_context_accumulated_secs: 61,
+                    active_context_segment_started_at: Some(100),
+                    active_context_restart_due: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+        let lease_owner = state.protocol.read().await.sessions["rolled-back"].owner();
+        assert_eq!(
+            state.claim_existing_start(&lease_owner).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        let target_owner = match state
+            .stage_restart_launch(&lease_owner, "claude-code".into(), true, None, None)
+            .await
+        {
+            crate::daemon_protocol::StageFreshLaunchOutcome::Staged { incarnation } => {
+                crate::daemon_protocol::ResourceOwner {
+                    session_id: "rolled-back".into(),
+                    incarnation,
+                }
+            }
+            other => panic!("expected staged restart, got {other:?}"),
+        };
+        assert_eq!(
+            state
+                .rollback_restart_launch(&lease_owner, &target_owner, None)
+                .await
+                .unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+
+        let stale_outcome = state
+            .complete_requested_restart_launch(
+                &lease_owner,
+                &target_owner,
+                None,
+                crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    fresh_context_after_active_secs: Some(120),
+                    ..Default::default()
+                },
+                false,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stale_outcome,
+            crate::daemon_protocol::LifecycleMutationOutcome::NotFound
+        );
+        let protocol = state.protocol.read().await;
+        let metadata = &protocol.sessions["rolled-back"].metadata;
+        assert_eq!(metadata.fresh_context_after_active_secs, Some(60));
+        assert_eq!(metadata.active_context_accumulated_secs, 61);
+        assert_eq!(metadata.active_context_segment_started_at, Some(100));
+        assert!(metadata.active_context_restart_due);
+    }
+
+    #[tokio::test]
     async fn failed_opencode_recreate_restores_incumbent() {
         use axum::Json;
         use axum::Router;
@@ -7674,6 +8043,10 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.path().to_string_lossy().into_owned()),
                     backend: Some("opencode".into()),
+                    fresh_context_after_active_secs: Some(60),
+                    active_context_accumulated_secs: 61,
+                    active_context_segment_started_at: Some(100),
+                    active_context_restart_due: true,
                     ..Default::default()
                 },
             })
@@ -7688,11 +8061,12 @@ mod tests {
             crate::daemon_protocol::LifecycleMutationOutcome::Applied
         );
 
-        let (_, _, outcome) = restart_session_for_start(
+        let (_, _, outcome) = restart_session_for_start_with_active_context_policy(
             &state,
             &owner,
             "same-id",
-            false,
+            true,
+            Some(120),
             None,
             None,
             None,
@@ -7713,6 +8087,11 @@ mod tests {
         );
         let proto = state.protocol.read().await;
         assert_eq!(proto.sessions["same-id"], previous);
+        let metadata = &proto.sessions["same-id"].metadata;
+        assert_eq!(metadata.fresh_context_after_active_secs, Some(60));
+        assert_eq!(metadata.active_context_accumulated_secs, 61);
+        assert_eq!(metadata.active_context_segment_started_at, Some(100));
+        assert!(metadata.active_context_restart_due);
         assert!(proto.lifecycle_leases.is_empty());
         server.abort();
     }
@@ -8737,6 +9116,28 @@ mod tests {
             assert_eq!(resolved.launch.as_deref(), case.expected_launch);
             assert_eq!(resolved.stored.as_deref(), case.expected_stored);
         }
+    }
+
+    #[test]
+    fn active_context_policy_selection_applies_only_to_initial_or_fresh_launches() {
+        // Break caught: initial spawn and authorized fresh restart may apply a
+        // request; omission and nonfresh recovery preserve the current limit.
+        assert_eq!(
+            active_context_policy_for_launch(None, Some(120), true),
+            Some(120)
+        );
+        assert_eq!(
+            active_context_policy_for_launch(Some(60), Some(120), true),
+            Some(120)
+        );
+        assert_eq!(
+            active_context_policy_for_launch(Some(60), None, true),
+            Some(60)
+        );
+        assert_eq!(
+            active_context_policy_for_launch(Some(60), Some(120), false),
+            Some(60)
+        );
     }
 
     #[cfg(unix)]
@@ -9840,6 +10241,106 @@ mod tests {
             metadata.idle_policy,
             Some(crate::daemon_protocol::IdlePolicy::CloseWhenDone)
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn soft_fresh_restart_applies_active_context_policy_after_stored_one_shot_acceptance() {
+        // Break caught: the OpenCode completion path must apply the requested
+        // fresh-context limit and reset accounting only after prompt acceptance.
+        use axum::Json;
+        use axum::Router;
+        use axum::extract::State as AxumState;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::Arc as StdArc;
+        use tokio::net::TcpListener;
+        use tokio::sync::Mutex;
+
+        async fn create_session() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "id": "ses_new" }))
+        }
+
+        async fn prompt_async(
+            AxumState(captured): AxumState<StdArc<Mutex<Option<String>>>>,
+            Json(body): Json<serde_json::Value>,
+        ) -> StatusCode {
+            *captured.lock().await = body["parts"][0]["text"].as_str().map(String::from);
+            StatusCode::NO_CONTENT
+        }
+
+        let captured = StdArc::new(Mutex::new(None));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/session", post(create_session))
+            .route("/session/{session_id}/prompt_async", post(prompt_async))
+            .with_state(captured.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = AppState::new(config);
+        {
+            let mut protocol = state.protocol.write().await;
+            protocol.apply(crate::daemon_protocol::Event::Register {
+                id: "soft-fresh".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some(dir.path().display().to_string()),
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_old".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    prompt: Some("stored continuation".into()),
+                    fresh_context_after_active_secs: Some(60),
+                    active_context_accumulated_secs: 61,
+                    active_context_segment_started_at: Some(100),
+                    active_context_restart_due: true,
+                    ..Default::default()
+                },
+            });
+        }
+
+        let (message, _, outcome) = restart_session_with_prompt_controls(
+            &state,
+            "soft-fresh",
+            true,
+            Some(120),
+            None,
+            None,
+            false,
+            Some("one-shot continuation"),
+            None,
+            None,
+            Some("opencode"),
+            None,
+            None,
+            None,
+            ParentSessionOverride::PreservePrevious,
+            None,
+        )
+        .await;
+
+        assert_eq!(outcome, RestartOutcome::Restarted, "{message}");
+        assert_eq!(
+            captured.lock().await.as_deref(),
+            Some("stored continuation\n\none-shot continuation")
+        );
+        let protocol = state.protocol.read().await;
+        let metadata = &protocol.sessions["soft-fresh"].metadata;
+        assert_eq!(metadata.fresh_context_after_active_secs, Some(120));
+        assert_eq!(metadata.active_context_accumulated_secs, 0);
+        assert_eq!(metadata.active_context_segment_started_at, None);
+        assert!(!metadata.active_context_restart_due);
+        assert_eq!(metadata.prompt.as_deref(), Some("stored continuation"));
         server.abort();
     }
 
