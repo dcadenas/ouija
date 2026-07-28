@@ -87,6 +87,10 @@ fn cli_reports_version(cli_name: &str) -> bool {
 /// Best-effort: no-op when mise isn't installed, when the dir has no mise
 /// config, or when `mise trust` fails for any reason.
 pub fn pre_trust_mise(dir: &str) {
+    if cfg!(test) {
+        return;
+    }
+
     for path in mise_config_paths(Path::new(dir)) {
         let attempt = run_mise_trust(Path::new("mise"), &path, MISE_TRUST_TIMEOUT);
         if attempt.success() {

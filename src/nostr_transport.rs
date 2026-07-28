@@ -334,22 +334,29 @@ fn should_cleanup_failed_opencode_attach_pane(
     is_http_api && backend_session_id.is_none()
 }
 
-fn should_remove_session_after_failed_restart(
-    is_http_api: bool,
-    backend_session_id: Option<&str>,
-    failed_pane_id: &str,
-    existing_pane_id: Option<&str>,
-) -> bool {
-    should_cleanup_failed_opencode_attach_pane(is_http_api, backend_session_id)
-        && existing_pane_id.is_none_or(|existing| existing == failed_pane_id)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IncumbentPaneDisposition {
+    Respawn,
+    Recreate,
+    Refuse,
 }
 
-async fn cleanup_failed_opencode_attach_pane(
-    state: &std::sync::Arc<AppState>,
-    owner: &crate::daemon_protocol::ResourceOwner,
-    pane_id: &str,
-) {
-    state.kill_owned_pane(owner, pane_id).await;
+fn classify_incumbent_pane(
+    inspection: &crate::tmux::ManagedPaneInspection,
+    lease_owner: &crate::daemon_protocol::ResourceOwner,
+    restart_target_owner: &crate::daemon_protocol::ResourceOwner,
+) -> IncumbentPaneDisposition {
+    match inspection {
+        crate::tmux::ManagedPaneInspection::Missing => IncumbentPaneDisposition::Recreate,
+        crate::tmux::ManagedPaneInspection::Managed(observed)
+            if crate::tmux::physical_owner_matches(observed, lease_owner)
+                || crate::tmux::physical_owner_matches(observed, restart_target_owner) =>
+        {
+            IncumbentPaneDisposition::Respawn
+        }
+        crate::tmux::ManagedPaneInspection::Managed(_)
+        | crate::tmux::ManagedPaneInspection::Unmanaged => IncumbentPaneDisposition::Refuse,
+    }
 }
 
 #[cfg(test)]
@@ -3076,6 +3083,29 @@ fn previous_http_restart_fallback_id(
     select_restart_resume_id(fresh, selected_backend, previous_metadata, None)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HttpRestartBackendPlan {
+    Reuse(String),
+    Create,
+}
+
+fn select_http_restart_backend_plan(
+    is_http_api: bool,
+    fresh: bool,
+    selected_backend: &str,
+    previous_metadata: Option<&crate::daemon_protocol::SessionMeta>,
+) -> Option<HttpRestartBackendPlan> {
+    if !is_http_api {
+        return None;
+    }
+
+    Some(
+        previous_http_restart_fallback_id(fresh, selected_backend, previous_metadata)
+            .map(HttpRestartBackendPlan::Reuse)
+            .unwrap_or(HttpRestartBackendPlan::Create),
+    )
+}
+
 /// Recover an interactive fresh launch that definitely failed before the
 /// backend command could start. The protocol guards make this a no-op when a
 /// concurrent SessionStart has already consumed the credential and bound the
@@ -3472,8 +3502,9 @@ async fn restart_session_claimed(
             RestartOutcome::Superseded,
         );
     }
-    // Capture existing pane before killing
-    let existing_pane = session.as_ref().and_then(|s| s.pane.clone());
+    // Capture the incumbent pane before staging so a verified live owner can
+    // be respawned in place. Recovery clears this to select the recreate path.
+    let mut existing_pane = session.as_ref().and_then(|s| s.pane.clone());
 
     let backend = match backend {
         Some(b) => match state.backends.get_required(b) {
@@ -3765,29 +3796,39 @@ async fn restart_session_claimed(
         crate::backend::DeliveryMode::HttpApi { .. }
     );
 
-    // Direct fresh respawn recovery can safely recognize only managed panes
-    // that already export the incumbent incarnation. Refuse legacy/unverified
-    // panes before staging a replacement; otherwise a crash before
-    // `respawn-pane` could orphan the incumbent after releasing its ID.
-    if let Some(existing_pane) = existing_pane.as_ref() {
-        let pane = existing_pane.clone();
-        let live_owner =
-            tokio::task::spawn_blocking(move || crate::tmux::inspect_pane_owner(&pane)).await;
-        let verification_error = match live_owner {
-            Ok(Ok(Some(live_owner)))
-                if crate::tmux::physical_owner_matches(&live_owner, lease_owner)
-                    || crate::tmux::physical_owner_matches(&live_owner, &restart_target_owner) =>
-            {
-                None
+    // Direct respawn recovery can safely recognize only managed panes that
+    // already export the incumbent or staged incarnation. A missing pane can
+    // use the new-window fallback; refuse live legacy/unverified panes before
+    // staging a replacement.
+    if let Some(incumbent_pane_id) = existing_pane.clone() {
+        let pane = incumbent_pane_id.clone();
+        let inspected =
+            tokio::task::spawn_blocking(move || crate::tmux::inspect_managed_pane(&pane)).await;
+        let verification_error = match inspected {
+            Ok(Ok(inspection)) => {
+                match classify_incumbent_pane(&inspection, lease_owner, &restart_target_owner) {
+                    IncumbentPaneDisposition::Respawn => None,
+                    IncumbentPaneDisposition::Recreate => {
+                        existing_pane = None;
+                        None
+                    }
+                    IncumbentPaneDisposition::Refuse => {
+                        let live_owner = match &inspection {
+                            crate::tmux::ManagedPaneInspection::Managed(owner) => Some(owner),
+                            crate::tmux::ManagedPaneInspection::Missing
+                            | crate::tmux::ManagedPaneInspection::Unmanaged => None,
+                        };
+                        Some(format!(
+                            "restart refused unverified incumbent pane {incumbent_pane_id}: expected {lease_owner:?} or {restart_target_owner:?}, found {live_owner:?}"
+                        ))
+                    }
+                }
             }
-            Ok(Ok(live_owner)) => Some(format!(
-                "restart refused unverified incumbent pane {existing_pane}: expected {lease_owner:?} or {restart_target_owner:?}, found {live_owner:?}"
-            )),
             Ok(Err(error)) => Some(format!(
-                "restart could not verify incumbent pane {existing_pane}: {error}"
+                "restart could not verify incumbent pane {incumbent_pane_id}: {error}"
             )),
             Err(error) => Some(format!(
-                "restart incumbent pane verification task failed for {existing_pane}: {error}"
+                "restart incumbent pane verification task failed for {incumbent_pane_id}: {error}"
             )),
         };
         if let Some(error) = verification_error {
@@ -3912,6 +3953,10 @@ async fn restart_session_claimed(
             let prompt = start_prompt;
             move || -> anyhow::Result<(String, bool)> {
                 use std::process::Command;
+
+                if cfg!(test) {
+                    return Ok((format!("%test-restart-{window_name}"), true));
+                }
 
                 // Try respawn-pane on existing pane — kills the process and restarts
                 // in-place, keeping the same pane ID and tmux session intact.
@@ -4193,6 +4238,10 @@ async fn restart_session_claimed(
                     crate::tmux::close_shell_after(prepared_command.command())
                 };
                 let launch_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    if cfg!(test) {
+                        return Ok(());
+                    }
+
                     crate::tmux::configure_managed_pane(&pane_for_launch);
                     let hidden_cmd = format!(" {command}");
                     let status = std::process::Command::new("tmux")
@@ -4248,30 +4297,101 @@ async fn restart_session_claimed(
                 }
             }
 
-            // For HttpApi backends, use the shared opencode serve instance
             let mut reused_previous_backend_session = false;
-            let mut backend_session_id = if matches!(
-                backend.delivery_mode(),
-                crate::backend::DeliveryMode::HttpApi { .. }
-            ) {
-                let setup_owner = state
-                    .protocol
-                    .read()
+            let backend_plan = select_http_restart_backend_plan(
+                is_http_api,
+                fresh,
+                &backend_name,
+                prev_metadata.as_ref(),
+            );
+            let mut backend_session_id = None;
+
+            // A non-fresh HttpApi restart preserves history by trying the
+            // stored session before creating a new one. Reuse deliberately
+            // does not record a restart backend claim: this restart did not
+            // create the session and therefore must not delete it on rollback.
+            if let Some(HttpRestartBackendPlan::Reuse(prev_sid)) = backend_plan {
+                let port = state.opencode_serve_port();
+                let check_url = format!("http://127.0.0.1:{port}/session/{prev_sid}");
+                match state
+                    .http_client
+                    .get(&check_url)
+                    .timeout(std::time::Duration::from_secs(2))
+                    .send()
                     .await
-                    .sessions
-                    .get(name)
-                    .filter(|session| session.pane.as_deref() == Some(pane_id.as_str()))
-                    .map(crate::daemon_protocol::SessionEntry::owner);
-                let setup_result = match setup_owner {
-                    Some(owner) => {
-                        setup_shared_serve_session(state, &owner, Some(lease_owner), &pane_id, &dir)
+                {
+                    Ok(r) if r.status().is_success() => {
+                        // Guard reuse against serve/attach-client version
+                        // skew: a mismatched attach TUI crashes to a bare
+                        // pane. Show the notice and keep the reused session
+                        // registered API-only instead (mirrors the
+                        // fresh-create guard in setup_shared_serve_session).
+                        if let Some((serve_v, client_v)) =
+                            opencode_attach_skew(&state.http_client, port).await
+                        {
+                            tracing::warn!(
+                                port,
+                                pane = %pane_id,
+                                backend_session_id = %prev_sid,
+                                serve_version = %serve_v,
+                                attach_client_version = %client_v,
+                                "opencode attach client/serve version skew on reuse; skipping attach TUI (would crash). Session remains functional via HTTP API."
+                            );
+                            notify_pane_opencode_attach_skew(&pane_id, &serve_v, &client_v, port)
+                                .await;
+                            backend_session_id = Some(prev_sid);
+                            reused_previous_backend_session = true;
+                        } else {
+                            match launch_opencode_attach_for_session(
+                                &pane_id, &dir, &prev_sid, port,
+                            )
                             .await
+                            .and_then(|attach_ready| {
+                                previous_backend_session_after_attach(
+                                    prev_sid.clone(),
+                                    attach_ready,
+                                    &pane_id,
+                                )
+                            }) {
+                                Ok(sid) => {
+                                    backend_session_id = Some(sid);
+                                    reused_previous_backend_session = true;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "previous backend_session_id {prev_sid} is reachable but attach failed: {e}"
+                                    );
+                                }
+                            }
+                        }
                     }
-                    None => Err(anyhow::anyhow!(
-                        "restart owner changed before OpenCode session setup"
-                    )),
-                };
-                match setup_result {
+                    _ => {
+                        tracing::warn!(
+                            "previous backend_session_id {prev_sid} is stale, creating new session"
+                        );
+                    }
+                }
+            }
+
+            // Fresh restarts and failed/unavailable reuse create a new session
+            // on the shared OpenCode serve.
+            if is_http_api && backend_session_id.is_none() {
+                let setup_result =
+                    if restart_target_is_current(state, lease_owner, &restart_target_owner).await {
+                        setup_shared_serve_session(
+                            state,
+                            &restart_target_owner,
+                            Some(lease_owner),
+                            &pane_id,
+                            &dir,
+                        )
+                        .await
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "restart owner changed before OpenCode session setup"
+                        ))
+                    };
+                backend_session_id = match setup_result {
                     Ok(sid) => Some(sid),
                     Err(e) => {
                         tracing::warn!("shared serve session setup failed: {e}");
@@ -4292,112 +4412,24 @@ async fn restart_session_claimed(
                         }
                         None
                     }
-                }
-            } else {
-                None
-            };
-
-            // Fall back to the previous session ID when not fresh,
-            // but only if the serve is reachable (the old ID may be stale
-            // if serve was restarted externally).
-            if backend_session_id.is_none() {
-                if let Some(prev_sid) =
-                    previous_http_restart_fallback_id(fresh, &backend_name, prev_metadata.as_ref())
-                {
-                    let port = state.opencode_serve_port();
-                    let check_url = format!("http://127.0.0.1:{port}/session/{prev_sid}");
-                    match state
-                        .http_client
-                        .get(&check_url)
-                        .timeout(std::time::Duration::from_secs(2))
-                        .send()
-                        .await
-                    {
-                        Ok(r) if r.status().is_success() => {
-                            // Guard reuse against serve/attach-client version
-                            // skew: a mismatched attach TUI crashes to a bare
-                            // pane. Show the notice and keep the reused session
-                            // registered API-only instead (mirrors the
-                            // fresh-create guard in setup_shared_serve_session).
-                            if let Some((serve_v, client_v)) =
-                                opencode_attach_skew(&state.http_client, port).await
-                            {
-                                tracing::warn!(
-                                    port,
-                                    pane = %pane_id,
-                                    backend_session_id = %prev_sid,
-                                    serve_version = %serve_v,
-                                    attach_client_version = %client_v,
-                                    "opencode attach client/serve version skew on reuse; skipping attach TUI (would crash). Session remains functional via HTTP API."
-                                );
-                                notify_pane_opencode_attach_skew(
-                                    &pane_id, &serve_v, &client_v, port,
-                                )
-                                .await;
-                                backend_session_id = Some(prev_sid);
-                                reused_previous_backend_session = true;
-                            } else {
-                                match launch_opencode_attach_for_session(
-                                    &pane_id, &dir, &prev_sid, port,
-                                )
-                                .await
-                                .and_then(|attach_ready| {
-                                    previous_backend_session_after_attach(
-                                        prev_sid.clone(),
-                                        attach_ready,
-                                        &pane_id,
-                                    )
-                                }) {
-                                    Ok(sid) => {
-                                        backend_session_id = Some(sid);
-                                        reused_previous_backend_session = true;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "previous backend_session_id {prev_sid} is reachable but attach failed: {e}"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        _ => {
-                            tracing::warn!(
-                                "previous backend_session_id {prev_sid} is stale, creating new session"
-                            );
-                        }
-                    }
-                }
+                };
             }
 
             if is_http_api && backend_session_id.is_none() {
                 tracing::warn!(
                     "restart_session: not registering {name} because OpenCode attach setup failed"
                 );
-                if should_cleanup_failed_opencode_attach_pane(is_http_api, None) {
-                    let owner = state
-                        .protocol
-                        .read()
-                        .await
-                        .sessions
-                        .get(name)
-                        .filter(|session| session.pane.as_deref() == Some(pane_id.as_str()))
-                        .map(crate::daemon_protocol::SessionEntry::owner);
-                    if let Some(owner) = owner {
-                        cleanup_failed_opencode_attach_pane(state, &owner, &pane_id).await;
-                    }
-                }
-                if should_remove_session_after_failed_restart(
-                    is_http_api,
-                    None,
-                    &pane_id,
-                    existing_pane.as_deref(),
-                ) {
-                    state
-                        .apply_and_execute(crate::daemon_protocol::Event::Remove {
-                            id: name.to_string(),
-                            keep_worktree: true,
-                        })
-                        .await;
+                if let Err(rollback_error) = rollback_claimed_restart(
+                    state,
+                    lease_owner,
+                    &restart_target_owner,
+                    Some(&pane_id),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        "failed to durably roll back restart for {name}: {rollback_error}"
+                    );
                 }
                 return (
                     format!(
@@ -7435,7 +7467,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_direct_restart_refuses_an_unverified_incumbent_before_staging() {
+    async fn missing_incumbent_pane_restarts_through_recreate_path() {
         let state = AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -7475,16 +7507,106 @@ mod tests {
         )
         .await;
 
+        assert_eq!(outcome, RestartOutcome::Restarted, "{message}");
+        let proto = state.protocol.read().await;
+        let restarted = &proto.sessions["same-id"];
+        assert_ne!(restarted.owner(), previous.owner());
+        assert_ne!(
+            restarted.pane.as_deref(),
+            previous.pane.as_deref(),
+            "a missing incumbent must select the new-pane fallback"
+        );
+        assert!(proto.lifecycle_leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_opencode_recreate_restores_incumbent() {
+        use axum::Json;
+        use axum::Router;
+        use axum::extract::State;
+        use axum::http::StatusCode;
+        use axum::routing::{get, post};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::net::TcpListener;
+
+        async fn health(State(reached): State<Arc<AtomicBool>>) -> Json<serde_json::Value> {
+            reached.store(true, Ordering::SeqCst);
+            Json(serde_json::json!({}))
+        }
+
+        async fn fail_create() -> StatusCode {
+            StatusCode::BAD_GATEWAY
+        }
+
+        let setup_reached = Arc::new(AtomicBool::new(false));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/global/health", get(health))
+            .route("/session", post(fail_create))
+            .with_state(setup_reached.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: port.checked_sub(320).unwrap(),
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        };
+        let state = AppState::new(config);
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "same-id".into(),
+                pane: Some("%definitely-not-a-live-managed-pane".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some(dir.path().to_string_lossy().into_owned()),
+                    backend: Some("opencode".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let previous = state.protocol.read().await.sessions["same-id"].clone();
+        let owner = match reserve_start_for_launch(&state, "same-id").await.unwrap() {
+            crate::daemon_protocol::StartDisposition::Existing(owner) => owner,
+            other => panic!("expected existing owner, got {other:?}"),
+        };
+        assert_eq!(
+            state.claim_existing_start(&owner).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+
+        let (_, _, outcome) = restart_session_for_start(
+            &state,
+            &owner,
+            "same-id",
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ParentSessionOverride::PreservePrevious,
+            None,
+        )
+        .await;
+
         assert_eq!(outcome, RestartOutcome::Failed);
         assert!(
-            message.contains("unverified incumbent")
-                || message.contains("could not verify incumbent")
-                || message.contains("verification task failed"),
-            "unexpected failure: {message}"
+            setup_reached.load(Ordering::SeqCst),
+            "the staged restart owner must authorize shared-serve setup"
         );
         let proto = state.protocol.read().await;
         assert_eq!(proto.sessions["same-id"], previous);
         assert!(proto.lifecycle_leases.is_empty());
+        server.abort();
     }
 
     #[tokio::test]
@@ -8774,6 +8896,48 @@ mod tests {
     }
 
     #[test]
+    fn non_fresh_http_restart_prefers_stored_backend_session() {
+        let previous = crate::daemon_protocol::SessionMeta {
+            backend: Some("opencode".into()),
+            backend_session_id: Some("ses_preserved".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            select_http_restart_backend_plan(true, false, "opencode", Some(&previous)),
+            Some(HttpRestartBackendPlan::Reuse("ses_preserved".into()))
+        );
+    }
+
+    #[test]
+    fn fresh_http_restart_creates_new_backend_session() {
+        let previous = crate::daemon_protocol::SessionMeta {
+            backend: Some("opencode".into()),
+            backend_session_id: Some("ses_previous".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            select_http_restart_backend_plan(true, true, "opencode", Some(&previous)),
+            Some(HttpRestartBackendPlan::Create)
+        );
+    }
+
+    #[test]
+    fn non_http_restart_has_no_opencode_backend_plan() {
+        let previous = crate::daemon_protocol::SessionMeta {
+            backend: Some("codex-cli".into()),
+            backend_session_id: Some("thread_previous".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            select_http_restart_backend_plan(false, false, "codex-cli", Some(&previous)),
+            None
+        );
+    }
+
+    #[test]
     fn restart_final_refresh_preserves_selected_codex_resume_id() {
         assert_eq!(
             final_restart_backend_binding(
@@ -8828,29 +8992,94 @@ mod tests {
         assert!(should_cleanup_failed_opencode_attach_pane(true, None));
     }
 
-    #[test]
-    fn failed_restart_placeholder_cleanup_required_without_backend_session() {
-        assert!(should_cleanup_failed_opencode_attach_pane(true, None));
+    fn incumbent_test_owners() -> (
+        crate::daemon_protocol::ResourceOwner,
+        crate::daemon_protocol::ResourceOwner,
+    ) {
+        (
+            crate::daemon_protocol::ResourceOwner {
+                session_id: "worker".into(),
+                incarnation: crate::daemon_protocol::SessionIncarnation(10),
+            },
+            crate::daemon_protocol::ResourceOwner {
+                session_id: "worker".into(),
+                incarnation: crate::daemon_protocol::SessionIncarnation(11),
+            },
+        )
     }
 
     #[test]
-    fn failed_restart_placeholder_does_not_remove_original_session() {
-        assert!(!should_remove_session_after_failed_restart(
-            true,
-            None,
-            "%new-placeholder",
-            Some("%original"),
-        ));
+    fn missing_incumbent_pane_is_recreated() {
+        let (lease_owner, restart_target_owner) = incumbent_test_owners();
+
+        assert_eq!(
+            classify_incumbent_pane(
+                &crate::tmux::ManagedPaneInspection::Missing,
+                &lease_owner,
+                &restart_target_owner,
+            ),
+            IncumbentPaneDisposition::Recreate
+        );
     }
 
     #[test]
-    fn failed_restart_respawned_pane_removes_session() {
-        assert!(should_remove_session_after_failed_restart(
-            true,
-            None,
-            "%original",
-            Some("%original"),
-        ));
+    fn unmanaged_incumbent_pane_is_refused() {
+        let (lease_owner, restart_target_owner) = incumbent_test_owners();
+
+        assert_eq!(
+            classify_incumbent_pane(
+                &crate::tmux::ManagedPaneInspection::Unmanaged,
+                &lease_owner,
+                &restart_target_owner,
+            ),
+            IncumbentPaneDisposition::Refuse
+        );
+    }
+
+    #[test]
+    fn lease_owned_incumbent_pane_is_respawned() {
+        let (lease_owner, restart_target_owner) = incumbent_test_owners();
+
+        assert_eq!(
+            classify_incumbent_pane(
+                &crate::tmux::ManagedPaneInspection::Managed(lease_owner.clone()),
+                &lease_owner,
+                &restart_target_owner,
+            ),
+            IncumbentPaneDisposition::Respawn
+        );
+    }
+
+    #[test]
+    fn restart_target_owned_incumbent_pane_is_respawned() {
+        let (lease_owner, restart_target_owner) = incumbent_test_owners();
+
+        assert_eq!(
+            classify_incumbent_pane(
+                &crate::tmux::ManagedPaneInspection::Managed(restart_target_owner.clone()),
+                &lease_owner,
+                &restart_target_owner,
+            ),
+            IncumbentPaneDisposition::Respawn
+        );
+    }
+
+    #[test]
+    fn stranger_owned_incumbent_pane_is_refused() {
+        let (lease_owner, restart_target_owner) = incumbent_test_owners();
+        let stranger_owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "stranger".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(12),
+        };
+
+        assert_eq!(
+            classify_incumbent_pane(
+                &crate::tmux::ManagedPaneInspection::Managed(stranger_owner),
+                &lease_owner,
+                &restart_target_owner,
+            ),
+            IncumbentPaneDisposition::Refuse
+        );
     }
 
     #[test]
