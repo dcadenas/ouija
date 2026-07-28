@@ -598,21 +598,47 @@ pub(crate) fn assert_shared_task_reminder_guidance(skill: &str) {
         "shared skill must preserve the native-subagent boundary"
     );
     assert!(
-        skill.contains("--target hub-cx --inject-only")
-            && skill.contains("one recurring exact-target task"),
-        "shared skill must teach explicit root enrollment with inject-only tasks"
+        skill.contains("`--fresh-context-after-active DURATION` is an opt-in policy")
+            && skill.contains("`spawn-session` and fresh `restart-session` launches"),
+        "shared skill must teach opt-in active-context refresh on manual lifecycle commands"
     );
     assert!(
-        skill.contains("fails closed")
-            && skill.contains("never creates, revives, restarts")
-            && skill.contains("respawns a session"),
-        "shared skill must preserve inject-only's non-lifecycle contract"
+        skill.contains(
+            "counts accumulated active work, not wall-clock time: the counter pauses while"
+        ) && skill.contains("the session is parked"),
+        "shared skill must explain that active-context accounting pauses while parked"
     );
     assert!(
-        skill.contains("Do not create per-child schedules")
-            && skill.contains("infer enrollment from names/roles/paths")
-            && skill.contains("OuijaCP lifecycle semantics are unrelated"),
-        "shared skill must keep child policy outside the daemon and native backends"
+        skill.contains("mandatory refresh notice only at a")
+            && skill.contains("safe `Stopped` boundary")
+            && skill.contains("Each later stopped boundary repeats the notice until a fresh")
+            && skill.contains("restart successfully completes"),
+        "shared skill must keep refresh notices at stopped boundaries until fresh restart success"
+    );
+    assert!(
+        skill.contains("--one-shot-file /dev/stdin")
+            && skill.contains(
+                "stored prompt exists, Ouija replays it before the one-shot continuation"
+            )
+            && skill.contains(
+                "Without a stored prompt, the one-shot continuation must be complete enough"
+            ),
+        "shared skill must explain fresh one-shot continuation composition"
+    );
+    assert!(
+        skill.contains("does not create\na scheduler task")
+            && skill.contains("does not discover children, traverse\nchild relationships, enroll child sessions, or inspect native subagents"),
+        "shared skill must keep active-context refresh free of scheduler enrollment and child traversal"
+    );
+    assert!(
+        skill.contains("`ouija rollover` remains a separate legacy/manual continuation facility")
+            && skill.contains("not used by active-context refresh"),
+        "shared skill must keep legacy manual rollover separate from active-context refresh"
+    );
+    assert!(
+        !skill.contains("--target hub-cx --inject-only")
+            && !skill.contains("one recurring exact-target task"),
+        "shared skill must not recommend the retired scheduled-audit production path"
     );
 }
 
