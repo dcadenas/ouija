@@ -739,6 +739,18 @@ pub struct SessionMetadata {
     /// sessions with `project_dir` set; distinct from metadata staleness).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_present: Option<bool>,
+    /// Positive active-work duration after which a fresh context restart is due.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_context_after_active_secs: Option<u64>,
+    /// Completed active-work time accumulated for the fresh-context policy.
+    #[serde(default)]
+    pub active_context_accumulated_secs: u64,
+    /// Open active-work segment start time, if the session is currently active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_context_segment_started_at: Option<i64>,
+    /// Whether the fresh-context active-time threshold has been reached.
+    #[serde(default)]
+    pub active_context_restart_due: bool,
 }
 
 fn default_true() -> bool {
@@ -774,6 +786,10 @@ impl Default for SessionMetadata {
             last_iteration_at: None,
             on_fire: None,
             worktree_present: None,
+            fresh_context_after_active_secs: None,
+            active_context_accumulated_secs: 0,
+            active_context_segment_started_at: None,
+            active_context_restart_due: false,
         }
     }
 }
@@ -1111,6 +1127,11 @@ impl AppState {
             | crate::daemon_protocol::Event::Remove { id, .. }
             | crate::daemon_protocol::Event::UpdateMetadata { id, .. } => {
                 add_current(&mut keys, &mut project_dirs, &protocol, id);
+            }
+            crate::daemon_protocol::Event::ActiveContextActive { owner, .. }
+            | crate::daemon_protocol::Event::ActiveContextStopped { owner, .. }
+            | crate::daemon_protocol::Event::FreshContextRestartSucceeded { owner } => {
+                add_current(&mut keys, &mut project_dirs, &protocol, &owner.session_id);
             }
             crate::daemon_protocol::Event::RefreshLaunchMetadata {
                 id, pane, metadata, ..
@@ -2666,6 +2687,9 @@ impl AppState {
                 Effect::StopAgent { owner, pane } => {
                     self.stop_session_agent(owner, pane).await;
                 }
+                // Task 2 owns safe-boundary notification delivery. Task 1
+                // persists and emits the pure protocol signal only.
+                Effect::ActiveContextRestartDue { .. } => {}
                 Effect::RenameAgent {
                     old_owner,
                     new_owner,
@@ -3057,6 +3081,10 @@ impl AppState {
                         last_iteration_at: m.last_iteration_at,
                         on_fire: m.on_fire.clone(),
                         worktree_present: m.worktree_present,
+                        fresh_context_after_active_secs: m.fresh_context_after_active_secs,
+                        active_context_accumulated_secs: m.active_context_accumulated_secs,
+                        active_context_segment_started_at: m.active_context_segment_started_at,
+                        active_context_restart_due: m.active_context_restart_due,
                     },
                 };
                 (k.clone(), session)
@@ -7042,6 +7070,10 @@ pub(crate) mod tests {
             last_iteration_at: Some(1_700_000_000),
             on_fire: Some(crate::scheduler::OnFire::NewSession),
             worktree_present: Some(false),
+            fresh_context_after_active_secs: Some(3_600),
+            active_context_accumulated_secs: 1_234,
+            active_context_segment_started_at: Some(1_700_000_050),
+            active_context_restart_due: true,
         };
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -7179,6 +7211,56 @@ pub(crate) mod tests {
         assert_eq!(hydrated.last_iteration_at, Some(1_700_000_000));
         assert_eq!(hydrated.last_metadata_update, Some(1_700_000_100));
         assert_eq!(hydrated.worktree_present, Some(false));
+        assert_eq!(hydrated.fresh_context_after_active_secs, Some(3_600));
+        assert_eq!(hydrated.active_context_accumulated_secs, 1_234);
+        assert_eq!(
+            hydrated.active_context_segment_started_at,
+            Some(1_700_000_050)
+        );
+        assert!(hydrated.active_context_restart_due);
+    }
+
+    #[tokio::test]
+    async fn persist_protocol_state_round_trips_active_context_accounting() {
+        // Break caught: hand-written protocol-to-persistence conversion can
+        // omit new fields, resetting an active session's refresh policy after
+        // daemon recovery.
+        let config = test_config();
+        let state = AppState::new(config.clone());
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%1".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    fresh_context_after_active_secs: Some(3_600),
+                    active_context_accumulated_secs: 1_234,
+                    active_context_segment_started_at: Some(1_700_000_000),
+                    active_context_restart_due: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        {
+            let proto = state.protocol.read().await;
+            state.persist_protocol_state(&proto).unwrap();
+        }
+
+        let loaded = crate::persistence::load_sessions(&config.data_dir).unwrap();
+        let persisted = loaded
+            .sessions
+            .iter()
+            .find(|session| session.id == "worker")
+            .expect("worker must persist");
+        let hydrated =
+            crate::daemon_protocol::metadata_to_session_meta_for_test(&persisted.metadata);
+        assert_eq!(hydrated.fresh_context_after_active_secs, Some(3_600));
+        assert_eq!(hydrated.active_context_accumulated_secs, 1_234);
+        assert_eq!(
+            hydrated.active_context_segment_started_at,
+            Some(1_700_000_000)
+        );
+        assert!(hydrated.active_context_restart_due);
     }
 
     #[tokio::test]

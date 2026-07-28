@@ -4505,6 +4505,13 @@ async fn restart_session_claimed(
                     // presence rather than carrying a stale bit across
                     // restart (the dir may have been recreated out of band).
                     worktree_present: None,
+                    // Task 1 adds durable active-context accounting. This
+                    // finalizer must preserve it; only the explicit exact-
+                    // owner fresh-success event may reset it.
+                    fresh_context_after_active_secs: m.fresh_context_after_active_secs,
+                    active_context_accumulated_secs: m.active_context_accumulated_secs,
+                    active_context_segment_started_at: m.active_context_segment_started_at,
+                    active_context_restart_due: m.active_context_restart_due,
                 },
                 None => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),

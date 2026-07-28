@@ -1543,6 +1543,10 @@ fn persisted_session_from_entry(
             last_iteration_at: metadata.last_iteration_at,
             on_fire: metadata.on_fire.clone(),
             worktree_present: metadata.worktree_present,
+            fresh_context_after_active_secs: metadata.fresh_context_after_active_secs,
+            active_context_accumulated_secs: metadata.active_context_accumulated_secs,
+            active_context_segment_started_at: metadata.active_context_segment_started_at,
+            active_context_restart_due: metadata.active_context_restart_due,
         },
     })
 }
@@ -4324,6 +4328,10 @@ mod tests {
             last_iteration_at: Some(1_700_000_002),
             on_fire: Some(crate::scheduler::OnFire::ContinueSession),
             worktree_present: Some(true),
+            fresh_context_after_active_secs: Some(3_600),
+            active_context_accumulated_secs: 1_234,
+            active_context_segment_started_at: Some(1_700_000_003),
+            active_context_restart_due: true,
         };
 
         let restored = metadata_for_restored_session(&metadata);
@@ -4352,6 +4360,22 @@ mod tests {
         assert_eq!(restored.last_iteration_at, metadata.last_iteration_at);
         assert_eq!(restored.on_fire, metadata.on_fire);
         assert_eq!(restored.worktree_present, metadata.worktree_present);
+        assert_eq!(
+            restored.fresh_context_after_active_secs,
+            metadata.fresh_context_after_active_secs
+        );
+        assert_eq!(
+            restored.active_context_accumulated_secs,
+            metadata.active_context_accumulated_secs
+        );
+        assert_eq!(
+            restored.active_context_segment_started_at,
+            metadata.active_context_segment_started_at
+        );
+        assert_eq!(
+            restored.active_context_restart_due,
+            metadata.active_context_restart_due
+        );
     }
 
     #[tokio::test]
