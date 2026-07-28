@@ -1104,10 +1104,33 @@ mod tests {
         actor
             .cast(SessionMsg::Active)
             .expect("queue active cancellation");
+        let rpc_actor = actor.clone();
+        tokio::time::timeout(std::time::Duration::from_millis(500), async move {
+            ractor::call!(rpc_actor, SessionMsg::GetPendingReplies)
+        })
+        .await
+        .expect("Active and its following actor RPC must complete before due delivery releases")
+        .expect("actor RPC must succeed");
+        let active_started_at = state.protocol.read().await.sessions["active-cancel"]
+            .metadata
+            .active_context_segment_started_at;
+        assert!(
+            active_started_at.is_some(),
+            "the Active event must apply at its captured boundary while delivery is blocked"
+        );
         // Keep the due request blocked past the replacement timer's deadline.
         // A detached delivery lets Active cancel that timer immediately; a
         // synchronous delivery leaves its IdleTimeout queued behind this turn.
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        let metadata = &state.protocol.read().await.sessions["active-cancel"].metadata;
+        assert_eq!(
+            metadata.active_context_segment_started_at,
+            active_started_at
+        );
+        assert_eq!(
+            metadata.active_context_accumulated_secs, 0,
+            "only a captured stopped boundary may close and charge the active segment"
+        );
         blocked.release_first_delivery.notify_one();
         let _ = ractor::call!(actor, SessionMsg::GetPendingReplies).expect("flush active");
 
@@ -1168,9 +1191,35 @@ mod tests {
         actor
             .cast(SessionMsg::Stopped)
             .expect("queue repeated stopped boundary");
+        actor
+            .cast(SessionMsg::Active)
+            .expect("queue active after repeated stopped boundary");
+        let rpc_actor = actor.clone();
+        tokio::time::timeout(std::time::Duration::from_millis(500), async move {
+            ractor::call!(rpc_actor, SessionMsg::GetPendingReplies)
+        })
+        .await
+        .expect("repeated Stopped, Active, and their actor RPC must complete before release")
+        .expect("actor RPC must succeed");
+        let active_started_at = state.protocol.read().await.sessions["repeat-stop"]
+            .metadata
+            .active_context_segment_started_at;
+        assert!(
+            active_started_at.is_some(),
+            "the post-stop Active boundary must apply before delivery releases"
+        );
         // The repeated boundary must replace the first boundary's timer while
-        // its due request remains blocked past that first timer's deadline.
-        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        // its due request remains blocked past the repeated timer's deadline.
+        tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+        let metadata = &state.protocol.read().await.sessions["repeat-stop"].metadata;
+        assert_eq!(
+            metadata.active_context_segment_started_at,
+            active_started_at
+        );
+        assert_eq!(
+            metadata.active_context_accumulated_secs, 0,
+            "only a captured stopped boundary may close and charge the active segment"
+        );
         blocked.release_first_delivery.notify_one();
         let _ = ractor::call!(actor, SessionMsg::GetPendingReplies).expect("flush repeated stop");
         wait_for_message_count(&blocked.messages, 2).await;

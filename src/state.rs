@@ -1236,11 +1236,15 @@ impl AppState {
             | crate::daemon_protocol::Event::UpdateMetadata { id, .. } => {
                 add_current(&mut keys, &mut project_dirs, &protocol, id);
             }
-            crate::daemon_protocol::Event::ActiveContextActive { owner, .. }
-            | crate::daemon_protocol::Event::ActiveContextStopped { owner, .. }
-            | crate::daemon_protocol::Event::FreshContextRestartSucceeded { owner } => {
+            crate::daemon_protocol::Event::FreshContextRestartSucceeded { owner } => {
                 add_current(&mut keys, &mut project_dirs, &protocol, &owner.session_id);
             }
+            // Active-context accounting is a pure, exact-owner protocol
+            // mutation. It must not wait behind owned delivery I/O holding the
+            // pane/backend/project gates; the protocol lock serializes the
+            // update and `DaemonState::apply` rejects superseded owners.
+            crate::daemon_protocol::Event::ActiveContextActive { .. }
+            | crate::daemon_protocol::Event::ActiveContextStopped { .. } => {}
             crate::daemon_protocol::Event::RefreshLaunchMetadata {
                 id, pane, metadata, ..
             } => {
