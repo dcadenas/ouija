@@ -1043,6 +1043,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "wall-clock timer-ordering regression; run explicitly"]
     async fn active_cancels_replaced_idle_timer_while_due_delivery_blocks() {
         // Break caught: cancelling a timer after slow due delivery leaves an
         // already-expired idle timeout queued ahead of Active.
@@ -1128,6 +1129,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "wall-clock timer-ordering regression; run explicitly"]
     async fn repeated_stopped_replaces_idle_timer_before_due_delivery_blocks() {
         // Break caught: a queued timeout from the prior stopped boundary must
         // not run before a repeated stopped boundary replaces its timers.

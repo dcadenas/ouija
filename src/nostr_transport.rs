@@ -7997,7 +7997,12 @@ mod tests {
             )
             .await
         });
-        control.reached.notified().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            control.reached.notified(),
+        )
+        .await
+        .expect("hard restart did not reach its test checkpoint within 2 seconds");
 
         let (target, pane) = {
             let protocol = state.protocol.read().await;
@@ -8072,7 +8077,11 @@ mod tests {
         );
 
         control.release.notify_one();
-        let (message, _, outcome) = restart.await.unwrap();
+        let (message, _, outcome) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), restart)
+                .await
+                .expect("hard restart did not finish within 5 seconds")
+                .expect("hard restart task failed");
         assert_eq!(outcome, RestartOutcome::Restarted, "{message}");
         let protocol = state.protocol.read().await;
         let metadata = &protocol.sessions["hard-staged"].metadata;
@@ -10595,7 +10604,12 @@ mod tests {
             )
             .await
         });
-        control.reached.notified().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            control.reached.notified(),
+        )
+        .await
+        .expect("soft restart did not reach its test checkpoint within 2 seconds");
 
         let target = state.protocol.read().await.sessions["soft-staged"].owner();
         let _ = crate::hooks::prompt_submit(
@@ -10659,7 +10673,12 @@ mod tests {
         );
 
         control.release.notify_one();
-        let (message, _, outcome) = restart.await.unwrap();
+        let (message, _, outcome) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), restart)
+                .await
+                .expect("soft restart did not finish within 5 seconds")
+                .expect("soft restart task failed");
+        server.abort();
         assert_eq!(outcome, RestartOutcome::Restarted, "{message}");
         let protocol = state.protocol.read().await;
         let metadata = &protocol.sessions["soft-staged"].metadata;
@@ -10673,7 +10692,6 @@ mod tests {
             state.drain_agent_compact_continuation_owned(&target).await,
             Some("soft staged mailbox".into())
         );
-        server.abort();
     }
 
     #[tokio::test]

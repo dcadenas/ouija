@@ -1196,7 +1196,12 @@ impl AppState {
             .filter(|control| control.checkpoint == checkpoint);
         if let Some(control) = control {
             control.reached.notify_one();
-            control.release.notified().await;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                control.release.notified(),
+            )
+            .await
+            .expect("restart test checkpoint was not released within 2 seconds");
         }
     }
 
@@ -5092,7 +5097,15 @@ pub(crate) mod tests {
             "paneless strong OpenCode owner must have the existing activity receiver"
         );
         state.query_agent_pending_replies("paneless-worker").await;
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        state
+            .protocol
+            .write()
+            .await
+            .sessions
+            .get_mut("paneless-worker")
+            .expect("registered paneless worker")
+            .metadata
+            .active_context_segment_started_at = Some(Utc::now().timestamp() - 2);
         assert!(
             state
                 .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Stopped)
@@ -5247,7 +5260,10 @@ pub(crate) mod tests {
             assert_ne!(protocol.sessions["paneless-reused"].owner(), stale_owner);
         }
         drop(held);
-        delivery_task.await.expect("delivery task failed");
+        tokio::time::timeout(std::time::Duration::from_secs(2), delivery_task)
+            .await
+            .expect("delayed paneless due delivery did not finish within 2 seconds")
+            .expect("delivery task failed");
 
         assert!(
             messages.lock().await.is_empty(),
