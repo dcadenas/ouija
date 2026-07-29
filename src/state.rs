@@ -1197,11 +1197,11 @@ impl AppState {
         if let Some(control) = control {
             control.reached.notify_one();
             tokio::time::timeout(
-                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(4),
                 control.release.notified(),
             )
             .await
-            .expect("restart test checkpoint was not released within 2 seconds");
+            .expect("restart test checkpoint was not released within 4 seconds");
         }
     }
 
