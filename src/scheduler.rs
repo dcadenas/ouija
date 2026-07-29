@@ -601,7 +601,7 @@ async fn execute_inject_only_snapshot(
             format!("inject-only target session '{session_name}' was superseded"),
         );
     }
-    let assistant_evidence = assistant_delivery_evidence(state, &session);
+    let assistant_evidence = assistant_delivery_evidence(state, &session).await;
     if let Err(error) = inject_alive_session_prompt(
         state,
         task,
@@ -619,16 +619,13 @@ async fn execute_inject_only_snapshot(
     TaskRun::ok(task, None)
 }
 
-fn assistant_delivery_evidence(
+async fn assistant_delivery_evidence(
     state: &SharedState,
     session: &crate::daemon_protocol::SessionEntry,
 ) -> crate::state::OwnedAssistantDeliveryEvidence {
-    let backend = session
-        .metadata
-        .backend
-        .as_deref()
-        .and_then(|name| state.backends.get(name))
-        .unwrap_or_else(|| state.backends.default());
+    let backend = state
+        .backend_or_default(session.metadata.backend.as_deref())
+        .await;
     crate::state::OwnedAssistantDeliveryEvidence {
         backend: session.metadata.backend.clone(),
         backend_session_id: session.metadata.backend_session_id.clone(),
@@ -2576,6 +2573,7 @@ mod tests {
     #[tokio::test]
     async fn inject_only_delivers_to_exact_live_local_owner_without_lifecycle_effects() {
         let state = crate::state::AppState::new_for_test();
+        state.settings.write().await.default_backend = "claude-code".into();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
                 id: "manual-root".into(),
@@ -2620,7 +2618,7 @@ mod tests {
             "manual-root",
             "%audit",
             false,
-            Some(assistant_delivery_evidence(&state, &session)),
+            Some(assistant_delivery_evidence(&state, &session).await),
         )
         .await;
 
@@ -2694,7 +2692,7 @@ mod tests {
             "manual-http",
             "%http",
             false,
-            Some(assistant_delivery_evidence(&state, &session)),
+            Some(assistant_delivery_evidence(&state, &session).await),
         )
         .await;
 

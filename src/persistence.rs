@@ -409,6 +409,9 @@ fn default_router_base_url() -> String {
 /// User-configurable daemon settings persisted in `settings.json`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OuijaSettings {
+    /// Backend used when a launch or legacy session has no backend selection.
+    #[serde(default = "default_backend")]
+    pub default_backend: String,
     #[serde(default = "default_true")]
     pub auto_register: bool,
     #[serde(default)]
@@ -453,6 +456,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_backend() -> String {
+    "opencode".to_string()
+}
+
 /// Default idle timeout before a session is considered stale (seconds).
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900;
 /// Default interval between reaper sweeps (seconds).
@@ -469,6 +476,7 @@ fn default_reaper_interval() -> u64 {
 impl Default for OuijaSettings {
     fn default() -> Self {
         Self {
+            default_backend: default_backend(),
             auto_register: true,
             human_sessions: Vec::new(),
             projects_dir: None,
@@ -968,6 +976,27 @@ mod tests {
         std::fs::write(dir.path().join("settings.json"), "{}").unwrap();
         let settings = load_settings(dir.path()).unwrap();
         assert!(settings.auto_register);
+        assert_eq!(
+            serde_json::to_value(settings).unwrap()["default_backend"],
+            "opencode"
+        );
+    }
+
+    #[test]
+    fn default_backend_round_trip_preserves_other_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"auto_register":false,"idle_timeout_secs":321,"default_backend":"claude-code"}"#,
+        )
+        .unwrap();
+
+        let settings = load_settings(dir.path()).unwrap();
+        let serialized = serde_json::to_value(settings).unwrap();
+
+        assert_eq!(serialized["default_backend"], "claude-code");
+        assert_eq!(serialized["auto_register"], false);
+        assert_eq!(serialized["idle_timeout_secs"], 321);
     }
 
     #[test]

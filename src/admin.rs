@@ -960,6 +960,14 @@ tr:hover td {{
     <table>
       <tr><th>Setting</th><th style="text-align:center;">Value</th></tr>
       <tr>
+        <td>Default backend <span class="tip" data-tip="Coding assistant backend used when a new launch does not specify one. Existing session backend bindings still take precedence.">?</span></td>
+        <td style="text-align:center;">
+          <select id="default-backend" onchange="updateSetting('default_backend', this.value)">
+            {default_backend_options}
+          </select>
+        </td>
+      </tr>
+      <tr>
         <td>Auto-register sessions <span class="tip" data-tip="When enabled, new sessions auto-register with the mesh via the SessionStart hook">?</span></td>
         <td style="text-align:center;">
           <input type="checkbox" id="auto-register" {auto_register_checked} onchange="updateSetting('auto_register', this.checked)">
@@ -1426,6 +1434,20 @@ setInterval(async () => {{
         log_html = log_html,
         log_empty = log_empty,
         saved_relays_json = saved_relays_json,
+        default_backend_options = state
+            .backends
+            .names()
+            .into_iter()
+            .map(|name| format!(
+                r#"<option value="{name}"{selected}>{name}</option>"#,
+                name = html_escape(name),
+                selected = if name == settings.default_backend {
+                    " selected"
+                } else {
+                    ""
+                },
+            ))
+            .collect::<String>(),
         idle_timeout_secs = settings.idle_timeout_secs,
         max_local_sessions = settings.max_local_sessions,
         auto_register_checked = if settings.auto_register {
@@ -1521,11 +1543,25 @@ fn truncate_npub(npub: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use axum::extract::State;
+
     #[test]
     fn inject_only_task_mode_is_visible_in_admin() {
         assert_eq!(
             super::task_mode_flag(&crate::scheduler::OnFire::InjectOnly).as_deref(),
             Some("inject only (exact live target)")
         );
+    }
+
+    #[tokio::test]
+    async fn dashboard_exposes_default_backend_selector() {
+        let state = crate::state::AppState::new_for_test();
+        let html = super::dashboard(State(state)).await.0;
+
+        assert!(html.contains("Default backend"));
+        assert!(html.contains("value=\"claude-code\""));
+        assert!(html.contains("value=\"opencode\" selected"));
+        assert!(html.contains("value=\"codex-cli\""));
+        assert!(html.contains("updateSetting('default_backend', this.value)"));
     }
 }

@@ -1740,12 +1740,9 @@ async fn kill_session_inner(
     };
     let project_dir = claimed_session.metadata.project_dir.clone();
     let backend_session_id = claimed_session.metadata.backend_session_id.clone();
-    let backend = claimed_session
-        .metadata
-        .backend
-        .as_deref()
-        .and_then(|backend| state.backends.get(backend))
-        .unwrap_or_else(|| state.backends.default());
+    let backend = state
+        .backend_or_default(claimed_session.metadata.backend.as_deref())
+        .await;
     let is_http_api = matches!(
         backend.delivery_mode(),
         crate::backend::DeliveryMode::HttpApi { .. }
@@ -2324,7 +2321,7 @@ async fn start_session_with_prompt_storage(
             Ok(backend) => backend,
             Err(message) => return (message, None),
         },
-        None => state.backends.default(),
+        None => state.backend_or_default(None).await,
     };
     let backend_name = backend.name().to_string();
 
@@ -3637,13 +3634,7 @@ async fn restart_session_claimed(
         None => {
             // Fall back to the existing session's backend
             let prev_backend = prev_metadata.as_ref().and_then(|m| m.backend.as_deref());
-            match prev_backend {
-                Some(b) => state
-                    .backends
-                    .get(b)
-                    .unwrap_or_else(|| state.backends.default()),
-                None => state.backends.default(),
-            }
+            state.backend_or_default(prev_backend).await
         }
     };
 

@@ -1210,7 +1210,20 @@ impl AppState {
 
     pub fn new(config: OuijaConfig) -> SharedState {
         let log_file = config.data_dir.join("messages.jsonl");
-        let settings = crate::persistence::load_settings(&config.config_dir).unwrap_or_default();
+        let backends = crate::backend::BackendRegistry::default_registry();
+        let mut settings =
+            crate::persistence::load_settings(&config.config_dir).unwrap_or_default();
+        if backends.get(&settings.default_backend).is_none() {
+            tracing::warn!(
+                default_backend = %settings.default_backend,
+                valid_backends = %backends.valid_names_csv(),
+                "persisted default backend is not registered; using registry default"
+            );
+            settings.default_backend = backends.default().name().to_string();
+            if let Err(error) = crate::persistence::save_settings(&config.config_dir, &settings) {
+                tracing::warn!(%error, "failed to repair persisted default backend");
+            }
+        }
         let scheduled_tasks = crate::persistence::load_tasks(&config.data_dir).unwrap_or_default();
         let protocol =
             crate::daemon_protocol::DaemonState::new(config.npub.clone(), config.name.clone());
@@ -1240,7 +1253,7 @@ impl AppState {
             perfire_worktree_panes: RwLock::new(HashMap::new()),
             sweep_in_progress: std::sync::atomic::AtomicBool::new(false),
             sweep_backoff_until: std::sync::Mutex::new(None),
-            backends: crate::backend::BackendRegistry::default_registry(),
+            backends,
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
             compact_in_progress: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -1930,13 +1943,31 @@ impl AppState {
             .get(session_id)
             .and_then(|s| s.metadata.backend.as_deref())
             .map(String::from);
-        match backend_name {
-            Some(name) => self
-                .backends
-                .get(&name)
-                .unwrap_or_else(|| self.backends.default()),
-            None => self.backends.default(),
+        self.backend_or_default(backend_name.as_deref()).await
+    }
+
+    /// Resolve a backend name, using the operator-configured default only when absent.
+    pub async fn backend_or_default(
+        &self,
+        backend_name: Option<&str>,
+    ) -> std::sync::Arc<dyn crate::backend::CodingAssistant> {
+        if let Some(name) = backend_name {
+            return self.backends.get(name).unwrap_or_else(|| {
+                tracing::warn!(
+                    backend = %name,
+                    "stored backend is not registered; using registry default"
+                );
+                self.backends.default()
+            });
         }
+        let default_name = self.settings.read().await.default_backend.clone();
+        self.backends.get(&default_name).unwrap_or_else(|| {
+            tracing::warn!(
+                default_backend = %default_name,
+                "configured default backend is not registered; using registry default"
+            );
+            self.backends.default()
+        })
     }
 
     /// Detect which backend is running in a tmux pane by walking the process tree.
@@ -9789,5 +9820,54 @@ pub(crate) mod tests {
             state.protocol.read().await.sessions.is_empty(),
             "the scanner must not resurrect a pane while explicit kill-session is in progress"
         );
+    }
+
+    #[test]
+    fn new_hydrates_valid_default_backend_and_preserves_other_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"default_backend":"claude-code","auto_register":false,"idle_timeout_secs":321}"#,
+        )
+        .unwrap();
+        let state = AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: 0,
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        let settings = state.settings.blocking_read();
+
+        assert_eq!(settings.default_backend, "claude-code");
+        assert!(!settings.auto_register);
+        assert_eq!(settings.idle_timeout_secs, 321);
+    }
+
+    #[test]
+    fn new_normalizes_invalid_default_backend_without_losing_other_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"default_backend":"removed-backend","auto_register":false,"idle_timeout_secs":321}"#,
+        )
+        .unwrap();
+        let state = AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: 0,
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        let settings = state.settings.blocking_read();
+
+        assert_eq!(settings.default_backend, "opencode");
+        assert!(!settings.auto_register);
+        assert_eq!(settings.idle_timeout_secs, 321);
+        drop(settings);
+        let persisted = crate::persistence::load_settings(dir.path()).unwrap();
+        assert_eq!(persisted.default_backend, "opencode");
+        assert!(!persisted.auto_register);
+        assert_eq!(persisted.idle_timeout_secs, 321);
     }
 }

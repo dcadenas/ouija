@@ -602,11 +602,7 @@ pub(crate) async fn session_delivery_plan(
         ));
     };
 
-    let backend = metadata
-        .backend
-        .as_deref()
-        .and_then(|name| state.backends.get(name))
-        .unwrap_or_else(|| state.backends.default());
+    let backend = state.backend_or_default(metadata.backend.as_deref()).await;
 
     match backend.delivery_mode() {
         crate::backend::DeliveryMode::TuiInjection => SessionDeliveryPlan::RawTmux {

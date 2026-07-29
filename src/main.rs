@@ -325,7 +325,7 @@ enum RolloverAction {
 
 #[derive(Subcommand)]
 enum ConfigAction {
-    /// Set a config value (e.g. ouija config set auto_register false)
+    /// Set a config value: default_backend (claude-code, opencode, codex-cli), auto_register, etc.
     Set { key: String, value: String },
     /// Route a Codex model alias to backend-specific launch config
     SetCodexModelRoute {
@@ -6011,5 +6011,19 @@ mod tests {
             !msg.contains("ouija register"),
             "must never steer callers toward `ouija register`, got: {msg}"
         );
+    }
+
+    #[test]
+    fn config_help_describes_default_backend_setting() {
+        let mut command = Cli::command();
+        let config = command
+            .find_subcommand_mut("config")
+            .expect("config subcommand");
+        let mut help = Vec::new();
+        config.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+
+        assert!(help.contains("default_backend"));
+        assert!(help.contains("claude-code, opencode, codex-cli"));
     }
 }

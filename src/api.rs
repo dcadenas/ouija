@@ -1444,10 +1444,7 @@ async fn resolve_force_pane_inject_target(
             None => state.detect_backend_in_pane(pane).await,
         },
     };
-    let backend = backend_name
-        .as_deref()
-        .and_then(|name| state.backends.get(name))
-        .unwrap_or_else(|| state.backends.default());
+    let backend = state.backend_or_default(backend_name.as_deref()).await;
 
     ForcePaneInjectTarget {
         session_id,
@@ -1616,13 +1613,9 @@ async fn compact_inner(
     // Resolve the backend from the name captured above rather than re-reading
     // the protocol lock — prevents the branch decision from diverging from the
     // metadata it was taken on.
-    let backend = match lookup.backend_name.as_deref() {
-        Some(name) => state
-            .backends
-            .get(name)
-            .unwrap_or_else(|| state.backends.default()),
-        None => state.backends.default(),
-    };
+    let backend = state
+        .backend_or_default(lookup.backend_name.as_deref())
+        .await;
 
     match backend.delivery_mode() {
         crate::backend::DeliveryMode::TuiInjection => {
@@ -1912,6 +1905,7 @@ pub async fn disconnect_node(
 pub async fn get_settings(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let settings = state.settings.read().await;
     Json(json!({
+        "default_backend": settings.default_backend,
         "auto_register": settings.auto_register,
         "claude_permission_mode": settings.claude_permission_mode,
         "codex_home": settings.codex_home,
@@ -1921,6 +1915,7 @@ pub async fn get_settings(State(state): State<SharedState>) -> Json<serde_json::
 
 #[derive(Debug, Deserialize)]
 pub struct SettingsUpdateBody {
+    default_backend: Option<String>,
     auto_register: Option<bool>,
     projects_dir: Option<String>,
     idle_timeout_secs: Option<u64>,
@@ -1938,25 +1933,32 @@ pub async fn update_settings(
     Json(body): Json<SettingsUpdateBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let mut settings = state.settings.write().await;
+    let mut updated = settings.clone();
+    if let Some(v) = body.default_backend {
+        if let Err(message) = state.backends.get_required(&v) {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": message })));
+        }
+        updated.default_backend = v;
+    }
     if let Some(v) = body.auto_register {
-        settings.auto_register = v;
+        updated.auto_register = v;
     }
     let projects_dir_changed = body.projects_dir.is_some();
     if let Some(v) = body.projects_dir {
-        settings.projects_dir = Some(v);
+        updated.projects_dir = Some(v);
     }
     if let Some(v) = body.idle_timeout_secs {
-        settings.idle_timeout_secs = v;
+        updated.idle_timeout_secs = v;
     }
     if let Some(v) = body.reaper_interval_secs {
-        settings.reaper_interval_secs = v;
+        updated.reaper_interval_secs = v;
     }
     if let Some(v) = body.max_local_sessions {
-        settings.max_local_sessions = v;
+        updated.max_local_sessions = v;
     }
     if let Some(v) = body.claude_permission_mode {
         let trimmed = v.trim();
-        settings.claude_permission_mode = if trimmed.is_empty() || trimmed == "default" {
+        updated.claude_permission_mode = if trimmed.is_empty() || trimmed == "default" {
             None
         } else {
             Some(trimmed.to_string())
@@ -1964,32 +1966,33 @@ pub async fn update_settings(
     }
     let codex_home_to_install = if let Some(v) = body.codex_home {
         let trimmed = v.trim();
-        settings.codex_home = if trimmed.is_empty() || trimmed == "default" {
+        updated.codex_home = if trimmed.is_empty() || trimmed == "default" {
             None
         } else {
             Some(trimmed.to_string())
         };
-        settings.codex_home.clone()
+        updated.codex_home.clone()
     } else {
         None
     };
     let mut codex_route_homes_to_install = Vec::new();
     if let Some(routes) = body.codex_model_routes {
-        settings.codex_model_routes = routes;
+        updated.codex_model_routes = routes;
         codex_route_homes_to_install.extend(
-            settings
+            updated
                 .codex_model_routes
                 .values()
                 .filter_map(|route| route.codex_home.clone()),
         );
     }
-    if let Err(e) = crate::persistence::save_settings(&state.config.config_dir, &settings) {
+    if let Err(e) = crate::persistence::save_settings(&state.config.config_dir, &updated) {
         tracing::warn!("failed to save settings: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("failed to save: {e}") })),
         );
     }
+    *settings = updated;
     // Drop the write lock before spawning the refresh
     drop(settings);
     // Rebuild project index when projects_dir changes
@@ -2011,6 +2014,7 @@ pub async fn update_settings(
         Json(json!({
             "status": "saved",
             "settings": {
+                "default_backend": settings.default_backend,
                 "auto_register": settings.auto_register,
                 "projects_dir": settings.projects_dir,
                 "claude_permission_mode": settings.claude_permission_mode,
@@ -4810,6 +4814,8 @@ pub async fn clear_reminder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, routing::get};
+    use tokio::net::TcpListener;
 
     #[tokio::test]
     async fn status_and_single_session_expose_incarnation_and_parent_observability() {
@@ -6155,6 +6161,122 @@ mod tests {
         assert!(!target.inject_config.use_inner_bracketed_paste);
         assert_eq!(target.inject_config.startup_inject_delay_secs, 0);
         assert_eq!(target.tui_pattern, None);
+    }
+
+    #[tokio::test]
+    async fn settings_default_backend_is_persisted_and_drives_only_fallbacks() {
+        let state = crate::state::AppState::new_for_test();
+        let app = Router::new()
+            .route("/api/settings", get(get_settings).post(update_settings))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+
+        let response = client
+            .post(format!("http://{addr}/api/settings"))
+            .json(&json!({"default_backend": "claude-code"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let settings: serde_json::Value = client
+            .get(format!("http://{addr}/api/settings"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(settings["default_backend"], "claude-code");
+        assert_eq!(
+            serde_json::to_value(
+                crate::persistence::load_settings(&state.config.config_dir).unwrap()
+            )
+            .unwrap()["default_backend"],
+            "claude-code"
+        );
+        assert_eq!(
+            state.backend_for_session("missing-session").await.name(),
+            "claude-code"
+        );
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "explicit-opencode".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        assert_eq!(
+            state.backend_for_session("explicit-opencode").await.name(),
+            "opencode"
+        );
+
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "unknown-stored-backend".into(),
+                pane: None,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("removed-backend".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        assert_eq!(
+            state
+                .backend_for_session("unknown-stored-backend")
+                .await
+                .name(),
+            "opencode",
+            "unknown stored metadata must not be reinterpreted as backend absence"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn settings_reject_invalid_default_backend_without_mutation() {
+        let state = crate::state::AppState::new_for_test();
+        state.settings.write().await.auto_register = false;
+        let before = state.settings.read().await.clone();
+        crate::persistence::save_settings(&state.config.config_dir, &before).unwrap();
+        let persisted_before =
+            std::fs::read(state.config.config_dir.join("settings.json")).unwrap();
+
+        let (status, body) = update_settings(
+            State(state.clone()),
+            Json(
+                serde_json::from_value(json!({
+                    "default_backend": "not-a-backend",
+                    "auto_register": true
+                }))
+                .unwrap(),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body["error"],
+            "unknown backend 'not-a-backend'. Valid backends: claude-code, opencode, codex-cli"
+        );
+        let after = state.settings.read().await.clone();
+        assert_eq!(
+            serde_json::to_value(after).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(state.config.config_dir.join("settings.json")).unwrap(),
+            persisted_before
+        );
     }
 
     #[tokio::test]
