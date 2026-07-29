@@ -2398,6 +2398,23 @@ impl DaemonState {
         vec![Effect::Persist]
     }
 
+    /// Retire runtime boundary records once their incarnation is neither live
+    /// nor retained as the exact rollback incumbent of an active restart.
+    fn retain_reachable_active_context_due_boundaries(&mut self) {
+        let sessions = &self.sessions;
+        let lifecycle_leases = &self.lifecycle_leases;
+        self.active_context_due_boundaries.retain(|incarnation, _| {
+            sessions
+                .values()
+                .any(|session| session.metadata.session_incarnation == *incarnation)
+                || lifecycle_leases.values().any(|lease| {
+                    lease.restart_previous.as_deref().is_some_and(|previous| {
+                        previous.metadata.session_incarnation == *incarnation
+                    })
+                })
+        });
+    }
+
     fn apply_register(
         &mut self,
         id: String,
@@ -2998,6 +3015,7 @@ impl DaemonState {
             );
         }
         self.lifecycle_leases.remove(&lease_owner.session_id);
+        self.retain_reachable_active_context_due_boundaries();
         LifecycleCommitResult {
             outcome: LifecycleMutationOutcome::Applied,
             effects,
@@ -3104,6 +3122,7 @@ impl DaemonState {
         self.sessions
             .insert(lease_owner.session_id.clone(), previous);
         self.lifecycle_leases.remove(&lease_owner.session_id);
+        self.retain_reachable_active_context_due_boundaries();
         let mut effects = vec![Effect::Persist];
         if networked {
             effects.push(Effect::BroadcastSessionList);
@@ -3237,6 +3256,7 @@ impl DaemonState {
         if networked {
             effects.push(Effect::BroadcastSessionList);
         }
+        self.retain_reachable_active_context_due_boundaries();
         effects
     }
 
@@ -3565,6 +3585,7 @@ impl DaemonState {
             .remove(id)
             .expect("session must exist after origin guard");
         let owner = session.owner();
+        self.retain_reachable_active_context_due_boundaries();
         let agent_pane = session
             .session_agent_pane()
             .map(|pane| pane.map(std::string::ToString::to_string));
@@ -3710,6 +3731,7 @@ impl DaemonState {
         } else {
             self.apply_remove(id, true)
         };
+        self.retain_reachable_active_context_due_boundaries();
         if kill_provisional_pane {
             effects.push(Effect::ProvisionalRollbackOk {
                 owner: staged_owner,
@@ -3754,6 +3776,7 @@ impl DaemonState {
             }
             None => self.apply_remove_unleased(id, true),
         };
+        self.retain_reachable_active_context_due_boundaries();
         if let Some(provisional_pane) = provisional_pane
             && restore_pane.as_deref() != Some(provisional_pane)
         {
@@ -4344,6 +4367,7 @@ impl DaemonState {
         }
 
         if !removed_ids.is_empty() {
+            self.retain_reachable_active_context_due_boundaries();
             effects.push(Effect::Persist);
             effects.push(Effect::ClearOwnedPendingReplies { removed_owners });
             // Increment wire_seq so the session list carries a fresh sequence
@@ -6139,6 +6163,185 @@ mod tests {
                 ..
             } if due_owner == &owner
         )));
+    }
+
+    fn register_active_context_boundary(
+        state: &mut DaemonState,
+        id: &str,
+        pane: &str,
+    ) -> ResourceOwner {
+        state.apply(Event::Register {
+            id: id.into(),
+            pane: Some(pane.into()),
+            metadata: SessionMeta {
+                backend: Some("claude-code".into()),
+                fresh_context_after_active_secs: Some(1),
+                active_context_restart_due: true,
+                ..Default::default()
+            },
+        });
+        let owner = state.sessions[id].owner();
+        state.apply(Event::ActiveContextActive {
+            owner: owner.clone(),
+            at: 100,
+        });
+        state.apply(Event::ActiveContextStopped {
+            owner: owner.clone(),
+            at: 101,
+        });
+        owner
+    }
+
+    fn stage_active_context_restart_target(
+        state: &mut DaemonState,
+        incumbent: &ResourceOwner,
+        fresh: bool,
+    ) -> ResourceOwner {
+        assert_eq!(
+            state.claim_existing_start(incumbent),
+            LifecycleMutationOutcome::Applied
+        );
+        let StageFreshLaunchOutcome::Staged { incarnation } = state
+            .stage_restart_launch(
+                incumbent,
+                "claude-code".into(),
+                true,
+                fresh,
+                None,
+                None,
+                None,
+            )
+            .outcome
+        else {
+            panic!("restart target must stage");
+        };
+        let target = ResourceOwner {
+            session_id: incumbent.session_id.clone(),
+            incarnation,
+        };
+        state.apply(Event::ActiveContextActive {
+            owner: target.clone(),
+            at: 200,
+        });
+        state.apply(Event::ActiveContextStopped {
+            owner: target.clone(),
+            at: 202,
+        });
+        target
+    }
+
+    #[test]
+    fn definitive_removal_and_reaping_retire_active_context_boundary_authority() {
+        // Break caught: removing the only live owner without retiring its
+        // runtime boundary leaks one entry for every never-reused incarnation.
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        let removed_owner = register_active_context_boundary(&mut state, "removed", "%1");
+        let reaped_owner = register_active_context_boundary(&mut state, "reaped", "%2");
+        assert_eq!(state.active_context_due_boundaries.len(), 2);
+
+        state.apply(Event::Remove {
+            id: "removed".into(),
+            keep_worktree: true,
+        });
+        assert!(
+            !state
+                .active_context_due_boundaries
+                .contains_key(&removed_owner.incarnation)
+        );
+        assert!(
+            state
+                .active_context_due_boundaries
+                .contains_key(&reaped_owner.incarnation)
+        );
+
+        state.apply(Event::ReapDead {
+            dead_sessions: vec![(reaped_owner.clone(), "%2".into())],
+        });
+        assert!(state.active_context_due_boundaries.is_empty());
+    }
+
+    #[test]
+    fn restart_success_retires_only_the_rollback_incumbent_boundary() {
+        // Break caught: successful replacement makes the saved incumbent
+        // unreachable, but the live target must keep its boundary authority.
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        let incumbent = register_active_context_boundary(&mut state, "worker", "%1");
+        let target = stage_active_context_restart_target(&mut state, &incumbent, false);
+        let staged_metadata = state.sessions["worker"].metadata.clone();
+        state.apply(Event::RefreshLaunchMetadata {
+            id: "worker".into(),
+            expected_incarnation: target.incarnation,
+            pane: Some("%1".into()),
+            metadata: staged_metadata,
+        });
+        assert!(
+            state
+                .active_context_due_boundaries
+                .contains_key(&incumbent.incarnation),
+            "rollback-capable incumbent must remain reachable while the lease is live"
+        );
+        assert!(
+            state
+                .active_context_due_boundaries
+                .contains_key(&target.incarnation)
+        );
+
+        let metadata = state.sessions["worker"].metadata.clone();
+        assert_eq!(
+            state
+                .complete_restart_launch(&incumbent, &target, Some("%1".into()), metadata, false)
+                .outcome,
+            LifecycleMutationOutcome::Applied
+        );
+
+        assert_eq!(state.sessions["worker"].owner(), target);
+        assert!(state.sessions["worker"].metadata.active_context_restart_due);
+        assert_eq!(
+            state
+                .active_context_due_boundaries
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![target.incarnation]
+        );
+    }
+
+    #[test]
+    fn restart_rollback_retires_only_the_abandoned_target_boundary() {
+        // Break caught: rollback must restore the incumbent's exact boundary
+        // authority and discard only the provisional target incarnation.
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        let incumbent = register_active_context_boundary(&mut state, "worker", "%1");
+        let target = stage_active_context_restart_target(&mut state, &incumbent, true);
+        assert!(
+            state
+                .active_context_due_boundaries
+                .contains_key(&incumbent.incarnation),
+            "saved incumbent must remain reachable until rollback is resolved"
+        );
+        assert!(
+            state
+                .active_context_due_boundaries
+                .contains_key(&target.incarnation)
+        );
+
+        assert_eq!(
+            state
+                .rollback_restart_launch(&incumbent, &target, None)
+                .outcome,
+            LifecycleMutationOutcome::Applied
+        );
+
+        assert_eq!(state.sessions["worker"].owner(), incumbent);
+        assert!(state.sessions["worker"].metadata.active_context_restart_due);
+        assert_eq!(
+            state
+                .active_context_due_boundaries
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![incumbent.incarnation]
+        );
     }
 
     #[test]
