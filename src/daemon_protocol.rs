@@ -328,8 +328,8 @@ pub struct SessionMeta {
     pub backend_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
-    /// One-time daemon-issued credential authorizing Codex to record its first
-    /// backend thread ID for this managed launch.
+    /// One-time daemon-issued credential authorizing a managed backend to record
+    /// its first native session ID for this launch.
     ///
     /// This deliberately never reaches persisted metadata or session-list
     /// serialization. A daemon restart therefore fails an unclaimed launch
@@ -2704,7 +2704,7 @@ impl DaemonState {
             reservation.phase = BackendRepairPhase::Staged;
         }
         session.metadata.backend = Some(backend);
-        if replace_backend_identity {
+        if replace_backend_identity || fresh {
             session.metadata.backend_session_id = None;
             session.metadata.session_start_credential = session_start_credential;
             session.metadata.opencode_binding = None;
@@ -8909,6 +8909,73 @@ mod tests {
                 .outcome,
             StageFreshLaunchOutcome::Rejected
         ));
+    }
+
+    #[test]
+    fn fresh_restart_stage_discards_incumbent_backend_identity() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_incumbent".into()),
+                opencode_binding: Some(OpenCodeBinding::StrongManaged),
+                project_dir: Some("/tmp/project".into()),
+                ..Default::default()
+            },
+        });
+        let incumbent = state.sessions["worker"].owner();
+        assert_eq!(
+            state.claim_existing_start(&incumbent),
+            LifecycleMutationOutcome::Applied
+        );
+
+        let staged = state.stage_restart_launch(
+            &incumbent,
+            "opencode".into(),
+            false,
+            true,
+            None,
+            None,
+            None,
+        );
+        let StageFreshLaunchOutcome::Staged { incarnation } = staged.outcome else {
+            panic!("restart target was not staged");
+        };
+        let target = ResourceOwner {
+            session_id: "worker".into(),
+            incarnation,
+        };
+
+        assert!(
+            state.sessions["worker"]
+                .metadata
+                .backend_session_id
+                .is_none()
+        );
+        assert!(state.sessions["worker"].metadata.opencode_binding.is_none());
+        assert_eq!(
+            state.record_restart_backend_claim(
+                &incumbent,
+                &target,
+                "opencode".into(),
+                "ses_replacement".into(),
+            ),
+            LifecycleMutationOutcome::Applied
+        );
+        assert!(
+            state.sessions["worker"]
+                .metadata
+                .backend_session_id
+                .is_none()
+        );
+        assert_eq!(
+            state.lifecycle_leases["worker"]
+                .backend_session_id
+                .as_deref(),
+            Some("ses_replacement")
+        );
     }
 
     #[test]
