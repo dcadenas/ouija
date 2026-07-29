@@ -323,7 +323,7 @@ impl BackendRegistry {
                 Arc::new(opencode::OpenCode) as _,
                 Arc::new(codex::Codex) as _,
             ],
-            "claude-code",
+            "opencode",
         )
     }
 
@@ -659,6 +659,12 @@ pub(crate) fn assert_shared_task_reminder_guidance(skill: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_registry_uses_opencode() {
+        let registry = BackendRegistry::default_registry();
+        assert_eq!(registry.default().name(), "opencode");
+    }
 
     #[test]
     fn registry_available_returns_backends_with_binaries() {
