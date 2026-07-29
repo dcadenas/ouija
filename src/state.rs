@@ -26,6 +26,7 @@ struct OwnedSessionAgent {
 pub(crate) enum RestartTestCheckpoint {
     HardBeforeCompletion,
     SoftAfterBackendClaim,
+    ActiveContextAfterNotificationSnapshot,
 }
 
 #[cfg(test)]
@@ -586,23 +587,43 @@ enum ActiveContextDueDelivery {
 async fn deliver_paneless_active_context_restart_due(
     state: &Arc<AppState>,
     owner: &crate::daemon_protocol::ResourceOwner,
+    boundary_generation: u64,
     delivery: &crate::daemon_protocol::HttpDeliverySnapshot,
     message: &str,
 ) {
-    let outcome = state
-        .with_owned_paneless_strong_opencode_claim(owner, &delivery.backend_session_id, || async {
-            crate::tmux::deliver_via_http(
-                state,
-                &delivery.backend_session_id,
-                delivery.project_dir.as_deref(),
-                message,
-                delivery.model.as_deref(),
-                delivery.effort.as_deref(),
-            )
+    let gate = state.backend_resource_gate(&delivery.backend_session_id);
+    let _resource = gate.lock().await;
+    let current_binding = state
+        .protocol
+        .read()
+        .await
+        .sessions
+        .get(&owner.session_id)
+        .is_some_and(|session| {
+            session.owner() == *owner
+                && session.pane.is_none()
+                && session.metadata.is_strong_opencode_binding()
+                && session.metadata.backend_session_id.as_deref()
+                    == Some(delivery.backend_session_id.as_str())
+        });
+    if !current_binding
+        || !state
+            .claim_active_context_restart_due(owner, boundary_generation)
             .await
-        })
-        .await;
-    if let Some(Err(decision)) = outcome {
+    {
+        return;
+    }
+
+    if let Err(decision) = crate::tmux::deliver_via_http(
+        state,
+        &delivery.backend_session_id,
+        delivery.project_dir.as_deref(),
+        message,
+        delivery.model.as_deref(),
+        delivery.effort.as_deref(),
+    )
+    .await
+    {
         tracing::warn!(
             session = %owner.session_id,
             incarnation = %owner.incarnation,
@@ -615,6 +636,7 @@ async fn deliver_paneless_active_context_restart_due(
 async fn notify_active_context_restart_due(
     state: &Arc<AppState>,
     owner: &crate::daemon_protocol::ResourceOwner,
+    boundary_generation: u64,
 ) {
     let notification = {
         let protocol = state.protocol.read().await;
@@ -625,6 +647,7 @@ async fn notify_active_context_restart_due(
                 if session.owner() != *owner
                     || !session.metadata.active_context_restart_due
                     || session.metadata.active_context_accounting_provisional
+                    || session.metadata.active_context_segment_started_at.is_some()
                 {
                     return None;
                 }
@@ -648,12 +671,36 @@ async fn notify_active_context_restart_due(
         return;
     };
 
+    #[cfg(test)]
+    state
+        .wait_restart_test_checkpoint(RestartTestCheckpoint::ActiveContextAfterNotificationSnapshot)
+        .await;
+
     let message =
         active_context_restart_due_message(&owner.session_id, limit_secs, has_stored_prompt);
     match delivery {
         ActiveContextDueDelivery::Pane { pane, vim_mode } => {
+            let gate = state.pane_resource_gate(&pane);
+            let _resource = gate.lock().await;
+            let current_pane = state
+                .protocol
+                .read()
+                .await
+                .sessions
+                .get(&owner.session_id)
+                .is_some_and(|session| {
+                    session.owner() == *owner && session.pane.as_deref() == Some(pane.as_str())
+                });
+            if !current_pane
+                || !state
+                    .claim_active_context_restart_due(owner, boundary_generation)
+                    .await
+            {
+                return;
+            }
             if let Err(error) =
-                crate::tmux::locked_inject_owned(state, owner, &pane, &message, vim_mode).await
+                crate::tmux::locked_inject(state, &owner.session_id, &pane, &message, vim_mode)
+                    .await
             {
                 tracing::warn!(
                     session = %owner.session_id,
@@ -663,7 +710,14 @@ async fn notify_active_context_restart_due(
             }
         }
         ActiveContextDueDelivery::PanelessHttp(delivery) => {
-            deliver_paneless_active_context_restart_due(state, owner, &delivery, &message).await;
+            deliver_paneless_active_context_restart_due(
+                state,
+                owner,
+                boundary_generation,
+                &delivery,
+                &message,
+            )
+            .await;
         }
     }
 }
@@ -671,13 +725,15 @@ async fn notify_active_context_restart_due(
 fn spawn_owned_active_context_restart_due_delivery(
     state: &Arc<AppState>,
     owner: &crate::daemon_protocol::ResourceOwner,
+    boundary_generation: u64,
 ) {
     let state = Arc::clone(state);
     let owner = owner.clone();
     tokio::spawn(async move {
-        // The delivery remains owned by this exact incarnation: the initial
-        // snapshot and `locked_inject_owned` both reject a superseded owner.
-        notify_active_context_restart_due(&state, &owner).await;
+        // The delivery remains owned by this exact incarnation and stopped
+        // boundary. The actual pane/backend claim revalidates both after any
+        // detached-task delay.
+        notify_active_context_restart_due(&state, &owner, boundary_generation).await;
     });
 }
 
@@ -1355,7 +1411,8 @@ impl AppState {
             // pane/backend/project gates; the protocol lock serializes the
             // update and `DaemonState::apply` rejects superseded owners.
             crate::daemon_protocol::Event::ActiveContextActive { .. }
-            | crate::daemon_protocol::Event::ActiveContextStopped { .. } => {}
+            | crate::daemon_protocol::Event::ActiveContextStopped { .. }
+            | crate::daemon_protocol::Event::ClaimActiveContextRestartDue { .. } => {}
             crate::daemon_protocol::Event::RefreshLaunchMetadata {
                 id, pane, metadata, ..
             } => {
@@ -1599,31 +1656,27 @@ impl AppState {
         if current { Some(action().await) } else { None }
     }
 
-    async fn with_owned_paneless_strong_opencode_claim<F, Fut, T>(
+    async fn claim_active_context_restart_due(
         &self,
         owner: &crate::daemon_protocol::ResourceOwner,
-        backend_session_id: &str,
-        action: F,
-    ) -> Option<T>
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = T>,
-    {
-        let gate = self.backend_resource_gate(backend_session_id);
-        let _resource = gate.lock().await;
-        let current = self
-            .protocol
-            .read()
-            .await
-            .sessions
-            .get(&owner.session_id)
-            .is_some_and(|session| {
-                session.owner() == *owner
-                    && session.pane.is_none()
-                    && session.metadata.is_strong_opencode_binding()
-                    && session.metadata.backend_session_id.as_deref() == Some(backend_session_id)
-            });
-        if current { Some(action().await) } else { None }
+        boundary_generation: u64,
+    ) -> bool {
+        let mut protocol = self.protocol.write().await;
+        let effects = protocol.apply(
+            crate::daemon_protocol::Event::ClaimActiveContextRestartDue {
+                owner: owner.clone(),
+                boundary_generation,
+            },
+        );
+        effects.iter().any(|effect| {
+            matches!(
+                effect,
+                crate::daemon_protocol::Effect::ActiveContextRestartDueClaimed {
+                    owner: claimed_owner,
+                    boundary_generation: claimed_generation,
+                } if claimed_owner == owner && *claimed_generation == boundary_generation
+            )
+        })
     }
 
     /// Durably claim a project directory for an exact lifecycle lease and keep
@@ -3205,8 +3258,15 @@ impl AppState {
                 Effect::StopAgent { owner, pane } => {
                     self.stop_session_agent(owner, pane.as_deref()).await;
                 }
-                Effect::ActiveContextRestartDue { owner } => {
-                    spawn_owned_active_context_restart_due_delivery(self, owner);
+                Effect::ActiveContextRestartDue {
+                    owner,
+                    boundary_generation,
+                } => {
+                    spawn_owned_active_context_restart_due_delivery(
+                        self,
+                        owner,
+                        *boundary_generation,
+                    );
                 }
                 Effect::RenameAgent {
                     old_owner,
@@ -3408,7 +3468,8 @@ impl AppState {
                 | Effect::RenameOk { .. }
                 | Effect::RenameFailed { .. }
                 | Effect::RemoveOk { .. }
-                | Effect::RemoveFailed { .. } => {}
+                | Effect::RemoveFailed { .. }
+                | Effect::ActiveContextRestartDueClaimed { .. } => {}
             }
         }
 
@@ -5168,8 +5229,16 @@ pub(crate) mod tests {
             })
             .await;
         let owner = state.protocol.read().await.sessions["provisional-worker"].owner();
+        state
+            .protocol
+            .write()
+            .await
+            .apply(crate::daemon_protocol::Event::ActiveContextStopped {
+                owner: owner.clone(),
+                at: 0,
+            });
 
-        notify_active_context_restart_due(&state, &owner).await;
+        notify_active_context_restart_due(&state, &owner, 0).await;
         assert!(
             messages.lock().await.is_empty(),
             "provisional target must not receive a due notice"
@@ -5184,8 +5253,119 @@ pub(crate) mod tests {
             .unwrap()
             .metadata
             .active_context_accounting_provisional = false;
-        notify_active_context_restart_due(&state, &owner).await;
+        let _ = state.protocol.write().await.apply(
+            crate::daemon_protocol::Event::ActiveContextStopped {
+                owner: owner.clone(),
+                at: 1,
+            },
+        );
+        notify_active_context_restart_due(&state, &owner, 0).await;
         assert_eq!(messages.lock().await.len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn active_before_due_delivery_claim_defers_notice_until_next_stopped_boundary() {
+        // Break caught: a detached due task that snapshots a stopped session
+        // may not inject after Active has reopened the work segment.
+        let messages = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route(
+                "/session/{session_id}/prompt_async",
+                post(paneless_prompt_async_recorder),
+            )
+            .with_state(messages.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let data_dir = tempfile::tempdir().unwrap().keep();
+        let state = AppState::new(crate::config::OuijaConfig {
+            name: "active-context-boundary-race-test".into(),
+            npub: "npub1test".into(),
+            port: port - 320,
+            data_dir: data_dir.clone(),
+            config_dir: data_dir,
+        });
+        let mut metadata = strong_paneless_opencode_metadata(Some("ses_boundary_race"));
+        metadata.fresh_context_after_active_secs = Some(60);
+        metadata.active_context_accumulated_secs = 60;
+        metadata.active_context_restart_due = true;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "boundary-race-worker".into(),
+                pane: None,
+                metadata,
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["boundary-race-worker"].owner();
+        state
+            .protocol
+            .write()
+            .await
+            .apply(crate::daemon_protocol::Event::ActiveContextStopped {
+                owner: owner.clone(),
+                at: 99,
+            });
+        let checkpoint =
+            RestartTestControl::new(RestartTestCheckpoint::ActiveContextAfterNotificationSnapshot);
+        state.set_restart_test_control(checkpoint.clone());
+
+        let delivery_state = state.clone();
+        let delivery_owner = owner.clone();
+        let stale_delivery = tokio::spawn(async move {
+            notify_active_context_restart_due(&delivery_state, &delivery_owner, 0).await;
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            checkpoint.reached.notified(),
+        )
+        .await
+        .expect("due delivery did not reach the controlled post-snapshot checkpoint");
+
+        state
+            .protocol
+            .write()
+            .await
+            .apply(crate::daemon_protocol::Event::ActiveContextActive {
+                owner: owner.clone(),
+                at: 100,
+            });
+        checkpoint.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), stale_delivery)
+            .await
+            .expect("stale due delivery did not finish after checkpoint release")
+            .expect("stale due delivery task failed");
+
+        assert!(
+            messages.lock().await.is_empty(),
+            "the stale stopped-boundary notice must not interrupt active work"
+        );
+        assert!(
+            state.protocol.read().await.sessions["boundary-race-worker"]
+                .metadata
+                .active_context_restart_due,
+            "skipping stale delivery must preserve the refresh requirement"
+        );
+
+        state.set_restart_test_control(RestartTestControl::new(
+            RestartTestCheckpoint::HardBeforeCompletion,
+        ));
+        state
+            .protocol
+            .write()
+            .await
+            .apply(crate::daemon_protocol::Event::ActiveContextStopped {
+                owner: owner.clone(),
+                at: 101,
+            });
+        notify_active_context_restart_due(&state, &owner, 1).await;
+        assert_eq!(
+            messages.lock().await.len(),
+            1,
+            "the next stopped boundary must remain eligible for notification"
+        );
         server.abort();
     }
 
@@ -5214,23 +5394,29 @@ pub(crate) mod tests {
             data_dir: data_dir.clone(),
             config_dir: data_dir,
         });
+        let mut metadata = strong_paneless_opencode_metadata(Some("ses_reused"));
+        metadata.fresh_context_after_active_secs = Some(60);
+        metadata.active_context_restart_due = true;
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
                 id: "paneless-reused".into(),
                 pane: None,
-                metadata: strong_paneless_opencode_metadata(Some("ses_reused")),
+                metadata,
             })
             .await;
         let (stale_owner, stale_delivery) = {
-            let protocol = state.protocol.read().await;
+            let mut protocol = state.protocol.write().await;
             let session = &protocol.sessions["paneless-reused"];
-            (
-                session.owner(),
-                session
-                    .metadata
-                    .http_delivery_snapshot()
-                    .expect("strong HTTP snapshot"),
-            )
+            let owner = session.owner();
+            let delivery = session
+                .metadata
+                .http_delivery_snapshot()
+                .expect("strong HTTP snapshot");
+            let _ = protocol.apply(crate::daemon_protocol::Event::ActiveContextStopped {
+                owner: owner.clone(),
+                at: 0,
+            });
+            (owner, delivery)
         };
         let gate = state.backend_resource_gate("ses_reused");
         let held = gate.lock().await;
@@ -5241,6 +5427,7 @@ pub(crate) mod tests {
             deliver_paneless_active_context_restart_due(
                 &delivery_state,
                 &delivery_owner,
+                0,
                 &delivery_snapshot,
                 "stale due notice",
             )

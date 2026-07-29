@@ -181,6 +181,21 @@ pub struct DaemonState {
     pub last_seen_seq: BTreeMap<String, u64>,
     /// Pending replies: session_id → list of pending msg_ids
     pub pending_replies: BTreeMap<String, Vec<PendingReplyEntry>>,
+    /// Runtime-only stopped-boundary delivery authority, keyed by the daemon-
+    /// unique session incarnation.
+    ///
+    /// This is deliberately not part of persisted session metadata. Detached
+    /// delivery tasks do not survive daemon recovery, while the durable
+    /// `active_context_restart_due` flag does; the next Stopped event after
+    /// recovery establishes a fresh eligible boundary from generation zero.
+    active_context_due_boundaries: BTreeMap<SessionIncarnation, ActiveContextDueBoundary>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+struct ActiveContextDueBoundary {
+    generation: u64,
+    stopped: bool,
+    claimed: bool,
 }
 
 /// A pending reply entry tracked in DaemonState.
@@ -1017,6 +1032,16 @@ pub enum Event {
         owner: ResourceOwner,
         at: i64,
     },
+    /// Claim one exact stopped-boundary due notice immediately before its
+    /// external delivery. Active or another boundary generation invalidates
+    /// a delayed claim without clearing the durable due requirement.
+    ///
+    /// This is internal delivery bookkeeping and deliberately does not bump
+    /// `last_metadata_update`.
+    ClaimActiveContextRestartDue {
+        owner: ResourceOwner,
+        boundary_generation: u64,
+    },
     /// Mark a conclusively successful fresh launch for its exact owner.
     ///
     /// New restart targets finalize their already-reset provisional
@@ -1124,6 +1149,14 @@ pub enum Effect {
     /// its active-context refresh is due.
     ActiveContextRestartDue {
         owner: ResourceOwner,
+        boundary_generation: u64,
+    },
+    /// Pure-state acknowledgement that one exact runtime boundary acquired
+    /// delivery authority. AppState uses this as the delivery claim result;
+    /// it has no external side effect and is intentionally not persisted.
+    ActiveContextRestartDueClaimed {
+        owner: ResourceOwner,
+        boundary_generation: u64,
     },
     RenameAgent {
         old_owner: ResourceOwner,
@@ -2194,6 +2227,10 @@ impl DaemonState {
             Event::ActiveContextStopped { owner, at } => {
                 self.apply_active_context_stopped(&owner, at)
             }
+            Event::ClaimActiveContextRestartDue {
+                owner,
+                boundary_generation,
+            } => self.apply_claim_active_context_restart_due(&owner, boundary_generation),
             Event::FreshContextRestartSucceeded { owner } => {
                 self.apply_fresh_context_restart_succeeded(&owner)
             }
@@ -2216,6 +2253,13 @@ impl DaemonState {
         }
 
         session.metadata.active_context_segment_started_at = Some(at);
+        let boundary = self
+            .active_context_due_boundaries
+            .entry(owner.incarnation)
+            .or_default();
+        boundary.generation = boundary.generation.wrapping_add(1);
+        boundary.stopped = false;
+        boundary.claimed = false;
         vec![Effect::Persist]
     }
 
@@ -2256,14 +2300,55 @@ impl DaemonState {
         if changed {
             effects.push(Effect::Persist);
         }
-        if session.metadata.active_context_restart_due
+        let due_boundary = if session.metadata.active_context_restart_due
             && !session.metadata.active_context_accounting_provisional
         {
+            let boundary = self
+                .active_context_due_boundaries
+                .entry(owner.incarnation)
+                .or_default();
+            boundary.stopped = true;
+            (!boundary.claimed).then_some(boundary.generation)
+        } else {
+            None
+        };
+        if let Some(boundary_generation) = due_boundary {
             effects.push(Effect::ActiveContextRestartDue {
                 owner: owner.clone(),
+                boundary_generation,
             });
         }
         effects
+    }
+
+    fn apply_claim_active_context_restart_due(
+        &mut self,
+        owner: &ResourceOwner,
+        boundary_generation: u64,
+    ) -> Vec<Effect> {
+        let Some(session) = self.sessions.get_mut(&owner.session_id) else {
+            return vec![];
+        };
+        if !matches!(session.origin, Origin::Local)
+            || session.metadata.session_incarnation != owner.incarnation
+            || !session.metadata.active_context_restart_due
+            || session.metadata.active_context_accounting_provisional
+            || session.metadata.active_context_segment_started_at.is_some()
+        {
+            return vec![];
+        }
+        let boundary = self
+            .active_context_due_boundaries
+            .entry(owner.incarnation)
+            .or_default();
+        if !boundary.stopped || boundary.generation != boundary_generation || boundary.claimed {
+            return vec![];
+        }
+        boundary.claimed = true;
+        vec![Effect::ActiveContextRestartDueClaimed {
+            owner: owner.clone(),
+            boundary_generation,
+        }]
     }
 
     fn apply_fresh_context_restart_succeeded(&mut self, owner: &ResourceOwner) -> Vec<Effect> {
@@ -2283,10 +2368,20 @@ impl DaemonState {
             }
             session.metadata.active_context_accounting_provisional = false;
             let mut effects = vec![Effect::Persist];
-            if session.metadata.active_context_restart_due {
-                effects.push(Effect::ActiveContextRestartDue {
-                    owner: owner.clone(),
-                });
+            if session.metadata.active_context_restart_due
+                && session.metadata.active_context_segment_started_at.is_none()
+            {
+                let boundary = self
+                    .active_context_due_boundaries
+                    .entry(owner.incarnation)
+                    .or_default();
+                boundary.stopped = true;
+                if !boundary.claimed {
+                    effects.push(Effect::ActiveContextRestartDue {
+                        owner: owner.clone(),
+                        boundary_generation: boundary.generation,
+                    });
+                }
             }
             return effects;
         }
@@ -5923,10 +6018,10 @@ mod tests {
     }
 
     #[test]
-    fn active_context_accounting_counts_active_time_and_notifies_at_every_due_stop() {
+    fn active_context_accounting_binds_notices_to_each_due_stopped_boundary() {
         // Break caught: an implementation that counts wall-clock parked time,
-        // opens a second segment on repeated Active, or suppresses later due
-        // stopped boundaries would produce the wrong total or omit a reminder.
+        // opens a second segment on repeated Active, reuses a claimed boundary,
+        // or suppresses later due boundaries would miscount or misdeliver.
         let mut state = DaemonState::new("d1".into(), "host1".into());
         state.apply(Event::Register {
             id: "worker".into(),
@@ -5974,10 +6069,41 @@ mod tests {
             Some(77),
             "internal accounting must not change user-facing metadata freshness"
         );
-        assert!(threshold_effects.iter().any(|effect| matches!(
-            effect,
-            Effect::ActiveContextRestartDue { owner: due_owner } if due_owner == &owner
-        )));
+        let boundary_generation = threshold_effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::ActiveContextRestartDue {
+                    owner: due_owner,
+                    boundary_generation,
+                } if due_owner == &owner => Some(*boundary_generation),
+                _ => None,
+            })
+            .expect("threshold stop emits an exact boundary token");
+        assert!(
+            state
+                .apply(Event::ClaimActiveContextRestartDue {
+                    owner: owner.clone(),
+                    boundary_generation,
+                })
+                .iter()
+                .any(|effect| matches!(
+                    effect,
+                    Effect::ActiveContextRestartDueClaimed {
+                        owner: claimed_owner,
+                        boundary_generation: claimed_generation,
+                    } if claimed_owner == &owner && *claimed_generation == boundary_generation
+                ))
+        );
+        assert!(
+            !state
+                .apply(Event::ActiveContextStopped {
+                    owner: owner.clone(),
+                    at: 111,
+                })
+                .iter()
+                .any(|effect| matches!(effect, Effect::ActiveContextRestartDue { .. })),
+            "a claimed stopped boundary may not notify twice"
+        );
 
         // The interval from 110 to 1_000 is parked and must not be charged.
         state.apply(Event::ActiveContextActive {
@@ -5996,7 +6122,10 @@ mod tests {
         );
         assert!(later_effects.iter().any(|effect| matches!(
             effect,
-            Effect::ActiveContextRestartDue { owner: due_owner } if due_owner == &owner
+            Effect::ActiveContextRestartDue {
+                owner: due_owner,
+                ..
+            } if due_owner == &owner
         )));
 
         let repeated_stop_effects = state.apply(Event::ActiveContextStopped {
@@ -6005,7 +6134,10 @@ mod tests {
         });
         assert!(repeated_stop_effects.iter().any(|effect| matches!(
             effect,
-            Effect::ActiveContextRestartDue { owner: due_owner } if due_owner == &owner
+            Effect::ActiveContextRestartDue {
+                owner: due_owner,
+                ..
+            } if due_owner == &owner
         )));
     }
 
@@ -6718,7 +6850,7 @@ mod tests {
                 .any(|effect| matches!(effect, Effect::Persist))
         );
         assert!(finalized.iter().any(
-            |effect| matches!(effect, Effect::ActiveContextRestartDue { owner } if owner == &target)
+            |effect| matches!(effect, Effect::ActiveContextRestartDue { owner, .. } if owner == &target)
         ));
         let metadata = &state.sessions["worker"].metadata;
         assert_eq!(metadata.fresh_context_after_active_secs, Some(120));
@@ -6908,7 +7040,7 @@ mod tests {
                 .any(|effect| matches!(effect, Effect::Persist))
         );
         assert!(effects.iter().any(
-            |effect| matches!(effect, Effect::ActiveContextRestartDue { owner } if owner == &target)
+            |effect| matches!(effect, Effect::ActiveContextRestartDue { owner, .. } if owner == &target)
         ));
         let staged = &state.sessions["worker"].metadata;
         assert_eq!(staged.active_context_accumulated_secs, 60);

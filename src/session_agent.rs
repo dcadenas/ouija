@@ -1232,7 +1232,7 @@ mod tests {
         // command or prompt semantics leaves the next context unable to resume.
         let (state, messages, server) =
             opencode_reminder_test_state("feature-worker", None, None).await;
-        let owner = {
+        let effects = {
             let mut protocol = state.protocol.write().await;
             let metadata = &mut protocol
                 .sessions
@@ -1242,12 +1242,14 @@ mod tests {
             metadata.fresh_context_after_active_secs = Some(5400);
             metadata.active_context_restart_due = true;
             metadata.prompt = Some("finish the active task".into());
-            protocol.sessions["feature-worker"].owner()
+            let owner = protocol.sessions["feature-worker"].owner();
+            protocol.apply(crate::daemon_protocol::Event::ActiveContextStopped {
+                owner: owner.clone(),
+                at: 0,
+            })
         };
 
-        state
-            .execute_effects(&[crate::daemon_protocol::Effect::ActiveContextRestartDue { owner }])
-            .await;
+        state.execute_effects(&effects).await;
 
         wait_for_message_count(&messages, 1).await;
         let messages = messages.lock().await;
@@ -1274,7 +1276,7 @@ mod tests {
         // the only instructions available to their fresh context.
         let (state, messages, server) =
             opencode_reminder_test_state("promptless-worker", None, None).await;
-        let owner = {
+        let effects = {
             let mut protocol = state.protocol.write().await;
             let metadata = &mut protocol
                 .sessions
@@ -1283,12 +1285,14 @@ mod tests {
                 .metadata;
             metadata.fresh_context_after_active_secs = Some(60);
             metadata.active_context_restart_due = true;
-            protocol.sessions["promptless-worker"].owner()
+            let owner = protocol.sessions["promptless-worker"].owner();
+            protocol.apply(crate::daemon_protocol::Event::ActiveContextStopped {
+                owner: owner.clone(),
+                at: 0,
+            })
         };
 
-        state
-            .execute_effects(&[crate::daemon_protocol::Effect::ActiveContextRestartDue { owner }])
-            .await;
+        state.execute_effects(&effects).await;
 
         wait_for_message_count(&messages, 1).await;
         let messages = messages.lock().await;
@@ -1304,7 +1308,7 @@ mod tests {
         // alone would inject the old session's instruction into its replacement.
         let (state, messages, server) =
             opencode_reminder_test_state("replacement-worker", None, None).await;
-        let stale_owner = {
+        let stale_effects = {
             let mut protocol = state.protocol.write().await;
             let metadata = &mut protocol
                 .sessions
@@ -1313,7 +1317,11 @@ mod tests {
                 .metadata;
             metadata.fresh_context_after_active_secs = Some(60);
             metadata.active_context_restart_due = true;
-            protocol.sessions["replacement-worker"].owner()
+            let owner = protocol.sessions["replacement-worker"].owner();
+            protocol.apply(crate::daemon_protocol::Event::ActiveContextStopped {
+                owner: owner.clone(),
+                at: 0,
+            })
         };
         {
             let mut protocol = state.protocol.write().await;
@@ -1328,11 +1336,7 @@ mod tests {
             });
         }
 
-        state
-            .execute_effects(&[crate::daemon_protocol::Effect::ActiveContextRestartDue {
-                owner: stale_owner,
-            }])
-            .await;
+        state.execute_effects(&stale_effects).await;
 
         assert!(
             messages.lock().await.is_empty(),
