@@ -1942,6 +1942,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn credentialed_managed_claude_session_start_binds_existing_pane() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "feat/claude-worker".into(),
+                pane: Some("%73".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    project_dir: Some("/home/user/code/proj".into()),
+                    session_start_credential: Some("claude-launch-secret".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: "%73".into(),
+                cwd: "/home/user/code/proj".into(),
+                backend_session_id: Some("claude-session-1".into()),
+                backend_identity: Some(crate::backend::BackendSessionIdentity {
+                    backend: "claude-code".into(),
+                    session_id: "claude-session-1".into(),
+                }),
+                adapter: Some("claude-code".into()),
+                launch_session_id: Some("feat/claude-worker".into()),
+                launch_credential: Some("claude-launch-secret".into()),
+                session_incarnation: Some(session_incarnation(&state, "feat/claude-worker").await),
+            },
+        )
+        .await;
+
+        assert_eq!(result["registered"], "feat/claude-worker");
+        assert_eq!(result["output"], "");
+        let protocol = state.protocol.read().await;
+        let metadata = &protocol.sessions["feat/claude-worker"].metadata;
+        assert_eq!(
+            metadata.backend_session_id.as_deref(),
+            Some("claude-session-1")
+        );
+        assert!(
+            metadata.session_start_credential.is_none(),
+            "the successful Claude bind must consume its one-time credential"
+        );
+    }
+
+    #[tokio::test]
     async fn session_start_rejects_tokenless_thread_rotation_for_existing_local_pane() {
         // Pane, cwd, and live backend provenance are reusable observations.
         // They must not authorize a fresh thread to replace the exact backend

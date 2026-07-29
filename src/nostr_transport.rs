@@ -11,6 +11,10 @@ use crate::protocol::WireMessage;
 use crate::state::AppState;
 use crate::transport::Transport;
 
+fn managed_tui_launch_requires_credential(backend_name: &str) -> bool {
+    matches!(backend_name, "claude-code" | "codex-cli")
+}
+
 fn opencode_binding_for_backend_session(
     is_http_api: bool,
     backend_session_id: Option<&str>,
@@ -41,11 +45,11 @@ fn opencode_binding_for_restart_session(
 
 /// Select the backend identity written by the final restart registration.
 ///
-/// A fresh Codex launch has to read the state again because its SessionStart
-/// hook can consume the one-time credential before this refresh. A resumed
-/// Codex launch already has an authoritative thread ID: the exact ID passed to
-/// `codex resume`, so the refresh must retain it even though TUI backends do
-/// not otherwise discover a backend session ID here.
+/// A fresh managed TUI launch has to read the state again because its
+/// SessionStart hook can consume the one-time credential before this refresh.
+/// A resumed Codex launch already has an authoritative thread ID: the exact ID
+/// passed to `codex resume`, so the refresh must retain it even though TUI
+/// backends do not otherwise discover a backend session ID here.
 fn final_restart_backend_binding(
     backend_name: &str,
     resume_id: Option<String>,
@@ -2497,11 +2501,11 @@ async fn start_session_with_prompt_storage(
     );
     drop(settings);
     crate::backend::codex::install_configured_home(launch_model.codex_home.as_deref());
-    // Mint the proof before rendering the command: a shared Codex app-server
-    // cannot rely on pane-local env, so fresh launches receive it as a trusted
-    // session-flags hook instead.
-    let session_start_credential =
-        (backend_name == "codex-cli").then(crate::daemon_protocol::new_session_start_credential);
+    // Mint one-time proof for every managed TUI identity before rendering the
+    // command. Claude receives it through pane_env_args; Codex additionally
+    // needs it embedded in its trusted session-flags hook.
+    let session_start_credential = managed_tui_launch_requires_credential(&backend_name)
+        .then(crate::daemon_protocol::new_session_start_credential);
     let backend_cmd = backend.build_start_command(&crate::backend::StartOpts {
         project_dir: dir.clone(),
         worktree: None, // ouija manages worktrees, not the backend
@@ -2510,8 +2514,11 @@ async fn start_session_with_prompt_storage(
         permission_mode: claude_permission_mode,
         codex_home: launch_model.codex_home.clone(),
     });
-    let backend_cmd = match session_start_credential.as_deref() {
-        Some(credential) => match crate::backend::codex::with_session_start_hook(
+    let backend_cmd = if backend_name == "codex-cli" {
+        let credential = session_start_credential
+            .as_deref()
+            .expect("new managed Codex identity must have a launch credential");
+        match crate::backend::codex::with_session_start_hook(
             backend_cmd,
             launch_model.codex_home.as_deref(),
             name,
@@ -2527,8 +2534,9 @@ async fn start_session_with_prompt_storage(
                 )
                 .await;
             }
-        },
-        None => backend_cmd,
+        }
+    } else {
+        backend_cmd
     };
 
     let reminder_meta = crate::daemon_protocol::SessionMeta {
@@ -3708,8 +3716,9 @@ async fn restart_session_claimed(
         tracing::info!("restart '{name}': using --resume {sid}");
     }
     let launches_new_backend_identity = fresh || resume_id.is_none();
-    let session_start_credential = (backend_name == "codex-cli" && launches_new_backend_identity)
-        .then(crate::daemon_protocol::new_session_start_credential);
+    let session_start_credential = (launches_new_backend_identity
+        && managed_tui_launch_requires_credential(&backend_name))
+    .then(crate::daemon_protocol::new_session_start_credential);
 
     let staged_incarnation = match state
         .stage_restart_launch(
@@ -3999,44 +4008,52 @@ async fn restart_session_claimed(
         None
     };
 
-    let claude_cmd = match session_start_credential.as_deref() {
-        Some(credential) => {
-            let Some(incarnation) = staged_incarnation else {
-                return (
-                    "restart missing staged Codex incarnation".into(),
-                    None,
-                    RestartOutcome::Failed,
-                );
-            };
-            match crate::backend::codex::with_session_start_hook(
-                claude_cmd,
-                launch_codex_home.as_deref(),
-                name,
-                credential,
-                incarnation,
-            ) {
-                Ok(command) => command,
-                Err(error) => {
-                    let rollback =
-                        rollback_claimed_restart(state, lease_owner, &restart_target_owner, None)
-                            .await;
+    let claude_cmd = if backend_name == "codex-cli" {
+        match session_start_credential.as_deref() {
+            Some(credential) => {
+                let Some(incarnation) = staged_incarnation else {
                     return (
-                        format!(
-                            "could not stage Codex launch credential: {error}{}",
-                            rollback
-                                .err()
-                                .map(|rollback_error| {
-                                    format!("; durable rollback failed: {rollback_error}")
-                                })
-                                .unwrap_or_default()
-                        ),
+                        "restart missing staged Codex incarnation".into(),
                         None,
                         RestartOutcome::Failed,
                     );
+                };
+                match crate::backend::codex::with_session_start_hook(
+                    claude_cmd,
+                    launch_codex_home.as_deref(),
+                    name,
+                    credential,
+                    incarnation,
+                ) {
+                    Ok(command) => command,
+                    Err(error) => {
+                        let rollback = rollback_claimed_restart(
+                            state,
+                            lease_owner,
+                            &restart_target_owner,
+                            None,
+                        )
+                        .await;
+                        return (
+                            format!(
+                                "could not stage Codex launch credential: {error}{}",
+                                rollback
+                                    .err()
+                                    .map(|rollback_error| {
+                                        format!("; durable rollback failed: {rollback_error}")
+                                    })
+                                    .unwrap_or_default()
+                            ),
+                            None,
+                            RestartOutcome::Failed,
+                        );
+                    }
                 }
             }
+            None => claude_cmd,
         }
-        None => claude_cmd,
+    } else {
+        claude_cmd
     };
 
     let start_gate = if let Some(pane) = existing_pane.as_deref() {
@@ -4554,10 +4571,10 @@ async fn restart_session_claimed(
                 );
             }
 
-            // Codex may have already consumed the credential and recorded its
-            // thread ID while the pane was starting. Preserve that atomic
-            // result instead of overwriting it with this restart's initial
-            // `None` placeholder during the metadata refresh below.
+            // A managed TUI hook may have already consumed the credential and
+            // recorded its backend ID while the pane was starting. Preserve
+            // that atomic result instead of overwriting it with this restart's
+            // initial `None` placeholder during the metadata refresh below.
             let session_start_result = if session_start_credential.is_some() {
                 let proto = state.protocol.read().await;
                 proto.sessions.get(name).map(|session| {
@@ -9629,6 +9646,13 @@ mod tests {
     }
 
     #[test]
+    fn managed_tui_launch_credential_is_required_for_claude_and_codex_only() {
+        assert!(managed_tui_launch_requires_credential("claude-code"));
+        assert!(managed_tui_launch_requires_credential("codex-cli"));
+        assert!(!managed_tui_launch_requires_credential("opencode"));
+    }
+
+    #[test]
     fn restart_final_refresh_preserves_selected_codex_resume_id() {
         assert_eq!(
             final_restart_backend_binding(
@@ -9670,6 +9694,36 @@ mod tests {
             ),
             (None, Some("launch-credential".into())),
             "a SessionStart that arrives after the final refresh still receives its pending credential"
+        );
+    }
+
+    #[test]
+    fn restart_final_refresh_preserves_credentialed_managed_claude_hook_binding() {
+        assert_eq!(
+            final_restart_backend_binding(
+                "claude-code",
+                None,
+                Some("launch-credential".into()),
+                None,
+                Some((Some("claude-thread-bound-early".into()), None)),
+            ),
+            (Some("claude-thread-bound-early".into()), None),
+            "a Claude SessionStart that consumes the credential before refresh remains bound"
+        );
+    }
+
+    #[test]
+    fn restart_final_refresh_leaves_managed_claude_credential_for_late_hook() {
+        assert_eq!(
+            final_restart_backend_binding(
+                "claude-code",
+                None,
+                Some("launch-credential".into()),
+                None,
+                None,
+            ),
+            (None, Some("launch-credential".into())),
+            "a Claude SessionStart after refresh retains the staged launch credential"
         );
     }
 

@@ -983,9 +983,9 @@ pub fn default_shell() -> String {
 ///
 /// `OUIJA_SESSION_INCARNATION`, when supplied, identifies the exact lifecycle
 /// owner of the managed launch. `OUIJA_SESSION_START_CREDENTIAL`, when supplied
-/// for a managed Codex launch, authorizes only its first backend-thread
-/// binding. `HISTFILE=/dev/null` and `fish_history=` suppress history writes so
-/// ouija commands don't pollute the user's shell history.
+/// for a managed TUI launch, authorizes only its first backend-identity binding.
+/// `HISTFILE=/dev/null` and `fish_history=` suppress history writes so ouija
+/// commands don't pollute the user's shell history.
 pub fn pane_env_args(
     session_id: &str,
     session_start_credential: Option<&str>,

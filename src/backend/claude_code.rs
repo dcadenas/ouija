@@ -633,6 +633,11 @@ mod tests {
         assert!(script.contains("--arg adapter \"claude-code\""), "{script}");
         assert!(script.contains("launch_session_id"), "{script}");
         assert!(script.contains("${OUIJA_SESSION_ID:-}"), "{script}");
+        assert!(
+            script.contains("${OUIJA_SESSION_START_CREDENTIAL:-}"),
+            "{script}"
+        );
+        assert!(script.contains("launch_credential"), "{script}");
         assert!(script.contains("OUIJA_SESSION_INCARNATION"), "{script}");
         assert!(script.contains("session_incarnation"), "{script}");
         assert!(
