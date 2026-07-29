@@ -5774,6 +5774,7 @@ mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -7777,6 +7778,7 @@ mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -7819,6 +7821,7 @@ mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -9762,6 +9765,7 @@ mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }

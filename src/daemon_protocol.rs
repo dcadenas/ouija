@@ -181,18 +181,10 @@ pub struct DaemonState {
     pub last_seen_seq: BTreeMap<String, u64>,
     /// Pending replies: session_id → list of pending msg_ids
     pub pending_replies: BTreeMap<String, Vec<PendingReplyEntry>>,
-    /// Runtime-only stopped-boundary delivery authority, keyed by the daemon-
-    /// unique session incarnation.
-    ///
-    /// This is deliberately not part of persisted session metadata. Detached
-    /// delivery tasks do not survive daemon recovery, while the durable
-    /// `active_context_restart_due` flag does; the next Stopped event after
-    /// recovery establishes a fresh eligible boundary from generation zero.
-    active_context_due_boundaries: BTreeMap<SessionIncarnation, ActiveContextDueBoundary>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-struct ActiveContextDueBoundary {
+pub(crate) struct ActiveContextDueBoundary {
     generation: u64,
     stopped: bool,
     claimed: bool,
@@ -219,6 +211,15 @@ pub struct SessionEntry {
     /// Unix timestamp of registration. Used for reaper grace period.
     #[serde(default)]
     pub registered_at: i64,
+    /// Runtime-only stopped-boundary delivery authority for this exact entry.
+    ///
+    /// Detached delivery tasks do not survive daemon recovery, while the
+    /// durable `active_context_restart_due` flag does; the next Stopped event
+    /// after recovery establishes a fresh eligible boundary from generation
+    /// zero. Keeping this on the entry makes replacement and rollback follow
+    /// the entry's ownership without a separately keyed reachability index.
+    #[serde(skip)]
+    pub(crate) active_context_due_boundary: ActiveContextDueBoundary,
 }
 
 impl SessionEntry {
@@ -2253,10 +2254,7 @@ impl DaemonState {
         }
 
         session.metadata.active_context_segment_started_at = Some(at);
-        let boundary = self
-            .active_context_due_boundaries
-            .entry(owner.incarnation)
-            .or_default();
+        let boundary = &mut session.active_context_due_boundary;
         boundary.generation = boundary.generation.wrapping_add(1);
         boundary.stopped = false;
         boundary.claimed = false;
@@ -2303,10 +2301,7 @@ impl DaemonState {
         let due_boundary = if session.metadata.active_context_restart_due
             && !session.metadata.active_context_accounting_provisional
         {
-            let boundary = self
-                .active_context_due_boundaries
-                .entry(owner.incarnation)
-                .or_default();
+            let boundary = &mut session.active_context_due_boundary;
             boundary.stopped = true;
             (!boundary.claimed).then_some(boundary.generation)
         } else {
@@ -2337,10 +2332,7 @@ impl DaemonState {
         {
             return vec![];
         }
-        let boundary = self
-            .active_context_due_boundaries
-            .entry(owner.incarnation)
-            .or_default();
+        let boundary = &mut session.active_context_due_boundary;
         if !boundary.stopped || boundary.generation != boundary_generation || boundary.claimed {
             return vec![];
         }
@@ -2371,10 +2363,7 @@ impl DaemonState {
             if session.metadata.active_context_restart_due
                 && session.metadata.active_context_segment_started_at.is_none()
             {
-                let boundary = self
-                    .active_context_due_boundaries
-                    .entry(owner.incarnation)
-                    .or_default();
+                let boundary = &mut session.active_context_due_boundary;
                 boundary.stopped = true;
                 if !boundary.claimed {
                     effects.push(Effect::ActiveContextRestartDue {
@@ -2396,23 +2385,6 @@ impl DaemonState {
         session.metadata.active_context_segment_started_at = None;
         session.metadata.active_context_restart_due = false;
         vec![Effect::Persist]
-    }
-
-    /// Retire runtime boundary records once their incarnation is neither live
-    /// nor retained as the exact rollback incumbent of an active restart.
-    fn retain_reachable_active_context_due_boundaries(&mut self) {
-        let sessions = &self.sessions;
-        let lifecycle_leases = &self.lifecycle_leases;
-        self.active_context_due_boundaries.retain(|incarnation, _| {
-            sessions
-                .values()
-                .any(|session| session.metadata.session_incarnation == *incarnation)
-                || lifecycle_leases.values().any(|lease| {
-                    lease.restart_previous.as_deref().is_some_and(|previous| {
-                        previous.metadata.session_incarnation == *incarnation
-                    })
-                })
-        });
     }
 
     fn apply_register(
@@ -2669,6 +2641,7 @@ impl DaemonState {
             origin: Origin::Local,
             metadata,
             registered_at: now.timestamp(),
+            active_context_due_boundary: ActiveContextDueBoundary::default(),
         };
         self.sessions.insert(id.clone(), session);
         effects.push(Effect::Persist);
@@ -2835,6 +2808,7 @@ impl DaemonState {
         session.metadata.restart_generation = session.metadata.restart_generation.saturating_add(1);
         session.metadata.session_incarnation = incarnation;
         session.registered_at = chrono::Utc::now().timestamp();
+        session.active_context_due_boundary = ActiveContextDueBoundary::default();
 
         let lease = self
             .lifecycle_leases
@@ -2924,6 +2898,7 @@ impl DaemonState {
         let now = chrono::Utc::now();
         session.metadata.session_incarnation = incarnation;
         session.registered_at = now.timestamp();
+        session.active_context_due_boundary = ActiveContextDueBoundary::default();
 
         let mut effects = vec![Effect::Persist];
         if session.metadata.networked {
@@ -3015,7 +2990,6 @@ impl DaemonState {
             );
         }
         self.lifecycle_leases.remove(&lease_owner.session_id);
-        self.retain_reachable_active_context_due_boundaries();
         LifecycleCommitResult {
             outcome: LifecycleMutationOutcome::Applied,
             effects,
@@ -3122,7 +3096,6 @@ impl DaemonState {
         self.sessions
             .insert(lease_owner.session_id.clone(), previous);
         self.lifecycle_leases.remove(&lease_owner.session_id);
-        self.retain_reachable_active_context_due_boundaries();
         let mut effects = vec![Effect::Persist];
         if networked {
             effects.push(Effect::BroadcastSessionList);
@@ -3256,7 +3229,6 @@ impl DaemonState {
         if networked {
             effects.push(Effect::BroadcastSessionList);
         }
-        self.retain_reachable_active_context_due_boundaries();
         effects
     }
 
@@ -3585,7 +3557,6 @@ impl DaemonState {
             .remove(id)
             .expect("session must exist after origin guard");
         let owner = session.owner();
-        self.retain_reachable_active_context_due_boundaries();
         let agent_pane = session
             .session_agent_pane()
             .map(|pane| pane.map(std::string::ToString::to_string));
@@ -3727,11 +3698,18 @@ impl DaemonState {
             .as_ref()
             .is_none_or(|session| session.pane.as_deref() != Some(pane));
         let mut effects = if let Some(previous) = previous {
-            self.apply_register(previous.id, previous.pane, previous.metadata)
+            let boundary = previous.active_context_due_boundary;
+            let restored_id = previous.id.clone();
+            let effects = self.apply_register(previous.id, previous.pane, previous.metadata);
+            if let Some(restored) = self.sessions.get_mut(&restored_id)
+                && restored.owner() != staged_owner
+            {
+                restored.active_context_due_boundary = boundary;
+            }
+            effects
         } else {
             self.apply_remove(id, true)
         };
-        self.retain_reachable_active_context_due_boundaries();
         if kill_provisional_pane {
             effects.push(Effect::ProvisionalRollbackOk {
                 owner: staged_owner,
@@ -3776,7 +3754,6 @@ impl DaemonState {
             }
             None => self.apply_remove_unleased(id, true),
         };
-        self.retain_reachable_active_context_due_boundaries();
         if let Some(provisional_pane) = provisional_pane
             && restore_pane.as_deref() != Some(provisional_pane)
         {
@@ -4367,7 +4344,6 @@ impl DaemonState {
         }
 
         if !removed_ids.is_empty() {
-            self.retain_reachable_active_context_due_boundaries();
             effects.push(Effect::Persist);
             effects.push(Effect::ClearOwnedPendingReplies { removed_owners });
             // Increment wire_seq so the session list carries a fresh sequence
@@ -5910,6 +5886,7 @@ mod tests {
                 origin: Origin::Remote("npub1peer".into()),
                 metadata: SessionMeta::default(),
                 registered_at: 0,
+                active_context_due_boundary: Default::default(),
             },
         );
         let ctx = SenderContext {
@@ -6192,6 +6169,71 @@ mod tests {
         owner
     }
 
+    fn register_claimed_active_context_boundary(
+        state: &mut DaemonState,
+        id: &str,
+        pane: &str,
+    ) -> (ResourceOwner, u64) {
+        state.apply(Event::Register {
+            id: id.into(),
+            pane: Some(pane.into()),
+            metadata: SessionMeta {
+                backend: Some("claude-code".into()),
+                fresh_context_after_active_secs: Some(1),
+                active_context_restart_due: true,
+                ..Default::default()
+            },
+        });
+        let owner = state.sessions[id].owner();
+        state.apply(Event::ActiveContextActive {
+            owner: owner.clone(),
+            at: 100,
+        });
+        let boundary_generation = state
+            .apply(Event::ActiveContextStopped {
+                owner: owner.clone(),
+                at: 101,
+            })
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::ActiveContextRestartDue {
+                    owner: due_owner,
+                    boundary_generation,
+                } if due_owner == owner => Some(boundary_generation),
+                _ => None,
+            })
+            .expect("stopped due boundary must notify");
+        assert!(
+            state
+                .apply(Event::ClaimActiveContextRestartDue {
+                    owner: owner.clone(),
+                    boundary_generation,
+                })
+                .into_iter()
+                .any(|effect| matches!(
+                    effect,
+                    Effect::ActiveContextRestartDueClaimed {
+                        owner: claimed_owner,
+                        boundary_generation: claimed_generation,
+                    } if claimed_owner == owner && claimed_generation == boundary_generation
+                ))
+        );
+        (owner, boundary_generation)
+    }
+
+    fn assert_claimed_boundary_does_not_notify_again(
+        state: &mut DaemonState,
+        owner: ResourceOwner,
+    ) {
+        let effects = state.apply(Event::ActiveContextStopped { owner, at: 102 });
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ActiveContextRestartDue { .. })),
+            "restored claimed boundary must not notify twice: {effects:?}"
+        );
+    }
+
     fn stage_active_context_restart_target(
         state: &mut DaemonState,
         incumbent: &ResourceOwner,
@@ -6231,39 +6273,7 @@ mod tests {
     }
 
     #[test]
-    fn definitive_removal_and_reaping_retire_active_context_boundary_authority() {
-        // Break caught: removing the only live owner without retiring its
-        // runtime boundary leaks one entry for every never-reused incarnation.
-        let mut state = DaemonState::new("d1".into(), "host1".into());
-        let removed_owner = register_active_context_boundary(&mut state, "removed", "%1");
-        let reaped_owner = register_active_context_boundary(&mut state, "reaped", "%2");
-        assert_eq!(state.active_context_due_boundaries.len(), 2);
-
-        state.apply(Event::Remove {
-            id: "removed".into(),
-            keep_worktree: true,
-        });
-        assert!(
-            !state
-                .active_context_due_boundaries
-                .contains_key(&removed_owner.incarnation)
-        );
-        assert!(
-            state
-                .active_context_due_boundaries
-                .contains_key(&reaped_owner.incarnation)
-        );
-
-        state.apply(Event::ReapDead {
-            dead_sessions: vec![(reaped_owner.clone(), "%2".into())],
-        });
-        assert!(state.active_context_due_boundaries.is_empty());
-    }
-
-    #[test]
-    fn restart_success_retires_only_the_rollback_incumbent_boundary() {
-        // Break caught: successful replacement makes the saved incumbent
-        // unreachable, but the live target must keep its boundary authority.
+    fn leased_restart_success_keeps_only_target_boundary_authority() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
         let incumbent = register_active_context_boundary(&mut state, "worker", "%1");
         let target = stage_active_context_restart_target(&mut state, &incumbent, false);
@@ -6274,17 +6284,6 @@ mod tests {
             pane: Some("%1".into()),
             metadata: staged_metadata,
         });
-        assert!(
-            state
-                .active_context_due_boundaries
-                .contains_key(&incumbent.incarnation),
-            "rollback-capable incumbent must remain reachable while the lease is live"
-        );
-        assert!(
-            state
-                .active_context_due_boundaries
-                .contains_key(&target.incarnation)
-        );
 
         let metadata = state.sessions["worker"].metadata.clone();
         assert_eq!(
@@ -6296,34 +6295,33 @@ mod tests {
 
         assert_eq!(state.sessions["worker"].owner(), target);
         assert!(state.sessions["worker"].metadata.active_context_restart_due);
-        assert_eq!(
+        assert!(
             state
-                .active_context_due_boundaries
-                .keys()
-                .copied()
-                .collect::<Vec<_>>(),
-            vec![target.incarnation]
+                .apply(Event::ClaimActiveContextRestartDue {
+                    owner: incumbent,
+                    boundary_generation: 1,
+                })
+                .is_empty()
+        );
+        assert!(
+            state
+                .apply(Event::ClaimActiveContextRestartDue {
+                    owner: target.clone(),
+                    boundary_generation: 1,
+                })
+                .into_iter()
+                .any(|effect| matches!(
+                    effect,
+                    Effect::ActiveContextRestartDueClaimed { owner, .. } if owner == target
+                ))
         );
     }
 
     #[test]
-    fn restart_rollback_retires_only_the_abandoned_target_boundary() {
-        // Break caught: rollback must restore the incumbent's exact boundary
-        // authority and discard only the provisional target incarnation.
+    fn leased_restart_rollback_restores_incumbent_claimed_boundary() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
-        let incumbent = register_active_context_boundary(&mut state, "worker", "%1");
+        let (incumbent, _) = register_claimed_active_context_boundary(&mut state, "worker", "%1");
         let target = stage_active_context_restart_target(&mut state, &incumbent, true);
-        assert!(
-            state
-                .active_context_due_boundaries
-                .contains_key(&incumbent.incarnation),
-            "saved incumbent must remain reachable until rollback is resolved"
-        );
-        assert!(
-            state
-                .active_context_due_boundaries
-                .contains_key(&target.incarnation)
-        );
 
         assert_eq!(
             state
@@ -6334,14 +6332,221 @@ mod tests {
 
         assert_eq!(state.sessions["worker"].owner(), incumbent);
         assert!(state.sessions["worker"].metadata.active_context_restart_due);
-        assert_eq!(
+        assert_claimed_boundary_does_not_notify_again(&mut state, incumbent);
+        assert!(
             state
-                .active_context_due_boundaries
-                .keys()
-                .copied()
-                .collect::<Vec<_>>(),
-            vec![incumbent.incarnation]
+                .apply(Event::ClaimActiveContextRestartDue {
+                    owner: target,
+                    boundary_generation: 1,
+                })
+                .is_empty()
         );
+    }
+
+    #[test]
+    fn ordinary_same_id_registration_replacement_discards_old_boundary() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        let old_owner = register_active_context_boundary(&mut state, "worker", "%1");
+
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("claude-code".into()),
+                ..Default::default()
+            },
+        });
+        let replacement_owner = state.sessions["worker"].owner();
+
+        assert_ne!(replacement_owner, old_owner);
+        assert_eq!(
+            state.sessions["worker"].active_context_due_boundary,
+            ActiveContextDueBoundary::default(),
+            "replacement must start with clean runtime boundary authority"
+        );
+        assert!(
+            state
+                .apply(Event::ClaimActiveContextRestartDue {
+                    owner: old_owner,
+                    boundary_generation: 1,
+                })
+                .is_empty(),
+            "the removed owner's generation must be invalid"
+        );
+        assert!(
+            state
+                .apply(Event::ClaimActiveContextRestartDue {
+                    owner: replacement_owner.clone(),
+                    boundary_generation: 1,
+                })
+                .is_empty(),
+            "the old generation must not transfer to the replacement"
+        );
+        let effects = state.apply(Event::ActiveContextStopped {
+            owner: replacement_owner,
+            at: 102,
+        });
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ActiveContextRestartDue {
+                boundary_generation: 0,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn pane_deduplicating_registration_discards_replaced_boundary() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        let old_owner = register_active_context_boundary(&mut state, "old", "%1");
+
+        state.apply(Event::Register {
+            id: "replacement".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("claude-code".into()),
+                ..Default::default()
+            },
+        });
+
+        assert!(!state.sessions.contains_key("old"));
+        assert_eq!(
+            state.sessions["replacement"].active_context_due_boundary,
+            ActiveContextDueBoundary::default()
+        );
+        assert!(
+            state
+                .apply(Event::ClaimActiveContextRestartDue {
+                    owner: old_owner,
+                    boundary_generation: 1,
+                })
+                .is_empty(),
+            "pane deduplication must invalidate the replaced entry's generation"
+        );
+    }
+
+    #[test]
+    fn remote_incarnation_collision_does_not_retain_local_boundary() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        let local_owner = register_active_context_boundary(&mut state, "local", "%1");
+        state.sessions.insert(
+            "remote".into(),
+            SessionEntry {
+                id: "remote".into(),
+                pane: None,
+                origin: Origin::Remote("peer".into()),
+                metadata: SessionMeta {
+                    session_incarnation: local_owner.incarnation,
+                    ..Default::default()
+                },
+                registered_at: 0,
+                active_context_due_boundary: ActiveContextDueBoundary::default(),
+            },
+        );
+
+        state.apply(Event::Remove {
+            id: "local".into(),
+            keep_worktree: true,
+        });
+
+        assert_eq!(
+            state.sessions["remote"].active_context_due_boundary,
+            ActiveContextDueBoundary::default(),
+            "a remote row with a colliding incarnation has only its own clean boundary"
+        );
+        assert!(
+            state
+                .apply(Event::ClaimActiveContextRestartDue {
+                    owner: local_owner,
+                    boundary_generation: 1,
+                })
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rename_preserves_claimed_active_context_boundary() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        let (old_owner, _) = register_claimed_active_context_boundary(&mut state, "worker", "%1");
+
+        state.apply(Event::Rename {
+            old_id: "worker".into(),
+            new_id: "renamed".into(),
+        });
+
+        let renamed_owner = state.sessions["renamed"].owner();
+        assert_eq!(renamed_owner.incarnation, old_owner.incarnation);
+        assert_claimed_boundary_does_not_notify_again(&mut state, renamed_owner);
+    }
+
+    #[test]
+    fn externally_held_fresh_rollback_preserves_claimed_boundary() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        let (incumbent, _) = register_claimed_active_context_boundary(&mut state, "worker", "%1");
+        let previous = state.sessions["worker"].clone();
+        let StageFreshLaunchOutcome::Staged { incarnation } = state
+            .stage_fresh_launch("worker", "claude-code".into(), Some("proof".into()), None)
+            .outcome
+        else {
+            panic!("fresh launch must stage");
+        };
+
+        state.apply(Event::Register {
+            id: "unrelated".into(),
+            pane: Some("%2".into()),
+            metadata: Default::default(),
+        });
+        state.apply(Event::Remove {
+            id: "unrelated".into(),
+            keep_worktree: true,
+        });
+        state.apply(Event::RollbackFreshLaunch {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            credential: Some("proof".into()),
+            staged_incarnation: incarnation,
+            previous: Some(previous),
+            provisional_pane: None,
+        });
+
+        assert_eq!(state.sessions["worker"].owner(), incumbent);
+        assert_claimed_boundary_does_not_notify_again(&mut state, incumbent);
+    }
+
+    #[test]
+    fn externally_held_provisional_rollback_preserves_claimed_boundary() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        let (incumbent, _) = register_claimed_active_context_boundary(&mut state, "worker", "%1");
+        let previous = state.sessions["worker"].clone();
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%staged".into()),
+            metadata: SessionMeta {
+                backend: Some("claude-code".into()),
+                session_start_credential: Some("proof".into()),
+                ..Default::default()
+            },
+        });
+
+        state.apply(Event::Register {
+            id: "unrelated".into(),
+            pane: Some("%2".into()),
+            metadata: Default::default(),
+        });
+        state.apply(Event::Remove {
+            id: "unrelated".into(),
+            keep_worktree: true,
+        });
+        state.apply(Event::RollbackProvisionalRegistration {
+            id: "worker".into(),
+            pane: "%staged".into(),
+            credential: Some("proof".into()),
+            previous: Some(previous),
+        });
+
+        let restored_owner = state.sessions["worker"].owner();
+        assert_ne!(restored_owner, incumbent);
+        assert_claimed_boundary_does_not_notify_again(&mut state, restored_owner);
     }
 
     #[test]
@@ -6936,6 +7141,32 @@ mod tests {
         );
         assert!(decoded.active_context_restart_due);
         assert!(decoded.active_context_accounting_provisional);
+    }
+
+    #[test]
+    fn active_context_due_boundary_is_runtime_only() {
+        let mut entry = SessionEntry {
+            id: "worker".into(),
+            metadata: SessionMeta {
+                active_context_restart_due: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        entry.active_context_due_boundary = ActiveContextDueBoundary {
+            generation: 7,
+            stopped: true,
+            claimed: true,
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("active_context_due_boundary"));
+        let decoded: SessionEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            decoded.active_context_due_boundary,
+            ActiveContextDueBoundary::default()
+        );
+        assert!(decoded.metadata.active_context_restart_due);
     }
 
     #[test]
@@ -8284,6 +8515,7 @@ mod tests {
                 ..Default::default()
             },
             registered_at: 0,
+            active_context_due_boundary: Default::default(),
         };
         let previous_owner = previous.owner();
         let lease = state.lifecycle_leases.get_mut("reserved").unwrap();
@@ -12939,6 +13171,7 @@ mod tests {
                     ..Default::default()
                 },
                 registered_at: 0,
+                active_context_due_boundary: Default::default(),
             },
         );
 

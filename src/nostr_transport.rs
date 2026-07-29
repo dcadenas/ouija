@@ -10019,6 +10019,7 @@ mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -10096,6 +10097,7 @@ mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -10153,6 +10155,7 @@ mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
             proto.lifecycle_leases.insert(
@@ -10256,6 +10259,7 @@ mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -10345,6 +10349,7 @@ mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -10440,6 +10445,7 @@ mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -10948,6 +10954,7 @@ mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -11043,6 +11050,7 @@ mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -11140,6 +11148,7 @@ mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -11190,6 +11199,7 @@ mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -11232,6 +11242,7 @@ mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -11276,6 +11287,7 @@ mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -11326,6 +11338,7 @@ mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -11363,6 +11376,7 @@ mod tests {
                     origin: crate::daemon_protocol::Origin::Local,
                     metadata: previous_metadata.clone(),
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -11418,6 +11432,7 @@ mod tests {
                     origin: crate::daemon_protocol::Origin::Local,
                     metadata: previous_metadata.clone(),
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }

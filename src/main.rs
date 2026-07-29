@@ -5565,6 +5565,7 @@ mod tests {
                         ..Default::default()
                     },
                     registered_at: 123,
+                    active_context_due_boundary: Default::default(),
                 },
             );
             state.persist_protocol_state(&proto).unwrap();

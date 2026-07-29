@@ -7350,6 +7350,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -7591,6 +7592,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -7665,6 +7667,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -7741,6 +7744,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -7801,6 +7805,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
             proto.apply(crate::daemon_protocol::Event::IncomingWire {
@@ -7919,6 +7924,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -8056,6 +8062,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -8167,6 +8174,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
             proto.pending_replies.insert(
@@ -8223,6 +8231,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
             proto.pending_replies.insert(
@@ -8273,6 +8282,7 @@ pub(crate) mod tests {
                     origin: Origin::Local,
                     metadata: crate::daemon_protocol::SessionMeta::default(),
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
             proto.sessions.insert(
@@ -8290,6 +8300,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -8348,6 +8359,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -8400,6 +8412,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -8447,6 +8460,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
             proto.sessions.insert(
@@ -8464,6 +8478,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
             proto.pending_replies.insert(
@@ -8524,6 +8539,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
             proto.pending_replies.insert(
@@ -8615,6 +8631,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
             proto.sessions.insert(
@@ -8632,6 +8649,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
             proto.pending_replies.insert(
@@ -8705,6 +8723,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
             proto.pending_replies.insert(
@@ -9429,6 +9448,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -9461,6 +9481,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -9494,6 +9515,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
             proto.sessions.insert(
@@ -9507,6 +9529,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -9551,6 +9574,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -9598,6 +9622,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
@@ -9662,6 +9687,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                     registered_at: 0,
+                    active_context_due_boundary: Default::default(),
                 },
             );
         }
