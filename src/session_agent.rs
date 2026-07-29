@@ -1257,10 +1257,12 @@ mod tests {
         let message = &messages[0];
         assert!(message.contains("feature-worker"));
         assert!(message.contains("1 hour 30 minutes"));
-        assert!(message.contains("concise, self-contained continuation"));
+        assert!(message.contains("concise, verified current-work continuation"));
         assert!(message.contains("Verify live state"));
         assert!(message.contains("stored prompt"));
         assert!(message.contains("will be replayed"));
+        assert!(message.contains("Confirm it is a durable base prompt"));
+        assert!(message.contains("replace it with `--prompt`"));
         assert!(message.contains("<<'OUIJA_CONTINUATION'"));
         assert!(
             message.contains(
@@ -1271,9 +1273,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn due_refresh_notification_requires_a_complete_promptless_continuation() {
-        // Break caught: promptless sessions that receive a terse notice lose
-        // the only instructions available to their fresh context.
+    async fn due_refresh_notification_repairs_a_promptless_session_with_a_durable_base() {
+        // Break caught: putting all state in a launch-only continuation leaves
+        // every later fresh context without a durable base prompt.
         let (state, messages, server) =
             opencode_reminder_test_state("promptless-worker", None, None).await;
         let effects = {
@@ -1298,7 +1300,10 @@ mod tests {
         let messages = messages.lock().await;
         assert_eq!(messages.len(), 1);
         assert!(messages[0].contains("has no stored prompt"));
-        assert!(messages[0].contains("complete enough to finish the work on its own"));
+        assert!(messages[0].contains("compose a concise durable base prompt"));
+        assert!(messages[0].contains("durable_prompt=\"$(cat <<'OUIJA_BASE_PROMPT'"));
+        assert!(messages[0].contains("--prompt \"$durable_prompt\""));
+        assert!(messages[0].contains("keep mutable current work only"));
         server.abort();
     }
 

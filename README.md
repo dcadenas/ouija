@@ -75,31 +75,56 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 
 ### Active-context refresh
 
-For a manually managed session, opt in to a fresh context after accumulated
-active work (not wall-clock time):
+Call the first setup **bootstrap active-context refresh** and later
+safe-boundary restarts **refresh context**. A successful fresh restart resets
+the active-time counter automatically; there is no separate rearm command.
+
+For a new manually managed session, bootstrap the policy with `spawn-session`
+(there is no `ouija spawn` alias). `spawn-session` has no `--one-shot-file`, so
+its stored `--prompt` must be the complete bounded assignment:
 
 ```bash
 ouija spawn-session worker --project-dir /path/to/project \
   --parent-session hub --when-done ask-parent \
   --fresh-context-after-active 4h --prompt "implement the feature"
+```
 
+For an existing session, inspect its exact Local row in `ouija status` before
+the fresh restart. Keep a concise durable base prompt in stored `prompt`; if it
+is null or transient handoff/recovery prose, replace it with `--prompt`. Put
+only verified mutable work in the launch-only continuation:
+
+```bash
 ouija restart-session worker --fresh --fresh-context-after-active 4h \
+  --prompt "durable role, authority, invariants, and source-of-truth rules" \
+  --backend codex-cli \
   --one-shot-file /tmp/verified-continuation.txt
 ```
+
+Omit `--prompt` when the stored prompt is already durable. Specify `--backend`
+when the current binding is absent or cannot be trusted; use only the exact
+current backend. If `ouija whoami` safely refuses stale evidence, recover only
+with the exact public Local ID supplied by trusted injected context or the
+operator, verify that exact status row, and never infer identity from a
+project/name match or `ouija ls`.
 
 The duration is a positive whole number of `h`, `m`, or `s`, such as `4h`,
 `90m`, or `3600s`. Active time pauses while the session is parked. Once due,
 Ouija gives its mandatory notice only at a safe stopped boundary, then repeats
-it at every later stopped boundary until a fresh restart succeeds. The notice
-uses a one-shot continuation: a stored prompt is replayed before it; without a
-stored prompt, make the one-shot continuation self-contained enough to finish
-the work.
+it at every later stopped boundary until a fresh restart succeeds. To refresh
+context, verify live state, write a small continuation, and run the exact
+restart command in that notice. The durable stored prompt is replayed before
+the one-shot continuation.
 
 This workflow creates no scheduler tasks, does not traverse or discover child
-sessions, and does not discover native subagents. `ouija rollover` remains a
-separate legacy/manual facility for an operator-chosen prepared-record handoff;
-it is not the active-context refresh workflow. See the installed Ouija skill
-for the exact safe-boundary continuation command.
+sessions, and does not discover native subagents. Another session is in scope
+only when it is Local and its `parent_session` exactly equals the current
+session's exact public Local ID, or when the operator explicitly allowlists its
+ID. Lifecycle-only setup does not justify broad repository tests, ignored
+Stateright, or expensive e2e. `ouija rollover` remains a separate legacy/manual
+facility for an operator-chosen prepared-record handoff; it is not the
+active-context refresh workflow. See the installed Ouija skill for the
+canonical bootstrap, verification, and safe-boundary procedures.
 
 ## Connecting machines
 
@@ -223,11 +248,16 @@ backticks, `$()`, quotes, and JSON before `ouija` receives the message.
 The legacy `--idle-policy` flag remains available for compatibility but is
 deprecated.
 
-On `restart-session`, `--prompt` replaces the stored startup prompt.
+On `spawn-session`, `--prompt` is the complete bounded assignment and becomes
+the stored base prompt; this command has no launch-only `--one-shot-file`.
+
+On `restart-session`, `--prompt` replaces the durable stored base prompt and
+should repair null or transient recovery prose.
 `--suppress-stored-prompt` skips that stored prompt for one launch without
 erasing it, while `--one-shot-file <PATH>` appends UTF-8 content that is
 delivered only on that launch and is never persisted. `--backend` explicitly
-selects `claude-code`, `opencode`, or `codex-cli`.
+selects `claude-code`, `opencode`, or `codex-cli`; use it when the current
+binding is absent or cannot be trusted.
 
 `--fresh-context-after-active DURATION` counts active seconds only; parked time
 does not count. It is available on `spawn-session`, and setting or changing it

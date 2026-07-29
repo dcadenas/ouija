@@ -629,20 +629,20 @@ pub(crate) fn assert_shared_task_reminder_guidance(skill: &str) {
     assert!(
         active_context_section.contains(
             r#"ouija restart-session "worker" --fresh --one-shot-file /dev/stdin <<'OUIJA_CONTINUATION'"#
-        ) && active_context.contains(
-                "stored prompt exists, Ouija replays it before the one-shot continuation"
-            )
-            && active_context.contains(
-                "Without a stored prompt, the one-shot continuation must be complete enough"
-            ),
-        "shared skill must require the quoted fresh-restart heredoc and explain one-shot composition"
+        ) && active_context.contains("Ouija replays the durable stored base before the launch-only continuation")
+            && active_context.contains("If `prompt` is null, absent, or transient recovery")
+            && active_context.contains("compose a concise durable base and replace it with `--prompt`"),
+        "shared skill must require the quoted fresh-restart heredoc and repair missing/transient stored prompts"
     );
     assert!(
         active_context.contains("does not create a scheduler task")
-            && active_context.contains(
-                "does not discover children, traverse child relationships, enroll child sessions, or inspect native subagents"
-            ),
-        "shared skill must keep active-context refresh free of scheduler enrollment and child traversal"
+            && active_context.contains("The policy applies only to the exact session")
+            && active_context
+                .contains("target is Local and its `parent_session` exactly equals the current")
+            && active_context.contains("session's exact public Local ID")
+            && active_context.contains("Never discover sessions from native")
+            && active_context.contains("subagents, names, paths, roles, or process trees"),
+        "shared skill must keep active-context refresh exact-owner scoped and free of scheduler enrollment"
     );
     assert!(
         skill.contains("`ouija rollover` remains a separate legacy/manual continuation facility")

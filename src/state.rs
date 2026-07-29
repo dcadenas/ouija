@@ -558,20 +558,33 @@ fn active_context_restart_due_message(
     has_stored_prompt: bool,
 ) -> String {
     let shell_session_id = crate::scheduler::shell_escape(session_id);
-    let prompt_guidance = if has_stored_prompt {
-        "This session has a stored prompt; it will be replayed before the one-shot continuation."
+    let (prompt_guidance, prompt_setup, prompt_option) = if has_stored_prompt {
+        (
+            "This session has a stored prompt; it will be replayed before the one-shot continuation. Confirm it is a durable base prompt. If it is transient recovery or handoff prose, replace it with `--prompt` when running the restart.",
+            "",
+            "",
+        )
     } else {
-        "This session has no stored prompt; make the one-shot continuation complete enough to finish the work on its own."
+        (
+            "This session has no stored prompt. Before restarting, compose a concise durable base prompt with the stable role, authority, invariants, and source-of-truth rules. Store it with `--prompt`; keep mutable current work only in the one-shot continuation.",
+            r#"Set the durable base prompt before running the restart:
+durable_prompt="$(cat <<'OUIJA_BASE_PROMPT'
+Write the durable base prompt here.
+OUIJA_BASE_PROMPT
+)"
+"#,
+            r#" --prompt "$durable_prompt""#,
+        )
     };
     format!(
         r#"Ouija active-context refresh is due for session "{session_id}" after {limit} of active work.
 
-At this stopped safe boundary, prepare a concise, self-contained continuation. Include the goal, completed work, remaining work, decisions, blockers, and exact next steps. Verify live state (files, tests, and current session/task status) before writing it.
+At this stopped safe boundary, prepare a concise, verified current-work continuation. Include the goal, completed work, remaining work, decisions, blockers, and exact next steps. Verify live state (files, tests, and current session/task status) before writing it.
 
 {prompt_guidance}
 
 Run this quoted heredoc to start the fresh session:
-ouija restart-session {shell_session_id} --fresh --one-shot-file /dev/stdin <<'OUIJA_CONTINUATION'
+{prompt_setup}ouija restart-session {shell_session_id} --fresh{prompt_option} --one-shot-file /dev/stdin <<'OUIJA_CONTINUATION'
 Write the verified continuation here.
 OUIJA_CONTINUATION
 "#,
@@ -5625,9 +5638,11 @@ pub(crate) mod tests {
                 "generated command failed for {session_id:?}: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            let mut expected = b"5\0restart-session\0".to_vec();
+            let mut expected = b"7\0restart-session\0".to_vec();
             expected.extend_from_slice(session_id.as_bytes());
-            expected.extend_from_slice(b"\0--fresh\0--one-shot-file\0/dev/stdin\0");
+            expected.extend_from_slice(
+                b"\0--fresh\0--prompt\0Write the durable base prompt here.\0--one-shot-file\0/dev/stdin\0",
+            );
             assert_eq!(
                 output.stdout, expected,
                 "generated command must pass the literal ID as one argument"
@@ -5644,6 +5659,33 @@ pub(crate) mod tests {
         assert!(!message.contains("<ouija-status type=\"active-context-restart-due\">"));
         assert!(message.contains(&format!("session \"{session_id}\"")));
         assert!(message.contains(&crate::scheduler::shell_escape(session_id)));
+    }
+
+    #[test]
+    fn active_context_restart_message_repairs_a_missing_durable_prompt() {
+        // Break caught: the original due notice made a null stored prompt the
+        // permanent state by putting the entire assignment in launch-only
+        // continuation text.
+        let message = active_context_restart_due_message("worker", 60, false);
+
+        assert!(message.contains("compose a concise durable base prompt"));
+        assert!(message.contains("durable_prompt=\"$(cat <<'OUIJA_BASE_PROMPT'"));
+        assert!(message.contains("--prompt \"$durable_prompt\""));
+        assert!(!message.contains("self-contained continuation"));
+        assert!(!message.contains(
+            "make the one-shot continuation complete enough to finish the work on its own"
+        ));
+    }
+
+    #[test]
+    fn active_context_restart_message_tells_stored_prompt_sessions_to_repair_transient_prose() {
+        // Break caught: Some(prompt) proves only presence, not that the value
+        // is a durable base suitable for every later fresh restart.
+        let message = active_context_restart_due_message("worker", 60, true);
+
+        assert!(message.contains("Confirm it is a durable base prompt"));
+        assert!(message.contains("If it is transient recovery or handoff prose"));
+        assert!(message.contains("replace it with `--prompt`"));
     }
 
     #[test]

@@ -169,12 +169,16 @@ enum Command {
     },
     /// Unregister a session (without killing it)
     Unregister { id: String },
-    /// Start a new session
+    /// Start a new session.
+    ///
+    /// There is no `ouija spawn` alias. The initial `--prompt` is the complete
+    /// bounded assignment; this command does not support `--one-shot-file`.
     #[command(name = "spawn-session")]
     SpawnSession {
         name: String,
         #[arg(long)]
         project_dir: Option<String>,
+        /// Complete bounded assignment stored as the session's base prompt.
         #[arg(long)]
         prompt: Option<String>,
         #[arg(long, value_parser = parse_manual_reminder)]
@@ -205,7 +209,7 @@ enum Command {
         /// Reasoning effort / variant (claude: --effort; codex: model_reasoning_effort; opencode: prompt variant).
         #[arg(long)]
         effort: Option<String>,
-        /// Restart with a fresh context after this much accumulated active work (e.g. 1h, 90m, 3600s).
+        /// Bootstrap active-context refresh after this much accumulated active work (e.g. 1h, 90m, 3600s).
         #[arg(long, value_parser = parse_fresh_context_after_active)]
         fresh_context_after_active: Option<u64>,
         #[arg(long)]
@@ -233,25 +237,25 @@ enum Command {
         name: String,
         #[arg(long)]
         fresh: bool,
-        /// Restart with a fresh context after this much accumulated active work (e.g. 1h, 90m, 3600s).
+        /// Set or change active-context refresh after this much accumulated active work.
         #[arg(
             long,
             requires = "fresh",
             value_parser = parse_fresh_context_after_active
         )]
         fresh_context_after_active: Option<u64>,
-        /// Replace the stored startup prompt and use it for this launch.
+        /// Replace the durable stored base prompt; use when it is absent or transient recovery prose.
         #[arg(long)]
         prompt: Option<String>,
         /// Do not reuse the stored startup prompt for this launch.
         #[arg(long)]
         suppress_stored_prompt: bool,
-        /// Append UTF-8 file contents for this launch only.
+        /// Append a verified current-work continuation for this launch only.
         #[arg(long)]
         one_shot_file: Option<PathBuf>,
         #[arg(long, value_parser = parse_manual_reminder)]
         reminder: Option<String>,
-        /// Override the coding-assistant backend on restart.
+        /// Select the backend explicitly when its binding is absent or cannot be trusted.
         #[arg(long)]
         backend: Option<String>,
         /// Override the LLM model on restart (defaults to the previous model).
@@ -3418,6 +3422,19 @@ fn read_one_shot_file(path: &std::path::Path) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory as _;
+
+    fn subcommand_long_help(name: &str) -> String {
+        let mut command = Cli::command()
+            .find_subcommand(name)
+            .unwrap_or_else(|| panic!("missing {name} subcommand"))
+            .clone();
+        let mut help = Vec::new();
+        command
+            .write_long_help(&mut help)
+            .expect("render subcommand help");
+        String::from_utf8(help).expect("clap help is UTF-8")
+    }
 
     #[test]
     fn pane_wire_suffix_strips_leading_percent() {
@@ -3499,6 +3516,20 @@ mod tests {
             } => assert_eq!(fresh_context_after_active, Some(3_600)),
             _ => panic!("expected spawn-session command"),
         }
+    }
+
+    #[test]
+    fn spawn_session_help_explains_first_launch_prompt_and_active_context_setup() {
+        // Break caught: agents previously tried a nonexistent `ouija spawn`
+        // flow and expected a launch-only continuation on first creation.
+        // The actual spawn-session help must describe its stored-prompt
+        // contract and name the active-context setup action.
+        let help = subcommand_long_help("spawn-session");
+
+        assert!(help.to_lowercase().contains("complete bounded assignment"));
+        assert!(help.contains("Bootstrap active-context refresh"));
+        assert!(help.contains("no `ouija spawn` alias"));
+        assert!(help.contains("does not support `--one-shot-file`"));
     }
 
     #[test]
@@ -3631,6 +3662,19 @@ mod tests {
             }
             _ => panic!("expected restart-session command"),
         }
+    }
+
+    #[test]
+    fn restart_session_help_separates_durable_prompt_from_launch_only_context() {
+        // Break caught: bootstrap attempts reused transient handoff prose as
+        // the stored prompt, or omitted an explicit backend after identity
+        // evidence had become unusable.
+        let help = subcommand_long_help("restart-session");
+
+        assert!(help.contains("durable stored base prompt"));
+        assert!(help.contains("transient recovery prose"));
+        assert!(help.contains("verified current-work continuation"));
+        assert!(help.contains("binding is absent or cannot be trusted"));
     }
 
     #[test]

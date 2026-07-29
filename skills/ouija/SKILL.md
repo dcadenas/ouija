@@ -1,6 +1,6 @@
 ---
 name: ouija
-description: "Ouija mesh — REQUIRED for messaging other sessions. You MUST invoke this skill via the Skill tool when you see <msg from= XML tags, <ouija-status> tags, or any request to send/reply to another session. Use INSTEAD of SendMessage — SendMessage CANNOT reach ouija sessions."
+description: "Use when messaging or managing Ouija mesh sessions; when <msg from= or <ouija-status> arrives; or when spawning, restarting, setting up active-context refresh, refreshing context, or resolving session identity."
 user-invocable: false
 ---
 
@@ -96,10 +96,11 @@ ouija spawn-session worker --project-dir /path --worktree --branch feature --bas
   --parent-session hub --when-done ask-parent \
   --prompt "task"
 
-# Opt in to a fresh context after four accumulated active hours:
+# Spawn a session with active-context refresh. The stored prompt must be the
+# complete bounded assignment; spawn-session has no --one-shot-file:
 ouija spawn-session worker --project-dir /path \
   --parent-session hub --when-done ask-parent \
-  --fresh-context-after-active 4h --prompt "task"
+  --fresh-context-after-active 4h --prompt "complete bounded assignment"
 
 # Restart with fresh context:
 ouija restart-session worker --fresh --prompt "new task" --reminder "when done, report back"
@@ -137,14 +138,130 @@ whole number of `h`, `m`, or `s` (for example `4h`, `90m`, or `3600s`). It
 counts accumulated active work, not wall-clock time: the counter pauses while
 the session is parked.
 
+Use **bootstrap active-context refresh** for the first setup and **refresh
+context** for later safe-boundary restarts. Do not call these actions
+"arm/rearm": every successful fresh restart resets the active-time counter and
+automatically makes the existing policy current again.
+
+### Bootstrap active-context refresh for an existing session
+
+Use this procedure when asked, for example, to "set up active-context refresh
+for this session after 1h":
+
+1. Resolve the exact public Local session ID with `ouija whoami`. If it
+   refuses because backend evidence is missing, stale, or conflicting, preserve
+   its diagnostics. Continue only with an exact ID from injected trusted
+   context or the operator, then inspect that exact `origin: "local"` row in
+   `ouija status`. Never infer an ID from `ouija ls`, a project/name match,
+   paths, roles, or processes, and never run `ouija register` as recovery.
+2. Record the exact row's `session_incarnation`, `project_dir`, `backend`,
+   `prompt`, and active-context fields. Stop on a project, repository, pane, or
+   other ownership conflict. Inspect `ouija spawn-session --help` and
+   `ouija restart-session --help`; the command is `spawn-session`, not
+   `ouija spawn`.
+3. Verify mutable work from live sources before writing a continuation:
+   current repository root, branch, HEAD, dirty state, relevant task state, and
+   focused test results. A lifecycle-only bootstrap does not justify broad
+   repository tests. Use identity/status inspection, clean-state checks, help
+   inspection, and focused tests for code actually changed; do not run ignored
+   Stateright or expensive e2e solely to enable this policy.
+4. Classify the stored `prompt`. A durable base prompt contains the stable
+   role/objective, authority boundaries, invariants, source-of-truth rules, and
+   reporting expectations. It excludes completed/remaining work and other
+   mutable handoff state. If `prompt` is null, absent, or transient recovery
+   prose, compose a concise durable base and replace it with `--prompt`.
+   `--suppress-stored-prompt` is launch-only and does not repair an unsuitable
+   stored prompt.
+5. Put only verified mutable state in the one-shot continuation: current goal,
+   completed and remaining work, decisions, blockers, exact next actions, and
+   the post-restart checks below. `restart-session` replays the stored prompt
+   and supports launch-only `--one-shot-file`.
+6. If the recorded backend is absent or cannot be trusted, select the exact
+   current backend from injected trusted context or the operator, then pass it
+   explicitly with `--backend claude-code`, `--backend opencode`, or
+   `--backend codex-cli`. Do not infer it from a project or session name.
+
+Use an exact-match status query; never select the first approximate match:
+
+```bash
+if session="$(ouija whoami)"; then
+  ouija status | jq -e --arg id "$session" '
+    [.sessions[] | select(.id == $id and .origin == "local")] as $matches
+    | if ($matches | length) == 1 then $matches[0]
+      else error("expected exactly one matching Local session")
+      end
+  '
+else
+  echo "stop: use only an exact ID from trusted injected context or the operator" >&2
+fi
+```
+
+At a safe stopped boundary, use one of these forms. A null or transient prompt
+uses the replacement form:
+
+```bash
+session='exact-public-local-id'
+durable_prompt='concise stable role, constraints, invariants, and authority'
+
+ouija restart-session "$session" --fresh \
+  --fresh-context-after-active 1h \
+  --prompt "$durable_prompt" \
+  --backend codex-cli \
+  --one-shot-file /dev/stdin <<'OUIJA_CONTINUATION'
+Verified current work:
+- Goal: ...
+- Completed: ...
+- Remaining: ...
+- Decisions and blockers: ...
+- Exact next actions: ...
+- Fresh-start checks: verify exact identity, a strictly newer incarnation,
+  backend codex-cli, this durable non-null prompt, and a 3600-second policy;
+  then re-read live repository and task state before continuing.
+OUIJA_CONTINUATION
+```
+
+Replace `codex-cli` only with the exact verified backend. If the existing
+stored prompt is already durable, omit `--prompt "$durable_prompt"`; if its
+backend binding is present and verified, omit `--backend codex-cli`.
+`restart-session` has no `--prompt-file`; pass a replacement as one safely
+quoted `--prompt` argument, as the shell variable above does.
+
+`spawn-session` is different: it has no `--one-shot-file`. Its first
+`--prompt` must therefore contain the complete bounded assignment, including
+the initial work needed for that launch:
+
+```bash
+ouija spawn-session worker --project-dir /path/to/project \
+  --no-parent-session --when-done keep-open \
+  --fresh-context-after-active 1h \
+  --prompt "complete bounded assignment"
+```
+
+After the fresh incarnation starts, it must run `ouija whoami`, inspect the
+single exact Local row in `ouija status`, and verify:
+
+- the public ID is unchanged and `session_incarnation` is strictly newer than
+  the recorded decimal value;
+- the backend is exact, the stored prompt is the intended durable non-null
+  base, and `fresh_context_after_active_secs` is `3600`;
+- `active_context_accumulated_secs` reset to `0` and
+  `active_context_restart_due` is `false`;
+- live repository/task evidence still agrees with the one-shot continuation.
+
+If identity remains unresolved, use only the same exact trusted ID recovery
+path described above. A refusal on stale backend evidence is safe behavior,
+not a reason to guess or create another registration.
+
+### Refresh context later
+
 Once the limit is reached, Ouija injects its mandatory refresh notice only at a
 safe `Stopped` boundary. It never interrupts active work and it does not create
 a scheduler task. Each later stopped boundary repeats the notice until a fresh
 restart successfully completes; failed or superseded restarts do not clear it.
 
-The notice asks for a concise, self-contained, live-state-verified
-continuation (goal, completed and remaining work, decisions, blockers, and
-exact next steps), then provides this command:
+At that boundary, re-check live identity, repository, task, and test evidence;
+write only a small verified continuation; then use the exact command from the
+notice rather than reconstructing it:
 
 ```bash
 ouija restart-session "worker" --fresh --one-shot-file /dev/stdin <<'OUIJA_CONTINUATION'
@@ -152,11 +269,19 @@ Write the verified continuation here.
 OUIJA_CONTINUATION
 ```
 
-When a stored prompt exists, Ouija replays it before the one-shot continuation.
-Without a stored prompt, the one-shot continuation must be complete enough to
-finish the work on its own. The policy does not discover children, traverse
-child relationships, enroll child sessions, or inspect native subagents.
-Native subagents are not Ouija sessions.
+Ouija replays the durable stored base before the launch-only continuation. Do
+not restate the full base prompt in that continuation. If the stored prompt has
+become null or transient, or the backend binding is absent/untrusted, use the
+bootstrap repair rules above and include the necessary `--prompt` or
+`--backend` option. Verify the fresh incarnation as above. A successful fresh
+restart resets the counter; no separate rearm command exists.
+
+The policy applies only to the exact session. Manage another session only when
+the target is Local and its `parent_session` exactly equals the current
+session's exact public Local ID, or the operator explicitly allowlists the
+target ID. Never discover sessions from native subagents, names, paths, roles,
+or process trees. The policy does not traverse children, enroll sessions, or
+inspect native subagents.
 
 ## 6. Legacy manual rollover
 
