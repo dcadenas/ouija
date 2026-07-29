@@ -3950,39 +3950,44 @@ impl AppState {
             return None;
         }
         let protocol = self.protocol.read().await;
-        let session = protocol
-            .sessions
-            .values()
-            .find(|session| session.metadata.session_incarnation == incarnation)?;
-        let owner = session.owner();
-        let staged_lease = protocol
-            .lifecycle_leases
-            .get(&owner.session_id)
-            .filter(|lease| {
-                lease.phase == crate::daemon_protocol::LifecyclePhase::Restarting
-                    && lease.restart_target_owner.as_ref() == Some(&owner)
-                    && lease.restart_previous.is_some()
+        let mut candidates = protocol.sessions.values().filter_map(|session| {
+            if !matches!(session.origin, crate::daemon_protocol::Origin::Local)
+                || session.metadata.session_incarnation != incarnation
+            {
+                return None;
+            }
+            let owner = session.owner();
+            let staged_lease = protocol
+                .lifecycle_leases
+                .get(&owner.session_id)
+                .filter(|lease| {
+                    lease.phase == crate::daemon_protocol::LifecyclePhase::Restarting
+                        && lease.restart_target_owner.as_ref() == Some(&owner)
+                        && lease.restart_previous.is_some()
+                });
+            let pane_matches = pane.is_none_or(|pane| {
+                staged_lease
+                    .and_then(|lease| {
+                        (lease.inert_pane_owner.as_ref() == Some(&owner))
+                            .then_some(lease.inert_pane.as_deref())
+                            .flatten()
+                    })
+                    .map_or_else(
+                        || session.pane.as_deref() == Some(pane),
+                        |claimed| claimed == pane,
+                    )
             });
-        let pane_matches = pane.is_none_or(|pane| {
-            staged_lease
-                .and_then(|lease| {
-                    (lease.inert_pane_owner.as_ref() == Some(&owner))
-                        .then_some(lease.inert_pane.as_deref())
-                        .flatten()
-                })
-                .map_or_else(
-                    || session.pane.as_deref() == Some(pane),
-                    |claimed| claimed == pane,
-                )
+            let backend_matches = backend_session_id.is_none_or(|backend_session_id| {
+                session.metadata.backend_session_id.as_deref() == Some(backend_session_id)
+                    || staged_lease.is_some_and(|lease| {
+                        lease.backend_session_owner.as_ref() == Some(&owner)
+                            && lease.backend_session_id.as_deref() == Some(backend_session_id)
+                    })
+            });
+            (pane_matches && backend_matches).then_some(owner)
         });
-        let backend_matches = backend_session_id.is_none_or(|backend_session_id| {
-            session.metadata.backend_session_id.as_deref() == Some(backend_session_id)
-                || staged_lease.is_some_and(|lease| {
-                    lease.backend_session_owner.as_ref() == Some(&owner)
-                        && lease.backend_session_id.as_deref() == Some(backend_session_id)
-                })
-        });
-        if !pane_matches || !backend_matches {
+        let owner = candidates.next()?;
+        if candidates.next().is_some() {
             return None;
         }
 
@@ -6937,6 +6942,62 @@ pub(crate) mod tests {
         })
         .await
         .expect("the staged paneless receiver must process Active");
+    }
+
+    #[tokio::test]
+    async fn exact_hook_owner_ignores_remote_incarnation_collision() {
+        // Break caught: a remote daemon may issue the same incarnation as this
+        // daemon, but that row must not hide the exact local hook owner.
+        let state = AppState::new_for_test();
+        proto_register(&state, "z-local", Some("%local")).await;
+        let local_owner = state.protocol.read().await.sessions["z-local"].owner();
+        {
+            let mut protocol = state.protocol.write().await;
+            protocol.sessions.insert(
+                "a-remote".into(),
+                crate::daemon_protocol::SessionEntry {
+                    id: "a-remote".into(),
+                    pane: None,
+                    origin: crate::daemon_protocol::Origin::Remote("npub1remote".into()),
+                    metadata: crate::daemon_protocol::SessionMeta {
+                        session_incarnation: local_owner.incarnation,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+        }
+
+        assert_eq!(
+            state
+                .exact_hook_session_owner(Some("%local"), None, local_owner.incarnation)
+                .await,
+            Some(local_owner)
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_hook_owner_rejects_ambiguous_local_evidence() {
+        // Break caught: an incarnation and pane shared by multiple local rows
+        // cannot authorize whichever matching owner sorts first.
+        let state = AppState::new_for_test();
+        proto_register(&state, "a-local", Some("%shared")).await;
+        let incarnation = state.protocol.read().await.sessions["a-local"]
+            .metadata
+            .session_incarnation;
+        {
+            let mut protocol = state.protocol.write().await;
+            let mut duplicate = protocol.sessions["a-local"].clone();
+            duplicate.id = "z-local".into();
+            protocol.sessions.insert(duplicate.id.clone(), duplicate);
+        }
+
+        assert_eq!(
+            state
+                .exact_hook_session_owner(Some("%shared"), None, incarnation)
+                .await,
+            None
+        );
     }
 
     /// Config whose opencode serve port (`config.port + 320` = 320) is
