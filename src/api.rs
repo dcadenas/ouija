@@ -3675,6 +3675,116 @@ pub async fn bind_backend_identity(
     }
 }
 
+/// Explicit operator request to bind the backend already running in one exact
+/// blank Local session. The daemon independently validates physical ownership.
+#[derive(Clone, Debug, Deserialize)]
+pub struct BackendIdentityRecoveryRequest {
+    pub target_session_id: String,
+    pub identity: BackendIdentityRequest,
+    #[serde(default)]
+    pub caller: crate::state::BackendRecoveryCallerEvidence,
+}
+
+pub async fn recover_backend_identity(
+    State(state): State<SharedState>,
+    Json(body): Json<BackendIdentityRecoveryRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let identity = match body.identity.into_identity() {
+        Ok(identity) => identity,
+        Err(error) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))),
+    };
+    if let Err(response) = validate_backend_name(&state, Some(&identity.backend)) {
+        return response;
+    }
+    let outcome = state
+        .recover_backend_identity(&body.target_session_id, &identity, &body.caller)
+        .await;
+    use crate::state::BackendIdentityRecoveryOutcome as Outcome;
+    match outcome {
+        Outcome::Recovered(owner) => (
+            StatusCode::OK,
+            Json(json!({
+                "outcome": "recovered",
+                "session_id": owner.session_id,
+                "session_incarnation": owner.incarnation.to_string(),
+            })),
+        ),
+        Outcome::TargetNotFound => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "outcome": "target_not_found",
+                "error": "the exact named session no longer exists"
+            })),
+        ),
+        Outcome::TargetNotLocal => (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "outcome": "target_not_local",
+                "error": "backend recovery is restricted to an exact Local session"
+            })),
+        ),
+        Outcome::TargetNotBlank => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "outcome": "target_not_blank",
+                "error": "the target no longer has a blank backend binding"
+            })),
+        ),
+        Outcome::TargetMissingPane | Outcome::TargetMissingProject => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "outcome": "target_missing_evidence",
+                "error": "the target lacks required pane or project ownership evidence"
+            })),
+        ),
+        Outcome::LifecycleInProgress => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "outcome": "lifecycle_in_progress",
+                "error": "the target has a lifecycle operation in progress"
+            })),
+        ),
+        Outcome::IdentityConflict => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "outcome": "identity_conflict",
+                "error": "the backend identity is already claimed by another Local session"
+            })),
+        ),
+        Outcome::PositiveEvidenceMismatch => (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "outcome": "caller_evidence_mismatch",
+                "error": "positive caller identity evidence conflicts with the exact target"
+            })),
+        ),
+        Outcome::PaneNotLive
+        | Outcome::PaneOwnerMismatch
+        | Outcome::PaneProjectMismatch
+        | Outcome::PaneBackendMismatch => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "outcome": "live_evidence_mismatch",
+                "error": "the live pane does not corroborate the exact target ownership snapshot"
+            })),
+        ),
+        Outcome::Superseded => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "outcome": "superseded",
+                "error": "the target ownership snapshot changed during recovery"
+            })),
+        ),
+        Outcome::PersistenceFailed => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "outcome": "persistence_failed",
+                "error": "recovery was rolled back because durable persistence failed"
+            })),
+        ),
+    }
+}
+
 /// Explicitly request repair of an incomplete legacy binding. Repair always
 /// performs a fresh managed relaunch; it never writes a caller-supplied native
 /// ID into the legacy row.
@@ -5030,6 +5140,101 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::GONE);
         assert_eq!(body["outcome"], "credential_expired");
+    }
+
+    #[tokio::test]
+    async fn backend_identity_recovery_maps_success_and_replay_without_respawn() {
+        let state = crate::state::AppState::new_for_test();
+        let project = tempfile::tempdir().unwrap();
+        let project_dir = project.path().to_string_lossy().into_owned();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "divine-invite-darshan".into(),
+                pane: Some("%712".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some(project_dir.clone()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["divine-invite-darshan"].owner();
+        *state.cached_assistant_panes.write().await = vec![crate::tmux::TmuxPane {
+            pane_id: "%712".into(),
+            session_name: "divine-invite-darshan".into(),
+            pane_current_path: Some(project_dir),
+            process_name: Some("codex".into()),
+        }];
+        state.set_backend_recovery_test_inspection(
+            crate::tmux::ManagedPaneInspection::MarkerOwner(owner.clone()),
+        );
+        let request = BackendIdentityRecoveryRequest {
+            target_session_id: "divine-invite-darshan".into(),
+            identity: backend_identity_request("codex-cli", "same-running-thread"),
+            caller: crate::state::BackendRecoveryCallerEvidence {
+                pane: Some("%712".into()),
+                pane_var_id: Some("divine-invite-darshan".into()),
+                env_id: Some("divine-invite-darshan".into()),
+            },
+        };
+
+        let (status, Json(body)) =
+            recover_backend_identity(State(state.clone()), Json(request.clone())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["outcome"], "recovered");
+        assert_eq!(body["session_id"], "divine-invite-darshan");
+        assert_eq!(body["session_incarnation"], owner.incarnation.to_string());
+
+        let (status, Json(body)) =
+            recover_backend_identity(State(state.clone()), Json(request)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["outcome"], "target_not_blank");
+        assert!(!body.to_string().contains("same-running-thread"));
+        assert_eq!(
+            state.protocol.read().await.sessions["divine-invite-darshan"]
+                .metadata
+                .backend_session_id
+                .as_deref(),
+            Some("same-running-thread")
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_identity_recovery_rejects_remote_incomplete_and_sibling_evidence() {
+        let state = crate::state::AppState::new_for_test();
+        state.protocol.write().await.sessions.insert(
+            "remote-target".into(),
+            crate::daemon_protocol::SessionEntry {
+                id: "remote-target".into(),
+                origin: crate::daemon_protocol::Origin::Remote("npub1peer".into()),
+                ..Default::default()
+            },
+        );
+        let (status, Json(body)) = recover_backend_identity(
+            State(state.clone()),
+            Json(BackendIdentityRecoveryRequest {
+                target_session_id: "remote-target".into(),
+                identity: backend_identity_request("codex-cli", "thread"),
+                caller: Default::default(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["outcome"], "target_not_local");
+
+        let (status, _) = recover_backend_identity(
+            State(state),
+            Json(BackendIdentityRecoveryRequest {
+                target_session_id: "remote-target".into(),
+                identity: backend_identity_request("codex-cli", ""),
+                caller: crate::state::BackendRecoveryCallerEvidence {
+                    pane: Some("%sibling".into()),
+                    pane_var_id: Some("sibling".into()),
+                    env_id: Some("sibling".into()),
+                },
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

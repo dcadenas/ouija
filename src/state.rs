@@ -783,6 +783,8 @@ pub struct AppState {
     restart_test_control: std::sync::Mutex<Option<RestartTestControl>>,
     #[cfg(test)]
     reclaim_test_inspection: std::sync::Mutex<Option<crate::tmux::ManagedPaneInspection>>,
+    #[cfg(test)]
+    backend_recovery_test_inspection: std::sync::Mutex<Option<crate::tmux::ManagedPaneInspection>>,
     /// Per-resource async gates serialize external pane/backend claims and cleanup
     /// without holding the protocol lock across tmux, process, or HTTP I/O.
     resource_gates:
@@ -833,6 +835,32 @@ pub(crate) enum MissingBackendPaneReclaimOutcome {
     IncarnationMismatch,
     NotFound,
     Refused,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct BackendRecoveryCallerEvidence {
+    pub pane: Option<String>,
+    pub pane_var_id: Option<String>,
+    pub env_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BackendIdentityRecoveryOutcome {
+    Recovered(crate::daemon_protocol::ResourceOwner),
+    TargetNotFound,
+    TargetNotLocal,
+    TargetNotBlank,
+    TargetMissingPane,
+    TargetMissingProject,
+    LifecycleInProgress,
+    IdentityConflict,
+    PositiveEvidenceMismatch,
+    PaneNotLive,
+    PaneOwnerMismatch,
+    PaneProjectMismatch,
+    PaneBackendMismatch,
+    Superseded,
+    PersistenceFailed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1131,6 +1159,29 @@ fn stale_backend_reclaim_accepts_incumbent_inspection(
     matches!(inspection, Ok(crate::tmux::ManagedPaneInspection::Missing))
 }
 
+fn backend_recovery_lease_conflicts(
+    protocol: &crate::daemon_protocol::DaemonState,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    pane: &str,
+    project_dir: &str,
+    identity: &crate::backend::BackendSessionIdentity,
+) -> bool {
+    let project_identity = project_dir_identity(project_dir);
+    protocol.lifecycle_leases.iter().any(|(id, lease)| {
+        id == &owner.session_id
+            || lease.owner == *owner
+            || lease.backend_session_owner.as_ref() == Some(owner)
+            || lease.restart_target_owner.as_ref() == Some(owner)
+            || lease.inert_pane.as_deref() == Some(pane)
+            || lease
+                .project_dir
+                .as_deref()
+                .is_some_and(|dir| project_dir_identity(dir) == project_identity)
+            || (lease.backend.as_deref() == Some(identity.backend.as_str())
+                && lease.backend_session_id.as_deref() == Some(identity.session_id.as_str()))
+    })
+}
+
 fn backend_for_process_name(
     process_name: &str,
     candidates: &[(String, Vec<String>)],
@@ -1223,6 +1274,7 @@ impl AppState {
             session_agents: RwLock::new(HashMap::new()),
             restart_test_control: std::sync::Mutex::new(None),
             reclaim_test_inspection: std::sync::Mutex::new(None),
+            backend_recovery_test_inspection: std::sync::Mutex::new(None),
             resource_gates: std::sync::Mutex::new(HashMap::new()),
             project_index: RwLock::new(HashMap::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
@@ -1277,6 +1329,8 @@ impl AppState {
             restart_test_control: std::sync::Mutex::new(None),
             #[cfg(test)]
             reclaim_test_inspection: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            backend_recovery_test_inspection: std::sync::Mutex::new(None),
             resource_gates: std::sync::Mutex::new(HashMap::new()),
             project_index: RwLock::new(HashMap::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
@@ -1309,6 +1363,17 @@ impl AppState {
             .reclaim_test_inspection
             .lock()
             .expect("reclaim test inspection mutex poisoned") = Some(inspection);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_backend_recovery_test_inspection(
+        &self,
+        inspection: crate::tmux::ManagedPaneInspection,
+    ) {
+        *self
+            .backend_recovery_test_inspection
+            .lock()
+            .expect("backend recovery test inspection mutex poisoned") = Some(inspection);
     }
 
     #[cfg(test)]
@@ -1584,6 +1649,18 @@ impl AppState {
                 if !backend_session_id.is_empty() {
                     keys.push(ResourceGateKey::BackendSession(backend_session_id.clone()));
                 }
+            }
+            crate::daemon_protocol::Event::RecoverBackendIdentity {
+                owner,
+                expected_pane,
+                expected_project_dir,
+                backend_session_id,
+                ..
+            } => {
+                add_current(&mut keys, &mut project_dirs, &protocol, &owner.session_id);
+                keys.push(ResourceGateKey::Pane(expected_pane.clone()));
+                keys.push(ResourceGateKey::BackendSession(backend_session_id.clone()));
+                project_dirs.push(expected_project_dir.clone());
             }
             crate::daemon_protocol::Event::ReapDead { dead_sessions } => {
                 for (owner, pane) in dead_sessions {
@@ -2131,6 +2208,171 @@ impl AppState {
             .values()
             .find(|s| s.pane.as_deref() == Some(pane))
             .map(|s| s.id.clone())
+    }
+
+    /// Recover a running backend into one explicitly named, unchanged blank Local row.
+    ///
+    /// The blank-to-bound protocol transition is the replay guard. Resource
+    /// gates cover the exact pane, project, and backend identity while this
+    /// coordinator independently inspects the physical pane and durably
+    /// persists the compare-and-swap.
+    pub(crate) async fn recover_backend_identity(
+        self: &Arc<Self>,
+        target_session_id: &str,
+        identity: &crate::backend::BackendSessionIdentity,
+        caller: &BackendRecoveryCallerEvidence,
+    ) -> BackendIdentityRecoveryOutcome {
+        let (owner, pane, project_dir) = {
+            let protocol = self.protocol.read().await;
+            let Some(target) = protocol.sessions.get(target_session_id) else {
+                return BackendIdentityRecoveryOutcome::TargetNotFound;
+            };
+            if !matches!(target.origin, crate::daemon_protocol::Origin::Local) {
+                return BackendIdentityRecoveryOutcome::TargetNotLocal;
+            }
+            if target.metadata.backend.is_some()
+                || target.metadata.backend_session_id.is_some()
+                || target.metadata.session_start_credential.is_some()
+                || target.metadata.backend_repair_reservation.is_some()
+                || target.metadata.opencode_binding.is_some()
+            {
+                return BackendIdentityRecoveryOutcome::TargetNotBlank;
+            }
+            if protocol.lifecycle_leases.contains_key(target_session_id) {
+                return BackendIdentityRecoveryOutcome::LifecycleInProgress;
+            }
+            if protocol.sessions.values().any(|session| {
+                session.id != target_session_id
+                    && matches!(session.origin, crate::daemon_protocol::Origin::Local)
+                    && session.metadata.backend.as_deref() == Some(identity.backend.as_str())
+                    && session.metadata.backend_session_id.as_deref()
+                        == Some(identity.session_id.as_str())
+            }) {
+                return BackendIdentityRecoveryOutcome::IdentityConflict;
+            }
+            let Some(pane) = target.pane.clone() else {
+                return BackendIdentityRecoveryOutcome::TargetMissingPane;
+            };
+            let Some(project_dir) = target.metadata.project_dir.clone() else {
+                return BackendIdentityRecoveryOutcome::TargetMissingProject;
+            };
+            if caller
+                .pane
+                .as_deref()
+                .is_some_and(|observed| observed != pane)
+                || caller
+                    .pane_var_id
+                    .as_deref()
+                    .is_some_and(|observed| observed != target_session_id)
+                || caller
+                    .env_id
+                    .as_deref()
+                    .is_some_and(|observed| observed != target_session_id)
+            {
+                return BackendIdentityRecoveryOutcome::PositiveEvidenceMismatch;
+            }
+            (target.owner(), pane, project_dir)
+        };
+
+        let event = crate::daemon_protocol::Event::RecoverBackendIdentity {
+            owner: owner.clone(),
+            expected_pane: pane.clone(),
+            expected_project_dir: project_dir.clone(),
+            backend: identity.backend.clone(),
+            backend_session_id: identity.session_id.clone(),
+        };
+        let resource_guards = self.lock_event_resources(&event).await;
+        {
+            let protocol = self.protocol.read().await;
+            if backend_recovery_lease_conflicts(&protocol, &owner, &pane, &project_dir, identity) {
+                return BackendIdentityRecoveryOutcome::LifecycleInProgress;
+            }
+        }
+
+        let panes = self.list_assistant_panes().await;
+        let Some(live_pane) = panes.iter().find(|candidate| candidate.pane_id == pane) else {
+            return BackendIdentityRecoveryOutcome::PaneNotLive;
+        };
+        let Some(process_name) = live_pane.process_name.as_deref() else {
+            return BackendIdentityRecoveryOutcome::PaneBackendMismatch;
+        };
+        let Some(backend) = self.backends.get(&identity.backend) else {
+            return BackendIdentityRecoveryOutcome::PaneBackendMismatch;
+        };
+        if crate::tmux::matching_process_name(process_name, backend.process_names()).is_none() {
+            return BackendIdentityRecoveryOutcome::PaneBackendMismatch;
+        }
+        let project_identity = project_dir_identity(&project_dir);
+        if live_pane
+            .pane_current_path
+            .as_deref()
+            .is_none_or(|path| project_dir_identity(path) != project_identity)
+        {
+            return BackendIdentityRecoveryOutcome::PaneProjectMismatch;
+        }
+
+        #[cfg(test)]
+        let test_inspection = self
+            .backend_recovery_test_inspection
+            .lock()
+            .expect("backend recovery test inspection mutex poisoned")
+            .clone();
+        #[cfg(not(test))]
+        let test_inspection: Option<crate::tmux::ManagedPaneInspection> = None;
+        let inspection = if let Some(inspection) = test_inspection {
+            Ok(inspection)
+        } else {
+            let pane = pane.clone();
+            match tokio::task::spawn_blocking(move || crate::tmux::inspect_managed_pane(&pane))
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!(error)),
+            }
+        };
+        if !matches!(inspection, Ok(ref inspection) if inspection.owner() == Some(&owner)) {
+            return BackendIdentityRecoveryOutcome::PaneOwnerMismatch;
+        }
+
+        let effects = {
+            let mut protocol = self.protocol.write().await;
+            if backend_recovery_lease_conflicts(&protocol, &owner, &pane, &project_dir, identity) {
+                return BackendIdentityRecoveryOutcome::LifecycleInProgress;
+            }
+            let before = protocol.clone();
+            let effects = protocol.apply(event);
+            if !effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    crate::daemon_protocol::Effect::BackendIdentityRecovered {
+                        owner: recovered_owner
+                    } if recovered_owner == &owner
+                )
+            }) {
+                return if protocol
+                    .sessions
+                    .get(target_session_id)
+                    .is_some_and(|target| {
+                        target.metadata.backend.is_some()
+                            || target.metadata.backend_session_id.is_some()
+                    }) {
+                    BackendIdentityRecoveryOutcome::TargetNotBlank
+                } else {
+                    BackendIdentityRecoveryOutcome::Superseded
+                };
+            }
+            if self.persist_protocol_state(&protocol).is_err() {
+                *protocol = before;
+                return BackendIdentityRecoveryOutcome::PersistenceFailed;
+            }
+            effects
+                .into_iter()
+                .filter(|effect| !matches!(effect, crate::daemon_protocol::Effect::Persist))
+                .collect::<Vec<_>>()
+        };
+        drop(resource_guards);
+        self.execute_effects(&effects).await;
+        BackendIdentityRecoveryOutcome::Recovered(owner)
     }
 
     pub(crate) async fn reclaim_missing_backend_pane(
@@ -3728,6 +3970,7 @@ impl AppState {
                 | Effect::RenameFailed { .. }
                 | Effect::RemoveOk { .. }
                 | Effect::RemoveFailed { .. }
+                | Effect::BackendIdentityRecovered { .. }
                 | Effect::ActiveContextRestartDueClaimed { .. } => {}
             }
         }
@@ -10134,5 +10377,316 @@ pub(crate) mod tests {
         assert_eq!(persisted.default_backend, "opencode");
         assert!(!persisted.auto_register);
         assert_eq!(persisted.idle_timeout_secs, 321);
+    }
+
+    async fn recovery_state(
+        project_dir: &str,
+    ) -> (
+        Arc<AppState>,
+        crate::daemon_protocol::ResourceOwner,
+        crate::backend::BackendSessionIdentity,
+    ) {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "divine-invite-darshan".into(),
+                pane: Some("%712".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some(project_dir.into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["divine-invite-darshan"].owner();
+        *state.cached_assistant_panes.write().await = vec![crate::tmux::TmuxPane {
+            pane_id: "%712".into(),
+            session_name: "divine-invite-darshan".into(),
+            pane_current_path: Some(project_dir.into()),
+            process_name: Some("codex".into()),
+        }];
+        state.set_backend_recovery_test_inspection(
+            crate::tmux::ManagedPaneInspection::ProcessOwner(owner.clone()),
+        );
+        (
+            state,
+            owner,
+            crate::backend::BackendSessionIdentity {
+                backend: "codex-cli".into(),
+                session_id: "existing-codex-thread".into(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn backend_recovery_adopts_running_context_without_respawn() {
+        let project = tempfile::tempdir().unwrap();
+        let project_dir = project.path().to_string_lossy().into_owned();
+        let (state, owner, identity) = recovery_state(&project_dir).await;
+
+        let outcome = state
+            .recover_backend_identity(
+                "divine-invite-darshan",
+                &identity,
+                &BackendRecoveryCallerEvidence {
+                    pane: Some("%712".into()),
+                    pane_var_id: Some("divine-invite-darshan".into()),
+                    env_id: Some("divine-invite-darshan".into()),
+                },
+            )
+            .await;
+
+        assert_eq!(
+            outcome,
+            BackendIdentityRecoveryOutcome::Recovered(owner.clone())
+        );
+        let protocol = state.protocol.read().await;
+        let recovered = &protocol.sessions["divine-invite-darshan"];
+        assert_eq!(recovered.owner(), owner);
+        assert_eq!(recovered.pane.as_deref(), Some("%712"));
+        assert_eq!(
+            recovered.metadata.project_dir.as_deref(),
+            Some(project_dir.as_str())
+        );
+        assert_eq!(recovered.metadata.backend.as_deref(), Some("codex-cli"));
+        assert_eq!(
+            recovered.metadata.backend_session_id.as_deref(),
+            Some("existing-codex-thread")
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_recovery_rejects_positive_caller_and_live_pane_mismatches() {
+        let project = tempfile::tempdir().unwrap();
+        let project_dir = project.path().to_string_lossy().into_owned();
+        let (state, owner, identity) = recovery_state(&project_dir).await;
+
+        let caller_mismatch = state
+            .recover_backend_identity(
+                "divine-invite-darshan",
+                &identity,
+                &BackendRecoveryCallerEvidence {
+                    pane: Some("%999".into()),
+                    pane_var_id: Some("sibling".into()),
+                    env_id: Some("sibling".into()),
+                },
+            )
+            .await;
+        assert_eq!(
+            caller_mismatch,
+            BackendIdentityRecoveryOutcome::PositiveEvidenceMismatch
+        );
+
+        let hidden_env_mismatch = state
+            .recover_backend_identity(
+                "divine-invite-darshan",
+                &identity,
+                &BackendRecoveryCallerEvidence {
+                    pane: Some("%712".into()),
+                    pane_var_id: Some("divine-invite-darshan".into()),
+                    env_id: Some("sibling".into()),
+                },
+            )
+            .await;
+        assert_eq!(
+            hidden_env_mismatch,
+            BackendIdentityRecoveryOutcome::PositiveEvidenceMismatch
+        );
+
+        state.set_backend_recovery_test_inspection(
+            crate::tmux::ManagedPaneInspection::MarkerOwner(
+                crate::daemon_protocol::ResourceOwner {
+                    session_id: owner.session_id.clone(),
+                    incarnation: crate::daemon_protocol::SessionIncarnation(
+                        owner.incarnation.0 + 1,
+                    ),
+                },
+            ),
+        );
+        let owner_mismatch = state
+            .recover_backend_identity(
+                "divine-invite-darshan",
+                &identity,
+                &BackendRecoveryCallerEvidence::default(),
+            )
+            .await;
+        assert_eq!(
+            owner_mismatch,
+            BackendIdentityRecoveryOutcome::PaneOwnerMismatch
+        );
+
+        state.set_backend_recovery_test_inspection(
+            crate::tmux::ManagedPaneInspection::ProcessOwner(owner),
+        );
+        state.cached_assistant_panes.write().await[0].pane_current_path =
+            Some(project.path().join("other").to_string_lossy().into_owned());
+        let project_mismatch = state
+            .recover_backend_identity(
+                "divine-invite-darshan",
+                &identity,
+                &BackendRecoveryCallerEvidence::default(),
+            )
+            .await;
+        assert_eq!(
+            project_mismatch,
+            BackendIdentityRecoveryOutcome::PaneProjectMismatch
+        );
+        assert!(
+            state.protocol.read().await.sessions["divine-invite-darshan"]
+                .metadata
+                .backend
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_backend_recovery_has_one_winner_and_rejects_replay() {
+        let project = tempfile::tempdir().unwrap();
+        let project_dir = project.path().to_string_lossy().into_owned();
+        let (state, owner, identity) = recovery_state(&project_dir).await;
+        let first_evidence = BackendRecoveryCallerEvidence::default();
+        let second_evidence = BackendRecoveryCallerEvidence::default();
+        let first =
+            state.recover_backend_identity("divine-invite-darshan", &identity, &first_evidence);
+        let second =
+            state.recover_backend_identity("divine-invite-darshan", &identity, &second_evidence);
+
+        let (first, second) = tokio::join!(first, second);
+        assert!(matches!(
+            (&first, &second),
+            (
+                BackendIdentityRecoveryOutcome::Recovered(recovered),
+                BackendIdentityRecoveryOutcome::TargetNotBlank
+            ) | (
+                BackendIdentityRecoveryOutcome::TargetNotBlank,
+                BackendIdentityRecoveryOutcome::Recovered(recovered)
+            ) if recovered == &owner
+        ));
+        let replay = state
+            .recover_backend_identity(
+                "divine-invite-darshan",
+                &identity,
+                &BackendRecoveryCallerEvidence::default(),
+            )
+            .await;
+        assert_eq!(replay, BackendIdentityRecoveryOutcome::TargetNotBlank);
+    }
+
+    #[tokio::test]
+    async fn backend_recovery_rejects_a_lease_on_the_same_canonical_project() {
+        let parent = tempfile::tempdir().unwrap();
+        let project = parent.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let alias = parent.path().join("project-alias");
+        std::os::unix::fs::symlink(&project, &alias).unwrap();
+        let project_dir = project.to_string_lossy().into_owned();
+        let (state, owner, identity) = recovery_state(&project_dir).await;
+        state.protocol.write().await.lifecycle_leases.insert(
+            "foreign-lifecycle".into(),
+            crate::daemon_protocol::LifecycleLease {
+                owner: crate::daemon_protocol::ResourceOwner {
+                    session_id: "foreign-lifecycle".into(),
+                    incarnation: crate::daemon_protocol::SessionIncarnation(
+                        owner.incarnation.0 + 1,
+                    ),
+                },
+                phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                backend: None,
+                backend_session_id: None,
+                backend_session_owner: None,
+                restart_target_owner: None,
+                restart_previous: None,
+                project_dir: Some(alias.to_string_lossy().into_owned()),
+                project_dir_owner: None,
+                project_dir_cleanup_on_abandon: false,
+                inert_pane: None,
+                inert_pane_owner: None,
+            },
+        );
+
+        let outcome = state
+            .recover_backend_identity(
+                "divine-invite-darshan",
+                &identity,
+                &BackendRecoveryCallerEvidence::default(),
+            )
+            .await;
+
+        assert_eq!(outcome, BackendIdentityRecoveryOutcome::LifecycleInProgress);
+        assert!(
+            state.protocol.read().await.sessions["divine-invite-darshan"]
+                .metadata
+                .backend
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_recovery_rolls_back_when_durable_persistence_fails() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let invalid_data_parent = config_dir.path().join("not-a-directory");
+        std::fs::write(&invalid_data_parent, "occupied").unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let project_dir = project.path().to_string_lossy().into_owned();
+        let state = AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: 0,
+            data_dir: invalid_data_parent,
+            config_dir: config_dir.path().to_path_buf(),
+        });
+        let owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "divine-invite-darshan".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(712),
+        };
+        state.protocol.write().await.sessions.insert(
+            owner.session_id.clone(),
+            crate::daemon_protocol::SessionEntry {
+                id: owner.session_id.clone(),
+                pane: Some("%712".into()),
+                origin: Origin::Local,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some(project_dir.clone()),
+                    session_incarnation: owner.incarnation,
+                    ..Default::default()
+                },
+                registered_at: 0,
+                active_context_due_boundary: Default::default(),
+            },
+        );
+        *state.cached_assistant_panes.write().await = vec![crate::tmux::TmuxPane {
+            pane_id: "%712".into(),
+            session_name: "divine-invite-darshan".into(),
+            pane_current_path: Some(project_dir),
+            process_name: Some("codex".into()),
+        }];
+        state.set_backend_recovery_test_inspection(
+            crate::tmux::ManagedPaneInspection::ProcessOwner(owner),
+        );
+
+        let outcome = state
+            .recover_backend_identity(
+                "divine-invite-darshan",
+                &crate::backend::BackendSessionIdentity {
+                    backend: "codex-cli".into(),
+                    session_id: "same-running-thread".into(),
+                },
+                &BackendRecoveryCallerEvidence::default(),
+            )
+            .await;
+
+        assert_eq!(outcome, BackendIdentityRecoveryOutcome::PersistenceFailed);
+        let protocol = state.protocol.read().await;
+        assert!(
+            protocol.sessions["divine-invite-darshan"]
+                .metadata
+                .backend
+                .is_none()
+        );
+        assert!(
+            protocol.sessions["divine-invite-darshan"]
+                .metadata
+                .backend_session_id
+                .is_none()
+        );
     }
 }
