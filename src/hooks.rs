@@ -359,6 +359,15 @@ async fn existing_pane_identity_matches(
         return false;
     }
 
+    live_pane_identity_matches(state, pane, hook_cwd).await
+}
+
+async fn live_pane_identity_matches(
+    state: &std::sync::Arc<crate::state::AppState>,
+    pane: &str,
+    hook_cwd: &str,
+) -> bool {
+    let hook_project_root = crate::state::resolve_project_root(hook_cwd);
     let panes = state.list_assistant_panes().await;
     let Some(live_pane_path) = panes
         .iter()
@@ -447,6 +456,88 @@ async fn session_start_inner(
             "skipped": "paneless SessionStart requires backend identity, launch session id, and launch credential",
             "output": "",
         });
+    }
+
+    let backend_identity = match body.backend_identity.as_ref() {
+        Some(identity) => {
+            let identity = crate::backend::BackendSessionIdentity {
+                backend: identity.backend.trim().to_string(),
+                session_id: identity.session_id.trim().to_string(),
+            };
+            if identity.backend.is_empty() || identity.session_id.is_empty() {
+                return json!({
+                    "skipped": "session-start requires a complete backend identity",
+                    "output": "",
+                });
+            }
+            if body
+                .adapter
+                .as_deref()
+                .is_some_and(|adapter| adapter != identity.backend)
+                || normalize_backend_session_id(body.backend_session_id.as_deref())
+                    .is_some_and(|session_id| session_id != identity.session_id)
+            {
+                return json!({
+                    "skipped": "session-start backend identity mismatch",
+                    "output": "",
+                });
+            }
+            Some(identity)
+        }
+        None => None,
+    };
+    let detected_backend = state.detect_backend_in_pane(&body.pane).await;
+    if let (Some(identity), Some(detected_backend)) =
+        (backend_identity.as_ref(), detected_backend.as_deref())
+        && identity.backend != detected_backend
+    {
+        return json!({
+            "skipped": "session-start backend identity does not match live pane",
+            "output": "",
+        });
+    }
+
+    if let Some(identity) = backend_identity.as_ref() {
+        let project_root = crate::state::resolve_project_root(&body.cwd);
+        if !live_pane_identity_matches(state, &body.pane, project_root).await {
+            return json!({
+                "skipped": "session-start pane identity mismatch",
+                "output": "",
+            });
+        }
+        match state
+            .reclaim_missing_backend_pane(
+                identity,
+                &body.pane,
+                project_root,
+                body.session_incarnation,
+            )
+            .await
+        {
+            crate::state::MissingBackendPaneReclaimOutcome::Reclaimed(owner)
+            | crate::state::MissingBackendPaneReclaimOutcome::Current(owner) => {
+                let output =
+                    mesh_instructions_for_backend(Some(&identity.backend), &owner.session_id);
+                return json!({
+                    "registered": owner.session_id,
+                    "session_incarnation": owner.incarnation.to_string(),
+                    "output": output,
+                });
+            }
+            crate::state::MissingBackendPaneReclaimOutcome::IncarnationMismatch => {
+                return json!({
+                    "skipped": "existing pane incarnation mismatch",
+                    "output": "",
+                });
+            }
+            crate::state::MissingBackendPaneReclaimOutcome::NotFound => {}
+            crate::state::MissingBackendPaneReclaimOutcome::Refused => {
+                return json!({
+                    "skipped": "stale canonical identity reclaim rejected",
+                    "output": "",
+                });
+            }
+        }
     }
 
     // Skip if pane already registered (Ouija-launched / API-started sessions hit
@@ -562,29 +653,34 @@ async fn session_start_inner(
     };
 
     // Detect backend from the process running in the pane
-    let detected_backend = state.detect_backend_in_pane(&body.pane).await;
+    let backend = backend_identity
+        .as_ref()
+        .map(|identity| identity.backend.clone())
+        .or(detected_backend);
 
     // Prefer the identity supplied by the backend's SessionStart adapter.
     // OpenCode has no such hook, so retain its shared-serve lookup fallback.
-    let backend_session_id = match normalize_backend_session_id(body.backend_session_id.as_deref())
-    {
-        Some(session_id) => Some(session_id),
-        None if detected_backend.as_deref() == Some("opencode") => {
-            resolve_opencode_session_id(state, project_root).await
-        }
-        None => None,
+    let backend_session_id = match backend_identity.as_ref() {
+        Some(identity) => Some(identity.session_id.clone()),
+        None => match normalize_backend_session_id(body.backend_session_id.as_deref()) {
+            Some(session_id) => Some(session_id),
+            None if backend.as_deref() == Some("opencode") => {
+                resolve_opencode_session_id(state, project_root).await
+            }
+            None => None,
+        },
     };
 
     // Compute mesh onboarding text before `detected_backend` is moved into the
     // metadata. Non-empty only for codex-cli (Claude/opencode carry the skill).
-    let output = mesh_instructions_for_backend(detected_backend.as_deref(), &id);
+    let output = mesh_instructions_for_backend(backend.as_deref(), &id);
 
     // Register
     let role = format!("working on {basename}");
     let proto_meta = crate::daemon_protocol::SessionMeta {
         project_dir: Some(project_root.to_string()),
         role: Some(role),
-        backend: detected_backend,
+        backend,
         backend_session_id,
         ..Default::default()
     };
@@ -2355,6 +2451,162 @@ mod tests {
             result["session_incarnation"],
             session.metadata.session_incarnation.to_string()
         );
+    }
+
+    async fn register_stale_canonical_session(
+        state: &std::sync::Arc<crate::state::AppState>,
+    ) -> crate::daemon_protocol::ResourceOwner {
+        state.set_reclaim_test_inspection(crate::tmux::ManagedPaneInspection::Missing);
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "myproject".into(),
+                pane: Some("%999999997".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/home/user/code/myproject".into()),
+                    role: Some("canonical role".into()),
+                    prompt: Some("preserve this prompt".into()),
+                    backend: Some("claude-code".into()),
+                    backend_session_id: Some("continued-thread".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state.protocol.read().await.sessions["myproject"].owner()
+    }
+
+    fn continued_thread_start() -> SessionStartBody {
+        SessionStartBody {
+            pane: "%999999998".into(),
+            cwd: "/home/user/code/myproject".into(),
+            backend_session_id: Some("continued-thread".into()),
+            backend_identity: Some(crate::backend::BackendSessionIdentity {
+                backend: "claude-code".into(),
+                session_id: "continued-thread".into(),
+            }),
+            adapter: Some("claude-code".into()),
+            launch_session_id: None,
+            launch_credential: None,
+            session_incarnation: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn session_start_reclaims_missing_canonical_pane_by_complete_backend_identity() {
+        let state = crate::state::AppState::new_for_test();
+        let stale_owner = register_stale_canonical_session(&state).await;
+        *state.cached_assistant_panes.write().await = vec![assistant_pane_with_process(
+            "%999999998",
+            "/home/user/code/myproject",
+            "claude",
+        )];
+
+        let result = session_start_inner(&state, continued_thread_start()).await;
+
+        assert_eq!(result["registered"], "myproject", "result: {result}");
+        let proto = state.protocol.read().await;
+        assert_eq!(
+            proto.sessions.len(),
+            1,
+            "must not create a suffixed duplicate"
+        );
+        let canonical = &proto.sessions["myproject"];
+        assert_eq!(canonical.pane.as_deref(), Some("%999999998"));
+        assert_eq!(canonical.metadata.backend.as_deref(), Some("claude-code"));
+        assert_eq!(
+            canonical.metadata.backend_session_id.as_deref(),
+            Some("continued-thread")
+        );
+        assert_eq!(canonical.metadata.role.as_deref(), Some("canonical role"));
+        assert_eq!(
+            canonical.metadata.prompt.as_deref(),
+            Some("preserve this prompt")
+        );
+        assert!(canonical.owner().incarnation > stale_owner.incarnation);
+    }
+
+    #[tokio::test]
+    async fn session_start_reclaims_canonical_from_scanner_created_metadata_only_duplicate() {
+        let state = crate::state::AppState::new_for_test();
+        let stale_owner = register_stale_canonical_session(&state).await;
+        *state.cached_assistant_panes.write().await = vec![assistant_pane_with_process(
+            "%999999998",
+            "/home/user/code/myproject",
+            "claude",
+        )];
+        state.scan_and_autoregister_panes().await;
+        assert!(
+            state
+                .protocol
+                .read()
+                .await
+                .sessions
+                .contains_key("myproject-2")
+        );
+
+        let result = session_start_inner(&state, continued_thread_start()).await;
+
+        assert_eq!(result["registered"], "myproject", "result: {result}");
+        let proto = state.protocol.read().await;
+        assert_eq!(proto.sessions.len(), 1, "scanner duplicate must be removed");
+        assert!(!proto.sessions.contains_key("myproject-2"));
+        let canonical = &proto.sessions["myproject"];
+        assert_eq!(canonical.pane.as_deref(), Some("%999999998"));
+        assert_eq!(canonical.metadata.role.as_deref(), Some("canonical role"));
+        assert!(canonical.owner().incarnation > stale_owner.incarnation);
+    }
+
+    #[tokio::test]
+    async fn session_start_reclaim_rejects_a_positive_live_backend_mismatch() {
+        let state = crate::state::AppState::new_for_test();
+        register_stale_canonical_session(&state).await;
+        *state.cached_assistant_panes.write().await = vec![assistant_pane_with_process(
+            "%999999998",
+            "/home/user/code/myproject",
+            "opencode",
+        )];
+
+        let result = session_start_inner(&state, continued_thread_start()).await;
+
+        assert_eq!(
+            result["skipped"],
+            "session-start backend identity does not match live pane"
+        );
+        let proto = state.protocol.read().await;
+        assert_eq!(
+            proto.sessions["myproject"].pane.as_deref(),
+            Some("%999999997")
+        );
+        assert!(!proto.sessions.contains_key("myproject-2"));
+    }
+
+    #[tokio::test]
+    async fn session_start_current_backend_identity_rejects_a_stale_incarnation() {
+        let state = crate::state::AppState::new_for_test();
+        *state.cached_assistant_panes.write().await = vec![assistant_pane_with_process(
+            "%999999998",
+            "/home/user/code/myproject",
+            "claude",
+        )];
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "myproject".into(),
+                pane: Some("%999999998".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/home/user/code/myproject".into()),
+                    backend: Some("claude-code".into()),
+                    backend_session_id: Some("continued-thread".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let current = session_incarnation(&state, "myproject").await;
+        let mut body = continued_thread_start();
+        body.session_incarnation = Some(crate::daemon_protocol::SessionIncarnation(current.0 + 1));
+
+        let result = session_start_inner(&state, body).await;
+
+        assert_eq!(result["skipped"], "existing pane incarnation mismatch");
+        assert_eq!(session_incarnation(&state, "myproject").await, current);
     }
 
     #[tokio::test]

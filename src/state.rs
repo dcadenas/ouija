@@ -781,6 +781,8 @@ pub struct AppState {
     session_agents: RwLock<HashMap<crate::daemon_protocol::ResourceOwner, OwnedSessionAgent>>,
     #[cfg(test)]
     restart_test_control: std::sync::Mutex<Option<RestartTestControl>>,
+    #[cfg(test)]
+    reclaim_test_inspection: std::sync::Mutex<Option<crate::tmux::ManagedPaneInspection>>,
     /// Per-resource async gates serialize external pane/backend claims and cleanup
     /// without holding the protocol lock across tmux, process, or HTTP I/O.
     resource_gates:
@@ -822,6 +824,15 @@ enum ResourceGateKey {
     Pane(String),
     BackendSession(String),
     ProjectDir(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MissingBackendPaneReclaimOutcome {
+    Reclaimed(crate::daemon_protocol::ResourceOwner),
+    Current(crate::daemon_protocol::ResourceOwner),
+    IncarnationMismatch,
+    NotFound,
+    Refused,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1114,6 +1125,22 @@ fn autoregister_accepts_pane_inspection(
     }
 }
 
+fn stale_backend_reclaim_accepts_incumbent_inspection(
+    inspection: &anyhow::Result<crate::tmux::ManagedPaneInspection>,
+) -> bool {
+    matches!(inspection, Ok(crate::tmux::ManagedPaneInspection::Missing))
+}
+
+fn backend_for_process_name(
+    process_name: &str,
+    candidates: &[(String, Vec<String>)],
+) -> Option<String> {
+    candidates.iter().find_map(|(backend, names)| {
+        let names = names.iter().map(String::as_str).collect::<Vec<_>>();
+        crate::tmux::matching_process_name(process_name, &names).map(|_| backend.clone())
+    })
+}
+
 fn wait_for_tmux_owner_convergence<Inspect, Wait>(
     expected_owner: &crate::daemon_protocol::ResourceOwner,
     attempts: usize,
@@ -1195,6 +1222,7 @@ impl AppState {
             last_reciprocated: std::sync::Mutex::new(HashMap::new()),
             session_agents: RwLock::new(HashMap::new()),
             restart_test_control: std::sync::Mutex::new(None),
+            reclaim_test_inspection: std::sync::Mutex::new(None),
             resource_gates: std::sync::Mutex::new(HashMap::new()),
             project_index: RwLock::new(HashMap::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
@@ -1247,6 +1275,8 @@ impl AppState {
             session_agents: RwLock::new(HashMap::new()),
             #[cfg(test)]
             restart_test_control: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            reclaim_test_inspection: std::sync::Mutex::new(None),
             resource_gates: std::sync::Mutex::new(HashMap::new()),
             project_index: RwLock::new(HashMap::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
@@ -1268,6 +1298,17 @@ impl AppState {
             .restart_test_control
             .lock()
             .expect("restart test control mutex poisoned") = Some(control);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_reclaim_test_inspection(
+        &self,
+        inspection: crate::tmux::ManagedPaneInspection,
+    ) {
+        *self
+            .reclaim_test_inspection
+            .lock()
+            .expect("reclaim test inspection mutex poisoned") = Some(inspection);
     }
 
     #[cfg(test)]
@@ -1424,6 +1465,29 @@ impl AppState {
                 if let Some(project_dir) = &metadata.project_dir {
                     project_dirs.push(project_dir.clone());
                 }
+            }
+            crate::daemon_protocol::Event::ReclaimMissingBackendPane {
+                canonical_owner,
+                expected_incumbent_pane,
+                new_pane,
+                expected_candidate,
+                backend_session_id,
+                project_dir,
+                ..
+            } => {
+                add_current(
+                    &mut keys,
+                    &mut project_dirs,
+                    &protocol,
+                    &canonical_owner.session_id,
+                );
+                if let Some(candidate) = expected_candidate {
+                    add_current(&mut keys, &mut project_dirs, &protocol, &candidate.id);
+                }
+                keys.push(ResourceGateKey::Pane(expected_incumbent_pane.clone()));
+                keys.push(ResourceGateKey::Pane(new_pane.clone()));
+                keys.push(ResourceGateKey::BackendSession(backend_session_id.clone()));
+                project_dirs.push(project_dir.clone());
             }
             crate::daemon_protocol::Event::StageFreshLaunch { id, .. }
             | crate::daemon_protocol::Event::Rename { old_id: id, .. }
@@ -1986,6 +2050,18 @@ impl AppState {
         let backend_process_names: Vec<(String, Vec<String>)> =
             self.backends.all_backend_process_names();
 
+        #[cfg(test)]
+        if let Some(process_name) = self
+            .cached_assistant_panes
+            .read()
+            .await
+            .iter()
+            .find(|candidate| candidate.pane_id == pane)
+            .and_then(|candidate| candidate.process_name.as_deref())
+        {
+            return backend_for_process_name(process_name, &backend_process_names);
+        }
+
         let pane = pane.to_string();
         tokio::task::spawn_blocking(move || {
             use std::process::Command;
@@ -2032,12 +2108,8 @@ impl AppState {
             let mut stack = vec![pane_pid];
             while let Some(pid) = stack.pop() {
                 if let Some(comm) = names.get(&pid) {
-                    for (backend_name, pnames) in &backend_process_names {
-                        for pn in pnames {
-                            if comm == pn || comm.strip_prefix('.') == Some(pn.as_str()) {
-                                return Some(backend_name.clone());
-                            }
-                        }
+                    if let Some(backend) = backend_for_process_name(comm, &backend_process_names) {
+                        return Some(backend);
                     }
                 }
                 if let Some(kids) = children.get(&pid) {
@@ -2059,6 +2131,147 @@ impl AppState {
             .values()
             .find(|s| s.pane.as_deref() == Some(pane))
             .map(|s| s.id.clone())
+    }
+
+    pub(crate) async fn reclaim_missing_backend_pane(
+        self: &Arc<Self>,
+        identity: &crate::backend::BackendSessionIdentity,
+        new_pane: &str,
+        project_dir: &str,
+        expected_incarnation: Option<crate::daemon_protocol::SessionIncarnation>,
+    ) -> MissingBackendPaneReclaimOutcome {
+        use crate::daemon_protocol::BackendIdentityResolution;
+
+        let (canonical_owner, incumbent_pane, canonical_project_dir, candidate) = {
+            let protocol = self.protocol.read().await;
+            let canonical_id = match protocol.resolve_backend_identity(identity) {
+                BackendIdentityResolution::Resolved { session_id } => session_id,
+                BackendIdentityResolution::NotFound => {
+                    return MissingBackendPaneReclaimOutcome::NotFound;
+                }
+                BackendIdentityResolution::Ambiguous { .. }
+                | BackendIdentityResolution::IncompleteLegacy { .. } => {
+                    return MissingBackendPaneReclaimOutcome::Refused;
+                }
+            };
+            let Some(canonical) = protocol.sessions.get(&canonical_id) else {
+                return MissingBackendPaneReclaimOutcome::Refused;
+            };
+            let Some(incumbent_pane) = canonical.pane.clone() else {
+                return MissingBackendPaneReclaimOutcome::Refused;
+            };
+            let Some(canonical_project_dir) = canonical.metadata.project_dir.clone() else {
+                return MissingBackendPaneReclaimOutcome::Refused;
+            };
+            if expected_incarnation
+                .is_some_and(|expected| expected != canonical.owner().incarnation)
+            {
+                return MissingBackendPaneReclaimOutcome::IncarnationMismatch;
+            }
+            if resolve_project_root(&canonical_project_dir) != project_dir
+                || protocol.lifecycle_leases.contains_key(&canonical_id)
+            {
+                return MissingBackendPaneReclaimOutcome::Refused;
+            }
+            if incumbent_pane == new_pane {
+                return MissingBackendPaneReclaimOutcome::Current(canonical.owner());
+            }
+            let candidate = protocol
+                .sessions
+                .values()
+                .find(|session| session.pane.as_deref() == Some(new_pane))
+                .cloned();
+            if candidate.as_ref().is_some_and(|candidate| {
+                !protocol.scanner_candidate_is_reclaimable(candidate, new_pane, project_dir)
+            }) {
+                return MissingBackendPaneReclaimOutcome::Refused;
+            }
+            (
+                canonical.owner(),
+                incumbent_pane,
+                canonical_project_dir,
+                candidate,
+            )
+        };
+
+        let event = crate::daemon_protocol::Event::ReclaimMissingBackendPane {
+            canonical_owner: canonical_owner.clone(),
+            expected_incumbent_pane: incumbent_pane.clone(),
+            new_pane: new_pane.to_string(),
+            expected_candidate: candidate.clone(),
+            backend: identity.backend.clone(),
+            backend_session_id: identity.session_id.clone(),
+            project_dir: canonical_project_dir,
+        };
+        let resource_guards = self.lock_event_resources(&event).await;
+        #[cfg(test)]
+        let test_inspection = self
+            .reclaim_test_inspection
+            .lock()
+            .expect("reclaim test inspection mutex poisoned")
+            .clone();
+        #[cfg(not(test))]
+        let test_inspection: Option<crate::tmux::ManagedPaneInspection> = None;
+        let inspection = if let Some(inspection) = test_inspection {
+            Ok(inspection)
+        } else {
+            let incumbent_pane_for_inspection = incumbent_pane.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::tmux::inspect_managed_pane_for_reclaim(&incumbent_pane_for_inspection)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!(error)),
+            }
+        };
+        if !stale_backend_reclaim_accepts_incumbent_inspection(&inspection) {
+            return MissingBackendPaneReclaimOutcome::Refused;
+        }
+
+        let effects = {
+            let mut protocol = self.protocol.write().await;
+            // Match the dashboard's protocol -> tasks lock order. Holding both
+            // guards makes the external task-reference check atomic with the
+            // candidate removal without introducing a tasks -> protocol cycle.
+            let scheduled_tasks = self.scheduled_tasks.read().await;
+            if candidate.as_ref().is_some_and(|candidate| {
+                scheduled_tasks
+                    .values()
+                    .any(|task| task.target_session.as_deref() == Some(candidate.id.as_str()))
+            }) {
+                return MissingBackendPaneReclaimOutcome::Refused;
+            }
+            let before = protocol.clone();
+            let effects = protocol.apply(event);
+            let reclaimed_owner = effects.iter().find_map(|effect| match effect {
+                crate::daemon_protocol::Effect::RegisterOk { owner, .. }
+                    if owner.session_id == canonical_owner.session_id =>
+                {
+                    Some(owner.clone())
+                }
+                _ => None,
+            });
+            let Some(reclaimed_owner) = reclaimed_owner else {
+                return MissingBackendPaneReclaimOutcome::Refused;
+            };
+            if let Err(error) = self.persist_protocol_state(&protocol) {
+                *protocol = before;
+                tracing::warn!(
+                    session_id = %canonical_owner.session_id,
+                    "failed to persist stale backend-pane reclaim: {error}"
+                );
+                return MissingBackendPaneReclaimOutcome::Refused;
+            }
+            let effects = effects
+                .into_iter()
+                .filter(|effect| !matches!(effect, crate::daemon_protocol::Effect::Persist))
+                .collect::<Vec<_>>();
+            (effects, reclaimed_owner)
+        };
+        drop(resource_guards);
+        self.execute_effects(&effects.0).await;
+        MissingBackendPaneReclaimOutcome::Reclaimed(effects.1)
     }
 
     /// Apply a protocol event and execute all resulting effects.
@@ -4791,6 +5004,7 @@ impl AppState {
             let proto_meta = crate::daemon_protocol::SessionMeta {
                 project_dir: Some(project_root.to_string()),
                 role: Some(format!("working on {basename}")),
+                scanner_registration: true,
                 ..Default::default()
             };
 
@@ -5821,6 +6035,45 @@ pub(crate) mod tests {
             &crate::tmux::ManagedPaneInspection::Missing,
             false,
         ));
+    }
+
+    #[test]
+    fn stale_backend_reclaim_requires_a_physically_missing_incumbent() {
+        let owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "canonical".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(42),
+        };
+        assert!(stale_backend_reclaim_accepts_incumbent_inspection(&Ok(
+            crate::tmux::ManagedPaneInspection::Missing
+        )));
+        for inspection in [
+            crate::tmux::ManagedPaneInspection::Unmanaged,
+            crate::tmux::ManagedPaneInspection::ProcessOwner(owner.clone()),
+            crate::tmux::ManagedPaneInspection::MarkerOwner(owner),
+        ] {
+            assert!(!stale_backend_reclaim_accepts_incumbent_inspection(&Ok(
+                inspection
+            )));
+        }
+        assert!(!stale_backend_reclaim_accepts_incumbent_inspection(&Err(
+            anyhow::anyhow!("inspection failed")
+        )));
+    }
+
+    #[test]
+    fn backend_process_detection_matches_full_paths_and_dot_prefixes() {
+        let candidates = vec![(
+            "codex-cli".to_string(),
+            vec!["codex".to_string(), "codex-cli".to_string()],
+        )];
+        assert_eq!(
+            backend_for_process_name("/opt/homebrew/bin/codex", &candidates).as_deref(),
+            Some("codex-cli")
+        );
+        assert_eq!(
+            backend_for_process_name(".codex", &candidates).as_deref(),
+            Some("codex-cli")
+        );
     }
 
     #[tokio::test]
@@ -8936,6 +9189,7 @@ pub(crate) mod tests {
             active_context_segment_started_at: Some(1_700_000_050),
             active_context_restart_due: true,
             active_context_accounting_provisional: true,
+            scanner_registration: false,
         };
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
