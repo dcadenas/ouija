@@ -425,6 +425,38 @@ ouija ask target-id "question"
 
 If implicit resolution fails and you do not have an exact injected or operator-provided public Local id, run `ouija whoami` and relay its diagnostics. **Never run `ouija register` to "fix" this** — it would create a duplicate session entry, not register the caller.
 
+### Recover a running backend from a both-null row
+
+Use this only when the operator explicitly identifies the exact public Local
+session and its existing daemon row has both `backend` and
+`backend_session_id` absent, while the current adapter discovers one complete
+backend identity. This command is intentionally usable when `ouija whoami`
+fails with backend resolution outcome `not_found`:
+
+```bash
+ouija recover-backend-identity exact-public-local-id
+```
+
+The positional value must come from trusted injected context or the operator.
+Never infer it from the project, pane, process, role, or `ouija ls`. The CLI
+does not put the backend-native identity in argv; it discovers the typed pair
+through the current backend adapter and sends it only to the local daemon.
+
+The daemon accepts recovery only when the target remains the same exact Local
+owner with a live assistant pane, canonical matching project, exact
+incarnation/owner markers, matching backend process, no lifecycle lease or
+managed-launch proof, a still-blank backend pair, and an identity not claimed
+elsewhere. It holds the pane/project/backend resource gates through inspection,
+the blank-to-bound compare-and-swap, and durable persistence. Any mismatch or
+concurrent ownership change fails closed. A successful recovery preserves the
+running backend context and does not respawn; the same request cannot be
+replayed because the target is no longer blank.
+
+Do not use this for a one-sided/incomplete or already populated backend pair,
+a Remote session, a missing/stale pane, or a lifecycle operation in progress.
+Do not run `ouija register` as fallback. Use the existing explicit fresh
+managed repair/restart when this narrow recovery refuses the row.
+
 ## 9. Patterns
 
 Recurring recovery and completion are separate. Supplying `--reminder` opts into idle-cycle recovery nudges; `--when-done` controls what the session does after completion. Pending replies remain an independent reason to wake a session.

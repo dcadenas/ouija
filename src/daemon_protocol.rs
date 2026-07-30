@@ -995,6 +995,18 @@ pub enum Event {
         /// with the backend-session binding.
         expected_session_start_credential: Option<String>,
     },
+    /// Bind an already-running backend only to an exact, unchanged blank Local owner.
+    ///
+    /// External pane/process/project inspection belongs to `AppState`; this
+    /// pure transition is the final blank-to-bound compare-and-swap. It does
+    /// not refresh user-facing metadata freshness.
+    RecoverBackendIdentity {
+        owner: ResourceOwner,
+        expected_pane: String,
+        expected_project_dir: String,
+        backend: String,
+        backend_session_id: String,
+    },
     /// Atomically replace a complete backend-session binding for a verified
     /// local pane. The caller must supply the currently stored session ID as
     /// a compare-and-swap guard. Managed launches use `AdoptBackend` instead.
@@ -1300,6 +1312,11 @@ pub enum Effect {
     ProvisionalRollbackOk {
         owner: ResourceOwner,
         pane: String,
+    },
+    /// Pure acknowledgement that exact-owner backend recovery consumed the
+    /// target's blank binding slot. It has no external side effect.
+    BackendIdentityRecovered {
+        owner: ResourceOwner,
     },
     CleanupWorktree {
         owner: ResourceOwner,
@@ -2237,6 +2254,19 @@ impl DaemonState {
                 backend_session_id,
                 expected_backend_session_id,
                 expected_session_start_credential,
+            ),
+            Event::RecoverBackendIdentity {
+                owner,
+                expected_pane,
+                expected_project_dir,
+                backend,
+                backend_session_id,
+            } => self.apply_recover_backend_identity(
+                &owner,
+                &expected_pane,
+                &expected_project_dir,
+                backend,
+                backend_session_id,
             ),
             Event::RebindBackend {
                 id,
@@ -4396,6 +4426,80 @@ impl DaemonState {
                 });
             }
         }
+        if session.metadata.networked {
+            effects.push(Effect::BroadcastSessionList);
+        }
+        effects
+    }
+
+    fn apply_recover_backend_identity(
+        &mut self,
+        owner: &ResourceOwner,
+        expected_pane: &str,
+        expected_project_dir: &str,
+        backend: String,
+        backend_session_id: String,
+    ) -> Vec<Effect> {
+        if backend.is_empty()
+            || backend_session_id.is_empty()
+            || self.lifecycle_leases.iter().any(|(id, lease)| {
+                id == &owner.session_id
+                    || lease.owner == *owner
+                    || lease.backend_session_owner.as_ref() == Some(owner)
+                    || lease.restart_target_owner.as_ref() == Some(owner)
+                    || lease.project_dir.as_deref() == Some(expected_project_dir)
+                    || lease.inert_pane.as_deref() == Some(expected_pane)
+                    || (lease.backend.as_deref() == Some(backend.as_str())
+                        && lease.backend_session_id.as_deref() == Some(backend_session_id.as_str()))
+            })
+        {
+            return vec![];
+        }
+        let Some(target) = self.sessions.get(&owner.session_id) else {
+            return vec![];
+        };
+        if !matches!(target.origin, Origin::Local)
+            || target.owner() != *owner
+            || target.pane.as_deref() != Some(expected_pane)
+            || target.metadata.project_dir.as_deref() != Some(expected_project_dir)
+            || target.metadata.backend.is_some()
+            || target.metadata.backend_session_id.is_some()
+            || target.metadata.session_start_credential.is_some()
+            || target.metadata.backend_repair_reservation.is_some()
+            || target.metadata.opencode_binding.is_some()
+        {
+            return vec![];
+        }
+        if self.sessions.values().any(|session| {
+            session.id != owner.session_id
+                && matches!(session.origin, Origin::Local)
+                && (backend_pair_matches(&session.metadata, &backend, &backend_session_id)
+                    || (session
+                        .metadata
+                        .backend
+                        .as_deref()
+                        .is_none_or(|value| value == backend)
+                        && session.metadata.backend_session_id.as_deref()
+                            == Some(backend_session_id.as_str())))
+        }) {
+            return vec![];
+        }
+
+        let session = self
+            .sessions
+            .get_mut(&owner.session_id)
+            .expect("exact Local owner checked above");
+        session.metadata.backend = Some(backend.clone());
+        session.metadata.backend_session_id = Some(backend_session_id);
+        if backend == "opencode" {
+            session.metadata.opencode_binding = Some(OpenCodeBinding::WeakAdopted);
+        }
+        let mut effects = vec![
+            Effect::BackendIdentityRecovered {
+                owner: owner.clone(),
+            },
+            Effect::Persist,
+        ];
         if session.metadata.networked {
             effects.push(Effect::BroadcastSessionList);
         }
@@ -12337,6 +12441,237 @@ mod tests {
         assert!(meta.last_metadata_update.is_none());
     }
 
+    fn blank_recovery_state() -> (DaemonState, ResourceOwner) {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "divine-invite-darshan".into(),
+            pane: Some("%712".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/home/daniel/code/divine-invite-darshan".into()),
+                role: Some("preserve current Codex context".into()),
+                ..Default::default()
+            },
+        });
+        let owner = state.sessions["divine-invite-darshan"].owner();
+        (state, owner)
+    }
+
+    fn recover_divine_invite_event(owner: &ResourceOwner) -> Event {
+        Event::RecoverBackendIdentity {
+            owner: owner.clone(),
+            expected_pane: "%712".into(),
+            expected_project_dir: "/home/daniel/code/divine-invite-darshan".into(),
+            backend: "codex-cli".into(),
+            backend_session_id: "codex-thread-existing".into(),
+        }
+    }
+
+    #[test]
+    fn recover_backend_identity_binds_both_null_row_without_replacing_owner() {
+        let (mut state, owner) = blank_recovery_state();
+        let before = state.sessions["divine-invite-darshan"].clone();
+
+        let effects = state.apply(recover_divine_invite_event(&owner));
+
+        let recovered = &state.sessions["divine-invite-darshan"];
+        assert_eq!(recovered.owner(), owner);
+        assert_eq!(recovered.pane, before.pane);
+        assert_eq!(recovered.metadata.project_dir, before.metadata.project_dir);
+        assert_eq!(recovered.metadata.role, before.metadata.role);
+        assert_eq!(recovered.metadata.backend.as_deref(), Some("codex-cli"));
+        assert_eq!(
+            recovered.metadata.backend_session_id.as_deref(),
+            Some("codex-thread-existing")
+        );
+        assert!(recovered.metadata.last_metadata_update.is_none());
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::BackendIdentityRecovered { owner: recovered_owner }
+                if recovered_owner == &owner
+        )));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Persist))
+        );
+        assert!(!effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SetTmuxVar { .. }
+                | Effect::WaitForTmuxOwner { .. }
+                | Effect::RenameWindow { .. }
+                | Effect::EnableAutoRename { .. }
+        )));
+    }
+
+    #[test]
+    fn recover_backend_identity_consumes_blank_slot_and_replay_is_rejected() {
+        let (mut state, owner) = blank_recovery_state();
+        assert!(!state.apply(recover_divine_invite_event(&owner)).is_empty());
+
+        let after_first = state.sessions["divine-invite-darshan"].clone();
+        let replay = state.apply(recover_divine_invite_event(&owner));
+
+        assert!(replay.is_empty());
+        assert_eq!(state.sessions["divine-invite-darshan"], after_first);
+    }
+
+    #[test]
+    fn recover_backend_identity_rejects_nonblank_remote_or_stale_target() {
+        let (base, owner) = blank_recovery_state();
+
+        let mut cases = Vec::new();
+        let mut backend_only = base.clone();
+        backend_only
+            .sessions
+            .get_mut(&owner.session_id)
+            .unwrap()
+            .metadata
+            .backend = Some("codex-cli".into());
+        cases.push(backend_only);
+        let mut session_only = base.clone();
+        session_only
+            .sessions
+            .get_mut(&owner.session_id)
+            .unwrap()
+            .metadata
+            .backend_session_id = Some("legacy-thread".into());
+        cases.push(session_only);
+        let mut remote = base.clone();
+        remote.sessions.get_mut(&owner.session_id).unwrap().origin =
+            Origin::Remote("npub1peer".into());
+        cases.push(remote);
+        let mut pending_launch = base.clone();
+        pending_launch
+            .sessions
+            .get_mut(&owner.session_id)
+            .unwrap()
+            .metadata
+            .session_start_credential = Some("managed-proof".into());
+        cases.push(pending_launch);
+        let mut pending_repair = base.clone();
+        pending_repair
+            .sessions
+            .get_mut(&owner.session_id)
+            .unwrap()
+            .metadata
+            .backend_repair_reservation = Some(BackendRepairReservation {
+            original_incarnation: owner.incarnation,
+            restart_generation: 1,
+            phase: BackendRepairPhase::PreStage,
+        });
+        cases.push(pending_repair);
+
+        for mut state in cases {
+            let before = state.sessions[&owner.session_id].clone();
+            assert!(state.apply(recover_divine_invite_event(&owner)).is_empty());
+            assert_eq!(state.sessions[&owner.session_id], before);
+        }
+
+        for event in [
+            Event::RecoverBackendIdentity {
+                owner: ResourceOwner {
+                    session_id: owner.session_id.clone(),
+                    incarnation: SessionIncarnation(owner.incarnation.0 + 1),
+                },
+                expected_pane: "%712".into(),
+                expected_project_dir: "/home/daniel/code/divine-invite-darshan".into(),
+                backend: "codex-cli".into(),
+                backend_session_id: "codex-thread-existing".into(),
+            },
+            Event::RecoverBackendIdentity {
+                owner: owner.clone(),
+                expected_pane: "%999".into(),
+                expected_project_dir: "/home/daniel/code/divine-invite-darshan".into(),
+                backend: "codex-cli".into(),
+                backend_session_id: "codex-thread-existing".into(),
+            },
+            Event::RecoverBackendIdentity {
+                owner: owner.clone(),
+                expected_pane: "%712".into(),
+                expected_project_dir: "/home/daniel/code/sibling".into(),
+                backend: "codex-cli".into(),
+                backend_session_id: "codex-thread-existing".into(),
+            },
+        ] {
+            let mut state = base.clone();
+            let before = state.sessions[&owner.session_id].clone();
+            assert!(state.apply(event).is_empty());
+            assert_eq!(state.sessions[&owner.session_id], before);
+        }
+    }
+
+    #[test]
+    fn recover_backend_identity_rejects_lease_or_identity_owned_elsewhere() {
+        let (mut leased, owner) = blank_recovery_state();
+        leased.lifecycle_leases.insert(
+            owner.session_id.clone(),
+            LifecycleLease {
+                owner: owner.clone(),
+                phase: LifecyclePhase::Restarting,
+                backend: None,
+                backend_session_id: None,
+                backend_session_owner: None,
+                restart_target_owner: None,
+                restart_previous: None,
+                project_dir: None,
+                project_dir_owner: None,
+                project_dir_cleanup_on_abandon: false,
+                inert_pane: None,
+                inert_pane_owner: None,
+            },
+        );
+        assert!(leased.apply(recover_divine_invite_event(&owner)).is_empty());
+
+        let (mut foreign_lease, owner) = blank_recovery_state();
+        foreign_lease.lifecycle_leases.insert(
+            "replacement".into(),
+            LifecycleLease {
+                owner: ResourceOwner {
+                    session_id: "replacement".into(),
+                    incarnation: SessionIncarnation(owner.incarnation.0 + 1),
+                },
+                phase: LifecyclePhase::Starting,
+                backend: None,
+                backend_session_id: None,
+                backend_session_owner: None,
+                restart_target_owner: None,
+                restart_previous: None,
+                project_dir: Some("/home/daniel/code/divine-invite-darshan".into()),
+                project_dir_owner: None,
+                project_dir_cleanup_on_abandon: false,
+                inert_pane: Some("%712".into()),
+                inert_pane_owner: None,
+            },
+        );
+        assert!(
+            foreign_lease
+                .apply(recover_divine_invite_event(&owner))
+                .is_empty()
+        );
+
+        let (mut duplicate, owner) = blank_recovery_state();
+        duplicate.apply(Event::Register {
+            id: "sibling".into(),
+            pane: Some("%713".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                backend_session_id: Some("codex-thread-existing".into()),
+                ..Default::default()
+            },
+        });
+        assert!(
+            duplicate
+                .apply(recover_divine_invite_event(&owner))
+                .is_empty()
+        );
+        assert!(
+            duplicate.sessions[&owner.session_id]
+                .metadata
+                .backend
+                .is_none()
+        );
+    }
+
     #[test]
     fn adopt_backend_non_networked_no_broadcast() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
@@ -13979,6 +14314,9 @@ mod stateright_model {
             prompt: Option<String>,
             reminder: Option<String>,
         },
+        RecoverBackendIdentity {
+            id: String,
+        },
         Remove {
             id: String,
         },
@@ -14074,6 +14412,7 @@ mod stateright_model {
             prompt: Option<String>,
             reminder: Option<String>,
         },
+        RecoverBackendIdentity(String),
         Remove(String),
         RemoveKeep(String),
         ReapDead(Vec<String>),
@@ -14229,6 +14568,7 @@ mod stateright_model {
                 // -- Register / Remove / Rename / Reap / Wire* shared path --
                 ModelMsg::Register { .. }
                 | ModelMsg::RegisterWithMeta { .. }
+                | ModelMsg::RecoverBackendIdentity { .. }
                 | ModelMsg::Remove { .. }
                 | ModelMsg::RemoveKeep { .. }
                 | ModelMsg::ReapDead { .. }
@@ -14263,6 +14603,33 @@ mod stateright_model {
                                 ..Default::default()
                             },
                         },
+                        ModelMsg::RecoverBackendIdentity { id } => {
+                            let (owner, pane, project_dir) = ds
+                                .sessions
+                                .get(&id)
+                                .map(|session| {
+                                    (
+                                        session.owner(),
+                                        session.pane.clone().unwrap_or_default(),
+                                        session.metadata.project_dir.clone().unwrap_or_default(),
+                                    )
+                                })
+                                .unwrap_or((
+                                    ResourceOwner {
+                                        session_id: id,
+                                        incarnation: SessionIncarnation::default(),
+                                    },
+                                    String::new(),
+                                    String::new(),
+                                ));
+                            Event::RecoverBackendIdentity {
+                                owner,
+                                expected_pane: pane,
+                                expected_project_dir: project_dir,
+                                backend: "codex-cli".into(),
+                                backend_session_id: "model-thread".into(),
+                            }
+                        }
                         ModelMsg::Remove { id } => Event::Remove {
                             id,
                             keep_worktree: false,
@@ -14596,6 +14963,9 @@ mod stateright_model {
                                 reminder: reminder.clone(),
                             },
                         ),
+                        ModelAction::RecoverBackendIdentity(id) => {
+                            o.send(*target, ModelMsg::RecoverBackendIdentity { id: id.clone() })
+                        }
                         ModelAction::Remove(id) => {
                             o.send(*target, ModelMsg::Remove { id: id.clone() })
                         }
@@ -14846,6 +15216,7 @@ mod stateright_model {
                 prompt: Some("model-prompt".to_string()),
                 reminder: Some("model-reminder".to_string()),
             });
+            c.push(ModelAction::RecoverBackendIdentity(id.to_string()));
         }
         // Offer RemoveKeep and ReapDead for first session only to limit
         // state space -- the code paths are symmetric across IDs.
@@ -15280,6 +15651,29 @@ mod stateright_model {
             .any(|ds| !ds.lifecycle_leases.is_empty())
     }
 
+    fn check_local_backend_identity_unique(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        daemon_states(&state.actor_states).iter().all(|ds| {
+            let mut pairs = BTreeSet::new();
+            ds.sessions.values().all(|session| {
+                if !matches!(session.origin, Origin::Local) {
+                    return true;
+                }
+                match (
+                    session.metadata.backend.as_deref(),
+                    session.metadata.backend_session_id.as_deref(),
+                ) {
+                    (Some(backend), Some(session_id)) => {
+                        pairs.insert((backend.to_string(), session_id.to_string()))
+                    }
+                    _ => true,
+                }
+            })
+        })
+    }
+
     // -- Model builder -------------------------------------------------------
 
     fn build_model() -> ActorModel<ModelActor, ()> {
@@ -15351,6 +15745,11 @@ mod stateright_model {
                 Expectation::Always,
                 "reap never cleans worktree",
                 check_reap_never_cleans_worktree,
+            )
+            .property(
+                Expectation::Always,
+                "local backend identity unique",
+                check_local_backend_identity_unique,
             )
             .property(Expectation::Sometimes, "registered", check_some_registered)
             .property(Expectation::Sometimes, "remote visible", check_some_remote)

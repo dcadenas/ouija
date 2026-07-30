@@ -146,6 +146,12 @@ enum Command {
     Ls,
     /// Print this session's Ouija id (same resolution path as ask/tell/reply)
     Whoami,
+    /// Bind this running backend to one exact blank Local session without restarting it.
+    #[command(name = "recover-backend-identity")]
+    RecoverBackendIdentity {
+        /// Exact public Local session ID supplied by the operator or injected context.
+        session_id: String,
+    },
     /// Prepare or adopt a session-owned context rollover.
     Rollover {
         #[command(subcommand)]
@@ -916,6 +922,27 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Whoami => {
             cli_whoami().await?;
+        }
+        Command::RecoverBackendIdentity { session_id } => {
+            let identity = backend::BackendRegistry::default_registry()
+                .caller_session_identity()
+                .context(
+                    "recovery requires exactly one complete backend identity from the current adapter",
+                )?;
+            let tmux_pane = std::env::var("TMUX_PANE")
+                .ok()
+                .filter(|pane| !pane.is_empty());
+            let pane_var = tmux_pane.as_deref().and_then(tmux_var::get);
+            let env_var = std::env::var("OUIJA_SESSION_ID")
+                .ok()
+                .filter(|id| !id.is_empty());
+            let caller = backend_recovery_caller_evidence(tmux_pane, pane_var, env_var);
+            let body = serde_json::json!({
+                "target_session_id": session_id,
+                "identity": identity,
+                "caller": caller,
+            });
+            cli_post("/api/backend-identities/recover", &body).await?;
         }
         Command::Rollover { action } => {
             let caller = rollover_live_caller().await?;
@@ -2991,6 +3018,18 @@ fn resolve_explicit_sender(
     }
 }
 
+fn backend_recovery_caller_evidence(
+    tmux_pane: Option<String>,
+    pane_var: Option<String>,
+    env_var: Option<String>,
+) -> crate::state::BackendRecoveryCallerEvidence {
+    crate::state::BackendRecoveryCallerEvidence {
+        pane: tmux_pane,
+        pane_var_id: pane_var.filter(|id| !id.is_empty()),
+        env_id: env_var.filter(|id| !id.is_empty()),
+    }
+}
+
 /// Resolve a message sender and the observations sent alongside it.
 ///
 /// An explicit public Local id is handled separately from fail-closed implicit
@@ -3458,6 +3497,34 @@ mod tests {
     #[test]
     fn pane_wire_suffix_handles_empty_string() {
         assert_eq!(pane_wire_suffix(""), "");
+    }
+
+    #[test]
+    fn recover_backend_identity_cli_requires_one_exact_public_id() {
+        let cli =
+            Cli::try_parse_from(["ouija", "recover-backend-identity", "divine-invite-darshan"])
+                .expect("explicit recovery command must parse");
+
+        match cli.command {
+            Command::RecoverBackendIdentity { session_id } => {
+                assert_eq!(session_id, "divine-invite-darshan");
+            }
+            _ => panic!("expected recover-backend-identity command"),
+        }
+        assert!(Cli::try_parse_from(["ouija", "recover-backend-identity"]).is_err());
+    }
+
+    #[test]
+    fn backend_recovery_evidence_preserves_every_positive_signal_without_whoami_resolution() {
+        let evidence = backend_recovery_caller_evidence(
+            Some("%712".into()),
+            Some("pane-owner".into()),
+            Some("stale-env-owner".into()),
+        );
+
+        assert_eq!(evidence.pane.as_deref(), Some("%712"));
+        assert_eq!(evidence.pane_var_id.as_deref(), Some("pane-owner"));
+        assert_eq!(evidence.env_id.as_deref(), Some("stale-env-owner"));
     }
 
     #[test]

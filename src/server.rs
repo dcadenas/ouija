@@ -82,6 +82,10 @@ pub async fn run(state: SharedState) -> anyhow::Result<()> {
             post(api::bind_backend_identity),
         )
         .route(
+            "/api/backend-identities/recover",
+            post(api::recover_backend_identity),
+        )
+        .route(
             "/api/backend-identities/repair",
             post(api::repair_backend_identity),
         )
