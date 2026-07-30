@@ -7481,6 +7481,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn methodless_inject_rejects_pane_not_owned_by_session() {
         let state = AppState::new_for_test();
+        state.settings.write().await.default_backend = "claude-code".into();
         proto_register(&state, "target", Some("%1")).await;
 
         let outcome = deliver_inject_message_effect(
@@ -7544,6 +7545,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn methodless_inject_stale_pane_marks_delivery_failed() {
         let state = AppState::new_for_test();
+        state.settings.write().await.default_backend = "claude-code".into();
         proto_register(&state, "sender", Some("%9")).await;
         proto_register(&state, "target", Some("%1")).await;
 
