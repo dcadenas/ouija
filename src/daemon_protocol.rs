@@ -875,6 +875,20 @@ pub enum Event {
         expected_orphaned_marker_owner: Option<ResourceOwner>,
         metadata: SessionMeta,
     },
+    /// Move an exact backend-bound Local owner from a physically missing pane.
+    ///
+    /// The state owner performs the physical `Missing` inspection before this
+    /// pure guarded transition. This event does not refresh user-facing
+    /// metadata; it preserves the canonical row and only advances ownership.
+    ReclaimMissingBackendPane {
+        canonical_owner: ResourceOwner,
+        expected_incumbent_pane: String,
+        new_pane: String,
+        expected_candidate_owner: Option<ResourceOwner>,
+        backend: String,
+        backend_session_id: String,
+        project_dir: String,
+    },
     /// Establish the next incarnation before a fresh hard launch performs any
     /// external work. Native identity is deliberately empty until the new
     /// process presents its launch proof.
@@ -2117,6 +2131,23 @@ impl DaemonState {
                 expected_orphaned_marker_owner,
                 metadata,
             ),
+            Event::ReclaimMissingBackendPane {
+                canonical_owner,
+                expected_incumbent_pane,
+                new_pane,
+                expected_candidate_owner,
+                backend,
+                backend_session_id,
+                project_dir,
+            } => self.apply_reclaim_missing_backend_pane(
+                canonical_owner,
+                expected_incumbent_pane,
+                new_pane,
+                expected_candidate_owner,
+                backend,
+                backend_session_id,
+                project_dir,
+            ),
             Event::StageFreshLaunch {
                 id,
                 backend,
@@ -3329,6 +3360,86 @@ impl DaemonState {
         }
 
         self.apply_register(id, Some(pane), metadata)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_reclaim_missing_backend_pane(
+        &mut self,
+        canonical_owner: ResourceOwner,
+        expected_incumbent_pane: String,
+        new_pane: String,
+        expected_candidate_owner: Option<ResourceOwner>,
+        backend: String,
+        backend_session_id: String,
+        project_dir: String,
+    ) -> Vec<Effect> {
+        let fail = |reason: String| {
+            vec![
+                Effect::Log {
+                    level: LogLevel::Warn,
+                    message: format!(
+                        "refusing stale backend-pane reclaim for '{}': {reason}",
+                        canonical_owner.session_id
+                    ),
+                },
+                Effect::RegisterFailed {
+                    session_id: canonical_owner.session_id.clone(),
+                    reason,
+                },
+            ]
+        };
+
+        let Some(canonical) = self.sessions.get(&canonical_owner.session_id) else {
+            return fail("canonical session no longer exists".into());
+        };
+        if canonical.owner() != canonical_owner
+            || !matches!(canonical.origin, Origin::Local)
+            || canonical.pane.as_deref() != Some(expected_incumbent_pane.as_str())
+            || !backend_pair_matches(&canonical.metadata, &backend, &backend_session_id)
+            || canonical.metadata.project_dir.as_deref() != Some(project_dir.as_str())
+        {
+            return fail("canonical owner, pane, backend identity, or project changed".into());
+        }
+        if self
+            .lifecycle_leases
+            .contains_key(&canonical_owner.session_id)
+        {
+            return fail("canonical session has a lifecycle operation in progress".into());
+        }
+        if !matches!(
+            self.resolve_backend_identity(&crate::backend::BackendSessionIdentity {
+                backend: backend.clone(),
+                session_id: backend_session_id.clone(),
+            }),
+            BackendIdentityResolution::Resolved { ref session_id }
+                if session_id == &canonical_owner.session_id
+        ) {
+            return fail("backend identity is no longer uniquely canonical".into());
+        }
+
+        let pane_holder = self
+            .sessions
+            .values()
+            .find(|session| session.pane.as_deref() == Some(new_pane.as_str()));
+        match (expected_candidate_owner.as_ref(), pane_holder) {
+            (None, None) => {}
+            (Some(expected), Some(candidate))
+                if candidate.owner() == *expected
+                    && candidate.owner() != canonical_owner
+                    && matches!(candidate.origin, Origin::Local)
+                    && candidate.metadata.project_dir.as_deref() == Some(project_dir.as_str())
+                    && candidate.metadata.backend.is_none()
+                    && candidate.metadata.backend_session_id.is_none()
+                    && !self.lifecycle_leases.contains_key(&candidate.id) => {}
+            (Some(_), Some(_)) => {
+                return fail("candidate pane owner is not the expected metadata-only row".into());
+            }
+            (Some(_), None) => return fail("candidate pane owner disappeared".into()),
+            (None, Some(_)) => return fail("candidate pane became owned".into()),
+        }
+
+        let metadata = canonical.metadata.clone();
+        self.apply_register(canonical_owner.session_id, Some(new_pane), metadata)
     }
 
     fn add_alias(&mut self, old_id: &str, new_id: &str) {
@@ -13154,6 +13265,145 @@ mod tests {
             session.metadata.backend_session_id.as_deref(),
             Some("ses_old")
         );
+    }
+
+    fn stale_backend_reclaim_event(
+        canonical_owner: ResourceOwner,
+        candidate_owner: Option<ResourceOwner>,
+    ) -> Event {
+        Event::ReclaimMissingBackendPane {
+            canonical_owner,
+            expected_incumbent_pane: "%1".into(),
+            new_pane: "%2".into(),
+            expected_candidate_owner: candidate_owner,
+            backend: "opencode".into(),
+            backend_session_id: "ses_same".into(),
+            project_dir: "/tmp/project".into(),
+        }
+    }
+
+    #[test]
+    fn reclaim_missing_backend_pane_preserves_canonical_metadata_and_removes_scanner_duplicate() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "canonical".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/project".into()),
+                role: Some("preserved role".into()),
+                prompt: Some("preserved prompt".into()),
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_same".into()),
+                ..Default::default()
+            },
+        });
+        let canonical_owner = state.sessions["canonical"].owner();
+        state.apply(Event::Register {
+            id: "project-2".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/project".into()),
+                role: Some("scanner role".into()),
+                ..Default::default()
+            },
+        });
+        let candidate_owner = state.sessions["project-2"].owner();
+
+        let effects = state.apply(stale_backend_reclaim_event(
+            canonical_owner.clone(),
+            Some(candidate_owner),
+        ));
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::RegisterOk { session_id, .. } if session_id == "canonical"
+        )));
+        assert_eq!(state.sessions.len(), 1);
+        assert!(!state.sessions.contains_key("project-2"));
+        let canonical = &state.sessions["canonical"];
+        assert_eq!(canonical.pane.as_deref(), Some("%2"));
+        assert_eq!(canonical.metadata.role.as_deref(), Some("preserved role"));
+        assert_eq!(
+            canonical.metadata.prompt.as_deref(),
+            Some("preserved prompt")
+        );
+        assert!(canonical.owner().incarnation > canonical_owner.incarnation);
+    }
+
+    #[test]
+    fn reclaim_missing_backend_pane_rejects_stale_owners_and_lifecycle_leases() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "canonical".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/project".into()),
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_same".into()),
+                ..Default::default()
+            },
+        });
+        let canonical_owner = state.sessions["canonical"].owner();
+
+        let mut stale_owner = canonical_owner.clone();
+        stale_owner.incarnation = SessionIncarnation(stale_owner.incarnation.0 + 1);
+        let effects = state.apply(stale_backend_reclaim_event(stale_owner, None));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::RegisterFailed { session_id, .. } if session_id == "canonical"
+        )));
+        assert_eq!(state.sessions["canonical"].pane.as_deref(), Some("%1"));
+
+        assert_eq!(
+            state.claim_existing_start(&canonical_owner),
+            LifecycleMutationOutcome::Applied
+        );
+        let effects = state.apply(stale_backend_reclaim_event(canonical_owner, None));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::RegisterFailed { session_id, reason }
+                if session_id == "canonical" && reason.contains("lifecycle")
+        )));
+        assert_eq!(state.sessions["canonical"].pane.as_deref(), Some("%1"));
+    }
+
+    #[test]
+    fn reclaim_missing_backend_pane_rejects_non_metadata_only_candidate() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "canonical".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/project".into()),
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_same".into()),
+                ..Default::default()
+            },
+        });
+        let canonical_owner = state.sessions["canonical"].owner();
+        state.apply(Event::Register {
+            id: "other".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/project".into()),
+                backend: Some("opencode".into()),
+                backend_session_id: Some("different-session".into()),
+                ..Default::default()
+            },
+        });
+        let candidate_owner = state.sessions["other"].owner();
+
+        let effects = state.apply(stale_backend_reclaim_event(
+            canonical_owner,
+            Some(candidate_owner),
+        ));
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::RegisterFailed { session_id, .. } if session_id == "canonical"
+        )));
+        assert_eq!(state.sessions["canonical"].pane.as_deref(), Some("%1"));
+        assert_eq!(state.sessions["other"].pane.as_deref(), Some("%2"));
     }
 
     #[test]

@@ -96,7 +96,7 @@ impl ProcessTree {
     }
 }
 
-fn matching_process_name<'a>(name: &str, names: &'a [&str]) -> Option<&'a str> {
+pub(crate) fn matching_process_name<'a>(name: &str, names: &'a [&str]) -> Option<&'a str> {
     let basename = std::path::Path::new(name)
         .file_name()
         .and_then(|f| f.to_str())
@@ -1025,7 +1025,15 @@ fn tmux_pane_is_absent(stderr: &str) -> bool {
         || stderr.contains("error connecting to ")
 }
 
-fn inspect_pane_format(pane: &str, format: &str) -> anyhow::Result<Option<String>> {
+fn tmux_target_pane_is_absent(stderr: &str) -> bool {
+    stderr.contains("can't find pane")
+}
+
+fn inspect_pane_format_with(
+    pane: &str,
+    format: &str,
+    pane_is_absent: fn(&str) -> bool,
+) -> anyhow::Result<Option<String>> {
     match std::process::Command::new("tmux")
         .args(["display-message", "-p", "-t", pane, format])
         .output()
@@ -1035,18 +1043,30 @@ fn inspect_pane_format(pane: &str, format: &str) -> anyhow::Result<Option<String
         )),
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            if tmux_pane_is_absent(&stderr) {
+            if pane_is_absent(&stderr) {
                 Ok(None)
             } else {
                 anyhow::bail!("tmux pane inspection failed for {pane}: {}", stderr.trim());
             }
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
 
-#[derive(Debug)]
+fn inspect_pane_format(pane: &str, format: &str) -> anyhow::Result<Option<String>> {
+    match inspect_pane_format_with(pane, format, tmux_pane_is_absent) {
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        result => result,
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) enum ManagedPaneInspection {
     Missing,
     Unmanaged,
@@ -1130,7 +1150,28 @@ pub fn inspect_pane_owner(
 
 /// Distinguish a missing pane from a live pane without managed identity.
 pub(crate) fn inspect_managed_pane(pane: &str) -> anyhow::Result<ManagedPaneInspection> {
-    let Some(pane_pid) = inspect_pane_format(pane, "#{pane_pid}")? else {
+    inspect_managed_pane_with(pane, false)
+}
+
+/// Inspect a reclaim incumbent without treating daemon/socket failures as absence.
+pub(crate) fn inspect_managed_pane_for_reclaim(
+    pane: &str,
+) -> anyhow::Result<ManagedPaneInspection> {
+    inspect_managed_pane_with(pane, true)
+}
+
+fn inspect_managed_pane_with(
+    pane: &str,
+    strict_missing: bool,
+) -> anyhow::Result<ManagedPaneInspection> {
+    let inspect = |format| {
+        if strict_missing {
+            inspect_pane_format_with(pane, format, tmux_target_pane_is_absent)
+        } else {
+            inspect_pane_format(pane, format)
+        }
+    };
+    let Some(pane_pid) = inspect("#{pane_pid}")? else {
         return Ok(ManagedPaneInspection::Missing);
     };
     if pane_pid.is_empty() {
@@ -1185,10 +1226,10 @@ pub(crate) fn inspect_managed_pane(pane: &str) -> anyhow::Result<ManagedPaneInsp
     // HTTP-backed sessions return to their persistent shell after the backend
     // attach exits. That shell may not expose the launch environment, while
     // these daemon-owned pane markers remain bound to the physical pane.
-    let Some(marker_session_id) = inspect_pane_format(pane, "#{@ouija_id}")? else {
+    let Some(marker_session_id) = inspect("#{@ouija_id}")? else {
         return Ok(ManagedPaneInspection::Missing);
     };
-    let Some(marker_incarnation) = inspect_pane_format(pane, "#{@ouija_incarnation}")? else {
+    let Some(marker_incarnation) = inspect("#{@ouija_incarnation}")? else {
         return Ok(ManagedPaneInspection::Missing);
     };
     if let Some(owner) = parse_owner(
@@ -1199,7 +1240,7 @@ pub(crate) fn inspect_managed_pane(pane: &str) -> anyhow::Result<ManagedPaneInsp
         return Ok(ManagedPaneInspection::MarkerOwner(owner));
     }
 
-    if inspect_pane_format(pane, "#{pane_pid}")?.is_none_or(|pid| pid.is_empty()) {
+    if inspect("#{pane_pid}")?.is_none_or(|pid| pid.is_empty()) {
         return Ok(ManagedPaneInspection::Missing);
     }
 
@@ -1361,6 +1402,21 @@ mod tests {
             "error connecting to /tmp/tmux-1001/default (No such file or directory)"
         ));
         assert!(!tmux_pane_is_absent("permission denied"));
+    }
+
+    #[test]
+    fn strict_reclaim_inspection_only_accepts_an_explicitly_missing_target_pane() {
+        assert!(tmux_target_pane_is_absent("can't find pane: %439"));
+        assert!(!tmux_target_pane_is_absent(
+            "no server running on /tmp/tmux"
+        ));
+        assert!(!tmux_target_pane_is_absent(
+            "failed to connect to server: permission denied"
+        ));
+        assert!(!tmux_target_pane_is_absent(
+            "error connecting to /tmp/tmux/default"
+        ));
+        assert!(!tmux_target_pane_is_absent("permission denied"));
     }
 
     #[test]
