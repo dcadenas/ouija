@@ -471,6 +471,12 @@ pub struct SessionMeta {
     /// Rollback and daemon recovery restore the literal incumbent instead.
     #[serde(default)]
     pub active_context_accounting_provisional: bool,
+    /// Runtime-only proof that the periodic pane scanner created this row.
+    ///
+    /// Omission on persistence is fail-closed: after daemon recovery the row
+    /// is no longer eligible for automatic canonical identity reclaim.
+    #[serde(skip)]
+    pub(crate) scanner_registration: bool,
 }
 
 /// In-memory authority for one explicit legacy-backend repair. The phase
@@ -851,6 +857,7 @@ impl Default for SessionMeta {
             active_context_segment_started_at: None,
             active_context_restart_due: false,
             active_context_accounting_provisional: false,
+            scanner_registration: false,
         }
     }
 }
@@ -884,7 +891,7 @@ pub enum Event {
         canonical_owner: ResourceOwner,
         expected_incumbent_pane: String,
         new_pane: String,
-        expected_candidate_owner: Option<ResourceOwner>,
+        expected_candidate: Option<SessionEntry>,
         backend: String,
         backend_session_id: String,
         project_dir: String,
@@ -1428,6 +1435,7 @@ pub(crate) fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>
             active_context_segment_started_at: m.active_context_segment_started_at,
             active_context_restart_due: m.active_context_restart_due,
             active_context_accounting_provisional: m.active_context_accounting_provisional,
+            scanner_registration: false,
         },
         None => SessionMeta::default(),
     }
@@ -2135,7 +2143,7 @@ impl DaemonState {
                 canonical_owner,
                 expected_incumbent_pane,
                 new_pane,
-                expected_candidate_owner,
+                expected_candidate,
                 backend,
                 backend_session_id,
                 project_dir,
@@ -2143,7 +2151,7 @@ impl DaemonState {
                 canonical_owner,
                 expected_incumbent_pane,
                 new_pane,
-                expected_candidate_owner,
+                expected_candidate,
                 backend,
                 backend_session_id,
                 project_dir,
@@ -3368,7 +3376,7 @@ impl DaemonState {
         canonical_owner: ResourceOwner,
         expected_incumbent_pane: String,
         new_pane: String,
-        expected_candidate_owner: Option<ResourceOwner>,
+        expected_candidate: Option<SessionEntry>,
         backend: String,
         backend_session_id: String,
         project_dir: String,
@@ -3421,16 +3429,16 @@ impl DaemonState {
             .sessions
             .values()
             .find(|session| session.pane.as_deref() == Some(new_pane.as_str()));
-        match (expected_candidate_owner.as_ref(), pane_holder) {
+        match (expected_candidate.as_ref(), pane_holder) {
             (None, None) => {}
             (Some(expected), Some(candidate))
-                if candidate.owner() == *expected
+                if candidate == expected
                     && candidate.owner() != canonical_owner
-                    && matches!(candidate.origin, Origin::Local)
-                    && candidate.metadata.project_dir.as_deref() == Some(project_dir.as_str())
-                    && candidate.metadata.backend.is_none()
-                    && candidate.metadata.backend_session_id.is_none()
-                    && !self.lifecycle_leases.contains_key(&candidate.id) => {}
+                    && self.scanner_candidate_is_reclaimable(
+                        candidate,
+                        &new_pane,
+                        &project_dir,
+                    ) => {}
             (Some(_), Some(_)) => {
                 return fail("candidate pane owner is not the expected metadata-only row".into());
             }
@@ -3440,6 +3448,48 @@ impl DaemonState {
 
         let metadata = canonical.metadata.clone();
         self.apply_register(canonical_owner.session_id, Some(new_pane), metadata)
+    }
+
+    pub(crate) fn scanner_candidate_is_reclaimable(
+        &self,
+        candidate: &SessionEntry,
+        pane: &str,
+        project_dir: &str,
+    ) -> bool {
+        let basename = std::path::Path::new(project_dir)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown");
+        let mut scanner_metadata = SessionMeta {
+            project_dir: Some(project_dir.to_string()),
+            role: Some(format!("working on {basename}")),
+            scanner_registration: true,
+            ..Default::default()
+        };
+        scanner_metadata.session_incarnation = candidate.metadata.session_incarnation;
+        let candidate_id = &candidate.id;
+        matches!(candidate.origin, Origin::Local)
+            && candidate.pane.as_deref() == Some(pane)
+            && candidate.metadata == scanner_metadata
+            && candidate.active_context_due_boundary == ActiveContextDueBoundary::default()
+            && !self.lifecycle_leases.contains_key(candidate_id)
+            && !self.pending_replies.contains_key(candidate_id)
+            && !self
+                .pending_replies
+                .values()
+                .flatten()
+                .any(|pending| pending.from == *candidate_id)
+            && !self.aliases.contains_key(candidate_id)
+            && !self.aliases.values().any(|target| target == candidate_id)
+            && !self.local_rename_aliases.contains_key(candidate_id)
+            && !self
+                .local_rename_aliases
+                .values()
+                .any(|target| target == candidate_id)
+            && !self.sessions.values().any(|session| {
+                session.id != *candidate_id
+                    && session.metadata.parent_session.as_deref() == Some(candidate_id.as_str())
+            })
     }
 
     fn add_alias(&mut self, old_id: &str, new_id: &str) {
@@ -13269,13 +13319,13 @@ mod tests {
 
     fn stale_backend_reclaim_event(
         canonical_owner: ResourceOwner,
-        candidate_owner: Option<ResourceOwner>,
+        candidate: Option<SessionEntry>,
     ) -> Event {
         Event::ReclaimMissingBackendPane {
             canonical_owner,
             expected_incumbent_pane: "%1".into(),
             new_pane: "%2".into(),
-            expected_candidate_owner: candidate_owner,
+            expected_candidate: candidate,
             backend: "opencode".into(),
             backend_session_id: "ses_same".into(),
             project_dir: "/tmp/project".into(),
@@ -13303,15 +13353,16 @@ mod tests {
             pane: Some("%2".into()),
             metadata: SessionMeta {
                 project_dir: Some("/tmp/project".into()),
-                role: Some("scanner role".into()),
+                role: Some("working on project".into()),
+                scanner_registration: true,
                 ..Default::default()
             },
         });
-        let candidate_owner = state.sessions["project-2"].owner();
+        let candidate = state.sessions["project-2"].clone();
 
         let effects = state.apply(stale_backend_reclaim_event(
             canonical_owner.clone(),
-            Some(candidate_owner),
+            Some(candidate),
         ));
 
         assert!(effects.iter().any(|effect| matches!(
@@ -13320,6 +13371,8 @@ mod tests {
         )));
         assert_eq!(state.sessions.len(), 1);
         assert!(!state.sessions.contains_key("project-2"));
+        assert_eq!(state.resolve_alias("project-2"), Some("canonical"));
+        assert!(!state.pending_replies.contains_key("project-2"));
         let canonical = &state.sessions["canonical"];
         assert_eq!(canonical.pane.as_deref(), Some("%2"));
         assert_eq!(canonical.metadata.role.as_deref(), Some("preserved role"));
@@ -13368,7 +13421,7 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_missing_backend_pane_rejects_non_metadata_only_candidate() {
+    fn reclaim_missing_backend_pane_rejects_candidate_with_durable_semantics() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
         state.apply(Event::Register {
             id: "canonical".into(),
@@ -13386,16 +13439,17 @@ mod tests {
             pane: Some("%2".into()),
             metadata: SessionMeta {
                 project_dir: Some("/tmp/project".into()),
-                backend: Some("opencode".into()),
-                backend_session_id: Some("different-session".into()),
+                role: Some("working on project".into()),
+                prompt: Some("legitimate work".into()),
+                scanner_registration: true,
                 ..Default::default()
             },
         });
-        let candidate_owner = state.sessions["other"].owner();
+        let candidate = state.sessions["other"].clone();
 
         let effects = state.apply(stale_backend_reclaim_event(
             canonical_owner,
-            Some(candidate_owner),
+            Some(candidate),
         ));
 
         assert!(effects.iter().any(|effect| matches!(
@@ -13404,6 +13458,149 @@ mod tests {
         )));
         assert_eq!(state.sessions["canonical"].pane.as_deref(), Some("%1"));
         assert_eq!(state.sessions["other"].pane.as_deref(), Some("%2"));
+        assert_eq!(
+            state.sessions["other"].metadata.prompt.as_deref(),
+            Some("legitimate work")
+        );
+    }
+
+    #[test]
+    fn reclaim_missing_backend_pane_rejects_identical_non_scanner_registration() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "canonical".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/project".into()),
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_same".into()),
+                ..Default::default()
+            },
+        });
+        let canonical_owner = state.sessions["canonical"].owner();
+        state.apply(Event::Register {
+            id: "manual".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/project".into()),
+                role: Some("working on project".into()),
+                ..Default::default()
+            },
+        });
+        let candidate = state.sessions["manual"].clone();
+
+        let effects = state.apply(stale_backend_reclaim_event(
+            canonical_owner,
+            Some(candidate),
+        ));
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::RegisterFailed { session_id, .. } if session_id == "canonical"
+        )));
+        assert_eq!(state.sessions["canonical"].pane.as_deref(), Some("%1"));
+        assert_eq!(state.sessions["manual"].pane.as_deref(), Some("%2"));
+    }
+
+    #[test]
+    fn reclaim_missing_backend_pane_rejects_candidate_changed_after_snapshot() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "canonical".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/project".into()),
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_same".into()),
+                ..Default::default()
+            },
+        });
+        let canonical_owner = state.sessions["canonical"].owner();
+        state.apply(Event::Register {
+            id: "project-2".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/project".into()),
+                role: Some("working on project".into()),
+                scanner_registration: true,
+                ..Default::default()
+            },
+        });
+        let candidate_snapshot = state.sessions["project-2"].clone();
+        state
+            .sessions
+            .get_mut("project-2")
+            .unwrap()
+            .metadata
+            .parent_session = Some("parent".into());
+
+        let effects = state.apply(stale_backend_reclaim_event(
+            canonical_owner,
+            Some(candidate_snapshot),
+        ));
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::RegisterFailed { session_id, .. } if session_id == "canonical"
+        )));
+        assert_eq!(state.sessions["canonical"].pane.as_deref(), Some("%1"));
+        assert_eq!(
+            state.sessions["project-2"]
+                .metadata
+                .parent_session
+                .as_deref(),
+            Some("parent")
+        );
+    }
+
+    #[test]
+    fn reclaim_missing_backend_pane_preserves_candidate_with_pending_reply_state() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "canonical".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/project".into()),
+                backend: Some("opencode".into()),
+                backend_session_id: Some("ses_same".into()),
+                ..Default::default()
+            },
+        });
+        let canonical_owner = state.sessions["canonical"].owner();
+        state.apply(Event::Register {
+            id: "project-2".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/project".into()),
+                role: Some("working on project".into()),
+                scanner_registration: true,
+                ..Default::default()
+            },
+        });
+        let candidate = state.sessions["project-2"].clone();
+        state.pending_replies.insert(
+            "project-2".into(),
+            vec![PendingReplyEntry {
+                msg_id: 1,
+                from: "sender".into(),
+                message: "work".into(),
+                received_at: 0,
+                last_activity: 0,
+                in_progress: false,
+            }],
+        );
+
+        let effects = state.apply(stale_backend_reclaim_event(
+            canonical_owner,
+            Some(candidate),
+        ));
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::RegisterFailed { session_id, .. } if session_id == "canonical"
+        )));
+        assert!(state.sessions.contains_key("project-2"));
+        assert!(state.pending_replies.contains_key("project-2"));
     }
 
     #[test]

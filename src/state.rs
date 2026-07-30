@@ -1468,7 +1468,7 @@ impl AppState {
                 canonical_owner,
                 expected_incumbent_pane,
                 new_pane,
-                expected_candidate_owner,
+                expected_candidate,
                 backend_session_id,
                 project_dir,
                 ..
@@ -1479,13 +1479,8 @@ impl AppState {
                     &protocol,
                     &canonical_owner.session_id,
                 );
-                if let Some(candidate_owner) = expected_candidate_owner {
-                    add_current(
-                        &mut keys,
-                        &mut project_dirs,
-                        &protocol,
-                        &candidate_owner.session_id,
-                    );
+                if let Some(candidate) = expected_candidate {
+                    add_current(&mut keys, &mut project_dirs, &protocol, &candidate.id);
                 }
                 keys.push(ResourceGateKey::Pane(expected_incumbent_pane.clone()));
                 keys.push(ResourceGateKey::Pane(new_pane.clone()));
@@ -2145,7 +2140,7 @@ impl AppState {
     ) -> MissingBackendPaneReclaimOutcome {
         use crate::daemon_protocol::BackendIdentityResolution;
 
-        let (canonical_owner, incumbent_pane, canonical_project_dir, candidate_owner) = {
+        let (canonical_owner, incumbent_pane, canonical_project_dir, candidate) = {
             let protocol = self.protocol.read().await;
             let canonical_id = match protocol.resolve_backend_identity(identity) {
                 BackendIdentityResolution::Resolved { session_id } => session_id,
@@ -2179,16 +2174,21 @@ impl AppState {
             if incumbent_pane == new_pane {
                 return MissingBackendPaneReclaimOutcome::Current(canonical.owner());
             }
-            let candidate_owner = protocol
+            let candidate = protocol
                 .sessions
                 .values()
                 .find(|session| session.pane.as_deref() == Some(new_pane))
-                .map(crate::daemon_protocol::SessionEntry::owner);
+                .cloned();
+            if candidate.as_ref().is_some_and(|candidate| {
+                !protocol.scanner_candidate_is_reclaimable(candidate, new_pane, project_dir)
+            }) {
+                return MissingBackendPaneReclaimOutcome::Refused;
+            }
             (
                 canonical.owner(),
                 incumbent_pane,
                 canonical_project_dir,
-                candidate_owner,
+                candidate,
             )
         };
 
@@ -2196,7 +2196,7 @@ impl AppState {
             canonical_owner: canonical_owner.clone(),
             expected_incumbent_pane: incumbent_pane.clone(),
             new_pane: new_pane.to_string(),
-            expected_candidate_owner: candidate_owner,
+            expected_candidate: candidate.clone(),
             backend: identity.backend.clone(),
             backend_session_id: identity.session_id.clone(),
             project_dir: canonical_project_dir,
@@ -2229,6 +2229,17 @@ impl AppState {
 
         let effects = {
             let mut protocol = self.protocol.write().await;
+            // Match the dashboard's protocol -> tasks lock order. Holding both
+            // guards makes the external task-reference check atomic with the
+            // candidate removal without introducing a tasks -> protocol cycle.
+            let scheduled_tasks = self.scheduled_tasks.read().await;
+            if candidate.as_ref().is_some_and(|candidate| {
+                scheduled_tasks
+                    .values()
+                    .any(|task| task.target_session.as_deref() == Some(candidate.id.as_str()))
+            }) {
+                return MissingBackendPaneReclaimOutcome::Refused;
+            }
             let before = protocol.clone();
             let effects = protocol.apply(event);
             let reclaimed_owner = effects.iter().find_map(|effect| match effect {
@@ -4991,6 +5002,7 @@ impl AppState {
             let proto_meta = crate::daemon_protocol::SessionMeta {
                 project_dir: Some(project_root.to_string()),
                 role: Some(format!("working on {basename}")),
+                scanner_registration: true,
                 ..Default::default()
             };
 
@@ -9168,6 +9180,7 @@ pub(crate) mod tests {
             active_context_segment_started_at: Some(1_700_000_050),
             active_context_restart_due: true,
             active_context_accounting_provisional: true,
+            scanner_registration: false,
         };
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {

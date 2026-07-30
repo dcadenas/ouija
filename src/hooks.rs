@@ -2528,22 +2528,20 @@ mod tests {
     async fn session_start_reclaims_canonical_from_scanner_created_metadata_only_duplicate() {
         let state = crate::state::AppState::new_for_test();
         let stale_owner = register_stale_canonical_session(&state).await;
-        state
-            .apply_and_execute(crate::daemon_protocol::Event::Register {
-                id: "myproject-2".into(),
-                pane: Some("%999999998".into()),
-                metadata: crate::daemon_protocol::SessionMeta {
-                    project_dir: Some("/home/user/code/myproject".into()),
-                    role: Some("working on myproject".into()),
-                    ..Default::default()
-                },
-            })
-            .await;
         *state.cached_assistant_panes.write().await = vec![assistant_pane_with_process(
             "%999999998",
             "/home/user/code/myproject",
             "claude",
         )];
+        state.scan_and_autoregister_panes().await;
+        assert!(
+            state
+                .protocol
+                .read()
+                .await
+                .sessions
+                .contains_key("myproject-2")
+        );
 
         let result = session_start_inner(&state, continued_thread_start()).await;
 

@@ -4641,6 +4641,7 @@ async fn restart_session_claimed(
                     active_context_segment_started_at: m.active_context_segment_started_at,
                     active_context_restart_due: m.active_context_restart_due,
                     active_context_accounting_provisional: m.active_context_accounting_provisional,
+                    scanner_registration: false,
                 },
                 None => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),
