@@ -178,7 +178,7 @@ enum Command {
         name: String,
         #[arg(long)]
         project_dir: Option<String>,
-        /// Complete bounded assignment stored as the session's base prompt.
+        /// Complete re-entrant, state-checking assignment stored as the session's base prompt and replayed after fresh restarts; verify live state and perform only remaining work. Before destructive or external actions, verify completion and current authorization.
         #[arg(long)]
         prompt: Option<String>,
         #[arg(long, value_parser = parse_manual_reminder)]
@@ -244,7 +244,7 @@ enum Command {
             value_parser = parse_fresh_context_after_active
         )]
         fresh_context_after_active: Option<u64>,
-        /// Replace the durable stored base prompt; use when it is absent or transient recovery prose.
+        /// Replace the durable stored base prompt when absent or transient recovery prose. It is replayed by default after every fresh restart; make it re-entrant, state-checking, guard expensive, destructive, or external actions against repetition, and verify current authorization before destructive or external actions.
         #[arg(long)]
         prompt: Option<String>,
         /// Do not reuse the stored startup prompt for this launch.
@@ -3667,14 +3667,24 @@ mod tests {
     #[test]
     fn restart_session_help_separates_durable_prompt_from_launch_only_context() {
         // Break caught: bootstrap attempts reused transient handoff prose as
-        // the stored prompt, or omitted an explicit backend after identity
-        // evidence had become unusable.
+        // the stored prompt, repeated non-idempotent work after replay, or
+        // omitted an explicit backend after identity evidence had become
+        // unusable.
         let help = subcommand_long_help("restart-session");
+        let spawn_help = subcommand_long_help("spawn-session");
 
         assert!(help.contains("durable stored base prompt"));
+        assert!(help.contains("replayed by default after every fresh restart"));
+        assert!(help.contains("re-entrant, state-checking"));
+        assert!(help.contains("expensive, destructive, or external actions"));
+        assert!(help.contains("current authorization"));
         assert!(help.contains("transient recovery prose"));
         assert!(help.contains("verified current-work continuation"));
         assert!(help.contains("binding is absent or cannot be trusted"));
+        assert!(spawn_help.contains("re-entrant, state-checking"));
+        assert!(spawn_help.contains("perform only remaining work"));
+        assert!(spawn_help.contains("destructive or external actions"));
+        assert!(spawn_help.contains("current authorization"));
     }
 
     #[test]

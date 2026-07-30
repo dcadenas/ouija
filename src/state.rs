@@ -583,6 +583,8 @@ At this stopped safe boundary, prepare a concise, verified current-work continua
 
 {prompt_guidance}
 
+The command below replays the stored prompt. Write it as a re-entrant, state-checking assignment: verify live state and perform only remaining work. Expensive, destructive, or external actions must not be repeated solely because the prompt was replayed; verify completion and current authorization first.
+
 Run this quoted heredoc to start the fresh session:
 {prompt_setup}ouija restart-session {shell_session_id} --fresh{prompt_option} --one-shot-file /dev/stdin <<'OUIJA_CONTINUATION'
 Write the verified continuation here.
@@ -5711,10 +5713,17 @@ pub(crate) mod tests {
     #[test]
     fn active_context_restart_message_tells_stored_prompt_sessions_to_repair_transient_prose() {
         // Break caught: Some(prompt) proves only presence, not that the value
-        // is a durable base suitable for every later fresh restart.
+        // is a replay-safe durable base suitable for every later fresh
+        // restart.
         let message = active_context_restart_due_message("worker", 60, true);
 
         assert!(message.contains("Confirm it is a durable base prompt"));
+        assert!(message.contains("The command below replays the stored prompt"));
+        assert!(message.contains("re-entrant, state-checking assignment"));
+        assert!(message.contains("perform only remaining work"));
+        assert!(message.contains("Expensive, destructive, or external actions"));
+        assert!(message.contains("must not be repeated solely because the prompt was replayed"));
+        assert!(message.contains("current authorization"));
         assert!(message.contains("If it is transient recovery or handoff prose"));
         assert!(message.contains("replace it with `--prompt`"));
     }

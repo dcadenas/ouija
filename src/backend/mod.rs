@@ -635,6 +635,19 @@ pub(crate) fn assert_shared_task_reminder_guidance(skill: &str) {
         "shared skill must require the quoted fresh-restart heredoc and repair missing/transient stored prompts"
     );
     assert!(
+        active_context.contains("By default, every fresh restart replays the stored prompt")
+            && active_context
+                .contains("Write every stored prompt as a re-entrant, state-checking assignment")
+            && active_context.contains("perform only the remaining work")
+            && active_context.contains(
+                "Expensive, destructive, or external actions must not be repeated solely because"
+            )
+            && active_context.contains("Verify completion and current authorization")
+            && active_context.contains("Copy the 1 TB file from A to B, then inspect foobar")
+            && active_context.contains("If the verified copy is incomplete"),
+        "shared skill must make replay safety explicit for non-idempotent stored-prompt work"
+    );
+    assert!(
         active_context.contains("does not create a scheduler task")
             && active_context.contains("The policy applies only to the exact session")
             && active_context

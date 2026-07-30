@@ -97,7 +97,8 @@ ouija spawn-session worker --project-dir /path --worktree --branch feature --bas
   --prompt "task"
 
 # Spawn a session with active-context refresh. The stored prompt must be the
-# complete bounded assignment; spawn-session has no --one-shot-file:
+# complete re-entrant, state-checking assignment; spawn-session has no
+# --one-shot-file:
 ouija spawn-session worker --project-dir /path \
   --parent-session hub --when-done ask-parent \
   --fresh-context-after-active 4h --prompt "complete bounded assignment"
@@ -124,7 +125,7 @@ Key fields:
 - `--when-done keep-open|ask-parent|close` — required completion behavior, independent of recurring reminders. Ouija generates the stay-open/ask-parent/close instructions
 - `--idle-policy` is deprecated; legacy scripts may still use `keep-open|ask-parent-when-done|close-when-done`
 - `--reminder` alone opts the session into recurring recovery nudges. Omit it for no task-reminder recurrence
-- On restart, `--prompt` is a persistent replacement; `--suppress-stored-prompt` only suppresses fallback for that launch; `--one-shot-file` appends launch-only UTF-8 content. `--backend` explicitly selects the restart backend
+- On restart, `--prompt` is a persistent replacement replayed by default after every fresh restart. Write it as a re-entrant, state-checking assignment that performs only remaining work. `--suppress-stored-prompt` only suppresses fallback for that launch; `--one-shot-file` appends launch-only UTF-8 content. `--backend` explicitly selects the restart backend
 - Pending replies can still wake a session without `--reminder`.
 - Never put `ouija clear-reminder` in manual reminder text. Ouija adds the concrete clearing command and ID to each injected nudge
 - `--worktree` — isolate in a git worktree at `~/.ouija/worktrees/<repo>/<session>`
@@ -142,6 +143,21 @@ Use **bootstrap active-context refresh** for the first setup and **refresh
 context** for later safe-boundary restarts. Do not call these actions
 "arm/rearm": every successful fresh restart resets the active-time counter and
 automatically makes the existing policy current again.
+
+### Stored-prompt replay safety
+
+By default, every fresh restart replays the stored prompt;
+`--suppress-stored-prompt` bypasses it only for that launch. Write every stored
+prompt as a re-entrant, state-checking assignment: verify live state first and
+perform only the remaining work. Expensive, destructive, or external actions
+must not be repeated solely because the prompt was replayed. Verify completion
+and current authorization before any such action.
+
+For example, do not store only: `Copy the 1 TB file from A to B, then inspect
+foobar.` Store a replay-safe instruction such as: `Check live state. If the
+verified copy is incomplete, resume or perform the copy and verify it. If it is
+complete, do not copy it again. Then inspect foobar if that step remains
+incomplete.`
 
 ### Bootstrap active-context refresh for an existing session
 
@@ -167,11 +183,11 @@ for this session after 1h":
    Stateright or expensive e2e solely to enable this policy.
 4. Classify the stored `prompt`. A durable base prompt contains the stable
    role/objective, authority boundaries, invariants, source-of-truth rules, and
-   reporting expectations. It excludes completed/remaining work and other
-   mutable handoff state. If `prompt` is null, absent, or transient recovery
-   prose, compose a concise durable base and replace it with `--prompt`.
-   `--suppress-stored-prompt` is launch-only and does not repair an unsuitable
-   stored prompt.
+   reporting expectations. Its actions are re-entrant and state-checking. It
+   excludes completed/remaining work and other mutable handoff state. If
+   `prompt` is null, absent, or transient recovery prose, compose a concise
+   durable base and replace it with `--prompt`. `--suppress-stored-prompt` is
+   launch-only and does not repair an unsuitable stored prompt.
 5. Put only verified mutable state in the one-shot continuation: current goal,
    completed and remaining work, decisions, blockers, exact next actions, and
    the post-restart checks below. `restart-session` replays the stored prompt
@@ -228,7 +244,8 @@ quoted `--prompt` argument, as the shell variable above does.
 
 `spawn-session` is different: it has no `--one-shot-file`. Its first
 `--prompt` must therefore contain the complete bounded assignment, including
-the initial work needed for that launch:
+the initial work needed for that launch, written so a later replay checks live
+state and performs only remaining work:
 
 ```bash
 ouija spawn-session worker --project-dir /path/to/project \
