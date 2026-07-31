@@ -9321,14 +9321,20 @@ pub(crate) mod tests {
                     | "reserved-pair"
                     | "actual-project-lease"
                     | "canonical-project-lease" => {
+                        let lease_owner = match protocol.reserve_start("foreign").unwrap() {
+                            crate::daemon_protocol::StartDisposition::Reserved(owner) => owner,
+                            other => panic!("unexpected lease result: {other:?}"),
+                        };
+                        if conflict == "id-lease" {
+                            let lease = protocol.lifecycle_leases.remove("foreign").unwrap();
+                            protocol
+                                .lifecycle_leases
+                                .insert("arbitrary-public-id".into(), lease);
+                        }
                         let lease_id = if conflict == "id-lease" {
                             "arbitrary-public-id"
                         } else {
                             "foreign"
-                        };
-                        let lease_owner = match protocol.reserve_start(lease_id).unwrap() {
-                            crate::daemon_protocol::StartDisposition::Reserved(owner) => owner,
-                            other => panic!("unexpected lease result: {other:?}"),
                         };
                         let lease = protocol.lifecycle_leases.get_mut(lease_id).unwrap();
                         match conflict {

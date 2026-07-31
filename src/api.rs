@@ -7387,13 +7387,12 @@ mod tests {
         assert_eq!(body["worktree_preserved"], true);
         assert!(worktree.path().exists());
         assert!(
-            state
+            !state
                 .protocol
                 .read()
                 .await
                 .dormant_sessions
-                .get("parked")
-                .is_none()
+                .contains_key("parked")
         );
     }
 
