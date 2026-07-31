@@ -4227,6 +4227,7 @@ impl AppState {
             .collect();
         self.persist_sessions_from(
             &sessions,
+            proto.dormant_sessions.clone(),
             proto.incarnation_high_water,
             proto.lifecycle_leases.clone(),
         )
@@ -5123,6 +5124,10 @@ impl AppState {
     fn persist_sessions_from(
         &self,
         sessions: &HashMap<String, Session>,
+        dormant_sessions: std::collections::BTreeMap<
+            String,
+            crate::daemon_protocol::DormantSession,
+        >,
         incarnation_high_water: crate::daemon_protocol::SessionIncarnation,
         lifecycle_leases: std::collections::BTreeMap<
             String,
@@ -5135,6 +5140,7 @@ impl AppState {
             .collect();
         let snapshot = crate::persistence::PersistedLifecycleState::new(
             persisted,
+            dormant_sessions,
             incarnation_high_water,
             lifecycle_leases,
         );

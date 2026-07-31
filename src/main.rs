@@ -1629,6 +1629,7 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
         .context("failed to restore lifecycle authority from sessions.json")?;
     let persistence::PersistedLifecycleState {
         mut sessions,
+        dormant_sessions,
         incarnation_high_water,
         lifecycle_leases,
         ..
@@ -1641,6 +1642,7 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
     {
         let mut proto = state.protocol.write().await;
         proto.restore_incarnation_high_water(incarnation_high_water);
+        proto.dormant_sessions = dormant_sessions.clone();
         proto.lifecycle_leases = lifecycle_leases;
     }
 
@@ -1676,6 +1678,9 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
                 session.metadata.backend.as_deref() == Some(backend)
                     && session.metadata.backend_session_id.as_deref() == Some(backend_session_id)
                     && session.metadata.session_incarnation != backend_session_owner.incarnation
+            }) || dormant_sessions.values().any(|dormant| {
+                dormant.metadata.backend.as_deref() == Some(backend)
+                    && dormant.metadata.backend_session_id.as_deref() == Some(backend_session_id)
             });
             if persisted_sharer {
                 tracing::info!(
@@ -1731,6 +1736,9 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
                 session.metadata.backend.as_deref() == Some(backend)
                     && session.metadata.backend_session_id.as_deref() == Some(backend_session_id)
                     && !abandoned_lease_owns_staged_row(session, lease)
+            }) || dormant_sessions.values().any(|dormant| {
+                dormant.metadata.backend.as_deref() == Some(backend)
+                    && dormant.metadata.backend_session_id.as_deref() == Some(backend_session_id)
             });
             if persisted_sharer {
                 tracing::info!(
@@ -1835,6 +1843,11 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
                     previous.metadata.project_dir.as_deref().is_some_and(|dir| {
                         crate::state::project_dir_identity(dir) == project_dir_identity
                     })
+                }) || dormant_sessions.values().any(|dormant| {
+                    dormant.metadata.project_dir.as_deref().is_some_and(|dir| {
+                        crate::state::project_dir_identity(dir) == project_dir_identity
+                    }) || crate::state::project_dir_identity(&dormant.canonical_project_identity)
+                        == project_dir_identity
                 });
             if persisted_sharer {
                 tracing::info!(
@@ -1892,6 +1905,7 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
             &state.config.data_dir,
             &persistence::PersistedLifecycleState::new(
                 sessions.clone(),
+                dormant_sessions.clone(),
                 incarnation_high_water,
                 std::collections::BTreeMap::new(),
             ),
@@ -3465,6 +3479,34 @@ mod tests {
     use super::*;
     use clap::CommandFactory as _;
 
+    fn persisted_dormant(
+        id: &str,
+        incarnation: u64,
+        backend: &str,
+        backend_session_id: &str,
+        project_dir: &str,
+        canonical_project_identity: &str,
+    ) -> crate::daemon_protocol::DormantSession {
+        crate::daemon_protocol::DormantSession {
+            id: id.into(),
+            prior_owner: crate::daemon_protocol::ResourceOwner {
+                session_id: id.into(),
+                incarnation: crate::daemon_protocol::SessionIncarnation(incarnation),
+            },
+            metadata: crate::daemon_protocol::SessionMeta {
+                project_dir: Some(project_dir.into()),
+                canonical_project_identity: Some(canonical_project_identity.into()),
+                backend: Some(backend.into()),
+                backend_session_id: Some(backend_session_id.into()),
+                session_incarnation: crate::daemon_protocol::SessionIncarnation(incarnation),
+                ..Default::default()
+            },
+            canonical_project_identity: canonical_project_identity.into(),
+            dormant_at: 1_753_920_123,
+            source: crate::daemon_protocol::DormancySource::Reaped,
+        }
+    }
+
     fn subcommand_long_help(name: &str) -> String {
         let mut command = Cli::command()
             .find_subcommand(name)
@@ -4660,6 +4702,230 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_persisted_dormant_sessions_before_live_reconciliation() {
+        let dir = tempfile::tempdir().unwrap();
+        let dormant = persisted_dormant(
+            "rootfix",
+            42,
+            "codex-cli",
+            "thread-rootfix",
+            "/tmp/worktrees/rootfix",
+            "/tmp/repository",
+        );
+        let snapshot = crate::persistence::PersistedLifecycleState::new(
+            vec![],
+            std::collections::BTreeMap::from([("rootfix".into(), dormant.clone())]),
+            crate::daemon_protocol::SessionIncarnation(41),
+            std::collections::BTreeMap::new(),
+        );
+        crate::persistence::save_sessions(dir.path(), &snapshot).unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "restore-dormant-test".into(),
+            npub: "npub1test".into(),
+            port: 0,
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+
+        restore_persisted_sessions(&state).await.unwrap();
+
+        let protocol = state.protocol.read().await;
+        assert_eq!(protocol.dormant_sessions["rootfix"], dormant);
+        assert!(protocol.sessions.is_empty());
+        assert_eq!(
+            protocol.incarnation_high_water,
+            crate::daemon_protocol::SessionIncarnation(42)
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_persisted_dormant_backend_suppresses_abandoned_abort() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let abort_port = listener.local_addr().unwrap().port();
+        let daemon_port = abort_port.checked_sub(320).unwrap();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let calls_for_route = calls.clone();
+        let app = Router::new().route(
+            "/session/{session_id}/abort",
+            post(move || {
+                let calls = calls_for_route.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dormant = persisted_dormant(
+            "rootfix",
+            42,
+            "opencode",
+            "ses_rootfix",
+            "/tmp/worktrees/rootfix",
+            "/tmp/repository",
+        );
+        let owner = dormant.prior_owner.clone();
+        let lease = crate::daemon_protocol::LifecycleLease {
+            owner: owner.clone(),
+            phase: crate::daemon_protocol::LifecyclePhase::Stopping,
+            backend: Some("opencode".into()),
+            backend_session_id: Some("ses_rootfix".into()),
+            backend_session_owner: Some(owner.clone()),
+            restart_target_owner: None,
+            restart_previous: None,
+            project_dir: None,
+            project_dir_owner: None,
+            project_dir_cleanup_on_abandon: false,
+            inert_pane: None,
+            inert_pane_owner: None,
+        };
+        let snapshot = crate::persistence::PersistedLifecycleState::new(
+            vec![],
+            std::collections::BTreeMap::from([("rootfix".into(), dormant)]),
+            owner.incarnation,
+            std::collections::BTreeMap::from([("rootfix".into(), lease)]),
+        );
+        crate::persistence::save_sessions(dir.path(), &snapshot).unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "restore-dormant-backend-test".into(),
+            npub: "npub1test".into(),
+            port: daemon_port,
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+
+        restore_persisted_sessions(&state).await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            state
+                .protocol
+                .read()
+                .await
+                .dormant_sessions
+                .contains_key("rootfix")
+        );
+        assert!(
+            crate::persistence::load_sessions(dir.path())
+                .unwrap()
+                .lifecycle_leases
+                .is_empty()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn restore_persisted_dormant_worktree_suppresses_abandoned_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let worktree = repo.join(".ouija/worktrees/rootfix");
+        let data_dir = root.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let run_git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_git(&["init", "-b", "main", repo.to_str().unwrap()]);
+        run_git(&[
+            "-C",
+            repo.to_str().unwrap(),
+            "config",
+            "user.email",
+            "test@example.com",
+        ]);
+        run_git(&["-C", repo.to_str().unwrap(), "config", "user.name", "Test"]);
+        std::fs::write(repo.join("tracked"), "base\n").unwrap();
+        run_git(&["-C", repo.to_str().unwrap(), "add", "tracked"]);
+        run_git(&["-C", repo.to_str().unwrap(), "commit", "-m", "initial"]);
+        run_git(&[
+            "-C",
+            repo.to_str().unwrap(),
+            "worktree",
+            "add",
+            "-b",
+            "rootfix",
+            worktree.to_str().unwrap(),
+        ]);
+
+        let actual = crate::state::project_dir_identity(worktree.to_str().unwrap());
+        let canonical = crate::state::project_dir_identity(repo.to_str().unwrap());
+        let dormant = persisted_dormant(
+            "rootfix",
+            42,
+            "codex-cli",
+            "thread-rootfix",
+            &actual,
+            &canonical,
+        );
+        let owner = dormant.prior_owner.clone();
+        let lease = crate::daemon_protocol::LifecycleLease {
+            owner: owner.clone(),
+            phase: crate::daemon_protocol::LifecyclePhase::Stopping,
+            backend: None,
+            backend_session_id: None,
+            backend_session_owner: None,
+            restart_target_owner: None,
+            restart_previous: None,
+            project_dir: Some(actual),
+            project_dir_owner: Some(owner.clone()),
+            project_dir_cleanup_on_abandon: true,
+            inert_pane: None,
+            inert_pane_owner: None,
+        };
+        let snapshot = crate::persistence::PersistedLifecycleState::new(
+            vec![],
+            std::collections::BTreeMap::from([("rootfix".into(), dormant)]),
+            owner.incarnation,
+            std::collections::BTreeMap::from([("rootfix".into(), lease)]),
+        );
+        crate::persistence::save_sessions(&data_dir, &snapshot).unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "restore-dormant-worktree-test".into(),
+            npub: "npub1test".into(),
+            port: 0,
+            data_dir: data_dir.clone(),
+            config_dir: data_dir.clone(),
+        });
+
+        restore_persisted_sessions(&state).await.unwrap();
+
+        assert!(
+            worktree.join("tracked").is_file(),
+            "dormant ownership must preserve the parked worktree"
+        );
+        assert!(
+            state
+                .protocol
+                .read()
+                .await
+                .dormant_sessions
+                .contains_key("rootfix")
+        );
+        assert!(
+            crate::persistence::load_sessions(&data_dir)
+                .unwrap()
+                .lifecycle_leases
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn restore_persisted_paneless_strong_opencode_session_spawns_activity_receiver() {
         // Break caught: startup rehydration bypasses Event::Register, so it
         // must explicitly recreate the exact optional-pane activity receiver.
@@ -4679,6 +4945,7 @@ mod tests {
                     ..Default::default()
                 },
             }],
+            std::collections::BTreeMap::new(),
             crate::daemon_protocol::SessionIncarnation(42),
             std::collections::BTreeMap::new(),
         );
@@ -4729,6 +4996,7 @@ mod tests {
                     ..Default::default()
                 },
             }],
+            std::collections::BTreeMap::new(),
             crate::daemon_protocol::SessionIncarnation(50),
             std::collections::BTreeMap::from([(
                 owner.session_id.clone(),
@@ -4843,6 +5111,7 @@ mod tests {
                     ..Default::default()
                 },
             }],
+            std::collections::BTreeMap::new(),
             crate::daemon_protocol::SessionIncarnation(2),
             std::collections::BTreeMap::from([(
                 incumbent.session_id.clone(),
@@ -4944,6 +5213,7 @@ mod tests {
         };
         let snapshot = crate::persistence::PersistedLifecycleState::new(
             vec![],
+            std::collections::BTreeMap::new(),
             owner.incarnation,
             std::collections::BTreeMap::from([(
                 owner.session_id.clone(),
@@ -5033,6 +5303,7 @@ mod tests {
         };
         let snapshot = crate::persistence::PersistedLifecycleState::new(
             vec![],
+            std::collections::BTreeMap::new(),
             owner.incarnation,
             std::collections::BTreeMap::from([(
                 owner.session_id.clone(),
@@ -5137,6 +5408,7 @@ mod tests {
             };
             let snapshot = crate::persistence::PersistedLifecycleState::new(
                 vec![],
+                std::collections::BTreeMap::new(),
                 owner.incarnation,
                 std::collections::BTreeMap::from([(
                     owner.session_id.clone(),
@@ -5202,6 +5474,7 @@ mod tests {
                     ..Default::default()
                 },
             }],
+            std::collections::BTreeMap::new(),
             replacement_owner.incarnation,
             std::collections::BTreeMap::from([(
                 stale_owner.session_id.clone(),
@@ -5273,6 +5546,7 @@ mod tests {
         };
         let snapshot = crate::persistence::PersistedLifecycleState::new(
             vec![],
+            std::collections::BTreeMap::new(),
             owner.incarnation,
             std::collections::BTreeMap::from([(
                 owner.session_id.clone(),
@@ -5493,6 +5767,7 @@ mod tests {
                     ..Default::default()
                 },
             }],
+            std::collections::BTreeMap::new(),
             owner.incarnation,
             std::collections::BTreeMap::from([(
                 owner.session_id.clone(),
@@ -5570,6 +5845,7 @@ mod tests {
                     },
                 },
             ],
+            std::collections::BTreeMap::new(),
             crate::daemon_protocol::SessionIncarnation(42),
             std::collections::BTreeMap::from([
                 (
