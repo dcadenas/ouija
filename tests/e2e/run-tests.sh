@@ -46,6 +46,13 @@ echo '{"auto_register":false,"reaper_interval_secs":1}' > /tmp/ouija-test/settin
 DAEMON_PID=$(start_daemon $PORT "local" /tmp/ouija-test)
 log "Daemon started (PID $DAEMON_PID, logs in /tmp/ouija-test/daemon.log)"
 
+if [ "${OUIJA_E2E_IDENTITY_ONLY:-}" = "1" ]; then
+    run_identity_continuity_scenario "$BASE" "$PORT" "$FAKE_BIN"
+    print_results
+    kill "$DAEMON_PID" 2>/dev/null || true
+    exit "$FAIL"
+fi
+
 # ═══════════════════════════════════════════════════════════════════
 # TESTS
 # ═══════════════════════════════════════════════════════════════════
@@ -1741,6 +1748,8 @@ assert_contains "35c: absent sender rejection explains registration" "$err" "not
 
 identity_rollover_cleanup
 trap - EXIT
+
+run_identity_continuity_scenario "$BASE" "$PORT" "$FAKE_BIN"
 
 # ── Daemon logs ──────────────────────────────────────────────────────
 log "Daemon logs:"

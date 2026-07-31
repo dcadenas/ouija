@@ -135,6 +135,171 @@ create_fake_claude() {
     echo "$fake_bin"
 }
 
+# Creates a fake "codex" binary from /bin/sleep in the given dir (or a temp dir).
+# Prints the directory path.
+create_fake_codex() {
+    local fake_bin="${1:-$(mktemp -d)}"
+    cp /bin/sleep "$fake_bin/codex"
+    chmod +x "$fake_bin/codex"
+    echo "$fake_bin"
+}
+
+# Creates a new tmux window in the "test" session, rooted at cwd, and runs the
+# named fake assistant binary. Prints the pane ID.
+create_assistant_pane() {
+    local fake_bin="$1" assistant="$2" cwd="$3"
+    tmux new-window -t test -c "$cwd"
+    local pane
+    pane=$(tmux display-message -t test -p '#{pane_id}')
+    tmux send-keys -t "$pane" "$fake_bin/$assistant 3600" Enter
+    echo "$pane"
+}
+
+# Exercises the durable Local identity path against one isolated daemon.
+run_identity_continuity_scenario() {
+    local base="$1" port="$2" fake_bin="$3"
+    local identity_root="/tmp/ouija-test/identity-continuity"
+    local claim_project="$identity_root/claim-project"
+    local claim_id="continuity-claim"
+    local continuity_id="continuity-worker"
+    local continuity_project="$identity_root/$continuity_id"
+    local claim_backend_id="thread-continuity-claim"
+    local continuity_backend_id="claude-continuity-thread"
+    local continuity_replacement_pane=""
+    local claim_pane continuity_pane
+
+    log "Test 36: Local identity continuity survives pane replacement"
+    mkdir -p "$claim_project" "$continuity_project"
+    create_fake_codex "$fake_bin" >/dev/null
+    claim_pane=$(create_assistant_pane "$fake_bin" codex "$claim_project")
+    continuity_pane=$(create_assistant_pane "$fake_bin" claude "$continuity_project")
+
+    IDENTITY_E2E_BASE="$base"
+    IDENTITY_E2E_CLAIM_ID="$claim_id"
+    IDENTITY_E2E_CONTINUITY_ID="$continuity_id"
+    IDENTITY_E2E_CLAIM_PANE="$claim_pane"
+    IDENTITY_E2E_CONTINUITY_PANE="$continuity_pane"
+    IDENTITY_E2E_REPLACEMENT_PANE=""
+    identity_continuity_cleanup() {
+        api "$IDENTITY_E2E_BASE" POST /api/settings \
+            -d '{"auto_register":false}' >/dev/null 2>&1 || true
+        api "$IDENTITY_E2E_BASE" POST /api/remove \
+            -d "{\"id\":\"$IDENTITY_E2E_CLAIM_ID\"}" >/dev/null 2>&1 || true
+        api "$IDENTITY_E2E_BASE" POST /api/remove \
+            -d "{\"id\":\"$IDENTITY_E2E_CONTINUITY_ID\"}" >/dev/null 2>&1 || true
+        tmux kill-pane -t "$IDENTITY_E2E_CLAIM_PANE" 2>/dev/null || true
+        tmux kill-pane -t "$IDENTITY_E2E_CONTINUITY_PANE" 2>/dev/null || true
+        if [ -n "$IDENTITY_E2E_REPLACEMENT_PANE" ]; then
+            tmux kill-pane -t "$IDENTITY_E2E_REPLACEMENT_PANE" 2>/dev/null || true
+        fi
+    }
+    # The cleanup is armed before the first mutation of daemon state.
+    trap identity_continuity_cleanup EXIT
+
+    # Trusted SessionStart records a transient Local attestation even while
+    # automatic registration is disabled. The explicit claim consumes only
+    # that exact pane/backend/project evidence.
+    local attestation claim_result claim_rc claim_incarnation claim_retry
+    attestation=$(api "$base" POST /api/hooks/session-start \
+        -d "{\"pane\":\"$claim_pane\",\"cwd\":\"$claim_project\",\"backend_session_id\":\"$claim_backend_id\",\"backend_identity\":{\"backend\":\"codex-cli\",\"session_id\":\"$claim_backend_id\"},\"adapter\":\"codex-cli\"}")
+    assert_contains "36a: unregistered Codex remains subject to auto-register policy" \
+        "$attestation" "auto_register disabled"
+    set +e
+    claim_result=$(env -u OUIJA_SESSION_ID TMUX_PANE="$claim_pane" \
+        CODEX_THREAD_ID="$claim_backend_id" OUIJA_PORT=$port \
+        ouija claim "$claim_id" 2>&1)
+    claim_rc=$?
+    set -e
+    assert_eq "36a: verified Local caller atomically claims requested free id" "$claim_rc" "0"
+    assert_contains "36a: first claim reports claimed" "$claim_result" '"outcome":"claimed"'
+    claim_incarnation=$(echo "$claim_result" | jq -r '.session_incarnation')
+
+    claim_retry=$(env -u OUIJA_SESSION_ID TMUX_PANE="$claim_pane" \
+        CODEX_THREAD_ID="$claim_backend_id" OUIJA_PORT=$port \
+        ouija claim "$claim_id")
+    assert_contains "36b: exact same-owner retry is current" "$claim_retry" '"outcome":"current"'
+    assert_eq "36b: retry preserves incarnation" \
+        "$(echo "$claim_retry" | jq -r '.session_incarnation')" "$claim_incarnation"
+
+    # Register a complete Claude owner through the real SessionStart boundary,
+    # then simulate its trusted clean-exit hook after the pane has disappeared.
+    local register_result prior_incarnation session_end
+    api "$base" POST /api/settings -d '{"auto_register":true}' >/dev/null
+    register_result=$(api "$base" POST /api/hooks/session-start \
+        -d "{\"pane\":\"$continuity_pane\",\"cwd\":\"$continuity_project\",\"backend_session_id\":\"$continuity_backend_id\",\"backend_identity\":{\"backend\":\"claude-code\",\"session_id\":\"$continuity_backend_id\"},\"adapter\":\"claude-code\"}")
+    api "$base" POST /api/settings -d '{"auto_register":false}' >/dev/null
+    assert_contains "36c: complete Claude fixture registered" \
+        "$register_result" "\"registered\":\"$continuity_id\""
+    prior_incarnation=$(session_field "$base" "$continuity_id" "session_incarnation")
+    tmux kill-pane -t "$continuity_pane"
+    session_end=$(api "$base" POST /api/hooks/session-end \
+        -d "{\"pane\":\"$continuity_pane\",\"backend_session_id\":\"$continuity_backend_id\",\"session_incarnation\":\"$prior_incarnation\"}")
+    assert_contains "36c: trusted SessionEnd parks complete identity" \
+        "$session_end" "\"dormant\":\"$continuity_id\""
+
+    local dormant_list dormant_show
+    dormant_list=$(env OUIJA_PORT=$port ouija dormant list)
+    assert_contains "36d: dormant list contains parked public id" "$dormant_list" "$continuity_id"
+    assert_not_contains "36d: dormant list redacts backend-native id" \
+        "$dormant_list" "$continuity_backend_id"
+    dormant_show=$(env OUIJA_PORT=$port ouija dormant show "$continuity_id")
+    assert_contains "36d: dormant show is explicitly non-routable" "$dormant_show" '"routable":false'
+    assert_contains "36d: dormant show retains canonical project" \
+        "$dormant_show" "$continuity_project"
+    assert_not_contains "36d: dormant show redacts backend-native id" \
+        "$dormant_show" "$continuity_backend_id"
+
+    # The same complete backend identity in a replacement pane recovers the
+    # prior public ID with a daemon-issued successor incarnation.
+    local recovery recovered_incarnation
+    continuity_replacement_pane=$(create_assistant_pane "$fake_bin" claude "$continuity_project")
+    IDENTITY_E2E_REPLACEMENT_PANE="$continuity_replacement_pane"
+    recovery=$(api "$base" POST /api/hooks/session-start \
+        -d "{\"pane\":\"$continuity_replacement_pane\",\"cwd\":\"$continuity_project\",\"backend_session_id\":\"$continuity_backend_id\",\"backend_identity\":{\"backend\":\"claude-code\",\"session_id\":\"$continuity_backend_id\"},\"adapter\":\"claude-code\"}")
+    assert_contains "36e: replacement pane recovers prior public id" \
+        "$recovery" "\"registered\":\"$continuity_id\""
+    recovered_incarnation=$(echo "$recovery" | jq -r '.session_incarnation')
+    if [ "$recovered_incarnation" -gt "$prior_incarnation" ]; then
+        pass "36e: recovery receives a newer daemon incarnation"
+    else
+        fail "36e: recovery receives a newer daemon incarnation" \
+            "greater than $prior_incarnation" "$recovered_incarnation"
+    fi
+
+    # A rename into an occupied destination fails closed and preserves rows.
+    local rename_result rename_rc identity_ids
+    set +e
+    rename_result=$(env -u OUIJA_SESSION_ID TMUX_PANE="$claim_pane" \
+        CODEX_THREAD_ID="$claim_backend_id" OUIJA_PORT=$port \
+        ouija rename "$continuity_id" --from "$claim_id" 2>&1)
+    rename_rc=$?
+    set -e
+    assert_eq "36f: occupied rename exits non-zero" "$rename_rc" "1"
+    assert_contains "36f: occupied rename explains conflict" "$rename_result" "already exists"
+    identity_ids=$(session_ids "$base")
+    assert_contains "36f: occupied rename preserves source" "$identity_ids" "$claim_id"
+    assert_contains "36f: occupied rename preserves destination" "$identity_ids" "$continuity_id"
+
+    # Park the recovered row once more, then explicitly forget it. Removing
+    # identity metadata must never remove the project/worktree directory.
+    local unregister_result
+    tmux kill-pane -t "$continuity_replacement_pane"
+    session_end=$(api "$base" POST /api/hooks/session-end \
+        -d "{\"pane\":\"$continuity_replacement_pane\",\"backend_session_id\":\"$continuity_backend_id\",\"session_incarnation\":\"$recovered_incarnation\"}")
+    assert_contains "36g: recovered owner can be parked exactly once" \
+        "$session_end" "\"dormant\":\"$continuity_id\""
+    unregister_result=$(env OUIJA_PORT=$port ouija unregister "$continuity_id")
+    assert_contains "36g: exact dormant unregister succeeds" \
+        "$unregister_result" "\"forgotten_dormant\":\"$continuity_id\""
+    assert_contains "36g: forget response reports preservation" \
+        "$unregister_result" '"worktree_preserved":true'
+    assert_eq "36g: dormant unregister preserves worktree" \
+        "$(test -d "$continuity_project" && echo present)" "present"
+
+    identity_continuity_cleanup
+    trap - EXIT
+}
+
 # Creates a new tmux window in the "test" session running the fake claude.
 # Prints the pane ID.
 create_claude_pane() {
