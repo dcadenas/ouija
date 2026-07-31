@@ -4300,6 +4300,9 @@ async fn auto_provision_from_backend_session(
     backend_sid: &str,
     dir: &str,
 ) -> Option<String> {
+    let target_project = crate::project_identity::resolve_project_identity_async(dir)
+        .await
+        .ok()?;
     // Race guard 1: another concurrent ready callback may have already
     // bound this backend_session_id while we were doing the dir lookup.
     // Short-circuit here so we surface the concurrent winner's id (which
@@ -4346,20 +4349,27 @@ async fn auto_provision_from_backend_session(
         .unwrap_or_default();
 
     // Filter to OpenCode panes in the target dir that are not already registered.
-    let candidates: Vec<String> = panes
-        .into_iter()
-        .filter(|p| {
-            !registered_panes.contains(&p.pane_id)
-                && p.process_name
-                    .as_deref()
-                    .is_some_and(|name| opencode_process_names.contains(name))
-                && p.pane_current_path
-                    .as_deref()
-                    .map(|path| crate::state::resolve_project_root(path) == dir)
-                    .unwrap_or(false)
-        })
-        .map(|p| p.pane_id)
-        .collect();
+    let mut candidates = Vec::new();
+    for pane in panes {
+        if registered_panes.contains(&pane.pane_id)
+            || !pane
+                .process_name
+                .as_deref()
+                .is_some_and(|name| opencode_process_names.contains(name))
+        {
+            continue;
+        }
+        let Some(path) = pane.pane_current_path.as_deref() else {
+            continue;
+        };
+        let Ok(pane_project) = crate::project_identity::resolve_project_identity_async(path).await
+        else {
+            continue;
+        };
+        if pane_project.canonical_repository == target_project.canonical_repository {
+            candidates.push(pane.pane_id);
+        }
+    }
 
     let pane_id = match candidates.len() {
         1 => candidates.into_iter().next().unwrap(),
@@ -4381,7 +4391,7 @@ async fn auto_provision_from_backend_session(
         }
     };
 
-    register_auto_provisioned_session(state, backend_sid, &pane_id, dir).await
+    register_auto_provisioned_session(state, backend_sid, &pane_id, &target_project).await
 }
 
 /// Auto-provision using an explicit `(pane, dir)` pair supplied by the
@@ -4431,10 +4441,12 @@ async fn auto_provision_with_explicit_pane(
         return None;
     }
 
-    // Resolve worktree paths up to the repo root, matching the
-    // scan-path's behaviour so the session id we derive is stable
-    // across /repo and /repo/.claude/worktrees/<branch>.
-    let dir = crate::state::resolve_project_root(cwd);
+    let Ok(project) = crate::project_identity::resolve_project_identity_async(cwd).await else {
+        tracing::warn!(
+            "auto-provision declined: could not resolve hinted cwd {cwd:?} for backend_session_id {backend_sid}"
+        );
+        return None;
+    };
 
     // Race guard: the backend_session_id may already be bound. Surface
     // the concurrent winner rather than racing a second Register that
@@ -4459,10 +4471,16 @@ async fn auto_provision_with_explicit_pane(
         );
         return None;
     };
-    let backend_dir = crate::state::resolve_project_root(&backend_dir);
-    if backend_dir != dir {
+    let Ok(backend_project) =
+        crate::project_identity::resolve_project_identity_async(&backend_dir).await
+    else {
+        return None;
+    };
+    if backend_project.canonical_repository != project.canonical_repository {
         tracing::warn!(
-            "auto-provision declined: backend_session_id {backend_sid} belongs to dir {backend_dir}, not hinted cwd {dir}"
+            "auto-provision declined: backend_session_id {backend_sid} belongs to dir {}, not hinted cwd {}",
+            backend_project.project_dir,
+            project.project_dir
         );
         return None;
     }
@@ -4501,14 +4519,18 @@ async fn auto_provision_with_explicit_pane(
 
     // Defense 2: the explicit cwd must match the pane's actual cwd after
     // applying the same project-root normalization as the scan path.
-    let cwd_matches_pane = hinted_pane
-        .pane_current_path
-        .as_deref()
-        .map(|path| crate::state::resolve_project_root(path) == dir)
-        .unwrap_or(false);
+    let cwd_matches_pane = match hinted_pane.pane_current_path.as_deref() {
+        Some(path) => crate::project_identity::resolve_project_identity_async(path)
+            .await
+            .is_ok_and(|pane_project| {
+                pane_project.canonical_repository == project.canonical_repository
+            }),
+        None => false,
+    };
     if !cwd_matches_pane {
         tracing::warn!(
-            "auto-provision declined: hint pane {pane} is not in hinted cwd {dir} (backend_session_id {backend_sid})"
+            "auto-provision declined: hint pane {pane} is not in hinted cwd {} (backend_session_id {backend_sid})",
+            project.project_dir
         );
         return None;
     }
@@ -4531,7 +4553,7 @@ async fn auto_provision_with_explicit_pane(
         }
     }
 
-    register_auto_provisioned_session(state, backend_sid, pane, dir).await
+    register_auto_provisioned_session(state, backend_sid, pane, &project).await
 }
 
 /// Inner helper: derive the session id, re-check the race, and apply the
@@ -4541,17 +4563,18 @@ async fn register_auto_provisioned_session(
     state: &std::sync::Arc<crate::state::AppState>,
     backend_sid: &str,
     pane_id: &str,
-    dir: &str,
+    project: &crate::project_identity::ProjectIdentity,
 ) -> Option<String> {
     // Derive a unique session id from the dir basename.
-    let basename = std::path::Path::new(dir)
+    let basename = std::path::Path::new(&project.project_dir)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unnamed");
     let base_id = crate::state::sanitize_session_id(basename);
     if base_id.is_empty() {
         tracing::warn!(
-            "auto-provision declined: could not derive a session id from dir {dir} (basename='{basename}')"
+            "auto-provision declined: could not derive a session id from dir {dir} (basename='{basename}')",
+            dir = project.project_dir
         );
         return None;
     }
@@ -4584,11 +4607,13 @@ async fn register_auto_provisioned_session(
     };
 
     tracing::info!(
-        "auto-provisioned session '{id}' for pane {pane_id} / backend_session_id {backend_sid} (dir: {dir})"
+        "auto-provisioned session '{id}' for pane {pane_id} / backend_session_id {backend_sid} (dir: {})",
+        project.project_dir
     );
 
     let metadata = crate::daemon_protocol::SessionMeta {
-        project_dir: Some(dir.to_string()),
+        project_dir: Some(project.project_dir.clone()),
+        canonical_project_identity: Some(project.canonical_repository.clone()),
         role: Some(format!("working on {basename}")),
         backend: Some("opencode".into()),
         backend_session_id: Some(backend_sid.to_string()),
@@ -10709,9 +10734,12 @@ mod tests {
             })
             .await;
 
+        let project = crate::project_identity::ProjectIdentity {
+            project_dir: "/tmp/freshproject".into(),
+            canonical_repository: "/tmp/freshproject".into(),
+        };
         let result =
-            register_auto_provisioned_session(&state, "ses_late_race", "%17", "/tmp/freshproject")
-                .await;
+            register_auto_provisioned_session(&state, "ses_late_race", "%17", &project).await;
 
         assert!(
             result.is_none(),

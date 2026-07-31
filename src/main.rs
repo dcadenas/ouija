@@ -6,6 +6,7 @@ pub mod daemon_protocol;
 mod hooks;
 mod nostr_transport;
 mod persistence;
+mod project_identity;
 mod project_index;
 mod protocol;
 mod rollover;
@@ -1587,6 +1588,7 @@ fn persisted_session_from_entry(
         metadata: state::SessionMetadata {
             vim_mode: metadata.vim_mode,
             project_dir: metadata.project_dir.clone(),
+            canonical_project_identity: metadata.canonical_project_identity.clone(),
             role: metadata.role.clone(),
             networked: metadata.networked,
             last_metadata_update: metadata
@@ -4576,6 +4578,7 @@ mod tests {
     fn metadata_for_restored_session_preserves_persisted_fields() {
         let metadata = crate::state::SessionMetadata {
             project_dir: Some("/tmp/project".into()),
+            canonical_project_identity: Some("/tmp/project".into()),
             role: Some("worker".into()),
             bulletin: Some("busy".into()),
             networked: false,

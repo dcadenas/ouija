@@ -326,6 +326,8 @@ pub struct IterationLogEntry {
 pub struct SessionMeta {
     #[serde(default)]
     pub project_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_project_identity: Option<String>,
     #[serde(default)]
     pub role: Option<String>,
     #[serde(default)]
@@ -826,6 +828,7 @@ impl Default for SessionMeta {
     fn default() -> Self {
         Self {
             project_dir: None,
+            canonical_project_identity: None,
             role: None,
             bulletin: None,
             networked: true,
@@ -1421,6 +1424,7 @@ pub(crate) fn metadata_to_session_meta(m: Option<&crate::state::SessionMetadata>
     match m {
         Some(m) => SessionMeta {
             project_dir: m.project_dir.clone(),
+            canonical_project_identity: m.canonical_project_identity.clone(),
             role: m.role.clone(),
             bulletin: m.bulletin.clone(),
             networked: m.networked,
@@ -3468,6 +3472,11 @@ impl DaemonState {
                         candidate,
                         &new_pane,
                         &project_dir,
+                        canonical
+                            .metadata
+                            .canonical_project_identity
+                            .as_deref()
+                            .or(Some(project_dir.as_str())),
                     ) => {}
             (Some(_), Some(_)) => {
                 return fail("candidate pane owner is not the expected metadata-only row".into());
@@ -3485,6 +3494,7 @@ impl DaemonState {
         candidate: &SessionEntry,
         pane: &str,
         project_dir: &str,
+        canonical_project_identity: Option<&str>,
     ) -> bool {
         let basename = std::path::Path::new(project_dir)
             .file_name()
@@ -3492,6 +3502,7 @@ impl DaemonState {
             .unwrap_or("unknown");
         let mut scanner_metadata = SessionMeta {
             project_dir: Some(project_dir.to_string()),
+            canonical_project_identity: canonical_project_identity.map(str::to_string),
             role: Some(format!("working on {basename}")),
             scanner_registration: true,
             ..Default::default()

@@ -560,15 +560,6 @@ impl CodingAssistant for ClaudeCode {
         ".claude"
     }
 
-    fn resolve_project_root<'a>(&self, path: &'a str) -> &'a str {
-        // Strip /.claude/worktrees/<branch> suffix if present
-        if let Some(idx) = path.find("/.claude/worktrees/") {
-            &path[..idx]
-        } else {
-            path
-        }
-    }
-
     fn has_project_history(&self, dir: &Path) -> bool {
         dir.join(".claude").is_dir()
     }
@@ -1044,24 +1035,6 @@ fi
     fn detect_session_id_nonexistent_dir() {
         let result = backend().detect_session_id("/nonexistent/path/that/does/not/exist");
         assert_eq!(result, None);
-    }
-
-    #[test]
-    fn resolve_project_root_strips_worktree_suffix() {
-        let b = backend();
-        assert_eq!(
-            b.resolve_project_root("/home/user/myproject/.claude/worktrees/feature-x"),
-            "/home/user/myproject"
-        );
-    }
-
-    #[test]
-    fn resolve_project_root_normal_path_unchanged() {
-        let b = backend();
-        assert_eq!(
-            b.resolve_project_root("/home/user/myproject"),
-            "/home/user/myproject"
-        );
     }
 
     #[test]

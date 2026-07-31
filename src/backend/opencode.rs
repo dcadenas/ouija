@@ -100,10 +100,6 @@ impl CodingAssistant for OpenCode {
         ".opencode"
     }
 
-    fn resolve_project_root<'a>(&self, path: &'a str) -> &'a str {
-        path
-    }
-
     fn has_project_history(&self, dir: &Path) -> bool {
         dir.join(".opencode").is_dir()
     }
@@ -421,19 +417,6 @@ mod tests {
         assert!(
             config.get("mcp").is_none() || config["mcp"].as_object().is_some_and(|m| m.is_empty()),
             "mcp block should be removed or empty after prune, got {config:#}"
-        );
-    }
-
-    #[test]
-    fn resolve_project_root_unchanged() {
-        let b = backend();
-        assert_eq!(
-            b.resolve_project_root("/home/user/myproject"),
-            "/home/user/myproject"
-        );
-        assert_eq!(
-            b.resolve_project_root("/home/user/myproject/subdir"),
-            "/home/user/myproject/subdir"
         );
     }
 }

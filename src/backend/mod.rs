@@ -536,9 +536,6 @@ pub trait CodingAssistant: Send + Sync + std::fmt::Debug + 'static {
     fn tui_ready_pattern(&self) -> Option<&str>;
     fn inject_config(&self) -> InjectConfig;
     fn config_dir_name(&self) -> &str;
-    fn resolve_project_root<'a>(&self, path: &'a str) -> &'a str {
-        path
-    }
     fn has_project_history(&self, dir: &Path) -> bool;
     fn compact_command(&self) -> Option<&str> {
         None

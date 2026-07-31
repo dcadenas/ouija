@@ -338,8 +338,12 @@ async fn existing_pane_identity_matches(
     pane: &str,
     hook_cwd: &str,
     registered_project_dir: Option<&str>,
+    registered_canonical_project: Option<&str>,
 ) -> bool {
-    let hook_project_root = crate::state::resolve_project_root(hook_cwd);
+    let Ok(hook_project) = crate::project_identity::resolve_project_identity_async(hook_cwd).await
+    else {
+        return false;
+    };
     let Some(registered_project_dir) = registered_project_dir else {
         tracing::warn!(
             pane,
@@ -348,8 +352,19 @@ async fn existing_pane_identity_matches(
         );
         return false;
     };
-    let registered_project_root = crate::state::resolve_project_root(registered_project_dir);
-    if registered_project_root != hook_project_root {
+    let registered_canonical_project = if let Some(registered_canonical_project) =
+        registered_canonical_project
+    {
+        registered_canonical_project.to_string()
+    } else {
+        let Ok(registered_project) =
+            crate::project_identity::resolve_project_identity_async(registered_project_dir).await
+        else {
+            return false;
+        };
+        registered_project.canonical_repository
+    };
+    if registered_canonical_project != hook_project.canonical_repository {
         tracing::warn!(
             pane,
             hook_cwd,
@@ -367,7 +382,10 @@ async fn live_pane_identity_matches(
     pane: &str,
     hook_cwd: &str,
 ) -> bool {
-    let hook_project_root = crate::state::resolve_project_root(hook_cwd);
+    let Ok(hook_project) = crate::project_identity::resolve_project_identity_async(hook_cwd).await
+    else {
+        return false;
+    };
     let panes = state.list_assistant_panes().await;
     let Some(live_pane_path) = panes
         .iter()
@@ -380,8 +398,12 @@ async fn live_pane_identity_matches(
         );
         return false;
     };
-    let live_project_root = crate::state::resolve_project_root(live_pane_path);
-    if live_project_root != hook_project_root {
+    let Ok(live_project) =
+        crate::project_identity::resolve_project_identity_async(live_pane_path).await
+    else {
+        return false;
+    };
+    if live_project.canonical_repository != hook_project.canonical_repository {
         tracing::warn!(
             pane,
             hook_cwd,
@@ -498,20 +520,21 @@ async fn session_start_inner(
     }
 
     if let Some(identity) = backend_identity.as_ref() {
-        let project_root = crate::state::resolve_project_root(&body.cwd);
-        if !live_pane_identity_matches(state, &body.pane, project_root).await {
+        let Ok(project) = crate::project_identity::resolve_project_identity_async(&body.cwd).await
+        else {
+            return json!({
+                "skipped": "invalid session-start project identity",
+                "output": "",
+            });
+        };
+        if !live_pane_identity_matches(state, &body.pane, &project.project_dir).await {
             return json!({
                 "skipped": "session-start pane identity mismatch",
                 "output": "",
             });
         }
         match state
-            .reclaim_missing_backend_pane(
-                identity,
-                &body.pane,
-                project_root,
-                body.session_incarnation,
-            )
+            .reclaim_missing_backend_pane(identity, &body.pane, &project, body.session_incarnation)
             .await
         {
             crate::state::MissingBackendPaneReclaimOutcome::Reclaimed(owner)
@@ -546,7 +569,13 @@ async fn session_start_inner(
     // session's authoritative stored backend + id, so the primary launch path
     // gets it (claude-code/opencode carry the skill and stay empty).
     if let Some(existing_id) = state.find_session_by_pane(&body.pane).await {
-        let (existing_owner, existing_backend, registered_project_dir, existing_backend_session_id) = {
+        let (
+            existing_owner,
+            existing_backend,
+            registered_project_dir,
+            registered_canonical_project,
+            existing_backend_session_id,
+        ) = {
             let proto = state.protocol.read().await;
             proto
                 .sessions
@@ -556,6 +585,7 @@ async fn session_start_inner(
                         session.owner(),
                         session.metadata.backend.clone(),
                         session.metadata.project_dir.clone(),
+                        session.metadata.canonical_project_identity.clone(),
                         session.metadata.backend_session_id.clone(),
                     )
                 })
@@ -575,6 +605,7 @@ async fn session_start_inner(
             &body.pane,
             &body.cwd,
             registered_project_dir.as_deref(),
+            registered_canonical_project.as_deref(),
         )
         .await
         {
@@ -619,19 +650,22 @@ async fn session_start_inner(
         });
     }
 
-    // Derive name from cwd
-    let project_root = crate::state::resolve_project_root(&body.cwd);
+    // Derive the live worktree and canonical repository from cwd.
+    let Ok(project) = crate::project_identity::resolve_project_identity_async(&body.cwd).await
+    else {
+        return json!({ "error": "could not resolve project identity", "output": "" });
+    };
 
     // Refuse a home-cwd registration: an agent whose cwd is still $HOME is a
     // premature hook mis-fire (e.g. opencode's SessionStart firing before it
     // cd's into its worktree). Registering it leaks a generic basename($HOME)-N
     // session that owns the live pane forever (#1483). The authoritative name
     // arrives via the API session_start path once the pane is bound.
-    if crate::state::is_home_project_root(project_root) {
+    if crate::state::is_home_project_root(&project.project_dir) {
         return json!({ "skipped": "home cwd (premature session-start)", "output": "" });
     }
 
-    let basename = std::path::Path::new(project_root)
+    let basename = std::path::Path::new(&project.project_dir)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unnamed");
@@ -665,7 +699,7 @@ async fn session_start_inner(
         None => match normalize_backend_session_id(body.backend_session_id.as_deref()) {
             Some(session_id) => Some(session_id),
             None if backend.as_deref() == Some("opencode") => {
-                resolve_opencode_session_id(state, project_root).await
+                resolve_opencode_session_id(state, &project.project_dir).await
             }
             None => None,
         },
@@ -678,7 +712,8 @@ async fn session_start_inner(
     // Register
     let role = format!("working on {basename}");
     let proto_meta = crate::daemon_protocol::SessionMeta {
-        project_dir: Some(project_root.to_string()),
+        project_dir: Some(project.project_dir),
+        canonical_project_identity: Some(project.canonical_repository),
         role: Some(role),
         backend,
         backend_session_id,
@@ -1503,13 +1538,11 @@ mod tests {
                 },
             })
             .await;
-        *state.cached_assistant_panes.write().await = vec![assistant_pane(
-            "%70",
-            "/home/user/code/proj/.ouija/worktrees/feat-worker",
-        )];
+        *state.cached_assistant_panes.write().await =
+            vec![assistant_pane("%70", "/home/user/code/proj")];
         let body = SessionStartBody {
             pane: "%70".into(),
-            cwd: "/home/user/code/proj/.ouija/worktrees/feat-worker".into(),
+            cwd: "/home/user/code/proj".into(),
             backend_session_id: Some("codex-thread-1".into()),
             backend_identity: None,
             adapter: Some("codex-cli".into()),
@@ -2690,7 +2723,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_start_resolves_worktree_path() {
+    async fn session_start_git_failure_preserves_full_worktree_path() {
         let state = crate::state::AppState::new_for_test();
         let body = SessionStartBody {
             pane: "%50".into(),
@@ -2703,7 +2736,15 @@ mod tests {
             session_incarnation: None,
         };
         let result = session_start_inner(&state, body).await;
-        assert_eq!(result["registered"], "ouija");
+        assert_eq!(result["registered"], "feature-x");
+        let protocol = state.protocol.read().await;
+        assert_eq!(
+            protocol.sessions["feature-x"]
+                .metadata
+                .project_dir
+                .as_deref(),
+            Some("/home/user/code/ouija/.ouija/worktrees/feature-x")
+        );
     }
 
     #[tokio::test]

@@ -191,24 +191,6 @@ pub(crate) fn project_dir_identity(path: &str) -> String {
     }
 }
 
-/// Resolve a pane's cwd to the actual project root.
-/// If the path is inside a `.claude/worktrees/<branch>` or `.ouija/worktrees/<branch>` directory,
-/// walk up to the repo root so autoregistration derives the project name, not the branch.
-///
-/// Phase 1: hardcoded to the Claude Code and Ouija worktree layouts. This function is called
-/// during auto-registration before a per-session backend is known.
-/// Phase 2: delegate to `backend.resolve_project_root(path)` once per-session backends are supported.
-pub fn resolve_project_root(path: &str) -> &str {
-    // Look for `/.claude/worktrees/` or `/.ouija/worktrees/` in the path
-    if let Some(idx) = path.find("/.claude/worktrees/") {
-        &path[..idx]
-    } else if let Some(idx) = path.find("/.ouija/worktrees/") {
-        &path[..idx]
-    } else {
-        path
-    }
-}
-
 /// Returns true when a resolved project root is the user's home directory and
 /// must not be auto-registered.
 ///
@@ -945,6 +927,8 @@ pub struct SessionMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_project_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     /// Whether this session is visible to and reachable from remote nodes.
     #[serde(default = "default_true")]
@@ -1069,6 +1053,7 @@ impl Default for SessionMetadata {
         Self {
             vim_mode: false,
             project_dir: None,
+            canonical_project_identity: None,
             role: None,
             networked: true,
             last_metadata_update: None,
@@ -2388,7 +2373,7 @@ impl AppState {
         self: &Arc<Self>,
         identity: &crate::backend::BackendSessionIdentity,
         new_pane: &str,
-        project_dir: &str,
+        project: &crate::project_identity::ProjectIdentity,
         expected_incarnation: Option<crate::daemon_protocol::SessionIncarnation>,
     ) -> MissingBackendPaneReclaimOutcome {
         use crate::daemon_protocol::BackendIdentityResolution;
@@ -2419,7 +2404,12 @@ impl AppState {
             {
                 return MissingBackendPaneReclaimOutcome::IncarnationMismatch;
             }
-            if resolve_project_root(&canonical_project_dir) != project_dir
+            let canonical_repository = canonical
+                .metadata
+                .canonical_project_identity
+                .clone()
+                .unwrap_or_else(|| canonical_project_dir.clone());
+            if canonical_repository != project.canonical_repository
                 || protocol.lifecycle_leases.contains_key(&canonical_id)
             {
                 return MissingBackendPaneReclaimOutcome::Refused;
@@ -2433,7 +2423,12 @@ impl AppState {
                 .find(|session| session.pane.as_deref() == Some(new_pane))
                 .cloned();
             if candidate.as_ref().is_some_and(|candidate| {
-                !protocol.scanner_candidate_is_reclaimable(candidate, new_pane, project_dir)
+                !protocol.scanner_candidate_is_reclaimable(
+                    candidate,
+                    new_pane,
+                    &project.project_dir,
+                    Some(&project.canonical_repository),
+                )
             }) {
                 return MissingBackendPaneReclaimOutcome::Refused;
             }
@@ -4145,6 +4140,7 @@ impl AppState {
                     metadata: SessionMetadata {
                         vim_mode: m.vim_mode,
                         project_dir: m.project_dir.clone(),
+                        canonical_project_identity: m.canonical_project_identity.clone(),
                         role: m.role.clone(),
                         networked: m.networked,
                         last_metadata_update: m
@@ -5228,22 +5224,26 @@ impl AppState {
                 continue;
             };
 
-            let project_root = resolve_project_root(path);
+            let Ok(project) = crate::project_identity::resolve_project_identity_async(path).await
+            else {
+                continue;
+            };
 
             // Same defense as the session-start hook: never auto-register a pane
             // whose resolved root is $HOME. Without this, a home-cwd pane the
             // hook already refused could still be grabbed generically here as
             // "daniel-N" and leak past task cleanup (#1483).
-            if is_home_project_root(project_root) {
+            if is_home_project_root(&project.project_dir) {
                 continue;
             }
 
-            let basename = std::path::Path::new(project_root)
+            let basename = std::path::Path::new(&project.project_dir)
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or("unknown");
+                .unwrap_or("unknown")
+                .to_string();
 
-            let base_id = sanitize_session_id(basename);
+            let base_id = sanitize_session_id(&basename);
 
             if base_id.is_empty() {
                 continue;
@@ -5254,7 +5254,8 @@ impl AppState {
             let id = resolve_unique_session_id(&id_to_pane, &base_id, Some(pane.pane_id.as_str()));
 
             let proto_meta = crate::daemon_protocol::SessionMeta {
-                project_dir: Some(project_root.to_string()),
+                project_dir: Some(project.project_dir),
+                canonical_project_identity: Some(project.canonical_repository),
                 role: Some(format!("working on {basename}")),
                 scanner_registration: true,
                 ..Default::default()
@@ -6843,38 +6844,6 @@ pub(crate) mod tests {
         assert_eq!(
             project_dir_identity(physical.join("target").to_str().unwrap()),
             project_dir_identity(alias.join("../target").to_str().unwrap())
-        );
-    }
-
-    #[test]
-    fn resolve_project_root_normal_path() {
-        assert_eq!(
-            resolve_project_root("/Users/dan/code/myproject"),
-            "/Users/dan/code/myproject"
-        );
-    }
-
-    #[test]
-    fn resolve_project_root_worktree_path() {
-        assert_eq!(
-            resolve_project_root("/Users/dan/code/chess-reader/.claude/worktrees/feature-branch"),
-            "/Users/dan/code/chess-reader"
-        );
-    }
-
-    #[test]
-    fn resolve_project_root_linux_worktree() {
-        assert_eq!(
-            resolve_project_root("/home/daniel/code/ouija/.claude/worktrees/auto-register"),
-            "/home/daniel/code/ouija"
-        );
-    }
-
-    #[test]
-    fn resolve_project_root_ouija_worktree() {
-        assert_eq!(
-            resolve_project_root("/home/daniel/code/ouija/.ouija/worktrees/feature-x"),
-            "/home/daniel/code/ouija"
         );
     }
 
@@ -9410,6 +9379,7 @@ pub(crate) mod tests {
         // any field that persist_protocol_state drops.
         let meta = crate::daemon_protocol::SessionMeta {
             project_dir: Some("/tmp/proj".into()),
+            canonical_project_identity: Some("/tmp/proj".into()),
             role: Some("worker".into()),
             networked: false,
             bulletin: Some("available".into()),

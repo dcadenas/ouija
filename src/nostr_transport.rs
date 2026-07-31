@@ -4599,6 +4599,7 @@ async fn restart_session_claimed(
             let proto_meta = match prev_metadata {
                 Some(ref m) => crate::daemon_protocol::SessionMeta {
                     project_dir: Some(dir.clone()),
+                    canonical_project_identity: m.canonical_project_identity.clone(),
                     role: m.role.clone(),
                     bulletin: m.bulletin.clone(),
                     networked: m.networked,
