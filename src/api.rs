@@ -7,6 +7,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::scheduler;
 use crate::state::SharedState;
@@ -1327,16 +1328,9 @@ pub async fn claim_local_identity(
                 "error": "requested ID is already live",
             })),
         ),
-        crate::state::LocalClaimOutcome::DestinationDormant { id } => (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "outcome": "destination_dormant",
-                "session_id": id,
-                "error": "requested ID is reserved by a dormant identity",
-                "inspect_command": format!("ouija dormant show {id}"),
-                "forget_command": format!("ouija unregister {id}"),
-            })),
-        ),
+        crate::state::LocalClaimOutcome::DestinationDormant { id } => {
+            (StatusCode::CONFLICT, Json(dormant_conflict_body(&id)))
+        }
         crate::state::LocalClaimOutcome::AlreadyRegistered { id } => (
             StatusCode::FORBIDDEN,
             Json(json!({
@@ -1367,6 +1361,95 @@ pub async fn claim_local_identity(
             })),
         ),
     }
+}
+
+fn dormant_backend_fingerprint(backend: &str, backend_session_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(backend.as_bytes());
+    hasher.update([0]);
+    hasher.update(backend_session_id.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn dormant_identity_json(dormant: &crate::daemon_protocol::DormantSession) -> serde_json::Value {
+    let metadata = &dormant.metadata;
+    json!({
+        "id": dormant.id,
+        "prior_incarnation": dormant.prior_owner.incarnation.to_string(),
+        "backend": metadata.backend,
+        "backend_session_fingerprint": dormant_backend_fingerprint(
+            metadata.backend.as_deref().unwrap_or_default(),
+            metadata.backend_session_id.as_deref().unwrap_or_default(),
+        ),
+        "project_dir": metadata.project_dir,
+        "canonical_project_identity": dormant.canonical_project_identity,
+        "dormant_at": dormant.dormant_at,
+        "source": dormant.source,
+        "fresh_context_after_active_secs": metadata.fresh_context_after_active_secs,
+        "active_context_accumulated_secs": metadata.active_context_accumulated_secs,
+        "active_context_segment_open": false,
+        "active_context_restart_due": metadata.active_context_restart_due,
+        "routable": false,
+    })
+}
+
+/// List durable Local identity reservations without making them routable or
+/// exposing backend-native identifiers and runtime authority.
+pub async fn dormant_identities(
+    State(state): State<SharedState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let protocol = state.protocol.read().await;
+    let rows = protocol
+        .dormant_sessions
+        .values()
+        .map(dormant_identity_json)
+        .collect::<Vec<_>>();
+    (StatusCode::OK, Json(json!({ "dormant_sessions": rows })))
+}
+
+/// Inspect one exact durable Local identity reservation.
+pub async fn dormant_identity(
+    State(state): State<SharedState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let protocol = state.protocol.read().await;
+    match protocol.dormant_sessions.get(&id) {
+        Some(dormant) => (
+            StatusCode::OK,
+            Json(json!({ "dormant_session": dormant_identity_json(dormant) })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "outcome": "dormant_not_found",
+                "session_id": id,
+                "error": "dormant identity not found",
+            })),
+        ),
+    }
+}
+
+fn operator_command_arg(id: &str) -> String {
+    if !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_./".contains(&byte))
+    {
+        id.to_string()
+    } else {
+        crate::scheduler::shell_escape(id)
+    }
+}
+
+fn dormant_conflict_body(id: &str) -> serde_json::Value {
+    let argument = operator_command_arg(id);
+    json!({
+        "outcome": "destination_dormant",
+        "session_id": id,
+        "error": "requested ID is reserved by a dormant identity",
+        "inspect_command": format!("ouija dormant show {argument}"),
+        "forget_command": format!("ouija unregister {argument}"),
+    })
 }
 
 /// Rename an existing session.
@@ -1405,14 +1488,25 @@ pub async fn rename(
             Json(json!({ "renamed": body.old_id, "to": body.new_id })),
         )
     } else {
-        let reason = effects
-            .iter()
-            .find_map(|e| match e {
-                crate::daemon_protocol::Effect::RenameFailed { reason, .. } => Some(reason.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| format!("session '{}' not found", body.old_id));
-        (StatusCode::NOT_FOUND, Json(json!({ "error": reason })))
+        let failure = effects.iter().find_map(|e| match e {
+            crate::daemon_protocol::Effect::RenameFailed { kind, reason } => {
+                Some((*kind, reason.clone()))
+            }
+            _ => None,
+        });
+        match failure {
+            Some((crate::daemon_protocol::RenameFailureKind::DestinationDormant, _)) => (
+                StatusCode::CONFLICT,
+                Json(dormant_conflict_body(&body.new_id)),
+            ),
+            Some((_, reason)) => (StatusCode::NOT_FOUND, Json(json!({ "error": reason }))),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": format!("session '{}' not found", body.old_id),
+                })),
+            ),
+        }
     }
 }
 
@@ -1439,6 +1533,16 @@ pub async fn remove(
         .any(|e| matches!(e, crate::daemon_protocol::Effect::RemoveOk { .. }))
     {
         (StatusCode::OK, Json(json!({ "removed": body.id })))
+    } else if effects.iter().any(
+        |e| matches!(e, crate::daemon_protocol::Effect::DormantForgotten { id } if id == &body.id),
+    ) {
+        (
+            StatusCode::OK,
+            Json(json!({
+                "forgotten_dormant": body.id,
+                "worktree_preserved": true,
+            })),
+        )
     } else {
         let reason = effects
             .iter()
@@ -7161,6 +7265,159 @@ mod tests {
                 .as_str()
                 .is_some_and(|command| command.contains("unregister requested"))
         );
+    }
+
+    async fn dormant_test_state(id: &str, project_dir: &str) -> SharedState {
+        let state = crate::state::AppState::new_for_test();
+        let mut metadata = crate::daemon_protocol::SessionMeta {
+            project_dir: Some(project_dir.into()),
+            canonical_project_identity: Some("/tmp/dormant-repository".into()),
+            backend: Some("codex-cli".into()),
+            backend_session_id: Some("opaque-backend-secret".into()),
+            session_incarnation: crate::daemon_protocol::SessionIncarnation(41),
+            fresh_context_after_active_secs: Some(3600),
+            active_context_accumulated_secs: 927,
+            active_context_segment_started_at: None,
+            active_context_restart_due: true,
+            prompt: Some("private stored prompt".into()),
+            ..Default::default()
+        };
+        metadata.session_start_credential = Some("launch-secret".into());
+        state.protocol.write().await.dormant_sessions.insert(
+            id.into(),
+            crate::daemon_protocol::DormantSession {
+                id: id.into(),
+                prior_owner: crate::daemon_protocol::ResourceOwner {
+                    session_id: id.into(),
+                    incarnation: crate::daemon_protocol::SessionIncarnation(41),
+                },
+                metadata,
+                canonical_project_identity: "/tmp/dormant-repository".into(),
+                dormant_at: 1_753_920_123,
+                source: crate::daemon_protocol::DormancySource::TrustedSessionEnd,
+            },
+        );
+        state
+    }
+
+    #[tokio::test]
+    async fn dormant_list_and_show_expose_only_redacted_non_routable_identity_metadata() {
+        let state = dormant_test_state("feat/identity", "/tmp/preserved-worktree").await;
+
+        let (list_status, Json(list)) = dormant_identities(State(state.clone())).await;
+        assert_eq!(list_status, StatusCode::OK);
+        let rows = list["dormant_sessions"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["id"], "feat/identity");
+        assert_eq!(row["prior_incarnation"], "41");
+        assert_eq!(row["backend"], "codex-cli");
+        assert_eq!(row["project_dir"], "/tmp/preserved-worktree");
+        assert_eq!(row["canonical_project_identity"], "/tmp/dormant-repository");
+        assert_eq!(row["dormant_at"], 1_753_920_123i64);
+        assert_eq!(row["source"], "trusted_session_end");
+        assert_eq!(row["fresh_context_after_active_secs"], 3600);
+        assert_eq!(row["active_context_accumulated_secs"], 927);
+        assert_eq!(row["active_context_segment_open"], false);
+        assert_eq!(row["active_context_restart_due"], true);
+        assert_eq!(row["routable"], false);
+        assert!(
+            row["backend_session_fingerprint"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("sha256:"))
+        );
+
+        let serialized = serde_json::to_string(&list).unwrap();
+        for forbidden in [
+            "opaque-backend-secret",
+            "launch-secret",
+            "private stored prompt",
+            "session_start_credential",
+            "backend_repair_reservation",
+            "pending_replies",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "dormant inspection leaked {forbidden}"
+            );
+        }
+
+        let (show_status, Json(show)) =
+            dormant_identity(State(state), axum::extract::Path("feat/identity".into())).await;
+        assert_eq!(show_status, StatusCode::OK);
+        assert_eq!(show["dormant_session"], *row);
+    }
+
+    #[tokio::test]
+    async fn dormant_show_missing_target_is_not_found() {
+        let state = crate::state::AppState::new_for_test();
+        let (status, Json(body)) =
+            dormant_identity(State(state), axum::extract::Path("missing".into())).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["outcome"], "dormant_not_found");
+        assert_eq!(body["session_id"], "missing");
+    }
+
+    #[tokio::test]
+    async fn dormant_unregister_forgets_exact_row_and_preserves_worktree() {
+        let worktree = tempfile::tempdir().unwrap();
+        let worktree_path = worktree.path().to_string_lossy().into_owned();
+        let state = dormant_test_state("parked", &worktree_path).await;
+
+        let (status, Json(body)) = remove(
+            State(state.clone()),
+            Json(RemoveBody {
+                id: "parked".into(),
+                keep_worktree: Some(false),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["forgotten_dormant"], "parked");
+        assert_eq!(body["worktree_preserved"], true);
+        assert!(worktree.path().exists());
+        assert!(
+            state
+                .protocol
+                .read()
+                .await
+                .dormant_sessions
+                .get("parked")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_destination_dormant_returns_structured_remediation() {
+        let state = dormant_test_state("reserved", "/tmp/preserved-worktree").await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "source".into(),
+                pane: Some("%source".into()),
+                metadata: crate::daemon_protocol::SessionMeta::default(),
+            })
+            .await;
+
+        let (status, Json(body)) = rename(
+            State(state.clone()),
+            Json(RenameBody {
+                old_id: "source".into(),
+                new_id: "reserved".into(),
+                sender_ctx: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["outcome"], "destination_dormant");
+        assert_eq!(body["session_id"], "reserved");
+        assert_eq!(body["inspect_command"], "ouija dormant show reserved");
+        assert_eq!(body["forget_command"], "ouija unregister reserved");
+        let protocol = state.protocol.read().await;
+        assert!(protocol.sessions.contains_key("source"));
+        assert!(protocol.dormant_sessions.contains_key("reserved"));
     }
 
     #[tokio::test]

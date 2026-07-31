@@ -425,6 +425,32 @@ ouija ask target-id "question"
 
 If implicit resolution fails and you do not have an exact injected or operator-provided public Local id, run `ouija whoami` and relay its diagnostics. **Never run `ouija register` to "fix" this** — it would create a duplicate session entry, not register the caller.
 
+### Claim or inspect durable Local identity
+
+`ouija claim exact-public-id` is the explicit Local operator path for a
+genuinely unregistered running assistant. It uses the current adapter's
+complete backend identity plus independently verified live pane/project
+evidence. The daemon atomically creates the requested free public ID, treats an
+exact same-owner retry as idempotent, and recovers an exact dormant backend pair
+before considering a new claim. A conflict fails closed; claim never evicts or
+renames another identity. Backend-native session IDs remain evidence in the
+Local control plane and are never public Ouija IDs or Nostr sender identity.
+
+Dormant identities are durable, non-routable reservations with no automatic
+expiry. Inspect the redacted reservation before intentionally releasing it:
+
+```bash
+ouija dormant list
+ouija dormant show exact-public-id
+ouija unregister exact-public-id
+```
+
+For a dormant target, `unregister` forgets only that exact reservation and
+preserves its worktree. Use it only when the operator explicitly intends to
+release the public ID and backend/project ownership. `ouija rename` requires an
+existing exact Local source row and never acts as registration or claim; use
+`ouija claim` for a genuinely unregistered caller.
+
 ### Recover a running backend from a both-null row
 
 Use this only when the operator explicitly identifies the exact public Local

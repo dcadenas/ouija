@@ -149,6 +149,11 @@ enum Command {
     Whoami,
     /// Atomically claim one exact free Local public ID for this backend session.
     Claim { requested_id: String },
+    /// Inspect durable Local identities parked for exact backend recovery.
+    Dormant {
+        #[command(subcommand)]
+        command: DormantCommand,
+    },
     /// Bind this running backend to one exact blank Local session without restarting it.
     #[command(name = "recover-backend-identity")]
     RecoverBackendIdentity {
@@ -309,6 +314,14 @@ enum Command {
         #[command(subcommand)]
         action: TaskAction,
     },
+}
+
+#[derive(Subcommand)]
+enum DormantCommand {
+    /// List all parked Local identities.
+    List,
+    /// Show one exact parked Local identity.
+    Show { id: String },
 }
 
 #[derive(Subcommand)]
@@ -943,6 +956,14 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
         }
+        Command::Dormant { command } => match command {
+            DormantCommand::List => {
+                cli_get("/api/session-identities/dormant").await?;
+            }
+            DormantCommand::Show { id } => {
+                cli_get(&dormant_show_path(&id)).await?;
+            }
+        },
         Command::RecoverBackendIdentity { session_id } => {
             let identity = backend::BackendRegistry::default_registry()
                 .caller_session_identity()
@@ -3258,8 +3279,10 @@ async fn cli_get(path: &str) -> anyhow::Result<()> {
     let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
     let url = format!("http://localhost:{port}{path}");
     let resp = reqwest::get(&url).await?;
+    let status = resp.status();
     let text = resp.text().await?;
-    println!("{text}");
+    let body = classify_http_response(status, &text)?;
+    println!("{body}");
     Ok(())
 }
 
@@ -3545,6 +3568,13 @@ fn encode_path_segment(segment: &str) -> String {
     percent_encoding::utf8_percent_encode(segment, PATH_SEGMENT).to_string()
 }
 
+fn dormant_show_path(id: &str) -> String {
+    format!(
+        "/api/session-identities/dormant/{}",
+        encode_path_segment(id)
+    )
+}
+
 fn read_one_shot_file(path: &std::path::Path) -> anyhow::Result<String> {
     std::fs::read_to_string(path).with_context(|| {
         format!(
@@ -3683,6 +3713,46 @@ mod tests {
             json.to_string().contains("opaque-thread-id"),
             "backend-native identity belongs only in the request body"
         );
+    }
+
+    #[test]
+    fn dormant_cli_parses_list_and_exact_show_id() {
+        let list = Cli::try_parse_from(["ouija", "dormant", "list"]).unwrap();
+        assert!(matches!(
+            list.command,
+            Command::Dormant {
+                command: DormantCommand::List
+            }
+        ));
+
+        let show = Cli::try_parse_from(["ouija", "dormant", "show", "feat/identity"]).unwrap();
+        match show.command {
+            Command::Dormant {
+                command: DormantCommand::Show { id },
+            } => assert_eq!(id, "feat/identity"),
+            _ => panic!("expected dormant show command"),
+        }
+        assert!(Cli::try_parse_from(["ouija", "dormant", "show"]).is_err());
+    }
+
+    #[test]
+    fn dormant_show_path_encodes_exact_id_as_one_segment() {
+        assert_eq!(
+            dormant_show_path("feat/identity %#"),
+            "/api/session-identities/dormant/feat%2Fidentity%20%25%23"
+        );
+    }
+
+    #[test]
+    fn dormant_get_non_success_is_a_cli_error() {
+        let error = classify_http_response(
+            reqwest::StatusCode::NOT_FOUND,
+            r#"{"outcome":"dormant_not_found"}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("404"));
+        assert!(error.contains("dormant_not_found"));
     }
 
     #[test]

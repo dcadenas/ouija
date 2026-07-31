@@ -25,6 +25,14 @@ pub async fn run(state: SharedState) -> anyhow::Result<()> {
             "/api/session-identities/claim",
             post(api::claim_local_identity),
         )
+        .route(
+            "/api/session-identities/dormant",
+            get(api::dormant_identities),
+        )
+        .route(
+            "/api/session-identities/dormant/{id}",
+            get(api::dormant_identity),
+        )
         .route("/api/remove", post(api::remove))
         .route("/api/sessions/update", post(api::update_session))
         .route("/api/sessions/bulk-update", post(api::bulk_update_sessions))
