@@ -28,7 +28,12 @@ pub async fn session_end(
     Json(body): Json<PaneBody>,
 ) -> (StatusCode, Json<Value>) {
     let result = session_end_inner(&state, body).await;
-    (StatusCode::OK, Json(result))
+    let status = if result.get("error").is_some() {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::OK
+    };
+    (status, Json(result))
 }
 
 async fn session_end_inner(
@@ -61,21 +66,25 @@ async fn session_end_inner(
         }
     };
     let id = session.id.clone();
-    // SessionEnd hook: always preserve worktrees. Cleanup should only happen
-    // via explicit API call with keep_worktree=false.
-    let effects = state
-        .apply_and_execute(crate::daemon_protocol::Event::RemoveOwned {
-            owner: session.owner(),
-            expected_pane: session.pane.clone(),
-            keep_worktree: true,
-        })
-        .await;
-    if !effects.iter().any(
-        |effect| matches!(effect, crate::daemon_protocol::Effect::RemoveOk { id: removed } if removed == &id),
-    ) {
-        return json!({ "skipped": "session replaced" });
+    match state
+        .dormant_owned(
+            session.owner(),
+            session.pane.clone(),
+            chrono::Utc::now().timestamp(),
+            crate::daemon_protocol::DormancySource::TrustedSessionEnd,
+        )
+        .await
+    {
+        crate::state::DormantOwnedOutcome::Dormant { .. } => json!({ "dormant": id }),
+        crate::state::DormantOwnedOutcome::Removed { .. } => json!({ "removed": id }),
+        crate::state::DormantOwnedOutcome::Superseded
+        | crate::state::DormantOwnedOutcome::LifecycleInProgress => {
+            json!({ "skipped": "session replaced" })
+        }
+        crate::state::DormantOwnedOutcome::PersistenceFailed => {
+            json!({ "error": "failed to persist session dormancy" })
+        }
     }
-    json!({ "removed": id })
 }
 
 async fn exact_hook_session_owner(
@@ -1137,7 +1146,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_end_removes_old_session() {
+    async fn session_end_incomplete_row_is_removed() {
         let state = crate::state::AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -1156,6 +1165,272 @@ mod tests {
         let result = session_end_inner(&state, body).await;
         assert!(result.get("removed").is_some());
         assert!(state.find_session_by_pane("%99").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn session_end_parks_eligible_clean_exit() {
+        let config = crate::state::tests::test_config();
+        let state = crate::state::AppState::new(config.clone());
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "claude-worker".into(),
+                pane: Some("%90".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/claude-worker".into()),
+                    canonical_project_identity: Some("/tmp/repository".into()),
+                    backend: Some("claude-code".into()),
+                    backend_session_id: Some("claude-session-1".into()),
+                    role: Some("continuity work".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["claude-worker"].owner();
+
+        let result = session_end_inner(
+            &state,
+            PaneBody {
+                pane: Some("%90".into()),
+                backend_session_id: Some("claude-session-1".into()),
+                session_incarnation: Some(owner.incarnation),
+            },
+        )
+        .await;
+
+        assert_eq!(result["dormant"], "claude-worker");
+        let protocol = state.protocol.read().await;
+        assert!(!protocol.sessions.contains_key("claude-worker"));
+        assert_eq!(
+            protocol.dormant_sessions["claude-worker"].prior_owner,
+            owner
+        );
+        assert_eq!(
+            protocol.dormant_sessions["claude-worker"].source,
+            crate::daemon_protocol::DormancySource::TrustedSessionEnd
+        );
+        drop(protocol);
+        assert!(
+            crate::persistence::load_sessions(&config.data_dir)
+                .unwrap()
+                .dormant_sessions
+                .contains_key("claude-worker")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_end_clean_exit_recovers_on_replacement_pane() {
+        let project = tempfile::tempdir().unwrap();
+        let project_dir = project
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "arbitrary-claude-id".into(),
+                pane: Some("%90".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some(project_dir.clone()),
+                    canonical_project_identity: Some(project_dir.clone()),
+                    backend: Some("claude-code".into()),
+                    backend_session_id: Some("claude-session-1".into()),
+                    role: Some("continuity work".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let prior_owner = state.protocol.read().await.sessions["arbitrary-claude-id"].owner();
+        assert_eq!(
+            session_end_inner(
+                &state,
+                PaneBody {
+                    pane: Some("%90".into()),
+                    backend_session_id: Some("claude-session-1".into()),
+                    session_incarnation: Some(prior_owner.incarnation),
+                },
+            )
+            .await["dormant"],
+            "arbitrary-claude-id"
+        );
+        *state.cached_assistant_panes.write().await =
+            vec![assistant_pane_with_process("%91", &project_dir, "claude")];
+        state.set_dormant_recovery_test_inspection(crate::tmux::ManagedPaneInspection::Unmanaged);
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: "%91".into(),
+                cwd: project_dir,
+                backend_session_id: Some("claude-session-1".into()),
+                backend_identity: Some(crate::backend::BackendSessionIdentity {
+                    backend: "claude-code".into(),
+                    session_id: "claude-session-1".into(),
+                }),
+                adapter: Some("claude-code".into()),
+                launch_session_id: None,
+                launch_credential: None,
+                session_incarnation: None,
+            },
+        )
+        .await;
+
+        assert_eq!(result["registered"], "arbitrary-claude-id");
+        let recovered = state.protocol.read().await.sessions["arbitrary-claude-id"].clone();
+        assert_eq!(recovered.pane.as_deref(), Some("%91"));
+        assert_eq!(recovered.metadata.role.as_deref(), Some("continuity work"));
+        assert!(recovered.owner().incarnation > prior_owner.incarnation);
+    }
+
+    #[tokio::test]
+    async fn session_end_lifecycle_lease_skips_without_mutation() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "leased".into(),
+                pane: Some("%90".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/leased".into()),
+                    canonical_project_identity: Some("/tmp/repository".into()),
+                    backend: Some("claude-code".into()),
+                    backend_session_id: Some("claude-session-lease".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["leased"].owner();
+        assert_eq!(
+            state.claim_existing_start(&owner).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        let before = state.protocol.read().await.clone();
+
+        let result = session_end_inner(
+            &state,
+            PaneBody {
+                pane: Some("%90".into()),
+                backend_session_id: Some("claude-session-lease".into()),
+                session_incarnation: Some(owner.incarnation),
+            },
+        )
+        .await;
+
+        assert_eq!(result["skipped"], "session replaced");
+        assert_eq!(*state.protocol.read().await, before);
+    }
+
+    #[tokio::test]
+    async fn session_end_active_accounting_matches_reaping() {
+        let observed_at = chrono::Utc::now().timestamp();
+        let metadata = crate::daemon_protocol::SessionMeta {
+            project_dir: Some("/tmp/accounting".into()),
+            canonical_project_identity: Some("/tmp/repository".into()),
+            backend: Some("claude-code".into()),
+            backend_session_id: Some("claude-session-accounting".into()),
+            fresh_context_after_active_secs: Some(60),
+            active_context_accumulated_secs: 10,
+            active_context_segment_started_at: Some(observed_at.saturating_sub(5)),
+            ..Default::default()
+        };
+        let clean_exit = crate::state::AppState::new_for_test();
+        clean_exit
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%90".into()),
+                metadata: metadata.clone(),
+            })
+            .await;
+        let clean_owner = clean_exit.protocol.read().await.sessions["worker"].owner();
+        assert_eq!(
+            session_end_inner(
+                &clean_exit,
+                PaneBody {
+                    pane: Some("%90".into()),
+                    backend_session_id: Some("claude-session-accounting".into()),
+                    session_incarnation: Some(clean_owner.incarnation),
+                },
+            )
+            .await["dormant"],
+            "worker"
+        );
+        let clean_dormant = clean_exit.protocol.read().await.dormant_sessions["worker"].clone();
+
+        let reaped = crate::state::AppState::new_for_test();
+        reaped
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%90".into()),
+                metadata,
+            })
+            .await;
+        let reaped_owner = reaped.protocol.read().await.sessions["worker"].owner();
+        assert_eq!(
+            reaped
+                .dormant_owned(
+                    reaped_owner,
+                    Some("%90".into()),
+                    clean_dormant.dormant_at,
+                    crate::daemon_protocol::DormancySource::Reaped,
+                )
+                .await,
+            crate::state::DormantOwnedOutcome::Dormant {
+                id: "worker".into()
+            }
+        );
+        let reaped_metadata = reaped.protocol.read().await.dormant_sessions["worker"]
+            .metadata
+            .clone();
+
+        assert_eq!(clean_dormant.metadata, reaped_metadata);
+    }
+
+    #[tokio::test]
+    async fn session_end_persistence_failure_keeps_live_owner_and_reports_error() {
+        let config = crate::state::tests::test_config();
+        let state = crate::state::AppState::new(config.clone());
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%90".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/worker".into()),
+                    canonical_project_identity: Some("/tmp/repository".into()),
+                    backend: Some("claude-code".into()),
+                    backend_session_id: Some("claude-session-failure".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["worker"].owner();
+        assert!(
+            state
+                .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Active)
+                .await
+        );
+        let before = state.protocol.read().await.clone();
+        std::fs::create_dir(config.data_dir.join("sessions.tmp")).unwrap();
+
+        let (status, Json(result)) = session_end(
+            State(state.clone()),
+            Json(PaneBody {
+                pane: Some("%90".into()),
+                backend_session_id: Some("claude-session-failure".into()),
+                session_incarnation: Some(owner.incarnation),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(result["error"], "failed to persist session dormancy");
+        assert!(result.get("dormant").is_none());
+        assert!(result.get("removed").is_none());
+        assert_eq!(*state.protocol.read().await, before);
+        assert!(
+            state
+                .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Active)
+                .await
+        );
     }
 
     #[tokio::test]
