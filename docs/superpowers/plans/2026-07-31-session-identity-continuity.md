@@ -186,7 +186,7 @@ pub(crate) enum NameResolution {
 }
 
 pub(crate) fn resolve_session_id(
-    sessions: &HashMap<String, SessionEntry>,
+    sessions: &BTreeMap<String, SessionEntry>,
     dormant: &BTreeMap<String, DormantSession>,
     requested: &str,
     mode: NameResolutionMode<'_>,
@@ -344,6 +344,35 @@ pub(crate) async fn claim_local_identity(
 ) -> LocalClaimOutcome;
 ```
 
+Use one persistence-atomic coordinator for every live-to-dormant transition:
+
+```rust
+pub(crate) enum DormancyOutcome {
+    Dormant { id: String, prior_owner: ResourceOwner },
+    Removed { id: String, prior_owner: ResourceOwner },
+    Superseded,
+    LeaseConflict,
+    PersistenceFailed(String),
+}
+
+pub(crate) async fn dormant_owned(
+    self: &Arc<Self>,
+    owner: ResourceOwner,
+    expected_pane: Option<&str>,
+    observed_at: i64,
+    source: DormancySource,
+) -> DormancyOutcome;
+```
+
+`dormant_owned` acquires the owner ID, pane, backend-pair, and canonical-project
+gates; clones the protocol; applies exactly one `Event::DormantOwned`; persists
+the complete candidate; installs the candidate only after persistence succeeds;
+then executes its non-`PersistSessions` effects. `Dormant` means the pure
+transition replaced the live row with a tombstone. `Removed` means that same
+pure transition removed an ineligible exact row. On persistence failure the
+original live row remains authoritative, no tombstone is installed, and no
+pane/agent/announcement effect runs.
+
 Implement dormant recovery as a separate resource-gated coordinator reused by
 SessionStart and claim:
 
@@ -371,7 +400,7 @@ versioned snapshot. Change the constructor to:
 PersistedLifecycleState::new(
     sessions: Vec<PersistedSession>,
     dormant_sessions: BTreeMap<String, DormantSession>,
-    incarnation_high_water: BTreeMap<String, SessionIncarnation>,
+    incarnation_high_water: SessionIncarnation,
     lifecycle_leases: BTreeMap<String, LifecycleLease>,
 ) -> Self
 ```
@@ -393,6 +422,7 @@ forgotten. Reconciliation persists schema v2 atomically.
 
 **Files:**
 
+- Modify: `src/state.rs` for the shared `LocalClaimEvidence` contract
 - Modify: `src/api.rs` tests near the existing `rename_claims_*` regressions
 - Modify: `src/api.rs` request/handler declarations
 - Modify: `src/server.rs` route table
@@ -430,6 +460,9 @@ stub so the tests fail for the intended behavioral reason.
   )
   ```
 
+  Define `LocalClaimEvidence` in `state.rs` exactly as mapped above; define
+  only `LocalClaimRequest` and the HTTP handler in `api.rs`.
+
 - [ ] Run the executable red contract:
 
   ```bash
@@ -442,7 +475,7 @@ stub so the tests fail for the intended behavioral reason.
 - [ ] Commit the contract tests and temporary stub:
 
   ```bash
-  git add src/api.rs src/server.rs
+  git add src/state.rs src/api.rs src/server.rs
   git commit -m "test: pin explicit local claim contract"
   ```
 
@@ -519,7 +552,7 @@ resource fields.
 
 - [ ] Add red name tests: automatic mode suffixes across both maps; exact mode
   returns live occupied, dormant occupied, same-owner idempotent, and never
-  suffixes.
+  suffixes. Prefix their function names with `resolve_session_id_`.
 - [ ] Add red tests for:
   eligible reap dormancy; equivalent trusted SessionEnd dormancy; stale owner
   no-op; incomplete-pair/ineligible-project removal; lease rejection; active
@@ -527,7 +560,8 @@ resource fields.
   provisional preservation; recovery parked state and provisional
   finalization; metadata preservation; strictly newer incarnation; retry;
   claim creation/idempotency; every live/dormant ID/pane/pair/project/lease
-  conflict; and dormant unregister without cleanup effect.
+  conflict; and dormant unregister without cleanup effect. Prefix dormancy
+  functions with `dormant_` and pure-claim functions with `claim_`.
 - [ ] Keep and strengthen the existing red occupied-rename regression: compare
   the complete source and destination entries before/after. Add dormant
   destination and same-ID idempotency cases.
@@ -589,30 +623,30 @@ resource fields.
 - Modify: `src/main.rs`
 - Test: inline persistence and startup tests
 
-**Consumes:** Complete live state, dormant map, high-water map, lifecycle
-leases.
+**Consumes:** Complete live state, dormant map, monotonic high-water value,
+lifecycle leases.
 
 **Produces:** Backward-compatible v2 snapshots and fail-closed validation.
 
 - [ ] Add red fixtures/tests for legacy arrays, v1-to-empty-dormant migration,
-  v2 round-trip, unknown-version refusal, high-water normalization, malformed
-  key/embedded-owner records, incomplete pairs, unsafe/open-segment tombstones,
-  live/dormant ID collisions, pair collisions across live/dormant/leases, and
-  timestamp/source/parked-accounting round-trip.
-- [ ] Add startup red tests proving dead eligible v1 rows are parked, dormant
-  rows survive reconciliation, and dormant backend/worktree sharers suppress
+  v2 round-trip, unknown-version refusal, monotonic high-water value
+  normalization, malformed key/embedded-owner records, incomplete pairs,
+  unsafe/open-segment tombstones, live/dormant ID collisions, pair collisions
+  across live/dormant/leases, and timestamp/source/parked-accounting round-trip.
+- [ ] Add startup red tests proving already-persisted dormant rows restore
+  before reconciliation and their backend/worktree ownership suppresses
   abandoned cleanup.
 - [ ] Run red:
 
   ```bash
   cargo test persistence::tests -- --nocapture
-  cargo test main::tests::restore_persisted -- --nocapture
+  cargo test tests::restore_persisted -- --nocapture
   ```
 
 - [ ] Set schema version 2, add the serde-defaulted map, implement the
   four-argument constructor, and explicitly accept only legacy, v1, and v2.
-- [ ] Normalize/validate against one combined ownership index. Include dormant
-  prior owners in incarnation high-water.
+- [ ] Normalize/validate against one combined ownership index. Raise the single
+  monotonic incarnation high-water value to include dormant prior owners.
 - [ ] Update every `PersistedLifecycleState::new` and
   `persist_sessions_from` call. Include dormancy in `persist_protocol_state`.
 - [ ] Restore dormancy before abandoned leases. Derive missing v1 canonical
@@ -621,7 +655,7 @@ leases.
 
   ```bash
   cargo test persistence::tests -- --nocapture
-  cargo test main::tests::restore_persisted -- --nocapture
+  cargo test tests::restore_persisted -- --nocapture
   ```
 
 - [ ] Commit:
@@ -644,22 +678,42 @@ leases.
 exact tombstone, and resource gates.
 
 **Produces:** Atomic persistence-backed recovery reused by SessionStart and
-claim; reaper parks rather than forgets eligible owners.
+claim; one atomic dormancy coordinator reused by startup, reaper, and trusted
+SessionEnd.
 
+- [ ] Add red `AppState::dormant_owned` tests for eligible parking, ineligible
+  exact removal, stale owner, lease conflict, and persistence failure. Both
+  eligible and ineligible persistence failures must preserve the original live
+  row, install no tombstone, and execute no external effect. Prefix these
+  functions with `dormant_owned_`.
+- [ ] Add a startup red test proving a dead eligible persisted live row is
+  inserted as live authority and then parked through
+  `AppState::dormant_owned`, with the startup observation timestamp. Name it
+  `restore_dead_live_row_uses_atomic_dormancy_coordinator`.
+- [ ] Add a reaper red test named
+  `reaper_uses_atomic_dormancy_coordinator` that observes the same persisted
+  outcome through the sweep boundary.
 - [ ] Add red state tests for recovery success, persistence failure rollback,
   stale tombstone, changed project, live prior ID, foreign/reserved pane,
   foreign/reserved pair, project lease, retry, and recovery precedence before
-  generic registration/home guard.
+  generic registration/home guard. Prefix these functions with
+  `recover_dormant_`.
 - [ ] Preserve the existing unstaged `%802`/`%819` rootfix Codex regression and
   expand it to assert arbitrary public ID, complete lifecycle metadata, parked
   accounting, and strictly newer incarnation.
 - [ ] Run red:
 
   ```bash
-  cargo test hooks::tests::session_start_recovers_reaped_codex_identity -- --nocapture
+  cargo test hooks::tests::resumed_backend_recovers_reaped_public_id_and_lifecycle_metadata -- --exact --nocapture
+  cargo test state::tests::dormant_owned -- --nocapture
   cargo test state::tests::recover_dormant -- --nocapture
+  cargo test tests::restore_dead_live_row_uses_atomic_dormancy_coordinator -- --exact --nocapture
+  cargo test tests::reaper_uses_atomic_dormancy_coordinator -- --exact --nocapture
   ```
 
+- [ ] Implement `AppState::dormant_owned` with the coordinator contract mapped
+  above. Persist the candidate before swapping protocol state or executing any
+  non-persistence effect.
 - [ ] Implement `AppState::recover_dormant_session` using the existing
   `recover_backend_identity` pattern: collect candidate, acquire all event
   resource gates, freshly inspect pane/backend/project/marker, clone protocol,
@@ -669,16 +723,20 @@ claim; reaper parks rather than forgets eligible owners.
   tombstone that fails corroboration returns a closed failure and never falls
   through.
 - [ ] Capture reaper `observed_at` when pane death is confirmed. Apply
-  `DormantOwned` for eligible rows; use exact removal only when the pure event
-  reports `tombstoned: false`.
+  dormancy only through `AppState::dormant_owned`. Startup dead-row
+  reconciliation uses the same coordinator after restoring the live row. Do
+  not apply a second removal when the outcome is `Removed`; the one pure
+  transition already removed and persisted the ineligible exact row.
 - [ ] Ensure recovery effects set pane markers, start the session agent, and
   re-announce only after persistence success.
 - [ ] Run green:
 
   ```bash
-  cargo test hooks::tests::session_start_recovers_reaped_codex_identity -- --nocapture
+  cargo test hooks::tests::resumed_backend_recovers_reaped_public_id_and_lifecycle_metadata -- --exact --nocapture
+  cargo test state::tests::dormant_owned -- --nocapture
   cargo test state::tests::recover_dormant -- --nocapture
-  cargo test main::tests::reaper_ -- --nocapture
+  cargo test tests::restore_dead_live_row_uses_atomic_dormancy_coordinator -- --exact --nocapture
+  cargo test tests::reaper_uses_atomic_dormancy_coordinator -- --exact --nocapture
   ```
 
 - [ ] Commit:
@@ -696,13 +754,15 @@ claim; reaper parks rather than forgets eligible owners.
 - Test: inline hook tests
 
 **Consumes:** Trusted SessionEnd resolved to exact incarnation plus pane or
-backend pair.
+backend pair, and `AppState::dormant_owned`.
 
 **Produces:** Clean Claude exit dormancy with visible response semantics.
 
 - [ ] Add red tests for eligible clean Claude exit, clean-exit/replacement-pane
   recovery, incomplete row removal, stale/superseded callback no-op, lease
-  conflict, and active-segment accounting equivalence with reaping.
+  conflict, active-segment accounting equivalence with reaping, and persistence
+  failure. The failure case asserts the live row remains, no tombstone appears,
+  no external dormancy effect executes, and the hook does not report success.
 - [ ] Run red:
 
   ```bash
@@ -710,10 +770,12 @@ backend pair.
   ```
 
 - [ ] Replace `Event::RemoveOwned` in `session_end_inner` with
-  `Event::DormantOwned { source: TrustedSessionEnd, observed_at: Utc::now().timestamp(), ... }`.
+  `AppState::dormant_owned(..., DormancySource::TrustedSessionEnd)`. The hook
+  never calls `apply_and_execute(Event::DormantOwned)` directly.
 - [ ] Map effects exactly:
   eligible park to `{"dormant":"<id>"}`, ineligible exact row to the existing
-  removed response, and stale owner to the existing skipped response.
+  removed response, stale owner to the existing skipped response, and
+  `PersistenceFailed` to an internal-error response without lifecycle success.
 - [ ] Confirm Codex remains no-SessionEnd and explicit `ouija unregister`
   remains intentional forget.
 - [ ] Run green:
@@ -751,9 +813,12 @@ identity signal.
   `auto_register=false`, replacement by newer same-pair observation, and
   rejection/invalidation for non-assistant pane, backend mismatch, foreign
   marker/owner, changed project, lease, stale pane, and daemon restart.
+  Prefix the state functions with `local_backend_pane_attestation_` and the
+  readiness function with `ready_records_attestation_`.
 - [ ] Add red backend/plugin tests proving `OpenCode::caller_session_id` reads
   only nonempty `OPENCODE_SESSION_ID` and embedded TypeScript defines
-  `shell.env` with `output.env.OPENCODE_SESSION_ID = input.sessionID`.
+  `shell.env` with `output.env.OPENCODE_SESSION_ID = input.sessionID`. Prefix
+  the focused backend functions with `caller_session_`.
 - [ ] Run red:
 
   ```bash
@@ -808,13 +873,14 @@ exact-name resolver, pure claim/recovery events.
   rollback; different requested ID with recovery precedence; and exact retry.
 - [ ] Add CLI parse/request tests. Use scoped environment mutation helpers
   already present in backend tests; serialize env-sensitive tests where
-  required.
+  required. Prefix coordinator functions with `claim_local_identity_`, API
+  functions with `claim_`, and root `main.rs` CLI functions with `claim_`.
 - [ ] Run red:
 
   ```bash
   cargo test api::tests::claim_ -- --nocapture
   cargo test state::tests::claim_local_identity -- --nocapture
-  cargo test main::tests::claim_ -- --nocapture
+  cargo test tests::claim_ -- --nocapture
   ```
 
   Expected: Task 1 tests still fail on the `501` stub.
@@ -837,7 +903,7 @@ exact-name resolver, pure claim/recovery events.
   ```bash
   cargo test api::tests::claim_ -- --nocapture
   cargo test state::tests::claim_local_identity -- --nocapture
-  cargo test main::tests::claim_ -- --nocapture
+  cargo test tests::claim_ -- --nocapture
   ```
 
 - [ ] Commit:
@@ -865,11 +931,13 @@ exact-name resolver, pure claim/recovery events.
   absence of credentials/reservations/pending/routability, encoded IDs,
   missing target, dormant unregister result, worktree preservation, and
   structured dormant rename/claim remediation.
+  Prefix API and root `main.rs` inspection functions with `dormant_`; name the
+  rename diagnostic function `rename_destination_dormant`.
 - [ ] Run red:
 
   ```bash
   cargo test api::tests::dormant_ -- --nocapture
-  cargo test main::tests::dormant_ -- --nocapture
+  cargo test tests::dormant_ -- --nocapture
   cargo test api::tests::rename_destination_dormant -- --nocapture
   ```
 
@@ -890,7 +958,7 @@ exact-name resolver, pure claim/recovery events.
 
   ```bash
   cargo test api::tests::dormant_ -- --nocapture
-  cargo test main::tests::dormant_ -- --nocapture
+  cargo test tests::dormant_ -- --nocapture
   cargo test api::tests::rename_destination_dormant -- --nocapture
   ```
 
@@ -920,7 +988,8 @@ managed reservation, backend bind/adopt/rebind, rename, claim, and recovery.
   tombstoned destination ID, tombstoned backend pair, live/dormant pane,
   foreign Local/Remote/Human owner, and ID/pane/pair/project lifecycle lease.
 - [ ] Include same-owner retries and stale exact callbacks. Assert the complete
-  protocol snapshot is unchanged on every rejection.
+  protocol snapshot is unchanged on every rejection. Prefix every table
+  function with `dormant_conflict_`.
 - [ ] Run red:
 
   ```bash
@@ -970,7 +1039,7 @@ managed reservation, backend bind/adopt/rebind, rename, claim, and recovery.
 - [ ] Run the focused red model before updating the old expectation:
 
   ```bash
-  cargo test model_check_rename_occupied -- --ignored --nocapture
+  cargo test daemon_protocol::stateright_model::model_check_occupied_rename_bfs -- --exact --ignored --nocapture
   ```
 
   Expected before the assertion update: the old “counterexample exists”
@@ -979,7 +1048,7 @@ managed reservation, backend bind/adopt/rebind, rename, claim, and recovery.
 - [ ] Update the focused assertion to require no counterexample and run green:
 
   ```bash
-  cargo test model_check_rename_occupied -- --ignored --nocapture
+  cargo test daemon_protocol::stateright_model::model_check_occupied_rename_bfs -- --exact --ignored --nocapture
   cargo test model_check_bfs -- --ignored --nocapture
   ```
 
