@@ -16392,6 +16392,10 @@ mod stateright_model {
             old_id: String,
             new_id: String,
         },
+        /// Focused collision sequence used to prove rename never evicts an
+        /// already-live destination owner.
+        RenameOccupied,
+        Identity(IdentityAction),
         // Wire protocol (daemon -> daemon)
         WireAnnounce {
             id: String,
@@ -16463,6 +16467,8 @@ mod stateright_model {
         CompleteRestart(String),
         StaleReap(String),
         Rename(String, String),
+        RenameOccupied,
+        Identity(IdentityAction),
         Send {
             from: String,
             to: String,
@@ -16491,6 +16497,23 @@ mod stateright_model {
         LifecycleDriver {
             target: Id,
         },
+        IdentityDriver {
+            target: Id,
+        },
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    enum IdentityAction {
+        DormantEligible,
+        DormantIneligible,
+        TrustedSessionEnd,
+        Recover,
+        Claim,
+        ForgetDormant,
+        StaleOwnerCallback,
+        ConflictingResources,
+        ActiveStopBoundaries,
+        PureRetries,
     }
 
     #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -16508,6 +16531,20 @@ mod stateright_model {
             last_was_reap: bool,
             /// Once false, a stale delayed result removed or replaced its winner.
             stale_result_preserved: bool,
+            /// Once false, a rename replaced a pre-existing destination owner.
+            occupied_rename_preserved: bool,
+            /// Once false, claim or recovery replaced a conflicting owner.
+            identity_destination_preserved: bool,
+            /// Once false, a recovery retry consumed or replaced state twice.
+            tombstone_consumed_once: bool,
+            /// Once false, a recovered owner failed to advance incarnation.
+            recovered_incarnation_advanced: bool,
+            /// Once false, an identity transition emitted worktree deletion.
+            identity_transition_no_cleanup: bool,
+            /// Once false, dormancy/recovery decreased accumulated active time.
+            dormant_accounting_monotonic: bool,
+            /// Bitset of identity-continuity actions exercised in this state.
+            identity_action_mask: u16,
         },
         Driver {
             actions_taken: u8,
@@ -16516,6 +16553,7 @@ mod stateright_model {
 
     const MAX_DRIVER_ACTIONS: u8 = 2;
     const MAX_LIFECYCLE_ACTIONS: u8 = 5;
+    const MAX_IDENTITY_ACTIONS: u8 = 1;
 
     #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
     enum SendOutcome {
@@ -16564,6 +16602,13 @@ mod stateright_model {
                     last_cleaned_worktrees: BTreeSet::new(),
                     last_was_reap: false,
                     stale_result_preserved: true,
+                    occupied_rename_preserved: true,
+                    identity_destination_preserved: true,
+                    tombstone_consumed_once: true,
+                    recovered_incarnation_advanced: true,
+                    identity_transition_no_cleanup: true,
+                    dormant_accounting_monotonic: true,
+                    identity_action_mask: 0,
                 },
                 Self::SessionDriver { .. } => {
                     offer_actions(o);
@@ -16571,6 +16616,10 @@ mod stateright_model {
                 }
                 Self::LifecycleDriver { .. } => {
                     offer_lifecycle_actions(o);
+                    ModelState::Driver { actions_taken: 0 }
+                }
+                Self::IdentityDriver { .. } => {
+                    offer_identity_actions(o);
                     ModelState::Driver { actions_taken: 0 }
                 }
             }
@@ -16598,12 +16647,67 @@ mod stateright_model {
                 last_cleaned_worktrees,
                 last_was_reap,
                 stale_result_preserved,
+                occupied_rename_preserved,
+                identity_destination_preserved,
+                tombstone_consumed_once,
+                recovered_incarnation_advanced,
+                identity_transition_no_cleanup,
+                dormant_accounting_monotonic,
+                identity_action_mask,
             } = s
             else {
                 return;
             };
 
             match msg {
+                ModelMsg::RenameOccupied => {
+                    let source_id = "occupied-source";
+                    let destination_id = "occupied-destination";
+                    ds.apply(Event::Register {
+                        id: source_id.into(),
+                        pane: Some("model-pane-occupied-source".into()),
+                        metadata: SessionMeta::default(),
+                    });
+                    ds.apply(Event::Register {
+                        id: destination_id.into(),
+                        pane: Some("model-pane-occupied-destination".into()),
+                        metadata: SessionMeta::default(),
+                    });
+                    let source_before = ds.sessions[source_id].clone();
+                    let destination_before = ds.sessions[destination_id].clone();
+                    let effects = ds.apply(Event::Rename {
+                        old_id: source_id.into(),
+                        new_id: destination_id.into(),
+                    });
+                    *occupied_rename_preserved &= ds.sessions.get(source_id)
+                        == Some(&source_before)
+                        && ds.sessions.get(destination_id) == Some(&destination_before)
+                        && effects
+                            .iter()
+                            .any(|effect| matches!(effect, Effect::RenameFailed { .. }));
+                    normalize_timestamps(ds);
+                    *last_send_result = None;
+                    *last_event_type = LastEvent::Other;
+                    *last_cleaned_worktrees = extract_cleaned_worktrees(&effects);
+                    *last_was_reap = false;
+                    route_effects(ds, &effects, peers, o);
+                }
+                ModelMsg::Identity(action) => {
+                    let observation = apply_identity_action(ds, action);
+                    *identity_destination_preserved &= observation.destination_preserved;
+                    *stale_result_preserved &= observation.stale_winner_preserved;
+                    *tombstone_consumed_once &= observation.tombstone_consumed_once;
+                    *recovered_incarnation_advanced &= observation.recovered_incarnation_advanced;
+                    *identity_transition_no_cleanup &= observation.no_worktree_cleanup;
+                    *dormant_accounting_monotonic &= observation.accounting_monotonic;
+                    *identity_action_mask |= 1 << (action as u16);
+                    normalize_timestamps(ds);
+                    *last_send_result = None;
+                    *last_event_type = LastEvent::Other;
+                    *last_cleaned_worktrees = extract_cleaned_worktrees(&observation.effects);
+                    *last_was_reap = false;
+                    route_effects(ds, &observation.effects, peers, o);
+                }
                 // -- Register / Remove / Rename / Reap / Wire* shared path --
                 ModelMsg::Register { .. }
                 | ModelMsg::RegisterWithMeta { .. }
@@ -16980,7 +17084,10 @@ mod stateright_model {
             random: &Self::Random,
             o: &mut Out<Self>,
         ) {
-            if let Self::SessionDriver { target } | Self::LifecycleDriver { target } = self {
+            if let Self::SessionDriver { target }
+            | Self::LifecycleDriver { target }
+            | Self::IdentityDriver { target } = self
+            {
                 let s = state.to_mut();
                 if let ModelState::Driver { actions_taken } = s {
                     *actions_taken += 1;
@@ -17042,6 +17149,10 @@ mod stateright_model {
                                 new_id: new.clone(),
                             },
                         ),
+                        ModelAction::RenameOccupied => o.send(*target, ModelMsg::RenameOccupied),
+                        ModelAction::Identity(action) => {
+                            o.send(*target, ModelMsg::Identity(*action))
+                        }
                         ModelAction::Send {
                             from,
                             to,
@@ -17073,12 +17184,14 @@ mod stateright_model {
                     let max_actions = match self {
                         Self::SessionDriver { .. } => MAX_DRIVER_ACTIONS,
                         Self::LifecycleDriver { .. } => MAX_LIFECYCLE_ACTIONS,
+                        Self::IdentityDriver { .. } => MAX_IDENTITY_ACTIONS,
                         Self::Daemon { .. } => unreachable!(),
                     };
                     if *actions_taken < max_actions {
                         match self {
                             Self::SessionDriver { .. } => offer_actions(o),
                             Self::LifecycleDriver { .. } => offer_lifecycle_actions(o),
+                            Self::IdentityDriver { .. } => offer_identity_actions(o),
                             Self::Daemon { .. } => unreachable!(),
                         }
                     }
@@ -17099,6 +17212,353 @@ mod stateright_model {
                 e.last_activity = 0;
             }
         }
+    }
+
+    struct IdentityObservation {
+        effects: Vec<Effect>,
+        destination_preserved: bool,
+        stale_winner_preserved: bool,
+        tombstone_consumed_once: bool,
+        recovered_incarnation_advanced: bool,
+        no_worktree_cleanup: bool,
+        accounting_monotonic: bool,
+    }
+
+    impl IdentityObservation {
+        fn new() -> Self {
+            Self {
+                effects: Vec::new(),
+                destination_preserved: true,
+                stale_winner_preserved: true,
+                tombstone_consumed_once: true,
+                recovered_incarnation_advanced: true,
+                no_worktree_cleanup: true,
+                accounting_monotonic: true,
+            }
+        }
+
+        fn record(&mut self, effects: Vec<Effect>) {
+            self.no_worktree_cleanup &= !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CleanupWorktree { .. }));
+            self.effects.extend(effects);
+        }
+    }
+
+    fn model_identity_metadata(id: &str, recoverable: bool) -> SessionMeta {
+        SessionMeta {
+            project_dir: Some(format!("/model/worktrees/{id}")),
+            canonical_project_identity: Some(format!("/model/repositories/{id}")),
+            backend: recoverable.then(|| "codex-cli".into()),
+            backend_session_id: recoverable.then(|| format!("model-thread-{id}")),
+            fresh_context_after_active_secs: Some(5),
+            ..Default::default()
+        }
+    }
+
+    fn ensure_model_identity_live(
+        ds: &mut DaemonState,
+        id: &str,
+        recoverable: bool,
+    ) -> ResourceOwner {
+        if let Some(session) = ds.sessions.get(id) {
+            return session.owner();
+        }
+        ds.apply(Event::Register {
+            id: id.into(),
+            pane: Some(format!("model-pane-{id}")),
+            metadata: model_identity_metadata(id, recoverable),
+        });
+        ds.sessions[id].owner()
+    }
+
+    fn park_model_identity(ds: &mut DaemonState, id: &str, source: DormancySource) -> Vec<Effect> {
+        if ds.dormant_sessions.contains_key(id) {
+            return Vec::new();
+        }
+        let owner = ensure_model_identity_live(ds, id, true);
+        let pane = ds.sessions[id].pane.clone();
+        ds.apply(Event::DormantOwned {
+            owner,
+            expected_pane: pane,
+            observed_at: 20,
+            source,
+        })
+    }
+
+    fn model_recovery_event(ds: &DaemonState, id: &str) -> Option<Event> {
+        let (owner, metadata, canonical_project_identity) =
+            if let Some(dormant) = ds.dormant_sessions.get(id) {
+                (
+                    dormant.prior_owner.clone(),
+                    &dormant.metadata,
+                    dormant.canonical_project_identity.clone(),
+                )
+            } else {
+                let current = ds.sessions.get(id)?;
+                (
+                    ResourceOwner {
+                        session_id: id.into(),
+                        incarnation: SessionIncarnation(
+                            current.metadata.session_incarnation.0.saturating_sub(1),
+                        ),
+                    },
+                    &current.metadata,
+                    current.metadata.canonical_project_identity.clone()?,
+                )
+            };
+        Some(Event::RecoverDormantSession {
+            dormant_owner: owner,
+            pane: format!("model-pane-recovered-{id}"),
+            backend: metadata.backend.clone()?,
+            backend_session_id: metadata.backend_session_id.clone()?,
+            project_dir: metadata.project_dir.clone()?,
+            canonical_project_identity,
+        })
+    }
+
+    fn apply_identity_action(ds: &mut DaemonState, action: IdentityAction) -> IdentityObservation {
+        let mut observation = IdentityObservation::new();
+        match action {
+            IdentityAction::DormantEligible => {
+                let id = "identity-dormant-eligible";
+                if !ds.dormant_sessions.contains_key(id) {
+                    let owner = ensure_model_identity_live(ds, id, true);
+                    let metadata = &mut ds.sessions.get_mut(id).unwrap().metadata;
+                    metadata.active_context_accumulated_secs = 3;
+                    metadata.active_context_segment_started_at = Some(10);
+                    let before = metadata.active_context_accumulated_secs;
+                    let pane = ds.sessions[id].pane.clone();
+                    observation.record(ds.apply(Event::DormantOwned {
+                        owner,
+                        expected_pane: pane,
+                        observed_at: 20,
+                        source: DormancySource::Reaped,
+                    }));
+                    let dormant = &ds.dormant_sessions[id];
+                    observation.accounting_monotonic &=
+                        dormant.metadata.active_context_accumulated_secs >= before;
+                }
+            }
+            IdentityAction::DormantIneligible => {
+                let id = "identity-dormant-ineligible";
+                let owner = ensure_model_identity_live(ds, id, false);
+                let pane = ds.sessions[id].pane.clone();
+                observation.record(ds.apply(Event::DormantOwned {
+                    owner,
+                    expected_pane: pane,
+                    observed_at: 20,
+                    source: DormancySource::Reaped,
+                }));
+                observation.destination_preserved &=
+                    !ds.sessions.contains_key(id) && !ds.dormant_sessions.contains_key(id);
+            }
+            IdentityAction::TrustedSessionEnd => {
+                let id = "identity-trusted-end";
+                observation.record(park_model_identity(
+                    ds,
+                    id,
+                    DormancySource::TrustedSessionEnd,
+                ));
+                observation.destination_preserved &= ds
+                    .dormant_sessions
+                    .get(id)
+                    .is_some_and(|dormant| dormant.source == DormancySource::TrustedSessionEnd);
+            }
+            IdentityAction::Recover => {
+                let id = "identity-recover";
+                observation.record(park_model_identity(ds, id, DormancySource::Reaped));
+                let prior_owner = ds
+                    .dormant_sessions
+                    .get(id)
+                    .map(|dormant| dormant.prior_owner.clone())
+                    .or_else(|| {
+                        ds.sessions.get(id).map(|current| ResourceOwner {
+                            session_id: id.into(),
+                            incarnation: SessionIncarnation(
+                                current.metadata.session_incarnation.0.saturating_sub(1),
+                            ),
+                        })
+                    })
+                    .unwrap();
+                let accumulated_before = ds.dormant_sessions.get(id).map_or(0, |dormant| {
+                    dormant.metadata.active_context_accumulated_secs
+                });
+                let event = model_recovery_event(ds, id).unwrap();
+                observation.record(ds.apply(event));
+                let recovered = ds.sessions.get(id).unwrap();
+                observation.recovered_incarnation_advanced &=
+                    recovered.owner().incarnation > prior_owner.incarnation;
+                observation.accounting_monotonic &=
+                    recovered.metadata.active_context_accumulated_secs >= accumulated_before;
+                let before_retry = ds.clone();
+                let retry = model_recovery_event(ds, id).unwrap();
+                observation.record(ds.apply(retry));
+                observation.tombstone_consumed_once &=
+                    !ds.dormant_sessions.contains_key(id) && *ds == before_retry;
+            }
+            IdentityAction::Claim => {
+                let id = "identity-claim";
+                let event = || Event::ClaimLocalSession {
+                    requested_id: id.into(),
+                    pane: format!("model-pane-{id}"),
+                    backend: "codex-cli".into(),
+                    backend_session_id: format!("model-thread-{id}"),
+                    project_dir: format!("/model/worktrees/{id}"),
+                    canonical_project_identity: format!("/model/repositories/{id}"),
+                };
+                observation.record(ds.apply(event()));
+                let before_retry = ds.clone();
+                observation.record(ds.apply(event()));
+                observation.tombstone_consumed_once &= *ds == before_retry;
+            }
+            IdentityAction::ForgetDormant => {
+                let id = "identity-forget";
+                observation.record(park_model_identity(ds, id, DormancySource::Reaped));
+                observation.record(ds.apply(Event::Remove {
+                    id: id.into(),
+                    keep_worktree: false,
+                }));
+                observation.destination_preserved &= !ds.dormant_sessions.contains_key(id);
+            }
+            IdentityAction::StaleOwnerCallback => {
+                let id = "identity-stale";
+                let owner = ensure_model_identity_live(ds, id, true);
+                let before = ds.clone();
+                observation.record(ds.apply(Event::DormantOwned {
+                    owner: ResourceOwner {
+                        session_id: id.into(),
+                        incarnation: SessionIncarnation(owner.incarnation.0.saturating_sub(1)),
+                    },
+                    expected_pane: Some(format!("model-pane-{id}")),
+                    observed_at: 20,
+                    source: DormancySource::Reaped,
+                }));
+                observation.stale_winner_preserved &= *ds == before;
+
+                let recovery_id = "identity-stale-recovery";
+                observation.record(park_model_identity(ds, recovery_id, DormancySource::Reaped));
+                let dormant = ds.dormant_sessions[recovery_id].clone();
+                let before_recovery = ds.clone();
+                observation.record(ds.apply(Event::RecoverDormantSession {
+                    dormant_owner: ResourceOwner {
+                        session_id: recovery_id.into(),
+                        incarnation: SessionIncarnation(
+                            dormant.prior_owner.incarnation.0.saturating_sub(1),
+                        ),
+                    },
+                    pane: format!("model-pane-recovered-{recovery_id}"),
+                    backend: dormant.metadata.backend.unwrap(),
+                    backend_session_id: dormant.metadata.backend_session_id.unwrap(),
+                    project_dir: dormant.metadata.project_dir.unwrap(),
+                    canonical_project_identity: dormant.canonical_project_identity,
+                }));
+                observation.stale_winner_preserved &= *ds == before_recovery;
+            }
+            IdentityAction::ConflictingResources => {
+                let destination = "identity-conflict-destination";
+                ensure_model_identity_live(ds, destination, true);
+                let before_claim = ds.clone();
+                observation.record(ds.apply(Event::ClaimLocalSession {
+                    requested_id: destination.into(),
+                    pane: "model-pane-foreign-claim".into(),
+                    backend: "codex-cli".into(),
+                    backend_session_id: "model-thread-foreign-claim".into(),
+                    project_dir: "/model/worktrees/foreign-claim".into(),
+                    canonical_project_identity: "/model/repositories/foreign-claim".into(),
+                }));
+                observation.destination_preserved &= *ds == before_claim;
+
+                let recovery_id = "identity-conflict-recovery";
+                observation.record(park_model_identity(ds, recovery_id, DormancySource::Reaped));
+                ensure_model_identity_live(ds, "identity-conflict-pane-owner", true);
+                ds.sessions
+                    .get_mut("identity-conflict-pane-owner")
+                    .unwrap()
+                    .pane = Some(format!("model-pane-recovered-{recovery_id}"));
+                let before_recovery = ds.clone();
+                let event = model_recovery_event(ds, recovery_id).unwrap();
+                observation.record(ds.apply(event));
+                observation.destination_preserved &= *ds == before_recovery;
+
+                let lease_id = "identity-conflict-lease";
+                if !ds.lifecycle_leases.contains_key(lease_id) {
+                    let _ = ds.reserve_start(lease_id);
+                    let lease = ds.lifecycle_leases.get_mut(lease_id).unwrap();
+                    lease.backend = Some("codex-cli".into());
+                    lease.backend_session_id = Some("model-thread-leased".into());
+                    lease.backend_session_owner = Some(lease.owner.clone());
+                }
+                let before_lease_claim = ds.clone();
+                observation.record(ds.apply(Event::ClaimLocalSession {
+                    requested_id: "identity-conflict-lease-claim".into(),
+                    pane: "model-pane-lease-claim".into(),
+                    backend: "codex-cli".into(),
+                    backend_session_id: "model-thread-leased".into(),
+                    project_dir: "/model/worktrees/lease-claim".into(),
+                    canonical_project_identity: "/model/repositories/lease-claim".into(),
+                }));
+                observation.destination_preserved &= *ds == before_lease_claim;
+            }
+            IdentityAction::ActiveStopBoundaries => {
+                let id = "identity-active-stop";
+                if ds.dormant_sessions.contains_key(id) {
+                    let event = model_recovery_event(ds, id).unwrap();
+                    observation.record(ds.apply(event));
+                }
+                let owner = ensure_model_identity_live(ds, id, true);
+                let accumulated_before = ds.sessions[id].metadata.active_context_accumulated_secs;
+                observation.record(ds.apply(Event::ActiveContextActive {
+                    owner: owner.clone(),
+                    at: 10,
+                }));
+                observation.record(ds.apply(Event::ActiveContextStopped {
+                    owner: owner.clone(),
+                    at: 20,
+                }));
+                observation.accounting_monotonic &=
+                    ds.sessions[id].metadata.active_context_accumulated_secs >= accumulated_before;
+                let pane = ds.sessions[id].pane.clone();
+                observation.record(ds.apply(Event::DormantOwned {
+                    owner,
+                    expected_pane: pane,
+                    observed_at: 25,
+                    source: DormancySource::Reaped,
+                }));
+                let dormant_accumulated = ds.dormant_sessions[id]
+                    .metadata
+                    .active_context_accumulated_secs;
+                let recover = model_recovery_event(ds, id).unwrap();
+                observation.record(ds.apply(recover));
+                observation.accounting_monotonic &=
+                    ds.sessions[id].metadata.active_context_accumulated_secs >= dormant_accumulated;
+            }
+            IdentityAction::PureRetries => {
+                let claim_id = "identity-retry-claim";
+                let claim = || Event::ClaimLocalSession {
+                    requested_id: claim_id.into(),
+                    pane: format!("model-pane-{claim_id}"),
+                    backend: "codex-cli".into(),
+                    backend_session_id: format!("model-thread-{claim_id}"),
+                    project_dir: format!("/model/worktrees/{claim_id}"),
+                    canonical_project_identity: format!("/model/repositories/{claim_id}"),
+                };
+                observation.record(ds.apply(claim()));
+                let before_claim_retry = ds.clone();
+                observation.record(ds.apply(claim()));
+                observation.tombstone_consumed_once &= *ds == before_claim_retry;
+
+                let recovery_id = "identity-retry-recovery";
+                observation.record(park_model_identity(ds, recovery_id, DormancySource::Reaped));
+                let recover = model_recovery_event(ds, recovery_id).unwrap();
+                observation.record(ds.apply(recover));
+                let before_recovery_retry = ds.clone();
+                let retry = model_recovery_event(ds, recovery_id).unwrap();
+                observation.record(ds.apply(retry));
+                observation.tombstone_consumed_once &= *ds == before_recovery_retry;
+            }
+        }
+        observation
     }
 
     fn extract_send_outcome(effects: &[Effect]) -> Option<SendOutcome> {
@@ -17309,6 +17769,25 @@ mod stateright_model {
                 ModelAction::StageRestart(id.clone()),
                 ModelAction::CompleteRestart(id.clone()),
                 ModelAction::StaleReap(id),
+                ModelAction::RenameOccupied,
+            ],
+        );
+    }
+
+    fn offer_identity_actions(o: &mut Out<ModelActor>) {
+        o.choose_random(
+            "identity-action",
+            vec![
+                ModelAction::Identity(IdentityAction::DormantEligible),
+                ModelAction::Identity(IdentityAction::DormantIneligible),
+                ModelAction::Identity(IdentityAction::TrustedSessionEnd),
+                ModelAction::Identity(IdentityAction::Recover),
+                ModelAction::Identity(IdentityAction::Claim),
+                ModelAction::Identity(IdentityAction::ForgetDormant),
+                ModelAction::Identity(IdentityAction::StaleOwnerCallback),
+                ModelAction::Identity(IdentityAction::ConflictingResources),
+                ModelAction::Identity(IdentityAction::ActiveStopBoundaries),
+                ModelAction::Identity(IdentityAction::PureRetries),
             ],
         );
     }
@@ -17695,21 +18174,162 @@ mod stateright_model {
         state: &<ActorModel<ModelActor, ()> as Model>::State,
     ) -> bool {
         daemon_states(&state.actor_states).iter().all(|ds| {
-            let mut pairs = BTreeSet::new();
-            ds.sessions.values().all(|session| {
-                if !matches!(session.origin, Origin::Local) {
+            fn record_pair(
+                owners: &mut BTreeMap<(String, String), ResourceOwner>,
+                backend: Option<&str>,
+                backend_session_id: Option<&str>,
+                owner: &ResourceOwner,
+            ) -> bool {
+                let (Some(backend), Some(backend_session_id)) = (backend, backend_session_id)
+                else {
                     return true;
+                };
+                let key = (backend.into(), backend_session_id.into());
+                owners.get(&key).is_none_or(|existing| existing == owner) && {
+                    owners.insert(key, owner.clone());
+                    true
                 }
-                match (
-                    session.metadata.backend.as_deref(),
-                    session.metadata.backend_session_id.as_deref(),
+            }
+
+            let mut owners = BTreeMap::new();
+            for session in ds.sessions.values() {
+                if matches!(session.origin, Origin::Local)
+                    && !record_pair(
+                        &mut owners,
+                        session.metadata.backend.as_deref(),
+                        session.metadata.backend_session_id.as_deref(),
+                        &session.owner(),
+                    )
+                {
+                    return false;
+                }
+            }
+            for dormant in ds.dormant_sessions.values() {
+                if !record_pair(
+                    &mut owners,
+                    dormant.metadata.backend.as_deref(),
+                    dormant.metadata.backend_session_id.as_deref(),
+                    &dormant.prior_owner,
                 ) {
-                    (Some(backend), Some(session_id)) => {
-                        pairs.insert((backend.to_string(), session_id.to_string()))
-                    }
-                    _ => true,
+                    return false;
                 }
-            })
+            }
+            for lease in ds.lifecycle_leases.values() {
+                let owner = lease.backend_session_owner.as_ref().unwrap_or(&lease.owner);
+                if !record_pair(
+                    &mut owners,
+                    lease.backend.as_deref(),
+                    lease.backend_session_id.as_deref(),
+                    owner,
+                ) {
+                    return false;
+                }
+            }
+            true
+        })
+    }
+
+    fn check_destinations_preserve_existing_owners(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        state.actor_states.iter().all(|actor| {
+            !matches!(
+                actor.as_ref(),
+                ModelState::Daemon {
+                    occupied_rename_preserved: false,
+                    ..
+                } | ModelState::Daemon {
+                    identity_destination_preserved: false,
+                    ..
+                }
+            )
+        })
+    }
+
+    fn check_tombstones_consumed_once(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        state.actor_states.iter().all(|actor| {
+            !matches!(
+                actor.as_ref(),
+                ModelState::Daemon {
+                    tombstone_consumed_once: false,
+                    ..
+                }
+            )
+        })
+    }
+
+    fn check_recovered_incarnation_advanced(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        state.actor_states.iter().all(|actor| {
+            !matches!(
+                actor.as_ref(),
+                ModelState::Daemon {
+                    recovered_incarnation_advanced: false,
+                    ..
+                }
+            )
+        })
+    }
+
+    fn check_identity_transitions_never_clean_worktrees(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        state.actor_states.iter().all(|actor| {
+            !matches!(
+                actor.as_ref(),
+                ModelState::Daemon {
+                    identity_transition_no_cleanup: false,
+                    ..
+                }
+            )
+        })
+    }
+
+    fn check_dormant_segments_are_closed(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        daemon_states(&state.actor_states).iter().all(|ds| {
+            ds.dormant_sessions
+                .values()
+                .all(|dormant| dormant.metadata.active_context_segment_started_at.is_none())
+        })
+    }
+
+    fn check_dormant_accounting_never_decreases(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        state.actor_states.iter().all(|actor| {
+            !matches!(
+                actor.as_ref(),
+                ModelState::Daemon {
+                    dormant_accounting_monotonic: false,
+                    ..
+                }
+            )
+        })
+    }
+
+    fn check_some_identity_action(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        state.actor_states.iter().any(|actor| {
+            matches!(
+                actor.as_ref(),
+                ModelState::Daemon {
+                    identity_action_mask,
+                    ..
+                } if *identity_action_mask != 0
+            )
         })
     }
 
@@ -17842,9 +18462,96 @@ mod stateright_model {
                 check_reap_never_cleans_worktree,
             )
             .property(
+                Expectation::Always,
+                "occupied rename preserves both owners",
+                check_destinations_preserve_existing_owners,
+            )
+            .property(
                 Expectation::Sometimes,
                 "lifecycle lease exercised",
                 check_some_lifecycle_lease,
+            )
+    }
+
+    fn build_rename_collision_model() -> ActorModel<ModelActor, ()> {
+        let daemon = Id::from(0usize);
+        ActorModel::new((), ())
+            .actor(ModelActor::Daemon {
+                daemon_id: "npub-rename".into(),
+                daemon_name: "host-rename".into(),
+                peers: vec![],
+            })
+            .actor(ModelActor::LifecycleDriver { target: daemon })
+            .init_network(Network::new_unordered_nonduplicating([]))
+            .property(
+                Expectation::Always,
+                "occupied rename preserves both owners",
+                check_destinations_preserve_existing_owners,
+            )
+            .within_boundary(|_, state| {
+                state.actor_states.iter().all(|actor| {
+                    !matches!(
+                        actor.as_ref(),
+                        ModelState::Driver { actions_taken } if *actions_taken > 1
+                    )
+                })
+            })
+    }
+
+    fn build_identity_continuity_model() -> ActorModel<ModelActor, ()> {
+        let daemon = Id::from(0usize);
+        ActorModel::new((), ())
+            .actor(ModelActor::Daemon {
+                daemon_id: "npub-identity".into(),
+                daemon_name: "host-identity".into(),
+                peers: vec![],
+            })
+            .actor(ModelActor::IdentityDriver { target: daemon })
+            .init_network(Network::new_unordered_nonduplicating([]))
+            .property(
+                Expectation::Always,
+                "identity destinations preserve existing owners",
+                check_destinations_preserve_existing_owners,
+            )
+            .property(
+                Expectation::Always,
+                "complete backend pairs have one distinct owner",
+                check_local_backend_identity_unique,
+            )
+            .property(
+                Expectation::Always,
+                "tombstones are consumed at most once",
+                check_tombstones_consumed_once,
+            )
+            .property(
+                Expectation::Always,
+                "recovered incarnation advances",
+                check_recovered_incarnation_advanced,
+            )
+            .property(
+                Expectation::Always,
+                "stale identity results preserve winners",
+                check_stale_result_preserves_winner,
+            )
+            .property(
+                Expectation::Always,
+                "identity transitions never clean worktrees",
+                check_identity_transitions_never_clean_worktrees,
+            )
+            .property(
+                Expectation::Always,
+                "dormant active segments are closed",
+                check_dormant_segments_are_closed,
+            )
+            .property(
+                Expectation::Always,
+                "dormant active time never decreases",
+                check_dormant_accounting_never_decreases,
+            )
+            .property(
+                Expectation::Sometimes,
+                "identity continuity exercised",
+                check_some_identity_action,
             )
     }
 
@@ -18031,24 +18738,52 @@ mod stateright_model {
     }
 
     #[test]
+    #[ignore = "focused Stateright regression; run explicitly"]
+    fn model_check_occupied_rename_bfs() {
+        build_rename_collision_model()
+            .checker()
+            .spawn_bfs()
+            .join()
+            .assert_properties();
+    }
+
+    #[test]
+    #[ignore = "focused Stateright identity-continuity model; run explicitly"]
+    fn model_check_identity_continuity_bfs() {
+        build_identity_continuity_model()
+            .checker()
+            .spawn_bfs()
+            .join()
+            .assert_properties();
+    }
+
+    #[test]
     #[ignore = "expensive exhaustive Stateright model check; run explicitly"]
     fn model_check_bfs() {
         use std::time::Instant;
         let start = Instant::now();
         let checker = build_model().checker().spawn_bfs().join();
         let lifecycle_checker = build_lifecycle_model().checker().spawn_bfs().join();
+        let identity_checker = build_identity_continuity_model()
+            .checker()
+            .spawn_bfs()
+            .join();
         let elapsed = start.elapsed();
         println!(
-            "Real DaemonState model -- states: {}, unique: {}, depth: {}; lifecycle states: {}, unique: {}, depth: {}; time: {:.1}s",
+            "Real DaemonState model -- states: {}, unique: {}, depth: {}; lifecycle states: {}, unique: {}, depth: {}; identity states: {}, unique: {}, depth: {}; time: {:.1}s",
             checker.state_count(),
             checker.unique_state_count(),
             checker.max_depth(),
             lifecycle_checker.state_count(),
             lifecycle_checker.unique_state_count(),
             lifecycle_checker.max_depth(),
+            identity_checker.state_count(),
+            identity_checker.unique_state_count(),
+            identity_checker.max_depth(),
             elapsed.as_secs_f64(),
         );
         checker.assert_properties();
         lifecycle_checker.assert_properties();
+        identity_checker.assert_properties();
     }
 }
