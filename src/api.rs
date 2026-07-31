@@ -685,13 +685,21 @@ pub async fn register(
         reminder: metadata.reminder.clone(),
         ..Default::default()
     };
-    let effects = state
-        .apply_and_execute(crate::daemon_protocol::Event::Register {
+    let event = match body.pane.clone() {
+        Some(pane) => crate::daemon_protocol::Event::RegisterIfPaneUnbound {
             id: body.id.clone(),
-            pane: body.pane.clone(),
+            pane,
+            expected_backend_session_id: proto_meta.backend_session_id.clone(),
+            expected_orphaned_marker_owner: None,
             metadata: proto_meta,
-        })
-        .await;
+        },
+        None => crate::daemon_protocol::Event::Register {
+            id: body.id.clone(),
+            pane: None,
+            metadata: proto_meta,
+        },
+    };
+    let effects = state.apply_and_execute(event).await;
     let (session_id, _replaced) = match effects.iter().find_map(|e| match e {
         crate::daemon_protocol::Effect::RegisterOk {
             session_id,
@@ -4864,12 +4872,12 @@ async fn register_auto_provisioned_session(
                 return None;
             }
         }
-        let id_to_pane: std::collections::HashMap<String, Option<String>> = proto
-            .sessions
-            .iter()
-            .map(|(id, s)| (id.clone(), s.pane.clone()))
-            .collect();
-        crate::state::resolve_unique_session_id(&id_to_pane, &base_id, Some(pane_id))
+        crate::state::resolve_unique_session_id(
+            &proto.sessions,
+            &proto.dormant_sessions,
+            &base_id,
+            Some(pane_id),
+        )
     };
 
     tracing::info!(
@@ -11369,6 +11377,51 @@ mod tests {
         assert!(
             incumbent.metadata.backend_session_id.is_none(),
             "incumbent metadata must not be overwritten by late auto-provision"
+        );
+    }
+
+    #[tokio::test]
+    async fn dormant_conflict_auto_provision_suffixes_a_reserved_automatic_name() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "freshproject".into(),
+                pane: Some("%old".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/freshproject".into()),
+                    canonical_project_identity: Some("/tmp/freshproject".into()),
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("parked-session".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["freshproject"].owner();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::DormantOwned {
+                owner,
+                expected_pane: Some("%old".into()),
+                observed_at: 30,
+                source: crate::daemon_protocol::DormancySource::Reaped,
+            })
+            .await;
+        let project = crate::project_identity::ProjectIdentity {
+            project_dir: "/tmp/freshproject".into(),
+            canonical_repository: "/tmp/freshproject".into(),
+        };
+
+        let result =
+            register_auto_provisioned_session(&state, "new-session", "%new", &project).await;
+
+        assert_eq!(result.as_deref(), Some("freshproject-2"));
+        let protocol = state.protocol.read().await;
+        assert!(protocol.dormant_sessions.contains_key("freshproject"));
+        assert_eq!(
+            protocol.sessions["freshproject-2"]
+                .metadata
+                .backend_session_id
+                .as_deref(),
+            Some("new-session")
         );
     }
 

@@ -743,12 +743,12 @@ async fn session_start_inner(
     // same-pane-idempotency rules as scan_and_autoregister_panes).
     let id = {
         let proto = state.protocol.read().await;
-        let id_to_pane: std::collections::HashMap<String, Option<String>> = proto
-            .sessions
-            .iter()
-            .map(|(id, s)| (id.clone(), s.pane.clone()))
-            .collect();
-        crate::state::resolve_unique_session_id(&id_to_pane, &base_id, Some(&body.pane))
+        crate::state::resolve_unique_session_id(
+            &proto.sessions,
+            &proto.dormant_sessions,
+            &base_id,
+            Some(&body.pane),
+        )
     };
 
     // Detect backend from the process running in the pane
@@ -785,9 +785,11 @@ async fn session_start_inner(
         ..Default::default()
     };
     let effects = state
-        .apply_and_execute(crate::daemon_protocol::Event::Register {
+        .apply_and_execute(crate::daemon_protocol::Event::RegisterIfPaneUnbound {
             id: id.clone(),
-            pane: Some(body.pane.clone()),
+            pane: body.pane.clone(),
+            expected_backend_session_id: proto_meta.backend_session_id.clone(),
+            expected_orphaned_marker_owner: None,
             metadata: proto_meta,
         })
         .await;
@@ -877,6 +879,63 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta::default(),
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn dormant_conflict_session_start_suffixes_a_reserved_automatic_name() {
+        let state = crate::state::AppState::new_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("worker");
+        std::fs::create_dir(&project).unwrap();
+        let project = project.to_string_lossy().into_owned();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%old".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some(project.clone()),
+                    canonical_project_identity: Some(project.clone()),
+                    backend: Some("codex-cli".into()),
+                    backend_session_id: Some("parked-thread".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["worker"].owner();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::DormantOwned {
+                owner,
+                expected_pane: Some("%old".into()),
+                observed_at: 30,
+                source: crate::daemon_protocol::DormancySource::Reaped,
+            })
+            .await;
+        *state.cached_assistant_panes.write().await = vec![crate::tmux::TmuxPane {
+            pane_id: "%new".into(),
+            session_name: "ouija".into(),
+            pane_current_path: Some(project.clone()),
+            process_name: Some("claude".into()),
+        }];
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: "%new".into(),
+                cwd: project,
+                backend_session_id: None,
+                backend_identity: None,
+                adapter: None,
+                launch_session_id: None,
+                launch_credential: None,
+                session_incarnation: None,
+            },
+        )
+        .await;
+
+        assert_eq!(result["registered"], "worker-2");
+        let protocol = state.protocol.read().await;
+        assert!(protocol.dormant_sessions.contains_key("worker"));
+        assert!(protocol.sessions.contains_key("worker-2"));
     }
 
     async fn session_incarnation(

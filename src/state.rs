@@ -142,51 +142,26 @@ pub fn sanitize_session_id(name: &str) -> String {
         .to_string()
 }
 
-/// Resolve a unique session ID for a new registration.
-///
-/// Walks `base_id`, `base_id-2`, `base_id-3`, ... until either an unused id is
-/// found or the existing entry's pane matches `target_pane` (idempotent
-/// re-registration of the same pane). Caps at `MAX_NAME_SUFFIX` attempts; on
-/// overflow returns the last id tried with a `tracing::warn!` so the caller's
-/// `Event::Register` either replaces the holder via apply_register's pane-dedup
-/// or fails loudly rather than spinning forever.
-///
-/// `id_to_pane` is a snapshot of `proto.sessions` keyed by id with the value
-/// being the pane currently bound to that id. Callers that already hold a
-/// `proto.sessions` read lock can build this in one pass; callers without a
-/// lock can pass a lazily-constructed map. Either way, the helper itself is
-/// pure — no I/O, no awaits, no locks — so it composes cleanly with both
-/// the lock-held (`hooks::session_start_inner`) and lock-free
-/// (`AppState::scan_and_autoregister_panes`) call sites.
-///
-/// `target_pane = None` means the caller has no pane to dedupe against (e.g.
-/// API-driven registration without a `pane` field). In that case every
-/// existing entry counts as a conflict; we never collapse to the base id just
-/// because some other holder also happens to have a None pane.
+/// Resolve an automatic registration name across both live and dormant
+/// occupancy. This is the coordinator-facing wrapper around the protocol's
+/// shared naming policy, so scan, hooks, and backend auto-provision cannot
+/// disagree about a parked public ID.
 pub fn resolve_unique_session_id(
-    id_to_pane: &HashMap<String, Option<String>>,
+    sessions: &std::collections::BTreeMap<String, crate::daemon_protocol::SessionEntry>,
+    dormant: &std::collections::BTreeMap<String, crate::daemon_protocol::DormantSession>,
     base_id: &str,
     target_pane: Option<&str>,
 ) -> String {
-    let mut id = base_id.to_string();
-    let mut suffix = 2u32;
-    while let Some(existing_pane) = id_to_pane.get(&id) {
-        // Same-pane idempotency: if the existing entry is bound to the
-        // same pane the caller is registering, return the current id so
-        // apply_register's idempotent path runs instead of inventing a new id.
-        if target_pane.is_some() && existing_pane.as_deref() == target_pane {
-            return id;
-        }
-        id = format!("{base_id}-{suffix}");
-        if suffix > MAX_NAME_SUFFIX {
-            tracing::warn!(
-                "resolve_unique_session_id: exhausted suffixes 2..={MAX_NAME_SUFFIX} for base '{base_id}', returning '{id}'"
-            );
-            return id;
-        }
-        suffix += 1;
+    match crate::daemon_protocol::resolve_session_id(
+        sessions,
+        dormant,
+        base_id,
+        crate::daemon_protocol::NameResolutionMode::Automatic { target_pane },
+    ) {
+        crate::daemon_protocol::NameResolution::Available(id)
+        | crate::daemon_protocol::NameResolution::Idempotent(id)
+        | crate::daemon_protocol::NameResolution::Occupied { id, .. } => id,
     }
-    id
 }
 
 /// Expand `~/` to `$HOME/` in a path string.
@@ -1230,6 +1205,7 @@ const MAX_LOG: usize = 100;
 /// Max task run records retained in memory.
 const MAX_TASK_RUNS: usize = 200;
 /// Max suffix number when resolving auto-registration name conflicts.
+#[cfg(test)]
 const MAX_NAME_SUFFIX: u32 = 100;
 /// Reciprocation debounce interval to prevent session list ping-pong.
 const RECIPROCATE_DEBOUNCE_SECS: u64 = 30;
@@ -6373,22 +6349,17 @@ impl AppState {
             return;
         }
 
-        // Build lookup tables from current sessions (single lock acquisition).
-        // These are updated within the loop so subsequent panes see prior registrations.
-        let (mut registered_panes, mut id_to_pane) = {
+        // Snapshot the current pane bindings. Name allocation itself is
+        // repeated under a fresh protocol read so concurrent registrations and
+        // durable dormant reservations participate in the same policy.
+        let mut registered_panes = {
             let proto = self.protocol.read().await;
-            let registered: std::collections::HashSet<String> = proto
+            proto
                 .sessions
                 .values()
                 .filter(|s| matches!(s.origin, crate::daemon_protocol::Origin::Local))
                 .filter_map(|s| s.pane.clone())
-                .collect();
-            let id_to_pane: std::collections::HashMap<String, Option<String>> = proto
-                .sessions
-                .iter()
-                .map(|(id, s)| (id.clone(), s.pane.clone()))
-                .collect();
-            (registered, id_to_pane)
+                .collect::<std::collections::HashSet<String>>()
         };
 
         for pane in &panes {
@@ -6485,9 +6456,15 @@ impl AppState {
                 continue;
             }
 
-            // Resolve name conflicts using pre-computed map (no lock re-acquisition).
-            // Shared with hooks::session_start_inner via resolve_unique_session_id.
-            let id = resolve_unique_session_id(&id_to_pane, &base_id, Some(pane.pane_id.as_str()));
+            let id = {
+                let proto = self.protocol.read().await;
+                resolve_unique_session_id(
+                    &proto.sessions,
+                    &proto.dormant_sessions,
+                    &base_id,
+                    Some(pane.pane_id.as_str()),
+                )
+            };
 
             let proto_meta = crate::daemon_protocol::SessionMeta {
                 project_dir: Some(project.project_dir),
@@ -6498,20 +6475,25 @@ impl AppState {
             };
 
             tracing::info!("auto-registering pane {} as '{id}'", pane.pane_id);
-            self.apply_and_execute(crate::daemon_protocol::Event::RegisterIfPaneUnbound {
-                id: id.clone(),
-                pane: pane.pane_id.clone(),
-                expected_backend_session_id: None,
-                expected_orphaned_marker_owner,
-                metadata: proto_meta,
-            })
-            .await;
+            let effects = self
+                .apply_and_execute(crate::daemon_protocol::Event::RegisterIfPaneUnbound {
+                    id: id.clone(),
+                    pane: pane.pane_id.clone(),
+                    expected_backend_session_id: None,
+                    expected_orphaned_marker_owner,
+                    metadata: proto_meta,
+                })
+                .await;
 
-            // Update maps so the next pane in this loop sees this registration.
-            // Without this, two panes in the same directory both claim the base
-            // name and the second overwrites the first.
-            id_to_pane.insert(id.clone(), Some(pane.pane_id.clone()));
-            registered_panes.insert(pane.pane_id.clone());
+            if effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    crate::daemon_protocol::Effect::RegisterOk { session_id, .. }
+                        if session_id == &id
+                )
+            }) {
+                registered_panes.insert(pane.pane_id.clone());
+            }
         }
     }
 
@@ -8113,11 +8095,38 @@ pub(crate) mod tests {
 
     // --- resolve_unique_session_id ---
 
+    fn resolve_unique_from_legacy_map(
+        map: &HashMap<String, Option<String>>,
+        base_id: &str,
+        target_pane: Option<&str>,
+    ) -> String {
+        let sessions = map
+            .iter()
+            .map(|(id, pane)| {
+                (
+                    id.clone(),
+                    crate::daemon_protocol::SessionEntry {
+                        id: id.clone(),
+                        pane: pane.clone(),
+                        origin: crate::daemon_protocol::Origin::Local,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        resolve_unique_session_id(
+            &sessions,
+            &std::collections::BTreeMap::new(),
+            base_id,
+            target_pane,
+        )
+    }
+
     #[test]
     fn resolve_unique_session_id_no_conflicts_returns_base() {
         let map: HashMap<String, Option<String>> = HashMap::new();
         assert_eq!(
-            resolve_unique_session_id(&map, "ouija", Some("%17")),
+            resolve_unique_from_legacy_map(&map, "ouija", Some("%17")),
             "ouija"
         );
     }
@@ -8132,7 +8141,7 @@ pub(crate) mod tests {
         let mut map = HashMap::new();
         map.insert("ouija".into(), Some("%17".into()));
         assert_eq!(
-            resolve_unique_session_id(&map, "ouija", Some("%17")),
+            resolve_unique_from_legacy_map(&map, "ouija", Some("%17")),
             "ouija"
         );
     }
@@ -8143,7 +8152,7 @@ pub(crate) mod tests {
         let mut map = HashMap::new();
         map.insert("ouija".into(), Some("%17".into()));
         assert_eq!(
-            resolve_unique_session_id(&map, "ouija", Some("%18")),
+            resolve_unique_from_legacy_map(&map, "ouija", Some("%18")),
             "ouija-2"
         );
     }
@@ -8155,7 +8164,7 @@ pub(crate) mod tests {
         map.insert("ouija".into(), Some("%17".into()));
         map.insert("ouija-2".into(), Some("%18".into()));
         assert_eq!(
-            resolve_unique_session_id(&map, "ouija", Some("%19")),
+            resolve_unique_from_legacy_map(&map, "ouija", Some("%19")),
             "ouija-3"
         );
     }
@@ -8167,7 +8176,10 @@ pub(crate) mod tests {
         // because some other id_to_pane entry happens to also be None.
         let mut map = HashMap::new();
         map.insert("ouija".into(), None);
-        assert_eq!(resolve_unique_session_id(&map, "ouija", None), "ouija-2");
+        assert_eq!(
+            resolve_unique_from_legacy_map(&map, "ouija", None),
+            "ouija-2"
+        );
     }
 
     #[test]
@@ -8182,7 +8194,7 @@ pub(crate) mod tests {
         for n in 2..=MAX_NAME_SUFFIX {
             map.insert(format!("ouija-{n}"), Some(format!("%{n}")));
         }
-        let resolved = resolve_unique_session_id(&map, "ouija", Some("%9999"));
+        let resolved = resolve_unique_from_legacy_map(&map, "ouija", Some("%9999"));
         // The overflow stop happens after format!("{base}-{suffix}") with
         // suffix == MAX_NAME_SUFFIX + 1. We don't pin the exact id; what
         // matters is that the call returns and is finite.
@@ -12715,6 +12727,45 @@ pub(crate) mod tests {
             .get("ouija")
             .expect("base ID should be reusable");
         assert_eq!(recovered.pane.as_deref(), Some("%orphan"));
+    }
+
+    #[tokio::test]
+    async fn dormant_conflict_scanner_suffixes_a_reserved_automatic_name() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "ouija".into(),
+                pane: Some("%old".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/ouija".into()),
+                    canonical_project_identity: Some("/tmp/ouija".into()),
+                    backend: Some("codex-cli".into()),
+                    backend_session_id: Some("parked-thread".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["ouija"].owner();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::DormantOwned {
+                owner,
+                expected_pane: Some("%old".into()),
+                observed_at: 30,
+                source: crate::daemon_protocol::DormancySource::Reaped,
+            })
+            .await;
+        *state.cached_assistant_panes.write().await = vec![crate::tmux::TmuxPane {
+            pane_id: "%new".into(),
+            session_name: "ouija".into(),
+            pane_current_path: Some("/tmp/ouija".into()),
+            process_name: Some("codex".into()),
+        }];
+
+        state.scan_and_autoregister_panes().await;
+
+        let protocol = state.protocol.read().await;
+        assert!(protocol.dormant_sessions.contains_key("ouija"));
+        assert_eq!(protocol.sessions["ouija-2"].pane.as_deref(), Some("%new"));
     }
 
     #[tokio::test]

@@ -2048,6 +2048,9 @@ impl DaemonState {
                 incarnation: session.metadata.session_incarnation,
             }));
         }
+        if let Some(dormant) = self.dormant_sessions.get(session_id) {
+            return Ok(StartDisposition::Existing(dormant.prior_owner.clone()));
+        }
 
         let incarnation = self
             .allocate_incarnation()
@@ -2919,6 +2922,34 @@ impl DaemonState {
         })
     }
 
+    fn backend_binding_lifecycle_conflict(
+        &self,
+        target: &SessionEntry,
+        backend: &str,
+        backend_session_id: &str,
+    ) -> bool {
+        let target_owner = target.owner();
+        self.lifecycle_leases.iter().any(|(lease_id, lease)| {
+            let owns_target = lease.owner == target_owner
+                || lease.restart_target_owner.as_ref() == Some(&target_owner);
+            !owns_target
+                && (lease_id == &target.id
+                    || target
+                        .pane
+                        .as_deref()
+                        .is_some_and(|pane| lease.inert_pane.as_deref() == Some(pane))
+                    || (lease.backend.as_deref() == Some(backend)
+                        && lease.backend_session_id.as_deref() == Some(backend_session_id))
+                    || [
+                        target.metadata.project_dir.as_deref(),
+                        target.metadata.canonical_project_identity.as_deref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .any(|project| lease.project_dir.as_deref() == Some(project)))
+        })
+    }
+
     fn local_activation_effects(&mut self, id: &str, pane: &str) -> Vec<Effect> {
         let session = &self.sessions[id];
         let owner = session.owner();
@@ -3057,6 +3088,58 @@ impl DaemonState {
         reserved_owner: Option<&ResourceOwner>,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
+
+        if self.dormant_sessions.contains_key(&id) {
+            return vec![Effect::RegisterFailed {
+                session_id: id.clone(),
+                reason: format!("session '{id}' is reserved by a dormant identity"),
+            }];
+        }
+
+        let supplied_pair = metadata
+            .backend
+            .as_deref()
+            .zip(metadata.backend_session_id.as_deref());
+        if let Some((backend, backend_session_id)) = supplied_pair
+            && self.dormant_pair_conflict(None, backend, backend_session_id)
+        {
+            return vec![Effect::RegisterFailed {
+                session_id: id.clone(),
+                reason: format!(
+                    "backend identity ({backend}, {backend_session_id}) is reserved by a dormant identity"
+                ),
+            }];
+        }
+
+        let registration_lease_conflict = self.lifecycle_leases.iter().find(|(_, lease)| {
+            if reserved_owner.is_some_and(|owner| lease.owner == *owner) {
+                return false;
+            }
+            let pane_conflict = pane
+                .as_deref()
+                .is_some_and(|pane| lease.inert_pane.as_deref() == Some(pane));
+            let pair_conflict = supplied_pair.is_some_and(|(backend, backend_session_id)| {
+                lease.backend.as_deref() == Some(backend)
+                    && lease.backend_session_id.as_deref() == Some(backend_session_id)
+            });
+            let project_conflict = [
+                metadata.project_dir.as_deref(),
+                metadata.canonical_project_identity.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|project| lease.project_dir.as_deref() == Some(project));
+            lease.owner.session_id == id || pane_conflict || pair_conflict || project_conflict
+        });
+        if let Some((_, lease)) = registration_lease_conflict {
+            return vec![Effect::RegisterFailed {
+                session_id: id.clone(),
+                reason: format!(
+                    "registration resources are reserved by session '{}' with a lifecycle operation in progress",
+                    lease.owner.session_id
+                ),
+            }];
+        }
 
         match (self.lifecycle_leases.get(&id), reserved_owner) {
             (Some(lease), Some(owner)) if lease.owner == *owner => {}
@@ -3936,6 +4019,19 @@ impl DaemonState {
             ];
         }
 
+        if let Some(existing) = self.sessions.get(&id)
+            && (!matches!(existing.origin, Origin::Local)
+                || existing.pane.as_deref() != Some(pane.as_str()))
+        {
+            let reason = format!(
+                "session '{id}' is already owned by a different pane, origin, or incarnation"
+            );
+            return vec![Effect::RegisterFailed {
+                session_id: id,
+                reason,
+            }];
+        }
+
         if let (Some(backend), Some(backend_session_id)) = (
             metadata.backend.as_deref(),
             metadata.backend_session_id.as_deref(),
@@ -3963,7 +4059,7 @@ impl DaemonState {
         if let Some(owner) = self
             .sessions
             .values()
-            .find(|s| matches!(s.origin, Origin::Local) && s.pane.as_deref() == Some(&pane))
+            .find(|s| s.id != id && s.pane.as_deref() == Some(&pane))
         {
             let reason = format!(
                 "pane {pane} is already bound to local session '{}'",
@@ -4861,6 +4957,15 @@ impl DaemonState {
                 effects: vec![],
             };
         }
+        if self.backend_binding_lifecycle_conflict(target, &identity.backend, &identity.session_id)
+        {
+            return BackendIdentityBindResult {
+                outcome: BackendIdentityBindOutcome::LifecycleInProgress {
+                    session_id: id.into(),
+                },
+                effects: vec![],
+            };
+        }
 
         if backend_pair_matches(&target.metadata, &identity.backend, &identity.session_id) {
             return BackendIdentityBindResult {
@@ -4920,6 +5025,16 @@ impl DaemonState {
             session.id != id
                 && matches!(session.origin, Origin::Local)
                 && backend_pair_matches(&session.metadata, &identity.backend, &identity.session_id)
+        }) {
+            return BackendIdentityBindResult {
+                outcome: BackendIdentityBindOutcome::IdentityBoundToOther {
+                    session_id: owner.id.clone(),
+                },
+                effects: vec![],
+            };
+        }
+        if let Some(owner) = self.dormant_sessions.values().find(|dormant| {
+            backend_pair_matches(&dormant.metadata, &identity.backend, &identity.session_id)
         }) {
             return BackendIdentityBindResult {
                 outcome: BackendIdentityBindOutcome::IdentityBoundToOther {
@@ -5002,6 +5117,11 @@ impl DaemonState {
                 .session_agent_pane()
                 .map(|pane| pane.map(std::string::ToString::to_string))
         });
+        if self.sessions.get(id).is_some_and(|target| {
+            self.backend_binding_lifecycle_conflict(target, &backend, &backend_session_id)
+        }) {
+            return vec![];
+        }
 
         if expected_backend_session_id.as_deref() != current_backend_session_id.as_deref() {
             return vec![];
@@ -5026,6 +5146,9 @@ impl DaemonState {
                 && matches!(s.origin, Origin::Local)
                 && backend_pair_matches(&s.metadata, &backend, &backend_session_id)
         }) {
+            return vec![];
+        }
+        if self.dormant_pair_conflict(None, &backend, &backend_session_id) {
             return vec![];
         }
 
@@ -5115,6 +5238,9 @@ impl DaemonState {
         }) {
             return vec![];
         }
+        if self.dormant_pair_conflict(None, &backend, &backend_session_id) {
+            return vec![];
+        }
 
         let session = self
             .sessions
@@ -5158,12 +5284,18 @@ impl DaemonState {
         {
             return vec![];
         }
+        if self.backend_binding_lifecycle_conflict(current, &backend, &backend_session_id) {
+            return vec![];
+        }
 
         if self.sessions.values().any(|session| {
             session.id != id
                 && matches!(session.origin, Origin::Local)
                 && backend_pair_matches(&session.metadata, &backend, &backend_session_id)
         }) {
+            return vec![];
+        }
+        if self.dormant_pair_conflict(None, &backend, &backend_session_id) {
             return vec![];
         }
 
@@ -9682,6 +9814,20 @@ mod tests {
         state.sessions[id].owner()
     }
 
+    fn inject_conflicting_live_identity(
+        state: &mut DaemonState,
+        id: &str,
+        pane: &str,
+        backend_session_id: &str,
+    ) -> ResourceOwner {
+        let mut source = DaemonState::new_for_model("fixture".into(), "fixture".into());
+        let owner = register_identity(&mut source, id, pane, backend_session_id);
+        let entry = source.sessions.remove(id).unwrap();
+        state.restore_incarnation_high_water(owner.incarnation);
+        state.sessions.insert(id.into(), entry);
+        owner
+    }
+
     fn assert_ineligible_dormancy_removes_without_tombstone(mut metadata: SessionMeta) {
         metadata.networked = false;
         let mut state = DaemonState::new("d1".into(), "host1".into());
@@ -10196,7 +10342,7 @@ mod tests {
     #[test]
     fn dormant_recovery_rejects_a_live_prior_id() {
         let (mut state, prior_owner) = dormant_recovery_state();
-        register_identity(&mut state, "worker", "%9", "thread-9");
+        inject_conflicting_live_identity(&mut state, "worker", "%9", "thread-9");
         assert!(state.sessions.contains_key("worker"));
         assert!(state.dormant_sessions.contains_key("worker"));
         assert_dormant_recovery_rejected(
@@ -10209,7 +10355,7 @@ mod tests {
     #[test]
     fn dormant_recovery_rejects_a_foreign_live_backend_pair() {
         let (mut state, prior_owner) = dormant_recovery_state();
-        register_identity(&mut state, "foreign", "%9", "thread-1");
+        inject_conflicting_live_identity(&mut state, "foreign", "%9", "thread-1");
         assert_dormant_recovery_rejected(
             state,
             recover_dormant_event(&prior_owner),
@@ -10220,7 +10366,8 @@ mod tests {
     #[test]
     fn dormant_recovery_rejects_a_foreign_dormant_backend_pair() {
         let (mut state, prior_owner) = dormant_recovery_state();
-        let foreign_owner = register_identity(&mut state, "foreign", "%9", "thread-1");
+        let foreign_owner =
+            inject_conflicting_live_identity(&mut state, "foreign", "%9", "thread-1");
         state.apply(Event::DormantOwned {
             owner: foreign_owner,
             expected_pane: Some("%9".into()),
@@ -10245,14 +10392,18 @@ mod tests {
             "canonical project",
         ] {
             let (mut state, prior_owner) = dormant_recovery_state();
+            let lease_owner = match state.reserve_start("reserved").expect("reserve lease") {
+                StartDisposition::Reserved(owner) => owner,
+                other => panic!("unexpected reservation: {other:?}"),
+            };
+            if conflict == "public ID" {
+                let lease = state.lifecycle_leases.remove("reserved").unwrap();
+                state.lifecycle_leases.insert("worker".into(), lease);
+            }
             let lease_id = if conflict == "public ID" {
                 "worker"
             } else {
                 "reserved"
-            };
-            let lease_owner = match state.reserve_start(lease_id).expect("reserve lease") {
-                StartDisposition::Reserved(owner) => owner,
-                other => panic!("unexpected reservation: {other:?}"),
             };
             let lease = state
                 .lifecycle_leases
@@ -10435,6 +10586,396 @@ mod tests {
                 .iter()
                 .any(|effect| matches!(effect, Effect::CleanupWorktree { .. }))
         );
+    }
+
+    #[test]
+    fn dormant_conflict_generic_registration_rejects_reserved_id_pair_and_foreign_pane() {
+        let mut baseline = DaemonState::new("d1".into(), "host1".into());
+        let dormant_owner = register_identity(&mut baseline, "parked", "%9", "thread-9");
+        baseline.apply(Event::DormantOwned {
+            owner: dormant_owner,
+            expected_pane: Some("%9".into()),
+            observed_at: 30,
+            source: DormancySource::Reaped,
+        });
+        register_identity(&mut baseline, "incumbent", "%1", "thread-1");
+
+        let attempts = [
+            (
+                "dormant destination ID",
+                Event::Register {
+                    id: "parked".into(),
+                    pane: Some("%2".into()),
+                    metadata: identity_metadata("thread-2"),
+                },
+            ),
+            (
+                "dormant backend pair",
+                Event::Register {
+                    id: "free".into(),
+                    pane: Some("%2".into()),
+                    metadata: identity_metadata("thread-9"),
+                },
+            ),
+            (
+                "foreign live pane",
+                Event::RegisterIfPaneUnbound {
+                    id: "free".into(),
+                    pane: "%1".into(),
+                    expected_backend_session_id: Some("thread-2".into()),
+                    expected_orphaned_marker_owner: None,
+                    metadata: identity_metadata("thread-2"),
+                },
+            ),
+        ];
+
+        for (conflict, event) in attempts {
+            let mut state = baseline.clone();
+            let before = state.clone();
+            let effects = state.apply(event);
+            assert_eq!(state, before, "{conflict} changed protocol state");
+            assert!(
+                effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::RegisterFailed { .. })),
+                "{conflict} did not emit RegisterFailed: {effects:?}"
+            );
+            assert!(
+                !effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::RegisterOk { .. } | Effect::Persist)),
+                "{conflict} emitted registration success: {effects:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dormant_conflict_managed_reservation_and_backend_mutations_preserve_snapshot() {
+        let mut baseline = DaemonState::new("d1".into(), "host1".into());
+        let dormant_owner = register_identity(&mut baseline, "parked", "%9", "thread-9");
+        baseline.apply(Event::DormantOwned {
+            owner: dormant_owner.clone(),
+            expected_pane: Some("%9".into()),
+            observed_at: 30,
+            source: DormancySource::Reaped,
+        });
+        baseline.apply(Event::Register {
+            id: "blank".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/repo/.ouija/worktrees/blank".into()),
+                canonical_project_identity: Some("/tmp/repo".into()),
+                ..Default::default()
+            },
+        });
+        baseline.apply(Event::Register {
+            id: "bound".into(),
+            pane: Some("%3".into()),
+            metadata: identity_metadata("thread-3"),
+        });
+        baseline.apply(Event::Register {
+            id: "managed".into(),
+            pane: Some("%4".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/repo/.ouija/worktrees/managed".into()),
+                canonical_project_identity: Some("/tmp/repo".into()),
+                backend: Some("codex-cli".into()),
+                session_start_credential: Some("credential".into()),
+                ..Default::default()
+            },
+        });
+
+        let mut reserve = baseline.clone();
+        let before = reserve.clone();
+        assert_eq!(
+            reserve.reserve_start("parked").unwrap(),
+            StartDisposition::Existing(dormant_owner)
+        );
+        assert_eq!(reserve, before, "dormant reservation mutated state");
+
+        let mut bind = baseline.clone();
+        let before = bind.clone();
+        let result = bind.bind_backend_identity(
+            "managed",
+            &crate::backend::BackendSessionIdentity {
+                backend: "codex-cli".into(),
+                session_id: "thread-9".into(),
+            },
+            Some("credential"),
+        );
+        assert_eq!(bind, before, "managed bind consumed dormant pair");
+        assert!(matches!(
+            result.outcome,
+            BackendIdentityBindOutcome::IdentityBoundToOther { ref session_id }
+                if session_id == "parked"
+        ));
+        assert!(result.effects.is_empty());
+
+        let stale_blank_owner = ResourceOwner {
+            session_id: "blank".into(),
+            incarnation: SessionIncarnation(
+                baseline.sessions["blank"]
+                    .metadata
+                    .session_incarnation
+                    .0
+                    .saturating_add(1),
+            ),
+        };
+        let attempts = [
+            Event::AdoptBackend {
+                id: "blank".into(),
+                backend: "codex-cli".into(),
+                backend_session_id: "thread-9".into(),
+                expected_backend_session_id: None,
+                expected_session_start_credential: None,
+            },
+            Event::RebindBackend {
+                id: "bound".into(),
+                backend: "codex-cli".into(),
+                backend_session_id: "thread-9".into(),
+                expected_backend_session_id: "thread-3".into(),
+            },
+            Event::RecoverBackendIdentity {
+                owner: baseline.sessions["blank"].owner(),
+                expected_pane: "%2".into(),
+                expected_project_dir: "/tmp/repo/.ouija/worktrees/blank".into(),
+                backend: "codex-cli".into(),
+                backend_session_id: "thread-9".into(),
+            },
+            Event::RecoverBackendIdentity {
+                owner: stale_blank_owner,
+                expected_pane: "%2".into(),
+                expected_project_dir: "/tmp/repo/.ouija/worktrees/blank".into(),
+                backend: "codex-cli".into(),
+                backend_session_id: "unreserved-thread".into(),
+            },
+        ];
+        for event in attempts {
+            let mut state = baseline.clone();
+            let before = state.clone();
+            let effects = state.apply(event);
+            assert_eq!(state, before, "backend mutation consumed dormant pair");
+            assert!(
+                !effects.iter().any(|effect| matches!(
+                    effect,
+                    Effect::Persist | Effect::BackendIdentityRecovered { .. }
+                )),
+                "backend mutation emitted success: {effects:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dormant_conflict_generic_registration_rejects_foreign_local_remote_and_human_owners() {
+        for origin in [
+            Origin::Local,
+            Origin::Remote("peer-npub".into()),
+            Origin::Human("human-npub".into()),
+        ] {
+            for collision in ["id", "pane"] {
+                let mut state = DaemonState::new("d1".into(), "host1".into());
+                state.sessions.insert(
+                    "foreign".into(),
+                    SessionEntry {
+                        id: "foreign".into(),
+                        pane: Some("%foreign".into()),
+                        origin: origin.clone(),
+                        metadata: SessionMeta {
+                            session_incarnation: SessionIncarnation(7),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                );
+                let before = state.clone();
+                let metadata = identity_metadata("claimant-thread");
+                let effects = state.apply(Event::RegisterIfPaneUnbound {
+                    id: if collision == "id" {
+                        "foreign".into()
+                    } else {
+                        "claimant".into()
+                    },
+                    pane: if collision == "pane" {
+                        "%foreign".into()
+                    } else {
+                        "%claimant".into()
+                    },
+                    expected_backend_session_id: metadata.backend_session_id.clone(),
+                    expected_orphaned_marker_owner: None,
+                    metadata,
+                });
+                assert_eq!(
+                    state, before,
+                    "{origin:?} {collision} collision changed state"
+                );
+                assert!(
+                    effects
+                        .iter()
+                        .any(|effect| matches!(effect, Effect::RegisterFailed { .. }))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dormant_conflict_generic_registration_rejects_each_lifecycle_resource_lease() {
+        for conflict in ["id", "pane", "pair", "actual project", "canonical project"] {
+            let mut state = DaemonState::new("d1".into(), "host1".into());
+            let lease_id = if conflict == "id" {
+                "chosen"
+            } else {
+                "reserved"
+            };
+            let lease_owner = match state.reserve_start(lease_id).unwrap() {
+                StartDisposition::Reserved(owner) => owner,
+                other => panic!("unexpected reservation: {other:?}"),
+            };
+            let lease = state.lifecycle_leases.get_mut(lease_id).unwrap();
+            match conflict {
+                "pane" => {
+                    lease.inert_pane = Some("%1".into());
+                    lease.inert_pane_owner = Some(lease_owner);
+                }
+                "pair" => {
+                    lease.backend = Some("codex-cli".into());
+                    lease.backend_session_id = Some("thread-1".into());
+                    lease.backend_session_owner = Some(lease_owner);
+                }
+                "actual project" => {
+                    lease.project_dir = Some("/tmp/repo/.ouija/worktrees/worker".into());
+                    lease.project_dir_owner = Some(lease_owner);
+                }
+                "canonical project" => {
+                    lease.project_dir = Some("/tmp/repo".into());
+                    lease.project_dir_owner = Some(lease_owner);
+                }
+                "id" => {}
+                _ => unreachable!(),
+            }
+            let before = state.clone();
+            let effects = state.apply(Event::Register {
+                id: "chosen".into(),
+                pane: Some("%1".into()),
+                metadata: identity_metadata("thread-1"),
+            });
+            assert_eq!(state, before, "{conflict} lease changed state");
+            assert!(
+                effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::RegisterFailed { .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn dormant_conflict_backend_entry_points_reject_each_foreign_lifecycle_resource_lease() {
+        for operation in ["bind", "adopt", "rebind"] {
+            for conflict in ["id", "pane", "pair", "actual project", "canonical project"] {
+                let mut state = DaemonState::new("d1".into(), "host1".into());
+                let target_id = operation;
+                let target_pane = format!("%{operation}");
+                let actual_project = format!("/tmp/repo/.ouija/worktrees/{operation}");
+                let canonical_project = "/tmp/repo";
+                let metadata = match operation {
+                    "bind" => SessionMeta {
+                        project_dir: Some(actual_project.clone()),
+                        canonical_project_identity: Some(canonical_project.into()),
+                        backend: Some("codex-cli".into()),
+                        session_start_credential: Some("credential".into()),
+                        ..Default::default()
+                    },
+                    "adopt" => SessionMeta {
+                        project_dir: Some(actual_project.clone()),
+                        canonical_project_identity: Some(canonical_project.into()),
+                        ..Default::default()
+                    },
+                    "rebind" => SessionMeta {
+                        project_dir: Some(actual_project.clone()),
+                        canonical_project_identity: Some(canonical_project.into()),
+                        backend: Some("codex-cli".into()),
+                        backend_session_id: Some("old-thread".into()),
+                        ..Default::default()
+                    },
+                    _ => unreachable!(),
+                };
+                state.apply(Event::Register {
+                    id: target_id.into(),
+                    pane: Some(target_pane.clone()),
+                    metadata,
+                });
+                let lease_owner = match state.reserve_start("lease").unwrap() {
+                    StartDisposition::Reserved(owner) => owner,
+                    other => panic!("unexpected reservation: {other:?}"),
+                };
+                let mut lease = state.lifecycle_leases.remove("lease").unwrap();
+                match conflict {
+                    "id" => {}
+                    "pane" => {
+                        lease.inert_pane = Some(target_pane);
+                        lease.inert_pane_owner = Some(lease_owner.clone());
+                    }
+                    "pair" => {
+                        lease.backend = Some("codex-cli".into());
+                        lease.backend_session_id = Some("new-thread".into());
+                        lease.backend_session_owner = Some(lease_owner.clone());
+                    }
+                    "actual project" => {
+                        lease.project_dir = Some(actual_project);
+                        lease.project_dir_owner = Some(lease_owner.clone());
+                    }
+                    "canonical project" => {
+                        lease.project_dir = Some(canonical_project.into());
+                        lease.project_dir_owner = Some(lease_owner.clone());
+                    }
+                    _ => unreachable!(),
+                }
+                let lease_key = if conflict == "id" { target_id } else { "lease" };
+                state.lifecycle_leases.insert(lease_key.into(), lease);
+                let before = state.clone();
+
+                match operation {
+                    "bind" => {
+                        let result = state.bind_backend_identity(
+                            target_id,
+                            &crate::backend::BackendSessionIdentity {
+                                backend: "codex-cli".into(),
+                                session_id: "new-thread".into(),
+                            },
+                            Some("credential"),
+                        );
+                        assert!(matches!(
+                            result.outcome,
+                            BackendIdentityBindOutcome::LifecycleInProgress { .. }
+                        ));
+                        assert!(result.effects.is_empty());
+                    }
+                    "adopt" => {
+                        let effects = state.apply(Event::AdoptBackend {
+                            id: target_id.into(),
+                            backend: "codex-cli".into(),
+                            backend_session_id: "new-thread".into(),
+                            expected_backend_session_id: None,
+                            expected_session_start_credential: None,
+                        });
+                        assert!(effects.is_empty());
+                    }
+                    "rebind" => {
+                        let effects = state.apply(Event::RebindBackend {
+                            id: target_id.into(),
+                            backend: "codex-cli".into(),
+                            backend_session_id: "new-thread".into(),
+                            expected_backend_session_id: "old-thread".into(),
+                        });
+                        assert!(effects.is_empty());
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    state, before,
+                    "{operation} accepted {conflict} lifecycle conflict"
+                );
+            }
+        }
     }
 
     #[test]
