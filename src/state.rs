@@ -69,6 +69,29 @@ pub(crate) enum LocalBackendPaneAttestationRecordOutcome {
     Rejected,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LocalClaimOutcome {
+    Claimed(crate::daemon_protocol::ResourceOwner),
+    Current(crate::daemon_protocol::ResourceOwner),
+    Recovered(crate::daemon_protocol::ResourceOwner),
+    InvalidId {
+        requested: String,
+        canonical: String,
+    },
+    DestinationLive {
+        id: String,
+    },
+    DestinationDormant {
+        id: String,
+    },
+    AlreadyRegistered {
+        id: String,
+    },
+    EvidenceConflict(&'static str),
+    ResourceConflict(&'static str),
+    PersistenceFailed(String),
+}
+
 #[derive(Clone)]
 struct OwnedSessionAgent {
     owner: crate::daemon_protocol::ResourceOwner,
@@ -2548,12 +2571,16 @@ impl AppState {
         }
     }
 
-    async fn observe_local_backend_pane_attestation(
+    async fn observe_local_backend_pane_physical(
         &self,
         identity: &crate::backend::BackendSessionIdentity,
         pane: &str,
         project: &crate::project_identity::ProjectIdentity,
-    ) -> Option<(crate::project_identity::ProjectIdentity, Option<String>)> {
+    ) -> Option<(
+        crate::project_identity::ProjectIdentity,
+        Option<String>,
+        crate::tmux::ManagedPaneInspection,
+    )> {
         if identity.backend.trim().is_empty()
             || identity.session_id.trim().is_empty()
             || !self
@@ -2579,6 +2606,18 @@ impl AppState {
             .local_backend_pane_attestation_inspection(pane)
             .await
             .ok()?;
+        Some((observed_project, pane_var_id, inspection))
+    }
+
+    async fn observe_local_backend_pane_attestation(
+        &self,
+        identity: &crate::backend::BackendSessionIdentity,
+        pane: &str,
+        project: &crate::project_identity::ProjectIdentity,
+    ) -> Option<(crate::project_identity::ProjectIdentity, Option<String>)> {
+        let (observed_project, pane_var_id, inspection) = self
+            .observe_local_backend_pane_physical(identity, pane, project)
+            .await?;
         let protocol = self.protocol.read().await;
         Self::local_backend_pane_attestation_protocol_allows(
             &protocol,
@@ -2765,6 +2804,408 @@ impl AppState {
         } else {
             false
         }
+    }
+
+    /// Atomically establish or recover one exact Local public identity from
+    /// verified caller evidence. Local control-plane evidence is evaluated
+    /// here only; no Nostr sender or wire identity participates.
+    pub(crate) async fn claim_local_identity(
+        self: &Arc<Self>,
+        requested_id: &str,
+        evidence: &LocalClaimEvidence,
+    ) -> LocalClaimOutcome {
+        let canonical = sanitize_session_id(requested_id);
+        if requested_id.is_empty() || canonical != requested_id {
+            return LocalClaimOutcome::InvalidId {
+                requested: requested_id.to_string(),
+                canonical,
+            };
+        }
+        let identity = crate::backend::BackendSessionIdentity {
+            backend: evidence.backend_identity.backend.trim().to_string(),
+            session_id: evidence.backend_identity.session_id.trim().to_string(),
+        };
+        if identity.backend.is_empty()
+            || identity.session_id.is_empty()
+            || self.backends.get(&identity.backend).is_none()
+        {
+            return LocalClaimOutcome::EvidenceConflict(
+                "claim requires one complete known backend identity",
+            );
+        }
+
+        let key = Self::local_backend_identity_key(&identity);
+        let attestation = self
+            .local_backend_pane_attestations
+            .read()
+            .await
+            .get(&key)
+            .cloned();
+        let live_pair = {
+            let protocol = self.protocol.read().await;
+            let mut matches = protocol.sessions.values().filter(|session| {
+                matches!(session.origin, crate::daemon_protocol::Origin::Local)
+                    && session.metadata.backend.as_deref() == Some(identity.backend.as_str())
+                    && session.metadata.backend_session_id.as_deref()
+                        == Some(identity.session_id.as_str())
+            });
+            let first = matches.next().cloned();
+            if matches.next().is_some() {
+                return LocalClaimOutcome::ResourceConflict(
+                    "backend identity has multiple live Local owners",
+                );
+            }
+            first
+        };
+
+        let pane = if let Some(explicit) = evidence
+            .pane
+            .as_deref()
+            .filter(|pane| !pane.trim().is_empty())
+        {
+            match attestation.as_ref() {
+                Some(LocalBackendPaneAttestationState::Unique(observed))
+                    if observed.pane != explicit =>
+                {
+                    return LocalClaimOutcome::EvidenceConflict(
+                        "explicit pane disagrees with backend attestation",
+                    );
+                }
+                Some(LocalBackendPaneAttestationState::Ambiguous { .. }) => {
+                    return LocalClaimOutcome::EvidenceConflict(
+                        "backend attestation is ambiguous across live panes",
+                    );
+                }
+                Some(LocalBackendPaneAttestationState::Unique(_)) | None => {}
+            }
+            if live_pair
+                .as_ref()
+                .and_then(|session| session.pane.as_deref())
+                .is_some_and(|current| current != explicit)
+            {
+                return LocalClaimOutcome::EvidenceConflict(
+                    "explicit pane disagrees with current backend owner",
+                );
+            }
+            explicit.to_string()
+        } else if evidence.pane.is_some() {
+            return LocalClaimOutcome::EvidenceConflict("explicit pane is empty");
+        } else if let Some(current) = live_pair.as_ref() {
+            let Some(pane) = current.pane.clone() else {
+                return LocalClaimOutcome::EvidenceConflict(
+                    "current backend owner has no pane to corroborate",
+                );
+            };
+            pane
+        } else {
+            match attestation.as_ref() {
+                Some(LocalBackendPaneAttestationState::Unique(observed)) => observed.pane.clone(),
+                Some(LocalBackendPaneAttestationState::Ambiguous { .. }) => {
+                    return LocalClaimOutcome::EvidenceConflict(
+                        "backend attestation is ambiguous across live panes",
+                    );
+                }
+                None => {
+                    return LocalClaimOutcome::EvidenceConflict(
+                        "claim requires an explicit pane or fresh backend attestation",
+                    );
+                }
+            }
+        };
+
+        let panes = self.list_assistant_panes().await;
+        let Some(live_pane) = panes.iter().find(|candidate| candidate.pane_id == pane) else {
+            return LocalClaimOutcome::EvidenceConflict("claim pane is not a live assistant pane");
+        };
+        let Some(process_name) = live_pane.process_name.as_deref() else {
+            return LocalClaimOutcome::EvidenceConflict(
+                "claim pane has no corroborated backend process",
+            );
+        };
+        let Some(backend) = self.backends.get(&identity.backend) else {
+            return LocalClaimOutcome::EvidenceConflict("claim backend is not registered");
+        };
+        if crate::tmux::matching_process_name(process_name, backend.process_names()).is_none() {
+            return LocalClaimOutcome::EvidenceConflict(
+                "claim backend does not match the live pane process",
+            );
+        }
+        let Some(live_path) = live_pane.pane_current_path.as_deref() else {
+            return LocalClaimOutcome::EvidenceConflict("claim pane has no current project path");
+        };
+        let Ok(project) = crate::project_identity::resolve_project_identity_async(live_path).await
+        else {
+            return LocalClaimOutcome::EvidenceConflict("claim project identity is invalid");
+        };
+        if is_home_project_root(&project.project_dir)
+            || project.project_dir == "/"
+            || project.canonical_repository == "/"
+        {
+            return LocalClaimOutcome::EvidenceConflict("claim project identity is unsafe");
+        }
+
+        let resource_guards = self
+            .local_backend_pane_attestation_resource_guards(
+                &identity,
+                &pane,
+                &project,
+                attestation.as_ref(),
+            )
+            .await;
+        let Some((observed_project, observed_pane_var, inspection)) = self
+            .observe_local_backend_pane_physical(&identity, &pane, &project)
+            .await
+        else {
+            return LocalClaimOutcome::EvidenceConflict("claim pane changed during corroboration");
+        };
+        if observed_project != project {
+            return LocalClaimOutcome::EvidenceConflict(
+                "claim project changed during corroboration",
+            );
+        }
+        if evidence
+            .pane_var_id
+            .as_ref()
+            .is_some_and(|reported| observed_pane_var.as_ref() != Some(reported))
+        {
+            return LocalClaimOutcome::EvidenceConflict(
+                "reported pane marker disagrees with the current pane marker",
+            );
+        }
+        {
+            let current_attestation = self
+                .local_backend_pane_attestations
+                .read()
+                .await
+                .get(&key)
+                .cloned();
+            if current_attestation != attestation {
+                return LocalClaimOutcome::EvidenceConflict(
+                    "backend attestation generation changed during claim",
+                );
+            }
+            if let Some(LocalBackendPaneAttestationState::Unique(observed)) =
+                current_attestation.as_ref()
+                && (observed.pane != pane
+                    || observed.project != project
+                    || observed.pane_var_id != observed_pane_var)
+            {
+                return LocalClaimOutcome::EvidenceConflict(
+                    "backend attestation no longer matches the live pane",
+                );
+            }
+        }
+
+        let (outcome, effects) = {
+            let mut protocol = self.protocol.write().await;
+            let pair_matches = |metadata: &crate::daemon_protocol::SessionMeta| {
+                metadata.backend.as_deref() == Some(identity.backend.as_str())
+                    && metadata.backend_session_id.as_deref() == Some(identity.session_id.as_str())
+            };
+            let mut live_matches = protocol.sessions.values().filter(|session| {
+                matches!(session.origin, crate::daemon_protocol::Origin::Local)
+                    && pair_matches(&session.metadata)
+            });
+            let live_match = live_matches.next().cloned();
+            if live_matches.next().is_some() {
+                return LocalClaimOutcome::ResourceConflict(
+                    "backend identity has multiple live Local owners",
+                );
+            }
+            let mut dormant_matches = protocol
+                .dormant_sessions
+                .values()
+                .filter(|dormant| pair_matches(&dormant.metadata));
+            let dormant_match = dormant_matches.next().cloned();
+            if dormant_matches.next().is_some() {
+                return LocalClaimOutcome::ResourceConflict(
+                    "backend identity has multiple dormant owners",
+                );
+            }
+
+            let authority_id = live_match
+                .as_ref()
+                .map(|session| session.id.as_str())
+                .or_else(|| dormant_match.as_ref().map(|dormant| dormant.id.as_str()));
+            let signal_allowed = |signal: Option<&String>| {
+                signal.is_none_or(|signal| {
+                    signal == requested_id || authority_id.is_some_and(|id| signal == id)
+                })
+            };
+            if !signal_allowed(evidence.pane_var_id.as_ref())
+                || !signal_allowed(evidence.env_id.as_ref())
+                || !signal_allowed(observed_pane_var.as_ref())
+            {
+                return LocalClaimOutcome::EvidenceConflict(
+                    "positive Local identity evidence names another owner",
+                );
+            }
+
+            if let Some(current) = live_match {
+                if current.id != requested_id {
+                    return LocalClaimOutcome::AlreadyRegistered { id: current.id };
+                }
+                if current.pane.as_deref() != Some(pane.as_str())
+                    || current.metadata.project_dir.as_deref() != Some(project.project_dir.as_str())
+                    || current.metadata.canonical_project_identity.as_deref()
+                        != Some(project.canonical_repository.as_str())
+                {
+                    return LocalClaimOutcome::ResourceConflict(
+                        "current backend owner disagrees with pane or project",
+                    );
+                }
+                let actual_project = project_dir_identity(&project.project_dir);
+                let canonical_project = project_dir_identity(&project.canonical_repository);
+                if protocol.lifecycle_leases.iter().any(|(id, lease)| {
+                    id == requested_id
+                        || lease.inert_pane.as_deref() == Some(pane.as_str())
+                        || (lease.backend.as_deref() == Some(identity.backend.as_str())
+                            && lease.backend_session_id.as_deref()
+                                == Some(identity.session_id.as_str()))
+                        || lease.project_dir.as_deref().is_some_and(|project_dir| {
+                            let lease_project = project_dir_identity(project_dir);
+                            lease_project == actual_project || lease_project == canonical_project
+                        })
+                }) {
+                    return LocalClaimOutcome::ResourceConflict(
+                        "current claim resources are held by a lifecycle lease",
+                    );
+                }
+                if !matches!(inspection, crate::tmux::ManagedPaneInspection::Unmanaged)
+                    && inspection.owner() != Some(&current.owner())
+                {
+                    return LocalClaimOutcome::EvidenceConflict(
+                        "live pane owner marker disagrees with current owner",
+                    );
+                }
+                (LocalClaimOutcome::Current(current.owner()), Vec::new())
+            } else if let Some(dormant) = dormant_match {
+                if dormant.metadata.project_dir.as_deref() != Some(project.project_dir.as_str())
+                    || dormant.canonical_project_identity != project.canonical_repository
+                {
+                    return LocalClaimOutcome::ResourceConflict(
+                        "dormant backend owner belongs to a different project",
+                    );
+                }
+                if !crate::tmux::pane_accepts_owner_marker(&inspection, &dormant.prior_owner) {
+                    return LocalClaimOutcome::EvidenceConflict(
+                        "replacement pane owner marker conflicts with dormant owner",
+                    );
+                }
+                let event = crate::daemon_protocol::Event::RecoverDormantSession {
+                    dormant_owner: dormant.prior_owner.clone(),
+                    pane: pane.clone(),
+                    backend: identity.backend.clone(),
+                    backend_session_id: identity.session_id.clone(),
+                    project_dir: project.project_dir.clone(),
+                    canonical_project_identity: project.canonical_repository.clone(),
+                };
+                let mut candidate = protocol.clone();
+                let effects = candidate.apply(event);
+                let Some(owner) = effects.iter().find_map(|effect| match effect {
+                    crate::daemon_protocol::Effect::DormantRecovered { owner } => {
+                        Some(owner.clone())
+                    }
+                    _ => None,
+                }) else {
+                    return LocalClaimOutcome::ResourceConflict(
+                        "dormant recovery resources are occupied",
+                    );
+                };
+                if let Err(error) = self.persist_protocol_state(&candidate) {
+                    return LocalClaimOutcome::PersistenceFailed(error.to_string());
+                }
+                *protocol = candidate;
+                (
+                    LocalClaimOutcome::Recovered(owner),
+                    effects
+                        .into_iter()
+                        .filter(|effect| !matches!(effect, crate::daemon_protocol::Effect::Persist))
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                if protocol.sessions.contains_key(requested_id) {
+                    return LocalClaimOutcome::DestinationLive {
+                        id: requested_id.to_string(),
+                    };
+                }
+                if protocol.dormant_sessions.contains_key(requested_id) {
+                    return LocalClaimOutcome::DestinationDormant {
+                        id: requested_id.to_string(),
+                    };
+                }
+                let actual_project = project_dir_identity(&project.project_dir);
+                let canonical_project = project_dir_identity(&project.canonical_repository);
+                if protocol.lifecycle_leases.iter().any(|(id, lease)| {
+                    id == requested_id
+                        || lease.inert_pane.as_deref() == Some(pane.as_str())
+                        || (lease.backend.as_deref() == Some(identity.backend.as_str())
+                            && lease.backend_session_id.as_deref()
+                                == Some(identity.session_id.as_str()))
+                        || lease.project_dir.as_deref().is_some_and(|project_dir| {
+                            let lease_project = project_dir_identity(project_dir);
+                            lease_project == actual_project || lease_project == canonical_project
+                        })
+                }) {
+                    return LocalClaimOutcome::ResourceConflict(
+                        "claim resources are held by a lifecycle lease",
+                    );
+                }
+                if protocol
+                    .sessions
+                    .values()
+                    .any(|session| session.pane.as_deref() == Some(pane.as_str()))
+                {
+                    return LocalClaimOutcome::ResourceConflict(
+                        "claim pane is owned by another session",
+                    );
+                }
+                if !matches!(inspection, crate::tmux::ManagedPaneInspection::Unmanaged) {
+                    return LocalClaimOutcome::EvidenceConflict(
+                        "unregistered claim pane carries a foreign owner marker",
+                    );
+                }
+                let event = crate::daemon_protocol::Event::ClaimLocalSession {
+                    requested_id: requested_id.to_string(),
+                    pane: pane.clone(),
+                    backend: identity.backend.clone(),
+                    backend_session_id: identity.session_id.clone(),
+                    project_dir: project.project_dir.clone(),
+                    canonical_project_identity: project.canonical_repository.clone(),
+                };
+                let mut candidate = protocol.clone();
+                let effects = candidate.apply(event);
+                let Some(owner) = effects.iter().find_map(|effect| match effect {
+                    crate::daemon_protocol::Effect::LocalClaimed {
+                        owner,
+                        disposition: crate::daemon_protocol::LocalClaimDisposition::Created,
+                    } => Some(owner.clone()),
+                    _ => None,
+                }) else {
+                    return LocalClaimOutcome::ResourceConflict(
+                        "claim resources changed before commit",
+                    );
+                };
+                if let Err(error) = self.persist_protocol_state(&candidate) {
+                    return LocalClaimOutcome::PersistenceFailed(error.to_string());
+                }
+                *protocol = candidate;
+                (
+                    LocalClaimOutcome::Claimed(owner),
+                    effects
+                        .into_iter()
+                        .filter(|effect| !matches!(effect, crate::daemon_protocol::Effect::Persist))
+                        .collect::<Vec<_>>(),
+                )
+            }
+        };
+        drop(resource_guards);
+        self.execute_effects(&effects).await;
+        if let Some(attestation) = attestation {
+            self.consume_local_backend_pane_attestation(&identity, attestation.generation())
+                .await;
+        }
+        outcome
     }
 
     /// Atomically park or forget one exact Local owner after a trusted
@@ -8062,6 +8503,425 @@ pub(crate) mod tests {
                 .await,
             LocalBackendPaneAttestationRecordOutcome::Recorded(_)
         ));
+    }
+
+    async fn claim_local_identity_fixture() -> (
+        Arc<AppState>,
+        tempfile::TempDir,
+        crate::project_identity::ProjectIdentity,
+        crate::backend::BackendSessionIdentity,
+        LocalClaimEvidence,
+    ) {
+        let project = tempfile::tempdir().unwrap();
+        let project_dir = project.path().canonicalize().unwrap();
+        let project_dir = project_dir.to_string_lossy().into_owned();
+        let project_identity =
+            crate::project_identity::resolve_project_identity_async(&project_dir)
+                .await
+                .unwrap();
+        let identity = crate::backend::BackendSessionIdentity {
+            backend: "codex-cli".into(),
+            session_id: "thread-claimant".into(),
+        };
+        let state = AppState::new_for_test();
+        *state.cached_assistant_panes.write().await = vec![crate::tmux::TmuxPane {
+            pane_id: "%1".into(),
+            session_name: "claim".into(),
+            pane_current_path: Some(project_identity.project_dir.clone()),
+            process_name: Some("codex".into()),
+        }];
+        let evidence = LocalClaimEvidence {
+            pane: Some("%1".into()),
+            pane_var_id: None,
+            env_id: None,
+            backend_identity: identity.clone(),
+        };
+        (state, project, project_identity, identity, evidence)
+    }
+
+    #[tokio::test]
+    async fn claim_local_identity_creates_and_retries_exact_owner() {
+        let (state, _project, project_identity, identity, evidence) =
+            claim_local_identity_fixture().await;
+
+        let first = state.claim_local_identity("chosen", &evidence).await;
+        let LocalClaimOutcome::Claimed(owner) = first else {
+            panic!("expected claim, got {first:?}");
+        };
+        assert_eq!(owner.session_id, "chosen");
+        let claimed = state.protocol.read().await.sessions["chosen"].clone();
+        assert_eq!(claimed.pane.as_deref(), Some("%1"));
+        assert_eq!(
+            claimed.metadata.project_dir.as_deref(),
+            Some(project_identity.project_dir.as_str())
+        );
+        assert_eq!(
+            claimed.metadata.backend_session_id.as_deref(),
+            Some(identity.session_id.as_str())
+        );
+
+        assert_eq!(
+            state.claim_local_identity("chosen", &evidence).await,
+            LocalClaimOutcome::Current(owner.clone())
+        );
+        assert_eq!(state.protocol.read().await.sessions.len(), 1);
+        assert_eq!(
+            state.claim_existing_start(&owner).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        assert!(matches!(
+            state.claim_local_identity("chosen", &evidence).await,
+            LocalClaimOutcome::ResourceConflict(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn claim_local_identity_uses_unique_attestation_without_explicit_pane() {
+        let (state, _project, project_identity, identity, mut evidence) =
+            claim_local_identity_fixture().await;
+        let recorded = state
+            .record_local_backend_pane_attestation(&identity, "%1", &project_identity)
+            .await;
+        assert!(matches!(
+            recorded,
+            LocalBackendPaneAttestationRecordOutcome::Recorded(_)
+        ));
+        evidence.pane = None;
+
+        assert!(matches!(
+            state.claim_local_identity("chosen", &evidence).await,
+            LocalClaimOutcome::Claimed(_)
+        ));
+        assert_eq!(state.local_backend_pane_attestation(&identity).await, None);
+    }
+
+    #[tokio::test]
+    async fn claim_local_identity_recovery_precedes_different_requested_id() {
+        let (state, _project, project_identity, identity, evidence) =
+            claim_local_identity_fixture().await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "durable-public-id".into(),
+                pane: Some("%0".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some(project_identity.project_dir.clone()),
+                    canonical_project_identity: Some(project_identity.canonical_repository.clone()),
+                    backend: Some(identity.backend.clone()),
+                    backend_session_id: Some(identity.session_id.clone()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let prior = state.protocol.read().await.sessions["durable-public-id"].owner();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::DormantOwned {
+                owner: prior.clone(),
+                expected_pane: Some("%0".into()),
+                observed_at: 1_753_920_100,
+                source: crate::daemon_protocol::DormancySource::Reaped,
+            })
+            .await;
+
+        let outcome = state
+            .claim_local_identity("different-request", &evidence)
+            .await;
+
+        let LocalClaimOutcome::Recovered(owner) = outcome else {
+            panic!("expected recovery, got {outcome:?}");
+        };
+        assert_eq!(owner.session_id, "durable-public-id");
+        assert!(owner.incarnation > prior.incarnation);
+        let protocol = state.protocol.read().await;
+        assert!(protocol.sessions.contains_key("durable-public-id"));
+        assert!(!protocol.sessions.contains_key("different-request"));
+        assert!(protocol.dormant_sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn claim_local_identity_rejects_invalid_or_conflicting_evidence_without_mutation() {
+        for conflict in [
+            "noncanonical-id",
+            "incomplete-backend",
+            "missing-pane-attestation",
+            "non-assistant-pane",
+            "backend-mismatch",
+            "foreign-pane-var",
+            "foreign-env-id",
+            "explicit-attestation-disagreement",
+            "ambiguous-attestation",
+            "stale-attestation-project",
+        ] {
+            let (state, _project, project_identity, identity, mut evidence) =
+                claim_local_identity_fixture().await;
+            let requested = if conflict == "noncanonical-id" {
+                "Not Canonical"
+            } else {
+                "chosen"
+            };
+            match conflict {
+                "noncanonical-id" => {}
+                "incomplete-backend" => evidence.backend_identity.session_id.clear(),
+                "missing-pane-attestation" => evidence.pane = None,
+                "non-assistant-pane" => state.cached_assistant_panes.write().await.clear(),
+                "backend-mismatch" => {
+                    state.cached_assistant_panes.write().await[0].process_name =
+                        Some("claude".into());
+                }
+                "foreign-pane-var" | "foreign-env-id" => {
+                    state
+                        .apply_and_execute(crate::daemon_protocol::Event::Register {
+                            id: "sibling".into(),
+                            pane: Some("%9".into()),
+                            metadata: crate::daemon_protocol::SessionMeta {
+                                project_dir: Some("/tmp/sibling".into()),
+                                canonical_project_identity: Some("/tmp/sibling".into()),
+                                backend: Some("claude-code".into()),
+                                backend_session_id: Some("sibling-thread".into()),
+                                ..Default::default()
+                            },
+                        })
+                        .await;
+                    if conflict == "foreign-pane-var" {
+                        evidence.pane_var_id = Some("sibling".into());
+                        state.set_local_backend_pane_attestation_test_pane_var(
+                            "%1",
+                            Some("sibling".into()),
+                        );
+                    } else {
+                        evidence.env_id = Some("sibling".into());
+                    }
+                }
+                "explicit-attestation-disagreement" => {
+                    state
+                        .record_local_backend_pane_attestation(&identity, "%1", &project_identity)
+                        .await;
+                    state
+                        .cached_assistant_panes
+                        .write()
+                        .await
+                        .push(crate::tmux::TmuxPane {
+                            pane_id: "%2".into(),
+                            session_name: "claim".into(),
+                            pane_current_path: Some(project_identity.project_dir.clone()),
+                            process_name: Some("codex".into()),
+                        });
+                    evidence.pane = Some("%2".into());
+                }
+                "ambiguous-attestation" => {
+                    state
+                        .record_local_backend_pane_attestation(&identity, "%1", &project_identity)
+                        .await;
+                    state
+                        .cached_assistant_panes
+                        .write()
+                        .await
+                        .push(crate::tmux::TmuxPane {
+                            pane_id: "%2".into(),
+                            session_name: "claim".into(),
+                            pane_current_path: Some(project_identity.project_dir.clone()),
+                            process_name: Some("codex".into()),
+                        });
+                    state
+                        .record_local_backend_pane_attestation(&identity, "%2", &project_identity)
+                        .await;
+                    evidence.pane = None;
+                }
+                "stale-attestation-project" => {
+                    state
+                        .record_local_backend_pane_attestation(&identity, "%1", &project_identity)
+                        .await;
+                    evidence.pane = None;
+                    state.cached_assistant_panes.write().await[0].pane_current_path =
+                        Some("/tmp/changed-project".into());
+                }
+                _ => unreachable!(),
+            }
+            let before = state.protocol.read().await.clone();
+
+            let outcome = state.claim_local_identity(requested, &evidence).await;
+
+            match conflict {
+                "noncanonical-id" => assert_eq!(
+                    outcome,
+                    LocalClaimOutcome::InvalidId {
+                        requested: "Not Canonical".into(),
+                        canonical: "not-canonical".into(),
+                    }
+                ),
+                _ => assert!(
+                    matches!(outcome, LocalClaimOutcome::EvidenceConflict(_)),
+                    "conflict {conflict}: {outcome:?}"
+                ),
+            }
+            assert_eq!(*state.protocol.read().await, before, "conflict {conflict}");
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_local_identity_rejects_live_dormant_and_lifecycle_resources() {
+        for conflict in [
+            "live-destination",
+            "dormant-destination",
+            "already-registered-pair",
+            "id-lease",
+            "pane-lease",
+            "pair-lease",
+            "actual-project-lease",
+            "canonical-project-lease",
+        ] {
+            let (state, _project, project_identity, identity, evidence) =
+                claim_local_identity_fixture().await;
+            match conflict {
+                "live-destination" => {
+                    state
+                        .apply_and_execute(crate::daemon_protocol::Event::Register {
+                            id: "chosen".into(),
+                            pane: Some("%9".into()),
+                            metadata: crate::daemon_protocol::SessionMeta::default(),
+                        })
+                        .await;
+                }
+                "dormant-destination" => {
+                    state
+                        .apply_and_execute(crate::daemon_protocol::Event::Register {
+                            id: "chosen".into(),
+                            pane: Some("%9".into()),
+                            metadata: continuity_metadata("other-thread", "/tmp/other"),
+                        })
+                        .await;
+                    let owner = state.protocol.read().await.sessions["chosen"].owner();
+                    state
+                        .apply_and_execute(crate::daemon_protocol::Event::DormantOwned {
+                            owner,
+                            expected_pane: Some("%9".into()),
+                            observed_at: 1_753_920_100,
+                            source: crate::daemon_protocol::DormancySource::Reaped,
+                        })
+                        .await;
+                }
+                "already-registered-pair" => {
+                    state
+                        .apply_and_execute(crate::daemon_protocol::Event::Register {
+                            id: "other-id".into(),
+                            pane: Some("%1".into()),
+                            metadata: crate::daemon_protocol::SessionMeta {
+                                project_dir: Some(project_identity.project_dir.clone()),
+                                canonical_project_identity: Some(
+                                    project_identity.canonical_repository.clone(),
+                                ),
+                                backend: Some(identity.backend.clone()),
+                                backend_session_id: Some(identity.session_id.clone()),
+                                ..Default::default()
+                            },
+                        })
+                        .await;
+                }
+                "id-lease"
+                | "pane-lease"
+                | "pair-lease"
+                | "actual-project-lease"
+                | "canonical-project-lease" => {
+                    let lease_id = if conflict == "id-lease" {
+                        "chosen"
+                    } else {
+                        "reserved"
+                    };
+                    let owner = match state
+                        .protocol
+                        .write()
+                        .await
+                        .reserve_start(lease_id)
+                        .unwrap()
+                    {
+                        crate::daemon_protocol::StartDisposition::Reserved(owner) => owner,
+                        outcome => panic!("unexpected reservation: {outcome:?}"),
+                    };
+                    let mut protocol = state.protocol.write().await;
+                    let lease = protocol.lifecycle_leases.get_mut(lease_id).unwrap();
+                    match conflict {
+                        "pane-lease" => {
+                            lease.inert_pane = Some("%1".into());
+                            lease.inert_pane_owner = Some(owner);
+                        }
+                        "pair-lease" => {
+                            lease.backend = Some(identity.backend.clone());
+                            lease.backend_session_id = Some(identity.session_id.clone());
+                            lease.backend_session_owner = Some(owner);
+                        }
+                        "actual-project-lease" => {
+                            lease.project_dir = Some(project_identity.project_dir.clone());
+                            lease.project_dir_owner = Some(owner);
+                        }
+                        "canonical-project-lease" => {
+                            lease.project_dir = Some(project_identity.canonical_repository.clone());
+                            lease.project_dir_owner = Some(owner);
+                        }
+                        "id-lease" => {}
+                        _ => unreachable!(),
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let before = state.protocol.read().await.clone();
+
+            let outcome = state.claim_local_identity("chosen", &evidence).await;
+
+            match conflict {
+                "live-destination" => {
+                    assert_eq!(
+                        outcome,
+                        LocalClaimOutcome::DestinationLive {
+                            id: "chosen".into()
+                        }
+                    )
+                }
+                "dormant-destination" => assert_eq!(
+                    outcome,
+                    LocalClaimOutcome::DestinationDormant {
+                        id: "chosen".into()
+                    }
+                ),
+                "already-registered-pair" => assert_eq!(
+                    outcome,
+                    LocalClaimOutcome::AlreadyRegistered {
+                        id: "other-id".into()
+                    }
+                ),
+                _ => assert!(
+                    matches!(outcome, LocalClaimOutcome::ResourceConflict(_)),
+                    "conflict {conflict}: {outcome:?}"
+                ),
+            }
+            assert_eq!(*state.protocol.read().await, before, "conflict {conflict}");
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_local_identity_persistence_failure_rolls_back() {
+        let config = test_config();
+        let state = AppState::new(config.clone());
+        let project = tempfile::tempdir().unwrap();
+        let project_dir = project.path().canonicalize().unwrap();
+        let project_dir = project_dir.to_string_lossy().into_owned();
+        *state.cached_assistant_panes.write().await = vec![crate::tmux::TmuxPane {
+            pane_id: "%1".into(),
+            session_name: "claim".into(),
+            pane_current_path: Some(project_dir),
+            process_name: Some("codex".into()),
+        }];
+        let evidence = LocalClaimEvidence {
+            pane: Some("%1".into()),
+            pane_var_id: None,
+            env_id: None,
+            backend_identity: local_backend_pane_attestation_identity(),
+        };
+        let before = state.protocol.read().await.clone();
+        std::fs::create_dir(config.data_dir.join("sessions.tmp")).unwrap();
+
+        let outcome = state.claim_local_identity("chosen", &evidence).await;
+
+        assert!(matches!(outcome, LocalClaimOutcome::PersistenceFailed(_)));
+        assert_eq!(*state.protocol.read().await, before);
     }
 
     async fn dormant_recovery_fixture() -> (

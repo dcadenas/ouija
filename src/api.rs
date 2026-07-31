@@ -1273,15 +1273,100 @@ pub struct LocalClaimRequest {
     pub caller: crate::state::LocalClaimEvidence,
 }
 
-/// Reserve the explicit Local claim route until its coordinator is wired.
+/// Claim one exact Local public identity from independently corroborated
+/// caller evidence. This route is local-only and has no Nostr wire analogue.
 pub async fn claim_local_identity(
-    State(_state): State<SharedState>,
-    Json(_body): Json<LocalClaimRequest>,
+    State(state): State<SharedState>,
+    Json(body): Json<LocalClaimRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({"outcome": "not_implemented"})),
-    )
+    match state
+        .claim_local_identity(&body.requested_id, &body.caller)
+        .await
+    {
+        crate::state::LocalClaimOutcome::Claimed(owner) => (
+            StatusCode::OK,
+            Json(json!({
+                "outcome": "claimed",
+                "session_id": owner.session_id,
+                "session_incarnation": owner.incarnation.to_string(),
+            })),
+        ),
+        crate::state::LocalClaimOutcome::Current(owner) => (
+            StatusCode::OK,
+            Json(json!({
+                "outcome": "current",
+                "session_id": owner.session_id,
+                "session_incarnation": owner.incarnation.to_string(),
+            })),
+        ),
+        crate::state::LocalClaimOutcome::Recovered(owner) => (
+            StatusCode::OK,
+            Json(json!({
+                "outcome": "recovered",
+                "session_id": owner.session_id,
+                "session_incarnation": owner.incarnation.to_string(),
+            })),
+        ),
+        crate::state::LocalClaimOutcome::InvalidId {
+            requested,
+            canonical,
+        } => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "outcome": "invalid_id",
+                "requested_id": requested,
+                "canonical_id": canonical,
+                "error": "requested ID must already be in canonical Ouija form",
+            })),
+        ),
+        crate::state::LocalClaimOutcome::DestinationLive { id } => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "outcome": "destination_live",
+                "session_id": id,
+                "error": "requested ID is already live",
+            })),
+        ),
+        crate::state::LocalClaimOutcome::DestinationDormant { id } => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "outcome": "destination_dormant",
+                "session_id": id,
+                "error": "requested ID is reserved by a dormant identity",
+                "inspect_command": format!("ouija dormant show {id}"),
+                "forget_command": format!("ouija unregister {id}"),
+            })),
+        ),
+        crate::state::LocalClaimOutcome::AlreadyRegistered { id } => (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "outcome": "already_registered",
+                "session_id": id,
+                "error": "backend identity already owns a different Local public ID; claim is not rename",
+            })),
+        ),
+        crate::state::LocalClaimOutcome::EvidenceConflict(reason) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "outcome": "evidence_conflict",
+                "error": reason,
+            })),
+        ),
+        crate::state::LocalClaimOutcome::ResourceConflict(reason) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "outcome": "resource_conflict",
+                "error": reason,
+            })),
+        ),
+        crate::state::LocalClaimOutcome::PersistenceFailed(reason) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "outcome": "persistence_failed",
+                "error": reason,
+            })),
+        ),
+    }
 }
 
 /// Rename an existing session.
@@ -6977,6 +7062,139 @@ mod tests {
         );
         let protocol = state.protocol.read().await;
         assert_eq!(protocol.sessions.get("requested"), Some(&incumbent_before));
+    }
+
+    #[tokio::test]
+    async fn claim_rejects_noncanonical_and_incomplete_evidence_as_bad_request() {
+        let state = crate::state::AppState::new_for_test();
+        for (requested_id, identity) in [
+            (
+                "Not Canonical",
+                crate::backend::BackendSessionIdentity {
+                    backend: "codex-cli".into(),
+                    session_id: "thread".into(),
+                },
+            ),
+            (
+                "requested",
+                crate::backend::BackendSessionIdentity {
+                    backend: "codex-cli".into(),
+                    session_id: String::new(),
+                },
+            ),
+        ] {
+            let (status, body) = claim_local_identity(
+                State(state.clone()),
+                Json(LocalClaimRequest {
+                    requested_id: requested_id.into(),
+                    caller: crate::state::LocalClaimEvidence {
+                        pane: Some("%1".into()),
+                        pane_var_id: None,
+                        env_id: None,
+                        backend_identity: identity,
+                    },
+                }),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::BAD_REQUEST, "body: {:?}", body.0);
+            assert!(body["outcome"].as_str().is_some());
+        }
+        assert!(state.protocol.read().await.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn claim_dormant_destination_returns_structured_remediation() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "requested".into(),
+                pane: Some("%old".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/old-worktree".into()),
+                    canonical_project_identity: Some("/tmp/old-repository".into()),
+                    backend: Some("codex-cli".into()),
+                    backend_session_id: Some("old-thread".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["requested"].owner();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::DormantOwned {
+                owner,
+                expected_pane: Some("%old".into()),
+                observed_at: 1_753_920_100,
+                source: crate::daemon_protocol::DormancySource::Reaped,
+            })
+            .await;
+        *state.cached_assistant_panes.write().await =
+            vec![pane_for_backend("/tmp/new-worktree", "%claimant", "codex")];
+
+        let (status, body) = claim_local_identity(
+            State(state),
+            Json(LocalClaimRequest {
+                requested_id: "requested".into(),
+                caller: crate::state::LocalClaimEvidence {
+                    pane: Some("%claimant".into()),
+                    pane_var_id: None,
+                    env_id: None,
+                    backend_identity: crate::backend::BackendSessionIdentity {
+                        backend: "codex-cli".into(),
+                        session_id: "new-thread".into(),
+                    },
+                },
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "body: {:?}", body.0);
+        assert_eq!(body["outcome"], "destination_dormant");
+        assert_eq!(body["session_id"], "requested");
+        assert!(
+            body["inspect_command"]
+                .as_str()
+                .is_some_and(|command| command.contains("dormant show requested"))
+        );
+        assert!(
+            body["forget_command"]
+                .as_str()
+                .is_some_and(|command| command.contains("unregister requested"))
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_persistence_failure_is_internal_error_without_success() {
+        let config = crate::state::tests::test_config();
+        let state = crate::state::AppState::new(config.clone());
+        let project = tempfile::tempdir().unwrap();
+        let project_dir = project.path().canonicalize().unwrap();
+        let project_dir = project_dir.to_string_lossy().into_owned();
+        *state.cached_assistant_panes.write().await =
+            vec![pane_for_backend(&project_dir, "%claimant", "codex")];
+        std::fs::create_dir(config.data_dir.join("sessions.tmp")).unwrap();
+
+        let (status, body) = claim_local_identity(
+            State(state.clone()),
+            Json(LocalClaimRequest {
+                requested_id: "requested".into(),
+                caller: crate::state::LocalClaimEvidence {
+                    pane: Some("%claimant".into()),
+                    pane_var_id: None,
+                    env_id: None,
+                    backend_identity: crate::backend::BackendSessionIdentity {
+                        backend: "codex-cli".into(),
+                        session_id: "new-thread".into(),
+                    },
+                },
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["outcome"], "persistence_failed");
+        assert!(body.get("session_id").is_none());
+        assert!(state.protocol.read().await.sessions.is_empty());
     }
 
     #[tokio::test]
