@@ -2496,6 +2496,7 @@ mod tests {
                 pane: Some("%999999997".into()),
                 metadata: crate::daemon_protocol::SessionMeta {
                     project_dir: Some("/home/user/code/myproject".into()),
+                    canonical_project_identity: Some("/home/user/code/myproject".into()),
                     role: Some("canonical role".into()),
                     prompt: Some("preserve this prompt".into()),
                     backend: Some("claude-code".into()),

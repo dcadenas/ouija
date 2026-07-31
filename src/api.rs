@@ -1323,7 +1323,7 @@ pub async fn rename(
         let reason = effects
             .iter()
             .find_map(|e| match e {
-                crate::daemon_protocol::Effect::RenameFailed { reason } => Some(reason.clone()),
+                crate::daemon_protocol::Effect::RenameFailed { reason, .. } => Some(reason.clone()),
                 _ => None,
             })
             .unwrap_or_else(|| format!("session '{}' not found", body.old_id));

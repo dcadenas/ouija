@@ -164,6 +164,8 @@ pub struct DaemonState {
     pub daemon_id: String,
     pub daemon_name: String,
     pub sessions: BTreeMap<String, SessionEntry>,
+    /// Durable, non-routable Local identities reserved for exact recovery.
+    pub dormant_sessions: BTreeMap<String, DormantSession>,
     /// Greatest incarnation ever allocated by this daemon.
     ///
     /// It is independent of the live session map so removing the current
@@ -220,6 +222,24 @@ pub struct SessionEntry {
     /// the entry's ownership without a separately keyed reachability index.
     #[serde(skip)]
     pub(crate) active_context_due_boundary: ActiveContextDueBoundary,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DormancySource {
+    Reaped,
+    TrustedSessionEnd,
+}
+
+/// Durable identity metadata parked while its backend is not live.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct DormantSession {
+    pub id: String,
+    pub prior_owner: ResourceOwner,
+    pub metadata: SessionMeta,
+    pub canonical_project_identity: String,
+    pub dormant_at: i64,
+    pub source: DormancySource,
 }
 
 impl SessionEntry {
@@ -899,6 +919,31 @@ pub enum Event {
         backend_session_id: String,
         project_dir: String,
     },
+    /// Park or remove one exact Local owner after trusted liveness observation.
+    DormantOwned {
+        owner: ResourceOwner,
+        expected_pane: Option<String>,
+        observed_at: i64,
+        source: DormancySource,
+    },
+    /// Consume one exact dormant identity into a replacement live owner.
+    RecoverDormantSession {
+        dormant_owner: ResourceOwner,
+        pane: String,
+        backend: String,
+        backend_session_id: String,
+        project_dir: String,
+        canonical_project_identity: String,
+    },
+    /// Create a new exact Local identity from already-corroborated evidence.
+    ClaimLocalSession {
+        requested_id: String,
+        pane: String,
+        backend: String,
+        backend_session_id: String,
+        project_dir: String,
+        canonical_project_identity: String,
+    },
     /// Establish the next incarnation before a fresh hard launch performs any
     /// external work. Native identity is deliberately empty until the new
     /// process presents its launch proof.
@@ -1297,7 +1342,23 @@ pub enum Effect {
         new_id: String,
     },
     RenameFailed {
+        kind: RenameFailureKind,
         reason: String,
+    },
+    DormancyApplied {
+        id: String,
+        prior_owner: ResourceOwner,
+        tombstoned: bool,
+    },
+    DormantRecovered {
+        owner: ResourceOwner,
+    },
+    LocalClaimed {
+        owner: ResourceOwner,
+        disposition: LocalClaimDisposition,
+    },
+    DormantForgotten {
+        id: String,
     },
     RemoveOk {
         id: String,
@@ -1327,6 +1388,41 @@ pub enum Effect {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalClaimDisposition {
+    Created,
+    Current,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenameFailureKind {
+    SourceMissing,
+    SourceNotLocal,
+    SourceLease,
+    DestinationLease,
+    DestinationLive,
+    DestinationDormant,
+    InvalidDestination,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NameResolutionMode<'a> {
+    Automatic {
+        target_pane: Option<&'a str>,
+    },
+    Exact {
+        same_owner: Option<&'a ResourceOwner>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum NameResolution {
+    Available(String),
+    Idempotent(String),
+    Occupied { id: String, dormant: bool },
+}
+
 /// Severity level for log effects emitted by the state machine.
 #[derive(Clone, Debug)]
 pub enum LogLevel {
@@ -1336,6 +1432,79 @@ pub enum LogLevel {
 }
 
 // --- Helpers ---
+
+const MAX_NAME_SUFFIX: u32 = 100;
+
+/// Sanitize a name into a canonical Local session ID.
+pub fn sanitize_session_id(name: &str) -> String {
+    name.to_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+/// Resolve one requested name against both routable and dormant occupancy.
+pub(crate) fn resolve_session_id(
+    sessions: &BTreeMap<String, SessionEntry>,
+    dormant: &BTreeMap<String, DormantSession>,
+    requested: &str,
+    mode: NameResolutionMode<'_>,
+) -> NameResolution {
+    match mode {
+        NameResolutionMode::Exact { same_owner } => {
+            if let Some(session) = sessions.get(requested) {
+                return if same_owner.is_some_and(|owner| session.owner() == *owner) {
+                    NameResolution::Idempotent(requested.to_string())
+                } else {
+                    NameResolution::Occupied {
+                        id: requested.to_string(),
+                        dormant: false,
+                    }
+                };
+            }
+            if let Some(dormant_session) = dormant.get(requested) {
+                return if same_owner.is_some_and(|owner| dormant_session.prior_owner == *owner) {
+                    NameResolution::Idempotent(requested.to_string())
+                } else {
+                    NameResolution::Occupied {
+                        id: requested.to_string(),
+                        dormant: true,
+                    }
+                };
+            }
+            NameResolution::Available(requested.to_string())
+        }
+        NameResolutionMode::Automatic { target_pane } => {
+            let base_id = sanitize_session_id(requested);
+            let mut id = base_id.clone();
+            for suffix in 1..=MAX_NAME_SUFFIX {
+                if let Some(session) = sessions.get(&id) {
+                    if target_pane.is_some()
+                        && session.pane.as_deref() == target_pane
+                        && matches!(session.origin, Origin::Local)
+                    {
+                        return NameResolution::Idempotent(id);
+                    }
+                } else if !dormant.contains_key(&id) {
+                    return NameResolution::Available(id);
+                }
+                id = format!("{base_id}-{}", suffix.saturating_add(1));
+            }
+            NameResolution::Occupied {
+                id,
+                dormant: dormant.contains_key(&base_id),
+            }
+        }
+    }
+}
 
 /// Builds a namespaced key like `"daemon_name/session_id"` for remote sessions.
 pub fn remote_session_key(daemon_name: &str, raw_id: &str) -> String {
@@ -1764,6 +1933,32 @@ fn verify_session_self_claim(
     ))
 }
 
+/// Park an active segment using the same saturating stopped-boundary arithmetic.
+fn close_active_context_segment(metadata: &mut SessionMeta, observed_at: i64) -> bool {
+    let mut changed = false;
+    if let Some(started_at) = metadata.active_context_segment_started_at.take() {
+        let elapsed = i128::from(observed_at) - i128::from(started_at);
+        let elapsed = u64::try_from(elapsed.max(0)).unwrap_or(u64::MAX);
+        metadata.active_context_accumulated_secs = metadata
+            .active_context_accumulated_secs
+            .saturating_add(elapsed);
+        changed = true;
+    }
+    if metadata
+        .fresh_context_after_active_secs
+        .is_some_and(|limit| limit > 0 && metadata.active_context_accumulated_secs >= limit)
+        && !metadata.active_context_restart_due
+    {
+        metadata.active_context_restart_due = true;
+        changed = true;
+    }
+    changed
+}
+
+fn usable_project_identity(value: &str) -> bool {
+    value.starts_with('/') && value != "/"
+}
+
 // --- Implementation ---
 
 impl DaemonState {
@@ -1815,6 +2010,10 @@ impl DaemonState {
         self.sessions
             .values()
             .any(|session| session.owner() == *owner)
+            || self
+                .dormant_sessions
+                .values()
+                .any(|dormant| dormant.prior_owner == *owner)
             || self.lifecycle_leases.values().any(|lease| {
                 lease.owner == *owner
                     || lease.backend_session_owner.as_ref() == Some(owner)
@@ -2177,6 +2376,42 @@ impl DaemonState {
                 backend_session_id,
                 project_dir,
             ),
+            Event::DormantOwned {
+                owner,
+                expected_pane,
+                observed_at,
+                source,
+            } => self.apply_dormant_owned(&owner, expected_pane.as_deref(), observed_at, source),
+            Event::RecoverDormantSession {
+                dormant_owner,
+                pane,
+                backend,
+                backend_session_id,
+                project_dir,
+                canonical_project_identity,
+            } => self.apply_recover_dormant_session(
+                &dormant_owner,
+                pane,
+                backend,
+                backend_session_id,
+                project_dir,
+                canonical_project_identity,
+            ),
+            Event::ClaimLocalSession {
+                requested_id,
+                pane,
+                backend,
+                backend_session_id,
+                project_dir,
+                canonical_project_identity,
+            } => self.apply_claim_local_session(
+                requested_id,
+                pane,
+                backend,
+                backend_session_id,
+                project_dir,
+                canonical_project_identity,
+            ),
             Event::StageFreshLaunch {
                 id,
                 backend,
@@ -2344,28 +2579,7 @@ impl DaemonState {
             return vec![];
         }
 
-        let mut changed = false;
-        if let Some(started_at) = session.metadata.active_context_segment_started_at.take() {
-            // The ordered i64 timestamp range spans `u64::MAX` seconds, so
-            // subtract in i128 before converting the non-negative interval.
-            let elapsed_secs = u64::try_from(i128::from(at) - i128::from(started_at)).unwrap_or(0);
-            session.metadata.active_context_accumulated_secs = session
-                .metadata
-                .active_context_accumulated_secs
-                .saturating_add(elapsed_secs);
-            changed = true;
-        }
-        if session
-            .metadata
-            .fresh_context_after_active_secs
-            .is_some_and(|limit| {
-                limit > 0 && session.metadata.active_context_accumulated_secs >= limit
-            })
-            && !session.metadata.active_context_restart_due
-        {
-            session.metadata.active_context_restart_due = true;
-            changed = true;
-        }
+        let changed = close_active_context_segment(&mut session.metadata, at);
 
         let mut effects = Vec::new();
         if changed {
@@ -2385,6 +2599,372 @@ impl DaemonState {
                 owner: owner.clone(),
                 boundary_generation,
             });
+        }
+        effects
+    }
+
+    fn apply_dormant_owned(
+        &mut self,
+        owner: &ResourceOwner,
+        expected_pane: Option<&str>,
+        observed_at: i64,
+        source: DormancySource,
+    ) -> Vec<Effect> {
+        let Some(session) = self.sessions.get(&owner.session_id) else {
+            return vec![];
+        };
+        if self.lifecycle_leases.contains_key(&owner.session_id)
+            || !matches!(session.origin, Origin::Local)
+            || session.owner() != *owner
+            || session.pane.as_deref() != expected_pane
+        {
+            return vec![];
+        }
+
+        let session = session.clone();
+        let mut metadata = session.metadata.clone();
+        close_active_context_segment(&mut metadata, observed_at);
+        metadata.session_start_credential = None;
+        metadata.backend_repair_reservation = None;
+        metadata.scanner_registration = false;
+
+        let recoverable = metadata
+            .backend
+            .as_deref()
+            .zip(metadata.backend_session_id.as_deref())
+            .is_some_and(|(backend, backend_session_id)| {
+                !backend.is_empty() && !backend_session_id.is_empty()
+            })
+            && metadata
+                .project_dir
+                .as_deref()
+                .is_some_and(usable_project_identity)
+            && metadata
+                .canonical_project_identity
+                .as_deref()
+                .is_some_and(usable_project_identity);
+
+        self.sessions.remove(&owner.session_id);
+        if recoverable {
+            let canonical_project_identity = metadata
+                .canonical_project_identity
+                .clone()
+                .expect("recoverable metadata has canonical project identity");
+            self.dormant_sessions.insert(
+                owner.session_id.clone(),
+                DormantSession {
+                    id: owner.session_id.clone(),
+                    prior_owner: owner.clone(),
+                    metadata,
+                    canonical_project_identity,
+                    dormant_at: observed_at,
+                    source,
+                },
+            );
+        }
+
+        let mut effects = vec![Effect::Persist];
+        if let Some(pane) = session.session_agent_pane() {
+            effects.push(Effect::StopAgent {
+                owner: owner.clone(),
+                pane: pane.map(str::to_string),
+            });
+        }
+        effects.push(Effect::ClearOwnedPendingReplies {
+            removed_owners: vec![owner.clone()],
+        });
+        if session.metadata.networked {
+            let seq = self.next_seq();
+            effects.push(Effect::Broadcast(
+                crate::protocol::WireMessage::SessionRemove {
+                    id: owner.session_id.clone(),
+                    daemon_id: self.daemon_id.clone(),
+                    daemon_name: self.daemon_name.clone(),
+                    seq,
+                },
+            ));
+            effects.push(Effect::BroadcastSessionList);
+        }
+        effects.push(Effect::DormancyApplied {
+            id: owner.session_id.clone(),
+            prior_owner: owner.clone(),
+            tombstoned: recoverable,
+        });
+        effects
+    }
+
+    fn apply_recover_dormant_session(
+        &mut self,
+        dormant_owner: &ResourceOwner,
+        pane: String,
+        backend: String,
+        backend_session_id: String,
+        project_dir: String,
+        canonical_project_identity: String,
+    ) -> Vec<Effect> {
+        if let Some(current) = self.sessions.get(&dormant_owner.session_id)
+            && matches!(current.origin, Origin::Local)
+            && current.metadata.session_incarnation > dormant_owner.incarnation
+            && current.pane.as_deref() == Some(pane.as_str())
+            && backend_pair_matches(&current.metadata, &backend, &backend_session_id)
+            && current.metadata.project_dir.as_deref() == Some(project_dir.as_str())
+            && current.metadata.canonical_project_identity.as_deref()
+                == Some(canonical_project_identity.as_str())
+        {
+            return vec![Effect::DormantRecovered {
+                owner: current.owner(),
+            }];
+        }
+
+        let Some(dormant) = self
+            .dormant_sessions
+            .get(&dormant_owner.session_id)
+            .cloned()
+        else {
+            return vec![];
+        };
+        if dormant.prior_owner != *dormant_owner
+            || dormant.id != dormant_owner.session_id
+            || dormant.metadata.project_dir.as_deref() != Some(project_dir.as_str())
+            || dormant.canonical_project_identity != canonical_project_identity
+            || dormant.metadata.canonical_project_identity.as_deref()
+                != Some(canonical_project_identity.as_str())
+            || !backend_pair_matches(&dormant.metadata, &backend, &backend_session_id)
+            || self.sessions.contains_key(&dormant_owner.session_id)
+            || self.live_resource_conflict(None, &pane, &backend, &backend_session_id)
+            || self.dormant_pair_conflict(
+                Some(&dormant_owner.session_id),
+                &backend,
+                &backend_session_id,
+            )
+            || self.lifecycle_resource_conflict(
+                &dormant_owner.session_id,
+                &pane,
+                &backend,
+                &backend_session_id,
+                &project_dir,
+                &canonical_project_identity,
+            )
+        {
+            return vec![];
+        }
+
+        self.restore_incarnation_high_water(dormant_owner.incarnation);
+        let Some(incarnation) = self.allocate_incarnation() else {
+            return vec![];
+        };
+        let mut metadata = dormant.metadata.clone();
+        metadata.session_incarnation = incarnation;
+        metadata.project_dir = Some(project_dir);
+        metadata.canonical_project_identity = Some(canonical_project_identity);
+        metadata.backend = Some(backend);
+        metadata.backend_session_id = Some(backend_session_id);
+        metadata.session_start_credential = None;
+        metadata.backend_repair_reservation = None;
+        metadata.scanner_registration = false;
+        metadata.active_context_segment_started_at = None;
+        metadata.active_context_accounting_provisional = false;
+        let id = dormant_owner.session_id.clone();
+        let registered_at = dormant.dormant_at;
+        self.dormant_sessions.remove(&id);
+        self.sessions.insert(
+            id.clone(),
+            SessionEntry {
+                id: id.clone(),
+                pane: Some(pane.clone()),
+                origin: Origin::Local,
+                metadata,
+                registered_at,
+                active_context_due_boundary: ActiveContextDueBoundary::default(),
+            },
+        );
+        let owner = self.sessions[&id].owner();
+        let mut effects = self.local_activation_effects(&id, &pane);
+        effects.push(Effect::DormantRecovered {
+            owner: owner.clone(),
+        });
+        effects
+    }
+
+    fn apply_claim_local_session(
+        &mut self,
+        requested_id: String,
+        pane: String,
+        backend: String,
+        backend_session_id: String,
+        project_dir: String,
+        canonical_project_identity: String,
+    ) -> Vec<Effect> {
+        if requested_id.is_empty()
+            || sanitize_session_id(&requested_id) != requested_id
+            || backend.is_empty()
+            || backend_session_id.is_empty()
+            || !usable_project_identity(&project_dir)
+            || !usable_project_identity(&canonical_project_identity)
+        {
+            return vec![];
+        }
+
+        if let Some(current) = self.sessions.get(&requested_id)
+            && matches!(current.origin, Origin::Local)
+            && current.pane.as_deref() == Some(pane.as_str())
+            && backend_pair_matches(&current.metadata, &backend, &backend_session_id)
+            && current.metadata.project_dir.as_deref() == Some(project_dir.as_str())
+            && current.metadata.canonical_project_identity.as_deref()
+                == Some(canonical_project_identity.as_str())
+        {
+            return vec![Effect::LocalClaimed {
+                owner: current.owner(),
+                disposition: LocalClaimDisposition::Current,
+            }];
+        }
+
+        if !matches!(
+            resolve_session_id(
+                &self.sessions,
+                &self.dormant_sessions,
+                &requested_id,
+                NameResolutionMode::Exact { same_owner: None },
+            ),
+            NameResolution::Available(_)
+        ) || self.live_resource_conflict(None, &pane, &backend, &backend_session_id)
+            || self.dormant_pair_conflict(None, &backend, &backend_session_id)
+            || self.lifecycle_resource_conflict(
+                &requested_id,
+                &pane,
+                &backend,
+                &backend_session_id,
+                &project_dir,
+                &canonical_project_identity,
+            )
+        {
+            return vec![];
+        }
+
+        let Some(incarnation) = self.allocate_incarnation() else {
+            return vec![];
+        };
+        let metadata = SessionMeta {
+            project_dir: Some(project_dir),
+            canonical_project_identity: Some(canonical_project_identity),
+            backend: Some(backend),
+            backend_session_id: Some(backend_session_id),
+            session_incarnation: incarnation,
+            ..Default::default()
+        };
+        self.sessions.insert(
+            requested_id.clone(),
+            SessionEntry {
+                id: requested_id.clone(),
+                pane: Some(pane.clone()),
+                origin: Origin::Local,
+                metadata,
+                registered_at: chrono::Utc::now().timestamp(),
+                active_context_due_boundary: ActiveContextDueBoundary::default(),
+            },
+        );
+        let owner = self.sessions[&requested_id].owner();
+        let mut effects = self.local_activation_effects(&requested_id, &pane);
+        effects.push(Effect::LocalClaimed {
+            owner,
+            disposition: LocalClaimDisposition::Created,
+        });
+        effects
+    }
+
+    fn live_resource_conflict(
+        &self,
+        except_id: Option<&str>,
+        pane: &str,
+        backend: &str,
+        backend_session_id: &str,
+    ) -> bool {
+        self.sessions.values().any(|session| {
+            except_id != Some(session.id.as_str())
+                && matches!(session.origin, Origin::Local)
+                && (session.pane.as_deref() == Some(pane)
+                    || backend_pair_matches(&session.metadata, backend, backend_session_id))
+        })
+    }
+
+    fn dormant_pair_conflict(
+        &self,
+        except_id: Option<&str>,
+        backend: &str,
+        backend_session_id: &str,
+    ) -> bool {
+        self.dormant_sessions.values().any(|dormant| {
+            except_id != Some(dormant.id.as_str())
+                && backend_pair_matches(&dormant.metadata, backend, backend_session_id)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lifecycle_resource_conflict(
+        &self,
+        id: &str,
+        pane: &str,
+        backend: &str,
+        backend_session_id: &str,
+        project_dir: &str,
+        canonical_project_identity: &str,
+    ) -> bool {
+        self.lifecycle_leases.iter().any(|(lease_id, lease)| {
+            lease_id == id
+                || lease.inert_pane.as_deref() == Some(pane)
+                || (lease.backend.as_deref() == Some(backend)
+                    && lease.backend_session_id.as_deref() == Some(backend_session_id))
+                || lease.project_dir.as_deref() == Some(project_dir)
+                || lease.project_dir.as_deref() == Some(canonical_project_identity)
+        })
+    }
+
+    fn local_activation_effects(&mut self, id: &str, pane: &str) -> Vec<Effect> {
+        let session = &self.sessions[id];
+        let owner = session.owner();
+        let networked = session.metadata.networked;
+        let agent_pane = session
+            .session_agent_pane()
+            .map(|pane| pane.map(str::to_string));
+        let mut effects = vec![
+            Effect::Persist,
+            Effect::SetTmuxVar {
+                owner: owner.clone(),
+                pane: pane.to_string(),
+                name: "@ouija_session".into(),
+                value: id.to_string(),
+            },
+            Effect::SetTmuxVar {
+                owner: owner.clone(),
+                pane: pane.to_string(),
+                name: "@ouija_id".into(),
+                value: id.to_string(),
+            },
+            Effect::SetTmuxVar {
+                owner: owner.clone(),
+                pane: pane.to_string(),
+                name: "@ouija_incarnation".into(),
+                value: owner.incarnation.to_string(),
+            },
+        ];
+        if let Some(agent_pane) = agent_pane {
+            effects.push(Effect::SpawnAgent {
+                owner: owner.clone(),
+                pane: agent_pane,
+            });
+        }
+        if networked {
+            let seq = self.next_seq();
+            effects.push(Effect::Broadcast(
+                crate::protocol::WireMessage::SessionAnnounce {
+                    id: id.to_string(),
+                    daemon_id: self.daemon_id.clone(),
+                    daemon_name: self.daemon_name.clone(),
+                    metadata: None,
+                    seq,
+                },
+            ));
+            effects.push(Effect::BroadcastSessionList);
         }
         effects
     }
@@ -3472,11 +4052,7 @@ impl DaemonState {
                         candidate,
                         &new_pane,
                         &project_dir,
-                        canonical
-                            .metadata
-                            .canonical_project_identity
-                            .as_deref()
-                            .or(Some(project_dir.as_str())),
+                        canonical.metadata.canonical_project_identity.as_deref(),
                     ) => {}
             (Some(_), Some(_)) => {
                 return fail("candidate pane owner is not the expected metadata-only row".into());
@@ -3612,38 +4188,76 @@ impl DaemonState {
     fn apply_rename(&mut self, old_id: &str, new_id: &str) -> Vec<Effect> {
         let mut effects = Vec::new();
 
-        if new_id.contains('/') {
+        if new_id.is_empty() || new_id.contains('/') {
             effects.push(Effect::RenameFailed {
+                kind: RenameFailureKind::InvalidDestination,
                 reason: "session ID cannot contain '/'".into(),
             });
             return effects;
         }
-        if let Some(reserved_id) = [old_id, new_id]
-            .into_iter()
-            .find(|id| self.lifecycle_leases.contains_key(*id))
-        {
+        if self.lifecycle_leases.contains_key(old_id) {
             effects.push(Effect::RenameFailed {
-                reason: format!("session '{reserved_id}' has a lifecycle operation in progress"),
+                kind: RenameFailureKind::SourceLease,
+                reason: format!("session '{old_id}' has a lifecycle operation in progress"),
+            });
+            return effects;
+        }
+        if self.lifecycle_leases.contains_key(new_id) {
+            effects.push(Effect::RenameFailed {
+                kind: RenameFailureKind::DestinationLease,
+                reason: format!("session '{new_id}' has a lifecycle operation in progress"),
             });
             return effects;
         }
 
-        // Check origin before removing
-        match self.sessions.get(old_id).map(|s| &s.origin) {
-            Some(Origin::Local) => {}
+        let source = match self.sessions.get(old_id) {
+            Some(source) if matches!(source.origin, Origin::Local) => source,
             Some(_) => {
                 effects.push(Effect::RenameFailed {
+                    kind: RenameFailureKind::SourceNotLocal,
                     reason: format!("cannot rename remote session '{old_id}'"),
                 });
                 return effects;
             }
             None => {
                 effects.push(Effect::RenameFailed {
+                    kind: RenameFailureKind::SourceMissing,
                     reason: format!("session '{old_id}' not found"),
                 });
                 return effects;
             }
         };
+        let source_owner = source.owner();
+        match resolve_session_id(
+            &self.sessions,
+            &self.dormant_sessions,
+            new_id,
+            NameResolutionMode::Exact {
+                same_owner: Some(&source_owner),
+            },
+        ) {
+            NameResolution::Available(_) => {}
+            NameResolution::Idempotent(_) => {
+                return vec![Effect::RenameOk {
+                    old_id: old_id.to_string(),
+                    new_id: new_id.to_string(),
+                }];
+            }
+            NameResolution::Occupied { dormant, .. } => {
+                return vec![Effect::RenameFailed {
+                    kind: if dormant {
+                        RenameFailureKind::DestinationDormant
+                    } else {
+                        RenameFailureKind::DestinationLive
+                    },
+                    reason: if dormant {
+                        format!("session '{new_id}' is reserved by a dormant identity")
+                    } else {
+                        format!("session '{new_id}' already exists")
+                    },
+                }];
+            }
+        }
 
         let mut renamed = self
             .sessions
@@ -3720,6 +4334,12 @@ impl DaemonState {
                 kind: RemoveFailureKind::LifecycleInProgress,
                 reason: format!("session '{id}' has a lifecycle operation in progress"),
             }];
+        }
+        if !self.sessions.contains_key(id) && self.dormant_sessions.remove(id).is_some() {
+            return vec![
+                Effect::Persist,
+                Effect::DormantForgotten { id: id.to_string() },
+            ];
         }
         self.apply_remove_unleased(id, keep_worktree)
     }
@@ -9037,6 +9657,681 @@ mod tests {
         );
     }
 
+    fn identity_metadata(backend_session_id: &str) -> SessionMeta {
+        SessionMeta {
+            project_dir: Some("/tmp/repo/.ouija/worktrees/worker".into()),
+            canonical_project_identity: Some("/tmp/repo".into()),
+            backend: Some("codex-cli".into()),
+            backend_session_id: Some(backend_session_id.into()),
+            role: Some("preserved role".into()),
+            ..Default::default()
+        }
+    }
+
+    fn register_identity(
+        state: &mut DaemonState,
+        id: &str,
+        pane: &str,
+        backend_session_id: &str,
+    ) -> ResourceOwner {
+        state.apply(Event::Register {
+            id: id.into(),
+            pane: Some(pane.into()),
+            metadata: identity_metadata(backend_session_id),
+        });
+        state.sessions[id].owner()
+    }
+
+    #[test]
+    fn resolve_session_id_automatic_suffixes_across_live_and_dormant_occupancy() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        register_identity(&mut state, "worker", "%1", "thread-1");
+        let owner = register_identity(&mut state, "worker-2", "%2", "thread-2");
+        state.apply(Event::DormantOwned {
+            owner,
+            expected_pane: Some("%2".into()),
+            observed_at: 20,
+            source: DormancySource::Reaped,
+        });
+
+        assert_eq!(
+            resolve_session_id(
+                &state.sessions,
+                &state.dormant_sessions,
+                "Worker",
+                NameResolutionMode::Automatic {
+                    target_pane: Some("%3")
+                },
+            ),
+            NameResolution::Available("worker-3".into())
+        );
+    }
+
+    #[test]
+    fn resolve_session_id_automatic_same_pane_is_idempotent() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        register_identity(&mut state, "worker", "%1", "thread-1");
+
+        assert_eq!(
+            resolve_session_id(
+                &state.sessions,
+                &state.dormant_sessions,
+                "worker",
+                NameResolutionMode::Automatic {
+                    target_pane: Some("%1")
+                },
+            ),
+            NameResolution::Idempotent("worker".into())
+        );
+    }
+
+    #[test]
+    fn resolve_session_id_exact_reports_live_and_dormant_occupancy_without_suffixing() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        register_identity(&mut state, "live", "%1", "thread-1");
+        let owner = register_identity(&mut state, "parked", "%2", "thread-2");
+        state.apply(Event::DormantOwned {
+            owner,
+            expected_pane: Some("%2".into()),
+            observed_at: 20,
+            source: DormancySource::TrustedSessionEnd,
+        });
+
+        assert_eq!(
+            resolve_session_id(
+                &state.sessions,
+                &state.dormant_sessions,
+                "live",
+                NameResolutionMode::Exact { same_owner: None },
+            ),
+            NameResolution::Occupied {
+                id: "live".into(),
+                dormant: false,
+            }
+        );
+        assert_eq!(
+            resolve_session_id(
+                &state.sessions,
+                &state.dormant_sessions,
+                "parked",
+                NameResolutionMode::Exact { same_owner: None },
+            ),
+            NameResolution::Occupied {
+                id: "parked".into(),
+                dormant: true,
+            }
+        );
+        let live_owner = state.sessions["live"].owner();
+        assert_eq!(
+            resolve_session_id(
+                &state.sessions,
+                &state.dormant_sessions,
+                "live",
+                NameResolutionMode::Exact {
+                    same_owner: Some(&live_owner),
+                },
+            ),
+            NameResolution::Idempotent("live".into())
+        );
+        let dormant_owner = state.dormant_sessions["parked"].prior_owner.clone();
+        assert_eq!(
+            resolve_session_id(
+                &state.sessions,
+                &state.dormant_sessions,
+                "parked",
+                NameResolutionMode::Exact {
+                    same_owner: Some(&dormant_owner),
+                },
+            ),
+            NameResolution::Idempotent("parked".into())
+        );
+    }
+
+    #[test]
+    fn dormant_reap_closes_active_segment_and_preserves_lifecycle_metadata() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        let mut metadata = identity_metadata("thread-1");
+        metadata.prompt = Some("continue the work".into());
+        metadata.reminder = Some("ask parent".into());
+        metadata.fresh_context_after_active_secs = Some(10);
+        metadata.active_context_accumulated_secs = 4;
+        metadata.active_context_segment_started_at = Some(10);
+        metadata.active_context_accounting_provisional = true;
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata,
+        });
+        let owner = state.sessions["worker"].owner();
+
+        let effects = state.apply(Event::DormantOwned {
+            owner: owner.clone(),
+            expected_pane: Some("%1".into()),
+            observed_at: 20,
+            source: DormancySource::Reaped,
+        });
+
+        assert!(!state.sessions.contains_key("worker"));
+        let dormant = &state.dormant_sessions["worker"];
+        assert_eq!(dormant.prior_owner, owner);
+        assert_eq!(dormant.source, DormancySource::Reaped);
+        assert_eq!(dormant.metadata.active_context_accumulated_secs, 14);
+        assert!(dormant.metadata.active_context_restart_due);
+        assert_eq!(dormant.metadata.active_context_segment_started_at, None);
+        assert!(dormant.metadata.active_context_accounting_provisional);
+        assert_eq!(
+            dormant.metadata.prompt.as_deref(),
+            Some("continue the work")
+        );
+        assert_eq!(dormant.metadata.reminder.as_deref(), Some("ask parent"));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::DormancyApplied {
+                tombstoned: true,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn dormant_trusted_session_end_uses_the_same_transition() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        let owner = register_identity(&mut state, "worker", "%1", "thread-1");
+
+        state.apply(Event::DormantOwned {
+            owner,
+            expected_pane: Some("%1".into()),
+            observed_at: 30,
+            source: DormancySource::TrustedSessionEnd,
+        });
+
+        assert_eq!(
+            state.dormant_sessions["worker"].source,
+            DormancySource::TrustedSessionEnd
+        );
+    }
+
+    #[test]
+    fn dormant_stale_owner_or_pane_is_a_noop() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        let owner = register_identity(&mut state, "worker", "%1", "thread-1");
+        let before = state.clone();
+
+        let mut stale = owner;
+        stale.incarnation = SessionIncarnation(stale.incarnation.0.saturating_add(1));
+        assert!(
+            state
+                .apply(Event::DormantOwned {
+                    owner: stale,
+                    expected_pane: Some("%1".into()),
+                    observed_at: 30,
+                    source: DormancySource::Reaped,
+                })
+                .is_empty()
+        );
+        assert_eq!(state, before);
+        assert!(
+            state
+                .apply(Event::DormantOwned {
+                    owner: state.sessions["worker"].owner(),
+                    expected_pane: Some("%9".into()),
+                    observed_at: 30,
+                    source: DormancySource::Reaped,
+                })
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn dormant_incomplete_identity_is_removed_without_a_tombstone() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/project".into()),
+                canonical_project_identity: Some("/tmp/project".into()),
+                backend: Some("codex-cli".into()),
+                ..Default::default()
+            },
+        });
+        let owner = state.sessions["worker"].owner();
+
+        let effects = state.apply(Event::DormantOwned {
+            owner,
+            expected_pane: Some("%1".into()),
+            observed_at: 30,
+            source: DormancySource::Reaped,
+        });
+
+        assert!(!state.sessions.contains_key("worker"));
+        assert!(!state.dormant_sessions.contains_key("worker"));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::DormancyApplied {
+                tombstoned: false,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn dormant_rejects_a_lifecycle_lease() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        let owner = register_identity(&mut state, "worker", "%1", "thread-1");
+        assert_eq!(
+            state.claim_existing_start(&owner),
+            LifecycleMutationOutcome::Applied
+        );
+        let before = state.clone();
+
+        assert!(
+            state
+                .apply(Event::DormantOwned {
+                    owner,
+                    expected_pane: Some("%1".into()),
+                    observed_at: 30,
+                    source: DormancySource::Reaped,
+                })
+                .is_empty()
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn dormant_active_accounting_handles_backward_time_and_overflow() {
+        let mut backward = DaemonState::new("d1".into(), "host1".into());
+        let mut metadata = identity_metadata("thread-1");
+        metadata.active_context_accumulated_secs = 7;
+        metadata.active_context_segment_started_at = Some(20);
+        backward.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata,
+        });
+        let owner = backward.sessions["worker"].owner();
+        backward.apply(Event::DormantOwned {
+            owner,
+            expected_pane: Some("%1".into()),
+            observed_at: 10,
+            source: DormancySource::Reaped,
+        });
+        assert_eq!(
+            backward.dormant_sessions["worker"]
+                .metadata
+                .active_context_accumulated_secs,
+            7
+        );
+
+        let mut overflow = DaemonState::new("d1".into(), "host1".into());
+        let mut metadata = identity_metadata("thread-2");
+        metadata.active_context_accumulated_secs = u64::MAX - 1;
+        metadata.active_context_segment_started_at = Some(i64::MIN);
+        overflow.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata,
+        });
+        let owner = overflow.sessions["worker"].owner();
+        overflow.apply(Event::DormantOwned {
+            owner,
+            expected_pane: Some("%1".into()),
+            observed_at: i64::MAX,
+            source: DormancySource::Reaped,
+        });
+        assert_eq!(
+            overflow.dormant_sessions["worker"]
+                .metadata
+                .active_context_accumulated_secs,
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn dormant_recovery_restores_parked_metadata_with_a_new_incarnation() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        let mut metadata = identity_metadata("thread-1");
+        metadata.active_context_accumulated_secs = 42;
+        metadata.active_context_restart_due = true;
+        metadata.active_context_accounting_provisional = true;
+        state.apply(Event::Register {
+            id: "arbitrary-public-id".into(),
+            pane: Some("%1".into()),
+            metadata,
+        });
+        let prior_owner = state.sessions["arbitrary-public-id"].owner();
+        state.apply(Event::DormantOwned {
+            owner: prior_owner.clone(),
+            expected_pane: Some("%1".into()),
+            observed_at: 30,
+            source: DormancySource::Reaped,
+        });
+
+        let effects = state.apply(Event::RecoverDormantSession {
+            dormant_owner: prior_owner.clone(),
+            pane: "%2".into(),
+            backend: "codex-cli".into(),
+            backend_session_id: "thread-1".into(),
+            project_dir: "/tmp/repo/.ouija/worktrees/worker".into(),
+            canonical_project_identity: "/tmp/repo".into(),
+        });
+
+        assert!(!state.dormant_sessions.contains_key("arbitrary-public-id"));
+        let recovered = &state.sessions["arbitrary-public-id"];
+        assert!(recovered.owner().incarnation > prior_owner.incarnation);
+        assert_eq!(recovered.pane.as_deref(), Some("%2"));
+        assert_eq!(recovered.metadata.active_context_accumulated_secs, 42);
+        assert!(recovered.metadata.active_context_restart_due);
+        assert!(!recovered.metadata.active_context_accounting_provisional);
+        assert_eq!(recovered.metadata.active_context_segment_started_at, None);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::DormantRecovered { owner } if owner == &recovered.owner()
+        )));
+        let recovered_owner = recovered.owner();
+
+        let before = state.clone();
+        let retry = state.apply(Event::RecoverDormantSession {
+            dormant_owner: prior_owner,
+            pane: "%2".into(),
+            backend: "codex-cli".into(),
+            backend_session_id: "thread-1".into(),
+            project_dir: "/tmp/repo/.ouija/worktrees/worker".into(),
+            canonical_project_identity: "/tmp/repo".into(),
+        });
+        assert_eq!(state, before);
+        assert!(retry.iter().any(|effect| matches!(
+            effect,
+            Effect::DormantRecovered { owner } if owner == &recovered_owner
+        )));
+    }
+
+    #[test]
+    fn dormant_recovery_rejects_stale_owner_changed_project_and_resource_conflicts() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        let prior_owner = register_identity(&mut state, "worker", "%1", "thread-1");
+        state.apply(Event::DormantOwned {
+            owner: prior_owner.clone(),
+            expected_pane: Some("%1".into()),
+            observed_at: 30,
+            source: DormancySource::Reaped,
+        });
+        register_identity(&mut state, "foreign", "%2", "thread-2");
+        let before = state.clone();
+
+        let attempts = [
+            Event::RecoverDormantSession {
+                dormant_owner: ResourceOwner {
+                    session_id: "worker".into(),
+                    incarnation: SessionIncarnation(prior_owner.incarnation.0.saturating_add(1)),
+                },
+                pane: "%3".into(),
+                backend: "codex-cli".into(),
+                backend_session_id: "thread-1".into(),
+                project_dir: "/tmp/repo/.ouija/worktrees/worker".into(),
+                canonical_project_identity: "/tmp/repo".into(),
+            },
+            Event::RecoverDormantSession {
+                dormant_owner: prior_owner.clone(),
+                pane: "%3".into(),
+                backend: "codex-cli".into(),
+                backend_session_id: "thread-1".into(),
+                project_dir: "/tmp/other".into(),
+                canonical_project_identity: "/tmp/other".into(),
+            },
+            Event::RecoverDormantSession {
+                dormant_owner: prior_owner,
+                pane: "%2".into(),
+                backend: "codex-cli".into(),
+                backend_session_id: "thread-1".into(),
+                project_dir: "/tmp/repo/.ouija/worktrees/worker".into(),
+                canonical_project_identity: "/tmp/repo".into(),
+            },
+        ];
+        for event in attempts {
+            assert!(state.apply(event).is_empty());
+            assert_eq!(state, before);
+        }
+    }
+
+    #[test]
+    fn claim_creates_and_retries_only_the_exact_same_local_owner() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        let event = || Event::ClaimLocalSession {
+            requested_id: "chosen".into(),
+            pane: "%1".into(),
+            backend: "codex-cli".into(),
+            backend_session_id: "thread-1".into(),
+            project_dir: "/tmp/repo/.ouija/worktrees/worker".into(),
+            canonical_project_identity: "/tmp/repo".into(),
+        };
+
+        let created = state.apply(event());
+        let owner = state.sessions["chosen"].owner();
+        assert!(created.iter().any(|effect| matches!(
+            effect,
+            Effect::LocalClaimed {
+                owner: effect_owner,
+                disposition: LocalClaimDisposition::Created,
+            } if effect_owner == &owner
+        )));
+        let before = state.clone();
+        let retried = state.apply(event());
+        assert_eq!(state, before);
+        assert!(retried.iter().any(|effect| matches!(
+            effect,
+            Effect::LocalClaimed {
+                owner: effect_owner,
+                disposition: LocalClaimDisposition::Current,
+            } if effect_owner == &owner
+        )));
+    }
+
+    #[test]
+    fn claim_rejects_noncanonical_and_all_live_or_dormant_resource_conflicts() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        let dormant_owner = register_identity(&mut state, "parked", "%9", "thread-9");
+        state.apply(Event::DormantOwned {
+            owner: dormant_owner,
+            expected_pane: Some("%9".into()),
+            observed_at: 30,
+            source: DormancySource::Reaped,
+        });
+        register_identity(&mut state, "live", "%1", "thread-1");
+        let before = state.clone();
+
+        let attempts = [
+            ("Not Canonical", "%2", "thread-2"),
+            ("live", "%2", "thread-2"),
+            ("parked", "%2", "thread-2"),
+            ("free", "%1", "thread-2"),
+            ("free", "%2", "thread-1"),
+            ("free", "%2", "thread-9"),
+        ];
+        for (requested_id, pane, backend_session_id) in attempts {
+            assert!(
+                state
+                    .apply(Event::ClaimLocalSession {
+                        requested_id: requested_id.into(),
+                        pane: pane.into(),
+                        backend: "codex-cli".into(),
+                        backend_session_id: backend_session_id.into(),
+                        project_dir: "/tmp/repo/.ouija/worktrees/worker".into(),
+                        canonical_project_identity: "/tmp/repo".into(),
+                    })
+                    .is_empty(),
+                "conflicting claim unexpectedly succeeded: {requested_id}"
+            );
+            assert_eq!(state, before);
+        }
+    }
+
+    #[test]
+    fn claim_rejects_id_pane_pair_and_project_lifecycle_leases() {
+        fn claim(state: &mut DaemonState) -> Vec<Effect> {
+            state.apply(Event::ClaimLocalSession {
+                requested_id: "chosen".into(),
+                pane: "%1".into(),
+                backend: "codex-cli".into(),
+                backend_session_id: "thread-1".into(),
+                project_dir: "/tmp/repo/.ouija/worktrees/worker".into(),
+                canonical_project_identity: "/tmp/repo".into(),
+            })
+        }
+
+        for conflict in ["id", "pane", "pair", "project"] {
+            let mut state = DaemonState::new("d1".into(), "host1".into());
+            let lease_id = if conflict == "id" {
+                "chosen"
+            } else {
+                "reserved"
+            };
+            let lease_owner = match state.reserve_start(lease_id).expect("reserve") {
+                StartDisposition::Reserved(owner) => owner,
+                other => panic!("unexpected reservation: {other:?}"),
+            };
+            let lease = state
+                .lifecycle_leases
+                .get_mut(lease_id)
+                .expect("reserved lease");
+            match conflict {
+                "pane" => {
+                    lease.inert_pane = Some("%1".into());
+                    lease.inert_pane_owner = Some(lease_owner);
+                }
+                "pair" => {
+                    lease.backend = Some("codex-cli".into());
+                    lease.backend_session_id = Some("thread-1".into());
+                    lease.backend_session_owner = Some(lease_owner);
+                }
+                "project" => {
+                    lease.project_dir = Some("/tmp/repo".into());
+                    lease.project_dir_owner = Some(lease_owner);
+                }
+                "id" => {}
+                _ => unreachable!(),
+            }
+            let before = state.clone();
+
+            assert!(claim(&mut state).is_empty(), "{conflict} lease");
+            assert_eq!(state, before);
+        }
+    }
+
+    #[test]
+    fn dormant_unregister_forgets_reservation_without_worktree_cleanup() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        let owner = register_identity(&mut state, "worker", "%1", "thread-1");
+        state.apply(Event::DormantOwned {
+            owner,
+            expected_pane: Some("%1".into()),
+            observed_at: 30,
+            source: DormancySource::Reaped,
+        });
+
+        let effects = state.apply(Event::Remove {
+            id: "worker".into(),
+            keep_worktree: false,
+        });
+
+        assert!(!state.dormant_sessions.contains_key("worker"));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::DormantForgotten { id } if id == "worker"))
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CleanupWorktree { .. }))
+        );
+    }
+
+    #[test]
+    fn rename_rejects_occupied_destination_without_overwriting_either_owner() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "source".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                backend_session_id: Some("source-thread".into()),
+                ..Default::default()
+            },
+        });
+        state.apply(Event::Register {
+            id: "destination".into(),
+            pane: Some("%2".into()),
+            metadata: SessionMeta {
+                backend: Some("codex-cli".into()),
+                backend_session_id: Some("destination-thread".into()),
+                ..Default::default()
+            },
+        });
+        let source_before = state.sessions["source"].clone();
+        let destination_before = state.sessions["destination"].clone();
+
+        let effects = state.apply(Event::Rename {
+            old_id: "source".into(),
+            new_id: "destination".into(),
+        });
+
+        assert_eq!(state.sessions.get("source"), Some(&source_before));
+        assert_eq!(state.sessions.get("destination"), Some(&destination_before));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::RenameFailed { reason, .. }]
+                if reason == "session 'destination' already exists"
+        ));
+    }
+
+    #[test]
+    fn rename_rejects_occupied_dormant_destination_without_mutation() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        register_identity(&mut state, "source", "%1", "thread-1");
+        let destination_owner = register_identity(&mut state, "destination", "%2", "thread-2");
+        state.apply(Event::DormantOwned {
+            owner: destination_owner,
+            expected_pane: Some("%2".into()),
+            observed_at: 30,
+            source: DormancySource::Reaped,
+        });
+        let before = state.clone();
+
+        let effects = state.apply(Event::Rename {
+            old_id: "source".into(),
+            new_id: "destination".into(),
+        });
+
+        assert_eq!(state, before);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::RenameFailed {
+                kind: RenameFailureKind::DestinationDormant,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn rename_same_id_is_idempotent_for_current_local_owner() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        register_identity(&mut state, "source", "%1", "thread-1");
+        let before = state.clone();
+
+        let effects = state.apply(Event::Rename {
+            old_id: "source".into(),
+            new_id: "source".into(),
+        });
+
+        assert_eq!(state, before);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::RenameOk { old_id, new_id }]
+                if old_id == "source" && new_id == "source"
+        ));
+    }
+
     #[test]
     fn rename_nonexistent_fails() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
@@ -9074,7 +10369,7 @@ mod tests {
         assert!(!state.sessions.contains_key("new"));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::RenameFailed { reason }]
+            [Effect::RenameFailed { reason, .. }]
                 if reason == "session 'old' has a lifecycle operation in progress"
         ));
     }
@@ -9111,7 +10406,7 @@ mod tests {
         assert!(!state.sessions.contains_key("new"));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::RenameFailed { reason }]
+            [Effect::RenameFailed { reason, .. }]
                 if reason == "session 'old' has a lifecycle operation in progress"
         ));
     }
@@ -9138,7 +10433,7 @@ mod tests {
         assert!(!state.sessions.contains_key("new"));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::RenameFailed { reason }]
+            [Effect::RenameFailed { reason, .. }]
                 if reason == "session 'new' has a lifecycle operation in progress"
         ));
     }
@@ -13686,6 +14981,7 @@ mod tests {
             pane: Some("%1".into()),
             metadata: SessionMeta {
                 project_dir: Some("/tmp/project".into()),
+                canonical_project_identity: Some("/tmp/project".into()),
                 role: Some("preserved role".into()),
                 prompt: Some("preserved prompt".into()),
                 backend: Some("opencode".into()),
@@ -13699,6 +14995,7 @@ mod tests {
             pane: Some("%2".into()),
             metadata: SessionMeta {
                 project_dir: Some("/tmp/project".into()),
+                canonical_project_identity: Some("/tmp/project".into()),
                 role: Some("working on project".into()),
                 scanner_registration: true,
                 ..Default::default()

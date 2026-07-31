@@ -1548,6 +1548,49 @@ impl AppState {
                 keys.push(ResourceGateKey::BackendSession(backend_session_id.clone()));
                 project_dirs.push(project_dir.clone());
             }
+            crate::daemon_protocol::Event::DormantOwned {
+                owner,
+                expected_pane,
+                ..
+            } => {
+                add_current(&mut keys, &mut project_dirs, &protocol, &owner.session_id);
+                if let Some(pane) = expected_pane {
+                    keys.push(ResourceGateKey::Pane(pane.clone()));
+                }
+            }
+            crate::daemon_protocol::Event::RecoverDormantSession {
+                dormant_owner,
+                pane,
+                backend_session_id,
+                project_dir,
+                canonical_project_identity,
+                ..
+            } => {
+                add_current(
+                    &mut keys,
+                    &mut project_dirs,
+                    &protocol,
+                    &dormant_owner.session_id,
+                );
+                keys.push(ResourceGateKey::Pane(pane.clone()));
+                keys.push(ResourceGateKey::BackendSession(backend_session_id.clone()));
+                project_dirs.push(project_dir.clone());
+                project_dirs.push(canonical_project_identity.clone());
+            }
+            crate::daemon_protocol::Event::ClaimLocalSession {
+                requested_id,
+                pane,
+                backend_session_id,
+                project_dir,
+                canonical_project_identity,
+                ..
+            } => {
+                add_current(&mut keys, &mut project_dirs, &protocol, requested_id);
+                keys.push(ResourceGateKey::Pane(pane.clone()));
+                keys.push(ResourceGateKey::BackendSession(backend_session_id.clone()));
+                project_dirs.push(project_dir.clone());
+                project_dirs.push(canonical_project_identity.clone());
+            }
             crate::daemon_protocol::Event::StageFreshLaunch { id, .. }
             | crate::daemon_protocol::Event::Rename { old_id: id, .. }
             | crate::daemon_protocol::Event::Remove { id, .. }
@@ -3974,6 +4017,10 @@ impl AppState {
                 | Effect::RenameFailed { .. }
                 | Effect::RemoveOk { .. }
                 | Effect::RemoveFailed { .. }
+                | Effect::DormancyApplied { .. }
+                | Effect::DormantRecovered { .. }
+                | Effect::LocalClaimed { .. }
+                | Effect::DormantForgotten { .. }
                 | Effect::BackendIdentityRecovered { .. }
                 | Effect::ActiveContextRestartDueClaimed { .. } => {}
             }
