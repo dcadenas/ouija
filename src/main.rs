@@ -5739,7 +5739,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_never_aborts_replacement_using_same_http_backend_session() {
+    async fn restore_rejects_replacement_sharing_a_stopping_lease_backend_pair() {
         let dir = tempfile::tempdir().unwrap();
         let stale_owner = crate::daemon_protocol::ResourceOwner {
             session_id: "worker".into(),
@@ -5791,19 +5791,16 @@ mod tests {
             config_dir: dir.path().to_path_buf(),
         });
 
-        restore_persisted_sessions(&state).await.unwrap();
-
-        let persisted = crate::persistence::load_sessions(dir.path()).unwrap();
-        assert!(persisted.lifecycle_leases.is_empty());
-        assert_eq!(persisted.sessions.len(), 1);
-        assert_eq!(
-            persisted.sessions[0].metadata.session_incarnation,
-            replacement_owner.incarnation
+        let error = restore_persisted_sessions(&state).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to restore lifecycle authority")
         );
-        assert_eq!(
-            state.protocol.read().await.sessions["worker"].owner(),
-            replacement_owner
-        );
+        assert!(format!("{error:#}").contains(
+            "backend pair (opencode, ses_worker) is assigned to distinct owners 'worker' and 'worker'"
+        ));
+        assert!(state.protocol.read().await.sessions.is_empty());
     }
 
     #[tokio::test]
