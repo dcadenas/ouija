@@ -21,6 +21,10 @@ pub async fn run(state: SharedState) -> anyhow::Result<()> {
         .route("/api/send", post(api::send_msg))
         .route("/api/inject", post(api::inject))
         .route("/api/rename", post(api::rename))
+        .route(
+            "/api/session-identities/claim",
+            post(api::claim_local_identity),
+        )
         .route("/api/remove", post(api::remove))
         .route("/api/sessions/update", post(api::update_session))
         .route("/api/sessions/bulk-update", post(api::bulk_update_sessions))

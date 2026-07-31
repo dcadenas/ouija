@@ -14,6 +14,15 @@ use crate::project_index::ProjectInfo;
 use crate::scheduler::{ScheduledTask, TaskRun};
 use crate::transport::Transport;
 
+/// Evidence supplied by a Local assistant claiming one public session ID.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LocalClaimEvidence {
+    pub pane: Option<String>,
+    pub pane_var_id: Option<String>,
+    pub env_id: Option<String>,
+    pub backend_identity: crate::backend::BackendSessionIdentity,
+}
+
 #[derive(Clone)]
 struct OwnedSessionAgent {
     owner: crate::daemon_protocol::ResourceOwner,

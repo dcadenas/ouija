@@ -5,7 +5,7 @@ use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::scheduler;
@@ -1265,6 +1265,23 @@ pub struct RenameBody {
     new_id: String,
     #[serde(default)]
     sender_ctx: Option<crate::daemon_protocol::SenderContext>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LocalClaimRequest {
+    pub requested_id: String,
+    pub caller: crate::state::LocalClaimEvidence,
+}
+
+/// Reserve the explicit Local claim route until its coordinator is wired.
+pub async fn claim_local_identity(
+    State(_state): State<SharedState>,
+    Json(_body): Json<LocalClaimRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({"outcome": "not_implemented"})),
+    )
 }
 
 /// Rename an existing session.
@@ -6733,6 +6750,149 @@ mod tests {
         let proto = state.protocol.read().await;
         assert!(proto.sessions.contains_key("hub"));
         assert!(!proto.sessions.contains_key("hub-cx"));
+    }
+
+    #[tokio::test]
+    async fn claim_creates_requested_free_id_for_verified_unregistered_backend() {
+        let state = crate::state::AppState::new_for_test();
+        let worktree = "/home/daniel/.ouija/worktrees/ouija/requested";
+        *state.cached_assistant_panes.write().await =
+            vec![pane_for_backend(worktree, "%claimant", "codex")];
+        let request = LocalClaimRequest {
+            requested_id: "requested".into(),
+            caller: crate::state::LocalClaimEvidence {
+                pane: Some("%claimant".into()),
+                pane_var_id: None,
+                env_id: None,
+                backend_identity: crate::backend::BackendSessionIdentity {
+                    backend: "codex-cli".into(),
+                    session_id: "new-thread".into(),
+                },
+            },
+        };
+
+        let (status, body) = claim_local_identity(State(state.clone()), Json(request)).await;
+
+        assert_eq!(status, StatusCode::OK, "body: {:?}", body.0);
+        let protocol = state.protocol.read().await;
+        assert_eq!(protocol.sessions.len(), 1);
+        let claimed = &protocol.sessions["requested"];
+        assert_eq!(claimed.pane.as_deref(), Some("%claimant"));
+        assert_eq!(claimed.metadata.project_dir.as_deref(), Some(worktree));
+        assert_eq!(claimed.metadata.backend.as_deref(), Some("codex-cli"));
+        assert_eq!(
+            claimed.metadata.backend_session_id.as_deref(),
+            Some("new-thread")
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_retry_by_same_owner_is_idempotent() {
+        let state = crate::state::AppState::new_for_test();
+        let worktree = "/home/daniel/.ouija/worktrees/ouija/requested";
+        *state.cached_assistant_panes.write().await =
+            vec![pane_for_backend(worktree, "%claimant", "codex")];
+        let request = || LocalClaimRequest {
+            requested_id: "requested".into(),
+            caller: crate::state::LocalClaimEvidence {
+                pane: Some("%claimant".into()),
+                pane_var_id: None,
+                env_id: None,
+                backend_identity: crate::backend::BackendSessionIdentity {
+                    backend: "codex-cli".into(),
+                    session_id: "new-thread".into(),
+                },
+            },
+        };
+
+        let (first_status, first_body) =
+            claim_local_identity(State(state.clone()), Json(request())).await;
+        assert_eq!(
+            first_status,
+            StatusCode::OK,
+            "first body: {:?}",
+            first_body.0
+        );
+        let first_owner = state.protocol.read().await.sessions["requested"].owner();
+
+        let (retry_status, retry_body) =
+            claim_local_identity(State(state.clone()), Json(request())).await;
+
+        assert_eq!(
+            retry_status,
+            StatusCode::OK,
+            "retry body: {:?}",
+            retry_body.0
+        );
+        let protocol = state.protocol.read().await;
+        assert_eq!(protocol.sessions.len(), 1);
+        assert_eq!(protocol.sessions["requested"].owner(), first_owner);
+    }
+
+    #[tokio::test]
+    async fn claim_cannot_take_occupied_destination() {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "requested".into(),
+                pane: Some("%incumbent".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/home/daniel/code/incumbent".into()),
+                    backend: Some("codex-cli".into()),
+                    backend_session_id: Some("incumbent-thread".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let incumbent_before = state.protocol.read().await.sessions["requested"].clone();
+        *state.cached_assistant_panes.write().await = vec![pane_for_backend(
+            "/home/daniel/.ouija/worktrees/ouija/requested",
+            "%claimant",
+            "codex",
+        )];
+
+        let (status, body) = claim_local_identity(
+            State(state.clone()),
+            Json(LocalClaimRequest {
+                requested_id: "requested".into(),
+                caller: crate::state::LocalClaimEvidence {
+                    pane: Some("%claimant".into()),
+                    pane_var_id: None,
+                    env_id: None,
+                    backend_identity: crate::backend::BackendSessionIdentity {
+                        backend: "codex-cli".into(),
+                        session_id: "claimant-thread".into(),
+                    },
+                },
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(status, StatusCode::CONFLICT | StatusCode::FORBIDDEN),
+            "body: {:?}",
+            body.0
+        );
+        let protocol = state.protocol.read().await;
+        assert_eq!(protocol.sessions.get("requested"), Some(&incumbent_before));
+    }
+
+    #[tokio::test]
+    async fn rename_missing_source_never_claims() {
+        let state = crate::state::AppState::new_for_test();
+
+        let (status, body) = rename(
+            State(state.clone()),
+            Json(RenameBody {
+                old_id: "missing".into(),
+                new_id: "requested".into(),
+                sender_ctx: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "body: {:?}", body.0);
+        assert!(state.protocol.read().await.sessions.is_empty());
     }
 
     #[tokio::test]
