@@ -663,11 +663,8 @@ async fn main() -> anyhow::Result<()> {
                             .await
                             .unwrap_or_default();
                             if !dead.is_empty() {
-                                reaper_state
-                                    .apply_and_execute(crate::daemon_protocol::Event::ReapDead {
-                                        dead_sessions: dead.clone(),
-                                    })
-                                    .await;
+                                let observed_at = chrono::Utc::now().timestamp();
+                                reap_dead_sessions(&reaper_state, dead.clone(), observed_at).await;
                             }
                             dead
                         } else {
@@ -1571,6 +1568,23 @@ fn lifecycle_lease_pane_owners(
     owners
 }
 
+async fn reap_dead_sessions(
+    state: &state::SharedState,
+    dead_sessions: Vec<(crate::daemon_protocol::ResourceOwner, String)>,
+    observed_at: i64,
+) {
+    for (owner, pane) in dead_sessions {
+        let _ = state
+            .dormant_owned(
+                owner,
+                Some(pane),
+                observed_at,
+                crate::daemon_protocol::DormancySource::Reaped,
+            )
+            .await;
+    }
+}
+
 fn persisted_session_from_entry(
     entry: &crate::daemon_protocol::SessionEntry,
 ) -> Option<persistence::PersistedSession> {
@@ -1928,71 +1942,93 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
             .is_some_and(|b| state.backends.uses_http_delivery(b))
     });
 
-    // Check pane liveness on blocking thread
+    // Check pane liveness on a blocking thread. Dead persisted rows are still
+    // restored as live authority first, then passed through the same atomic
+    // dormancy coordinator as the runtime reaper.
     let names: Vec<String> = state.backends.all_process_names();
-    let mut alive = tokio::task::spawn_blocking(move || {
+    let (mut alive, dead) = tokio::task::spawn_blocking(move || {
         let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-        pane_bound
-            .into_iter()
-            .filter(|ps| {
-                ps.pane
-                    .as_ref()
-                    .is_some_and(|p| crate::tmux::pane_alive(p, &name_refs))
-            })
-            .collect::<Vec<_>>()
+        pane_bound.into_iter().partition::<Vec<_>, _>(|ps| {
+            ps.pane
+                .as_ref()
+                .is_some_and(|p| crate::tmux::pane_alive(p, &name_refs))
+        })
     })
     .await
     .unwrap_or_default();
     alive.extend(http_delivered);
 
-    if alive.is_empty() {
-        return Ok(());
-    }
-
-    let marker_effects = {
+    let (marker_effects, dead_owners) = {
         let mut proto = state.protocol.write().await;
         let mut marker_effects = Vec::new();
-        for ps in &alive {
+        let mut dead_owners = Vec::new();
+        for (ps, is_alive) in alive
+            .iter()
+            .map(|session| (session, true))
+            .chain(dead.iter().map(|session| (session, false)))
+        {
             let entry = crate::daemon_protocol::SessionEntry {
                 id: ps.id.clone(),
                 pane: ps.pane.clone(),
                 origin: crate::daemon_protocol::Origin::Local,
                 metadata: metadata_for_restored_session(&ps.metadata),
+                registered_at: ps.registered_at.timestamp(),
                 ..Default::default()
             };
             let owner = entry.owner();
-            if let Some(pane) = &entry.pane {
-                marker_effects.extend([
-                    crate::daemon_protocol::Effect::SetTmuxVar {
-                        owner: owner.clone(),
-                        pane: pane.clone(),
-                        name: "@ouija_session".into(),
-                        value: entry.id.clone(),
-                    },
-                    crate::daemon_protocol::Effect::SetTmuxVar {
-                        owner: owner.clone(),
-                        pane: pane.clone(),
-                        name: "@ouija_id".into(),
-                        value: entry.id.clone(),
-                    },
-                    crate::daemon_protocol::Effect::SetTmuxVar {
-                        owner: owner.clone(),
-                        pane: pane.clone(),
-                        name: "@ouija_incarnation".into(),
-                        value: entry.metadata.session_incarnation.to_string(),
-                    },
-                ]);
-            }
-            if let Some(pane) = entry.session_agent_pane() {
-                marker_effects.push(crate::daemon_protocol::Effect::SpawnAgent {
-                    owner,
-                    pane: pane.map(String::from),
-                });
+            if is_alive {
+                if let Some(pane) = &entry.pane {
+                    marker_effects.extend([
+                        crate::daemon_protocol::Effect::SetTmuxVar {
+                            owner: owner.clone(),
+                            pane: pane.clone(),
+                            name: "@ouija_session".into(),
+                            value: entry.id.clone(),
+                        },
+                        crate::daemon_protocol::Effect::SetTmuxVar {
+                            owner: owner.clone(),
+                            pane: pane.clone(),
+                            name: "@ouija_id".into(),
+                            value: entry.id.clone(),
+                        },
+                        crate::daemon_protocol::Effect::SetTmuxVar {
+                            owner: owner.clone(),
+                            pane: pane.clone(),
+                            name: "@ouija_incarnation".into(),
+                            value: entry.metadata.session_incarnation.to_string(),
+                        },
+                    ]);
+                }
+                if let Some(pane) = entry.session_agent_pane() {
+                    marker_effects.push(crate::daemon_protocol::Effect::SpawnAgent {
+                        owner,
+                        pane: pane.map(String::from),
+                    });
+                }
+            } else {
+                dead_owners.push((owner, entry.pane.clone()));
             }
             proto.sessions.insert(ps.id.clone(), entry);
         }
-        marker_effects
+        (marker_effects, dead_owners)
     };
+
+    let observed_at = chrono::Utc::now().timestamp();
+    for (owner, pane) in dead_owners {
+        if matches!(
+            state
+                .dormant_owned(
+                    owner,
+                    pane,
+                    observed_at,
+                    crate::daemon_protocol::DormancySource::Reaped,
+                )
+                .await,
+            crate::state::DormantOwnedOutcome::PersistenceFailed
+        ) {
+            anyhow::bail!("failed to persist startup dormancy reconciliation");
+        }
+    }
 
     // Startup rehydration bypasses Event::Register so it can preserve the
     // durable incarnation exactly. Re-emit Register's pane markers and exact
@@ -2000,7 +2036,11 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
     // resource gate and physical-owner check reject a conflicting live
     // incarnation.
     let _ = state.execute_effects(&marker_effects).await;
-    tracing::info!("restored {} persisted sessions", alive.len());
+    tracing::info!(
+        "restored {} live and reconciled {} dead persisted sessions",
+        alive.len(),
+        dead.len()
+    );
     Ok(())
 }
 
@@ -4923,6 +4963,97 @@ mod tests {
                 .lifecycle_leases
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn restore_dead_live_row_uses_atomic_dormancy_coordinator() {
+        let dir = tempfile::tempdir().unwrap();
+        let registered_at = chrono::Utc::now();
+        let snapshot = crate::persistence::PersistedLifecycleState::new(
+            vec![crate::persistence::PersistedSession {
+                id: "dead-worker".into(),
+                pane: Some("%999999991".into()),
+                registered_at,
+                last_activity_at: registered_at,
+                metadata: crate::state::SessionMetadata {
+                    project_dir: Some("/tmp/dead-worker".into()),
+                    canonical_project_identity: Some("/tmp/repository".into()),
+                    backend: Some("codex-cli".into()),
+                    backend_session_id: Some("thread-dead-worker".into()),
+                    session_incarnation: crate::daemon_protocol::SessionIncarnation(42),
+                    role: Some("preserve me".into()),
+                    ..Default::default()
+                },
+            }],
+            std::collections::BTreeMap::new(),
+            crate::daemon_protocol::SessionIncarnation(42),
+            std::collections::BTreeMap::new(),
+        );
+        crate::persistence::save_sessions(dir.path(), &snapshot).unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "restore-dead-live-test".into(),
+            npub: "npub1test".into(),
+            port: 0,
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        let before = chrono::Utc::now().timestamp();
+
+        restore_persisted_sessions(&state).await.unwrap();
+
+        let after = chrono::Utc::now().timestamp();
+        let protocol = state.protocol.read().await;
+        assert!(!protocol.sessions.contains_key("dead-worker"));
+        let dormant = &protocol.dormant_sessions["dead-worker"];
+        assert!((before..=after).contains(&dormant.dormant_at));
+        assert_eq!(
+            dormant.source,
+            crate::daemon_protocol::DormancySource::Reaped
+        );
+        assert_eq!(dormant.metadata.role.as_deref(), Some("preserve me"));
+        drop(protocol);
+        let persisted = crate::persistence::load_sessions(dir.path()).unwrap();
+        assert!(persisted.sessions.is_empty());
+        assert!(persisted.dormant_sessions.contains_key("dead-worker"));
+    }
+
+    #[tokio::test]
+    async fn reaper_uses_atomic_dormancy_coordinator() {
+        let config = crate::state::tests::test_config();
+        let state = crate::state::AppState::new(config.clone());
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "dead-worker".into(),
+                pane: Some("%999999992".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/dead-worker".into()),
+                    canonical_project_identity: Some("/tmp/repository".into()),
+                    backend: Some("codex-cli".into()),
+                    backend_session_id: Some("thread-dead-worker".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["dead-worker"].owner();
+
+        reap_dead_sessions(
+            &state,
+            vec![(owner.clone(), "%999999992".into())],
+            1_753_920_321,
+        )
+        .await;
+
+        let protocol = state.protocol.read().await;
+        assert!(!protocol.sessions.contains_key("dead-worker"));
+        assert_eq!(protocol.dormant_sessions["dead-worker"].prior_owner, owner);
+        assert_eq!(
+            protocol.dormant_sessions["dead-worker"].dormant_at,
+            1_753_920_321
+        );
+        drop(protocol);
+        let persisted = crate::persistence::load_sessions(&config.data_dir).unwrap();
+        assert!(persisted.sessions.is_empty());
+        assert_eq!(persisted.dormant_sessions["dead-worker"].prior_owner, owner);
     }
 
     #[tokio::test]

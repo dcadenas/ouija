@@ -776,6 +776,8 @@ pub struct AppState {
     reclaim_test_inspection: std::sync::Mutex<Option<crate::tmux::ManagedPaneInspection>>,
     #[cfg(test)]
     backend_recovery_test_inspection: std::sync::Mutex<Option<crate::tmux::ManagedPaneInspection>>,
+    #[cfg(test)]
+    dormant_recovery_test_inspection: std::sync::Mutex<Option<crate::tmux::ManagedPaneInspection>>,
     /// Per-resource async gates serialize external pane/backend claims and cleanup
     /// without holding the protocol lock across tmux, process, or HTTP I/O.
     resource_gates:
@@ -851,6 +853,24 @@ pub(crate) enum BackendIdentityRecoveryOutcome {
     PaneProjectMismatch,
     PaneBackendMismatch,
     Superseded,
+    PersistenceFailed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DormantOwnedOutcome {
+    Dormant { id: String },
+    Removed { id: String },
+    Superseded,
+    LifecycleInProgress,
+    PersistenceFailed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DormantRecoveryOutcome {
+    Recovered(crate::daemon_protocol::ResourceOwner),
+    Current(crate::daemon_protocol::ResourceOwner),
+    NotFound,
+    Refused,
     PersistenceFailed,
 }
 
@@ -1269,6 +1289,7 @@ impl AppState {
             restart_test_control: std::sync::Mutex::new(None),
             reclaim_test_inspection: std::sync::Mutex::new(None),
             backend_recovery_test_inspection: std::sync::Mutex::new(None),
+            dormant_recovery_test_inspection: std::sync::Mutex::new(None),
             resource_gates: std::sync::Mutex::new(HashMap::new()),
             project_index: RwLock::new(HashMap::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
@@ -1325,6 +1346,8 @@ impl AppState {
             reclaim_test_inspection: std::sync::Mutex::new(None),
             #[cfg(test)]
             backend_recovery_test_inspection: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            dormant_recovery_test_inspection: std::sync::Mutex::new(None),
             resource_gates: std::sync::Mutex::new(HashMap::new()),
             project_index: RwLock::new(HashMap::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
@@ -1368,6 +1391,17 @@ impl AppState {
             .backend_recovery_test_inspection
             .lock()
             .expect("backend recovery test inspection mutex poisoned") = Some(inspection);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_dormant_recovery_test_inspection(
+        &self,
+        inspection: crate::tmux::ManagedPaneInspection,
+    ) {
+        *self
+            .dormant_recovery_test_inspection
+            .lock()
+            .expect("dormant recovery test inspection mutex poisoned") = Some(inspection);
     }
 
     #[cfg(test)]
@@ -2245,6 +2279,228 @@ impl AppState {
             .values()
             .find(|s| s.pane.as_deref() == Some(pane))
             .map(|s| s.id.clone())
+    }
+
+    /// Atomically park or forget one exact Local owner after a trusted
+    /// liveness observation.
+    ///
+    /// The pure candidate is persisted before it replaces live protocol
+    /// authority. Stop-agent, pending-reply, and broadcast effects therefore
+    /// cannot escape when the snapshot write fails.
+    pub(crate) async fn dormant_owned(
+        self: &Arc<Self>,
+        owner: crate::daemon_protocol::ResourceOwner,
+        expected_pane: Option<String>,
+        observed_at: i64,
+        source: crate::daemon_protocol::DormancySource,
+    ) -> DormantOwnedOutcome {
+        let event = crate::daemon_protocol::Event::DormantOwned {
+            owner: owner.clone(),
+            expected_pane: expected_pane.clone(),
+            observed_at,
+            source,
+        };
+        let resource_guards = self.lock_event_resources(&event).await;
+        let (outcome, effects) = {
+            let mut protocol = self.protocol.write().await;
+            let Some(current) = protocol.sessions.get(&owner.session_id) else {
+                return DormantOwnedOutcome::Superseded;
+            };
+            if !matches!(current.origin, crate::daemon_protocol::Origin::Local)
+                || current.owner() != owner
+                || expected_pane
+                    .as_deref()
+                    .is_some_and(|pane| current.pane.as_deref() != Some(pane))
+            {
+                return DormantOwnedOutcome::Superseded;
+            }
+            if protocol.lifecycle_leases.contains_key(&owner.session_id) {
+                return DormantOwnedOutcome::LifecycleInProgress;
+            }
+
+            let mut candidate = protocol.clone();
+            let effects = candidate.apply(event);
+            let Some(tombstoned) = effects.iter().find_map(|effect| match effect {
+                crate::daemon_protocol::Effect::DormancyApplied {
+                    id,
+                    prior_owner,
+                    tombstoned,
+                } if id == &owner.session_id && prior_owner == &owner => Some(*tombstoned),
+                _ => None,
+            }) else {
+                return DormantOwnedOutcome::Superseded;
+            };
+            if self.persist_protocol_state(&candidate).is_err() {
+                return DormantOwnedOutcome::PersistenceFailed;
+            }
+            *protocol = candidate;
+            let outcome = if tombstoned {
+                DormantOwnedOutcome::Dormant {
+                    id: owner.session_id.clone(),
+                }
+            } else {
+                DormantOwnedOutcome::Removed {
+                    id: owner.session_id.clone(),
+                }
+            };
+            let effects = effects
+                .into_iter()
+                .filter(|effect| !matches!(effect, crate::daemon_protocol::Effect::Persist))
+                .collect::<Vec<_>>();
+            (outcome, effects)
+        };
+        drop(resource_guards);
+        self.execute_effects(&effects).await;
+        outcome
+    }
+
+    /// Recover one exact dormant backend identity into its replacement pane.
+    ///
+    /// A matching tombstone is a fail-closed boundary: once found, every
+    /// physical and protocol conflict rejects recovery instead of falling
+    /// through to generic registration under another public ID.
+    pub(crate) async fn recover_dormant_session(
+        self: &Arc<Self>,
+        identity: &crate::backend::BackendSessionIdentity,
+        pane: &str,
+        project: &crate::project_identity::ProjectIdentity,
+    ) -> DormantRecoveryOutcome {
+        let dormant = {
+            let protocol = self.protocol.read().await;
+            let mut live_matches = protocol.sessions.values().filter(|session| {
+                matches!(session.origin, crate::daemon_protocol::Origin::Local)
+                    && session.metadata.backend.as_deref() == Some(identity.backend.as_str())
+                    && session.metadata.backend_session_id.as_deref()
+                        == Some(identity.session_id.as_str())
+            });
+            if let Some(current) = live_matches.next() {
+                if live_matches.next().is_some() {
+                    return DormantRecoveryOutcome::Refused;
+                }
+                return if current.pane.as_deref() == Some(pane)
+                    && current.metadata.project_dir.as_deref() == Some(project.project_dir.as_str())
+                    && current.metadata.canonical_project_identity.as_deref()
+                        == Some(project.canonical_repository.as_str())
+                {
+                    DormantRecoveryOutcome::Current(current.owner())
+                } else {
+                    DormantRecoveryOutcome::Refused
+                };
+            }
+
+            let mut matches = protocol.dormant_sessions.values().filter(|dormant| {
+                dormant.metadata.backend.as_deref() == Some(identity.backend.as_str())
+                    && dormant.metadata.backend_session_id.as_deref()
+                        == Some(identity.session_id.as_str())
+            });
+            let Some(dormant) = matches.next().cloned() else {
+                return DormantRecoveryOutcome::NotFound;
+            };
+            if matches.next().is_some() {
+                return DormantRecoveryOutcome::Refused;
+            }
+            dormant
+        };
+
+        let event = crate::daemon_protocol::Event::RecoverDormantSession {
+            dormant_owner: dormant.prior_owner.clone(),
+            pane: pane.to_string(),
+            backend: identity.backend.clone(),
+            backend_session_id: identity.session_id.clone(),
+            project_dir: project.project_dir.clone(),
+            canonical_project_identity: project.canonical_repository.clone(),
+        };
+        let resource_guards = self.lock_event_resources(&event).await;
+
+        let panes = self.list_assistant_panes().await;
+        let Some(live_pane) = panes.iter().find(|candidate| candidate.pane_id == pane) else {
+            return DormantRecoveryOutcome::Refused;
+        };
+        let Some(process_name) = live_pane.process_name.as_deref() else {
+            return DormantRecoveryOutcome::Refused;
+        };
+        let Some(backend) = self.backends.get(&identity.backend) else {
+            return DormantRecoveryOutcome::Refused;
+        };
+        if crate::tmux::matching_process_name(process_name, backend.process_names()).is_none() {
+            return DormantRecoveryOutcome::Refused;
+        }
+        if live_pane.pane_current_path.as_deref().is_none_or(|path| {
+            project_dir_identity(path) != project_dir_identity(&project.project_dir)
+        }) {
+            return DormantRecoveryOutcome::Refused;
+        }
+
+        #[cfg(test)]
+        let test_inspection = self
+            .dormant_recovery_test_inspection
+            .lock()
+            .expect("dormant recovery test inspection mutex poisoned")
+            .clone();
+        #[cfg(not(test))]
+        let test_inspection: Option<crate::tmux::ManagedPaneInspection> = None;
+        let inspection = if let Some(inspection) = test_inspection {
+            Ok(inspection)
+        } else {
+            let pane = pane.to_string();
+            match tokio::task::spawn_blocking(move || crate::tmux::inspect_managed_pane(&pane))
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!(error)),
+            }
+        };
+        if !matches!(
+            inspection,
+            Ok(ref inspection)
+                if crate::tmux::pane_accepts_owner_marker(inspection, &dormant.prior_owner)
+        ) {
+            return DormantRecoveryOutcome::Refused;
+        }
+
+        let (owner, effects) = {
+            let mut protocol = self.protocol.write().await;
+            if protocol
+                .dormant_sessions
+                .get(&dormant.id)
+                .is_none_or(|current| current != &dormant)
+            {
+                if let Some(current) = protocol.sessions.get(&dormant.id)
+                    && matches!(current.origin, crate::daemon_protocol::Origin::Local)
+                    && current.pane.as_deref() == Some(pane)
+                    && current.metadata.backend.as_deref() == Some(identity.backend.as_str())
+                    && current.metadata.backend_session_id.as_deref()
+                        == Some(identity.session_id.as_str())
+                    && current.metadata.project_dir.as_deref() == Some(project.project_dir.as_str())
+                    && current.metadata.canonical_project_identity.as_deref()
+                        == Some(project.canonical_repository.as_str())
+                {
+                    return DormantRecoveryOutcome::Current(current.owner());
+                }
+                return DormantRecoveryOutcome::Refused;
+            }
+
+            let mut candidate = protocol.clone();
+            let effects = candidate.apply(event);
+            let Some(owner) = effects.iter().find_map(|effect| match effect {
+                crate::daemon_protocol::Effect::DormantRecovered { owner } => Some(owner.clone()),
+                _ => None,
+            }) else {
+                return DormantRecoveryOutcome::Refused;
+            };
+            if self.persist_protocol_state(&candidate).is_err() {
+                return DormantRecoveryOutcome::PersistenceFailed;
+            }
+            *protocol = candidate;
+            let effects = effects
+                .into_iter()
+                .filter(|effect| !matches!(effect, crate::daemon_protocol::Effect::Persist))
+                .collect::<Vec<_>>();
+            (owner, effects)
+        };
+        drop(resource_guards);
+        self.execute_effects(&effects).await;
+        DormantRecoveryOutcome::Recovered(owner)
     }
 
     /// Recover a running backend into one explicitly named, unchanged blank Local row.
@@ -7021,6 +7277,499 @@ pub(crate) mod tests {
             port: 0,
             npub: "npub1test".into(),
         }
+    }
+
+    fn continuity_metadata(
+        backend_session_id: &str,
+        project_dir: &str,
+    ) -> crate::daemon_protocol::SessionMeta {
+        crate::daemon_protocol::SessionMeta {
+            project_dir: Some(project_dir.into()),
+            canonical_project_identity: Some(project_dir.into()),
+            backend: Some("codex-cli".into()),
+            backend_session_id: Some(backend_session_id.into()),
+            role: Some("permanent identity work".into()),
+            prompt: Some("finish the continuity fix".into()),
+            fresh_context_after_active_secs: Some(3_600),
+            active_context_accumulated_secs: 90,
+            ..Default::default()
+        }
+    }
+
+    async fn dormant_recovery_fixture() -> (
+        Arc<AppState>,
+        tempfile::TempDir,
+        crate::daemon_protocol::ResourceOwner,
+        crate::backend::BackendSessionIdentity,
+        crate::project_identity::ProjectIdentity,
+    ) {
+        let project = tempfile::tempdir().unwrap();
+        let canonical_repository = project.path().canonicalize().unwrap();
+        let worktree = canonical_repository.join("worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        let project_dir = worktree.to_string_lossy().into_owned();
+        let canonical_repository = canonical_repository.to_string_lossy().into_owned();
+        let state = AppState::new_for_test();
+        let mut metadata = continuity_metadata("thread-continuity", &project_dir);
+        metadata.canonical_project_identity = Some(canonical_repository.clone());
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "arbitrary-public-id".into(),
+                pane: Some("%1".into()),
+                metadata,
+            })
+            .await;
+        let prior_owner = state.protocol.read().await.sessions["arbitrary-public-id"].owner();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::DormantOwned {
+                owner: prior_owner.clone(),
+                expected_pane: Some("%1".into()),
+                observed_at: 1_753_920_100,
+                source: crate::daemon_protocol::DormancySource::Reaped,
+            })
+            .await;
+        *state.cached_assistant_panes.write().await = vec![crate::tmux::TmuxPane {
+            pane_id: "%2".into(),
+            session_name: "replacement".into(),
+            pane_current_path: Some(project_dir.clone()),
+            process_name: Some("codex".into()),
+        }];
+        state.set_dormant_recovery_test_inspection(crate::tmux::ManagedPaneInspection::Unmanaged);
+        (
+            state,
+            project,
+            prior_owner,
+            crate::backend::BackendSessionIdentity {
+                backend: "codex-cli".into(),
+                session_id: "thread-continuity".into(),
+            },
+            crate::project_identity::ProjectIdentity {
+                project_dir: project_dir.clone(),
+                canonical_repository,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn dormant_owned_parks_eligible_owner_only_after_persistence() {
+        let config = test_config();
+        let state = AppState::new(config.clone());
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%1".into()),
+                metadata: continuity_metadata("thread-worker", "/tmp/project"),
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["worker"].owner();
+
+        let outcome = state
+            .dormant_owned(
+                owner.clone(),
+                Some("%1".into()),
+                1_753_920_200,
+                crate::daemon_protocol::DormancySource::Reaped,
+            )
+            .await;
+
+        assert_eq!(
+            outcome,
+            DormantOwnedOutcome::Dormant {
+                id: "worker".into()
+            }
+        );
+        let protocol = state.protocol.read().await;
+        assert!(!protocol.sessions.contains_key("worker"));
+        assert_eq!(protocol.dormant_sessions["worker"].prior_owner, owner);
+        drop(protocol);
+        let persisted = crate::persistence::load_sessions(&config.data_dir).unwrap();
+        assert!(persisted.sessions.is_empty());
+        assert_eq!(persisted.dormant_sessions["worker"].prior_owner, owner);
+    }
+
+    #[tokio::test]
+    async fn dormant_owned_removes_ineligible_owner_atomically() {
+        let config = test_config();
+        let state = AppState::new(config.clone());
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "legacy".into(),
+                pane: Some("%1".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/project".into()),
+                    backend: Some("codex-cli".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["legacy"].owner();
+
+        let outcome = state
+            .dormant_owned(
+                owner,
+                Some("%1".into()),
+                1_753_920_200,
+                crate::daemon_protocol::DormancySource::Reaped,
+            )
+            .await;
+
+        assert_eq!(
+            outcome,
+            DormantOwnedOutcome::Removed {
+                id: "legacy".into()
+            }
+        );
+        let protocol = state.protocol.read().await;
+        assert!(!protocol.sessions.contains_key("legacy"));
+        assert!(!protocol.dormant_sessions.contains_key("legacy"));
+        drop(protocol);
+        let persisted = crate::persistence::load_sessions(&config.data_dir).unwrap();
+        assert!(persisted.sessions.is_empty());
+        assert!(persisted.dormant_sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dormant_owned_rejects_stale_owner_and_lifecycle_lease() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%1".into()),
+                metadata: continuity_metadata("thread-worker", "/tmp/project"),
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["worker"].owner();
+        let before = state.protocol.read().await.clone();
+        let mut stale = owner.clone();
+        stale.incarnation =
+            crate::daemon_protocol::SessionIncarnation(stale.incarnation.0.saturating_add(1));
+        assert_eq!(
+            state
+                .dormant_owned(
+                    stale,
+                    Some("%1".into()),
+                    1_753_920_200,
+                    crate::daemon_protocol::DormancySource::Reaped,
+                )
+                .await,
+            DormantOwnedOutcome::Superseded
+        );
+        assert_eq!(*state.protocol.read().await, before);
+
+        assert_eq!(
+            state.claim_existing_start(&owner).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        let leased = state.protocol.read().await.clone();
+        assert_eq!(
+            state
+                .dormant_owned(
+                    owner,
+                    Some("%1".into()),
+                    1_753_920_200,
+                    crate::daemon_protocol::DormancySource::Reaped,
+                )
+                .await,
+            DormantOwnedOutcome::LifecycleInProgress
+        );
+        assert_eq!(*state.protocol.read().await, leased);
+    }
+
+    #[tokio::test]
+    async fn dormant_owned_eligible_persistence_failure_preserves_live_authority() {
+        assert_dormant_owned_persistence_failure(true).await;
+    }
+
+    #[tokio::test]
+    async fn dormant_owned_ineligible_persistence_failure_preserves_live_authority() {
+        assert_dormant_owned_persistence_failure(false).await;
+    }
+
+    async fn assert_dormant_owned_persistence_failure(eligible: bool) {
+        let config = test_config();
+        let state = AppState::new(config.clone());
+        let metadata = if eligible {
+            continuity_metadata("thread-worker", "/tmp/project")
+        } else {
+            crate::daemon_protocol::SessionMeta {
+                project_dir: Some("/tmp/project".into()),
+                backend: Some("codex-cli".into()),
+                ..Default::default()
+            }
+        };
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%1".into()),
+                metadata,
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["worker"].owner();
+        let before = state.protocol.read().await.clone();
+        assert!(state.session_agents.read().await.contains_key(&owner));
+        std::fs::create_dir(config.data_dir.join("sessions.tmp")).unwrap();
+
+        let outcome = state
+            .dormant_owned(
+                owner.clone(),
+                Some("%1".into()),
+                1_753_920_200,
+                crate::daemon_protocol::DormancySource::Reaped,
+            )
+            .await;
+
+        assert_eq!(outcome, DormantOwnedOutcome::PersistenceFailed);
+        assert_eq!(*state.protocol.read().await, before);
+        assert!(
+            state.session_agents.read().await.contains_key(&owner),
+            "failed persistence must not execute StopAgent"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_dormant_restores_and_persists_exact_identity_then_retries_idempotently() {
+        let (state, _project, prior_owner, identity, project_identity) =
+            dormant_recovery_fixture().await;
+
+        let outcome = state
+            .recover_dormant_session(&identity, "%2", &project_identity)
+            .await;
+
+        let DormantRecoveryOutcome::Recovered(owner) = outcome else {
+            panic!("expected recovery, got {outcome:?}");
+        };
+        assert_eq!(owner.session_id, "arbitrary-public-id");
+        assert!(owner.incarnation > prior_owner.incarnation);
+        let protocol = state.protocol.read().await;
+        assert!(
+            !protocol
+                .dormant_sessions
+                .contains_key("arbitrary-public-id")
+        );
+        assert_eq!(
+            protocol.sessions["arbitrary-public-id"].pane.as_deref(),
+            Some("%2")
+        );
+        assert_eq!(
+            protocol.sessions["arbitrary-public-id"]
+                .metadata
+                .role
+                .as_deref(),
+            Some("permanent identity work")
+        );
+        drop(protocol);
+        assert!(
+            crate::persistence::load_sessions(&state.config.data_dir)
+                .unwrap()
+                .dormant_sessions
+                .is_empty()
+        );
+
+        let retry = state
+            .recover_dormant_session(&identity, "%2", &project_identity)
+            .await;
+        assert_eq!(retry, DormantRecoveryOutcome::Current(owner));
+    }
+
+    #[tokio::test]
+    async fn recover_dormant_persistence_failure_rolls_back_without_activation() {
+        let (state, _project, _prior_owner, identity, project_identity) =
+            dormant_recovery_fixture().await;
+        let before = state.protocol.read().await.clone();
+        assert!(state.session_agents.read().await.is_empty());
+        std::fs::create_dir(state.config.data_dir.join("sessions.tmp")).unwrap();
+
+        let outcome = state
+            .recover_dormant_session(&identity, "%2", &project_identity)
+            .await;
+
+        assert_eq!(outcome, DormantRecoveryOutcome::PersistenceFailed);
+        assert_eq!(*state.protocol.read().await, before);
+        assert!(
+            state.session_agents.read().await.is_empty(),
+            "failed recovery must not execute SpawnAgent"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_dormant_rejects_changed_project_and_live_or_reserved_resources() {
+        for conflict in [
+            "changed-project",
+            "changed-canonical",
+            "live-id",
+            "id-lease",
+            "live-pane",
+            "reserved-pane",
+            "live-pair",
+            "dormant-pair",
+            "reserved-pair",
+            "actual-project-lease",
+            "canonical-project-lease",
+            "foreign-marker",
+        ] {
+            let (state, _project, _prior_owner, identity, mut project_identity) =
+                dormant_recovery_fixture().await;
+            {
+                let mut protocol = state.protocol.write().await;
+                let foreign_owner = crate::daemon_protocol::ResourceOwner {
+                    session_id: "foreign".into(),
+                    incarnation: crate::daemon_protocol::SessionIncarnation(500),
+                };
+                match conflict {
+                    "changed-project" => {
+                        project_identity.project_dir = "/tmp/other".into();
+                    }
+                    "changed-canonical" => {
+                        project_identity.canonical_repository = "/tmp/other".into();
+                    }
+                    "live-id" => {
+                        protocol.sessions.insert(
+                            "arbitrary-public-id".into(),
+                            crate::daemon_protocol::SessionEntry {
+                                id: "arbitrary-public-id".into(),
+                                pane: Some("%9".into()),
+                                origin: Origin::Local,
+                                metadata: crate::daemon_protocol::SessionMeta {
+                                    session_incarnation: foreign_owner.incarnation,
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    "live-pane" => {
+                        protocol.sessions.insert(
+                            "foreign".into(),
+                            crate::daemon_protocol::SessionEntry {
+                                id: "foreign".into(),
+                                pane: Some("%2".into()),
+                                origin: Origin::Local,
+                                metadata: crate::daemon_protocol::SessionMeta {
+                                    session_incarnation: foreign_owner.incarnation,
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    "live-pair" => {
+                        protocol.sessions.insert(
+                            "foreign".into(),
+                            crate::daemon_protocol::SessionEntry {
+                                id: "foreign".into(),
+                                pane: Some("%9".into()),
+                                origin: Origin::Local,
+                                metadata: crate::daemon_protocol::SessionMeta {
+                                    backend: Some(identity.backend.clone()),
+                                    backend_session_id: Some(identity.session_id.clone()),
+                                    session_incarnation: foreign_owner.incarnation,
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    "dormant-pair" => {
+                        let mut foreign = protocol.dormant_sessions["arbitrary-public-id"].clone();
+                        foreign.id = "foreign".into();
+                        foreign.prior_owner = foreign_owner;
+                        foreign.metadata.session_incarnation = foreign.prior_owner.incarnation;
+                        protocol.dormant_sessions.insert("foreign".into(), foreign);
+                    }
+                    "id-lease"
+                    | "reserved-pane"
+                    | "reserved-pair"
+                    | "actual-project-lease"
+                    | "canonical-project-lease" => {
+                        let lease_id = if conflict == "id-lease" {
+                            "arbitrary-public-id"
+                        } else {
+                            "foreign"
+                        };
+                        let lease_owner = match protocol.reserve_start(lease_id).unwrap() {
+                            crate::daemon_protocol::StartDisposition::Reserved(owner) => owner,
+                            other => panic!("unexpected lease result: {other:?}"),
+                        };
+                        let lease = protocol.lifecycle_leases.get_mut(lease_id).unwrap();
+                        match conflict {
+                            "reserved-pane" => {
+                                lease.inert_pane = Some("%2".into());
+                                lease.inert_pane_owner = Some(lease_owner);
+                            }
+                            "reserved-pair" => {
+                                lease.backend = Some(identity.backend.clone());
+                                lease.backend_session_id = Some(identity.session_id.clone());
+                                lease.backend_session_owner = Some(lease_owner);
+                            }
+                            "actual-project-lease" => {
+                                lease.project_dir = Some(project_identity.project_dir.clone());
+                                lease.project_dir_owner = Some(lease_owner);
+                            }
+                            "canonical-project-lease" => {
+                                lease.project_dir =
+                                    Some(project_identity.canonical_repository.clone());
+                                lease.project_dir_owner = Some(lease_owner);
+                            }
+                            "id-lease" => {}
+                            _ => unreachable!(),
+                        }
+                    }
+                    "foreign-marker" => {}
+                    _ => unreachable!(),
+                }
+            }
+            if conflict == "foreign-marker" {
+                state.set_dormant_recovery_test_inspection(
+                    crate::tmux::ManagedPaneInspection::MarkerOwner(
+                        crate::daemon_protocol::ResourceOwner {
+                            session_id: "foreign".into(),
+                            incarnation: crate::daemon_protocol::SessionIncarnation(999),
+                        },
+                    ),
+                );
+            }
+            let before = state.protocol.read().await.clone();
+
+            let outcome = state
+                .recover_dormant_session(&identity, "%2", &project_identity)
+                .await;
+
+            assert_eq!(
+                outcome,
+                DormantRecoveryOutcome::Refused,
+                "conflict {conflict}"
+            );
+            assert_eq!(*state.protocol.read().await, before, "conflict {conflict}");
+        }
+    }
+
+    #[tokio::test]
+    async fn recover_dormant_rejects_stale_tombstone_after_resource_wait() {
+        let (state, _project, _prior_owner, identity, project_identity) =
+            dormant_recovery_fixture().await;
+        let held_gate = state.pane_resource_gate("%2").lock_owned().await;
+        let recovery_state = state.clone();
+        let recovery_identity = identity.clone();
+        let recovery_project = project_identity.clone();
+        let recovery = tokio::spawn(async move {
+            recovery_state
+                .recover_dormant_session(&recovery_identity, "%2", &recovery_project)
+                .await
+        });
+        tokio::task::yield_now().await;
+        {
+            let mut protocol = state.protocol.write().await;
+            let dormant = protocol
+                .dormant_sessions
+                .get_mut("arbitrary-public-id")
+                .unwrap();
+            dormant.dormant_at += 1;
+        }
+        let expected = state.protocol.read().await.clone();
+        drop(held_gate);
+
+        assert_eq!(recovery.await.unwrap(), DormantRecoveryOutcome::Refused);
+        assert_eq!(*state.protocol.read().await, expected);
     }
 
     #[tokio::test]

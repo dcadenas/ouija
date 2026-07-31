@@ -553,7 +553,38 @@ async fn session_start_inner(
                     "output": "",
                 });
             }
-            crate::state::MissingBackendPaneReclaimOutcome::NotFound => {}
+            crate::state::MissingBackendPaneReclaimOutcome::NotFound => {
+                match state
+                    .recover_dormant_session(identity, &body.pane, &project)
+                    .await
+                {
+                    crate::state::DormantRecoveryOutcome::Recovered(owner)
+                    | crate::state::DormantRecoveryOutcome::Current(owner) => {
+                        let output = mesh_instructions_for_backend(
+                            Some(&identity.backend),
+                            &owner.session_id,
+                        );
+                        return json!({
+                            "registered": owner.session_id,
+                            "session_incarnation": owner.incarnation.to_string(),
+                            "output": output,
+                        });
+                    }
+                    crate::state::DormantRecoveryOutcome::NotFound => {}
+                    crate::state::DormantRecoveryOutcome::Refused => {
+                        return json!({
+                            "skipped": "dormant identity recovery rejected",
+                            "output": "",
+                        });
+                    }
+                    crate::state::DormantRecoveryOutcome::PersistenceFailed => {
+                        return json!({
+                            "error": "dormant identity recovery persistence failed",
+                            "output": "",
+                        });
+                    }
+                }
+            }
             crate::state::MissingBackendPaneReclaimOutcome::Refused => {
                 return json!({
                     "skipped": "stale canonical identity reclaim rejected",
@@ -2587,6 +2618,122 @@ mod tests {
         assert_eq!(canonical.pane.as_deref(), Some("%999999998"));
         assert_eq!(canonical.metadata.role.as_deref(), Some("canonical role"));
         assert!(canonical.owner().incarnation > stale_owner.incarnation);
+    }
+
+    #[tokio::test]
+    async fn resumed_backend_recovers_reaped_public_id_and_lifecycle_metadata() {
+        let state = crate::state::AppState::new_for_test();
+        let worktree = "/home/daniel/.ouija/worktrees/ouija/rootfix";
+        let project = crate::project_identity::resolve_project_identity(worktree).unwrap();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "rootfix".into(),
+                pane: Some("%802".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some(project.project_dir.clone()),
+                    canonical_project_identity: Some(project.canonical_repository.clone()),
+                    role: Some("permanent identity fix".into()),
+                    bulletin: Some("preserve identity continuity".into()),
+                    backend: Some("codex-cli".into()),
+                    backend_session_id: Some("019fb5e7-1fd4-7861-bd29-6a4860a3be75".into()),
+                    prompt: Some("finish the permanent identity fix".into()),
+                    reminder: Some("resume only remaining work".into()),
+                    parent_session: Some("ouija".into()),
+                    idle_policy: Some(crate::daemon_protocol::IdlePolicy::AskParentWhenDone),
+                    fresh_context_after_active_secs: Some(3_600),
+                    active_context_accumulated_secs: 120,
+                    active_context_segment_started_at: Some(1_753_920_000),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let reaped_owner = state.protocol.read().await.sessions["rootfix"].owner();
+        let dormancy = state
+            .dormant_owned(
+                reaped_owner.clone(),
+                Some("%802".into()),
+                1_753_920_030,
+                crate::daemon_protocol::DormancySource::Reaped,
+            )
+            .await;
+        assert_eq!(
+            dormancy,
+            crate::state::DormantOwnedOutcome::Dormant {
+                id: "rootfix".into()
+            }
+        );
+        assert!(
+            !state.protocol.read().await.sessions.contains_key("rootfix"),
+            "the regression requires the original live row to have been reaped"
+        );
+        let parked = state.protocol.read().await.dormant_sessions["rootfix"].clone();
+        assert_eq!(parked.metadata.active_context_accumulated_secs, 150);
+        assert_eq!(parked.metadata.active_context_segment_started_at, None);
+        *state.cached_assistant_panes.write().await = vec![assistant_pane_with_process(
+            "%819",
+            &project.project_dir,
+            "codex",
+        )];
+        state.set_dormant_recovery_test_inspection(crate::tmux::ManagedPaneInspection::Unmanaged);
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: "%819".into(),
+                cwd: worktree.into(),
+                backend_session_id: Some("019fb5e7-1fd4-7861-bd29-6a4860a3be75".into()),
+                backend_identity: Some(crate::backend::BackendSessionIdentity {
+                    backend: "codex-cli".into(),
+                    session_id: "019fb5e7-1fd4-7861-bd29-6a4860a3be75".into(),
+                }),
+                adapter: Some("codex-cli".into()),
+                launch_session_id: None,
+                launch_credential: None,
+                session_incarnation: None,
+            },
+        )
+        .await;
+
+        assert_eq!(result["registered"], "rootfix", "result: {result}");
+        let protocol = state.protocol.read().await;
+        assert_eq!(protocol.sessions.len(), 1);
+        let resumed = &protocol.sessions["rootfix"];
+        assert_eq!(resumed.pane.as_deref(), Some("%819"));
+        assert_eq!(
+            resumed.metadata.backend_session_id.as_deref(),
+            Some("019fb5e7-1fd4-7861-bd29-6a4860a3be75")
+        );
+        assert_eq!(
+            resumed.metadata.role.as_deref(),
+            Some("permanent identity fix")
+        );
+        assert_eq!(
+            resumed.metadata.bulletin.as_deref(),
+            Some("preserve identity continuity")
+        );
+        assert_eq!(
+            resumed.metadata.prompt.as_deref(),
+            Some("finish the permanent identity fix")
+        );
+        assert_eq!(
+            resumed.metadata.reminder.as_deref(),
+            Some("resume only remaining work")
+        );
+        assert_eq!(resumed.metadata.parent_session.as_deref(), Some("ouija"));
+        assert_eq!(
+            resumed.metadata.idle_policy,
+            Some(crate::daemon_protocol::IdlePolicy::AskParentWhenDone)
+        );
+        assert_eq!(
+            resumed.metadata.fresh_context_after_active_secs,
+            Some(3_600)
+        );
+        assert_eq!(resumed.metadata.active_context_accumulated_secs, 150);
+        assert_eq!(resumed.metadata.active_context_segment_started_at, None);
+        assert!(
+            resumed.owner().incarnation > reaped_owner.incarnation,
+            "recovery must allocate a fresh daemon-issued incarnation"
+        );
     }
 
     #[tokio::test]
