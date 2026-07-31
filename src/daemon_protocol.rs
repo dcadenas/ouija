@@ -9682,6 +9682,43 @@ mod tests {
         state.sessions[id].owner()
     }
 
+    fn assert_ineligible_dormancy_removes_without_tombstone(mut metadata: SessionMeta) {
+        metadata.networked = false;
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        register_identity(&mut state, "unrelated", "%9", "unrelated-thread");
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata,
+        });
+        let owner = state.sessions["worker"].owner();
+        let mut expected = state.clone();
+        expected.sessions.remove("worker");
+
+        let effects = state.apply(Event::DormantOwned {
+            owner: owner.clone(),
+            expected_pane: Some("%1".into()),
+            observed_at: 30,
+            source: DormancySource::Reaped,
+        });
+
+        assert_eq!(state, expected, "only the exact ineligible row is removed");
+        assert!(!state.dormant_sessions.contains_key("worker"));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::DormancyApplied {
+                id,
+                prior_owner,
+                tombstoned: false,
+            } if id == "worker" && prior_owner == &owner
+        )));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CleanupWorktree { .. }))
+        );
+    }
+
     #[test]
     fn resolve_session_id_automatic_suffixes_across_live_and_dormant_occupancy() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
@@ -9884,35 +9921,34 @@ mod tests {
 
     #[test]
     fn dormant_incomplete_identity_is_removed_without_a_tombstone() {
-        let mut state = DaemonState::new("d1".into(), "host1".into());
-        state.apply(Event::Register {
-            id: "worker".into(),
-            pane: Some("%1".into()),
-            metadata: SessionMeta {
-                project_dir: Some("/tmp/project".into()),
-                canonical_project_identity: Some("/tmp/project".into()),
-                backend: Some("codex-cli".into()),
-                ..Default::default()
-            },
+        assert_ineligible_dormancy_removes_without_tombstone(SessionMeta {
+            project_dir: Some("/tmp/project".into()),
+            canonical_project_identity: Some("/tmp/project".into()),
+            backend: Some("codex-cli".into()),
+            ..Default::default()
         });
-        let owner = state.sessions["worker"].owner();
+    }
 
-        let effects = state.apply(Event::DormantOwned {
-            owner,
-            expected_pane: Some("%1".into()),
-            observed_at: 30,
-            source: DormancySource::Reaped,
+    #[test]
+    fn dormant_unsafe_actual_project_is_removed_without_a_tombstone() {
+        assert_ineligible_dormancy_removes_without_tombstone(SessionMeta {
+            project_dir: Some("/".into()),
+            canonical_project_identity: Some("/tmp/repo".into()),
+            backend: Some("codex-cli".into()),
+            backend_session_id: Some("thread-1".into()),
+            ..Default::default()
         });
+    }
 
-        assert!(!state.sessions.contains_key("worker"));
-        assert!(!state.dormant_sessions.contains_key("worker"));
-        assert!(effects.iter().any(|effect| matches!(
-            effect,
-            Effect::DormancyApplied {
-                tombstoned: false,
-                ..
-            }
-        )));
+    #[test]
+    fn dormant_unsafe_canonical_project_is_removed_without_a_tombstone() {
+        assert_ineligible_dormancy_removes_without_tombstone(SessionMeta {
+            project_dir: Some("/tmp/repo/.ouija/worktrees/worker".into()),
+            canonical_project_identity: Some("/".into()),
+            backend: Some("codex-cli".into()),
+            backend_session_id: Some("thread-1".into()),
+            ..Default::default()
+        });
     }
 
     #[test]
@@ -10046,8 +10082,7 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn dormant_recovery_rejects_stale_owner_changed_project_and_resource_conflicts() {
+    fn dormant_recovery_state() -> (DaemonState, ResourceOwner) {
         let mut state = DaemonState::new("d1".into(), "host1".into());
         let prior_owner = register_identity(&mut state, "worker", "%1", "thread-1");
         state.apply(Event::DormantOwned {
@@ -10056,41 +10091,196 @@ mod tests {
             observed_at: 30,
             source: DormancySource::Reaped,
         });
-        register_identity(&mut state, "foreign", "%2", "thread-2");
+        (state, prior_owner)
+    }
+
+    fn recover_dormant_event(dormant_owner: &ResourceOwner) -> Event {
+        Event::RecoverDormantSession {
+            dormant_owner: dormant_owner.clone(),
+            pane: "%2".into(),
+            backend: "codex-cli".into(),
+            backend_session_id: "thread-1".into(),
+            project_dir: "/tmp/repo/.ouija/worktrees/worker".into(),
+            canonical_project_identity: "/tmp/repo".into(),
+        }
+    }
+
+    fn assert_dormant_recovery_rejected(mut state: DaemonState, event: Event, conflict: &str) {
         let before = state.clone();
 
+        let effects = state.apply(event);
+
+        assert_eq!(state, before, "{conflict} changed protocol state");
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                Effect::DormantRecovered { .. }
+                    | Effect::Persist
+                    | Effect::SetTmuxVar { .. }
+                    | Effect::SpawnAgent { .. }
+                    | Effect::Broadcast(_)
+                    | Effect::BroadcastSessionList
+            )),
+            "{conflict} emitted recovery success effects: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn dormant_recovery_rejects_stale_owner_changed_project_and_resource_conflicts() {
+        let (mut state, prior_owner) = dormant_recovery_state();
+        register_identity(&mut state, "foreign", "%2", "thread-2");
+
         let attempts = [
-            Event::RecoverDormantSession {
-                dormant_owner: ResourceOwner {
-                    session_id: "worker".into(),
-                    incarnation: SessionIncarnation(prior_owner.incarnation.0.saturating_add(1)),
+            (
+                "stale dormant owner",
+                Event::RecoverDormantSession {
+                    dormant_owner: ResourceOwner {
+                        session_id: "worker".into(),
+                        incarnation: SessionIncarnation(
+                            prior_owner.incarnation.0.saturating_add(1),
+                        ),
+                    },
+                    pane: "%3".into(),
+                    backend: "codex-cli".into(),
+                    backend_session_id: "thread-1".into(),
+                    project_dir: "/tmp/repo/.ouija/worktrees/worker".into(),
+                    canonical_project_identity: "/tmp/repo".into(),
                 },
-                pane: "%3".into(),
-                backend: "codex-cli".into(),
-                backend_session_id: "thread-1".into(),
-                project_dir: "/tmp/repo/.ouija/worktrees/worker".into(),
-                canonical_project_identity: "/tmp/repo".into(),
-            },
-            Event::RecoverDormantSession {
-                dormant_owner: prior_owner.clone(),
-                pane: "%3".into(),
-                backend: "codex-cli".into(),
-                backend_session_id: "thread-1".into(),
-                project_dir: "/tmp/other".into(),
-                canonical_project_identity: "/tmp/other".into(),
-            },
+            ),
+            (
+                "changed actual and canonical project",
+                Event::RecoverDormantSession {
+                    dormant_owner: prior_owner.clone(),
+                    pane: "%3".into(),
+                    backend: "codex-cli".into(),
+                    backend_session_id: "thread-1".into(),
+                    project_dir: "/tmp/other".into(),
+                    canonical_project_identity: "/tmp/other".into(),
+                },
+            ),
+            (
+                "foreign live pane",
+                Event::RecoverDormantSession {
+                    dormant_owner: prior_owner,
+                    pane: "%2".into(),
+                    backend: "codex-cli".into(),
+                    backend_session_id: "thread-1".into(),
+                    project_dir: "/tmp/repo/.ouija/worktrees/worker".into(),
+                    canonical_project_identity: "/tmp/repo".into(),
+                },
+            ),
+        ];
+        for (conflict, event) in attempts {
+            assert_dormant_recovery_rejected(state.clone(), event, conflict);
+        }
+    }
+
+    #[test]
+    fn dormant_recovery_rejects_a_different_worktree_in_the_same_repository() {
+        let (state, prior_owner) = dormant_recovery_state();
+
+        assert_dormant_recovery_rejected(
+            state,
             Event::RecoverDormantSession {
                 dormant_owner: prior_owner,
                 pane: "%2".into(),
                 backend: "codex-cli".into(),
                 backend_session_id: "thread-1".into(),
-                project_dir: "/tmp/repo/.ouija/worktrees/worker".into(),
+                project_dir: "/tmp/repo/.ouija/worktrees/other".into(),
                 canonical_project_identity: "/tmp/repo".into(),
             },
-        ];
-        for event in attempts {
-            assert!(state.apply(event).is_empty());
-            assert_eq!(state, before);
+            "different actual worktree",
+        );
+    }
+
+    #[test]
+    fn dormant_recovery_rejects_a_live_prior_id() {
+        let (mut state, prior_owner) = dormant_recovery_state();
+        register_identity(&mut state, "worker", "%9", "thread-9");
+        assert!(state.sessions.contains_key("worker"));
+        assert!(state.dormant_sessions.contains_key("worker"));
+        assert_dormant_recovery_rejected(
+            state,
+            recover_dormant_event(&prior_owner),
+            "prior public ID occupied live",
+        );
+    }
+
+    #[test]
+    fn dormant_recovery_rejects_a_foreign_live_backend_pair() {
+        let (mut state, prior_owner) = dormant_recovery_state();
+        register_identity(&mut state, "foreign", "%9", "thread-1");
+        assert_dormant_recovery_rejected(
+            state,
+            recover_dormant_event(&prior_owner),
+            "foreign live backend pair",
+        );
+    }
+
+    #[test]
+    fn dormant_recovery_rejects_a_foreign_dormant_backend_pair() {
+        let (mut state, prior_owner) = dormant_recovery_state();
+        let foreign_owner = register_identity(&mut state, "foreign", "%9", "thread-1");
+        state.apply(Event::DormantOwned {
+            owner: foreign_owner,
+            expected_pane: Some("%9".into()),
+            observed_at: 40,
+            source: DormancySource::Reaped,
+        });
+
+        assert_dormant_recovery_rejected(
+            state,
+            recover_dormant_event(&prior_owner),
+            "foreign dormant backend pair",
+        );
+    }
+
+    #[test]
+    fn dormant_recovery_rejects_each_lifecycle_lease_resource_conflict() {
+        for conflict in [
+            "public ID",
+            "pane",
+            "backend pair",
+            "actual project",
+            "canonical project",
+        ] {
+            let (mut state, prior_owner) = dormant_recovery_state();
+            let lease_id = if conflict == "public ID" {
+                "worker"
+            } else {
+                "reserved"
+            };
+            let lease_owner = match state.reserve_start(lease_id).expect("reserve lease") {
+                StartDisposition::Reserved(owner) => owner,
+                other => panic!("unexpected reservation: {other:?}"),
+            };
+            let lease = state
+                .lifecycle_leases
+                .get_mut(lease_id)
+                .expect("reserved lease");
+            match conflict {
+                "pane" => {
+                    lease.inert_pane = Some("%2".into());
+                    lease.inert_pane_owner = Some(lease_owner);
+                }
+                "backend pair" => {
+                    lease.backend = Some("codex-cli".into());
+                    lease.backend_session_id = Some("thread-1".into());
+                    lease.backend_session_owner = Some(lease_owner);
+                }
+                "actual project" => {
+                    lease.project_dir = Some("/tmp/repo/.ouija/worktrees/worker".into());
+                    lease.project_dir_owner = Some(lease_owner);
+                }
+                "canonical project" => {
+                    lease.project_dir = Some("/tmp/repo".into());
+                    lease.project_dir_owner = Some(lease_owner);
+                }
+                "public ID" => {}
+                _ => unreachable!(),
+            }
+
+            assert_dormant_recovery_rejected(state, recover_dormant_event(&prior_owner), conflict);
         }
     }
 
