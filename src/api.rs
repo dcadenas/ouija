@@ -4091,6 +4091,42 @@ async fn backend_session_ready_inner(
         .await
 }
 
+async fn record_opencode_ready_attestation(
+    state: &std::sync::Arc<crate::state::AppState>,
+    backend_sid: &str,
+    pane: &str,
+    cwd: &str,
+) -> crate::state::LocalBackendPaneAttestationRecordOutcome {
+    if cwd.is_empty() || cwd == "/" || !cwd.starts_with('/') {
+        return crate::state::LocalBackendPaneAttestationRecordOutcome::Rejected;
+    }
+    let Ok(hinted_project) = crate::project_identity::resolve_project_identity_async(cwd).await
+    else {
+        return crate::state::LocalBackendPaneAttestationRecordOutcome::Rejected;
+    };
+    let Some(backend_dir) = lookup_opencode_session_dir(state, backend_sid).await else {
+        return crate::state::LocalBackendPaneAttestationRecordOutcome::Rejected;
+    };
+    let Ok(backend_project) =
+        crate::project_identity::resolve_project_identity_async(&backend_dir).await
+    else {
+        return crate::state::LocalBackendPaneAttestationRecordOutcome::Rejected;
+    };
+    if backend_project != hinted_project {
+        return crate::state::LocalBackendPaneAttestationRecordOutcome::Rejected;
+    }
+    state
+        .record_local_backend_pane_attestation(
+            &crate::backend::BackendSessionIdentity {
+                backend: "opencode".into(),
+                session_id: backend_sid.to_string(),
+            },
+            pane,
+            &hinted_project,
+        )
+        .await
+}
+
 async fn backend_session_ready_inner_with_hints(
     state: &std::sync::Arc<crate::state::AppState>,
     backend_sid: String,
@@ -4124,6 +4160,7 @@ async fn backend_session_ready_inner_with_hints(
             "error": "backend readiness belongs to a replaced session incarnation",
         });
     }
+    let mut attestation_generation = None;
     let name = match resolution {
         crate::daemon_protocol::BackendIdentityResolution::Resolved { session_id } => {
             let n = session_id;
@@ -4150,6 +4187,33 @@ async fn backend_session_ready_inner_with_hints(
             });
         }
         crate::daemon_protocol::BackendIdentityResolution::NotFound => {
+            if let (Some(pane), Some(cwd)) = (hints.pane.as_deref(), hints.cwd.as_deref()) {
+                match record_opencode_ready_attestation(state, &backend_sid, pane, cwd).await {
+                    crate::state::LocalBackendPaneAttestationRecordOutcome::Recorded(
+                        attestation,
+                    ) => {
+                        attestation_generation = Some(attestation.generation);
+                    }
+                    crate::state::LocalBackendPaneAttestationRecordOutcome::Ambiguous {
+                        ..
+                    } => {
+                        return json!({
+                            "delivered": false,
+                            "outcome": "ambiguous_attestation",
+                            "error": "backend readiness is ambiguous across live panes",
+                        });
+                    }
+                    crate::state::LocalBackendPaneAttestationRecordOutcome::Rejected => {
+                        if state.settings.read().await.auto_register {
+                            return json!({
+                                "delivered": false,
+                                "outcome": "attestation_rejected",
+                                "error": "backend readiness pane attestation rejected",
+                            });
+                        }
+                    }
+                }
+            }
             // Step 2: adoption. Consumes one opencode-serve round-trip internally;
             // we redo it here in step 3 if adoption misses, since auto-provision
             // needs the dir too. The double call is intentionally kept to preserve
@@ -4262,6 +4326,19 @@ async fn backend_session_ready_inner_with_hints(
             "outcome": "superseded",
             "error": "backend readiness belongs to a replaced session incarnation",
         });
+    }
+    let identity = crate::backend::BackendSessionIdentity {
+        backend: "opencode".into(),
+        session_id: backend_sid.clone(),
+    };
+    if let Some(generation) = attestation_generation {
+        state
+            .consume_local_backend_pane_attestation(&identity, generation)
+            .await;
+    } else if let Some(attestation) = state.local_backend_pane_attestation(&identity).await {
+        state
+            .consume_local_backend_pane_attestation(&identity, attestation.generation())
+            .await;
     }
 
     let delivered = deliver_pending_prompt(state, &name).await;
@@ -9910,6 +9987,64 @@ mod tests {
     }
 
     // --- backend_session_ready_inner (end-to-end through the outer handler) ---
+
+    #[tokio::test]
+    async fn ready_records_attestation_when_auto_register_disabled() {
+        use axum::Router;
+        use axum::routing::get;
+        use tokio::net::TcpListener;
+
+        let project = tempfile::tempdir().unwrap();
+        let project_dir = project.path().canonicalize().unwrap();
+        let project_dir = project_dir.to_string_lossy().into_owned();
+        let response_project = project_dir.clone();
+        async fn session_dir(State(project): State<String>) -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "directory": project }))
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_port = listener.local_addr().unwrap().port();
+        assert!(serve_port >= 320, "test listener port must be >= 320");
+        let app = Router::new()
+            .route("/session/{session_id}", get(session_dir))
+            .with_state(response_project);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let data = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: serve_port - 320,
+            data_dir: data.path().to_path_buf(),
+            config_dir: data.path().to_path_buf(),
+        });
+        state.settings.write().await.auto_register = false;
+        *state.cached_assistant_panes.write().await = vec![pane_in(&project_dir, "%17")];
+        let identity = crate::backend::BackendSessionIdentity {
+            backend: "opencode".into(),
+            session_id: "ses_attested".into(),
+        };
+
+        let response = backend_session_ready_inner_with_hints(
+            &state,
+            identity.session_id.clone(),
+            BackendSessionReadyHints {
+                pane: Some("%17".into()),
+                cwd: Some(project_dir),
+                session_incarnation: None,
+            },
+        )
+        .await;
+
+        assert_eq!(response["delivered"], false);
+        assert!(state.protocol.read().await.sessions.is_empty());
+        assert!(matches!(
+            state.local_backend_pane_attestation(&identity).await,
+            Some(crate::state::LocalBackendPaneAttestationState::Unique(_))
+        ));
+        server.abort();
+    }
 
     #[tokio::test]
     async fn backend_session_ready_respects_auto_register_disabled() {

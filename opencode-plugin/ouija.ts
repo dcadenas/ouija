@@ -33,6 +33,10 @@ export const OuijaPlugin: Plugin = async (ctx) => {
   }
 
   return {
+    "shell.env": async (input, output) => {
+      output.env.OPENCODE_SESSION_ID = input.sessionID
+    },
+
     "experimental.chat.system.transform": async (input, output) => {
       // Resolve the ouija session id synchronously here, before composing the
       // system prompt. Otherwise we race the session.status event handler

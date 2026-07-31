@@ -475,13 +475,6 @@ async fn session_start_inner(
         };
     }
 
-    // Uncredentialed discovery remains subject to the operator's legacy
-    // auto-registration policy. A managed proof above is already sufficient
-    // authorization and must not be blocked by this discovery setting.
-    if !state.settings.read().await.auto_register {
-        return json!({ "skipped": "auto_register disabled", "output": "" });
-    }
-
     if body.pane.trim().is_empty() {
         return json!({
             "skipped": "paneless SessionStart requires backend identity, launch session id, and launch credential",
@@ -528,6 +521,7 @@ async fn session_start_inner(
         });
     }
 
+    let mut attestation_generation = None;
     if let Some(identity) = backend_identity.as_ref() {
         let Ok(project) = crate::project_identity::resolve_project_identity_async(&body.cwd).await
         else {
@@ -601,6 +595,37 @@ async fn session_start_inner(
                 });
             }
         }
+        if matches!(identity.backend.as_str(), "codex-cli" | "claude-code")
+            && state.find_session_by_pane(&body.pane).await.is_none()
+        {
+            match state
+                .record_local_backend_pane_attestation(identity, &body.pane, &project)
+                .await
+            {
+                crate::state::LocalBackendPaneAttestationRecordOutcome::Recorded(attestation) => {
+                    attestation_generation = Some(attestation.generation);
+                }
+                crate::state::LocalBackendPaneAttestationRecordOutcome::Ambiguous { .. } => {
+                    return json!({
+                        "skipped": "session-start backend identity is ambiguous across live panes",
+                        "output": "",
+                    });
+                }
+                crate::state::LocalBackendPaneAttestationRecordOutcome::Rejected => {
+                    return json!({
+                        "skipped": "session-start backend pane attestation rejected",
+                        "output": "",
+                    });
+                }
+            }
+        }
+    }
+
+    // Uncredentialed discovery remains subject to the operator's legacy
+    // auto-registration policy. Trusted explicit-pane callbacks above retain
+    // their transient attestation even when discovery is disabled.
+    if !state.settings.read().await.auto_register {
+        return json!({ "skipped": "auto_register disabled", "output": "" });
     }
 
     // Skip if pane already registered (Ouija-launched / API-started sessions hit
@@ -777,6 +802,12 @@ async fn session_start_inner(
             "output": "",
         });
     };
+    if let (Some(identity), Some(generation)) = (backend_identity.as_ref(), attestation_generation)
+    {
+        state
+            .consume_local_backend_pane_attestation(identity, generation)
+            .await;
+    }
 
     json!({
         "registered": id,
@@ -3088,6 +3119,77 @@ mod tests {
             "home-cwd must be refused, got {result:?}"
         );
         assert!(state.find_session_by_pane("%51").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn local_backend_pane_attestation_session_start_survives_auto_register_disabled() {
+        let project = tempfile::tempdir().unwrap();
+        let project_dir = project.path().canonicalize().unwrap();
+        let project_dir = project_dir.to_string_lossy().into_owned();
+        let identity = crate::backend::BackendSessionIdentity {
+            backend: "codex-cli".into(),
+            session_id: "thread-attested-disabled".into(),
+        };
+        let state = crate::state::AppState::new_for_test();
+        state.settings.write().await.auto_register = false;
+        *state.cached_assistant_panes.write().await =
+            vec![assistant_pane_with_process("%53", &project_dir, "codex")];
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: "%53".into(),
+                cwd: project_dir,
+                backend_session_id: Some(identity.session_id.clone()),
+                backend_identity: Some(identity.clone()),
+                adapter: Some(identity.backend.clone()),
+                launch_session_id: None,
+                launch_credential: None,
+                session_incarnation: None,
+            },
+        )
+        .await;
+
+        assert_eq!(result["skipped"], "auto_register disabled");
+        assert!(state.protocol.read().await.sessions.is_empty());
+        assert!(matches!(
+            state.local_backend_pane_attestation(&identity).await,
+            Some(crate::state::LocalBackendPaneAttestationState::Unique(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_backend_pane_attestation_session_start_survives_home_guard() {
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        let identity = crate::backend::BackendSessionIdentity {
+            backend: "codex-cli".into(),
+            session_id: "thread-attested-home".into(),
+        };
+        let state = crate::state::AppState::new_for_test();
+        *state.cached_assistant_panes.write().await =
+            vec![assistant_pane_with_process("%54", &home, "codex")];
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: "%54".into(),
+                cwd: home,
+                backend_session_id: Some(identity.session_id.clone()),
+                backend_identity: Some(identity.clone()),
+                adapter: Some(identity.backend.clone()),
+                launch_session_id: None,
+                launch_credential: None,
+                session_incarnation: None,
+            },
+        )
+        .await;
+
+        assert_eq!(result["skipped"], "home cwd (premature session-start)");
+        assert!(state.protocol.read().await.sessions.is_empty());
+        assert!(matches!(
+            state.local_backend_pane_attestation(&identity).await,
+            Some(crate::state::LocalBackendPaneAttestationState::Unique(_))
+        ));
     }
 
     #[tokio::test]

@@ -83,6 +83,12 @@ impl CodingAssistant for OpenCode {
         None
     }
 
+    fn caller_session_id(&self) -> Option<String> {
+        std::env::var("OPENCODE_SESSION_ID")
+            .ok()
+            .filter(|session_id| !session_id.is_empty())
+    }
+
     fn tui_ready_pattern(&self) -> Option<&str> {
         None
     }
@@ -167,6 +173,46 @@ impl CodingAssistant for OpenCode {
 mod tests {
     use super::*;
     use crate::backend::{ResumeOpts, StartOpts};
+    use std::sync::{Mutex, MutexGuard};
+
+    static CALLER_SESSION_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct ScopedEnvVar {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(name: &'static str, value: Option<&str>) -> Self {
+            let lock = CALLER_SESSION_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let previous = std::env::var_os(name);
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+            Self {
+                name,
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(value) => std::env::set_var(self.name, value),
+                    None => std::env::remove_var(self.name),
+                }
+            }
+        }
+    }
 
     fn backend() -> OpenCode {
         OpenCode
@@ -205,6 +251,56 @@ mod tests {
     fn detect_session_id_always_none() {
         assert_eq!(backend().detect_session_id("/home/user/myproject"), None);
         assert_eq!(backend().detect_session_id("/some/other/path"), None);
+    }
+
+    #[test]
+    fn caller_session_reads_only_nonempty_opencode_session_id() {
+        let _missing = ScopedEnvVar::set("OPENCODE_SESSION_ID", None);
+        assert_eq!(backend().caller_session_id(), None);
+        drop(_missing);
+
+        let _empty = ScopedEnvVar::set("OPENCODE_SESSION_ID", Some(""));
+        assert_eq!(backend().caller_session_id(), None);
+        drop(_empty);
+
+        let _present = ScopedEnvVar::set("OPENCODE_SESSION_ID", Some("ses_exact"));
+        assert_eq!(backend().caller_session_id().as_deref(), Some("ses_exact"));
+    }
+
+    #[test]
+    fn caller_session_plugin_exports_exact_shell_identity() {
+        assert!(
+            embedded::PLUGIN_TS.contains("\"shell.env\": async (input, output) =>"),
+            "OpenCode plugin must define the documented shell.env hook"
+        );
+        assert!(
+            embedded::PLUGIN_TS.contains("output.env.OPENCODE_SESSION_ID = input.sessionID"),
+            "tool shells must receive only their exact OpenCode session identity"
+        );
+    }
+
+    #[test]
+    fn caller_session_registry_rejects_two_positive_backend_signals() {
+        let _opencode = ScopedEnvVar::set("OPENCODE_SESSION_ID", Some("ses_opencode"));
+        // The environment helper intentionally serializes only this module's
+        // mutations. Set the second signal within the same scope so the
+        // registry observes both identities atomically from this test.
+        let previous_codex = std::env::var_os("CODEX_THREAD_ID");
+        unsafe {
+            std::env::set_var("CODEX_THREAD_ID", "thread_codex");
+        }
+        let identity =
+            crate::backend::BackendRegistry::default_registry().caller_session_identity();
+        unsafe {
+            match previous_codex {
+                Some(value) => std::env::set_var("CODEX_THREAD_ID", value),
+                None => std::env::remove_var("CODEX_THREAD_ID"),
+            }
+        }
+        assert_eq!(
+            identity, None,
+            "ambiguous adapter evidence must fail closed"
+        );
     }
 
     #[test]

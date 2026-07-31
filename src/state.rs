@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -21,6 +21,52 @@ pub struct LocalClaimEvidence {
     pub pane_var_id: Option<String>,
     pub env_id: Option<String>,
     pub backend_identity: crate::backend::BackendSessionIdentity,
+}
+
+type BackendIdentityKey = (String, String);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocalBackendPaneAttestation {
+    pub identity: crate::backend::BackendSessionIdentity,
+    pub pane: String,
+    pub project: crate::project_identity::ProjectIdentity,
+    pub pane_var_id: Option<String>,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LocalBackendPaneAttestationState {
+    Unique(LocalBackendPaneAttestation),
+    Ambiguous {
+        panes: BTreeSet<String>,
+        generation: u64,
+    },
+}
+
+impl LocalBackendPaneAttestationState {
+    pub(crate) fn generation(&self) -> u64 {
+        match self {
+            Self::Unique(attestation) => attestation.generation,
+            Self::Ambiguous { generation, .. } => *generation,
+        }
+    }
+
+    fn panes(&self) -> BTreeSet<String> {
+        match self {
+            Self::Unique(attestation) => [attestation.pane.clone()].into(),
+            Self::Ambiguous { panes, .. } => panes.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LocalBackendPaneAttestationRecordOutcome {
+    Recorded(LocalBackendPaneAttestation),
+    Ambiguous {
+        panes: BTreeSet<String>,
+        generation: u64,
+    },
+    Rejected,
 }
 
 #[derive(Clone)]
@@ -778,6 +824,12 @@ pub struct AppState {
     backend_recovery_test_inspection: std::sync::Mutex<Option<crate::tmux::ManagedPaneInspection>>,
     #[cfg(test)]
     dormant_recovery_test_inspection: std::sync::Mutex<Option<crate::tmux::ManagedPaneInspection>>,
+    #[cfg(test)]
+    local_backend_pane_attestation_test_pane_vars:
+        std::sync::Mutex<HashMap<String, Option<String>>>,
+    #[cfg(test)]
+    local_backend_pane_attestation_test_inspections:
+        std::sync::Mutex<HashMap<String, crate::tmux::ManagedPaneInspection>>,
     /// Per-resource async gates serialize external pane/backend claims and cleanup
     /// without holding the protocol lock across tmux, process, or HTTP I/O.
     resource_gates:
@@ -788,6 +840,11 @@ pub struct AppState {
     pending_commands: std::sync::Mutex<Vec<(String, tokio::sync::oneshot::Sender<String>)>>,
     /// Cached tmux panes running the coding assistant, refreshed by the reaper loop.
     pub(crate) cached_assistant_panes: RwLock<Vec<crate::tmux::TmuxPane>>,
+    /// Transient, daemon-local corroboration established only by trusted
+    /// adapter callbacks carrying one complete typed backend identity.
+    local_backend_pane_attestations:
+        RwLock<BTreeMap<BackendIdentityKey, LocalBackendPaneAttestationState>>,
+    local_backend_pane_attestation_generation: std::sync::atomic::AtomicU64,
     /// Short-lived suppression after explicit removal. This replaces an
     /// indefinite `@ouija_id` marker as the protection against the scanner
     /// re-registering a pane before kill-session finishes.
@@ -1290,10 +1347,14 @@ impl AppState {
             reclaim_test_inspection: std::sync::Mutex::new(None),
             backend_recovery_test_inspection: std::sync::Mutex::new(None),
             dormant_recovery_test_inspection: std::sync::Mutex::new(None),
+            local_backend_pane_attestation_test_pane_vars: std::sync::Mutex::new(HashMap::new()),
+            local_backend_pane_attestation_test_inspections: std::sync::Mutex::new(HashMap::new()),
             resource_gates: std::sync::Mutex::new(HashMap::new()),
             project_index: RwLock::new(HashMap::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
             cached_assistant_panes: RwLock::new(Vec::new()),
+            local_backend_pane_attestations: RwLock::new(BTreeMap::new()),
+            local_backend_pane_attestation_generation: std::sync::atomic::AtomicU64::new(0),
             autoregister_suppressed_panes: std::sync::Mutex::new(HashMap::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
             sweep_in_progress: std::sync::atomic::AtomicBool::new(false),
@@ -1348,10 +1409,16 @@ impl AppState {
             backend_recovery_test_inspection: std::sync::Mutex::new(None),
             #[cfg(test)]
             dormant_recovery_test_inspection: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            local_backend_pane_attestation_test_pane_vars: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            local_backend_pane_attestation_test_inspections: std::sync::Mutex::new(HashMap::new()),
             resource_gates: std::sync::Mutex::new(HashMap::new()),
             project_index: RwLock::new(HashMap::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
             cached_assistant_panes: RwLock::new(Vec::new()),
+            local_backend_pane_attestations: RwLock::new(BTreeMap::new()),
+            local_backend_pane_attestation_generation: std::sync::atomic::AtomicU64::new(0),
             autoregister_suppressed_panes: std::sync::Mutex::new(HashMap::new()),
             perfire_worktree_panes: RwLock::new(HashMap::new()),
             sweep_in_progress: std::sync::atomic::AtomicBool::new(false),
@@ -1402,6 +1469,30 @@ impl AppState {
             .dormant_recovery_test_inspection
             .lock()
             .expect("dormant recovery test inspection mutex poisoned") = Some(inspection);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_local_backend_pane_attestation_test_pane_var(
+        &self,
+        pane: &str,
+        value: Option<String>,
+    ) {
+        self.local_backend_pane_attestation_test_pane_vars
+            .lock()
+            .expect("attestation pane-var test mutex poisoned")
+            .insert(pane.to_string(), value);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_local_backend_pane_attestation_test_inspection(
+        &self,
+        pane: &str,
+        inspection: crate::tmux::ManagedPaneInspection,
+    ) {
+        self.local_backend_pane_attestation_test_inspections
+            .lock()
+            .expect("attestation inspection test mutex poisoned")
+            .insert(pane.to_string(), inspection);
     }
 
     #[cfg(test)]
@@ -2279,6 +2370,401 @@ impl AppState {
             .values()
             .find(|s| s.pane.as_deref() == Some(pane))
             .map(|s| s.id.clone())
+    }
+
+    fn local_backend_identity_key(
+        identity: &crate::backend::BackendSessionIdentity,
+    ) -> BackendIdentityKey {
+        (identity.backend.clone(), identity.session_id.clone())
+    }
+
+    fn next_local_backend_pane_attestation_generation(&self) -> Option<u64> {
+        self.local_backend_pane_attestation_generation
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |current| current.checked_add(1),
+            )
+            .ok()
+            .and_then(|previous| previous.checked_add(1))
+    }
+
+    async fn local_backend_pane_attestation_resource_guards(
+        &self,
+        identity: &crate::backend::BackendSessionIdentity,
+        pane: &str,
+        project: &crate::project_identity::ProjectIdentity,
+        prior: Option<&LocalBackendPaneAttestationState>,
+    ) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+        let mut keys = vec![
+            ResourceGateKey::Pane(pane.to_string()),
+            ResourceGateKey::BackendSession(identity.session_id.clone()),
+            ResourceGateKey::ProjectDir(project_dir_identity(&project.project_dir)),
+            ResourceGateKey::ProjectDir(project_dir_identity(&project.canonical_repository)),
+        ];
+        if let Some(prior) = prior {
+            keys.extend(prior.panes().into_iter().map(ResourceGateKey::Pane));
+            if let LocalBackendPaneAttestationState::Unique(attestation) = prior {
+                keys.push(ResourceGateKey::ProjectDir(project_dir_identity(
+                    &attestation.project.project_dir,
+                )));
+                keys.push(ResourceGateKey::ProjectDir(project_dir_identity(
+                    &attestation.project.canonical_repository,
+                )));
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        let mut guards = Vec::with_capacity(keys.len());
+        for key in keys {
+            guards.push(self.resource_gate(key).lock_owned().await);
+        }
+        guards
+    }
+
+    async fn local_backend_pane_attestation_pane_var(&self, pane: &str) -> Option<String> {
+        #[cfg(test)]
+        {
+            return self
+                .local_backend_pane_attestation_test_pane_vars
+                .lock()
+                .expect("attestation pane-var test mutex poisoned")
+                .get(pane)
+                .cloned()
+                .flatten();
+        }
+        #[cfg(not(test))]
+        {
+            let pane = pane.to_string();
+            tokio::task::spawn_blocking(move || crate::tmux_var::get(&pane))
+                .await
+                .ok()
+                .flatten()
+        }
+    }
+
+    async fn local_backend_pane_attestation_inspection(
+        &self,
+        pane: &str,
+    ) -> anyhow::Result<crate::tmux::ManagedPaneInspection> {
+        #[cfg(test)]
+        {
+            return Ok(self
+                .local_backend_pane_attestation_test_inspections
+                .lock()
+                .expect("attestation inspection test mutex poisoned")
+                .get(pane)
+                .cloned()
+                .unwrap_or(crate::tmux::ManagedPaneInspection::Unmanaged));
+        }
+        #[cfg(not(test))]
+        {
+            let pane = pane.to_string();
+            tokio::task::spawn_blocking(move || crate::tmux::inspect_managed_pane(&pane))
+                .await
+                .map_err(anyhow::Error::from)?
+        }
+    }
+
+    async fn local_backend_pane_has_matching_process(
+        &self,
+        identity: &crate::backend::BackendSessionIdentity,
+        pane: &str,
+    ) -> bool {
+        let panes = self.list_assistant_panes().await;
+        let Some(candidate) = panes.iter().find(|candidate| candidate.pane_id == pane) else {
+            return false;
+        };
+        let Some(process_name) = candidate.process_name.as_deref() else {
+            return false;
+        };
+        self.backends.get(&identity.backend).is_some_and(|backend| {
+            crate::tmux::matching_process_name(process_name, backend.process_names()).is_some()
+        })
+    }
+
+    fn local_backend_pane_attestation_protocol_allows(
+        protocol: &crate::daemon_protocol::DaemonState,
+        identity: &crate::backend::BackendSessionIdentity,
+        pane: &str,
+        project: &crate::project_identity::ProjectIdentity,
+        pane_var_id: Option<&str>,
+        inspection: &crate::tmux::ManagedPaneInspection,
+    ) -> bool {
+        let pair_matches = |metadata: &crate::daemon_protocol::SessionMeta| {
+            metadata.backend.as_deref() == Some(identity.backend.as_str())
+                && metadata.backend_session_id.as_deref() == Some(identity.session_id.as_str())
+        };
+        if protocol.sessions.values().any(|session| {
+            session.pane.as_deref() == Some(pane)
+                || (matches!(session.origin, crate::daemon_protocol::Origin::Local)
+                    && pair_matches(&session.metadata))
+        }) {
+            return false;
+        }
+
+        let mut dormant_matches = protocol
+            .dormant_sessions
+            .values()
+            .filter(|dormant| pair_matches(&dormant.metadata));
+        let exact_dormant = dormant_matches.next();
+        if dormant_matches.next().is_some() {
+            return false;
+        }
+        if exact_dormant.is_some_and(|dormant| {
+            dormant.metadata.project_dir.as_deref() != Some(project.project_dir.as_str())
+                || dormant.canonical_project_identity != project.canonical_repository
+        }) {
+            return false;
+        }
+
+        let actual_project = project_dir_identity(&project.project_dir);
+        let canonical_project = project_dir_identity(&project.canonical_repository);
+        if protocol.lifecycle_leases.values().any(|lease| {
+            lease.inert_pane.as_deref() == Some(pane)
+                || (lease.backend.as_deref() == Some(identity.backend.as_str())
+                    && lease.backend_session_id.as_deref() == Some(identity.session_id.as_str()))
+                || lease.project_dir.as_deref().is_some_and(|project_dir| {
+                    let identity = project_dir_identity(project_dir);
+                    identity == actual_project || identity == canonical_project
+                })
+        }) {
+            return false;
+        }
+
+        if pane_var_id
+            .is_some_and(|marker| exact_dormant.is_none_or(|dormant| marker != dormant.id))
+        {
+            return false;
+        }
+
+        match inspection {
+            crate::tmux::ManagedPaneInspection::Unmanaged => true,
+            crate::tmux::ManagedPaneInspection::ProcessOwner(owner)
+            | crate::tmux::ManagedPaneInspection::MarkerOwner(owner) => {
+                exact_dormant.is_some_and(|dormant| dormant.prior_owner == *owner)
+            }
+            crate::tmux::ManagedPaneInspection::Missing => false,
+        }
+    }
+
+    async fn observe_local_backend_pane_attestation(
+        &self,
+        identity: &crate::backend::BackendSessionIdentity,
+        pane: &str,
+        project: &crate::project_identity::ProjectIdentity,
+    ) -> Option<(crate::project_identity::ProjectIdentity, Option<String>)> {
+        if identity.backend.trim().is_empty()
+            || identity.session_id.trim().is_empty()
+            || !self
+                .local_backend_pane_has_matching_process(identity, pane)
+                .await
+        {
+            return None;
+        }
+        let panes = self.list_assistant_panes().await;
+        let live_path = panes
+            .iter()
+            .find(|candidate| candidate.pane_id == pane)?
+            .pane_current_path
+            .as_deref()?;
+        let observed_project = crate::project_identity::resolve_project_identity_async(live_path)
+            .await
+            .ok()?;
+        if observed_project != *project {
+            return None;
+        }
+        let pane_var_id = self.local_backend_pane_attestation_pane_var(pane).await;
+        let inspection = self
+            .local_backend_pane_attestation_inspection(pane)
+            .await
+            .ok()?;
+        let protocol = self.protocol.read().await;
+        Self::local_backend_pane_attestation_protocol_allows(
+            &protocol,
+            identity,
+            pane,
+            &observed_project,
+            pane_var_id.as_deref(),
+            &inspection,
+        )
+        .then_some((observed_project, pane_var_id))
+    }
+
+    /// Record one trusted explicit-pane adapter callback as transient Local
+    /// corroboration. The callback creates no public ID or durable authority.
+    pub(crate) async fn record_local_backend_pane_attestation(
+        self: &Arc<Self>,
+        identity: &crate::backend::BackendSessionIdentity,
+        pane: &str,
+        project: &crate::project_identity::ProjectIdentity,
+    ) -> LocalBackendPaneAttestationRecordOutcome {
+        let key = Self::local_backend_identity_key(identity);
+        loop {
+            let prior = self
+                .local_backend_pane_attestations
+                .read()
+                .await
+                .get(&key)
+                .cloned();
+            let _guards = self
+                .local_backend_pane_attestation_resource_guards(
+                    identity,
+                    pane,
+                    project,
+                    prior.as_ref(),
+                )
+                .await;
+            let Some((observed_project, pane_var_id)) = self
+                .observe_local_backend_pane_attestation(identity, pane, project)
+                .await
+            else {
+                let mut attestations = self.local_backend_pane_attestations.write().await;
+                if attestations.get(&key) == prior.as_ref() {
+                    attestations.remove(&key);
+                    return LocalBackendPaneAttestationRecordOutcome::Rejected;
+                }
+                continue;
+            };
+
+            let mut competing_panes = BTreeSet::new();
+            if let Some(prior) = prior.as_ref() {
+                match prior {
+                    LocalBackendPaneAttestationState::Unique(attestation)
+                        if attestation.pane != pane =>
+                    {
+                        if self
+                            .observe_local_backend_pane_attestation(
+                                &attestation.identity,
+                                &attestation.pane,
+                                &attestation.project,
+                            )
+                            .await
+                            .is_some()
+                        {
+                            competing_panes.insert(attestation.pane.clone());
+                        }
+                    }
+                    LocalBackendPaneAttestationState::Ambiguous { panes, .. } => {
+                        for candidate in panes {
+                            if candidate != pane
+                                && self
+                                    .observe_local_backend_pane_attestation(
+                                        identity, candidate, project,
+                                    )
+                                    .await
+                                    .is_some()
+                            {
+                                competing_panes.insert(candidate.clone());
+                            }
+                        }
+                    }
+                    LocalBackendPaneAttestationState::Unique(_) => {}
+                }
+            }
+            competing_panes.insert(pane.to_string());
+            let Some(generation) = self.next_local_backend_pane_attestation_generation() else {
+                return LocalBackendPaneAttestationRecordOutcome::Rejected;
+            };
+            let (next, outcome) = if competing_panes.len() > 1 {
+                (
+                    LocalBackendPaneAttestationState::Ambiguous {
+                        panes: competing_panes.clone(),
+                        generation,
+                    },
+                    LocalBackendPaneAttestationRecordOutcome::Ambiguous {
+                        panes: competing_panes,
+                        generation,
+                    },
+                )
+            } else {
+                let attestation = LocalBackendPaneAttestation {
+                    identity: identity.clone(),
+                    pane: pane.to_string(),
+                    project: observed_project,
+                    pane_var_id,
+                    generation,
+                };
+                (
+                    LocalBackendPaneAttestationState::Unique(attestation.clone()),
+                    LocalBackendPaneAttestationRecordOutcome::Recorded(attestation),
+                )
+            };
+            let mut attestations = self.local_backend_pane_attestations.write().await;
+            if attestations.get(&key) != prior.as_ref() {
+                continue;
+            }
+            attestations.insert(key, next);
+            return outcome;
+        }
+    }
+
+    /// Revalidate and return the current transient corroboration. Invalid
+    /// physical observations are removed rather than retained as authority.
+    pub(crate) async fn local_backend_pane_attestation(
+        self: &Arc<Self>,
+        identity: &crate::backend::BackendSessionIdentity,
+    ) -> Option<LocalBackendPaneAttestationState> {
+        let key = Self::local_backend_identity_key(identity);
+        loop {
+            let current = self
+                .local_backend_pane_attestations
+                .read()
+                .await
+                .get(&key)
+                .cloned()?;
+            let valid = match &current {
+                LocalBackendPaneAttestationState::Unique(attestation) => self
+                    .observe_local_backend_pane_attestation(
+                        &attestation.identity,
+                        &attestation.pane,
+                        &attestation.project,
+                    )
+                    .await
+                    .is_some_and(|(project, pane_var_id)| {
+                        project == attestation.project && pane_var_id == attestation.pane_var_id
+                    }),
+                LocalBackendPaneAttestationState::Ambiguous { panes, .. } => {
+                    let mut live = BTreeSet::new();
+                    for pane in panes {
+                        if self
+                            .local_backend_pane_has_matching_process(identity, pane)
+                            .await
+                        {
+                            live.insert(pane.clone());
+                        }
+                    }
+                    live.len() == panes.len() && !live.is_empty()
+                }
+            };
+            let mut attestations = self.local_backend_pane_attestations.write().await;
+            if attestations.get(&key) != Some(&current) {
+                continue;
+            }
+            if valid {
+                return Some(current);
+            }
+            attestations.remove(&key);
+            return None;
+        }
+    }
+
+    pub(crate) async fn consume_local_backend_pane_attestation(
+        &self,
+        identity: &crate::backend::BackendSessionIdentity,
+        generation: u64,
+    ) -> bool {
+        let key = Self::local_backend_identity_key(identity);
+        let mut attestations = self.local_backend_pane_attestations.write().await;
+        if attestations
+            .get(&key)
+            .is_some_and(|current| current.generation() == generation)
+        {
+            attestations.remove(&key);
+            true
+        } else {
+            false
+        }
     }
 
     /// Atomically park or forget one exact Local owner after a trusted
@@ -7294,6 +7780,288 @@ pub(crate) mod tests {
             active_context_accumulated_secs: 90,
             ..Default::default()
         }
+    }
+
+    fn local_backend_pane_attestation_identity() -> crate::backend::BackendSessionIdentity {
+        crate::backend::BackendSessionIdentity {
+            backend: "codex-cli".into(),
+            session_id: "thread-attested".into(),
+        }
+    }
+
+    async fn local_backend_pane_attestation_fixture() -> (
+        Arc<AppState>,
+        tempfile::TempDir,
+        crate::project_identity::ProjectIdentity,
+    ) {
+        let project = tempfile::tempdir().unwrap();
+        let project_dir = project.path().canonicalize().unwrap();
+        let project_dir = project_dir.to_string_lossy().into_owned();
+        let project_identity =
+            crate::project_identity::resolve_project_identity_async(&project_dir)
+                .await
+                .unwrap();
+        let state = AppState::new_for_test();
+        *state.cached_assistant_panes.write().await = vec![crate::tmux::TmuxPane {
+            pane_id: "%1".into(),
+            session_name: "attestation".into(),
+            pane_current_path: Some(project_identity.project_dir.clone()),
+            process_name: Some("codex".into()),
+        }];
+        (state, project, project_identity)
+    }
+
+    #[tokio::test]
+    async fn local_backend_pane_attestation_records_revalidates_consumes_and_is_transient() {
+        let (state, _project, project_identity) = local_backend_pane_attestation_fixture().await;
+        let identity = local_backend_pane_attestation_identity();
+
+        let outcome = state
+            .record_local_backend_pane_attestation(&identity, "%1", &project_identity)
+            .await;
+        let LocalBackendPaneAttestationRecordOutcome::Recorded(recorded) = outcome else {
+            panic!("expected recorded attestation, got {outcome:?}");
+        };
+        assert_eq!(recorded.identity, identity);
+        assert_eq!(recorded.pane, "%1");
+        assert_eq!(recorded.project, project_identity);
+        assert_eq!(recorded.pane_var_id, None);
+        assert!(recorded.generation > 0);
+        assert_eq!(
+            state.local_backend_pane_attestation(&identity).await,
+            Some(LocalBackendPaneAttestationState::Unique(recorded.clone()))
+        );
+        assert!(
+            state
+                .consume_local_backend_pane_attestation(&identity, recorded.generation)
+                .await
+        );
+        assert_eq!(state.local_backend_pane_attestation(&identity).await, None);
+
+        let restarted = AppState::new_for_test();
+        assert_eq!(
+            restarted.local_backend_pane_attestation(&identity).await,
+            None,
+            "attestations must not survive daemon reconstruction"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_backend_pane_attestation_newer_observation_replaces_or_marks_ambiguity() {
+        let (state, _project, project_identity) = local_backend_pane_attestation_fixture().await;
+        let identity = local_backend_pane_attestation_identity();
+        let first = match state
+            .record_local_backend_pane_attestation(&identity, "%1", &project_identity)
+            .await
+        {
+            LocalBackendPaneAttestationRecordOutcome::Recorded(attestation) => attestation,
+            outcome => panic!("expected first recording, got {outcome:?}"),
+        };
+        state
+            .cached_assistant_panes
+            .write()
+            .await
+            .push(crate::tmux::TmuxPane {
+                pane_id: "%2".into(),
+                session_name: "attestation".into(),
+                pane_current_path: Some(project_identity.project_dir.clone()),
+                process_name: Some("codex".into()),
+            });
+
+        let ambiguous = state
+            .record_local_backend_pane_attestation(&identity, "%2", &project_identity)
+            .await;
+        let LocalBackendPaneAttestationRecordOutcome::Ambiguous { panes, generation } = ambiguous
+        else {
+            panic!("expected ambiguity, got {ambiguous:?}");
+        };
+        assert_eq!(panes, ["%1".to_string(), "%2".to_string()].into());
+        assert!(generation > first.generation);
+
+        state
+            .cached_assistant_panes
+            .write()
+            .await
+            .retain(|pane| pane.pane_id == "%2");
+        let replacement = match state
+            .record_local_backend_pane_attestation(&identity, "%2", &project_identity)
+            .await
+        {
+            LocalBackendPaneAttestationRecordOutcome::Recorded(attestation) => attestation,
+            outcome => panic!("expected surviving observation, got {outcome:?}"),
+        };
+        assert!(replacement.generation > generation);
+        assert_eq!(replacement.pane, "%2");
+    }
+
+    #[tokio::test]
+    async fn local_backend_pane_attestation_rejects_foreign_resources_and_invalidates_stale_data() {
+        for conflict in [
+            "non-assistant-pane",
+            "backend-mismatch",
+            "foreign-pane-var",
+            "foreign-owner-marker",
+            "live-pane-owner",
+            "lifecycle-pane",
+            "lifecycle-pair",
+            "lifecycle-project",
+        ] {
+            let (state, _project, project_identity) =
+                local_backend_pane_attestation_fixture().await;
+            let identity = local_backend_pane_attestation_identity();
+            match conflict {
+                "non-assistant-pane" => state.cached_assistant_panes.write().await.clear(),
+                "backend-mismatch" => {
+                    state.cached_assistant_panes.write().await[0].process_name =
+                        Some("claude".into());
+                }
+                "foreign-pane-var" => state
+                    .set_local_backend_pane_attestation_test_pane_var("%1", Some("foreign".into())),
+                "foreign-owner-marker" => state.set_local_backend_pane_attestation_test_inspection(
+                    "%1",
+                    crate::tmux::ManagedPaneInspection::MarkerOwner(
+                        crate::daemon_protocol::ResourceOwner {
+                            session_id: "foreign".into(),
+                            incarnation: crate::daemon_protocol::SessionIncarnation(99),
+                        },
+                    ),
+                ),
+                "live-pane-owner" => {
+                    state
+                        .apply_and_execute(crate::daemon_protocol::Event::Register {
+                            id: "foreign".into(),
+                            pane: Some("%1".into()),
+                            metadata: crate::daemon_protocol::SessionMeta {
+                                project_dir: Some(project_identity.project_dir.clone()),
+                                canonical_project_identity: Some(
+                                    project_identity.canonical_repository.clone(),
+                                ),
+                                backend: Some("claude-code".into()),
+                                backend_session_id: Some("foreign-thread".into()),
+                                ..Default::default()
+                            },
+                        })
+                        .await;
+                }
+                "lifecycle-pane" | "lifecycle-pair" | "lifecycle-project" => {
+                    let owner = match state
+                        .protocol
+                        .write()
+                        .await
+                        .reserve_start("foreign")
+                        .unwrap()
+                    {
+                        crate::daemon_protocol::StartDisposition::Reserved(owner) => owner,
+                        outcome => panic!("unexpected reservation: {outcome:?}"),
+                    };
+                    let mut protocol = state.protocol.write().await;
+                    let lease = protocol.lifecycle_leases.get_mut("foreign").unwrap();
+                    match conflict {
+                        "lifecycle-pane" => {
+                            lease.inert_pane = Some("%1".into());
+                            lease.inert_pane_owner = Some(owner);
+                        }
+                        "lifecycle-pair" => {
+                            lease.backend = Some(identity.backend.clone());
+                            lease.backend_session_id = Some(identity.session_id.clone());
+                            lease.backend_session_owner = Some(owner);
+                        }
+                        "lifecycle-project" => {
+                            lease.project_dir = Some(project_identity.project_dir.clone());
+                            lease.project_dir_owner = Some(owner);
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                _ => unreachable!(),
+            }
+
+            let before = state.protocol.read().await.clone();
+            assert_eq!(
+                state
+                    .record_local_backend_pane_attestation(&identity, "%1", &project_identity)
+                    .await,
+                LocalBackendPaneAttestationRecordOutcome::Rejected,
+                "conflict {conflict}"
+            );
+            assert_eq!(*state.protocol.read().await, before, "conflict {conflict}");
+            assert_eq!(
+                state.local_backend_pane_attestation(&identity).await,
+                None,
+                "conflict {conflict}"
+            );
+        }
+
+        for stale in ["pane", "backend", "project", "marker"] {
+            let (state, _project, project_identity) =
+                local_backend_pane_attestation_fixture().await;
+            let identity = local_backend_pane_attestation_identity();
+            assert!(matches!(
+                state
+                    .record_local_backend_pane_attestation(&identity, "%1", &project_identity)
+                    .await,
+                LocalBackendPaneAttestationRecordOutcome::Recorded(_)
+            ));
+            match stale {
+                "pane" => state.cached_assistant_panes.write().await.clear(),
+                "backend" => {
+                    state.cached_assistant_panes.write().await[0].process_name =
+                        Some("claude".into());
+                }
+                "project" => {
+                    state.cached_assistant_panes.write().await[0].pane_current_path =
+                        Some("/tmp/changed-attestation-project".into());
+                }
+                "marker" => state
+                    .set_local_backend_pane_attestation_test_pane_var("%1", Some("foreign".into())),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                state.local_backend_pane_attestation(&identity).await,
+                None,
+                "stale {stale} observation must invalidate"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_backend_pane_attestation_allows_exact_dormant_owner_for_recovery() {
+        let (state, _project, project_identity) = local_backend_pane_attestation_fixture().await;
+        let identity = local_backend_pane_attestation_identity();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "durable-id".into(),
+                pane: Some("%0".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some(project_identity.project_dir.clone()),
+                    canonical_project_identity: Some(project_identity.canonical_repository.clone()),
+                    backend: Some(identity.backend.clone()),
+                    backend_session_id: Some(identity.session_id.clone()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["durable-id"].owner();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::DormantOwned {
+                owner: owner.clone(),
+                expected_pane: Some("%0".into()),
+                observed_at: 1_753_920_100,
+                source: crate::daemon_protocol::DormancySource::Reaped,
+            })
+            .await;
+        state.set_local_backend_pane_attestation_test_pane_var("%1", Some("durable-id".into()));
+        state.set_local_backend_pane_attestation_test_inspection(
+            "%1",
+            crate::tmux::ManagedPaneInspection::MarkerOwner(owner),
+        );
+
+        assert!(matches!(
+            state
+                .record_local_backend_pane_attestation(&identity, "%1", &project_identity)
+                .await,
+            LocalBackendPaneAttestationRecordOutcome::Recorded(_)
+        ));
     }
 
     async fn dormant_recovery_fixture() -> (
