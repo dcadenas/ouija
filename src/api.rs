@@ -1530,12 +1530,21 @@ pub async fn remove(
     State(state): State<SharedState>,
     Json(body): Json<RemoveBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let effects = state
-        .apply_and_execute(crate::daemon_protocol::Event::Remove {
-            id: body.id.clone(),
-            keep_worktree: body.keep_worktree.unwrap_or(false),
-        })
-        .await;
+    let effects = match state
+        .remove_session(body.id.clone(), body.keep_worktree.unwrap_or(false))
+        .await
+    {
+        crate::state::SessionRemoveOutcome::Applied(effects) => effects,
+        crate::state::SessionRemoveOutcome::PersistenceFailed => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "outcome": "persistence_failed",
+                    "error": "the dormant identity was preserved because durable persistence failed",
+                })),
+            );
+        }
+    };
     if effects
         .iter()
         .any(|e| matches!(e, crate::daemon_protocol::Effect::RemoveOk { .. }))
@@ -7372,6 +7381,10 @@ mod tests {
         let worktree = tempfile::tempdir().unwrap();
         let worktree_path = worktree.path().to_string_lossy().into_owned();
         let state = dormant_test_state("parked", &worktree_path).await;
+        {
+            let protocol = state.protocol.read().await;
+            state.persist_protocol_state(&protocol).unwrap();
+        }
 
         let (status, Json(body)) = remove(
             State(state.clone()),
@@ -7393,6 +7406,51 @@ mod tests {
                 .await
                 .dormant_sessions
                 .contains_key("parked")
+        );
+        assert!(
+            !crate::persistence::load_sessions(&state.config.data_dir)
+                .unwrap()
+                .dormant_sessions
+                .contains_key("parked"),
+            "a daemon restart must not resurrect an explicitly forgotten identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn dormant_unregister_persistence_failure_is_internal_error_without_forgetting() {
+        let state = dormant_test_state("parked", "/tmp/preserved-worktree").await;
+        {
+            let protocol = state.protocol.read().await;
+            state.persist_protocol_state(&protocol).unwrap();
+        }
+        std::fs::create_dir(state.config.data_dir.join("sessions.tmp")).unwrap();
+
+        let (status, Json(body)) = remove(
+            State(state.clone()),
+            Json(RemoveBody {
+                id: "parked".into(),
+                keep_worktree: Some(false),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["outcome"], "persistence_failed");
+        assert!(
+            state
+                .protocol
+                .read()
+                .await
+                .dormant_sessions
+                .contains_key("parked"),
+            "failed persistence must preserve live protocol authority"
+        );
+        assert!(
+            crate::persistence::load_sessions(&state.config.data_dir)
+                .unwrap()
+                .dormant_sessions
+                .contains_key("parked"),
+            "failed persistence must preserve restart authority"
         );
     }
 

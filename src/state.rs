@@ -920,6 +920,12 @@ pub(crate) enum DormantOwnedOutcome {
     PersistenceFailed,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum SessionRemoveOutcome {
+    Applied(Vec<crate::daemon_protocol::Effect>),
+    PersistenceFailed,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DormantRecoveryOutcome {
     Recovered(crate::daemon_protocol::ResourceOwner),
@@ -3255,6 +3261,47 @@ impl AppState {
         drop(resource_guards);
         self.execute_effects(&effects).await;
         outcome
+    }
+
+    /// Remove one session while making dormant forget durable before publication.
+    pub(crate) async fn remove_session(
+        self: &Arc<Self>,
+        id: String,
+        keep_worktree: bool,
+    ) -> SessionRemoveOutcome {
+        let event = crate::daemon_protocol::Event::Remove {
+            id: id.clone(),
+            keep_worktree,
+        };
+        let resource_guards = self.lock_event_resources(&event).await;
+        let effects = {
+            let mut protocol = self.protocol.write().await;
+            if protocol.dormant_sessions.contains_key(&id) {
+                let mut candidate = protocol.clone();
+                let effects = candidate.apply(event);
+                if !effects.iter().any(|effect| {
+                    matches!(
+                        effect,
+                        crate::daemon_protocol::Effect::DormantForgotten { .. }
+                    )
+                }) {
+                    return SessionRemoveOutcome::Applied(effects);
+                }
+                if self.persist_protocol_state(&candidate).is_err() {
+                    return SessionRemoveOutcome::PersistenceFailed;
+                }
+                *protocol = candidate;
+                effects
+                    .into_iter()
+                    .filter(|effect| !matches!(effect, crate::daemon_protocol::Effect::Persist))
+                    .collect::<Vec<_>>()
+            } else {
+                protocol.apply(event)
+            }
+        };
+        drop(resource_guards);
+        self.execute_effects(&effects).await;
+        SessionRemoveOutcome::Applied(effects)
     }
 
     /// Recover one exact dormant backend identity into its replacement pane.
