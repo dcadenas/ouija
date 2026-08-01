@@ -595,6 +595,63 @@ async fn session_start_inner(
                 });
             }
         }
+        if let Some(existing_id) = state.find_session_by_pane(&body.pane).await {
+            let incumbent_owner = {
+                let protocol = state.protocol.read().await;
+                protocol
+                    .sessions
+                    .get(&existing_id)
+                    .map(|session| session.owner())
+            };
+            if let Some(incumbent_owner) = incumbent_owner {
+                let basename = std::path::Path::new(&project.project_dir)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("unnamed");
+                let base_id = crate::state::sanitize_session_id(basename);
+                if !base_id.is_empty() {
+                    let replacement_id = {
+                        let protocol = state.protocol.read().await;
+                        crate::state::resolve_unique_session_id(
+                            &protocol.sessions,
+                            &protocol.dormant_sessions,
+                            &base_id,
+                            None,
+                        )
+                    };
+                    match state
+                        .replace_reused_cross_backend_pane(
+                            incumbent_owner,
+                            body.pane.clone(),
+                            project.clone(),
+                            identity.clone(),
+                            replacement_id,
+                        )
+                        .await
+                    {
+                        crate::state::ReusedPaneReplacementOutcome::Replaced(owner) => {
+                            let output = mesh_instructions_for_backend(
+                                Some(&identity.backend),
+                                &owner.session_id,
+                            );
+                            return json!({
+                                "registered": owner.session_id,
+                                "session_incarnation": owner.incarnation.to_string(),
+                                "output": output,
+                            });
+                        }
+                        crate::state::ReusedPaneReplacementOutcome::PersistenceFailed => {
+                            return json!({
+                                "error": "cross-backend pane replacement persistence failed",
+                                "output": "",
+                            });
+                        }
+                        crate::state::ReusedPaneReplacementOutcome::NotApplicable
+                        | crate::state::ReusedPaneReplacementOutcome::Refused => {}
+                    }
+                }
+            }
+        }
         if matches!(identity.backend.as_str(), "codex-cli" | "claude-code")
             && state.find_session_by_pane(&body.pane).await.is_none()
         {
@@ -2720,6 +2777,73 @@ mod tests {
                 .backend_session_id
                 .as_deref(),
             Some("codex-thread-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_replaces_proven_cross_backend_pane_owner() {
+        let state = crate::state::AppState::new_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let old_project = root.path().join("ouija");
+        let new_project = root.path().join("hub-fundamentals");
+        std::fs::create_dir_all(&old_project).unwrap();
+        std::fs::create_dir_all(&new_project).unwrap();
+        let old_project = old_project.to_string_lossy().into_owned();
+        let new_project = new_project.to_string_lossy().into_owned();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "ouija".into(),
+                pane: Some("%3".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("oc-old".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted),
+                    project_dir: Some(old_project.clone()),
+                    canonical_project_identity: Some(old_project),
+                    ..Default::default()
+                },
+            })
+            .await;
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "hub-fundamentals".into(),
+                pane: Some("%718".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("claude-code".into()),
+                    backend_session_id: Some("claude-existing".into()),
+                    project_dir: Some(new_project.clone()),
+                    canonical_project_identity: Some(new_project.clone()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        *state.cached_assistant_panes.write().await =
+            vec![assistant_pane_with_process("%3", &new_project, "claude")];
+
+        let result = session_start_inner(
+            &state,
+            SessionStartBody {
+                pane: "%3".into(),
+                cwd: new_project,
+                backend_session_id: Some("claude-new".into()),
+                backend_identity: Some(crate::backend::BackendSessionIdentity {
+                    backend: "claude-code".into(),
+                    session_id: "claude-new".into(),
+                }),
+                adapter: Some("claude-code".into()),
+                launch_session_id: None,
+                launch_credential: None,
+                session_incarnation: None,
+            },
+        )
+        .await;
+
+        assert_eq!(result["registered"], "hub-fundamentals-2");
+        let protocol = state.protocol.read().await;
+        assert!(protocol.dormant_sessions.contains_key("ouija"));
+        assert_eq!(
+            protocol.sessions["hub-fundamentals-2"].pane.as_deref(),
+            Some("%3")
         );
     }
 

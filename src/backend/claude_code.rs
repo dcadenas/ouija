@@ -648,6 +648,92 @@ mod tests {
         );
     }
 
+    fn run_statusline_fixture(input: &str, status: &str, marker: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let script = root.path().join("ouija-statusline.sh");
+        std::fs::write(&script, embedded::SCRIPT_STATUSLINE).unwrap();
+        std::fs::write(
+            bin.join("curl"),
+            "#!/bin/bash\nprintf '%s' \"$OUIJA_STATUS_FIXTURE\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            bin.join("tmux"),
+            r#"#!/bin/bash
+if [[ "$*" == *'#{pane_id}'* ]]; then printf '%s\n' '%3'; exit 0; fi
+if [[ "$*" == *'#{@ouija_id}'* ]]; then printf '%s\n' "$OUIJA_MARKER_FIXTURE"; exit 0; fi
+exit 1
+"#,
+        )
+        .unwrap();
+        for path in [&script, &bin.join("curl"), &bin.join("tmux")] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let mut child = Command::new("bash")
+            .arg(&script)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("HOME", root.path())
+            .env("TMUX_PANE", "%3")
+            .env("OUIJA_STATUS_FIXTURE", status)
+            .env("OUIJA_MARKER_FIXTURE", marker)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[test]
+    fn statusline_rejects_stale_marker_and_daemon_row_from_another_project() {
+        let output = run_statusline_fixture(
+            r#"{"cwd":"/repo/hub-fundamentals"}"#,
+            r#"{"sessions":[{"id":"ouija","pane":"%3","origin":"local","project_dir":"/repo/ouija"}],"version":"0.1.0"}"#,
+            "ouija",
+        );
+
+        assert!(
+            output.contains("ouija id: \u{1b}[33mregistering"),
+            "{output}"
+        );
+        assert!(!output.contains("ouija id: ouija"), "{output}");
+    }
+
+    #[test]
+    fn statusline_uses_daemon_id_for_matching_pane_and_project() {
+        let output = run_statusline_fixture(
+            r#"{"cwd":"/repo/hub-fundamentals"}"#,
+            r#"{"sessions":[{"id":"hub-fundamentals-2","pane":"%3","origin":"local","project_dir":"/repo/hub-fundamentals"}],"version":"0.1.0"}"#,
+            "ouija",
+        );
+
+        assert!(output.contains("ouija id: hub-fundamentals-2"), "{output}");
+    }
+
     #[test]
     fn hook_scripts_keep_incarnations_bound_to_backend_threads() {
         let root = tempfile::tempdir().unwrap();

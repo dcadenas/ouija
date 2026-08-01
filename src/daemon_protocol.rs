@@ -926,6 +926,17 @@ pub enum Event {
         observed_at: i64,
         source: DormancySource,
     },
+    /// Atomically park one exact Local owner and register a different backend
+    /// after the state owner corroborates physical pane reuse.
+    ///
+    /// The incumbent's user-facing metadata is preserved in dormancy. The
+    /// replacement receives ordinary new-registration metadata freshness.
+    ReplaceReusedPaneOwner {
+        incumbent: Box<SessionEntry>,
+        replacement_id: String,
+        replacement_metadata: SessionMeta,
+        observed_at: i64,
+    },
     /// Consume one exact dormant identity into a replacement live owner.
     RecoverDormantSession {
         dormant_owner: ResourceOwner,
@@ -2383,6 +2394,17 @@ impl DaemonState {
                 observed_at,
                 source,
             } => self.apply_dormant_owned(&owner, expected_pane.as_deref(), observed_at, source),
+            Event::ReplaceReusedPaneOwner {
+                incumbent,
+                replacement_id,
+                replacement_metadata,
+                observed_at,
+            } => self.apply_replace_reused_pane_owner(
+                *incumbent,
+                replacement_id,
+                replacement_metadata,
+                observed_at,
+            ),
             Event::RecoverDormantSession {
                 dormant_owner,
                 pane,
@@ -2692,6 +2714,92 @@ impl DaemonState {
             prior_owner: owner.clone(),
             tombstoned: recoverable,
         });
+        effects
+    }
+
+    fn apply_replace_reused_pane_owner(
+        &mut self,
+        incumbent: SessionEntry,
+        replacement_id: String,
+        replacement_metadata: SessionMeta,
+        observed_at: i64,
+    ) -> Vec<Effect> {
+        let failed = |reason: &str| {
+            vec![Effect::RegisterFailed {
+                session_id: replacement_id.clone(),
+                reason: reason.to_string(),
+            }]
+        };
+        let Some(current) = self.sessions.get(&incumbent.id) else {
+            return failed("incumbent no longer exists");
+        };
+        if current != &incumbent || !matches!(current.origin, Origin::Local) {
+            return failed("incumbent owner changed");
+        }
+        let Some(pane) = incumbent.pane.clone() else {
+            return failed("incumbent has no pane");
+        };
+        let Some((incumbent_backend, _)) = incumbent
+            .metadata
+            .backend
+            .as_deref()
+            .zip(incumbent.metadata.backend_session_id.as_deref())
+        else {
+            return failed("incumbent backend identity is incomplete");
+        };
+        let Some((replacement_backend, replacement_backend_session_id)) = replacement_metadata
+            .backend
+            .as_deref()
+            .zip(replacement_metadata.backend_session_id.as_deref())
+        else {
+            return failed("replacement backend identity is incomplete");
+        };
+        if incumbent.metadata.is_strong_opencode_binding()
+            || incumbent_backend == replacement_backend
+            || incumbent.id == replacement_id
+        {
+            return failed("replacement is not a different logical backend owner");
+        }
+
+        let incumbent_owner = incumbent.owner();
+        let mut candidate = self.clone();
+        let mut effects = candidate.apply_dormant_owned(
+            &incumbent_owner,
+            Some(&pane),
+            observed_at,
+            DormancySource::Reaped,
+        );
+        if !effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::DormancyApplied {
+                    prior_owner,
+                    tombstoned: true,
+                    ..
+                } if prior_owner == &incumbent_owner
+            )
+        }) {
+            return failed("incumbent could not be parked");
+        }
+
+        let registration = candidate.apply_register_if_pane_unbound(
+            replacement_id.clone(),
+            pane,
+            Some(replacement_backend_session_id.to_string()),
+            None,
+            replacement_metadata,
+        );
+        if !registration.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::RegisterOk { session_id, .. } if session_id == &replacement_id
+            )
+        }) {
+            return failed("replacement resources changed");
+        }
+
+        effects.extend(registration);
+        *self = candidate;
         effects
     }
 
@@ -9744,6 +9852,108 @@ mod tests {
             metadata: identity_metadata(backend_session_id),
         });
         state.sessions[id].owner()
+    }
+
+    fn replacement_metadata(backend: &str, backend_session_id: &str) -> SessionMeta {
+        SessionMeta {
+            project_dir: Some("/tmp/hub-fundamentals".into()),
+            canonical_project_identity: Some("/tmp/hub-fundamentals".into()),
+            backend: Some(backend.into()),
+            backend_session_id: Some(backend_session_id.into()),
+            role: Some("working on hub-fundamentals".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cross_backend_pane_replacement_parks_exact_owner_and_registers_replacement() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        register_identity(&mut state, "ouija", "%3", "old-thread");
+        register_identity(&mut state, "hub-fundamentals", "%718", "existing-thread");
+        let incumbent = state.sessions["ouija"].clone();
+
+        let effects = state.apply(Event::ReplaceReusedPaneOwner {
+            incumbent: Box::new(incumbent.clone()),
+            replacement_id: "hub-fundamentals-2".into(),
+            replacement_metadata: replacement_metadata("claude-code", "new-thread"),
+            observed_at: 100,
+        });
+
+        assert!(!state.sessions.contains_key("ouija"));
+        assert_eq!(
+            state.dormant_sessions["ouija"].prior_owner,
+            incumbent.owner()
+        );
+        let replacement = &state.sessions["hub-fundamentals-2"];
+        assert_eq!(replacement.pane.as_deref(), Some("%3"));
+        assert_eq!(replacement.metadata.backend.as_deref(), Some("claude-code"));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::DormancyApplied {
+                prior_owner,
+                tombstoned: true,
+                ..
+            } if prior_owner == &incumbent.owner()
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::RegisterOk { session_id, .. } if session_id == "hub-fundamentals-2"
+        )));
+    }
+
+    #[test]
+    fn same_backend_pane_replacement_is_rejected_without_mutation() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        register_identity(&mut state, "worker", "%3", "old-thread");
+        let incumbent = state.sessions["worker"].clone();
+        let before = state.clone();
+
+        let effects = state.apply(Event::ReplaceReusedPaneOwner {
+            incumbent: Box::new(incumbent),
+            replacement_id: "worker-2".into(),
+            replacement_metadata: replacement_metadata("codex-cli", "new-thread"),
+            observed_at: 100,
+        });
+
+        assert_eq!(state, before);
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::RegisterFailed { .. }))
+        );
+    }
+
+    #[test]
+    fn strong_opencode_pane_replacement_is_rejected_without_mutation() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "managed-opencode".into(),
+            pane: Some("%3".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/opencode".into()),
+                canonical_project_identity: Some("/tmp/opencode".into()),
+                backend: Some("opencode".into()),
+                backend_session_id: Some("managed-thread".into()),
+                opencode_binding: Some(OpenCodeBinding::StrongManaged),
+                ..Default::default()
+            },
+        });
+        let incumbent = state.sessions["managed-opencode"].clone();
+        let before = state.clone();
+
+        let effects = state.apply(Event::ReplaceReusedPaneOwner {
+            incumbent: Box::new(incumbent),
+            replacement_id: "worker".into(),
+            replacement_metadata: replacement_metadata("claude-code", "new-thread"),
+            observed_at: 100,
+        });
+
+        assert_eq!(state, before);
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::RegisterFailed { .. }))
+        );
     }
 
     fn inject_conflicting_live_identity(

@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -94,6 +95,20 @@ impl ProcessTree {
         }
         None
     }
+
+    fn descendant_names(&self, root: u32) -> Vec<&str> {
+        let mut names = Vec::new();
+        let mut stack = vec![root];
+        while let Some(pid) = stack.pop() {
+            if let Some(name) = self.names.get(&pid) {
+                names.push(name.as_str());
+            }
+            if let Some(kids) = self.children.get(&pid) {
+                stack.extend(kids);
+            }
+        }
+        names
+    }
 }
 
 pub(crate) fn matching_process_name<'a>(name: &str, names: &'a [&str]) -> Option<&'a str> {
@@ -104,6 +119,23 @@ pub(crate) fn matching_process_name<'a>(name: &str, names: &'a [&str]) -> Option
     names.iter().copied().find(|target| {
         name == *target || basename == *target || basename.strip_prefix('.') == Some(*target)
     })
+}
+
+pub(crate) fn matching_backends_for_process_names<'a>(
+    process_names: impl IntoIterator<Item = &'a str>,
+    backends: &[(String, Vec<String>)],
+) -> BTreeSet<String> {
+    let process_names = process_names.into_iter().collect::<Vec<_>>();
+    backends
+        .iter()
+        .filter_map(|(backend, names)| {
+            let names = names.iter().map(String::as_str).collect::<Vec<_>>();
+            process_names
+                .iter()
+                .any(|process_name| matching_process_name(process_name, &names).is_some())
+                .then(|| backend.clone())
+        })
+        .collect()
 }
 
 /// Find all tmux panes that have a matching assistant process.
@@ -174,20 +206,35 @@ pub fn find_assistant_panes(names: &[&str]) -> anyhow::Result<Vec<TmuxPane>> {
 
 /// Check if a tmux pane exists and has a matching process in its tree.
 pub fn pane_alive(pane_id: &str, names: &[&str]) -> bool {
+    let Some(pane_pid) = pane_pid(pane_id) else {
+        return false;
+    };
+
+    ProcessTree::snapshot().is_some_and(|t| t.has_descendant_named(pane_pid, names))
+}
+
+fn pane_pid(pane_id: &str) -> Option<u32> {
     let output = match Command::new("tmux")
         .args(["display-message", "-t", pane_id, "-p", "#{pane_pid}"])
         .output()
     {
         Ok(o) if o.status.success() => o,
-        _ => return false,
+        _ => return None,
     };
 
-    let pane_pid: u32 = match String::from_utf8_lossy(&output.stdout).trim().parse() {
-        Ok(pid) => pid,
-        Err(_) => return false,
-    };
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
 
-    ProcessTree::snapshot().is_some_and(|t| t.has_descendant_named(pane_pid, names))
+pub(crate) fn backends_in_pane(
+    pane_id: &str,
+    backends: &[(String, Vec<String>)],
+) -> Option<BTreeSet<String>> {
+    let pane_pid = pane_pid(pane_id)?;
+    let process_tree = ProcessTree::snapshot()?;
+    Some(matching_backends_for_process_names(
+        process_tree.descendant_names(pane_pid),
+        backends,
+    ))
 }
 
 /// Log a warning if the pane is not running a known app.
@@ -1295,6 +1342,35 @@ pub fn tmux_session_name(project_dir: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn matching_backends_returns_all_matches() {
+        let backends = vec![
+            ("claude-code".to_string(), vec!["claude".to_string()]),
+            ("opencode".to_string(), vec!["opencode".to_string()]),
+        ];
+
+        let matches =
+            matching_backends_for_process_names(["bash", ".opencode", "claude"], &backends);
+
+        assert_eq!(
+            matches,
+            BTreeSet::from(["claude-code".to_string(), "opencode".to_string()])
+        );
+    }
+
+    #[test]
+    fn matching_backends_returns_empty_for_unknown_processes() {
+        let backends = vec![
+            ("claude-code".to_string(), vec!["claude".to_string()]),
+            ("opencode".to_string(), vec!["opencode".to_string()]),
+        ];
+
+        let matches = matching_backends_for_process_names(["bash", "vim"], &backends);
+
+        assert!(matches.is_empty());
+    }
 
     #[test]
     fn renamed_owner_matches_immutable_pane_incarnation() {

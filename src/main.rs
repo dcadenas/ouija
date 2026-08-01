@@ -644,7 +644,11 @@ async fn main() -> anyhow::Result<()> {
                     tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
 
                     // Reap dead local sessions via protocol
-                    let panes_to_check: Vec<(crate::daemon_protocol::ResourceOwner, String)> = {
+                    let panes_to_check: Vec<(
+                        crate::daemon_protocol::ResourceOwner,
+                        String,
+                        Vec<String>,
+                    )> = {
                         let proto = reaper_state.protocol.read().await;
                         let now = chrono::Utc::now().timestamp();
                         proto
@@ -654,25 +658,27 @@ async fn main() -> anyhow::Result<()> {
                                 matches!(s.origin, crate::daemon_protocol::Origin::Local)
                                     && s.pane.is_some()
                                     && (s.registered_at == 0 || now - s.registered_at > 60)
-                                    // HTTP-delivered sessions (opencode shared serve)
-                                    // are reachable independently of the tmux pane, so a
-                                    // dead/absent attach TUI must not get them reaped.
-                                    && !s.metadata.backend.as_deref().is_some_and(|b| {
-                                        reaper_state.backends.uses_http_delivery(b)
-                                    })
                             })
-                            .filter_map(|s| Some((s.owner(), s.pane.clone()?)))
+                            .filter_map(|s| {
+                                Some((
+                                    s.owner(),
+                                    s.pane.clone()?,
+                                    reaper_process_names(&reaper_state.backends, &s.metadata)?,
+                                ))
+                            })
                             .collect()
                     };
                     let dead_sessions: Vec<(crate::daemon_protocol::ResourceOwner, String)> =
                         if !panes_to_check.is_empty() {
-                            let names: Vec<String> = reaper_state.backends.all_process_names();
                             let dead = tokio::task::spawn_blocking(move || {
-                                let name_refs: Vec<&str> =
-                                    names.iter().map(|s| s.as_str()).collect();
                                 panes_to_check
                                     .into_iter()
-                                    .filter(|(_, pane)| !crate::tmux::pane_alive(pane, &name_refs))
+                                    .filter_map(|(owner, pane, names)| {
+                                        let name_refs: Vec<&str> =
+                                            names.iter().map(String::as_str).collect();
+                                        (!crate::tmux::pane_alive(&pane, &name_refs))
+                                            .then_some((owner, pane))
+                                    })
                                     .collect::<Vec<_>>()
                             })
                             .await
@@ -1609,6 +1615,29 @@ fn lifecycle_lease_pane_owners(
         owners.push(owner.clone());
     }
     owners
+}
+
+fn reaper_process_names(
+    backends: &crate::backend::BackendRegistry,
+    metadata: &crate::daemon_protocol::SessionMeta,
+) -> Option<Vec<String>> {
+    if metadata.is_strong_opencode_binding() {
+        return None;
+    }
+    match metadata
+        .backend
+        .as_deref()
+        .and_then(|backend| backends.get(backend))
+    {
+        Some(backend) => Some(
+            backend
+                .process_names()
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+        ),
+        None => Some(backends.all_process_names()),
+    }
 }
 
 async fn reap_dead_sessions(
@@ -5211,6 +5240,43 @@ mod tests {
         let persisted = crate::persistence::load_sessions(&config.data_dir).unwrap();
         assert!(persisted.sessions.is_empty());
         assert_eq!(persisted.dormant_sessions["dead-worker"].prior_owner, owner);
+    }
+
+    #[test]
+    fn reaper_process_names_exempts_only_strong_opencode_bindings() {
+        let backends = crate::backend::BackendRegistry::default_registry();
+        let strong = crate::daemon_protocol::SessionMeta {
+            backend: Some("opencode".into()),
+            backend_session_id: Some("managed".into()),
+            opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+            ..Default::default()
+        };
+        let weak = crate::daemon_protocol::SessionMeta {
+            backend: Some("opencode".into()),
+            backend_session_id: Some("adopted".into()),
+            opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted),
+            ..Default::default()
+        };
+
+        assert_eq!(reaper_process_names(&backends, &strong), None);
+        assert_eq!(
+            reaper_process_names(&backends, &weak),
+            Some(vec!["opencode".to_string()])
+        );
+    }
+
+    #[test]
+    fn reaper_process_names_uses_only_the_stored_backend() {
+        let backends = crate::backend::BackendRegistry::default_registry();
+        let claude = crate::daemon_protocol::SessionMeta {
+            backend: Some("claude-code".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            reaper_process_names(&backends, &claude),
+            Some(vec!["claude".to_string()])
+        );
     }
 
     #[tokio::test]

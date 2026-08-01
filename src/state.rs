@@ -828,6 +828,8 @@ pub struct AppState {
     #[cfg(test)]
     local_backend_pane_attestation_test_inspections:
         std::sync::Mutex<HashMap<String, crate::tmux::ManagedPaneInspection>>,
+    #[cfg(test)]
+    pane_backend_test_observations: std::sync::Mutex<HashMap<String, Option<BTreeSet<String>>>>,
     /// Per-resource async gates serialize external pane/backend claims and cleanup
     /// without holding the protocol lock across tmux, process, or HTTP I/O.
     resource_gates:
@@ -931,6 +933,14 @@ pub(crate) enum DormantRecoveryOutcome {
     Recovered(crate::daemon_protocol::ResourceOwner),
     Current(crate::daemon_protocol::ResourceOwner),
     NotFound,
+    Refused,
+    PersistenceFailed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReusedPaneReplacementOutcome {
+    Replaced(crate::daemon_protocol::ResourceOwner),
+    NotApplicable,
     Refused,
     PersistenceFailed,
 }
@@ -1261,6 +1271,7 @@ fn backend_recovery_lease_conflicts(
     })
 }
 
+#[cfg(test)]
 fn backend_for_process_name(
     process_name: &str,
     candidates: &[(String, Vec<String>)],
@@ -1357,6 +1368,7 @@ impl AppState {
             dormant_recovery_test_inspection: std::sync::Mutex::new(None),
             local_backend_pane_attestation_test_pane_vars: std::sync::Mutex::new(HashMap::new()),
             local_backend_pane_attestation_test_inspections: std::sync::Mutex::new(HashMap::new()),
+            pane_backend_test_observations: std::sync::Mutex::new(HashMap::new()),
             resource_gates: std::sync::Mutex::new(HashMap::new()),
             project_index: RwLock::new(HashMap::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
@@ -1421,6 +1433,8 @@ impl AppState {
             local_backend_pane_attestation_test_pane_vars: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             local_backend_pane_attestation_test_inspections: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            pane_backend_test_observations: std::sync::Mutex::new(HashMap::new()),
             resource_gates: std::sync::Mutex::new(HashMap::new()),
             project_index: RwLock::new(HashMap::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
@@ -1455,6 +1469,18 @@ impl AppState {
             .reclaim_test_inspection
             .lock()
             .expect("reclaim test inspection mutex poisoned") = Some(inspection);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_pane_backend_test_observation(
+        &self,
+        pane: impl Into<String>,
+        observation: Option<BTreeSet<String>>,
+    ) {
+        self.pane_backend_test_observations
+            .lock()
+            .expect("pane backend test observations mutex poisoned")
+            .insert(pane.into(), observation);
     }
 
     #[cfg(test)]
@@ -1689,6 +1715,24 @@ impl AppState {
                 add_current(&mut keys, &mut project_dirs, &protocol, &owner.session_id);
                 if let Some(pane) = expected_pane {
                     keys.push(ResourceGateKey::Pane(pane.clone()));
+                }
+            }
+            crate::daemon_protocol::Event::ReplaceReusedPaneOwner {
+                incumbent,
+                replacement_id,
+                replacement_metadata,
+                ..
+            } => {
+                add_entry(&mut keys, &mut project_dirs, incumbent);
+                add_current(&mut keys, &mut project_dirs, &protocol, replacement_id);
+                if let Some(backend_session_id) = &replacement_metadata.backend_session_id {
+                    keys.push(ResourceGateKey::BackendSession(backend_session_id.clone()));
+                }
+                if let Some(project_dir) = &replacement_metadata.project_dir {
+                    project_dirs.push(project_dir.clone());
+                }
+                if let Some(canonical_project) = &replacement_metadata.canonical_project_identity {
+                    project_dirs.push(canonical_project.clone());
                 }
             }
             crate::daemon_protocol::Event::RecoverDormantSession {
@@ -2279,11 +2323,7 @@ impl AppState {
         })
     }
 
-    /// Detect which backend is running in a tmux pane by walking the process tree.
-    ///
-    /// Returns the backend name (e.g. `"opencode"`, `"claude-code"`) if a known
-    /// backend process is found, or `None` if detection fails.
-    pub async fn detect_backend_in_pane(&self, pane: &str) -> Option<String> {
+    pub(crate) async fn backends_in_pane(&self, pane: &str) -> Option<BTreeSet<String>> {
         // Candidate process names for every registered backend. Deliberately not
         // filtered by `available()`: that runs each backend's `is_available()` CLI
         // probe (e.g. a slow/hanging npx `codex --version`) on the caller — which
@@ -2294,6 +2334,17 @@ impl AppState {
             self.backends.all_backend_process_names();
 
         #[cfg(test)]
+        if let Some(observation) = self
+            .pane_backend_test_observations
+            .lock()
+            .expect("pane backend test observations mutex poisoned")
+            .get(pane)
+            .cloned()
+        {
+            return observation;
+        }
+
+        #[cfg(test)]
         if let Some(process_name) = self
             .cached_assistant_panes
             .read()
@@ -2302,68 +2353,31 @@ impl AppState {
             .find(|candidate| candidate.pane_id == pane)
             .and_then(|candidate| candidate.process_name.as_deref())
         {
-            return backend_for_process_name(process_name, &backend_process_names);
+            return Some(crate::tmux::matching_backends_for_process_names(
+                [process_name],
+                &backend_process_names,
+            ));
         }
 
         let pane = pane.to_string();
         tokio::task::spawn_blocking(move || {
-            use std::process::Command;
-
-            let output = Command::new("tmux")
-                .args(["display-message", "-t", &pane, "-p", "#{pane_pid}"])
-                .output()
-                .ok()?;
-            if !output.status.success() {
-                return None;
-            }
-            let pane_pid: u32 = String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .parse()
-                .ok()?;
-
-            let output = Command::new("ps")
-                .args(["-eo", "pid,ppid,comm"])
-                .output()
-                .ok()?;
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut children: std::collections::HashMap<u32, Vec<u32>> =
-                std::collections::HashMap::new();
-            let mut names: std::collections::HashMap<u32, String> =
-                std::collections::HashMap::new();
-
-            for line in stdout.lines().skip(1) {
-                let mut parts = line.split_whitespace();
-                let (Some(pid_s), Some(ppid_s), Some(comm)) =
-                    (parts.next(), parts.next(), parts.next())
-                else {
-                    continue;
-                };
-                let (Ok(pid), Ok(ppid)) = (pid_s.parse::<u32>(), ppid_s.parse::<u32>()) else {
-                    continue;
-                };
-                children.entry(ppid).or_default().push(pid);
-                names.insert(pid, comm.to_string());
-            }
-
-            // BFS from pane_pid, check each process against known backend names.
-            // Match both exact name and dot-prefixed name (e.g. ".opencode"
-            // which appears when run via npm/node wrapper).
-            let mut stack = vec![pane_pid];
-            while let Some(pid) = stack.pop() {
-                if let Some(comm) = names.get(&pid) {
-                    if let Some(backend) = backend_for_process_name(comm, &backend_process_names) {
-                        return Some(backend);
-                    }
-                }
-                if let Some(kids) = children.get(&pid) {
-                    stack.extend(kids);
-                }
-            }
-            None
+            crate::tmux::backends_in_pane(&pane, &backend_process_names)
         })
         .await
         .ok()
         .flatten()
+    }
+
+    /// Detect which backend is running in a tmux pane by walking the process tree.
+    ///
+    /// Returns a backend only when the complete process observation identifies
+    /// exactly one known backend. Failed, empty, or ambiguous observations fail closed.
+    pub async fn detect_backend_in_pane(&self, pane: &str) -> Option<String> {
+        let backends = self.backends_in_pane(pane).await?;
+        if backends.len() != 1 {
+            return None;
+        }
+        backends.into_iter().next()
     }
 
     /// Find the session ID registered on a given pane (full `%NNN` format).
@@ -3256,6 +3270,124 @@ impl AppState {
                 .filter(|effect| !matches!(effect, crate::daemon_protocol::Effect::Persist))
                 .collect::<Vec<_>>();
             (outcome, effects)
+        };
+        drop(resource_guards);
+        self.execute_effects(&effects).await;
+        outcome
+    }
+
+    /// Replace an exact pane owner after corroborating different-backend reuse.
+    pub(crate) async fn replace_reused_cross_backend_pane(
+        self: &Arc<Self>,
+        incumbent_owner: crate::daemon_protocol::ResourceOwner,
+        pane: String,
+        project: crate::project_identity::ProjectIdentity,
+        identity: crate::backend::BackendSessionIdentity,
+        replacement_id: String,
+    ) -> ReusedPaneReplacementOutcome {
+        let incumbent = {
+            let protocol = self.protocol.read().await;
+            let Some(incumbent) = protocol.sessions.get(&incumbent_owner.session_id) else {
+                return ReusedPaneReplacementOutcome::NotApplicable;
+            };
+            if incumbent.owner() != incumbent_owner
+                || incumbent.pane.as_deref() != Some(pane.as_str())
+                || !matches!(incumbent.origin, crate::daemon_protocol::Origin::Local)
+            {
+                return ReusedPaneReplacementOutcome::Refused;
+            }
+            incumbent.clone()
+        };
+        let Some(incumbent_backend) = incumbent.metadata.backend.as_deref() else {
+            return ReusedPaneReplacementOutcome::NotApplicable;
+        };
+        if incumbent.metadata.is_strong_opencode_binding()
+            || incumbent.metadata.backend_session_id.is_none()
+            || incumbent_backend == identity.backend
+            || identity.backend.trim().is_empty()
+            || identity.session_id.trim().is_empty()
+        {
+            return ReusedPaneReplacementOutcome::NotApplicable;
+        }
+
+        let basename = std::path::Path::new(&project.project_dir)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unnamed");
+        let replacement_metadata = crate::daemon_protocol::SessionMeta {
+            project_dir: Some(project.project_dir.clone()),
+            canonical_project_identity: Some(project.canonical_repository.clone()),
+            role: Some(format!("working on {basename}")),
+            backend: Some(identity.backend.clone()),
+            backend_session_id: Some(identity.session_id.clone()),
+            ..Default::default()
+        };
+        let event = crate::daemon_protocol::Event::ReplaceReusedPaneOwner {
+            incumbent: Box::new(incumbent.clone()),
+            replacement_id: replacement_id.clone(),
+            replacement_metadata,
+            observed_at: chrono::Utc::now().timestamp(),
+        };
+        let resource_guards = self.lock_event_resources(&event).await;
+
+        let panes = self.list_assistant_panes().await;
+        let Some(live_pane) = panes.iter().find(|candidate| candidate.pane_id == pane) else {
+            return ReusedPaneReplacementOutcome::Refused;
+        };
+        let Some(live_path) = live_pane.pane_current_path.as_deref() else {
+            return ReusedPaneReplacementOutcome::Refused;
+        };
+        let Ok(live_project) =
+            crate::project_identity::resolve_project_identity_async(live_path).await
+        else {
+            return ReusedPaneReplacementOutcome::Refused;
+        };
+        if live_project != project {
+            return ReusedPaneReplacementOutcome::Refused;
+        }
+        let Some(observed_backends) = self.backends_in_pane(&pane).await else {
+            return ReusedPaneReplacementOutcome::Refused;
+        };
+        if observed_backends.len() != 1 || !observed_backends.contains(&identity.backend) {
+            return ReusedPaneReplacementOutcome::Refused;
+        }
+
+        let (outcome, effects) = {
+            let mut protocol = self.protocol.write().await;
+            let mut candidate = protocol.clone();
+            let effects = candidate.apply(event);
+            let parked = effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    crate::daemon_protocol::Effect::DormancyApplied {
+                        prior_owner,
+                        tombstoned: true,
+                        ..
+                    } if prior_owner == &incumbent_owner
+                )
+            });
+            let replacement_owner = effects.iter().find_map(|effect| match effect {
+                crate::daemon_protocol::Effect::RegisterOk { owner, .. }
+                    if owner.session_id == replacement_id =>
+                {
+                    Some(owner.clone())
+                }
+                _ => None,
+            });
+            let Some(replacement_owner) = replacement_owner.filter(|_| parked) else {
+                return ReusedPaneReplacementOutcome::Refused;
+            };
+            if self.persist_protocol_state(&candidate).is_err() {
+                return ReusedPaneReplacementOutcome::PersistenceFailed;
+            }
+            *protocol = candidate;
+            (
+                ReusedPaneReplacementOutcome::Replaced(replacement_owner),
+                effects
+                    .into_iter()
+                    .filter(|effect| !matches!(effect, crate::daemon_protocol::Effect::Persist))
+                    .collect::<Vec<_>>(),
+            )
         };
         drop(resource_guards);
         self.execute_effects(&effects).await;
@@ -7622,6 +7754,42 @@ pub(crate) mod tests {
             backend_for_process_name(".codex", &candidates).as_deref(),
             Some("codex-cli")
         );
+    }
+
+    #[tokio::test]
+    async fn detect_backend_in_pane_returns_single_observed_backend() {
+        let state = AppState::new_for_test();
+        state.set_pane_backend_test_observation(
+            "%42",
+            Some(BTreeSet::from(["opencode".to_string()])),
+        );
+
+        assert_eq!(
+            state.detect_backend_in_pane("%42").await.as_deref(),
+            Some("opencode")
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_backend_in_pane_returns_none_for_empty_observation() {
+        let state = AppState::new_for_test();
+        state.set_pane_backend_test_observation("%42", Some(BTreeSet::new()));
+
+        assert_eq!(state.detect_backend_in_pane("%42").await, None);
+    }
+
+    #[tokio::test]
+    async fn detect_backend_in_pane_returns_none_for_ambiguous_observation() {
+        let state = AppState::new_for_test();
+        state.set_pane_backend_test_observation(
+            "%42",
+            Some(BTreeSet::from([
+                "claude-code".to_string(),
+                "opencode".to_string(),
+            ])),
+        );
+
+        assert_eq!(state.detect_backend_in_pane("%42").await, None);
     }
 
     #[tokio::test]

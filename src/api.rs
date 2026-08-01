@@ -4333,6 +4333,74 @@ async fn record_opencode_ready_attestation(
         .await
 }
 
+/// Bind a standalone OpenCode readiness callback to an exact blank Local row.
+///
+/// Interactive OpenCode sessions are not necessarily known to the managed
+/// opencode serve, so the serve-directory adoption path cannot prove them.
+/// When the plugin supplies both hints and the daemon already has exactly one
+/// blank Local owner for that live pane/project, reuse the explicit recovery
+/// path's ownership checks instead of inventing a second binding rule.
+async fn recover_standalone_opencode_backend_session(
+    state: &std::sync::Arc<crate::state::AppState>,
+    backend_sid: &str,
+    pane: &str,
+    cwd: &str,
+) -> Option<String> {
+    if cwd.is_empty() || cwd == "/" || !cwd.starts_with('/') {
+        return None;
+    }
+    let project = crate::project_identity::resolve_project_identity_async(cwd)
+        .await
+        .ok()?;
+    let hinted_project_dir = crate::state::project_dir_identity(&project.project_dir);
+    let hinted_canonical = crate::state::project_dir_identity(&project.canonical_repository);
+    let candidate_id = {
+        let proto = state.protocol.read().await;
+        let mut candidates = proto.sessions.values().filter(|session| {
+            matches!(session.origin, crate::daemon_protocol::Origin::Local)
+                && session.pane.as_deref() == Some(pane)
+                && session.metadata.backend.is_none()
+                && session.metadata.backend_session_id.is_none()
+                && session.metadata.session_start_credential.is_none()
+                && session.metadata.backend_repair_reservation.is_none()
+                && session.metadata.opencode_binding.is_none()
+                && session
+                    .metadata
+                    .project_dir
+                    .as_deref()
+                    .map(crate::state::project_dir_identity)
+                    == Some(hinted_project_dir.clone())
+                && session
+                    .metadata
+                    .canonical_project_identity
+                    .as_deref()
+                    .map(crate::state::project_dir_identity)
+                    == Some(hinted_canonical.clone())
+        });
+        let candidate = candidates.next()?;
+        if candidates.next().is_some() {
+            return None;
+        }
+        candidate.id.clone()
+    };
+
+    let identity = crate::backend::BackendSessionIdentity {
+        backend: "opencode".into(),
+        session_id: backend_sid.to_string(),
+    };
+    let caller = crate::state::BackendRecoveryCallerEvidence {
+        pane: Some(pane.to_string()),
+        ..Default::default()
+    };
+    match state
+        .recover_backend_identity(&candidate_id, &identity, &caller)
+        .await
+    {
+        crate::state::BackendIdentityRecoveryOutcome::Recovered(owner) => Some(owner.session_id),
+        _ => None,
+    }
+}
+
 async fn backend_session_ready_inner_with_hints(
     state: &std::sync::Arc<crate::state::AppState>,
     backend_sid: String,
@@ -4393,29 +4461,35 @@ async fn backend_session_ready_inner_with_hints(
             });
         }
         crate::daemon_protocol::BackendIdentityResolution::NotFound => {
+            let mut standalone_recovered = None;
             if let (Some(pane), Some(cwd)) = (hints.pane.as_deref(), hints.cwd.as_deref()) {
-                match record_opencode_ready_attestation(state, &backend_sid, pane, cwd).await {
-                    crate::state::LocalBackendPaneAttestationRecordOutcome::Recorded(
-                        attestation,
-                    ) => {
-                        attestation_generation = Some(attestation.generation);
-                    }
-                    crate::state::LocalBackendPaneAttestationRecordOutcome::Ambiguous {
-                        ..
-                    } => {
-                        return json!({
-                            "delivered": false,
-                            "outcome": "ambiguous_attestation",
-                            "error": "backend readiness is ambiguous across live panes",
-                        });
-                    }
-                    crate::state::LocalBackendPaneAttestationRecordOutcome::Rejected => {
-                        if state.settings.read().await.auto_register {
+                standalone_recovered =
+                    recover_standalone_opencode_backend_session(state, &backend_sid, pane, cwd)
+                        .await;
+                if standalone_recovered.is_none() {
+                    match record_opencode_ready_attestation(state, &backend_sid, pane, cwd).await {
+                        crate::state::LocalBackendPaneAttestationRecordOutcome::Recorded(
+                            attestation,
+                        ) => {
+                            attestation_generation = Some(attestation.generation);
+                        }
+                        crate::state::LocalBackendPaneAttestationRecordOutcome::Ambiguous {
+                            ..
+                        } => {
                             return json!({
                                 "delivered": false,
-                                "outcome": "attestation_rejected",
-                                "error": "backend readiness pane attestation rejected",
+                                "outcome": "ambiguous_attestation",
+                                "error": "backend readiness is ambiguous across live panes",
                             });
+                        }
+                        crate::state::LocalBackendPaneAttestationRecordOutcome::Rejected => {
+                            if state.settings.read().await.auto_register {
+                                return json!({
+                                    "delivered": false,
+                                    "outcome": "attestation_rejected",
+                                    "error": "backend readiness pane attestation rejected",
+                                });
+                            }
                         }
                     }
                 }
@@ -4425,14 +4499,18 @@ async fn backend_session_ready_inner_with_hints(
             // needs the dir too. The double call is intentionally kept to preserve
             // adoption's existing call signature (and fail-mode coverage) for this
             // surgical change — dir lookup is a cheap loopback GET.
-            let adopted = adopt_backend_session_id(state, &backend_sid).await;
+            let adopted = if standalone_recovered.is_some() {
+                None
+            } else {
+                adopt_backend_session_id(state, &backend_sid).await
+            };
 
-            if let Some(n) = adopted {
+            if let Some(n) = standalone_recovered.or(adopted) {
                 tracing::info!(
                     target: "ouija::api::backend_session_ready",
                     backend_session_id = %backend_sid,
                     session = %n,
-                    "ready adopted backend session into existing ouija session"
+                    "ready bound backend session to an existing ouija session"
                 );
                 n
             } else {
@@ -11045,6 +11123,67 @@ mod tests {
             Some("/tmp/explicit-project"),
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn backend_session_ready_binds_standalone_blank_scanner_row_without_serve() {
+        // Standalone interactive opencode is not a session on the managed
+        // opencode serve, so /session/<backend_sid> 404s. When the scanner
+        // already registered the exact live pane as a blank Local row and the
+        // pane owner markers corroborate that same owner, readiness must bind
+        // the backend identity instead of failing attestation.
+        let project = tempfile::tempdir().unwrap();
+        let project_dir = project.path().canonicalize().unwrap();
+        let project_dir = project_dir.to_string_lossy().into_owned();
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "standalone".into(),
+                pane: Some("%3".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some(project_dir.clone()),
+                    canonical_project_identity: Some(project_dir.clone()),
+                    scanner_registration: true,
+                    ..Default::default()
+                },
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["standalone"].owner();
+        *state.cached_assistant_panes.write().await = vec![pane_in(&project_dir, "%3")];
+        state.set_backend_recovery_test_inspection(
+            crate::tmux::ManagedPaneInspection::MarkerOwner(owner.clone()),
+        );
+
+        let response = backend_session_ready_inner_with_hints(
+            &state,
+            "ses_standalone".into(),
+            BackendSessionReadyHints {
+                pane: Some("%3".into()),
+                cwd: Some(project_dir.clone()),
+                session_incarnation: None,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            response["session"].as_str(),
+            Some("standalone"),
+            "standalone blank scanner row must be bound by readiness, got: {response}"
+        );
+        let proto = state.protocol.read().await;
+        let session = &proto.sessions["standalone"];
+        assert_eq!(session.owner(), owner);
+        assert_eq!(session.metadata.backend.as_deref(), Some("opencode"));
+        assert_eq!(
+            session.metadata.backend_session_id.as_deref(),
+            Some("ses_standalone")
+        );
+        assert!(matches!(
+            resolve_opencode_backend_identity(&proto, "ses_standalone"),
+            crate::daemon_protocol::BackendIdentityResolution::Resolved {
+                ref session_id
+            } if session_id == "standalone"
+        ));
     }
 
     #[tokio::test]

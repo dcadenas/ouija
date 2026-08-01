@@ -10,18 +10,19 @@ STATUS=$(curl -sf "http://localhost:${PORT}/api/status" 2>/dev/null) || { echo "
 
 PANE="${TMUX_PANE:-$(tmux display-message -p '#{pane_id}' 2>/dev/null)}"
 
-# My session ID — tmux pane option (set by register hook) is fastest and most current,
-# then API, then derive from cwd as last resort.
+CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)
+[ -z "$CWD" ] && CWD="$PWD"
+PROJECT_DIR=$(git -C "$CWD" rev-parse --path-format=absolute --show-toplevel 2>/dev/null || printf '%s' "$CWD")
+
+# The daemon row is authoritative. Pane markers survive process replacement,
+# and basename guesses cannot account for daemon-assigned collision suffixes.
 MY_ID=""
 if [ -n "$PANE" ]; then
-  MY_ID=$(tmux display-message -t "$PANE" -p '#{@ouija_id}' 2>/dev/null)
-  [ -z "$MY_ID" ] && MY_ID=$(echo "$STATUS" | jq -r --arg pane "$PANE" '.sessions[] | select(.pane == $pane) | .id' 2>/dev/null)
-  if [ -z "$MY_ID" ]; then
-    CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)
-    [ -z "$CWD" ] && CWD="$PWD"
-    # Resolve worktree paths to project root
-    CWD=$(echo "$CWD" | sed 's|/\.claude/worktrees/.*||')
-    MY_ID=$(basename "$CWD" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/^-//;s/-$//')
+  DAEMON_ROW=$(printf '%s' "$STATUS" | jq -c \
+    --arg pane "$PANE" --arg project "$PROJECT_DIR" \
+    '.sessions[] | select(.pane == $pane and .project_dir == $project)' 2>/dev/null)
+  if [ -n "$DAEMON_ROW" ]; then
+    MY_ID=$(printf '%s' "$DAEMON_ROW" | jq -r '.id // empty' 2>/dev/null)
   fi
 fi
 
