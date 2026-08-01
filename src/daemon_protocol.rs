@@ -1065,9 +1065,6 @@ pub enum Event {
         backend_session_id: String,
         expected_backend_session_id: String,
     },
-    ReapDead {
-        dead_sessions: Vec<(ResourceOwner, String)>,
-    },
     IncomingWire {
         msg: crate::protocol::WireMessage,
         sender_npub: Option<String>,
@@ -2524,7 +2521,6 @@ impl DaemonState {
                 backend_session_id,
                 expected_backend_session_id,
             ),
-            Event::ReapDead { dead_sessions } => self.apply_reap(dead_sessions),
             Event::IncomingWire { msg, sender_npub } => self.apply_incoming_wire(msg, sender_npub),
             Event::Send {
                 from,
@@ -5317,79 +5313,6 @@ impl DaemonState {
         if session.metadata.networked {
             effects.push(Effect::BroadcastSessionList);
         }
-        effects
-    }
-
-    fn apply_reap(&mut self, dead_sessions: Vec<(ResourceOwner, String)>) -> Vec<Effect> {
-        let mut effects = Vec::new();
-        let mut removed_ids = Vec::new();
-        let mut removed_owners = Vec::new();
-
-        for (owner, expected_pane) in dead_sessions {
-            if self.lifecycle_leases.contains_key(&owner.session_id) {
-                continue;
-            }
-            let Some(current) = self.sessions.get(&owner.session_id) else {
-                continue;
-            };
-            if !matches!(current.origin, Origin::Local)
-                || current.metadata.session_incarnation != owner.incarnation
-                || current.pane.as_deref() != Some(expected_pane.as_str())
-            {
-                continue;
-            }
-            let id = owner.session_id.clone();
-            let session = self
-                .sessions
-                .remove(&id)
-                .expect("exact reaper owner checked above");
-            removed_ids.push(id.clone());
-            removed_owners.push(owner.clone());
-
-            effects.push(Effect::Log {
-                level: LogLevel::Info,
-                message: format!("reaped dead session: {id}"),
-            });
-
-            if let Some(ref pane_id) = session.pane {
-                effects.push(Effect::ClearTmuxVar {
-                    owner: owner.clone(),
-                    pane: pane_id.clone(),
-                    name: "@ouija_session".into(),
-                });
-                effects.push(Effect::ClearTmuxVar {
-                    owner: owner.clone(),
-                    pane: pane_id.clone(),
-                    name: "@ouija_id".into(),
-                });
-                effects.push(Effect::ClearTmuxVar {
-                    owner: owner.clone(),
-                    pane: pane_id.clone(),
-                    name: "@ouija_incarnation".into(),
-                });
-                effects.push(Effect::EnableAutoRename {
-                    owner: owner.clone(),
-                    pane: pane_id.clone(),
-                });
-                effects.push(Effect::StopAgent {
-                    owner: owner.clone(),
-                    pane: Some(pane_id.clone()),
-                });
-            }
-
-            // Note: no CleanupWorktree on reap (preserves uncommitted work)
-        }
-
-        if !removed_ids.is_empty() {
-            effects.push(Effect::Persist);
-            effects.push(Effect::ClearOwnedPendingReplies { removed_owners });
-            // Increment wire_seq so the session list carries a fresh sequence
-            // number. Without this, the list shares the seq of the prior
-            // mutation and can be reordered with it, breaking convergence.
-            self.next_seq();
-            effects.push(Effect::BroadcastSessionList);
-        }
-
         effects
     }
 
@@ -11463,7 +11386,7 @@ mod tests {
     }
 
     #[test]
-    fn reap_removes_dead_sessions() {
+    fn reap_parks_complete_dead_session_with_identity_metadata() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
         state.apply(Event::Register {
             id: "alive".into(),
@@ -11473,26 +11396,44 @@ mod tests {
         state.apply(Event::Register {
             id: "dead".into(),
             pane: Some("%2".into()),
-            metadata: Default::default(),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/worktrees/dead".into()),
+                canonical_project_identity: Some("/tmp/repositories/dead".into()),
+                backend: Some("codex-cli".into()),
+                backend_session_id: Some("thread-dead".into()),
+                role: Some("preserve this identity".into()),
+                prompt: Some("resume this work".into()),
+                ..Default::default()
+            },
         });
         let dead_owner = test_owner(&state, "dead");
-        let effects = state.apply(Event::ReapDead {
-            dead_sessions: vec![(dead_owner, "%2".into())],
+        let expected_metadata = state.sessions["dead"].metadata.clone();
+        let effects = state.apply(Event::DormantOwned {
+            owner: dead_owner.clone(),
+            expected_pane: Some("%2".into()),
+            observed_at: 1_753_920_200,
+            source: DormancySource::Reaped,
         });
         assert!(!state.sessions.contains_key("dead"));
         assert!(state.sessions.contains_key("alive"));
+        let dormant = &state.dormant_sessions["dead"];
+        assert_eq!(dormant.metadata, expected_metadata);
+        assert_eq!(dormant.canonical_project_identity, "/tmp/repositories/dead");
         assert!(
             !effects
                 .iter()
                 .any(|e| matches!(e, Effect::CleanupWorktree { .. }))
         );
         assert!(
-            effects.iter().any(|e| matches!(
-                e,
-                Effect::ClearTmuxVar { pane, name, .. }
-                    if pane == "%2" && name == "@ouija_id"
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::DormancyApplied {
+                    id,
+                    prior_owner,
+                    tombstoned: true,
+                } if id == "dead" && prior_owner == &dead_owner
             )),
-            "the reaper has proved this pane dead, so its stale autoregister marker must be released"
+            "the reaper must park the complete owner instead of deleting it"
         );
     }
 
@@ -11521,8 +11462,11 @@ mod tests {
         let replacement_incarnation = state.sessions["worker"].metadata.session_incarnation;
         assert_ne!(replacement_incarnation, stale_owner.incarnation);
 
-        let effects = state.apply(Event::ReapDead {
-            dead_sessions: vec![(stale_owner, "%2".into())],
+        let effects = state.apply(Event::DormantOwned {
+            owner: stale_owner,
+            expected_pane: Some("%2".into()),
+            observed_at: 1_753_920_200,
+            source: DormancySource::Reaped,
         });
 
         assert_eq!(
@@ -11629,8 +11573,11 @@ mod tests {
         ));
         assert!(
             state
-                .apply(Event::ReapDead {
-                    dead_sessions: vec![(owner.clone(), "%2".into())],
+                .apply(Event::DormantOwned {
+                    owner: owner.clone(),
+                    expected_pane: Some("%2".into()),
+                    observed_at: 1_753_920_200,
+                    source: DormancySource::Reaped,
                 })
                 .is_empty()
         );
@@ -16192,8 +16139,11 @@ mod tests {
 
         // d0 reaps a dead session
         let frontend_owner = d0.sessions["frontend"].owner();
-        d0.apply(Event::ReapDead {
-            dead_sessions: vec![(frontend_owner, "%1".into())],
+        d0.apply(Event::DormantOwned {
+            owner: frontend_owner,
+            expected_pane: Some("%1".into()),
+            observed_at: 1_753_920_200,
+            source: DormancySource::Reaped,
         });
         assert!(!d0.sessions.contains_key("frontend"));
 
@@ -16554,8 +16504,10 @@ mod stateright_model {
             last_event_type: LastEvent,
             /// Worktree dirs cleaned up in the last apply (for invariant checking).
             last_cleaned_worktrees: BTreeSet<String>,
-            /// Whether the last event was a ReapDead.
+            /// Whether the last event modeled a reaper observation.
             last_was_reap: bool,
+            /// Once false, a complete reaped identity was not parked intact.
+            reap_identity_preserved: bool,
             /// Once false, a stale delayed result removed or replaced its winner.
             stale_result_preserved: bool,
             /// Once false, a rename replaced a pre-existing destination owner.
@@ -16628,6 +16580,7 @@ mod stateright_model {
                     last_event_type: LastEvent::Other,
                     last_cleaned_worktrees: BTreeSet::new(),
                     last_was_reap: false,
+                    reap_identity_preserved: true,
                     stale_result_preserved: true,
                     occupied_rename_preserved: true,
                     identity_destination_preserved: true,
@@ -16673,6 +16626,7 @@ mod stateright_model {
                 last_event_type,
                 last_cleaned_worktrees,
                 last_was_reap,
+                reap_identity_preserved,
                 stale_result_preserved,
                 occupied_rename_preserved,
                 identity_destination_preserved,
@@ -16727,6 +16681,9 @@ mod stateright_model {
                     *recovered_incarnation_advanced &= observation.recovered_incarnation_advanced;
                     *identity_transition_no_cleanup &= observation.no_worktree_cleanup;
                     *dormant_accounting_monotonic &= observation.accounting_monotonic;
+                    if action == IdentityAction::DormantEligible {
+                        *reap_identity_preserved &= observation.dormant_metadata_preserved;
+                    }
                     *identity_action_mask |= 1 << (action as u16);
                     normalize_timestamps(ds);
                     *last_send_result = None;
@@ -16762,17 +16719,26 @@ mod stateright_model {
                             project_dir,
                             prompt,
                             reminder,
-                        } => Event::Register {
-                            id: id.clone(),
-                            pane: Some(format!("model-pane-{id}")),
-                            metadata: SessionMeta {
-                                networked: true,
-                                project_dir,
-                                prompt,
-                                reminder,
-                                ..Default::default()
-                            },
-                        },
+                        } => {
+                            let canonical_project_identity = project_dir.clone();
+                            let backend = project_dir.as_ref().map(|_| "codex-cli".into());
+                            let backend_session_id =
+                                project_dir.as_ref().map(|_| format!("model-thread-{id}"));
+                            Event::Register {
+                                id: id.clone(),
+                                pane: Some(format!("model-pane-{id}")),
+                                metadata: SessionMeta {
+                                    networked: true,
+                                    project_dir,
+                                    canonical_project_identity,
+                                    backend,
+                                    backend_session_id,
+                                    prompt,
+                                    reminder,
+                                    ..Default::default()
+                                },
+                            }
+                        }
                         ModelMsg::RecoverBackendIdentity { id } => {
                             let (owner, pane, project_dir, canonical_project_identity) = ds
                                 .sessions
@@ -16815,15 +16781,26 @@ mod stateright_model {
                             id,
                             keep_worktree: true,
                         },
-                        ModelMsg::ReapDead { ids } => Event::ReapDead {
-                            dead_sessions: ids
-                                .into_iter()
-                                .filter_map(|id| {
-                                    let session = ds.sessions.get(&id)?;
-                                    Some((session.owner(), session.pane.clone()?))
-                                })
-                                .collect(),
-                        },
+                        ModelMsg::ReapDead { ids } => {
+                            let id = ids.into_iter().next().unwrap_or_default();
+                            let (owner, expected_pane) = ds
+                                .sessions
+                                .get(&id)
+                                .map(|session| (session.owner(), session.pane.clone()))
+                                .unwrap_or((
+                                    ResourceOwner {
+                                        session_id: id,
+                                        incarnation: SessionIncarnation::default(),
+                                    },
+                                    None,
+                                ));
+                            Event::DormantOwned {
+                                owner,
+                                expected_pane,
+                                observed_at: 0,
+                                source: DormancySource::Reaped,
+                            }
+                        }
                         ModelMsg::Rename { old_id, new_id } => Event::Rename { old_id, new_id },
                         ModelMsg::WireAnnounce {
                             id,
@@ -16891,7 +16868,33 @@ mod stateright_model {
                         },
                         _ => unreachable!(),
                     };
+                    let expected_reaped_identity = if is_reap {
+                        match &event {
+                            Event::DormantOwned { owner, .. } => ds
+                                .sessions
+                                .get(&owner.session_id)
+                                .filter(|session| {
+                                    session.owner() == *owner
+                                        && session.metadata.backend.is_some()
+                                        && session.metadata.backend_session_id.is_some()
+                                        && session.metadata.project_dir.is_some()
+                                        && session.metadata.canonical_project_identity.is_some()
+                                })
+                                .map(|session| (owner.clone(), session.metadata.clone())),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
                     let effects = ds.apply(event);
+                    if let Some((owner, metadata)) = expected_reaped_identity {
+                        *reap_identity_preserved &= ds
+                            .dormant_sessions
+                            .get(&owner.session_id)
+                            .is_some_and(|dormant| {
+                                dormant.prior_owner == owner && dormant.metadata == metadata
+                            });
+                    }
                     normalize_timestamps(ds);
                     *last_send_result = None;
                     *last_event_type = LastEvent::Other;
@@ -16998,14 +17001,14 @@ mod stateright_model {
                                     let pane = ds.sessions.get(&id)?.pane.clone()?;
                                     let stale_incarnation =
                                         SessionIncarnation(owner.incarnation.0.saturating_sub(1));
-                                    Some(ds.apply(Event::ReapDead {
-                                        dead_sessions: vec![(
-                                            ResourceOwner {
-                                                session_id: id.clone(),
-                                                incarnation: stale_incarnation,
-                                            },
-                                            pane,
-                                        )],
+                                    Some(ds.apply(Event::DormantOwned {
+                                        owner: ResourceOwner {
+                                            session_id: id.clone(),
+                                            incarnation: stale_incarnation,
+                                        },
+                                        expected_pane: Some(pane),
+                                        observed_at: 0,
+                                        source: DormancySource::Reaped,
                                     }))
                                 })
                                 .unwrap_or_default();
@@ -17256,6 +17259,7 @@ mod stateright_model {
         recovered_incarnation_advanced: bool,
         no_worktree_cleanup: bool,
         accounting_monotonic: bool,
+        dormant_metadata_preserved: bool,
     }
 
     impl IdentityObservation {
@@ -17268,6 +17272,7 @@ mod stateright_model {
                 recovered_incarnation_advanced: true,
                 no_worktree_cleanup: true,
                 accounting_monotonic: true,
+                dormant_metadata_preserved: true,
             }
         }
 
@@ -17361,6 +17366,11 @@ mod stateright_model {
                     let metadata = &mut ds.sessions.get_mut(id).unwrap().metadata;
                     metadata.active_context_accumulated_secs = 3;
                     metadata.active_context_segment_started_at = Some(10);
+                    let mut expected_metadata = metadata.clone();
+                    close_active_context_segment(&mut expected_metadata, 20);
+                    expected_metadata.session_start_credential = None;
+                    expected_metadata.backend_repair_reservation = None;
+                    expected_metadata.scanner_registration = false;
                     let before = metadata.active_context_accumulated_secs;
                     let pane = ds.sessions[id].pane.clone();
                     observation.record(ds.apply(Event::DormantOwned {
@@ -17370,6 +17380,7 @@ mod stateright_model {
                         source: DormancySource::Reaped,
                     }));
                     let dormant = &ds.dormant_sessions[id];
+                    observation.dormant_metadata_preserved &= dormant.metadata == expected_metadata;
                     observation.accounting_monotonic &=
                         dormant.metadata.active_context_accumulated_secs >= before;
                 }
@@ -18141,8 +18152,7 @@ mod stateright_model {
         true
     }
 
-    /// ReapDead must never emit CleanupWorktree. Reap preserves worktrees
-    /// (uncommitted work) -- only explicit Remove with keep_worktree=false cleans up.
+    /// Reaping must never emit CleanupWorktree.
     fn check_reap_never_cleans_worktree(
         _: &ActorModel<ModelActor, ()>,
         state: &<ActorModel<ModelActor, ()> as Model>::State,
@@ -18162,6 +18172,22 @@ mod stateright_model {
         true
     }
 
+    /// Complete reaped identities must retain their tombstone metadata.
+    fn check_reap_preserves_identity(
+        _: &ActorModel<ModelActor, ()>,
+        state: &<ActorModel<ModelActor, ()> as Model>::State,
+    ) -> bool {
+        state.actor_states.iter().all(|actor| {
+            !matches!(
+                actor.as_ref(),
+                ModelState::Daemon {
+                    reap_identity_preserved: false,
+                    ..
+                }
+            )
+        })
+    }
+
     /// Liveness: the model exercises worktree cleanup at least once.
     fn check_some_worktree_cleanup(
         _: &ActorModel<ModelActor, ()>,
@@ -18178,7 +18204,7 @@ mod stateright_model {
         })
     }
 
-    /// Liveness: the model exercises the ReapDead path.
+    /// Liveness: the model exercises the reaper path.
     fn check_some_reap(
         _: &ActorModel<ModelActor, ()>,
         state: &<ActorModel<ModelActor, ()> as Model>::State,
@@ -18441,6 +18467,11 @@ mod stateright_model {
             )
             .property(
                 Expectation::Always,
+                "reap preserves complete identity",
+                check_reap_preserves_identity,
+            )
+            .property(
+                Expectation::Always,
                 "local backend identity unique",
                 check_local_backend_identity_unique,
             )
@@ -18494,6 +18525,11 @@ mod stateright_model {
                 Expectation::Always,
                 "reap never cleans worktree",
                 check_reap_never_cleans_worktree,
+            )
+            .property(
+                Expectation::Always,
+                "reap preserves complete identity",
+                check_reap_preserves_identity,
             )
             .property(
                 Expectation::Always,
@@ -18581,6 +18617,11 @@ mod stateright_model {
                 Expectation::Always,
                 "dormant active time never decreases",
                 check_dormant_accounting_never_decreases,
+            )
+            .property(
+                Expectation::Always,
+                "reap preserves complete identity",
+                check_reap_preserves_identity,
             )
             .property(
                 Expectation::Sometimes,

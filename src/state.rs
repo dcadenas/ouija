@@ -1834,12 +1834,6 @@ impl AppState {
                 project_dirs.push(expected_project_dir.clone());
                 project_dirs.push(expected_canonical_project_identity.clone());
             }
-            crate::daemon_protocol::Event::ReapDead { dead_sessions } => {
-                for (owner, pane) in dead_sessions {
-                    add_current(&mut keys, &mut project_dirs, &protocol, &owner.session_id);
-                    keys.push(ResourceGateKey::Pane(pane.clone()));
-                }
-            }
             crate::daemon_protocol::Event::PruneStale { sessions } => {
                 for (owner, project_dir) in sessions {
                     add_current(&mut keys, &mut project_dirs, &protocol, &owner.session_id);
