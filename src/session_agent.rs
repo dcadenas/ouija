@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use ractor::concurrency::JoinHandle;
@@ -86,6 +86,7 @@ pub struct SessionAgentState {
     watchdog_timer: Option<JoinHandle<Result<(), MessagingErr<SessionMsg>>>>,
     /// One-shot continuation text to inject after compact completes.
     pub pending_compact_continuation: Option<String>,
+    pending_reply_reminder_attempts: HashMap<(String, u64), tokio::time::Instant>,
 }
 
 impl std::fmt::Debug for SessionAgentState {
@@ -146,7 +147,44 @@ impl SessionAgentState {
             next_clearing_id: 0,
             watchdog_timer: None,
             pending_compact_continuation: None,
+            pending_reply_reminder_attempts: HashMap::new(),
         }
+    }
+
+    fn claim_due_pending_reply_reminders(
+        &mut self,
+        all_pending: &[PendingReplyEntry],
+        eligible: &[&PendingReplyEntry],
+        now: tokio::time::Instant,
+        cooldown: std::time::Duration,
+    ) -> Vec<PendingReplyEntry> {
+        self.pending_reply_reminder_attempts
+            .retain(|(from, msg_id), _| {
+                all_pending
+                    .iter()
+                    .any(|entry| entry.from == *from && entry.msg_id == *msg_id)
+            });
+
+        eligible
+            .iter()
+            .filter_map(|entry| {
+                let key = (entry.from.clone(), entry.msg_id);
+                let cooling_down =
+                    self.pending_reply_reminder_attempts
+                        .get(&key)
+                        .is_some_and(|last_attempt| {
+                            match now.checked_duration_since(*last_attempt) {
+                                Some(elapsed) => elapsed < cooldown,
+                                None => true,
+                            }
+                        });
+                if cooling_down {
+                    return None;
+                }
+                self.pending_reply_reminder_attempts.insert(key, now);
+                Some((*entry).clone())
+            })
+            .collect()
     }
 
     fn owns(&self, protocol: &crate::daemon_protocol::DaemonState) -> bool {
@@ -246,20 +284,25 @@ impl Actor for SessionAgent {
                 // nudges. Without either reason, the idle-check would just
                 // create a nudge loop (the session responds to clear it, which
                 // triggers Active→Stopped→repeat).
-                let (has_pending, has_reminder) = {
+                let (pending, has_reminder) = {
                     let proto = self.app_state.protocol.read().await;
                     let session = state
                         .owns(&proto)
                         .then(|| proto.sessions.get(&state.owner.session_id))
                         .flatten();
-                    let pending = session.is_some()
-                        && proto
+                    let pending = if session.is_some() {
+                        proto
                             .pending_replies
                             .get(&state.owner.session_id)
-                            .is_some_and(|pending| !pending.is_empty());
+                            .cloned()
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     let reminder = session.is_some_and(|s| s.metadata.has_active_reminder());
                     (pending, reminder)
                 };
+                let has_pending = !pending.is_empty();
 
                 if has_pending || has_reminder {
                     state.idle_timer = Some(
@@ -276,29 +319,14 @@ impl Actor for SessionAgent {
                 }
 
                 // Nudge about pending replies older than idle_timeout
-                if has_pending {
-                    let cutoff = Utc::now().timestamp() - timeout as i64;
-                    let pending = {
-                        let protocol = self.app_state.protocol.read().await;
-                        if state.owns(&protocol) {
-                            protocol
-                                .pending_replies
-                                .get(&state.owner.session_id)
-                                .cloned()
-                                .unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        }
-                    };
-                    let overdue: Vec<&PendingReplyEntry> = pending
-                        .iter()
-                        .filter(|p| p.last_activity < cutoff)
-                        .collect();
-
-                    if !overdue.is_empty() {
-                        self.send_reminders(&overdue, state).await;
-                    }
-                }
+                let cutoff = Utc::now().timestamp() - timeout as i64;
+                let overdue: Vec<&PendingReplyEntry> = pending
+                    .iter()
+                    .filter(|p| p.last_activity < cutoff)
+                    .collect();
+                let cooldown = std::time::Duration::from_secs(timeout);
+                self.send_pending_reply_reminders(&pending, &overdue, state, cooldown, None)
+                    .await;
 
                 self.app_state
                     .apply_and_execute(crate::daemon_protocol::Event::ActiveContextStopped {
@@ -527,27 +555,18 @@ impl Actor for SessionAgent {
                             count = pending.len(),
                             "reminding about unanswered pending replies"
                         );
-                        for p in &pending {
-                            if !self.is_current(state).await {
-                                break;
-                            }
-                            let Some(pane) = state.pane.as_deref() else {
-                                break;
-                            };
-                            let msg = format!(
-                                "<ouija-status type=\"reminder\" clearing_id=\"{clearing_id}\">Pending reply owed: msg #{} from {}</ouija-status>",
-                                p.msg_id, p.from
-                            );
-                            let _ = crate::tmux::locked_inject_owned(
-                                &self.app_state,
-                                &state.owner,
-                                pane,
-                                &msg,
-                                vim_mode,
-                            )
-                            .await;
-                        }
                     }
+                    let eligible = pending.iter().collect::<Vec<_>>();
+                    self.send_pending_reply_reminders(
+                        &pending,
+                        &eligible,
+                        state,
+                        std::time::Duration::from_secs(
+                            self.app_state.settings.read().await.idle_timeout_secs,
+                        ),
+                        Some(clearing_id),
+                    )
+                    .await;
                 }
             }
         }
@@ -640,31 +659,53 @@ impl SessionAgent {
         current
     }
 
-    /// Inject pending-reply reminders into the session's pane.
-    async fn send_reminders(&self, entries: &[&PendingReplyEntry], state: &SessionAgentState) {
-        let Some(pane) = state.pane.as_deref() else {
+    async fn send_pending_reply_reminders(
+        &self,
+        all_pending: &[PendingReplyEntry],
+        eligible: &[&PendingReplyEntry],
+        state: &mut SessionAgentState,
+        cooldown: std::time::Duration,
+        clearing_id: Option<u64>,
+    ) {
+        if !self.is_current(state).await {
+            return;
+        }
+        let Some(pane) = state.pane.clone() else {
             return;
         };
+        let due = state.claim_due_pending_reply_reminders(
+            all_pending,
+            eligible,
+            tokio::time::Instant::now(),
+            cooldown,
+        );
         let vim_mode = self.app_state.protocol.read().await;
         let vim_mode = vim_mode
             .session_agent_pane_for_owner(&state.owner)
-            .filter(|claimed| *claimed == Some(pane))
+            .filter(|claimed| *claimed == Some(pane.as_str()))
             .and_then(|_| vim_mode.sessions.get(&state.owner.session_id))
             .map(|session| session.metadata.vim_mode)
             .unwrap_or(false);
 
-        for p in entries {
+        for entry in due {
             if !self.is_current(state).await {
                 break;
             }
-            let reminder = format!(
-                "<ouija-status type=\"reminder\">You have an unanswered question from {} (msg {}) — reply using: ouija reply {} {} \"your answer\"</ouija-status>",
-                p.from, p.msg_id, p.from, p.msg_id
-            );
+            let reminder = if let Some(clearing_id) = clearing_id {
+                format!(
+                    "<ouija-status type=\"reminder\" clearing_id=\"{clearing_id}\">Pending reply owed: msg #{} from {}</ouija-status>",
+                    entry.msg_id, entry.from
+                )
+            } else {
+                format!(
+                    "<ouija-status type=\"reminder\">You have an unanswered question from {} (msg {}) — reply using: ouija reply {} {} \"your answer\"</ouija-status>",
+                    entry.from, entry.msg_id, entry.from, entry.msg_id
+                )
+            };
             let _ = crate::tmux::locked_inject_owned(
                 &self.app_state,
                 &state.owner,
-                pane,
+                &pane,
                 &reminder,
                 vim_mode,
             )
@@ -915,6 +956,23 @@ mod tests {
         handle.await.expect("actor failed");
     }
 
+    async fn spawn_reminder_test_agent(
+        state: Arc<AppState>,
+        session_id: &str,
+    ) -> (ActorRef<SessionMsg>, ractor::concurrency::JoinHandle<()>) {
+        let owner = state.protocol.read().await.sessions[session_id].owner();
+        Actor::spawn(
+            None,
+            SessionAgent { app_state: state },
+            SessionAgentArgs {
+                owner,
+                pane: Some("%99".into()),
+            },
+        )
+        .await
+        .expect("spawn failed")
+    }
+
     async fn register_test_session(
         state: &std::sync::Arc<crate::state::AppState>,
         id: &str,
@@ -936,10 +994,113 @@ mod tests {
         }
     }
 
+    fn pending_entry(from: &str, msg_id: u64) -> PendingReplyEntry {
+        PendingReplyEntry {
+            msg_id,
+            from: from.into(),
+            message: "question".into(),
+            received_at: 1,
+            last_activity: 1,
+            in_progress: false,
+        }
+    }
+
     #[test]
     fn agent_state_starts_not_idle() {
         let state = SessionAgentState::new(test_owner("test-sess"), "%1".into());
         assert!(!state.idle);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_reply_cooldown_reopens_only_after_the_full_timeout() {
+        let mut state = SessionAgentState::new(test_owner("worker"), "%1".into());
+        let pending = vec![pending_entry("parent", 10)];
+        let eligible = pending.iter().collect::<Vec<_>>();
+        let cooldown = std::time::Duration::from_secs(60);
+        let now = tokio::time::Instant::now();
+
+        assert_eq!(
+            state
+                .claim_due_pending_reply_reminders(&pending, &eligible, now, cooldown)
+                .len(),
+            1
+        );
+        tokio::time::advance(std::time::Duration::from_secs(59)).await;
+        assert!(
+            state
+                .claim_due_pending_reply_reminders(
+                    &pending,
+                    &eligible,
+                    tokio::time::Instant::now(),
+                    cooldown,
+                )
+                .is_empty()
+        );
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert_eq!(
+            state
+                .claim_due_pending_reply_reminders(
+                    &pending,
+                    &eligible,
+                    tokio::time::Instant::now(),
+                    cooldown,
+                )
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_reply_cooldown_is_independent_per_message_identity() {
+        let mut state = SessionAgentState::new(test_owner("worker"), "%1".into());
+        let first = vec![pending_entry("parent", 10)];
+        let first_eligible = first.iter().collect::<Vec<_>>();
+        let cooldown = std::time::Duration::from_secs(60);
+        let now = tokio::time::Instant::now();
+
+        assert_eq!(
+            state
+                .claim_due_pending_reply_reminders(&first, &first_eligible, now, cooldown)
+                .len(),
+            1
+        );
+
+        let both = vec![pending_entry("parent", 10), pending_entry("parent", 11)];
+        let both_eligible = both.iter().collect::<Vec<_>>();
+        let claimed = state.claim_due_pending_reply_reminders(&both, &both_eligible, now, cooldown);
+        assert_eq!(
+            claimed.iter().map(|entry| entry.msg_id).collect::<Vec<_>>(),
+            vec![11]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_reply_cooldown_prunes_resolved_message_identity() {
+        let mut state = SessionAgentState::new(test_owner("worker"), "%1".into());
+        let first = vec![pending_entry("parent", 10)];
+        let eligible = first.iter().collect::<Vec<_>>();
+        let now = tokio::time::Instant::now();
+        let cooldown = std::time::Duration::from_secs(60);
+
+        assert_eq!(
+            state
+                .claim_due_pending_reply_reminders(&first, &eligible, now, cooldown)
+                .len(),
+            1
+        );
+        assert!(
+            state
+                .claim_due_pending_reply_reminders(&[], &[], now, cooldown)
+                .is_empty()
+        );
+
+        assert_eq!(
+            state
+                .claim_due_pending_reply_reminders(&first, &eligible, now, cooldown)
+                .len(),
+            1,
+            "a newly pending message with the same identity is eligible after pruning"
+        );
     }
 
     #[tokio::test]
@@ -1676,6 +1837,43 @@ mod tests {
             messages[0],
             "<ouija-status type=\"reminder\" clearing_id=\"1\">Pending reply owed: msg #73 from requester</ouija-status>"
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn rapid_stopped_boundaries_throttle_one_overdue_pending_reply() {
+        let (state, messages, server) =
+            opencode_reminder_test_state("rapid-pending", None, None).await;
+        state.protocol.write().await.pending_replies.insert(
+            "rapid-pending".into(),
+            vec![PendingReplyEntry {
+                msg_id: 74,
+                from: "requester".into(),
+                message: "what failed?".into(),
+                received_at: Utc::now().timestamp() - 2,
+                last_activity: Utc::now().timestamp() - 2,
+                in_progress: false,
+            }],
+        );
+
+        let (actor, handle) = spawn_reminder_test_agent(state, "rapid-pending").await;
+        actor.cast(SessionMsg::Stopped).expect("first stopped");
+        let _ = ractor::call!(actor, SessionMsg::GetPendingReplies).expect("flush first stopped");
+        wait_for_message_count(&messages, 1).await;
+
+        actor.cast(SessionMsg::Stopped).expect("second stopped");
+        actor.cast(SessionMsg::Stopped).expect("third stopped");
+        let _ =
+            ractor::call!(actor, SessionMsg::GetPendingReplies).expect("flush repeated stopped");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(
+            messages.lock().await.len(),
+            1,
+            "the same overdue pending reply must be attempted only once per idle timeout"
+        );
+        actor.stop(None);
+        handle.await.expect("actor failed");
         server.abort();
     }
 
