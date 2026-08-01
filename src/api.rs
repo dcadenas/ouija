@@ -5478,6 +5478,7 @@ mod tests {
                 pane: Some("%712".into()),
                 metadata: crate::daemon_protocol::SessionMeta {
                     project_dir: Some(project_dir.clone()),
+                    canonical_project_identity: Some(project_dir.clone()),
                     ..Default::default()
                 },
             })

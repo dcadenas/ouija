@@ -1052,6 +1052,7 @@ pub enum Event {
         owner: ResourceOwner,
         expected_pane: String,
         expected_project_dir: String,
+        expected_canonical_project_identity: String,
         backend: String,
         backend_session_id: String,
     },
@@ -2501,12 +2502,14 @@ impl DaemonState {
                 owner,
                 expected_pane,
                 expected_project_dir,
+                expected_canonical_project_identity,
                 backend,
                 backend_session_id,
             } => self.apply_recover_backend_identity(
                 &owner,
                 &expected_pane,
                 &expected_project_dir,
+                &expected_canonical_project_identity,
                 backend,
                 backend_session_id,
             ),
@@ -5191,17 +5194,21 @@ impl DaemonState {
         owner: &ResourceOwner,
         expected_pane: &str,
         expected_project_dir: &str,
+        expected_canonical_project_identity: &str,
         backend: String,
         backend_session_id: String,
     ) -> Vec<Effect> {
         if backend.is_empty()
             || backend_session_id.is_empty()
+            || !usable_project_identity(expected_project_dir)
+            || !usable_project_identity(expected_canonical_project_identity)
             || self.lifecycle_leases.iter().any(|(id, lease)| {
                 id == &owner.session_id
                     || lease.owner == *owner
                     || lease.backend_session_owner.as_ref() == Some(owner)
                     || lease.restart_target_owner.as_ref() == Some(owner)
                     || lease.project_dir.as_deref() == Some(expected_project_dir)
+                    || lease.project_dir.as_deref() == Some(expected_canonical_project_identity)
                     || lease.inert_pane.as_deref() == Some(expected_pane)
                     || (lease.backend.as_deref() == Some(backend.as_str())
                         && lease.backend_session_id.as_deref() == Some(backend_session_id.as_str()))
@@ -5216,6 +5223,8 @@ impl DaemonState {
             || target.owner() != *owner
             || target.pane.as_deref() != Some(expected_pane)
             || target.metadata.project_dir.as_deref() != Some(expected_project_dir)
+            || target.metadata.canonical_project_identity.as_deref()
+                != Some(expected_canonical_project_identity)
             || target.metadata.backend.is_some()
             || target.metadata.backend_session_id.is_some()
             || target.metadata.session_start_credential.is_some()
@@ -10739,6 +10748,7 @@ mod tests {
                 owner: baseline.sessions["blank"].owner(),
                 expected_pane: "%2".into(),
                 expected_project_dir: "/tmp/repo/.ouija/worktrees/blank".into(),
+                expected_canonical_project_identity: "/tmp/repo".into(),
                 backend: "codex-cli".into(),
                 backend_session_id: "thread-9".into(),
             },
@@ -10746,6 +10756,7 @@ mod tests {
                 owner: stale_blank_owner,
                 expected_pane: "%2".into(),
                 expected_project_dir: "/tmp/repo/.ouija/worktrees/blank".into(),
+                expected_canonical_project_identity: "/tmp/repo".into(),
                 backend: "codex-cli".into(),
                 backend_session_id: "unreserved-thread".into(),
             },
@@ -14485,6 +14496,7 @@ mod tests {
             pane: Some("%712".into()),
             metadata: SessionMeta {
                 project_dir: Some("/home/daniel/code/divine-invite-darshan".into()),
+                canonical_project_identity: Some("/home/daniel/code/divine-invite-darshan".into()),
                 role: Some("preserve current Codex context".into()),
                 ..Default::default()
             },
@@ -14498,6 +14510,7 @@ mod tests {
             owner: owner.clone(),
             expected_pane: "%712".into(),
             expected_project_dir: "/home/daniel/code/divine-invite-darshan".into(),
+            expected_canonical_project_identity: "/home/daniel/code/divine-invite-darshan".into(),
             backend: "codex-cli".into(),
             backend_session_id: "codex-thread-existing".into(),
         }
@@ -14612,6 +14625,8 @@ mod tests {
                 },
                 expected_pane: "%712".into(),
                 expected_project_dir: "/home/daniel/code/divine-invite-darshan".into(),
+                expected_canonical_project_identity: "/home/daniel/code/divine-invite-darshan"
+                    .into(),
                 backend: "codex-cli".into(),
                 backend_session_id: "codex-thread-existing".into(),
             },
@@ -14619,6 +14634,8 @@ mod tests {
                 owner: owner.clone(),
                 expected_pane: "%999".into(),
                 expected_project_dir: "/home/daniel/code/divine-invite-darshan".into(),
+                expected_canonical_project_identity: "/home/daniel/code/divine-invite-darshan"
+                    .into(),
                 backend: "codex-cli".into(),
                 backend_session_id: "codex-thread-existing".into(),
             },
@@ -14626,6 +14643,16 @@ mod tests {
                 owner: owner.clone(),
                 expected_pane: "%712".into(),
                 expected_project_dir: "/home/daniel/code/sibling".into(),
+                expected_canonical_project_identity: "/home/daniel/code/divine-invite-darshan"
+                    .into(),
+                backend: "codex-cli".into(),
+                backend_session_id: "codex-thread-existing".into(),
+            },
+            Event::RecoverBackendIdentity {
+                owner: owner.clone(),
+                expected_pane: "%712".into(),
+                expected_project_dir: "/home/daniel/code/divine-invite-darshan".into(),
+                expected_canonical_project_identity: "/home/daniel/code/sibling".into(),
                 backend: "codex-cli".into(),
                 backend_session_id: "codex-thread-existing".into(),
             },
@@ -16747,7 +16774,7 @@ mod stateright_model {
                             },
                         },
                         ModelMsg::RecoverBackendIdentity { id } => {
-                            let (owner, pane, project_dir) = ds
+                            let (owner, pane, project_dir, canonical_project_identity) = ds
                                 .sessions
                                 .get(&id)
                                 .map(|session| {
@@ -16755,6 +16782,11 @@ mod stateright_model {
                                         session.owner(),
                                         session.pane.clone().unwrap_or_default(),
                                         session.metadata.project_dir.clone().unwrap_or_default(),
+                                        session
+                                            .metadata
+                                            .canonical_project_identity
+                                            .clone()
+                                            .unwrap_or_default(),
                                     )
                                 })
                                 .unwrap_or((
@@ -16764,11 +16796,13 @@ mod stateright_model {
                                     },
                                     String::new(),
                                     String::new(),
+                                    String::new(),
                                 ));
                             Event::RecoverBackendIdentity {
                                 owner,
                                 expected_pane: pane,
                                 expected_project_dir: project_dir,
+                                expected_canonical_project_identity: canonical_project_identity,
                                 backend: "codex-cli".into(),
                                 backend_session_id: "model-thread".into(),
                             }

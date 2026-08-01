@@ -1240,19 +1240,22 @@ fn backend_recovery_lease_conflicts(
     owner: &crate::daemon_protocol::ResourceOwner,
     pane: &str,
     project_dir: &str,
+    canonical_project_identity: &str,
     identity: &crate::backend::BackendSessionIdentity,
 ) -> bool {
-    let project_identity = project_dir_identity(project_dir);
+    let actual_project_identity = project_dir_identity(project_dir);
+    let canonical_project_identity = project_dir_identity(canonical_project_identity);
     protocol.lifecycle_leases.iter().any(|(id, lease)| {
         id == &owner.session_id
             || lease.owner == *owner
             || lease.backend_session_owner.as_ref() == Some(owner)
             || lease.restart_target_owner.as_ref() == Some(owner)
             || lease.inert_pane.as_deref() == Some(pane)
-            || lease
-                .project_dir
-                .as_deref()
-                .is_some_and(|dir| project_dir_identity(dir) == project_identity)
+            || lease.project_dir.as_deref().is_some_and(|dir| {
+                let lease_identity = project_dir_identity(dir);
+                lease_identity == actual_project_identity
+                    || lease_identity == canonical_project_identity
+            })
             || (lease.backend.as_deref() == Some(identity.backend.as_str())
                 && lease.backend_session_id.as_deref() == Some(identity.session_id.as_str()))
     })
@@ -1821,6 +1824,7 @@ impl AppState {
                 owner,
                 expected_pane,
                 expected_project_dir,
+                expected_canonical_project_identity,
                 backend_session_id,
                 ..
             } => {
@@ -1828,6 +1832,7 @@ impl AppState {
                 keys.push(ResourceGateKey::Pane(expected_pane.clone()));
                 keys.push(ResourceGateKey::BackendSession(backend_session_id.clone()));
                 project_dirs.push(expected_project_dir.clone());
+                project_dirs.push(expected_canonical_project_identity.clone());
             }
             crate::daemon_protocol::Event::ReapDead { dead_sessions } => {
                 for (owner, pane) in dead_sessions {
@@ -3465,7 +3470,7 @@ impl AppState {
         identity: &crate::backend::BackendSessionIdentity,
         caller: &BackendRecoveryCallerEvidence,
     ) -> BackendIdentityRecoveryOutcome {
-        let (owner, pane, project_dir) = {
+        let (owner, pane, project_dir, canonical_project_identity) = {
             let protocol = self.protocol.read().await;
             let Some(target) = protocol.sessions.get(target_session_id) else {
                 return BackendIdentityRecoveryOutcome::TargetNotFound;
@@ -3499,6 +3504,11 @@ impl AppState {
             let Some(project_dir) = target.metadata.project_dir.clone() else {
                 return BackendIdentityRecoveryOutcome::TargetMissingProject;
             };
+            let Some(canonical_project_identity) =
+                target.metadata.canonical_project_identity.clone()
+            else {
+                return BackendIdentityRecoveryOutcome::TargetMissingProject;
+            };
             if caller
                 .pane
                 .as_deref()
@@ -3514,20 +3524,33 @@ impl AppState {
             {
                 return BackendIdentityRecoveryOutcome::PositiveEvidenceMismatch;
             }
-            (target.owner(), pane, project_dir)
+            (
+                target.owner(),
+                pane,
+                project_dir,
+                canonical_project_identity,
+            )
         };
 
         let event = crate::daemon_protocol::Event::RecoverBackendIdentity {
             owner: owner.clone(),
             expected_pane: pane.clone(),
             expected_project_dir: project_dir.clone(),
+            expected_canonical_project_identity: canonical_project_identity.clone(),
             backend: identity.backend.clone(),
             backend_session_id: identity.session_id.clone(),
         };
         let resource_guards = self.lock_event_resources(&event).await;
         {
             let protocol = self.protocol.read().await;
-            if backend_recovery_lease_conflicts(&protocol, &owner, &pane, &project_dir, identity) {
+            if backend_recovery_lease_conflicts(
+                &protocol,
+                &owner,
+                &pane,
+                &project_dir,
+                &canonical_project_identity,
+                identity,
+            ) {
                 return BackendIdentityRecoveryOutcome::LifecycleInProgress;
             }
         }
@@ -3545,11 +3568,17 @@ impl AppState {
         if crate::tmux::matching_process_name(process_name, backend.process_names()).is_none() {
             return BackendIdentityRecoveryOutcome::PaneBackendMismatch;
         }
-        let project_identity = project_dir_identity(&project_dir);
-        if live_pane
-            .pane_current_path
-            .as_deref()
-            .is_none_or(|path| project_dir_identity(path) != project_identity)
+        let Some(live_project_path) = live_pane.pane_current_path.as_deref() else {
+            return BackendIdentityRecoveryOutcome::PaneProjectMismatch;
+        };
+        let Ok(live_project) =
+            crate::project_identity::resolve_project_identity_async(live_project_path).await
+        else {
+            return BackendIdentityRecoveryOutcome::PaneProjectMismatch;
+        };
+        if project_dir_identity(&live_project.project_dir) != project_dir_identity(&project_dir)
+            || project_dir_identity(&live_project.canonical_repository)
+                != project_dir_identity(&canonical_project_identity)
         {
             return BackendIdentityRecoveryOutcome::PaneProjectMismatch;
         }
@@ -3579,7 +3608,14 @@ impl AppState {
 
         let effects = {
             let mut protocol = self.protocol.write().await;
-            if backend_recovery_lease_conflicts(&protocol, &owner, &pane, &project_dir, identity) {
+            if backend_recovery_lease_conflicts(
+                &protocol,
+                &owner,
+                &pane,
+                &project_dir,
+                &canonical_project_identity,
+                identity,
+            ) {
                 return BackendIdentityRecoveryOutcome::LifecycleInProgress;
             }
             let before = protocol.clone();
@@ -12906,6 +12942,7 @@ pub(crate) mod tests {
                 pane: Some("%712".into()),
                 metadata: crate::daemon_protocol::SessionMeta {
                     project_dir: Some(project_dir.into()),
+                    canonical_project_identity: Some(project_dir.into()),
                     ..Default::default()
                 },
             })
@@ -13134,6 +13171,76 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn backend_recovery_rejects_project_repointed_to_another_git_repository() {
+        let parent = tempfile::tempdir().unwrap();
+        let project = parent.path().join("worktree");
+        let other_worktree = parent.path().join("other-worktree");
+        let repository_a = parent.path().join("repository-a");
+        let repository_b = parent.path().join("repository-b");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&other_worktree).unwrap();
+        for (worktree, repository) in [(&project, &repository_a), (&other_worktree, &repository_b)]
+        {
+            let output = std::process::Command::new("git")
+                .args([
+                    "init",
+                    "-q",
+                    "--separate-git-dir",
+                    repository.to_str().unwrap(),
+                    worktree.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git init failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let original =
+            crate::project_identity::resolve_project_identity(project.to_str().unwrap()).unwrap();
+        let (state, _owner, identity) = recovery_state(&original.project_dir).await;
+        state
+            .protocol
+            .write()
+            .await
+            .sessions
+            .get_mut("divine-invite-darshan")
+            .unwrap()
+            .metadata
+            .canonical_project_identity = Some(original.canonical_repository.clone());
+
+        std::fs::write(
+            project.join(".git"),
+            format!("gitdir: {}\n", repository_b.display()),
+        )
+        .unwrap();
+        let repointed =
+            crate::project_identity::resolve_project_identity(project.to_str().unwrap()).unwrap();
+        assert_eq!(repointed.project_dir, original.project_dir);
+        assert_ne!(
+            repointed.canonical_repository,
+            original.canonical_repository
+        );
+
+        let outcome = state
+            .recover_backend_identity(
+                "divine-invite-darshan",
+                &identity,
+                &BackendRecoveryCallerEvidence::default(),
+            )
+            .await;
+
+        assert_eq!(outcome, BackendIdentityRecoveryOutcome::PaneProjectMismatch);
+        assert!(
+            state.protocol.read().await.sessions["divine-invite-darshan"]
+                .metadata
+                .backend
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn backend_recovery_rolls_back_when_durable_persistence_fails() {
         let config_dir = tempfile::tempdir().unwrap();
         let invalid_data_parent = config_dir.path().join("not-a-directory");
@@ -13159,6 +13266,7 @@ pub(crate) mod tests {
                 origin: Origin::Local,
                 metadata: crate::daemon_protocol::SessionMeta {
                     project_dir: Some(project_dir.clone()),
+                    canonical_project_identity: Some(project_dir.clone()),
                     session_incarnation: owner.incarnation,
                     ..Default::default()
                 },
