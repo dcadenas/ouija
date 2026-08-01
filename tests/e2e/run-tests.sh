@@ -68,21 +68,22 @@ result=$(api "$BASE" POST /api/register -d "{\"id\":\"sess-b\",\"pane\":\"$PANE_
 assert_contains "register returns id" "$result" '"registered":"sess-b"'
 assert_eq "session count is 2" "$(session_count "$BASE")" "2"
 
-log "Test 3: Pane dedup — re-register same pane with new ID replaces old"
-result=$(api "$BASE" POST /api/register -d "{\"id\":\"sess-a-renamed\",\"pane\":\"$PANE_A\"}")
-assert_contains "dedup replaces old session" "$result" '"registered":"sess-a-renamed"'
-assert_contains "reports replaced session" "$result" '"pane"'
+log "Test 3: Register refuses to evict a live pane owner"
+register_status=$(curl -s -o /tmp/register-conflict.json -w '%{http_code}' \
+    -X POST "$BASE/api/register" -H 'Content-Type: application/json' \
+    -d "{\"id\":\"sess-a-renamed\",\"pane\":\"$PANE_A\"}")
+assert_eq "live pane registration returns conflict" "$register_status" "409"
 ids=$(session_ids "$BASE")
-assert_contains "new id present" "$ids" "sess-a-renamed"
-assert_not_contains "old id gone" "$ids" "sess-a "
+assert_contains "current owner remains" "$ids" "sess-a"
+assert_not_contains "conflicting id absent" "$ids" "sess-a-renamed"
 assert_eq "session count still 2" "$(session_count "$BASE")" "2"
 
 log "Test 4: Rename via API"
-result=$(api "$BASE" POST /api/rename -d '{"old_id":"sess-a-renamed","new_id":"sess-a2"}')
+result=$(api "$BASE" POST /api/rename -d '{"old_id":"sess-a","new_id":"sess-a2"}')
 assert_contains "rename response" "$result" '"renamed"'
 ids=$(session_ids "$BASE")
 assert_contains "new name exists" "$ids" "sess-a2"
-assert_not_contains "old name gone" "$ids" "sess-a-renamed"
+assert_not_contains "old name gone" "$ids" "sess-a "
 
 log "Test 4b: Marker-only orphan is reclaimed and explicit CLI rename succeeds"
 MARKER_RECLAIM_PANE=$(create_claude_pane "$FAKE_BIN")
@@ -163,16 +164,16 @@ REGISTER_SCRIPT=$(find_script "ouija-register.sh")
 api "$BASE" POST /api/settings -d '{"auto_register":true}' >/dev/null
 # Remove existing registration on PANE_A so the hook can register fresh
 api "$BASE" POST /api/remove -d '{"id":"sess-a2"}' >/dev/null 2>&1 || true
-# Run the hook — it should register a session named "my-project".
+# Run the hook — the pane should reclaim its sticky public name.
 # The hook intentionally produces no stdout (see PR #534), and
 # ouija-register.sh swallows curl errors with `|| exit 0`, so asserting
 # on empty stdout would pass even if the daemon were unreachable.
 # Verify registration via the daemon's session list instead.
 echo '{"source":"startup"}' | TMUX_PANE="$PANE_A" OUIJA_PORT=$PORT bash -c "cd /tmp/my-project && bash '$REGISTER_SCRIPT'" >/dev/null 2>&1
 ids=$(session_ids "$BASE")
-assert_contains "hook-registered session in list" "$ids" "my-project"
+assert_contains "hook reclaims pane's public name" "$ids" "sess-a2"
 # Clean up
-api "$BASE" POST /api/remove -d '{"id":"my-project"}' >/dev/null 2>&1 || true
+api "$BASE" POST /api/remove -d '{"id":"sess-a2"}' >/dev/null 2>&1 || true
 api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/dev/null
 api "$BASE" POST /api/register -d "{\"id\":\"sess-b\",\"pane\":\"$PANE_B\"}" >/dev/null
 
@@ -241,12 +242,10 @@ assert_eq "10d: explicit hook consumes credential file" \
 rm -rf "$CODEX_HOOK_PROBE"
 
 log "Test 10e: Register with bulletin"
-result=$(api "$BASE" POST /api/register -d "{\"id\":\"bull-sess\",\"pane\":\"$PANE_A\",\"role\":\"tester\",\"bulletin\":\"need help with auth\"}")
-assert_contains "register with bulletin" "$result" '"registered":"bull-sess"'
-bull=$(session_field "$BASE" "bull-sess" "bulletin")
+result=$(api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\",\"role\":\"tester\",\"bulletin\":\"need help with auth\"}")
+assert_contains "register with bulletin" "$result" '"registered":"sess-a2"'
+bull=$(session_field "$BASE" "sess-a2" "bulletin")
 assert_eq "bulletin in status" "$bull" "need help with auth"
-# Rename back for later tests
-api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/dev/null
 
 log "Test 10f: Update bulletin via API"
 result=$(api "$BASE" POST /api/sessions/update -d '{"id":"sess-a2","bulletin":"offering Rust help"}')
@@ -405,8 +404,8 @@ trap - EXIT
 api "$BASE" POST /api/settings -d '{"auto_register":true}' >/dev/null
 
 log "Test 12d: Custom session names survive restart with auto-register ON"
-# Register a session with a custom name that differs from its directory basename
-api "$BASE" POST /api/register -d "{\"id\":\"my-custom-name\",\"pane\":\"$PANE_A\",\"metadata\":{\"project_dir\":\"/tmp\"}}" >/dev/null
+# Explicitly rename the pane owner to a custom name that differs from its directory basename.
+api "$BASE" POST /api/rename -d '{"old_id":"sess-a2","new_id":"my-custom-name"}' >/dev/null
 ids_before=$(session_ids "$BASE")
 assert_contains "custom name registered" "$ids_before" "my-custom-name"
 # Restart daemon WITH auto_register enabled — the bug would overwrite "my-custom-name" with "tmp"
@@ -463,12 +462,14 @@ log "Test 18: REST send to missing session — error"
 result=$(api "$BASE" POST /api/send -d '{"from":"rest-ok","to":"ghost","message":"hi"}')
 assert_contains "REST send error" "$result" '"error"'
 
-log "Test 19: REST pane dedup — re-register same pane replaces old"
-result=$(api "$BASE" POST /api/register -d "{\"id\":\"rest-renamed\",\"pane\":\"$PANE_A\"}")
-assert_contains "REST dedup replaces" "$result" '"registered":"rest-renamed"'
+log "Test 19: REST register refuses to evict a live pane owner"
+register_status=$(curl -s -o /tmp/rest-register-conflict.json -w '%{http_code}' \
+    -X POST "$BASE/api/register" -H 'Content-Type: application/json' \
+    -d "{\"id\":\"rest-renamed\",\"pane\":\"$PANE_A\"}")
+assert_eq "REST live pane registration returns conflict" "$register_status" "409"
 ids=$(session_ids "$BASE")
-assert_contains "new REST id present" "$ids" "rest-renamed"
-assert_not_contains "old REST id gone" "$ids" "rest-ok"
+assert_contains "REST current owner remains" "$ids" "rest-ok"
+assert_not_contains "REST conflicting id absent" "$ids" "rest-renamed"
 
 log "Test 19b: REST re-register same ID updates metadata"
 result=$(api "$BASE" POST /api/register -d "{\"id\":\"rest-ok\",\"pane\":\"$PANE_A\",\"role\":\"updated-role\"}")
@@ -522,7 +523,8 @@ api "$BASE" POST /api/remove -d '{"id":"autostart-sender"}' >/dev/null 2>&1 || t
 fi  # end skip auto-start test
 rm -rf "${AUTOSTART_DIR:-}" 2>/dev/null
 # Restore projects_dir
-api "$BASE" POST /api/settings -d '{"projects_dir":"/tmp/projects"}' >/dev/null
+api "$BASE" POST /api/settings \
+    -d '{"projects_dir":"/tmp/projects","default_backend":"claude-code"}' >/dev/null
 
 # ══════════════════════════════════════════════════════════════════════
 # ── Scheduled Tasks ─────────────────────────────────────────────────
@@ -669,6 +671,7 @@ L2_PANE=$(session_field "$BASE" "lifecycle-test" "pane")
 L2_PANE_PID=$(tmux display-message -t "$L2_PANE" -p '#{pane_pid}')
 L2_PHYSICAL_SESSION=$(tr '\0' '\n' <"/proc/$L2_PANE_PID/environ" | sed -n 's/^OUIJA_SESSION_ID=//p')
 L2_PHYSICAL_INCARNATION=$(tr '\0' '\n' <"/proc/$L2_PANE_PID/environ" | sed -n 's/^OUIJA_SESSION_INCARNATION=//p')
+wait_for 5 bash -c "test \"\$(tmux display-message -t '$L2_PANE' -p '#{@ouija_incarnation}')\" = '$L2_INCARNATION_AFTER'"
 L2_MARKER_INCARNATION=$(tmux display-message -t "$L2_PANE" -p '#{@ouija_incarnation}')
 assert_eq "L2: respawn exports session ID" "$L2_PHYSICAL_SESSION" "lifecycle-test"
 assert_eq "L2: respawn exports committed incarnation" "$L2_PHYSICAL_INCARNATION" "$L2_INCARNATION_AFTER"
@@ -1027,7 +1030,7 @@ rm -rf /tmp/projects/wt-branch-test
 mkdir -p /tmp/fakebin
 cp /bin/sleep /tmp/fakebin/claude
 chmod +x /tmp/fakebin/claude
-printf '#!/bin/bash\nexec /tmp/fakebin/claude 3600\n' > /usr/local/bin/claude
+printf '#!/bin/bash\nprompt=""\nfor arg in "$@"; do prompt="$arg"; done\nif [ -n "$prompt" ]; then printf "%%s" "$prompt" > "/tmp/ouija-prompt-${OUIJA_SESSION_ID}.txt"; fi\nexec /tmp/fakebin/claude 3600\n' > /usr/local/bin/claude
 chmod +x /usr/local/bin/claude
 
 log "Test L16: ouija.start with from param uses XML format with reply=true"
@@ -1102,7 +1105,10 @@ log "Test L19: Sessions sharing project_dir are grouped in same tmux session"
 mkdir -p /tmp/projects/grouped-repo
 L19A=$(api "$BASE" POST /api/sessions/start -d '{"name":"group-a","project_dir":"/tmp/projects/grouped-repo"}')
 assert_contains "L19a: first start succeeds" "$L19A" "starting"
-wait_for 10 bash -c "session_ids '$BASE' | grep -qF 'group-a'"
+wait_for 10 persisted_session_launch_completed "group-a"
+# The API returns before the async start future logs completion; let its
+# in-memory project resource gate clear before starting a sibling session.
+sleep 0.5
 L19A_PANE=$(session_field "$BASE" "group-a" "pane")
 # Get the tmux session name of the first pane
 L19A_TMUX_SESS=$(tmux display-message -t "$L19A_PANE" -p '#{session_name}')
@@ -1528,6 +1534,7 @@ api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/
 
 log "Test 31: Re-registration preserves loop state"
 # Register a session directly with loop metadata (no ouija.start, avoids worktree complexity)
+api "$BASE" POST /api/remove -d '{"id":"sess-a2"}' >/dev/null 2>&1 || true
 api "$BASE" POST /api/register -d "{\"id\":\"reregtest\",\"pane\":\"$PANE_A\",\"reminder\":\"call loop_next when done\"}" >/dev/null
 # Manually set prompt via a second register with all fields
 # (simulates what ouija.start does internally)
@@ -1553,6 +1560,7 @@ role3=$(echo "$status3" | jq -r '.sessions[] | select(.id == "reregtest") | .rol
 assert_eq "31c: reminder preserved after REST re-register" "$rem3" "call loop_next when done"
 assert_eq "31c: role updated via REST" "$role3" "hook-registered"
 # Clean up — restore sess-a2 on PANE_A
+api "$BASE" POST /api/remove -d '{"id":"reregtest"}' >/dev/null 2>&1 || true
 api "$BASE" POST /api/register -d "{\"id\":\"sess-a2\",\"pane\":\"$PANE_A\"}" >/dev/null
 api "$BASE" POST /api/register -d "{\"id\":\"sess-b\",\"pane\":\"$PANE_B\"}" >/dev/null
 

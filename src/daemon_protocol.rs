@@ -926,8 +926,7 @@ pub enum Event {
         observed_at: i64,
         source: DormancySource,
     },
-    /// Atomically park one exact Local owner and register a different backend
-    /// after the state owner corroborates physical pane reuse.
+    /// Atomically replace one exact Local pane owner with a new conversation.
     ///
     /// The incumbent's user-facing metadata is preserved in dormancy. The
     /// replacement receives ordinary new-registration metadata freshness.
@@ -1410,7 +1409,6 @@ pub enum RenameFailureKind {
     SourceLease,
     DestinationLease,
     DestinationLive,
-    DestinationDormant,
     InvalidDestination,
 }
 
@@ -1460,10 +1458,10 @@ pub fn sanitize_session_id(name: &str) -> String {
         .to_string()
 }
 
-/// Resolve one requested name against both routable and dormant occupancy.
+/// Resolve one requested name against live sessions and lifecycle leases.
 pub(crate) fn resolve_session_id(
     sessions: &BTreeMap<String, SessionEntry>,
-    dormant: &BTreeMap<String, DormantSession>,
+    lifecycle_leases: &BTreeMap<String, LifecycleLease>,
     requested: &str,
     mode: NameResolutionMode<'_>,
 ) -> NameResolution {
@@ -1479,14 +1477,10 @@ pub(crate) fn resolve_session_id(
                     }
                 };
             }
-            if let Some(dormant_session) = dormant.get(requested) {
-                return if same_owner.is_some_and(|owner| dormant_session.prior_owner == *owner) {
-                    NameResolution::Idempotent(requested.to_string())
-                } else {
-                    NameResolution::Occupied {
-                        id: requested.to_string(),
-                        dormant: true,
-                    }
+            if lifecycle_leases.contains_key(requested) {
+                return NameResolution::Occupied {
+                    id: requested.to_string(),
+                    dormant: false,
                 };
             }
             NameResolution::Available(requested.to_string())
@@ -1502,15 +1496,12 @@ pub(crate) fn resolve_session_id(
                     {
                         return NameResolution::Idempotent(id);
                     }
-                } else if !dormant.contains_key(&id) {
+                } else if !lifecycle_leases.contains_key(&id) {
                     return NameResolution::Available(id);
                 }
                 id = format!("{base_id}-{}", suffix.saturating_add(1));
             }
-            NameResolution::Occupied {
-                id,
-                dormant: dormant.contains_key(&base_id),
-            }
+            NameResolution::Occupied { id, dormant: false }
         }
     }
 }
@@ -1829,9 +1820,9 @@ pub fn validate_sender_claim(
 
 /// Validate an explicit public Local sender id supplied to the local CLI.
 ///
-/// Missing, unregistered, and incomplete observations are absence of proof,
-/// not proof of a sibling caller. Only an observation that resolves through
-/// daemon state to another Local session vetoes the claim.
+/// An exact target-pane match is authoritative over stale observations.
+/// Otherwise, positive sibling evidence vetoes the claim while missing,
+/// unregistered, and incomplete observations remain absence of proof.
 fn validate_trusted_local_sender_claim(
     state: &DaemonState,
     from: &str,
@@ -1851,6 +1842,9 @@ fn validate_trusted_local_sender_claim(
     }
 
     if let Some(caller_pane) = ctx.pane.as_deref().filter(|pane| !pane.is_empty()) {
+        if session.pane.as_deref() == Some(caller_pane) {
+            return Ok(());
+        }
         if let Some(sibling) = state.sessions.values().find(|candidate| {
             candidate.id != from
                 && matches!(candidate.origin, Origin::Local)
@@ -2015,6 +2009,7 @@ impl DaemonState {
     /// Whether an exact lifecycle owner still has any authority in protocol
     /// state. Marker-only pane ownership may be reclaimed only when this is
     /// false; public IDs and pane IDs are intentionally insufficient.
+    #[cfg(test)]
     pub(crate) fn references_resource_owner(&self, owner: &ResourceOwner) -> bool {
         self.sessions
             .values()
@@ -2023,6 +2018,24 @@ impl DaemonState {
                 .dormant_sessions
                 .values()
                 .any(|dormant| dormant.prior_owner == *owner)
+            || self.lifecycle_leases.values().any(|lease| {
+                lease.owner == *owner
+                    || lease.backend_session_owner.as_ref() == Some(owner)
+                    || lease.restart_target_owner.as_ref() == Some(owner)
+                    || lease
+                        .restart_previous
+                        .as_deref()
+                        .is_some_and(|session| session.owner() == *owner)
+                    || lease.project_dir_owner.as_ref() == Some(owner)
+                    || lease.inert_pane_owner.as_ref() == Some(owner)
+            })
+    }
+
+    /// Whether observed pane ownership still protects an exact owner.
+    pub(crate) fn marker_owner_blocks_reassignment(&self, owner: &ResourceOwner) -> bool {
+        self.sessions
+            .values()
+            .any(|session| session.owner() == *owner)
             || self.lifecycle_leases.values().any(|lease| {
                 lease.owner == *owner
                     || lease.backend_session_owner.as_ref() == Some(owner)
@@ -2057,10 +2070,6 @@ impl DaemonState {
                 incarnation: session.metadata.session_incarnation,
             }));
         }
-        if let Some(dormant) = self.dormant_sessions.get(session_id) {
-            return Ok(StartDisposition::Existing(dormant.prior_owner.clone()));
-        }
-
         let incarnation = self
             .allocate_incarnation()
             .ok_or(IncarnationAllocatorExhausted)?;
@@ -2688,6 +2697,18 @@ impl DaemonState {
         }
 
         let mut effects = vec![Effect::Persist];
+        if let Some(pane) = session.pane.as_deref() {
+            effects.push(Effect::ClearTmuxVar {
+                owner: owner.clone(),
+                pane: pane.to_string(),
+                name: "@ouija_session".into(),
+            });
+            effects.push(Effect::ClearTmuxVar {
+                owner: owner.clone(),
+                pane: pane.to_string(),
+                name: "@ouija_id".into(),
+            });
+        }
         if let Some(pane) = session.session_agent_pane() {
             effects.push(Effect::StopAgent {
                 owner: owner.clone(),
@@ -2736,31 +2757,12 @@ impl DaemonState {
         if current != &incumbent || !matches!(current.origin, Origin::Local) {
             return failed("incumbent owner changed");
         }
+        if replacement_id != incumbent.id {
+            return failed("same-pane successor must keep the incumbent public name");
+        }
         let Some(pane) = incumbent.pane.clone() else {
             return failed("incumbent has no pane");
         };
-        let Some((incumbent_backend, _)) = incumbent
-            .metadata
-            .backend
-            .as_deref()
-            .zip(incumbent.metadata.backend_session_id.as_deref())
-        else {
-            return failed("incumbent backend identity is incomplete");
-        };
-        let Some((replacement_backend, replacement_backend_session_id)) = replacement_metadata
-            .backend
-            .as_deref()
-            .zip(replacement_metadata.backend_session_id.as_deref())
-        else {
-            return failed("replacement backend identity is incomplete");
-        };
-        if incumbent.metadata.is_strong_opencode_binding()
-            || incumbent_backend == replacement_backend
-            || incumbent.id == replacement_id
-        {
-            return failed("replacement is not a different logical backend owner");
-        }
-
         let incumbent_owner = incumbent.owner();
         let mut candidate = self.clone();
         let mut effects = candidate.apply_dormant_owned(
@@ -2781,11 +2783,12 @@ impl DaemonState {
         }) {
             return failed("incumbent could not be parked");
         }
+        candidate.clear_orphaned_replies(std::slice::from_ref(&incumbent.id));
 
         let registration = candidate.apply_register_if_pane_unbound(
             replacement_id.clone(),
             pane,
-            Some(replacement_backend_session_id.to_string()),
+            replacement_metadata.backend_session_id.clone(),
             None,
             replacement_metadata,
         );
@@ -2932,7 +2935,7 @@ impl DaemonState {
         if !matches!(
             resolve_session_id(
                 &self.sessions,
-                &self.dormant_sessions,
+                &self.lifecycle_leases,
                 &requested_id,
                 NameResolutionMode::Exact { same_owner: None },
             ),
@@ -2962,6 +2965,9 @@ impl DaemonState {
             session_incarnation: incarnation,
             ..Default::default()
         };
+        self.dormant_sessions.remove(&requested_id);
+        self.aliases.remove(&requested_id);
+        self.local_rename_aliases.remove(&requested_id);
         self.sessions.insert(
             requested_id.clone(),
             SessionEntry {
@@ -3081,6 +3087,12 @@ impl DaemonState {
             Effect::SetTmuxVar {
                 owner: owner.clone(),
                 pane: pane.to_string(),
+                name: "@ouija_last_session".into(),
+                value: id.to_string(),
+            },
+            Effect::SetTmuxVar {
+                owner: owner.clone(),
+                pane: pane.to_string(),
                 name: "@ouija_incarnation".into(),
                 value: owner.incarnation.to_string(),
             },
@@ -3195,13 +3207,6 @@ impl DaemonState {
         reserved_owner: Option<&ResourceOwner>,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
-
-        if self.dormant_sessions.contains_key(&id) {
-            return vec![Effect::RegisterFailed {
-                session_id: id.clone(),
-                reason: format!("session '{id}' is reserved by a dormant identity"),
-            }];
-        }
 
         let supplied_pair = metadata
             .backend
@@ -3477,6 +3482,12 @@ impl DaemonState {
         let now = chrono::Utc::now();
         metadata.session_incarnation = incarnation;
 
+        // Historical rows do not reserve public names. Once a new live owner
+        // takes the name, the older recovery record is no longer canonical.
+        self.dormant_sessions.remove(&id);
+        self.aliases.remove(&id);
+        self.local_rename_aliases.remove(&id);
+
         // Insert session
         let session = SessionEntry {
             id: id.clone(),
@@ -3506,6 +3517,12 @@ impl DaemonState {
                 owner: owner.clone(),
                 pane: pane_id.clone(),
                 name: "@ouija_id".into(),
+                value: id.clone(),
+            });
+            effects.push(Effect::SetTmuxVar {
+                owner: owner.clone(),
+                pane: pane_id.clone(),
+                name: "@ouija_last_session".into(),
                 value: id.clone(),
             });
             effects.push(Effect::SetTmuxVar {
@@ -4054,6 +4071,12 @@ impl DaemonState {
             effects.push(Effect::SetTmuxVar {
                 owner: owner.clone(),
                 pane: pane.clone(),
+                name: "@ouija_last_session".into(),
+                value: id.clone(),
+            });
+            effects.push(Effect::SetTmuxVar {
+                owner: owner.clone(),
+                pane: pane.clone(),
                 name: "@ouija_incarnation".into(),
                 value: owner.incarnation.to_string(),
             });
@@ -4084,7 +4107,7 @@ impl DaemonState {
         metadata: SessionMeta,
     ) -> Vec<Effect> {
         if let Some(owner) = expected_orphaned_marker_owner.as_ref()
-            && self.references_resource_owner(owner)
+            && self.marker_owner_blocks_reassignment(owner)
         {
             let reason = format!(
                 "pane {pane} marker owner {}/{} is still active or reserved",
@@ -4433,7 +4456,7 @@ impl DaemonState {
         let source_owner = source.owner();
         match resolve_session_id(
             &self.sessions,
-            &self.dormant_sessions,
+            &self.lifecycle_leases,
             new_id,
             NameResolutionMode::Exact {
                 same_owner: Some(&source_owner),
@@ -4446,18 +4469,10 @@ impl DaemonState {
                     new_id: new_id.to_string(),
                 }];
             }
-            NameResolution::Occupied { dormant, .. } => {
+            NameResolution::Occupied { .. } => {
                 return vec![Effect::RenameFailed {
-                    kind: if dormant {
-                        RenameFailureKind::DestinationDormant
-                    } else {
-                        RenameFailureKind::DestinationLive
-                    },
-                    reason: if dormant {
-                        format!("session '{new_id}' is reserved by a dormant identity")
-                    } else {
-                        format!("session '{new_id}' already exists")
-                    },
+                    kind: RenameFailureKind::DestinationLive,
+                    reason: format!("session '{new_id}' already exists"),
                 }];
             }
         }
@@ -4470,6 +4485,9 @@ impl DaemonState {
         renamed.id = new_id.to_string();
         let new_owner = renamed.owner();
         let pane = renamed.pane.clone();
+        self.dormant_sessions.remove(new_id);
+        self.aliases.remove(new_id);
+        self.local_rename_aliases.remove(new_id);
         self.sessions.insert(new_id.to_string(), renamed);
 
         // Migrate pending_replies key
@@ -4490,6 +4508,12 @@ impl DaemonState {
                 owner: new_owner.clone(),
                 pane: pane_id.clone(),
                 name: "@ouija_id".into(),
+                value: new_id.to_string(),
+            });
+            effects.push(Effect::SetTmuxVar {
+                owner: new_owner.clone(),
+                pane: pane_id.clone(),
+                name: "@ouija_last_session".into(),
                 value: new_id.to_string(),
             });
             effects.push(Effect::SetTmuxVar {
@@ -6648,7 +6672,7 @@ mod tests {
     }
 
     #[test]
-    fn trusted_local_claim_rejects_backend_observation_resolving_to_sibling() {
+    fn trusted_local_claim_prefers_exact_target_pane_over_stale_backend_observation() {
         let mut state = claim_state();
         register_codex(&mut state, "hub-4", Some("%10"), "old-thread");
         register_codex(&mut state, "sibling", Some("%11"), "new-thread");
@@ -6661,25 +6685,17 @@ mod tests {
             }),
         );
 
-        let err = validate_sender_claim(&state, "hub-4", &ctx).unwrap_err();
-        assert!(
-            err.contains("sibling") && err.contains("hub-4"),
-            "rejection must name the conflicting Local sessions, got: {err}"
-        );
+        assert_eq!(validate_sender_claim(&state, "hub-4", &ctx), Ok(()));
     }
 
     #[test]
-    fn trusted_local_claim_rejects_self_id_observation_resolving_to_sibling() {
+    fn trusted_local_claim_prefers_exact_target_pane_over_stale_self_id() {
         let mut state = claim_state();
         register_codex(&mut state, "hub-4", Some("%10"), "old-thread");
         register_codex(&mut state, "sibling", Some("%11"), "sibling-thread");
         let ctx = trusted_local_sender_context(Some("%10"), Some("sibling"), None);
 
-        let err = validate_sender_claim(&state, "hub-4", &ctx).unwrap_err();
-        assert!(
-            err.contains("sibling") && err.contains("hub-4"),
-            "rejection must name the conflicting Local sessions, got: {err}"
-        );
+        assert_eq!(validate_sender_claim(&state, "hub-4", &ctx), Ok(()));
     }
 
     #[test]
@@ -9598,14 +9614,7 @@ mod tests {
     }
 
     #[test]
-    fn register_emits_ouija_id_marker_for_autoregister_skip() {
-        // The reaper's `scan_and_autoregister_panes` skips panes that have
-        // `@ouija_id` set. Without this effect, API-spawned panes never get
-        // the marker (the SessionStart hook early-returns without setting
-        // it for pre-registered panes), so the reaper can auto-register a
-        // ghost session during the window between `Event::Remove` (which
-        // clears `@ouija_session`) and `tmux kill-pane` (which destroys
-        // the pane).
+    fn register_emits_current_owner_and_sticky_name_markers() {
         let mut state = DaemonState::new("npub1abc".into(), "myhost".into());
         let effects = state.apply(Event::Register {
             id: "pat-paral".into(),
@@ -9620,6 +9629,11 @@ mod tests {
             )),
             "Register must emit SetTmuxVar for @ouija_id, got: {effects:?}"
         );
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SetTmuxVar { name, value, pane, .. }
+                if name == "@ouija_last_session" && value == "pat-paral" && pane == "%1"
+        )));
         let incarnation = state.sessions["pat-paral"]
             .metadata
             .session_incarnation
@@ -9866,7 +9880,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_backend_pane_replacement_parks_exact_owner_and_registers_replacement() {
+    fn cross_backend_pane_replacement_keeps_the_public_name() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
         register_identity(&mut state, "ouija", "%3", "old-thread");
         register_identity(&mut state, "hub-fundamentals", "%718", "existing-thread");
@@ -9874,17 +9888,13 @@ mod tests {
 
         let effects = state.apply(Event::ReplaceReusedPaneOwner {
             incumbent: Box::new(incumbent.clone()),
-            replacement_id: "hub-fundamentals-2".into(),
+            replacement_id: "ouija".into(),
             replacement_metadata: replacement_metadata("claude-code", "new-thread"),
             observed_at: 100,
         });
 
-        assert!(!state.sessions.contains_key("ouija"));
-        assert_eq!(
-            state.dormant_sessions["ouija"].prior_owner,
-            incumbent.owner()
-        );
-        let replacement = &state.sessions["hub-fundamentals-2"];
+        assert!(!state.dormant_sessions.contains_key("ouija"));
+        let replacement = &state.sessions["ouija"];
         assert_eq!(replacement.pane.as_deref(), Some("%3"));
         assert_eq!(replacement.metadata.backend.as_deref(), Some("claude-code"));
         assert!(effects.iter().any(|effect| matches!(
@@ -9897,34 +9907,62 @@ mod tests {
         )));
         assert!(effects.iter().any(|effect| matches!(
             effect,
-            Effect::RegisterOk { session_id, .. } if session_id == "hub-fundamentals-2"
+            Effect::RegisterOk { session_id, .. } if session_id == "ouija"
         )));
     }
 
     #[test]
-    fn same_backend_pane_replacement_is_rejected_without_mutation() {
+    fn same_backend_pane_replacement_keeps_the_public_name() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
         register_identity(&mut state, "worker", "%3", "old-thread");
+        state.pending_replies.insert(
+            "worker".into(),
+            vec![PendingReplyEntry {
+                msg_id: 7,
+                from: "parent".into(),
+                message: "old task".into(),
+                received_at: 1,
+                last_activity: 1,
+                in_progress: true,
+            }],
+        );
+        state.pending_replies.insert(
+            "other".into(),
+            vec![PendingReplyEntry {
+                msg_id: 8,
+                from: "worker".into(),
+                message: "old outgoing task".into(),
+                received_at: 1,
+                last_activity: 1,
+                in_progress: false,
+            }],
+        );
         let incumbent = state.sessions["worker"].clone();
-        let before = state.clone();
-
         let effects = state.apply(Event::ReplaceReusedPaneOwner {
             incumbent: Box::new(incumbent),
-            replacement_id: "worker-2".into(),
+            replacement_id: "worker".into(),
             replacement_metadata: replacement_metadata("codex-cli", "new-thread"),
             observed_at: 100,
         });
 
-        assert_eq!(state, before);
-        assert!(
-            effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::RegisterFailed { .. }))
+        assert_eq!(state.sessions["worker"].pane.as_deref(), Some("%3"));
+        assert_eq!(
+            state.sessions["worker"]
+                .metadata
+                .backend_session_id
+                .as_deref(),
+            Some("new-thread")
         );
+        assert!(!state.dormant_sessions.contains_key("worker"));
+        assert!(state.pending_replies.is_empty());
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::RegisterOk { session_id, .. } if session_id == "worker"
+        )));
     }
 
     #[test]
-    fn strong_opencode_pane_replacement_is_rejected_without_mutation() {
+    fn strong_opencode_pane_successor_keeps_the_public_name() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
         state.apply(Event::Register {
             id: "managed-opencode".into(),
@@ -9939,21 +9977,25 @@ mod tests {
             },
         });
         let incumbent = state.sessions["managed-opencode"].clone();
-        let before = state.clone();
-
         let effects = state.apply(Event::ReplaceReusedPaneOwner {
             incumbent: Box::new(incumbent),
-            replacement_id: "worker".into(),
+            replacement_id: "managed-opencode".into(),
             replacement_metadata: replacement_metadata("claude-code", "new-thread"),
             observed_at: 100,
         });
 
-        assert_eq!(state, before);
-        assert!(
-            effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::RegisterFailed { .. }))
+        assert_eq!(
+            state.sessions["managed-opencode"]
+                .metadata
+                .backend
+                .as_deref(),
+            Some("claude-code")
         );
+        assert!(!state.dormant_sessions.contains_key("managed-opencode"));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::RegisterOk { session_id, .. } if session_id == "managed-opencode"
+        )));
     }
 
     fn inject_conflicting_live_identity(
@@ -10008,7 +10050,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_session_id_automatic_suffixes_across_live_and_dormant_occupancy() {
+    fn resolve_session_id_automatic_ignores_history_and_suffixes_live_occupancy() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
         register_identity(&mut state, "worker", "%1", "thread-1");
         let owner = register_identity(&mut state, "worker-2", "%2", "thread-2");
@@ -10022,13 +10064,13 @@ mod tests {
         assert_eq!(
             resolve_session_id(
                 &state.sessions,
-                &state.dormant_sessions,
+                &state.lifecycle_leases,
                 "Worker",
                 NameResolutionMode::Automatic {
                     target_pane: Some("%3")
                 },
             ),
-            NameResolution::Available("worker-3".into())
+            NameResolution::Available("worker-2".into())
         );
     }
 
@@ -10040,7 +10082,7 @@ mod tests {
         assert_eq!(
             resolve_session_id(
                 &state.sessions,
-                &state.dormant_sessions,
+                &state.lifecycle_leases,
                 "worker",
                 NameResolutionMode::Automatic {
                     target_pane: Some("%1")
@@ -10051,7 +10093,26 @@ mod tests {
     }
 
     #[test]
-    fn resolve_session_id_exact_reports_live_and_dormant_occupancy_without_suffixing() {
+    fn resolve_session_id_suffixes_names_held_by_lifecycle_leases() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        assert!(matches!(
+            state.reserve_start("worker").unwrap(),
+            StartDisposition::Reserved(_)
+        ));
+
+        assert_eq!(
+            resolve_session_id(
+                &state.sessions,
+                &state.lifecycle_leases,
+                "worker",
+                NameResolutionMode::Automatic { target_pane: None },
+            ),
+            NameResolution::Available("worker-2".into())
+        );
+    }
+
+    #[test]
+    fn resolve_session_id_exact_reports_live_occupancy_and_ignores_history() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
         register_identity(&mut state, "live", "%1", "thread-1");
         let owner = register_identity(&mut state, "parked", "%2", "thread-2");
@@ -10065,7 +10126,7 @@ mod tests {
         assert_eq!(
             resolve_session_id(
                 &state.sessions,
-                &state.dormant_sessions,
+                &state.lifecycle_leases,
                 "live",
                 NameResolutionMode::Exact { same_owner: None },
             ),
@@ -10077,20 +10138,17 @@ mod tests {
         assert_eq!(
             resolve_session_id(
                 &state.sessions,
-                &state.dormant_sessions,
+                &state.lifecycle_leases,
                 "parked",
                 NameResolutionMode::Exact { same_owner: None },
             ),
-            NameResolution::Occupied {
-                id: "parked".into(),
-                dormant: true,
-            }
+            NameResolution::Available("parked".into())
         );
         let live_owner = state.sessions["live"].owner();
         assert_eq!(
             resolve_session_id(
                 &state.sessions,
-                &state.dormant_sessions,
+                &state.lifecycle_leases,
                 "live",
                 NameResolutionMode::Exact {
                     same_owner: Some(&live_owner),
@@ -10102,13 +10160,13 @@ mod tests {
         assert_eq!(
             resolve_session_id(
                 &state.sessions,
-                &state.dormant_sessions,
+                &state.lifecycle_leases,
                 "parked",
                 NameResolutionMode::Exact {
                     same_owner: Some(&dormant_owner),
                 },
             ),
-            NameResolution::Idempotent("parked".into())
+            NameResolution::Available("parked".into())
         );
     }
 
@@ -10155,6 +10213,16 @@ mod tests {
                 tombstoned: true,
                 ..
             }
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ClearTmuxVar { name, pane, .. }
+                if name == "@ouija_session" && pane == "%1"
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ClearTmuxVar { name, pane, .. }
+                if name == "@ouija_id" && pane == "%1"
         )));
     }
 
@@ -10611,7 +10679,7 @@ mod tests {
     }
 
     #[test]
-    fn claim_rejects_noncanonical_and_all_live_or_dormant_resource_conflicts() {
+    fn claim_rejects_noncanonical_and_live_or_backend_resource_conflicts() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
         let dormant_owner = register_identity(&mut state, "parked", "%9", "thread-9");
         state.apply(Event::DormantOwned {
@@ -10626,7 +10694,6 @@ mod tests {
         let attempts = [
             ("Not Canonical", "%2", "thread-2"),
             ("live", "%2", "thread-2"),
-            ("parked", "%2", "thread-2"),
             ("free", "%1", "thread-2"),
             ("free", "%2", "thread-1"),
             ("free", "%2", "thread-9"),
@@ -10744,14 +10811,6 @@ mod tests {
 
         let attempts = [
             (
-                "dormant destination ID",
-                Event::Register {
-                    id: "parked".into(),
-                    pane: Some("%2".into()),
-                    metadata: identity_metadata("thread-2"),
-                },
-            ),
-            (
                 "dormant backend pair",
                 Event::Register {
                     id: "free".into(),
@@ -10789,6 +10848,17 @@ mod tests {
                 "{conflict} emitted registration success: {effects:?}"
             );
         }
+
+        let effects = baseline.apply(Event::Register {
+            id: "parked".into(),
+            pane: Some("%2".into()),
+            metadata: identity_metadata("thread-2"),
+        });
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::RegisterOk { session_id, .. } if session_id == "parked"
+        )));
+        assert!(!baseline.dormant_sessions.contains_key("parked"));
     }
 
     #[test]
@@ -10828,12 +10898,11 @@ mod tests {
         });
 
         let mut reserve = baseline.clone();
-        let before = reserve.clone();
-        assert_eq!(
+        assert!(matches!(
             reserve.reserve_start("parked").unwrap(),
-            StartDisposition::Existing(dormant_owner)
-        );
-        assert_eq!(reserve, before, "dormant reservation mutated state");
+            StartDisposition::Reserved(_)
+        ));
+        assert!(reserve.dormant_sessions.contains_key("parked"));
 
         let mut bind = baseline.clone();
         let before = bind.clone();
@@ -11161,7 +11230,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_rejects_occupied_dormant_destination_without_mutation() {
+    fn rename_reuses_a_name_held_only_by_history() {
         let mut state = DaemonState::new("d1".into(), "host1".into());
         register_identity(&mut state, "source", "%1", "thread-1");
         let destination_owner = register_identity(&mut state, "destination", "%2", "thread-2");
@@ -11171,20 +11240,18 @@ mod tests {
             observed_at: 30,
             source: DormancySource::Reaped,
         });
-        let before = state.clone();
-
         let effects = state.apply(Event::Rename {
             old_id: "source".into(),
             new_id: "destination".into(),
         });
 
-        assert_eq!(state, before);
+        assert!(state.sessions.contains_key("destination"));
+        assert!(!state.sessions.contains_key("source"));
+        assert!(!state.dormant_sessions.contains_key("destination"));
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::RenameFailed {
-                kind: RenameFailureKind::DestinationDormant,
-                ..
-            }]
+            effects.last(),
+            Some(Effect::RenameOk { old_id, new_id })
+                if old_id == "source" && new_id == "destination"
         ));
     }
 
@@ -15677,6 +15744,54 @@ mod tests {
             )),
             "unreferenced marker owner should remain reclaimable, got: {effects:?}"
         );
+    }
+
+    #[test]
+    fn register_if_pane_unbound_reclaims_trusted_session_end_marker() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "ended-owner".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/project".into()),
+                canonical_project_identity: Some("/tmp/project".into()),
+                backend: Some("claude-code".into()),
+                backend_session_id: Some("ended-thread".into()),
+                ..Default::default()
+            },
+        });
+        let ended_owner = state.sessions["ended-owner"].owner();
+        state.apply(Event::DormantOwned {
+            owner: ended_owner.clone(),
+            expected_pane: Some("%1".into()),
+            observed_at: 30,
+            source: DormancySource::TrustedSessionEnd,
+        });
+
+        assert!(state.references_resource_owner(&ended_owner));
+        assert!(!state.marker_owner_blocks_reassignment(&ended_owner));
+        let effects = state.apply(Event::RegisterIfPaneUnbound {
+            id: "project".into(),
+            pane: "%1".into(),
+            expected_backend_session_id: None,
+            expected_orphaned_marker_owner: Some(ended_owner),
+            metadata: SessionMeta {
+                project_dir: Some("/tmp/project".into()),
+                canonical_project_identity: Some("/tmp/project".into()),
+                scanner_registration: true,
+                ..Default::default()
+            },
+        });
+
+        assert!(state.dormant_sessions.contains_key("ended-owner"));
+        assert_eq!(state.sessions["project"].pane.as_deref(), Some("%1"));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::RegisterOk { session_id, .. } if session_id == "project"
+        )));
+
+        let ended_owner = &state.dormant_sessions["ended-owner"].prior_owner;
+        assert!(!state.marker_owner_blocks_reassignment(ended_owner));
     }
 
     #[test]

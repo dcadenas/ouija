@@ -1117,7 +1117,7 @@ fn inspect_pane_format(pane: &str, format: &str) -> anyhow::Result<Option<String
 pub(crate) enum ManagedPaneInspection {
     Missing,
     Unmanaged,
-    /// Complete immutable owner exported by the pane's current process.
+    /// Complete launch owner exported by the pane's current process.
     ProcessOwner(crate::daemon_protocol::ResourceOwner),
     /// Complete owner recovered only from mutable tmux pane markers.
     MarkerOwner(crate::daemon_protocol::ResourceOwner),
@@ -1148,20 +1148,20 @@ pub(crate) fn pane_accepts_owner_marker(
 
 /// Decide whether the daemon may write an exact current owner's pane markers.
 ///
-/// A complete process owner is immutable launch evidence and is never
-/// displaced. A conflicting marker-only owner may be reclaimed only after the
-/// protocol state confirms that exact owner is absent from both sessions and
-/// lifecycle leases.
+/// Process environments and tmux markers can outlive an engine conversation.
+/// Protocol state decides whether either observed owner still has authority.
 pub(crate) fn pane_marker_write_is_authorized(
     inspection: &ManagedPaneInspection,
     expected: &crate::daemon_protocol::ResourceOwner,
-    observed_owner_is_referenced: bool,
+    observed_owner_blocks_reassignment: bool,
 ) -> bool {
     match inspection {
         ManagedPaneInspection::Unmanaged => true,
-        ManagedPaneInspection::ProcessOwner(observed) => physical_owner_matches(observed, expected),
+        ManagedPaneInspection::ProcessOwner(observed) => {
+            physical_owner_matches(observed, expected) || !observed_owner_blocks_reassignment
+        }
         ManagedPaneInspection::MarkerOwner(observed) => {
-            physical_owner_matches(observed, expected) || !observed_owner_is_referenced
+            physical_owner_matches(observed, expected) || !observed_owner_blocks_reassignment
         }
         ManagedPaneInspection::Missing => false,
     }
@@ -1541,7 +1541,7 @@ mod tests {
     }
 
     #[test]
-    fn orphan_marker_can_be_reclaimed_but_process_identity_cannot() {
+    fn stale_pane_owners_can_be_reclaimed_only_without_live_authority() {
         let expected = crate::daemon_protocol::ResourceOwner {
             session_id: "hub".to_string(),
             incarnation: crate::daemon_protocol::SessionIncarnation(43),
@@ -1561,10 +1561,15 @@ mod tests {
             &expected,
             true,
         ));
+        assert!(pane_marker_write_is_authorized(
+            &ManagedPaneInspection::ProcessOwner(stale.clone()),
+            &expected,
+            false,
+        ));
         assert!(!pane_marker_write_is_authorized(
             &ManagedPaneInspection::ProcessOwner(stale),
             &expected,
-            false,
+            true,
         ));
     }
 

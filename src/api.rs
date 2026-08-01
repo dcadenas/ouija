@@ -1336,9 +1336,6 @@ pub async fn claim_local_identity(
                 "error": "requested ID is already live",
             })),
         ),
-        crate::state::LocalClaimOutcome::DestinationDormant { id } => {
-            (StatusCode::CONFLICT, Json(dormant_conflict_body(&id)))
-        }
         crate::state::LocalClaimOutcome::AlreadyRegistered { id } => (
             StatusCode::FORBIDDEN,
             Json(json!({
@@ -1437,29 +1434,6 @@ pub async fn dormant_identity(
     }
 }
 
-fn operator_command_arg(id: &str) -> String {
-    if !id.is_empty()
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"-_./".contains(&byte))
-    {
-        id.to_string()
-    } else {
-        crate::scheduler::shell_escape(id)
-    }
-}
-
-fn dormant_conflict_body(id: &str) -> serde_json::Value {
-    let argument = operator_command_arg(id);
-    json!({
-        "outcome": "destination_dormant",
-        "session_id": id,
-        "error": "requested ID is reserved by a dormant identity",
-        "inspect_command": format!("ouija dormant show {argument}"),
-        "forget_command": format!("ouija unregister {argument}"),
-    })
-}
-
 /// Rename an existing session.
 pub async fn rename(
     State(state): State<SharedState>,
@@ -1503,11 +1477,16 @@ pub async fn rename(
             _ => None,
         });
         match failure {
-            Some((crate::daemon_protocol::RenameFailureKind::DestinationDormant, _)) => (
-                StatusCode::CONFLICT,
-                Json(dormant_conflict_body(&body.new_id)),
-            ),
-            Some((_, reason)) => (StatusCode::NOT_FOUND, Json(json!({ "error": reason }))),
+            Some((crate::daemon_protocol::RenameFailureKind::InvalidDestination, reason)) => {
+                (StatusCode::BAD_REQUEST, Json(json!({ "error": reason })))
+            }
+            Some((crate::daemon_protocol::RenameFailureKind::SourceMissing, reason)) => {
+                (StatusCode::NOT_FOUND, Json(json!({ "error": reason })))
+            }
+            Some((crate::daemon_protocol::RenameFailureKind::SourceNotLocal, reason)) => {
+                (StatusCode::FORBIDDEN, Json(json!({ "error": reason })))
+            }
+            Some((_, reason)) => (StatusCode::CONFLICT, Json(json!({ "error": reason }))),
             None => (
                 StatusCode::NOT_FOUND,
                 Json(json!({
@@ -4947,6 +4926,7 @@ async fn register_auto_provisioned_session(
     // suffix-bumped id and run a redundant Register. apply_register's
     // pane-dedup would then evict the winner's session by pane (different
     // id, same pane) — stomping their atomic bind.
+    let preferred_id = state.pane_last_session_id(pane_id).await.unwrap_or(base_id);
     let id = {
         let proto = state.protocol.read().await;
         match resolve_opencode_backend_identity(&proto, backend_sid) {
@@ -4961,8 +4941,8 @@ async fn register_auto_provisioned_session(
         }
         crate::state::resolve_unique_session_id(
             &proto.sessions,
-            &proto.dormant_sessions,
-            &base_id,
+            &proto.lifecycle_leases,
+            &preferred_id,
             Some(pane_id),
         )
     };
@@ -5533,7 +5513,7 @@ mod tests {
             })
             .await;
         let (status, Json(body)) = bind_backend_identity(
-            State(state),
+            State(state.clone()),
             Json(BackendIdentityBindRequest {
                 target_session_id: "stale".into(),
                 identity,
@@ -7304,7 +7284,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claim_dormant_destination_returns_structured_remediation() {
+    async fn claim_reuses_a_name_held_only_by_history() {
         let state = crate::state::AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -7332,7 +7312,7 @@ mod tests {
             vec![pane_for_backend("/tmp/new-worktree", "%claimant", "codex")];
 
         let (status, body) = claim_local_identity(
-            State(state),
+            State(state.clone()),
             Json(LocalClaimRequest {
                 requested_id: "requested".into(),
                 caller: crate::state::LocalClaimEvidence {
@@ -7348,19 +7328,12 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::CONFLICT, "body: {:?}", body.0);
-        assert_eq!(body["outcome"], "destination_dormant");
+        assert_eq!(status, StatusCode::OK, "body: {:?}", body.0);
+        assert_eq!(body["outcome"], "claimed");
         assert_eq!(body["session_id"], "requested");
-        assert!(
-            body["inspect_command"]
-                .as_str()
-                .is_some_and(|command| command.contains("dormant show requested"))
-        );
-        assert!(
-            body["forget_command"]
-                .as_str()
-                .is_some_and(|command| command.contains("unregister requested"))
-        );
+        let protocol = state.protocol.read().await;
+        assert!(protocol.sessions.contains_key("requested"));
+        assert!(!protocol.dormant_sessions.contains_key("requested"));
     }
 
     async fn dormant_test_state(id: &str, project_dir: &str) -> SharedState {
@@ -7534,7 +7507,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rename_destination_dormant_returns_structured_remediation() {
+    async fn rename_reuses_a_name_held_only_by_history() {
         let state = dormant_test_state("reserved", "/tmp/preserved-worktree").await;
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -7554,14 +7527,12 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(body["outcome"], "destination_dormant");
-        assert_eq!(body["session_id"], "reserved");
-        assert_eq!(body["inspect_command"], "ouija dormant show reserved");
-        assert_eq!(body["forget_command"], "ouija unregister reserved");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["renamed"], "source");
+        assert_eq!(body["to"], "reserved");
         let protocol = state.protocol.read().await;
-        assert!(protocol.sessions.contains_key("source"));
-        assert!(protocol.dormant_sessions.contains_key("reserved"));
+        assert!(protocol.sessions.contains_key("reserved"));
+        assert!(!protocol.dormant_sessions.contains_key("reserved"));
     }
 
     #[tokio::test]
@@ -11578,7 +11549,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dormant_conflict_auto_provision_suffixes_a_reserved_automatic_name() {
+    async fn auto_provision_reuses_a_name_held_only_by_history() {
         let state = crate::state::AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -11610,11 +11581,11 @@ mod tests {
         let result =
             register_auto_provisioned_session(&state, "new-session", "%new", &project).await;
 
-        assert_eq!(result.as_deref(), Some("freshproject-2"));
+        assert_eq!(result.as_deref(), Some("freshproject"));
         let protocol = state.protocol.read().await;
-        assert!(protocol.dormant_sessions.contains_key("freshproject"));
+        assert!(!protocol.dormant_sessions.contains_key("freshproject"));
         assert_eq!(
-            protocol.sessions["freshproject-2"]
+            protocol.sessions["freshproject"]
                 .metadata
                 .backend_session_id
                 .as_deref(),

@@ -81,9 +81,6 @@ pub(crate) enum LocalClaimOutcome {
     DestinationLive {
         id: String,
     },
-    DestinationDormant {
-        id: String,
-    },
     AlreadyRegistered {
         id: String,
     },
@@ -142,19 +139,16 @@ pub fn sanitize_session_id(name: &str) -> String {
         .to_string()
 }
 
-/// Resolve an automatic registration name across both live and dormant
-/// occupancy. This is the coordinator-facing wrapper around the protocol's
-/// shared naming policy, so scan, hooks, and backend auto-provision cannot
-/// disagree about a parked public ID.
+/// Resolve an automatic registration name across live and lifecycle occupancy.
 pub fn resolve_unique_session_id(
     sessions: &std::collections::BTreeMap<String, crate::daemon_protocol::SessionEntry>,
-    dormant: &std::collections::BTreeMap<String, crate::daemon_protocol::DormantSession>,
+    lifecycle_leases: &std::collections::BTreeMap<String, crate::daemon_protocol::LifecycleLease>,
     base_id: &str,
     target_pane: Option<&str>,
 ) -> String {
     match crate::daemon_protocol::resolve_session_id(
         sessions,
-        dormant,
+        lifecycle_leases,
         base_id,
         crate::daemon_protocol::NameResolutionMode::Automatic { target_pane },
     ) {
@@ -1226,16 +1220,17 @@ const MAX_NAME_SUFFIX: u32 = 100;
 /// Reciprocation debounce interval to prevent session list ping-pong.
 const RECIPROCATE_DEBOUNCE_SECS: u64 = 30;
 const AUTOREGISTER_REMOVE_GRACE_SECS: u64 = 10;
+const AUTOREGISTER_SESSION_END_GRACE_SECS: u64 = 5;
 
 fn autoregister_accepts_pane_inspection(
     inspection: &crate::tmux::ManagedPaneInspection,
-    marker_owner_is_referenced: bool,
+    marker_owner_blocks_reassignment: bool,
 ) -> bool {
     match inspection {
         crate::tmux::ManagedPaneInspection::Unmanaged => true,
-        crate::tmux::ManagedPaneInspection::MarkerOwner(_) => !marker_owner_is_referenced,
-        crate::tmux::ManagedPaneInspection::Missing
-        | crate::tmux::ManagedPaneInspection::ProcessOwner(_) => false,
+        crate::tmux::ManagedPaneInspection::MarkerOwner(_)
+        | crate::tmux::ManagedPaneInspection::ProcessOwner(_) => !marker_owner_blocks_reassignment,
+        crate::tmux::ManagedPaneInspection::Missing => false,
     }
 }
 
@@ -3124,11 +3119,6 @@ impl AppState {
                         id: requested_id.to_string(),
                     };
                 }
-                if protocol.dormant_sessions.contains_key(requested_id) {
-                    return LocalClaimOutcome::DestinationDormant {
-                        id: requested_id.to_string(),
-                    };
-                }
                 let actual_project = project_dir_identity(&project.project_dir);
                 let canonical_project = project_dir_identity(&project.canonical_repository);
                 if protocol.lifecycle_leases.iter().any(|(id, lease)| {
@@ -3271,12 +3261,24 @@ impl AppState {
                 .collect::<Vec<_>>();
             (outcome, effects)
         };
+        if source == crate::daemon_protocol::DormancySource::TrustedSessionEnd
+            && let Some(pane) = expected_pane
+        {
+            self.autoregister_suppressed_panes
+                .lock()
+                .expect("autoregister suppression mutex poisoned")
+                .insert(
+                    pane,
+                    std::time::Instant::now()
+                        + std::time::Duration::from_secs(AUTOREGISTER_SESSION_END_GRACE_SECS),
+                );
+        }
         drop(resource_guards);
         self.execute_effects(&effects).await;
         outcome
     }
 
-    /// Replace an exact pane owner after corroborating different-backend reuse.
+    /// Replace an exact pane owner after corroborating a new conversation.
     pub(crate) async fn replace_reused_cross_backend_pane(
         self: &Arc<Self>,
         incumbent_owner: crate::daemon_protocol::ResourceOwner,
@@ -3298,14 +3300,12 @@ impl AppState {
             }
             incumbent.clone()
         };
-        let Some(incumbent_backend) = incumbent.metadata.backend.as_deref() else {
+        if identity.backend.trim().is_empty() || identity.session_id.trim().is_empty() {
             return ReusedPaneReplacementOutcome::NotApplicable;
-        };
-        if incumbent.metadata.is_strong_opencode_binding()
-            || incumbent.metadata.backend_session_id.is_none()
-            || incumbent_backend == identity.backend
-            || identity.backend.trim().is_empty()
-            || identity.session_id.trim().is_empty()
+        }
+        if incumbent.metadata.backend.as_deref() == Some(identity.backend.as_str())
+            && incumbent.metadata.backend_session_id.as_deref()
+                == Some(identity.session_id.as_str())
         {
             return ReusedPaneReplacementOutcome::NotApplicable;
         }
@@ -6094,21 +6094,22 @@ impl AppState {
                     }
                 };
 
-                let observed_owner_is_referenced = match &inspection {
+                let observed_owner_blocks_reassignment = match &inspection {
                     crate::tmux::ManagedPaneInspection::MarkerOwner(observed)
+                    | crate::tmux::ManagedPaneInspection::ProcessOwner(observed)
                         if !crate::tmux::physical_owner_matches(observed, &owner) =>
                     {
                         self.protocol
                             .read()
                             .await
-                            .references_resource_owner(observed)
+                            .marker_owner_blocks_reassignment(observed)
                     }
                     _ => false,
                 };
                 if !crate::tmux::pane_marker_write_is_authorized(
                     &inspection,
                     &owner,
-                    observed_owner_is_referenced,
+                    observed_owner_blocks_reassignment,
                 ) {
                     tracing::warn!(
                         %pane,
@@ -6122,6 +6123,7 @@ impl AppState {
 
                 let reclaimable_marker = match inspection {
                     crate::tmux::ManagedPaneInspection::MarkerOwner(observed)
+                    | crate::tmux::ManagedPaneInspection::ProcessOwner(observed)
                         if !crate::tmux::physical_owner_matches(&observed, &owner) =>
                     {
                         Some(observed)
@@ -6145,7 +6147,8 @@ impl AppState {
                         || matches!(
                             (&current, reclaimable_marker.as_ref()),
                             (
-                                crate::tmux::ManagedPaneInspection::MarkerOwner(current),
+                                crate::tmux::ManagedPaneInspection::MarkerOwner(current)
+                                | crate::tmux::ManagedPaneInspection::ProcessOwner(current),
                                 Some(reclaimable),
                             ) if current == reclaimable
                         );
@@ -6546,6 +6549,17 @@ impl AppState {
         .unwrap_or_default()
     }
 
+    pub(crate) async fn pane_last_session_id(&self, pane: &str) -> Option<String> {
+        let pane = pane.to_string();
+        tokio::task::spawn_blocking(move || {
+            crate::tmux_var::get_last_session_id(&pane).or_else(|| crate::tmux_var::get(&pane))
+        })
+        .await
+        .ok()
+        .flatten()
+        .filter(|id| sanitize_session_id(id) == *id)
+    }
+
     /// Scan tmux for assistant panes, update cache, and auto-register unregistered ones.
     pub async fn scan_and_autoregister_panes(self: &Arc<Self>) {
         let panes = self.list_assistant_panes().await;
@@ -6560,7 +6574,7 @@ impl AppState {
 
         // Snapshot the current pane bindings. Name allocation itself is
         // repeated under a fresh protocol read so concurrent registrations and
-        // durable dormant reservations participate in the same policy.
+        // lifecycle reservations participate in the same policy.
         let mut registered_panes = {
             let proto = self.protocol.read().await;
             proto
@@ -6598,12 +6612,18 @@ impl AppState {
                     .unwrap_or_else(|error| Err(error.into()))
             };
             let expected_orphaned_marker_owner = match &inspection {
-                Ok(crate::tmux::ManagedPaneInspection::MarkerOwner(owner)) => Some(owner.clone()),
+                Ok(crate::tmux::ManagedPaneInspection::MarkerOwner(owner))
+                | Ok(crate::tmux::ManagedPaneInspection::ProcessOwner(owner)) => {
+                    Some(owner.clone())
+                }
                 _ => None,
             };
-            let marker_owner_is_referenced =
+            let marker_owner_blocks_reassignment =
                 if let Some(owner) = expected_orphaned_marker_owner.as_ref() {
-                    self.protocol.read().await.references_resource_owner(owner)
+                    self.protocol
+                        .read()
+                        .await
+                        .marker_owner_blocks_reassignment(owner)
                 } else {
                     false
                 };
@@ -6611,7 +6631,7 @@ impl AppState {
                 Ok(inspection)
                     if autoregister_accepts_pane_inspection(
                         &inspection,
-                        marker_owner_is_referenced,
+                        marker_owner_blocks_reassignment,
                     ) => {}
                 Ok(inspection) => {
                     tracing::warn!(
@@ -6665,12 +6685,22 @@ impl AppState {
                 continue;
             }
 
+            let preferred_id = self
+                .pane_last_session_id(&pane.pane_id)
+                .await
+                .or_else(|| {
+                    expected_orphaned_marker_owner
+                        .as_ref()
+                        .map(|owner| owner.session_id.clone())
+                        .filter(|id| sanitize_session_id(id) == *id)
+                })
+                .unwrap_or(base_id);
             let id = {
                 let proto = self.protocol.read().await;
                 resolve_unique_session_id(
                     &proto.sessions,
-                    &proto.dormant_sessions,
-                    &base_id,
+                    &proto.lifecycle_leases,
+                    &preferred_id,
                     Some(pane.pane_id.as_str()),
                 )
             };
@@ -7689,15 +7719,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn autoregister_skips_complete_process_owners_but_allows_marker_orphans() {
+    fn autoregister_allows_unreferenced_owners_and_blocks_referenced_owners() {
         let owner = crate::daemon_protocol::ResourceOwner {
             session_id: "old".into(),
             incarnation: crate::daemon_protocol::SessionIncarnation(42),
         };
 
-        assert!(!autoregister_accepts_pane_inspection(
+        assert!(autoregister_accepts_pane_inspection(
             &crate::tmux::ManagedPaneInspection::ProcessOwner(owner.clone()),
             false,
+        ));
+        assert!(!autoregister_accepts_pane_inspection(
+            &crate::tmux::ManagedPaneInspection::ProcessOwner(owner.clone()),
+            true,
         ));
         assert!(autoregister_accepts_pane_inspection(
             &crate::tmux::ManagedPaneInspection::MarkerOwner(owner.clone()),
@@ -9015,10 +9049,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn claim_local_identity_rejects_live_dormant_and_lifecycle_resources() {
+    async fn claim_local_identity_rejects_live_and_lifecycle_resources() {
         for conflict in [
             "live-destination",
-            "dormant-destination",
             "already-registered-pair",
             "id-lease",
             "pane-lease",
@@ -9035,24 +9068,6 @@ pub(crate) mod tests {
                             id: "chosen".into(),
                             pane: Some("%9".into()),
                             metadata: crate::daemon_protocol::SessionMeta::default(),
-                        })
-                        .await;
-                }
-                "dormant-destination" => {
-                    state
-                        .apply_and_execute(crate::daemon_protocol::Event::Register {
-                            id: "chosen".into(),
-                            pane: Some("%9".into()),
-                            metadata: continuity_metadata("other-thread", "/tmp/other"),
-                        })
-                        .await;
-                    let owner = state.protocol.read().await.sessions["chosen"].owner();
-                    state
-                        .apply_and_execute(crate::daemon_protocol::Event::DormantOwned {
-                            owner,
-                            expected_pane: Some("%9".into()),
-                            observed_at: 1_753_920_100,
-                            source: crate::daemon_protocol::DormancySource::Reaped,
                         })
                         .await;
                 }
@@ -9132,12 +9147,6 @@ pub(crate) mod tests {
                         }
                     )
                 }
-                "dormant-destination" => assert_eq!(
-                    outcome,
-                    LocalClaimOutcome::DestinationDormant {
-                        id: "chosen".into()
-                    }
-                ),
                 "already-registered-pair" => assert_eq!(
                     outcome,
                     LocalClaimOutcome::AlreadyRegistered {
@@ -12981,7 +12990,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn dormant_conflict_scanner_suffixes_a_reserved_automatic_name() {
+    async fn scanner_reuses_a_name_held_only_by_history() {
         let state = AppState::new_for_test();
         state
             .apply_and_execute(crate::daemon_protocol::Event::Register {
@@ -13015,8 +13024,50 @@ pub(crate) mod tests {
         state.scan_and_autoregister_panes().await;
 
         let protocol = state.protocol.read().await;
+        assert!(!protocol.dormant_sessions.contains_key("ouija"));
+        assert_eq!(protocol.sessions["ouija"].pane.as_deref(), Some("%new"));
+    }
+
+    #[tokio::test]
+    async fn trusted_session_end_grace_prevents_scanner_resurrection() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "ouija".into(),
+                pane: Some("%ending".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    project_dir: Some("/tmp/ouija".into()),
+                    canonical_project_identity: Some("/tmp/ouija".into()),
+                    backend: Some("claude-code".into()),
+                    backend_session_id: Some("ending-thread".into()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["ouija"].owner();
+        assert!(matches!(
+            state
+                .dormant_owned(
+                    owner,
+                    Some("%ending".into()),
+                    30,
+                    crate::daemon_protocol::DormancySource::TrustedSessionEnd,
+                )
+                .await,
+            DormantOwnedOutcome::Dormant { .. }
+        ));
+        *state.cached_assistant_panes.write().await = vec![crate::tmux::TmuxPane {
+            pane_id: "%ending".into(),
+            session_name: "ouija".into(),
+            pane_current_path: Some("/tmp/ouija".into()),
+            process_name: Some("claude".into()),
+        }];
+
+        state.scan_and_autoregister_panes().await;
+
+        let protocol = state.protocol.read().await;
+        assert!(protocol.sessions.is_empty());
         assert!(protocol.dormant_sessions.contains_key("ouija"));
-        assert_eq!(protocol.sessions["ouija-2"].pane.as_deref(), Some("%new"));
     }
 
     #[tokio::test]

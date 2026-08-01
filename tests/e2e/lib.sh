@@ -169,6 +169,7 @@ run_identity_continuity_scenario() {
     local claim_pane continuity_pane
 
     log "Test 36: Local identity continuity survives pane replacement"
+    api "$base" POST /api/settings -d '{"auto_register":false}' >/dev/null
     mkdir -p "$claim_project" "$continuity_project"
     create_fake_codex "$fake_bin" >/dev/null
     claim_pane=$(create_assistant_pane "$fake_bin" codex "$claim_project")

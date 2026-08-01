@@ -403,7 +403,7 @@ The CLI infers your session ID from `$TMUX_PANE`. In engines whose bash tool run
 
 Run `ouija whoami` to learn your own id when automatic identity evidence is available. It resolves through the same signals implicit sends use, prints the id on stdout, and fails loudly with per-signal diagnostics when it cannot identify you. Implicit `ouija whoami` remains fail-closed when pane, environment, or backend identity cannot prove one Local owner.
 
-For an explicit local send, an exact injected or operator-provided public Local session id is authoritative even when `ouija whoami` has missing, not-found, or incomplete backend evidence. Use that exact id with `--from`. The daemon requires it to name an existing Local session and rejects the send if pane, environment, or a complete backend pair positively resolves the caller to a different Local session.
+For an explicit local send, an exact injected or operator-provided public Local session id is authoritative even when `ouija whoami` has missing, not-found, incomplete, or stale backend evidence. Use that exact id with `--from`. The daemon requires it to name an existing Local session. An exact target-pane match wins over stale environment or backend evidence; a pane owned by a different Local session still rejects the send, as does positive sibling evidence when the caller is outside the target pane.
 
 Use only an exact public id as the sender: the output of `ouija whoami`, your `$OUIJA_SESSION_ID`, the id in your injected system prompt (`You are session "<id>" on the ouija mesh`), or an exact id explicitly provided by the operator. Never guess a sender id — not the project directory name, a branch name, or an entry picked from `ouija ls` (`ouija ls` shows all sessions but cannot tell you which one is you). A guessed `--from` impersonates another session and misroutes its replies.
 
@@ -430,14 +430,17 @@ If implicit resolution fails and you do not have an exact injected or operator-p
 `ouija claim exact-public-id` is the explicit Local operator path for a
 genuinely unregistered running assistant. It uses the current adapter's
 complete backend identity plus independently verified live pane/project
-evidence. The daemon atomically creates the requested free public ID, treats an
-exact same-owner retry as idempotent, and recovers an exact dormant backend pair
-before considering a new claim. A conflict fails closed; claim never evicts or
-renames another identity. Backend-native session IDs remain evidence in the
-Local control plane and are never public Ouija IDs or Nostr sender identity.
+evidence. The daemon atomically creates the requested ID when no live session
+or lifecycle operation holds it, treats an exact same-owner retry as
+idempotent, and recovers an exact dormant backend pair before considering a new
+claim. Historical rows do not reserve public names. A live or lifecycle
+conflict fails closed; claim never evicts or renames another live identity.
+Backend-native session IDs remain evidence in the Local control plane and are
+never public Ouija IDs or Nostr sender identity.
 
-Dormant identities are durable, non-routable reservations with no automatic
-expiry. Inspect the redacted reservation before intentionally releasing it:
+Dormant identities are durable, non-routable recovery records. They preserve
+backend and project continuity but do not reserve public names. Inspect one
+before intentionally forgetting its recovery metadata:
 
 ```bash
 ouija dormant list
@@ -445,11 +448,11 @@ ouija dormant show exact-public-id
 ouija unregister exact-public-id
 ```
 
-For a dormant target, `unregister` forgets only that exact reservation and
-preserves its worktree. Use it only when the operator explicitly intends to
-release the public ID and backend/project ownership. `ouija rename` requires an
-existing exact Local source row and never acts as registration or claim; use
-`ouija claim` for a genuinely unregistered caller.
+For a dormant target, `unregister` forgets only that exact recovery record and
+preserves its worktree. `ouija rename` requires an existing exact Local source
+row and may take a name found only in dormant history; it still refuses names
+held by live sessions or lifecycle operations. Use `ouija claim` for a
+genuinely unregistered caller.
 
 ### Recover a running backend from a both-null row
 

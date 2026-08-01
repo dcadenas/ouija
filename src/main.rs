@@ -2066,6 +2066,12 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
                         crate::daemon_protocol::Effect::SetTmuxVar {
                             owner: owner.clone(),
                             pane: pane.clone(),
+                            name: "@ouija_last_session".into(),
+                            value: entry.id.clone(),
+                        },
+                        crate::daemon_protocol::Effect::SetTmuxVar {
+                            owner: owner.clone(),
+                            pane: pane.clone(),
                             name: "@ouija_incarnation".into(),
                             value: entry.metadata.session_incarnation.to_string(),
                         },
@@ -3011,6 +3017,46 @@ async fn whoami_outcome() -> WhoamiOutcome {
     let pane_var = tmux_pane.as_deref().and_then(tmux_var::get);
     let env_var = std::env::var("OUIJA_SESSION_ID").ok();
     let backend_identity = backend::BackendRegistry::default_registry().caller_session_identity();
+
+    if let Some(pane) = tmux_pane.as_deref() {
+        let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
+        let base = format!("http://localhost:{port}");
+        let status = match reqwest::get(format!("{base}/api/status")).await {
+            Ok(response) => response.json::<serde_json::Value>().await.ok(),
+            Err(_) => None,
+        };
+        let Some(status) = status else {
+            return WhoamiOutcome::Unresolved(WhoamiFailure {
+                tmux_pane,
+                pane_var,
+                env_var,
+                lookup: Some(PaneLookupFailure::DaemonUnreachable(base)),
+            });
+        };
+        let current_id = status["sessions"].as_array().and_then(|sessions| {
+            sessions
+                .iter()
+                .find(|session| {
+                    session["pane"].as_str() == Some(pane)
+                        && session["origin"].as_str() == Some("local")
+                })
+                .and_then(|session| session["id"].as_str().map(String::from))
+        });
+        return match current_id {
+            Some(id) => WhoamiOutcome::Resolved {
+                id,
+                source: IdentitySource::PaneLookup,
+                tmux_pane,
+                backend_identity,
+            },
+            None => WhoamiOutcome::Unresolved(WhoamiFailure {
+                tmux_pane,
+                pane_var,
+                env_var,
+                lookup: Some(PaneLookupFailure::NoSessionForPane),
+            }),
+        };
+    }
 
     let (local, lookup) =
         match pick_session_id(tmux_pane.as_deref(), pane_var.clone(), env_var.clone()) {

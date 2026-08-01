@@ -604,21 +604,17 @@ async fn session_start_inner(
                     .map(|session| session.owner())
             };
             if let Some(incumbent_owner) = incumbent_owner {
-                let basename = std::path::Path::new(&project.project_dir)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("unnamed");
-                let base_id = crate::state::sanitize_session_id(basename);
-                if !base_id.is_empty() {
-                    let replacement_id = {
-                        let protocol = state.protocol.read().await;
-                        crate::state::resolve_unique_session_id(
-                            &protocol.sessions,
-                            &protocol.dormant_sessions,
-                            &base_id,
-                            None,
-                        )
-                    };
+                if body
+                    .session_incarnation
+                    .is_some_and(|incarnation| incarnation != incumbent_owner.incarnation)
+                {
+                    return json!({
+                        "skipped": "existing pane incarnation mismatch",
+                        "output": "",
+                    });
+                }
+                let replacement_id = incumbent_owner.session_id.clone();
+                if !replacement_id.is_empty() {
                     match state
                         .replace_reused_cross_backend_pane(
                             incumbent_owner,
@@ -798,12 +794,16 @@ async fn session_start_inner(
 
     // Resolve name conflicts via the shared helper (same suffix-bumping and
     // same-pane-idempotency rules as scan_and_autoregister_panes).
+    let preferred_id = state
+        .pane_last_session_id(&body.pane)
+        .await
+        .unwrap_or(base_id);
     let id = {
         let proto = state.protocol.read().await;
         crate::state::resolve_unique_session_id(
             &proto.sessions,
-            &proto.dormant_sessions,
-            &base_id,
+            &proto.lifecycle_leases,
+            &preferred_id,
             Some(&body.pane),
         )
     };
@@ -939,7 +939,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dormant_conflict_session_start_suffixes_a_reserved_automatic_name() {
+    async fn session_start_reuses_a_name_held_only_by_history() {
         let state = crate::state::AppState::new_for_test();
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join("worker");
@@ -989,10 +989,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result["registered"], "worker-2");
+        assert_eq!(result["registered"], "worker");
         let protocol = state.protocol.read().await;
-        assert!(protocol.dormant_sessions.contains_key("worker"));
-        assert!(protocol.sessions.contains_key("worker-2"));
+        assert!(!protocol.dormant_sessions.contains_key("worker"));
+        assert!(protocol.sessions.contains_key("worker"));
     }
 
     async fn session_incarnation(
@@ -2712,7 +2712,10 @@ mod tests {
                 pane: "%72".into(),
                 cwd: "/home/user/code/proj".into(),
                 backend_session_id: Some("codex-thread-stale".into()),
-                backend_identity: None,
+                backend_identity: Some(crate::backend::BackendSessionIdentity {
+                    backend: "codex-cli".into(),
+                    session_id: "codex-thread-stale".into(),
+                }),
                 adapter: Some("codex-cli".into()),
                 launch_session_id: None,
                 launch_credential: None,
@@ -2838,13 +2841,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result["registered"], "hub-fundamentals-2");
+        assert_eq!(result["registered"], "ouija");
         let protocol = state.protocol.read().await;
-        assert!(protocol.dormant_sessions.contains_key("ouija"));
-        assert_eq!(
-            protocol.sessions["hub-fundamentals-2"].pane.as_deref(),
-            Some("%3")
-        );
+        assert!(!protocol.dormant_sessions.contains_key("ouija"));
+        assert_eq!(protocol.sessions["ouija"].pane.as_deref(), Some("%3"));
     }
 
     #[tokio::test]
