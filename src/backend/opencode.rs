@@ -345,12 +345,13 @@ mod tests {
     #[test]
     fn embedded_skill_distinguishes_public_session_id_from_opencode_backend_ids() {
         assert!(
-            embedded::SKILL_MD.contains("ouija ask target-id \"question\" --from public-ouija-id"),
-            "skill must show ask with the public Ouija sender id"
+            embedded::SKILL_MD.contains(
+                "Public Ouija IDs and backend-native conversation IDs are different identities"
+            ),
+            "skill must distinguish public Ouija and backend-native identities"
         );
         assert!(
-            embedded::SKILL_MD
-                .contains("Never use `opencode` or an OpenCode `backend_session_id` as `--from`"),
+            embedded::SKILL_MD.contains("never use `opencode` or a backend session ID as `--from`"),
             "skill must warn against backend labels and opaque backend session ids"
         );
     }
@@ -405,11 +406,11 @@ mod tests {
             "skill section 7 must teach `ouija whoami` as the identity source"
         );
         assert!(
-            embedded::SKILL_MD.contains("Never guess"),
+            embedded::SKILL_MD.contains("Never guess a sender from a project"),
             "skill must explicitly forbid guessing a sender id"
         );
         assert!(
-            embedded::SKILL_MD.contains("project directory"),
+            embedded::SKILL_MD.contains("project, branch, role, process, or `ouija ls`"),
             "skill must name the project-basename guess that caused the incident"
         );
         assert!(
@@ -417,13 +418,12 @@ mod tests {
             "the old example read as an invitation to invent a plausible-looking id"
         );
         assert!(
-            embedded::SKILL_MD
-                .contains("exact injected or operator-provided public Local session id"),
+            embedded::SKILL_MD.contains("trusted injected context or the operator"),
             "skill must distinguish authoritative explicit Local ids from guesses"
         );
         assert!(
-            embedded::SKILL_MD.contains("Implicit `ouija whoami` remains fail-closed"),
-            "skill must keep unresolved implicit identity separate from explicit Local claims"
+            embedded::SKILL_MD.contains("Never run `ouija register` to repair caller identity"),
+            "skill must reject duplicate registration as identity recovery"
         );
     }
 

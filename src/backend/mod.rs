@@ -552,10 +552,11 @@ pub trait CodingAssistant: Send + Sync + std::fmt::Debug + 'static {
 
 #[cfg(test)]
 pub(crate) fn assert_shared_task_reminder_guidance(skill: &str) {
+    let normalized_skill = skill.split_whitespace().collect::<Vec<_>>().join(" ");
     let active_context_section = skill
-        .split("## 5. Active-context refresh")
+        .split("## Active-context refresh")
         .nth(1)
-        .and_then(|section| section.split("## 6.").next())
+        .and_then(|section| section.split("## Identity and recovery").next())
         .expect("shared skill must contain the active-context refresh section");
     let active_context = active_context_section
         .split_whitespace()
@@ -563,24 +564,26 @@ pub(crate) fn assert_shared_task_reminder_guidance(skill: &str) {
         .join(" ");
 
     assert!(
-        skill.contains("`--reminder` alone opts the session into recurring recovery nudges."),
-        "skill must make recurring reminders explicitly opt in"
+        normalized_skill.contains("## Progressive disclosure")
+            && normalized_skill.contains("Do not preload or reproduce the full command catalog")
+            && normalized_skill
+                .contains("Follow those diagnostics rather than inventing a workaround"),
+        "skill must delegate routine syntax and recovery to help and actionable errors"
     );
     assert!(
-        skill.contains("`--when-done keep-open|ask-parent|close`"),
-        "skill must teach the primary completion option independently"
+        normalized_skill.contains("`reply=\"true\"` means the sender is blocked")
+            && normalized_skill.contains("A progress update does not clear the pending reply")
+            && normalized_skill.contains("Do not poll logs, status, or pane output"),
+        "skill must preserve non-obvious message threading semantics"
     );
     assert!(
-        skill.contains("`--idle-policy` is deprecated"),
-        "skill must label the compatibility option as deprecated"
-    );
-    assert!(
-        skill.contains("Pending replies can still wake a session without `--reminder`."),
-        "skill must preserve the independent pending-reply wakeup contract"
-    );
-    assert!(
-        skill.contains("Never put `ouija clear-reminder` in manual reminder text."),
-        "skill must reserve generated clearing commands for Ouija"
+        normalized_skill.contains("`--when-done keep-open|ask-parent|close`")
+            && normalized_skill
+                .contains("`--reminder` independently enables recurring recovery nudges")
+            && normalized_skill
+                .contains("Pending replies can wake a session even without a reminder")
+            && normalized_skill.contains("never place `ouija clear-reminder` in reminder text"),
+        "skill must distinguish completion, reminders, and pending replies"
     );
     let placeholder_command = ["ouija clear-reminder", "N"].join(" ");
     assert!(
@@ -588,75 +591,51 @@ pub(crate) fn assert_shared_task_reminder_guidance(skill: &str) {
         "skill must not contain a copyable placeholder clearing command"
     );
     assert!(
-        skill.contains("ouija rollover prepare --stdin"),
-        "shared skill must teach session-owned rollover preparation"
-    );
-    assert!(
-        skill.contains("ouija rollover adopt"),
-        "shared skill must teach verified adoption"
-    );
-    assert!(
-        skill.contains("Repository, git, test, and GitHub")
-            && skill.contains("evidence remains authoritative"),
+        normalized_skill.contains("Repository and task evidence remain authoritative"),
         "shared skill must keep continuation records non-authoritative"
     );
     assert!(
-        skill.contains("Native subagents are not Ouija sessions"),
+        normalized_skill.contains("Native subagents are not Ouija sessions"),
         "shared skill must preserve the native-subagent boundary"
     );
     assert!(
-        active_context.contains("`--fresh-context-after-active DURATION` is an opt-in policy")
-            && active_context.contains("`spawn-session` and fresh `restart-session` launches"),
-        "shared skill must teach opt-in active-context refresh on manual lifecycle commands"
-    );
-    assert!(
-        active_context.contains(
-            "counts accumulated active work, not wall-clock time: the counter pauses while"
-        ) && active_context.contains("the session is parked"),
+        active_context.contains("counts accumulated active work, not wall time")
+            && active_context.contains("pauses while parked"),
         "shared skill must explain that active-context accounting pauses while parked"
     );
     assert!(
-        active_context.contains("mandatory refresh notice only at a")
-            && active_context.contains("safe `Stopped` boundary")
-            && active_context
-                .contains("Each later stopped boundary repeats the notice until a fresh")
-            && active_context.contains("restart successfully completes"),
-        "shared skill must keep refresh notices at stopped boundaries until fresh restart success"
+        active_context.contains("triggers only at a safe stopped boundary")
+            && active_context.contains("A successful fresh restart resets the counter")
+            && active_context.contains("there is no separate rearm command"),
+        "shared skill must explain the active-context refresh lifecycle"
     );
     assert!(
-        active_context_section.contains(
-            r#"ouija restart-session "worker" --fresh --one-shot-file /dev/stdin <<'OUIJA_CONTINUATION'"#
-        ) && active_context.contains("Ouija replays the durable stored base before the launch-only continuation")
-            && active_context.contains("If `prompt` is null, absent, or transient recovery")
-            && active_context.contains("compose a concise durable base and replace it with `--prompt`"),
-        "shared skill must require the quoted fresh-restart heredoc and repair missing/transient stored prompts"
+        active_context
+            .contains("Make the stored prompt a concise durable role and replay-safe assignment")
+            && active_context.contains("Put verified completed/remaining work")
+            && active_context.contains("in a one-shot continuation")
+            && active_context_section.contains("--one-shot-file /dev/stdin"),
+        "shared skill must separate durable prompts from mutable continuation state"
     );
     assert!(
-        active_context.contains("By default, every fresh restart replays the stored prompt")
-            && active_context
-                .contains("Write every stored prompt as a re-entrant, state-checking assignment")
-            && active_context.contains("perform only the remaining work")
-            && active_context.contains(
-                "Expensive, destructive, or external actions must not be repeated solely because"
-            )
-            && active_context.contains("Verify completion and current authorization")
-            && active_context.contains("Copy the 1 TB file from A to B, then inspect foobar")
-            && active_context.contains("If the verified copy is incomplete"),
+        normalized_skill.contains("Every stored prompt must be re-entrant and state-checking")
+            && normalized_skill.contains("Perform only work that remains incomplete")
+            && normalized_skill
+                .contains("Do not repeat expensive, destructive, or external actions"),
         "shared skill must make replay safety explicit for non-idempotent stored-prompt work"
     );
     assert!(
-        active_context.contains("does not create a scheduler task")
-            && active_context.contains("The policy applies only to the exact session")
-            && active_context
-                .contains("target is Local and its `parent_session` exactly equals the current")
-            && active_context.contains("session's exact public Local ID")
-            && active_context.contains("Never discover sessions from native")
-            && active_context.contains("subagents, names, paths, roles, or process trees"),
-        "shared skill must keep active-context refresh exact-owner scoped and free of scheduler enrollment"
+        active_context.contains("Do not use scheduler tasks or legacy rollover")
+            && normalized_skill
+                .contains("Never guess a sender from a project, branch, role, process")
+            && normalized_skill
+                .contains("never use `opencode` or a backend session ID as `--from`"),
+        "shared skill must preserve refresh and sender-identity boundaries"
     );
     assert!(
-        skill.contains("`ouija rollover` remains a separate legacy/manual continuation facility")
-            && skill.contains("not used by active-context refresh"),
+        normalized_skill
+            .contains("`ouija rollover` is a separate explicit continuation-record workflow")
+            && normalized_skill.contains("not the active-context refresh path"),
         "shared skill must keep legacy manual rollover separate from active-context refresh"
     );
     assert!(
