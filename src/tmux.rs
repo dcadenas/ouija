@@ -21,6 +21,12 @@ const MAX_INJECT_RETRIES: u32 = 3;
 /// Base delay for exponential backoff between retries (500ms, 1s, 2s).
 const RETRY_BASE_MS: u64 = 500;
 
+/// Upper bound on a single tmux injection attempt.
+///
+/// A healthy inject measures in the low hundreds of milliseconds (paste settle
+/// plus verify), so this is generous headroom rather than a tight deadline.
+const INJECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(15);
+
 static INJECT_BUFFER_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -237,42 +243,15 @@ pub(crate) fn backends_in_pane(
     ))
 }
 
-/// Log a warning if the pane is not running a known app.
-///
-/// This is purely informational — injection proceeds regardless, since
-/// messages queued in the terminal input buffer are picked up when the
-/// app's turn ends.
-fn check_known_app(pane: &str, names: &[&str]) -> anyhow::Result<()> {
-    let output = Command::new("tmux")
-        .args([
-            "display-message",
-            "-t",
-            pane,
-            "-p",
-            "#{pane_current_command}",
-        ])
-        .output();
-
-    let cmd = match output {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => {
-            tracing::warn!(pane, "could not detect pane command");
-            return Ok(());
-        }
-    };
-
-    if !names
-        .iter()
-        .any(|&app| cmd == app || cmd.strip_prefix('.') == Some(app))
-    {
-        tracing::warn!(
-            pane,
-            cmd,
-            "pane is not running a known app — injecting anyway"
-        );
-    }
-    Ok(())
-}
+// A `check_known_app` helper used to run here. It compared
+// `#{pane_current_command}` against a list of expected app names and warned
+// when there was no match, but its only caller passed an empty list, so the
+// match could never succeed and the warning fired on every single injection —
+// including for panes genuinely running the assistant. It was removed rather
+// than repaired: `pane_current_command` reports the *foreground child*, so a
+// busy agent running a tool command reads as `bash` and the signal is
+// unreliable for exactly the sessions that matter most. `backends_in_pane`
+// already walks the pane's process tree when a trustworthy answer is needed.
 
 /// Ensure the pane is in INSERT mode for vim-enabled sessions.
 ///
@@ -330,8 +309,6 @@ pub fn inject(
     tui_pattern: Option<&str>,
 ) -> anyhow::Result<()> {
     let t0 = Instant::now();
-    check_known_app(pane, &[])?;
-    let t1 = Instant::now();
 
     if vim_mode {
         if let Some(pattern) = tui_pattern {
@@ -351,8 +328,7 @@ pub fn inject(
     tracing::info!(
         pane,
         msg_len = message.len(),
-        check_app_ms = t1.duration_since(t0).as_millis() as u64,
-        vim_mode_ms = t2.duration_since(t1).as_millis() as u64,
+        vim_mode_ms = t2.duration_since(t0).as_millis() as u64,
         inject_ms = t3.duration_since(t2).as_millis() as u64,
         verify_ms = t4.duration_since(t3).as_millis() as u64,
         total_ms = t4.duration_since(t0).as_millis() as u64,
@@ -595,11 +571,28 @@ pub async fn pane_inject_loop(mut rx: tokio::sync::mpsc::UnboundedReceiver<Injec
                 startup_inject_delay_secs: req.inject_config.startup_inject_delay_secs,
             };
             let tui_pattern = req.tui_pattern.clone();
-            match tokio::task::spawn_blocking(move || {
-                inject(&pane, &message, vim_mode, &config, tui_pattern.as_deref())
-            })
+            // `inject` shells out to tmux via std::process::Command, which has
+            // no timeout of its own. A tmux server that stops answering would
+            // otherwise park this task forever, and every caller awaiting
+            // `result_rx` with it. Bounding the wait converts an indefinite
+            // stall into a retryable error. The blocking thread may outlive the
+            // timeout — that is deliberate: leaking one pool thread is strictly
+            // better than stalling delivery for every session.
+            let attempt = tokio::time::timeout(
+                INJECT_ATTEMPT_TIMEOUT,
+                tokio::task::spawn_blocking(move || {
+                    inject(&pane, &message, vim_mode, &config, tui_pattern.as_deref())
+                }),
+            )
             .await
-            {
+            .unwrap_or_else(|_| {
+                Ok(Err(anyhow::anyhow!(
+                    "inject timed out after {}s (tmux did not respond)",
+                    INJECT_ATTEMPT_TIMEOUT.as_secs()
+                )))
+            });
+
+            match attempt {
                 Ok(Ok(())) => break Ok(()),
                 Ok(Err(e)) => {
                     attempts += 1;

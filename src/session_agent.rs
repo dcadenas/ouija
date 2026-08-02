@@ -679,13 +679,20 @@ impl SessionAgent {
             tokio::time::Instant::now(),
             cooldown,
         );
-        let vim_mode = self.app_state.protocol.read().await;
-        let vim_mode = vim_mode
-            .session_agent_pane_for_owner(&state.owner)
-            .filter(|claimed| *claimed == Some(pane.as_str()))
-            .and_then(|_| vim_mode.sessions.get(&state.owner.session_id))
-            .map(|session| session.metadata.vim_mode)
-            .unwrap_or(false);
+        // The read guard MUST be confined to this block. Shadowing it does not
+        // drop it, so binding it directly in the enclosing scope would pin a
+        // `protocol` reader across the `locked_inject_owned` awaits below. That
+        // inject has no timeout, and tokio's RwLock is fair: one queued writer
+        // then blocks every subsequent reader, wedging the whole daemon.
+        let vim_mode = {
+            let protocol = self.app_state.protocol.read().await;
+            protocol
+                .session_agent_pane_for_owner(&state.owner)
+                .filter(|claimed| *claimed == Some(pane.as_str()))
+                .and_then(|_| protocol.sessions.get(&state.owner.session_id))
+                .map(|session| session.metadata.vim_mode)
+                .unwrap_or(false)
+        };
 
         for entry in due {
             if !self.is_current(state).await {
