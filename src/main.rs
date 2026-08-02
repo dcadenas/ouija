@@ -1621,9 +1621,6 @@ fn reaper_process_names(
     backends: &crate::backend::BackendRegistry,
     metadata: &crate::daemon_protocol::SessionMeta,
 ) -> Option<Vec<String>> {
-    if metadata.is_strong_opencode_binding() {
-        return None;
-    }
     match metadata
         .backend
         .as_deref()
@@ -2003,15 +2000,16 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
         return Ok(());
     }
 
-    // HTTP-delivered sessions (opencode shared serve) are reachable over their
-    // API regardless of the tmux pane, so pane-process liveness must not gate
-    // their restoration — same reaper-false-positive class as the live reaper.
-    // Keep them unconditionally; only pane-bound (TUI) sessions need the check.
-    let (http_delivered, pane_bound): (Vec<_>, Vec<_>) = sessions.into_iter().partition(|ps| {
-        ps.metadata
-            .backend
-            .as_deref()
-            .is_some_and(|b| state.backends.uses_http_delivery(b))
+    // A deliberately paneless HTTP session remains reachable through the
+    // shared API. A pane-backed HTTP session still needs a live assistant pane;
+    // otherwise its stale row must not reserve a public Local name.
+    let (paneless_http, pane_bound): (Vec<_>, Vec<_>) = sessions.into_iter().partition(|ps| {
+        ps.pane.is_none()
+            && ps
+                .metadata
+                .backend
+                .as_deref()
+                .is_some_and(|backend| state.backends.uses_http_delivery(backend))
     });
 
     // Check pane liveness on a blocking thread. Dead persisted rows are still
@@ -2028,7 +2026,7 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
     })
     .await
     .unwrap_or_default();
-    alive.extend(http_delivered);
+    alive.extend(paneless_http);
 
     let (marker_effects, dead_owners) = {
         let mut proto = state.protocol.write().await;
@@ -5289,7 +5287,7 @@ mod tests {
     }
 
     #[test]
-    fn reaper_process_names_exempts_only_strong_opencode_bindings() {
+    fn reaper_process_names_checks_pane_backed_strong_opencode_bindings() {
         let backends = crate::backend::BackendRegistry::default_registry();
         let strong = crate::daemon_protocol::SessionMeta {
             backend: Some("opencode".into()),
@@ -5304,11 +5302,54 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(reaper_process_names(&backends, &strong), None);
+        assert_eq!(
+            reaper_process_names(&backends, &strong),
+            Some(vec!["opencode".to_string()])
+        );
         assert_eq!(
             reaper_process_names(&backends, &weak),
             Some(vec!["opencode".to_string()])
         );
+    }
+
+    #[tokio::test]
+    async fn restore_reaps_pane_backed_strong_opencode_session_with_missing_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let registered_at = chrono::Utc::now();
+        let snapshot = crate::persistence::PersistedLifecycleState::new(
+            vec![crate::persistence::PersistedSession {
+                id: "stale-opencode".into(),
+                pane: Some("%999999990".into()),
+                registered_at,
+                last_activity_at: registered_at,
+                metadata: crate::state::SessionMetadata {
+                    project_dir: Some("/tmp/stale-opencode".into()),
+                    canonical_project_identity: Some("/tmp/stale-opencode".into()),
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_stale_opencode".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+                    session_incarnation: crate::daemon_protocol::SessionIncarnation(42),
+                    ..Default::default()
+                },
+            }],
+            std::collections::BTreeMap::new(),
+            crate::daemon_protocol::SessionIncarnation(42),
+            std::collections::BTreeMap::new(),
+        );
+        crate::persistence::save_sessions(dir.path(), &snapshot).unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "restore-stale-opencode-test".into(),
+            npub: "npub1test".into(),
+            port: 0,
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+
+        restore_persisted_sessions(&state).await.unwrap();
+
+        let protocol = state.protocol.read().await;
+        assert!(!protocol.sessions.contains_key("stale-opencode"));
+        assert!(protocol.dormant_sessions.contains_key("stale-opencode"));
     }
 
     #[test]

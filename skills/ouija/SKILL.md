@@ -140,6 +140,12 @@ Local ID from trusted injected context or the operator may be passed explicitly
 with `--from`. Never run `ouija register` to repair caller identity; it can
 create a duplicate rather than identify the caller.
 
+Treat an operator-requested new public name as a literal argument. Do not
+spell-correct it from repository names, nearby sessions, or likely intent, and
+do not preflight availability with `ls` or `status`. Run `ouija rename` once
+with the exact requested name. If the command reports a real conflict, relay
+that error and ask for a different name; do not silently choose one.
+
 Names are held by live Local sessions and lifecycle operations. Dormant rows are
 non-routable recovery history and do not reserve names. `claim`, `dormant`,
 `rename`, `unregister`, and `recover-backend-identity` enforce their own narrow

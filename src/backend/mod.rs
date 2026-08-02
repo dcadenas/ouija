@@ -634,6 +634,13 @@ pub(crate) fn assert_shared_task_reminder_guidance(skill: &str) {
     );
     assert!(
         normalized_skill
+            .contains("Treat an operator-requested new public name as a literal argument")
+            && normalized_skill.contains("do not preflight availability with `ls` or `status`")
+            && normalized_skill.contains("Run `ouija rename` once with the exact requested name"),
+        "shared skill must prevent speculative rename correction and discovery"
+    );
+    assert!(
+        normalized_skill
             .contains("`ouija rollover` is a separate explicit continuation-record workflow")
             && normalized_skill.contains("not the active-context refresh path"),
         "shared skill must keep legacy manual rollover separate from active-context refresh"
