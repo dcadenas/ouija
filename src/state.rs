@@ -278,7 +278,28 @@ pub(crate) struct EffectDeliveryFailure {
 pub(crate) enum DeliveryOutcome {
     Accepted,
     Rejected(String),
+    /// The injection could not be verified and the recipient was not mid-turn,
+    /// so there is no benign explanation. Reported to the sender as "unknown".
     Ambiguous(String),
+    /// The injection could not be verified only because the recipient was
+    /// mid-turn and its TUI had not redrawn yet. Reported to the sender as
+    /// "queued"; a deferred re-check reports a loss if the text never appears.
+    Queued(String),
+}
+
+/// Upper bound on asking a session agent to hold a deferred delivery re-check.
+const DELIVERY_RECHECK_QUERY_TIMEOUT_MS: u64 = 5_000;
+
+/// Whether the recipient was mid-turn when an injection was verified.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecipientTurnState {
+    /// The recipient is mid-turn; an unrendered paste is expected.
+    MidTurn,
+    /// The recipient is between turns; an unrendered paste has no excuse.
+    BetweenTurns,
+    /// No session agent, or the query failed. Treated like `BetweenTurns`,
+    /// because failing toward the louder signal is correct when we do not know.
+    Unknown,
 }
 
 fn prompt_async_failure_reason(
@@ -367,25 +388,51 @@ async fn deliver_raw_tmux_for_session(
         }
     };
 
-    inject_delivery_outcome(result)
+    resolve_inject_delivery_outcome(state, request, result).await
 }
 
-/// Map a tmux injection attempt to a delivery outcome.
+/// Map a tmux injection attempt to a delivery outcome, using the recipient's
+/// turn state to separate an expected miss from a real one.
 ///
-/// Only an observed injection counts as delivered. When the pane never showed
-/// the text we cannot prove either way, so report `Ambiguous` ("unknown" to the
-/// sender) rather than a delivery the recipient may never have seen. `Rejected`
-/// would be wrong for the same reason: the paste itself succeeded, and the
-/// recipient may well have the message.
-fn inject_delivery_outcome(
+/// An unverified injection into a mid-turn recipient is the common, benign
+/// case: the TUI has not redrawn, and the pasted text arrives when the turn
+/// ends. That is reported as `Queued` — and only after the recipient's agent
+/// has accepted a deferred re-check, so the quiet answer is never the end of
+/// the story. Everything else keeps the loud `Ambiguous` answer.
+pub(crate) async fn resolve_inject_delivery_outcome(
+    state: &AppState,
+    request: &InjectDeliveryRequest<'_>,
     result: anyhow::Result<crate::tmux::InjectVerification>,
 ) -> DeliveryOutcome {
-    match result {
-        Ok(crate::tmux::InjectVerification::Confirmed) => DeliveryOutcome::Accepted,
-        Ok(crate::tmux::InjectVerification::Unconfirmed(reason)) => {
+    let reason = match result {
+        Ok(crate::tmux::InjectVerification::Confirmed) => return DeliveryOutcome::Accepted,
+        Ok(crate::tmux::InjectVerification::Unconfirmed(reason)) => reason,
+        Err(error) => return DeliveryOutcome::Rejected(error.to_string()),
+    };
+
+    let turn_state = state
+        .schedule_deferred_delivery_recheck(crate::tmux::DeferredInjectVerification {
+            session_id: request.session_id.to_string(),
+            pane: request.pane.to_string(),
+            message: request.message.to_string(),
+            msg_id: request.msg_id,
+            first_reason: reason.clone(),
+        })
+        .await;
+
+    inject_delivery_outcome(reason, turn_state)
+}
+
+/// Decide what an unverified injection means given the recipient's turn state.
+///
+/// Pure. `MidTurn` is the only state with a benign explanation; `Unknown` and
+/// `BetweenTurns` both take the louder answer.
+fn inject_delivery_outcome(reason: String, turn_state: RecipientTurnState) -> DeliveryOutcome {
+    match turn_state {
+        RecipientTurnState::MidTurn => DeliveryOutcome::Queued(reason),
+        RecipientTurnState::BetweenTurns | RecipientTurnState::Unknown => {
             DeliveryOutcome::Ambiguous(reason)
         }
-        Err(error) => DeliveryOutcome::Rejected(error.to_string()),
     }
 }
 
@@ -444,6 +491,9 @@ pub(crate) struct InjectDeliveryRequest<'a> {
     pub vim_mode: bool,
     pub delivery_method: Option<&'a str>,
     pub recorded_method: Option<&'a str>,
+    /// Message id reported to the sender, when the send carried one. Only used
+    /// to identify the message in a deferred delivery re-check.
+    pub msg_id: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -5054,6 +5104,10 @@ impl AppState {
             Effect::SendDelivered { http_delivery, .. } => http_delivery.as_ref(),
             _ => None,
         });
+        let recorded_msg_id = effects.iter().find_map(|effect| match effect {
+            Effect::SendDelivered { msg_id, .. } => Some(*msg_id),
+            _ => None,
+        });
         let mut delivery_failure = None;
 
         for effect in effects {
@@ -5088,6 +5142,7 @@ impl AppState {
                     message,
                     vim_mode,
                     delivery_method,
+                    pending_reply_msg_id,
                     ..
                 } => {
                     let outcome = deliver_inject_message_effect(
@@ -5099,6 +5154,7 @@ impl AppState {
                             vim_mode: *vim_mode,
                             delivery_method: delivery_method.as_deref(),
                             recorded_method,
+                            msg_id: recorded_msg_id.or(*pending_reply_msg_id),
                         },
                     )
                     .await;
@@ -5110,6 +5166,12 @@ impl AppState {
                         }
                         DeliveryOutcome::Ambiguous(reason) => {
                             tracing::warn!(session = %session_id, "message delivery outcome ambiguous; preserving delivered state: {reason}");
+                        }
+                        // Quiet on purpose: the recipient was mid-turn, so an
+                        // unrendered paste is expected. Its session agent holds
+                        // a re-check that warns if the text never arrives.
+                        DeliveryOutcome::Queued(reason) => {
+                            tracing::debug!(session = %session_id, "message queued behind the recipient's turn; re-check scheduled: {reason}");
                         }
                     }
                 }
@@ -5137,7 +5199,8 @@ impl AppState {
                                     delivery_failure
                                         .get_or_insert(EffectDeliveryFailure { reason });
                                 }
-                                DeliveryOutcome::Ambiguous(reason) => {
+                                DeliveryOutcome::Ambiguous(reason)
+                                | DeliveryOutcome::Queued(reason) => {
                                     tracing::warn!(session = %session_id, "http delivery outcome ambiguous; preserving delivered state: {reason}");
                                 }
                             }
@@ -6037,6 +6100,38 @@ impl AppState {
                 .unwrap_or_default()
         } else {
             Vec::new()
+        }
+    }
+
+    /// Ask the recipient's session agent to hold a deferred re-verification of
+    /// an injection whose text was not observed in the pane (RPC).
+    ///
+    /// The agent answers and queues in one message, so the turn state that
+    /// justifies a quiet `queued` answer is the same turn state that owns the
+    /// follow-up. Returns `Unknown` when the session has no agent or the query
+    /// fails, which keeps the outcome loud rather than assuming a benign miss.
+    pub(crate) async fn schedule_deferred_delivery_recheck(
+        &self,
+        pending: crate::tmux::DeferredInjectVerification,
+    ) -> RecipientTurnState {
+        let Some(agent) = self.current_session_agent(&pending.session_id).await else {
+            return RecipientTurnState::Unknown;
+        };
+        // Bounded: the send that is waiting on this answer is a synchronous
+        // HTTP request. A timed-out query falls through to `Unknown`, which is
+        // the loud answer, so a stalled agent cannot turn into a silent pass.
+        match ractor::call_t!(
+            agent,
+            crate::session_agent::SessionMsg::QueueDeliveryRecheck,
+            DELIVERY_RECHECK_QUERY_TIMEOUT_MS,
+            pending
+        ) {
+            Ok(true) => RecipientTurnState::MidTurn,
+            Ok(false) => RecipientTurnState::BetweenTurns,
+            Err(error) => {
+                tracing::debug!("deferred delivery re-check query failed: {error}");
+                RecipientTurnState::Unknown
+            }
         }
     }
 
@@ -10665,11 +10760,39 @@ pub(crate) mod tests {
         server.abort();
     }
 
+    fn inject_request<'a>(session_id: &'a str, pane: &'a str) -> InjectDeliveryRequest<'a> {
+        InjectDeliveryRequest {
+            session_id,
+            pane,
+            message: "hello there",
+            vim_mode: false,
+            delivery_method: Some("tmux"),
+            recorded_method: None,
+            msg_id: Some(42),
+        }
+    }
+
+    async fn take_agent_delivery_recheck_state(
+        state: &Arc<AppState>,
+        session_id: &str,
+    ) -> (Vec<crate::tmux::DeferredInjectVerification>, Vec<String>) {
+        let agent = state
+            .current_session_agent(session_id)
+            .await
+            .expect("registered session must have an agent");
+        ractor::call!(
+            agent,
+            crate::session_agent::SessionMsg::TestTakeDeliveryRecheckState
+        )
+        .expect("agent query")
+    }
+
     #[test]
     fn unverified_inject_is_never_reported_as_delivered() {
-        let outcome = inject_delivery_outcome(Ok(crate::tmux::InjectVerification::Unconfirmed(
+        let outcome = inject_delivery_outcome(
             "injected text was not observed in pane %18 after paste".into(),
-        )));
+            RecipientTurnState::BetweenTurns,
+        );
 
         assert!(
             matches!(outcome, DeliveryOutcome::Ambiguous(ref reason) if reason.contains("not observed in pane %18")),
@@ -10678,21 +10801,195 @@ pub(crate) mod tests {
         assert_ne!(outcome, DeliveryOutcome::Accepted);
     }
 
-    #[test]
-    fn verified_inject_is_reported_as_delivered() {
+    #[tokio::test]
+    async fn verified_inject_is_reported_as_delivered() {
+        let state = AppState::new_for_test();
+        proto_register(&state, "target", Some("%1")).await;
+
         assert_eq!(
-            inject_delivery_outcome(Ok(crate::tmux::InjectVerification::Confirmed)),
+            resolve_inject_delivery_outcome(
+                &state,
+                &inject_request("target", "%1"),
+                Ok(crate::tmux::InjectVerification::Confirmed),
+            )
+            .await,
             DeliveryOutcome::Accepted
         );
     }
 
-    #[test]
-    fn failed_inject_is_reported_as_rejected() {
-        let outcome = inject_delivery_outcome(Err(anyhow::anyhow!("tmux paste-buffer failed")));
+    #[tokio::test]
+    async fn failed_inject_is_reported_as_rejected() {
+        let state = AppState::new_for_test();
+        proto_register(&state, "target", Some("%1")).await;
+
+        let outcome = resolve_inject_delivery_outcome(
+            &state,
+            &inject_request("target", "%1"),
+            Err(anyhow::anyhow!("tmux paste-buffer failed")),
+        )
+        .await;
 
         assert!(
             matches!(outcome, DeliveryOutcome::Rejected(ref reason) if reason.contains("paste-buffer failed")),
             "expected rejection, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unverified_inject_into_a_mid_turn_recipient_is_queued_and_rechecked() {
+        let state = AppState::new_for_test();
+        proto_register(&state, "busy", Some("%1")).await;
+        let owner = state.protocol.read().await.sessions["busy"].owner();
+        assert!(
+            state
+                .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Active)
+                .await,
+            "the recipient must have the existing activity receiver"
+        );
+
+        let outcome = resolve_inject_delivery_outcome(
+            &state,
+            &inject_request("busy", "%1"),
+            Ok(crate::tmux::InjectVerification::Unconfirmed(
+                "injected text was not observed in pane %1 after paste".into(),
+            )),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, DeliveryOutcome::Queued(ref reason) if reason.contains("not observed in pane %1")),
+            "a mid-turn recipient must yield a queued delivery, got {outcome:?}"
+        );
+
+        let (queued, _) = take_agent_delivery_recheck_state(&state, "busy").await;
+        assert_eq!(
+            queued.len(),
+            1,
+            "a queued delivery must leave a re-check on the recipient's agent"
+        );
+        assert_eq!(queued[0].pane, "%1");
+        assert_eq!(queued[0].msg_id, Some(42));
+        assert_eq!(queued[0].message, "hello there");
+    }
+
+    #[tokio::test]
+    async fn unverified_inject_into_an_idle_recipient_is_reported_unknown() {
+        let state = AppState::new_for_test();
+        proto_register(&state, "idle", Some("%1")).await;
+        let owner = state.protocol.read().await.sessions["idle"].owner();
+        state
+            .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Active)
+            .await;
+        state
+            .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Stopped)
+            .await;
+
+        let outcome = resolve_inject_delivery_outcome(
+            &state,
+            &inject_request("idle", "%1"),
+            Ok(crate::tmux::InjectVerification::Unconfirmed(
+                "injected text was not observed in pane %1 after paste".into(),
+            )),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, DeliveryOutcome::Ambiguous(_)),
+            "an idle recipient has no benign explanation for a missing paste, got {outcome:?}"
+        );
+        let (queued, _) = take_agent_delivery_recheck_state(&state, "idle").await;
+        assert!(
+            queued.is_empty(),
+            "an idle recipient must not queue a re-check"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_delivery_recheck_reports_a_loss_only_when_the_message_never_arrives() {
+        let state = AppState::new_for_test();
+        proto_register(&state, "busy", Some("%1")).await;
+        let owner = state.protocol.read().await.sessions["busy"].owner();
+
+        // A queued delivery whose text is still absent once the turn ends is a
+        // real loss, not a benign redraw delay.
+        crate::tmux::set_test_deferred_verification(Some(
+            crate::tmux::InjectVerification::Unconfirmed("still not in the pane".into()),
+        ));
+        state
+            .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Active)
+            .await;
+        let outcome = resolve_inject_delivery_outcome(
+            &state,
+            &inject_request("busy", "%1"),
+            Ok(crate::tmux::InjectVerification::Unconfirmed(
+                "first miss".into(),
+            )),
+        )
+        .await;
+        assert!(matches!(outcome, DeliveryOutcome::Queued(_)));
+        state
+            .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Stopped)
+            .await;
+
+        let (queued, losses) = take_agent_delivery_recheck_state(&state, "busy").await;
+        assert!(
+            queued.is_empty(),
+            "the turn ended, so the re-check queue must be drained"
+        );
+        assert_eq!(losses.len(), 1, "a still-missing message must be reported");
+        assert!(
+            losses[0].contains("still not observed in pane %1")
+                && losses[0].contains("session busy"),
+            "the loss must name the pane and session, got {}",
+            losses[0]
+        );
+
+        // The same flow stays silent when the message did land.
+        crate::tmux::set_test_deferred_verification(Some(
+            crate::tmux::InjectVerification::Confirmed,
+        ));
+        state
+            .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Active)
+            .await;
+        let outcome = resolve_inject_delivery_outcome(
+            &state,
+            &inject_request("busy", "%1"),
+            Ok(crate::tmux::InjectVerification::Unconfirmed(
+                "first miss".into(),
+            )),
+        )
+        .await;
+        assert!(matches!(outcome, DeliveryOutcome::Queued(_)));
+        state
+            .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Stopped)
+            .await;
+
+        let (queued, losses) = take_agent_delivery_recheck_state(&state, "busy").await;
+        assert!(queued.is_empty());
+        assert!(
+            losses.is_empty(),
+            "a message that arrived must not be reported as lost, got {losses:?}"
+        );
+
+        crate::tmux::set_test_deferred_verification(None);
+    }
+
+    #[tokio::test]
+    async fn unverified_inject_without_a_session_agent_is_reported_unknown() {
+        let state = AppState::new_for_test();
+
+        let outcome = resolve_inject_delivery_outcome(
+            &state,
+            &inject_request("no-such-session", "%1"),
+            Ok(crate::tmux::InjectVerification::Unconfirmed(
+                "injected text was not observed in pane %1 after paste".into(),
+            )),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, DeliveryOutcome::Ambiguous(_)),
+            "an unknown turn state must fail toward the louder signal, got {outcome:?}"
         );
     }
 
@@ -10711,6 +11008,7 @@ pub(crate) mod tests {
                 vim_mode: false,
                 delivery_method: Some("tmux"),
                 recorded_method: None,
+                msg_id: None,
             },
         )
         .await;
@@ -10732,6 +11030,7 @@ pub(crate) mod tests {
                 vim_mode: false,
                 delivery_method: Some("tmux"),
                 recorded_method: None,
+                msg_id: None,
             },
         )
         .await;
@@ -10757,6 +11056,7 @@ pub(crate) mod tests {
                 vim_mode: false,
                 delivery_method: None,
                 recorded_method: None,
+                msg_id: None,
             },
         )
         .await;
@@ -10796,6 +11096,7 @@ pub(crate) mod tests {
                 vim_mode: false,
                 delivery_method: Some("tmux"),
                 recorded_method: None,
+                msg_id: None,
             },
         )
         .await;

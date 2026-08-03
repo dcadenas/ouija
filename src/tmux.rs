@@ -16,6 +16,12 @@ const VIM_DETECT_MS: u64 = 100;
 const VIM_BACKSPACE_MS: u64 = 50;
 /// Delay before verification capture.
 const VERIFY_DELAY_MS: u64 = 100;
+/// Delay before a deferred re-verification captures the pane.
+///
+/// The re-check runs from the recipient's own end-of-turn signal, so it gives
+/// the TUI a moment to finish its end-of-turn redraw before looking again.
+#[cfg_attr(test, allow(dead_code))]
+const DEFERRED_VERIFY_DELAY_MS: u64 = 300;
 /// Max retry attempts for pane injection (pane busy / mid-output).
 const MAX_INJECT_RETRIES: u32 = 3;
 /// Base delay for exponential backoff between retries (500ms, 1s, 2s).
@@ -388,7 +394,9 @@ fn verify_injected(pane: &str, message: &str) -> InjectVerification {
         Ok(c) => c,
         Err(e) => {
             let reason = format!("could not capture pane {pane} to verify injection: {e}");
-            tracing::warn!(pane, "inject verification: {reason}");
+            // Logged quietly on purpose: the caller decides how loud a miss is,
+            // because only it knows whether the recipient was mid-turn.
+            tracing::debug!(pane, "inject verification: {reason}");
             return InjectVerification::Unconfirmed(reason);
         }
     };
@@ -406,12 +414,116 @@ fn verify_injected(pane: &str, message: &str) -> InjectVerification {
          against the last {} captured lines)",
         CAPTURE_SCROLL_LINES.trim_start_matches('-')
     );
-    tracing::warn!(
+    // Quiet by design. A miss right after the paste is expected while the
+    // recipient is mid-turn, so escalating here would warn on nearly every
+    // message to a busy session. The caller warns once it knows the recipient
+    // was idle, and the deferred re-check warns when the text is still absent
+    // after the recipient's turn ended.
+    tracing::debug!(
         pane,
         msg_len = message.len(),
         "inject verification: {reason}"
     );
     InjectVerification::Unconfirmed(reason)
+}
+
+/// An injection whose first verification missed while the recipient was
+/// mid-turn, held for re-verification once that turn ends.
+///
+/// This exists so that "the TUI had not redrawn yet" never becomes a silent
+/// pass: every queued delivery is looked at again, and a still-absent message
+/// is reported as a real loss.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeferredInjectVerification {
+    /// Public session id of the recipient.
+    pub session_id: String,
+    /// Pane the text was pasted into.
+    pub pane: String,
+    /// The exact text that was injected; re-verified with the same needle.
+    pub message: String,
+    /// Message id reported to the sender, when the send carried one.
+    pub msg_id: Option<u64>,
+    /// Why the first verification was inconclusive.
+    pub first_reason: String,
+}
+
+#[cfg(test)]
+static TEST_DEFERRED_VERIFICATION: std::sync::Mutex<Option<InjectVerification>> =
+    std::sync::Mutex::new(None);
+
+/// Test hook: force the result of the next deferred re-verification.
+///
+/// Unit tests must not capture panes on the host tmux server, so the re-check's
+/// tmux side is replaced while its decision and reporting logic stay live.
+#[cfg(test)]
+pub(crate) fn set_test_deferred_verification(verification: Option<InjectVerification>) {
+    *TEST_DEFERRED_VERIFICATION
+        .lock()
+        .expect("test deferred verification lock") = verification;
+}
+
+/// Re-capture the recipient's pane and look for the injected text again.
+fn verify_deferred_injection(pending: &DeferredInjectVerification) -> InjectVerification {
+    #[cfg(test)]
+    {
+        let _ = pending;
+        return TEST_DEFERRED_VERIFICATION
+            .lock()
+            .expect("test deferred verification lock")
+            .clone()
+            .unwrap_or(InjectVerification::Confirmed);
+    }
+    #[cfg(not(test))]
+    {
+        thread::sleep(Duration::from_millis(DEFERRED_VERIFY_DELAY_MS));
+        verify_injected(&pending.pane, &pending.message)
+    }
+}
+
+/// Decide what a deferred re-check result means.
+///
+/// Pure. `Some(reason)` is a genuine loss: the recipient has finished the turn
+/// that could explain the first miss, and the text is still not in its pane.
+pub(crate) fn deferred_delivery_loss(
+    pending: &DeferredInjectVerification,
+    verification: &InjectVerification,
+) -> Option<String> {
+    match verification {
+        InjectVerification::Confirmed => None,
+        InjectVerification::Unconfirmed(reason) => Some(format!(
+            "message was still not observed in pane {} after session {} finished its turn; \
+             treat it as lost, not queued (first check: {}; re-check: {reason})",
+            pending.pane, pending.session_id, pending.first_reason
+        )),
+    }
+}
+
+/// Run a deferred re-check and report a still-missing message at warn.
+///
+/// Returns the loss reason when the message is gone, `None` when it landed.
+/// Blocking: call from a blocking context.
+pub(crate) fn report_deferred_injection(pending: &DeferredInjectVerification) -> Option<String> {
+    let verification = verify_deferred_injection(pending);
+    match deferred_delivery_loss(pending, &verification) {
+        Some(reason) => {
+            tracing::warn!(
+                session = %pending.session_id,
+                pane = %pending.pane,
+                msg_id = ?pending.msg_id,
+                "queued message never arrived: {reason}"
+            );
+            Some(reason)
+        }
+        None => {
+            tracing::debug!(
+                session = %pending.session_id,
+                pane = %pending.pane,
+                msg_id = ?pending.msg_id,
+                "queued message confirmed in pane after the recipient's turn ended"
+            );
+            None
+        }
+    }
 }
 
 /// Strip characters a TUI may insert into the middle of pasted text.
@@ -1412,6 +1524,39 @@ pub fn tmux_session_name(project_dir: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    fn deferred(pane: &str) -> DeferredInjectVerification {
+        DeferredInjectVerification {
+            session_id: "worker".into(),
+            pane: pane.into(),
+            message: "hello".into(),
+            msg_id: Some(7),
+            first_reason: "recipient was mid-turn".into(),
+        }
+    }
+
+    #[test]
+    fn deferred_recheck_that_still_misses_reports_a_loss() {
+        let loss = deferred_delivery_loss(
+            &deferred("%3"),
+            &InjectVerification::Unconfirmed("not observed in pane %3".into()),
+        )
+        .expect("a still-absent message after the turn ended is a loss");
+
+        assert!(loss.contains("pane %3"), "loss must name the pane: {loss}");
+        assert!(
+            loss.contains("session worker"),
+            "loss must name the session: {loss}"
+        );
+    }
+
+    #[test]
+    fn deferred_recheck_that_finds_the_message_is_silent() {
+        assert_eq!(
+            deferred_delivery_loss(&deferred("%3"), &InjectVerification::Confirmed),
+            None
+        );
+    }
 
     #[test]
     fn matching_backends_returns_all_matches() {

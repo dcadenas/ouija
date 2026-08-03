@@ -1416,6 +1416,7 @@ async fn route_human_message(
                             vim_mode: session.metadata.vim_mode,
                             delivery_method,
                             recorded_method: None,
+                            msg_id: Some(msg_id),
                         },
                     )
                     .await;
@@ -5338,7 +5339,8 @@ async fn soft_restart_session_claimed(
         .await
         {
             crate::state::DeliveryOutcome::Accepted => {}
-            crate::state::DeliveryOutcome::Ambiguous(reason) => {
+            crate::state::DeliveryOutcome::Ambiguous(reason)
+            | crate::state::DeliveryOutcome::Queued(reason) => {
                 tracing::warn!(
                     "soft restart: prompt_async outcome ambiguous for {new_session_id}: {reason}; retaining the target to avoid duplicate work"
                 );

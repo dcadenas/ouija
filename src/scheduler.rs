@@ -725,13 +725,18 @@ async fn inject_alive_session_prompt(
             vim_mode,
             delivery_method: None,
             recorded_method: None,
+            msg_id: None,
         },
     )
     .await
     {
         crate::state::DeliveryOutcome::Accepted => Ok(()),
         crate::state::DeliveryOutcome::Rejected(reason) => Err(reason),
-        crate::state::DeliveryOutcome::Ambiguous(reason) => {
+        // A scheduled prompt has no sender to answer, so both unverified
+        // outcomes stay failures here; the queued case additionally carries a
+        // deferred re-check on the recipient's agent.
+        crate::state::DeliveryOutcome::Ambiguous(reason)
+        | crate::state::DeliveryOutcome::Queued(reason) => {
             Err(format!("prompt delivery ambiguous: {reason}"))
         }
     }

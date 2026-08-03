@@ -924,7 +924,9 @@ pub async fn send_msg(
             }
             return (StatusCode::BAD_GATEWAY, Json(body));
         }
-        crate::state::DeliveryOutcome::Ambiguous(_) => {}
+        // Neither is a failure: the paste succeeded and the message may well be
+        // sitting in the recipient's input box. Keep the send's state changes.
+        crate::state::DeliveryOutcome::Ambiguous(_) | crate::state::DeliveryOutcome::Queued(_) => {}
     }
 
     if let Some((method, msg_id)) = effects.iter().find_map(|e| match e {
@@ -938,6 +940,10 @@ pub async fn send_msg(
             crate::state::DeliveryOutcome::Ambiguous(_)
         ) {
             "unknown"
+        } else if matches!(delivery_outcome, crate::state::DeliveryOutcome::Queued(_)) {
+            // The recipient was mid-turn, so its TUI had not redrawn the paste
+            // yet. That is the normal path for a busy session, not a warning.
+            "queued"
         } else if method == "http" {
             "accepted"
         } else {
@@ -1165,6 +1171,10 @@ async fn execute_send_effects_for_api(
         Effect::SendDelivered { http_delivery, .. } => http_delivery.as_ref(),
         _ => None,
     });
+    let recorded_msg_id = effects.iter().find_map(|effect| match effect {
+        Effect::SendDelivered { msg_id, .. } => Some(*msg_id),
+        _ => None,
+    });
 
     let mut outcome = crate::state::DeliveryOutcome::Accepted;
 
@@ -1179,6 +1189,7 @@ async fn execute_send_effects_for_api(
                 message,
                 vim_mode,
                 delivery_method,
+                pending_reply_msg_id,
                 ..
             } => {
                 outcome = combine_delivery_outcome(
@@ -1192,6 +1203,7 @@ async fn execute_send_effects_for_api(
                             vim_mode: *vim_mode,
                             delivery_method: delivery_method.as_deref(),
                             recorded_method,
+                            msg_id: recorded_msg_id.or(*pending_reply_msg_id),
                         },
                     )
                     .await,
@@ -1232,10 +1244,14 @@ async fn execute_send_effects_for_api(
                 // true on an unconfirmed delivery is what let five lost
                 // messages read as delivered while the daemon held the
                 // disconfirming evidence.
+                // `Queued` is included for the same reason: it means the text
+                // was not observed, only that there is a benign explanation for
+                // why not. The deferred re-check, not this flag, resolves it.
                 let delivered = if matches!(
                     outcome,
                     crate::state::DeliveryOutcome::Rejected(_)
                         | crate::state::DeliveryOutcome::Ambiguous(_)
+                        | crate::state::DeliveryOutcome::Queued(_)
                 ) {
                     false
                 } else {
@@ -1273,6 +1289,12 @@ fn combine_delivery_outcome(
         (crate::state::DeliveryOutcome::Ambiguous(reason), _)
         | (_, crate::state::DeliveryOutcome::Ambiguous(reason)) => {
             crate::state::DeliveryOutcome::Ambiguous(reason)
+        }
+        // Weaker than ambiguous: a queued delivery has a benign explanation and
+        // its own scheduled follow-up.
+        (crate::state::DeliveryOutcome::Queued(reason), _)
+        | (_, crate::state::DeliveryOutcome::Queued(reason)) => {
+            crate::state::DeliveryOutcome::Queued(reason)
         }
         (crate::state::DeliveryOutcome::Accepted, crate::state::DeliveryOutcome::Accepted) => {
             crate::state::DeliveryOutcome::Accepted
@@ -3434,7 +3456,8 @@ async fn deliver_pending_prompt(state: &SharedState, session_name: &str) -> bool
         Some(delivery) => {
             match deliver_pending_prompt_http_outcome(state, &pending, &delivery, &prompt).await {
                 crate::state::DeliveryOutcome::Accepted => Ok(()),
-                crate::state::DeliveryOutcome::Ambiguous(_) => {
+                crate::state::DeliveryOutcome::Ambiguous(_)
+                | crate::state::DeliveryOutcome::Queued(_) => {
                     tracing::warn!(
                         "readiness prompt HTTP delivery failed ambiguously for {session_name}; not retrying via raw tmux"
                     );

@@ -65,6 +65,21 @@ pub enum SessionMsg {
     DrainPendingCompactContinuation(ractor::RpcReplyPort<Option<String>>),
     /// Internal: watchdog timer expired (no Active or Stopped within 2x idle_timeout).
     WatchdogTimeout,
+    /// Hold a deferred delivery re-verification until this session's turn ends (RPC).
+    ///
+    /// Replies `true` when the session is mid-turn and the re-check was queued
+    /// — the sender may then be told the message is `queued`. Replies `false`
+    /// when the session is not mid-turn, in which case an unverified injection
+    /// has no benign explanation and the caller must report it as unknown.
+    QueueDeliveryRecheck(
+        crate::tmux::DeferredInjectVerification,
+        ractor::RpcReplyPort<bool>,
+    ),
+    /// Test-only: drain the queued re-checks and the losses they reported.
+    #[cfg(test)]
+    TestTakeDeliveryRecheckState(
+        ractor::RpcReplyPort<(Vec<crate::tmux::DeferredInjectVerification>, Vec<String>)>,
+    ),
 }
 
 /// Per-session behavioral state owned by the agent.
@@ -87,6 +102,12 @@ pub struct SessionAgentState {
     /// One-shot continuation text to inject after compact completes.
     pub pending_compact_continuation: Option<String>,
     pending_reply_reminder_attempts: HashMap<(String, u64), tokio::time::Instant>,
+    /// Injections that could not be verified because this session was mid-turn.
+    /// Drained and re-verified when the turn ends.
+    pending_delivery_rechecks: Vec<crate::tmux::DeferredInjectVerification>,
+    /// Test-only record of losses reported by deferred re-checks.
+    #[cfg(test)]
+    delivery_recheck_losses: Vec<String>,
 }
 
 impl std::fmt::Debug for SessionAgentState {
@@ -148,6 +169,24 @@ impl SessionAgentState {
             watchdog_timer: None,
             pending_compact_continuation: None,
             pending_reply_reminder_attempts: HashMap::new(),
+            pending_delivery_rechecks: Vec::new(),
+            #[cfg(test)]
+            delivery_recheck_losses: Vec::new(),
+        }
+    }
+
+    /// True when the session is mid-turn: a turn has started (`Active`) and has
+    /// not yet ended (`Stopped`).
+    ///
+    /// Derived from the timestamps the existing activity signals already
+    /// maintain, so no parallel activity message is introduced. When the agent
+    /// has never seen an `Active`, the turn state is unknown and this reports
+    /// `false` — callers must then fail toward the louder signal.
+    pub fn mid_turn(&self) -> bool {
+        match (self.last_active_at, self.last_stopped_at) {
+            (Some(active), Some(stopped)) => active > stopped,
+            (Some(_), None) => true,
+            (None, _) => false,
         }
     }
 
@@ -334,6 +373,12 @@ impl Actor for SessionAgent {
                         at: now.timestamp(),
                     })
                     .await;
+
+                // The turn that could innocently explain an unverified
+                // injection has now ended, so every message reported as
+                // `queued` gets looked at again. Anything still absent is a
+                // real loss and is reported as one.
+                Self::run_pending_delivery_rechecks(state).await;
             }
             SessionMsg::Active => {
                 state.idle = false;
@@ -368,6 +413,23 @@ impl Actor for SessionAgent {
                         Vec::new()
                     };
                     let _ = reply.send(pending);
+                }
+            }
+            SessionMsg::QueueDeliveryRecheck(pending, reply) => {
+                let mid_turn = state.mid_turn();
+                if mid_turn {
+                    state.pending_delivery_rechecks.push(pending);
+                }
+                if !reply.is_closed() {
+                    let _ = reply.send(mid_turn);
+                }
+            }
+            #[cfg(test)]
+            SessionMsg::TestTakeDeliveryRecheckState(reply) => {
+                let queued = state.pending_delivery_rechecks.clone();
+                let losses = std::mem::take(&mut state.delivery_recheck_losses);
+                if !reply.is_closed() {
+                    let _ = reply.send((queued, losses));
                 }
             }
             SessionMsg::Renamed { .. } => unreachable!("renames handled before owner validation"),
@@ -657,6 +719,30 @@ impl SessionAgent {
         }
         let _ = reply.send(acquired);
         current
+    }
+
+    /// Re-verify every injection this session queued while it was mid-turn.
+    ///
+    /// A `queued` delivery that is never followed up would be the same
+    /// false-benign signal as reporting an unverified injection as delivered,
+    /// so the queue is always drained here and each entry is looked at again.
+    async fn run_pending_delivery_rechecks(state: &mut SessionAgentState) {
+        let pending = std::mem::take(&mut state.pending_delivery_rechecks);
+        for entry in pending {
+            let loss =
+                tokio::task::spawn_blocking(move || crate::tmux::report_deferred_injection(&entry))
+                    .await
+                    .unwrap_or_else(|error| {
+                        tracing::warn!("deferred delivery re-check task failed: {error}");
+                        None
+                    });
+            #[cfg(test)]
+            if let Some(loss) = loss {
+                state.delivery_recheck_losses.push(loss);
+            }
+            #[cfg(not(test))]
+            let _ = loss;
+        }
     }
 
     async fn send_pending_reply_reminders(
@@ -1010,6 +1096,25 @@ mod tests {
             last_activity: 1,
             in_progress: false,
         }
+    }
+
+    #[test]
+    fn mid_turn_tracks_the_existing_active_and_stopped_signals() {
+        let mut state = SessionAgentState::new(test_owner("worker"), "%1".into());
+        assert!(
+            !state.mid_turn(),
+            "a session with no observed activity has an unknown turn state, \
+             which must not read as mid-turn"
+        );
+
+        state.last_active_at = Some(Utc::now());
+        assert!(state.mid_turn(), "a started turn is mid-turn");
+
+        state.last_stopped_at = Some(state.last_active_at.unwrap() + chrono::Duration::seconds(1));
+        assert!(!state.mid_turn(), "an ended turn is not mid-turn");
+
+        state.last_active_at = Some(state.last_stopped_at.unwrap() + chrono::Duration::seconds(1));
+        assert!(state.mid_turn(), "the next turn is mid-turn again");
     }
 
     #[test]
