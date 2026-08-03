@@ -193,7 +193,12 @@ pub(crate) struct ActiveContextDueBoundary {
 }
 
 /// A pending reply entry tracked in DaemonState.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+///
+/// Serialized so obligations survive a daemon restart. Before that, a restart
+/// dropped the whole index: the reminder stream went quiet even though the asks
+/// were still unanswered, and `message` — the question body — was only
+/// recoverable by reading the recipient's backend transcript.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct PendingReplyEntry {
     pub msg_id: u64,
     pub from: String,

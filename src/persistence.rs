@@ -53,6 +53,13 @@ pub struct PersistedLifecycleState {
     pub incarnation_high_water: crate::daemon_protocol::SessionIncarnation,
     #[serde(default)]
     pub lifecycle_leases: BTreeMap<String, crate::daemon_protocol::LifecycleLease>,
+    /// Outstanding reply obligations, keyed by the session that owes them.
+    ///
+    /// `serde(default)` so a `sessions.json` written before this field existed
+    /// still loads; it simply restores with no obligations, which is the old
+    /// behaviour.
+    #[serde(default)]
+    pub pending_replies: BTreeMap<String, Vec<crate::daemon_protocol::PendingReplyEntry>>,
 }
 
 impl Default for PersistedLifecycleState {
@@ -63,6 +70,7 @@ impl Default for PersistedLifecycleState {
             dormant_sessions: BTreeMap::new(),
             incarnation_high_water: Default::default(),
             lifecycle_leases: BTreeMap::new(),
+            pending_replies: BTreeMap::new(),
         }
     }
 }
@@ -80,8 +88,19 @@ impl PersistedLifecycleState {
             dormant_sessions,
             incarnation_high_water,
             lifecycle_leases,
+            pending_replies: BTreeMap::new(),
         }
         .normalized()
+    }
+
+    /// Attach outstanding reply obligations to a snapshot before saving.
+    #[must_use]
+    pub fn with_pending_replies(
+        mut self,
+        pending_replies: BTreeMap<String, Vec<crate::daemon_protocol::PendingReplyEntry>>,
+    ) -> Self {
+        self.pending_replies = pending_replies;
+        self
     }
 
     fn normalized(mut self) -> Self {
@@ -1469,6 +1488,54 @@ mod tests {
     }
 
     #[test]
+    fn pending_replies_survive_a_save_load_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = crate::daemon_protocol::PendingReplyEntry {
+            msg_id: 42,
+            from: "turnero".into(),
+            message: "which shape do you want?".into(),
+            received_at: 1_700_000_000,
+            last_activity: 1_700_000_001,
+            in_progress: true,
+        };
+        let snapshot = PersistedLifecycleState::new(
+            vec![],
+            BTreeMap::new(),
+            crate::daemon_protocol::SessionIncarnation(1),
+            BTreeMap::new(),
+        )
+        .with_pending_replies(BTreeMap::from([(
+            "worker".to_string(),
+            vec![entry.clone()],
+        )]));
+
+        save_sessions(dir.path(), &snapshot).unwrap();
+        let loaded = load_sessions(dir.path()).unwrap();
+
+        // The body matters: it is what a cold coordinator needs to answer
+        // without reading the recipient's backend transcript.
+        assert_eq!(loaded.pending_replies["worker"], vec![entry]);
+    }
+
+    #[test]
+    fn load_sessions_defaults_pending_replies_when_absent() {
+        // sessions.json written before pending_replies existed must still load.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("sessions.json"),
+            serde_json::json!({
+                "version": SESSION_STATE_VERSION,
+                "sessions": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let loaded = load_sessions(dir.path()).unwrap();
+        assert!(loaded.pending_replies.is_empty());
+    }
+
+    #[test]
     fn load_sessions_rejects_mismatched_lease_owner_key() {
         let dir = tempfile::tempdir().unwrap();
         let snapshot = PersistedLifecycleState {
@@ -1476,6 +1543,7 @@ mod tests {
             sessions: vec![],
             dormant_sessions: BTreeMap::new(),
             incarnation_high_water: crate::daemon_protocol::SessionIncarnation(5),
+            pending_replies: BTreeMap::new(),
             lifecycle_leases: BTreeMap::from([(
                 "wrong-key".into(),
                 crate::daemon_protocol::LifecycleLease {
@@ -1514,6 +1582,7 @@ mod tests {
             sessions: vec![],
             dormant_sessions: BTreeMap::new(),
             incarnation_high_water: crate::daemon_protocol::SessionIncarnation(6),
+            pending_replies: BTreeMap::new(),
             lifecycle_leases: BTreeMap::from([(
                 "pending".into(),
                 crate::daemon_protocol::LifecycleLease {

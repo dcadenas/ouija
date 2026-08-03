@@ -1616,6 +1616,10 @@ pub enum KillOutcome {
     Removed,
     Failed,
     Superseded,
+    /// Stop authority was released, but the session row still exists. Distinct
+    /// from `Removed` so a scripted caller does not read lease recovery as a
+    /// completed kill — a follow-up `kill-session` is still required.
+    Recovered,
 }
 
 /// Typed kill result paired with the existing human-facing status text.
@@ -1646,6 +1650,13 @@ impl KillSessionResult {
             outcome: KillOutcome::Superseded,
         }
     }
+
+    fn recovered(message: String) -> Self {
+        Self {
+            message,
+            outcome: KillOutcome::Recovered,
+        }
+    }
 }
 
 /// Kill the Claude process in a named session's pane.
@@ -1673,6 +1684,146 @@ pub async fn kill_session_owned(
         Some((owner.clone(), expected_pane.to_string())),
     )
     .await
+}
+
+/// Clear a stuck lifecycle lease for one session without restarting the daemon.
+///
+/// A failed `kill-session` can leave a durable `Stopping` lease behind. Because
+/// [`crate::daemon_protocol::DaemonState::claim_existing_stop`] rejects while
+/// any lease exists for the public session ID, every later kill returns
+/// `superseded (Rejected)` and the session is stuck. Until this existed the only
+/// recovery was a daemon restart, which disrupts every unrelated session on the
+/// host — so the rational operator choice was to leave a dead row in `ouija ls`,
+/// making the session list overstate what is actually alive.
+///
+/// This applies the same discipline the daemon-start restore path uses: replay
+/// the backend abort first and release stop authority only once the backend is
+/// confirmed stopped, failing closed otherwise. It deliberately releases *only*
+/// the lease; the session row, pane and worktree are left alone so an ordinary
+/// `kill-session` can then finish the job through its normal path.
+pub async fn recover_lease(state: &std::sync::Arc<AppState>, name: &str) -> KillSessionResult {
+    let lease = state
+        .protocol
+        .read()
+        .await
+        .lifecycle_leases
+        .get(name)
+        .cloned();
+    let Some(lease) = lease else {
+        return KillSessionResult::failed(format!("no lifecycle lease held for session '{name}'"));
+    };
+    if lease.phase != crate::daemon_protocol::LifecyclePhase::Stopping {
+        return KillSessionResult::failed(format!(
+            "lease for '{name}' is {:?}, not Stopping; refusing to release",
+            lease.phase
+        ));
+    }
+
+    // Only an HTTP-delivery backend has a server-side turn that can outlive the
+    // pane, so only that case needs an abort replayed before release.
+    match (
+        lease.backend.as_deref(),
+        lease.backend_session_id.as_deref(),
+    ) {
+        (Some(backend), Some(backend_session_id)) if state.backends.uses_http_delivery(backend) => {
+            let port = state.opencode_serve_port();
+            let segment = crate::encode_path_segment(backend_session_id);
+            let url = format!("http://127.0.0.1:{port}/session/{segment}/abort");
+            let response = state
+                .http_client
+                .post(&url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await;
+            match response {
+                Ok(r)
+                    if r.status().is_success() || r.status() == reqwest::StatusCode::NOT_FOUND =>
+                {
+                    tracing::info!(
+                        session = %name,
+                        backend_session_id,
+                        "recover-lease confirmed backend abort"
+                    );
+                }
+                Ok(r) => {
+                    let status = r.status();
+                    tracing::warn!(session = %name, backend_session_id, %status, "recover-lease abort not confirmed");
+                    return KillSessionResult::failed(format!(
+                        "backend abort for '{name}' returned {status}; stop authority retained"
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!(session = %name, backend_session_id, "recover-lease abort failed: {e}");
+                    return KillSessionResult::failed(format!(
+                        "backend abort for '{name}' failed: {e}; stop authority retained"
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+
+    match state.abort_lifecycle(&lease.owner).await {
+        Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {
+            tracing::info!(session = %name, "recover-lease released stop authority");
+            KillSessionResult::recovered(format!(
+                "released stop authority for '{name}'; retry 'ouija kill-session {name}' to finish cleanup"
+            ))
+        }
+        Ok(outcome) => KillSessionResult::failed(format!(
+            "lease release for '{name}' was not applied ({outcome:?})"
+        )),
+        Err(error) => KillSessionResult::failed(format!(
+            "failed to persist lease release for '{name}': {error}"
+        )),
+    }
+}
+
+/// Resolve a failed opencode abort, releasing stop authority only when the
+/// abort provably never took effect.
+///
+/// The distinction matters because `claim_existing_stop` rejects while *any*
+/// lease exists for the public session ID, so a retained lease that nothing
+/// will retry wedges the session until the daemon restarts. A refused
+/// connection or an outright rejection (400/409/410/422) means the backend
+/// never acted, so the lease is released and the operator can simply retry. A
+/// timeout is genuinely ambiguous — the abort may have been received and
+/// applied — so stop authority is retained and recovery goes through the
+/// restore path or `ouija recover-lease`.
+///
+/// Both branches log. Previously they returned a string to the CLI caller and
+/// recorded nothing, which left no server-side trace of a failed kill.
+async fn resolve_failed_abort(
+    state: &std::sync::Arc<AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    name: &str,
+    oc_sid: &str,
+    decision: PromptAsyncFallbackDecision,
+    detail: String,
+) -> KillSessionResult {
+    match decision {
+        PromptAsyncFallbackDecision::DefiniteNonAcceptance => {
+            let _ = state.abort_lifecycle(owner).await;
+            tracing::warn!(
+                session = %name,
+                oc_sid,
+                ?decision,
+                "{detail}; stop authority released, retry permitted"
+            );
+            KillSessionResult::failed(format!(
+                "{detail}; stop authority released, retry permitted"
+            ))
+        }
+        PromptAsyncFallbackDecision::Ambiguous => {
+            tracing::warn!(
+                session = %name,
+                oc_sid,
+                ?decision,
+                "{detail}; stop authority retained for recovery"
+            );
+            KillSessionResult::failed(format!("{detail}; stop authority retained for recovery"))
+        }
+    }
 }
 
 async fn kill_session_inner(
@@ -1808,15 +1959,30 @@ async fn kill_session_inner(
                 }
                 Ok(r) => {
                     let status = r.status();
+                    let decision =
+                        classify_prompt_async_fallback(PromptAsyncFailure::Status(status));
                     let text = r.text().await.unwrap_or_default();
-                    return KillSessionResult::failed(format!(
-                        "opencode abort for session '{name}' returned {status}: {text}; stop authority retained for recovery"
-                    ));
+                    return resolve_failed_abort(
+                        state,
+                        &owner,
+                        name,
+                        oc_sid,
+                        decision,
+                        format!("opencode abort for session '{name}' returned {status}: {text}"),
+                    )
+                    .await;
                 }
                 Err(e) => {
-                    return KillSessionResult::failed(format!(
-                        "opencode abort for session '{name}' failed: {e}; stop authority retained for recovery"
-                    ));
+                    let decision = classify_prompt_async_fallback(PromptAsyncFailure::Request(&e));
+                    return resolve_failed_abort(
+                        state,
+                        &owner,
+                        name,
+                        oc_sid,
+                        decision,
+                        format!("opencode abort for session '{name}' failed: {e}"),
+                    )
+                    .await;
                 }
             }
         }
@@ -7403,6 +7569,86 @@ mod tests {
         assert!(
             protocol.lifecycle_leases.is_empty(),
             "an invalid HTTP kill must release its claim because no external work started"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_lease_reports_when_nothing_is_held() {
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%2".into()),
+                metadata: Default::default(),
+            })
+            .await;
+
+        let result = recover_lease(&state, "worker").await;
+
+        assert_eq!(result.outcome, KillOutcome::Failed);
+        assert!(
+            result.message.contains("no lifecycle lease"),
+            "got: {}",
+            result.message
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_lease_refuses_a_lease_that_is_not_stopping() {
+        // Only a stuck *stop* is recoverable this way. Releasing a Starting or
+        // Restarting lease would hand a live launch's resources to a racer.
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%2".into()),
+                metadata: Default::default(),
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["worker"].owner();
+        claim_restart_for_external_work(&state, "worker")
+            .await
+            .expect("restart claim must succeed");
+
+        let result = recover_lease(&state, "worker").await;
+
+        assert_eq!(result.outcome, KillOutcome::Failed);
+        assert!(
+            result.message.contains("not Stopping"),
+            "got: {}",
+            result.message
+        );
+        assert_eq!(
+            state.protocol.read().await.lifecycle_leases["worker"].owner,
+            owner,
+            "a refused recovery must leave the lease untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_lease_releases_a_stuck_stop_without_a_backend() {
+        // A stuck Stopping lease with no HTTP backend has no abort to replay,
+        // so the release is unconditional and an ordinary kill can then finish.
+        let state = AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "worker".into(),
+                pane: Some("%2".into()),
+                metadata: Default::default(),
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["worker"].owner();
+        assert_eq!(
+            state.claim_existing_stop(&owner, "%2", true).await.unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+
+        let result = recover_lease(&state, "worker").await;
+
+        assert_eq!(result.outcome, KillOutcome::Recovered);
+        assert!(
+            state.protocol.read().await.lifecycle_leases.is_empty(),
+            "stop authority must be released so kill-session can retry"
         );
     }
 

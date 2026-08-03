@@ -5598,6 +5598,7 @@ impl AppState {
             proto.dormant_sessions.clone(),
             proto.incarnation_high_water,
             proto.lifecycle_leases.clone(),
+            proto.pending_replies.clone(),
         )
     }
 
@@ -6504,6 +6505,10 @@ impl AppState {
             String,
             crate::daemon_protocol::LifecycleLease,
         >,
+        pending_replies: std::collections::BTreeMap<
+            String,
+            Vec<crate::daemon_protocol::PendingReplyEntry>,
+        >,
     ) -> anyhow::Result<()> {
         let persisted: Vec<_> = sessions
             .values()
@@ -6514,7 +6519,8 @@ impl AppState {
             dormant_sessions,
             incarnation_high_water,
             lifecycle_leases,
-        );
+        )
+        .with_pending_replies(pending_replies);
         crate::persistence::save_sessions(&self.config.data_dir, &snapshot)
     }
 

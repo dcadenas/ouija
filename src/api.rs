@@ -833,7 +833,31 @@ pub async fn send_msg(
             Json(json!({ "error": format!("restart is in progress for session '{}'", body.to) })),
         );
     }
+    // A plain `tell` never clears a pending reply: only `responds_to` plus
+    // `done` does. Answering an ask with `tell` therefore looks completely
+    // successful to the sender while the obligation stays open and fires an
+    // unanswered-question reminder later, which trains coordinators to distrust
+    // the reminder stream. Warn rather than refuse — `tell --reply-to` progress
+    // updates before a final answer are legitimate and must keep working.
+    let owed_msg_id = if !body.expects_reply && body.responds_to.is_none() {
+        state
+            .protocol
+            .read()
+            .await
+            .pending_replies
+            .get(&body.from)
+            .and_then(|pending| {
+                pending
+                    .iter()
+                    .find(|entry| entry.from == body.to)
+                    .map(|entry| entry.msg_id)
+            })
+    } else {
+        None
+    };
+
     let from = body.from.clone();
+    let to = body.to.clone();
     let (effects, rollback) = {
         let mut proto = state.protocol.write().await;
         let mut rollback = FailedSendRollback::capture(&proto, &from, body.responds_to, body.done);
@@ -919,14 +943,20 @@ pub async fn send_msg(
         } else {
             "delivered"
         };
-        (
-            StatusCode::OK,
-            Json(json!({
-                "status": status,
-                "method": method,
-                "msg_id": msg_id,
-            })),
-        )
+        let mut payload = json!({
+            "status": status,
+            "method": method,
+            "msg_id": msg_id,
+        });
+        if let Some(owed) = owed_msg_id {
+            let warning = format!(
+                "you still owe '{to}' a reply to msg #{owed}; a plain tell does not clear it — \
+                 use: ouija reply {to} {owed} \"...\""
+            );
+            tracing::warn!(%from, %to, owed_msg_id = owed, "plain tell sent while a reply is owed");
+            payload["warning"] = json!(warning);
+        }
+        (StatusCode::OK, Json(payload))
     } else {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2802,6 +2832,28 @@ pub async fn kill_session(
     };
     (
         StatusCode::OK,
+        Json(json!({
+            "result": result.message,
+            "outcome": result.outcome,
+        })),
+    )
+}
+
+/// Release a stuck lifecycle lease so an ordinary kill can proceed.
+///
+/// Recovery for a failed kill used to require a daemon restart, which disrupts
+/// every unrelated session on the host. This is the scoped equivalent.
+pub async fn recover_lease(
+    State(state): State<SharedState>,
+    Json(body): Json<SessionNameBody>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let result = crate::nostr_transport::recover_lease(&state, &body.name).await;
+    let code = match result.outcome {
+        crate::nostr_transport::KillOutcome::Recovered => StatusCode::OK,
+        _ => StatusCode::CONFLICT,
+    };
+    (
+        code,
         Json(json!({
             "result": result.message,
             "outcome": result.outcome,
@@ -6907,6 +6959,124 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "delivered");
         assert_eq!(body["method"], "tmux");
+    }
+
+    /// Register two panes and have `asker` ask `owing` a question, leaving
+    /// `owing` with an outstanding reply obligation.
+    async fn state_with_outstanding_ask() -> SharedState {
+        let state = crate::state::AppState::new_for_test();
+        for (id, pane) in [("asker", "%a1"), ("owing", "%o1")] {
+            state
+                .apply_and_execute(crate::daemon_protocol::Event::Register {
+                    id: id.into(),
+                    pane: Some(pane.into()),
+                    metadata: crate::daemon_protocol::SessionMeta::default(),
+                })
+                .await;
+        }
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Send {
+                from: "asker".into(),
+                to: "owing".into(),
+                message: "which shape do you want?".into(),
+                expects_reply: true,
+                responds_to: None,
+                done: false,
+            })
+            .await;
+        state
+    }
+
+    #[tokio::test]
+    async fn plain_tell_answering_an_ask_warns_that_the_obligation_remains() {
+        let state = state_with_outstanding_ask().await;
+
+        let (status, body) = send_msg(
+            State(state),
+            Json(SendBody {
+                from: "owing".into(),
+                to: "asker".into(),
+                message: "the second shape".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+                sender_ctx: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let warning = body["warning"].as_str().unwrap_or_else(|| {
+            panic!("a plain tell answering an ask must warn, got: {:?}", body.0)
+        });
+        assert!(
+            warning.contains("ouija reply asker"),
+            "warning must teach the fix, got: {warning}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_tell_without_an_outstanding_ask_does_not_warn() {
+        let state = crate::state::AppState::new_for_test();
+        for (id, pane) in [("a", "%a2"), ("b", "%b2")] {
+            state
+                .apply_and_execute(crate::daemon_protocol::Event::Register {
+                    id: id.into(),
+                    pane: Some(pane.into()),
+                    metadata: crate::daemon_protocol::SessionMeta::default(),
+                })
+                .await;
+        }
+
+        let (status, body) = send_msg(
+            State(state),
+            Json(SendBody {
+                from: "a".into(),
+                to: "b".into(),
+                message: "just an update".into(),
+                expects_reply: false,
+                responds_to: None,
+                done: false,
+                sender_ctx: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.get("warning").is_none(),
+            "an ordinary tell must stay quiet, got: {:?}",
+            body.0
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_tell_with_reply_to_does_not_warn() {
+        // `tell --reply-to` is a deliberate progress update before the final
+        // answer. Warning on it would punish correct usage.
+        let state = state_with_outstanding_ask().await;
+        let msg_id = state.protocol.read().await.pending_replies["owing"][0].msg_id;
+
+        let (status, body) = send_msg(
+            State(state),
+            Json(SendBody {
+                from: "owing".into(),
+                to: "asker".into(),
+                message: "still working on it".into(),
+                expects_reply: false,
+                responds_to: Some(msg_id),
+                done: false,
+                sender_ctx: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.get("warning").is_none(),
+            "an explicit progress update must not warn, got: {:?}",
+            body.0
+        );
     }
 
     // --- /api/send sender-claim guardrails (task #1395) ---

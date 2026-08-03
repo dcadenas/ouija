@@ -238,6 +238,11 @@ enum Command {
         #[arg(long)]
         keep_worktree: bool,
     },
+    /// Release a stuck lifecycle lease left by a failed kill, without
+    /// restarting the daemon. Replays the backend abort first and fails closed
+    /// if it cannot be confirmed. Retry `kill-session` afterwards.
+    #[command(name = "recover-lease")]
+    RecoverLease { name: String },
     /// Prune stale sessions whose worktree is missing
     #[command(name = "prune-stale-sessions")]
     PruneStaleSessions {
@@ -287,6 +292,11 @@ enum Command {
         #[arg(long)]
         from: Option<String>,
     },
+    /// List the replies this session still owes, with the question bodies.
+    ///
+    /// Answer each with `ouija reply <from> <msg_id> "..."`. A plain `tell`
+    /// does not clear the obligation.
+    Pending,
     /// Clear a pending reply from a disconnected sender
     #[command(name = "clear-reply")]
     ClearReply { sender_id: String },
@@ -1108,6 +1118,10 @@ async fn main() -> anyhow::Result<()> {
             });
             cli_post("/api/sessions/kill", &body).await?;
         }
+        Command::RecoverLease { name } => {
+            let body = serde_json::json!({ "name": name });
+            cli_post("/api/sessions/recover-lease", &body).await?;
+        }
         Command::PruneStaleSessions { yes } => {
             let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
             let url = format!("http://localhost:{port}/api/sessions/prune-stale");
@@ -1246,6 +1260,14 @@ async fn main() -> anyhow::Result<()> {
                 "clearing_id": clearing_id,
             });
             cli_post("/api/clear-reminder", &body).await?;
+        }
+        Command::Pending => {
+            let pane = std::env::var("TMUX_PANE")
+                .context("TMUX_PANE not set — must be run from a tmux pane")?;
+            // Same `%` strip as clear-reply: axum percent-decodes `%74` to `t`
+            // and would silently 404. See `pane_wire_suffix` docstring and #646.
+            let pane = pane_wire_suffix(&pane);
+            cli_get(&format!("/api/pane/{pane}/pending-replies")).await?;
         }
         Command::ClearReply { sender_id } => {
             let pane = std::env::var("TMUX_PANE")
@@ -1715,6 +1737,7 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
         dormant_sessions,
         incarnation_high_water,
         lifecycle_leases,
+        pending_replies,
         ..
     } = persisted;
     let abandoned_leases: Vec<_> = lifecycle_leases.values().cloned().collect();
@@ -1727,6 +1750,18 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
         proto.restore_incarnation_high_water(incarnation_high_water);
         proto.dormant_sessions = dormant_sessions.clone();
         proto.lifecycle_leases = lifecycle_leases;
+        // Reply obligations outlive the daemon. Entries keyed by a session that
+        // no longer exists are dropped: the obligation belongs to that session,
+        // so without it there is nobody left to owe the reply. Entries are kept
+        // regardless of who asked, because the asker may be a human or a remote
+        // peer that is not present in `sessions` at restore time.
+        let live: std::collections::HashSet<&str> =
+            sessions.iter().map(|s| s.id.as_str()).collect();
+        proto.pending_replies = pending_replies
+            .iter()
+            .filter(|(owed_by, _)| live.contains(owed_by.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
     }
 
     // A persisted lifecycle lease proves the daemon stopped before the
@@ -1991,7 +2026,11 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
                 dormant_sessions.clone(),
                 incarnation_high_water,
                 std::collections::BTreeMap::new(),
-            ),
+            )
+            // Reply obligations are not lifecycle authority and must survive
+            // this reconciliation; omitting them here would silently wipe every
+            // outstanding ask on any restart that reconciles a lease.
+            .with_pending_replies(state.protocol.read().await.pending_replies.clone()),
         )
         .context("failed to persist reconciled lifecycle authority")?;
     }
