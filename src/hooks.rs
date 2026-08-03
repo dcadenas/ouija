@@ -462,6 +462,18 @@ async fn session_start_inner(
                     .get(&session_id)
                     .and_then(|session| session.metadata.backend.as_deref())
                     .map(String::from);
+                // Managed launches register the pane before this hook fires, so
+                // observe the editor mode here too (see `sync_vim_mode_for_owner`).
+                sync_vim_mode_for_owner(
+                    state,
+                    &crate::daemon_protocol::ResourceOwner {
+                        session_id: session_id.clone(),
+                        incarnation,
+                    },
+                    backend.as_deref(),
+                    &body.cwd,
+                )
+                .await;
                 json!({
                     "registered": session_id,
                     "session_incarnation": incarnation.to_string(),
@@ -542,6 +554,13 @@ async fn session_start_inner(
         {
             crate::state::MissingBackendPaneReclaimOutcome::Reclaimed(owner)
             | crate::state::MissingBackendPaneReclaimOutcome::Current(owner) => {
+                sync_vim_mode_for_owner(
+                    state,
+                    &owner,
+                    Some(&identity.backend),
+                    &project.project_dir,
+                )
+                .await;
                 let output =
                     mesh_instructions_for_backend(Some(&identity.backend), &owner.session_id);
                 return json!({
@@ -563,6 +582,13 @@ async fn session_start_inner(
                 {
                     crate::state::DormantRecoveryOutcome::Recovered(owner)
                     | crate::state::DormantRecoveryOutcome::Current(owner) => {
+                        sync_vim_mode_for_owner(
+                            state,
+                            &owner,
+                            Some(&identity.backend),
+                            &project.project_dir,
+                        )
+                        .await;
                         let output = mesh_instructions_for_backend(
                             Some(&identity.backend),
                             &owner.session_id,
@@ -626,6 +652,13 @@ async fn session_start_inner(
                         .await
                     {
                         crate::state::ReusedPaneReplacementOutcome::Replaced(owner) => {
+                            sync_vim_mode_for_owner(
+                                state,
+                                &owner,
+                                Some(&identity.backend),
+                                &project.project_dir,
+                            )
+                            .await;
                             let output = mesh_instructions_for_backend(
                                 Some(&identity.backend),
                                 &owner.session_id,
@@ -760,6 +793,17 @@ async fn session_start_inner(
                 .get(&existing_id)
                 .and_then(|session| session.metadata.backend.clone())
         };
+        // Ouija-launched sessions are pane-registered before this hook fires,
+        // so this early return is the only chance to observe their editor mode.
+        // Without it every managed session would keep `vim_mode: false` and
+        // injection would paste into a prompt sitting in vim NORMAL mode.
+        sync_vim_mode_for_owner(
+            state,
+            &existing_owner,
+            bound_backend.as_deref(),
+            registered_project_dir.as_deref().unwrap_or(&body.cwd),
+        )
+        .await;
         let output = mesh_instructions_for_backend(bound_backend.as_deref(), &existing_id);
         return json!({
             "registered": existing_id,
@@ -833,12 +877,19 @@ async fn session_start_inner(
 
     // Register
     let role = format!("working on {basename}");
+    // Hook registrations never carried `vim_mode`, so every one of them
+    // recorded `false` and injection skipped `ensure_insert_mode` even for
+    // panes whose prompt was in vim NORMAL mode (where a paste is eaten as vim
+    // commands). Read Claude Code's own `editorMode` setting instead; an
+    // undetermined setting keeps the historical `false` default.
+    let vim_mode = detect_hook_vim_mode(backend.as_deref(), &project.project_dir);
     let proto_meta = crate::daemon_protocol::SessionMeta {
         project_dir: Some(project.project_dir),
         canonical_project_identity: Some(project.canonical_repository),
         role: Some(role),
         backend,
         backend_session_id,
+        vim_mode,
         ..Default::default()
     };
     let effects = state
@@ -873,6 +924,45 @@ async fn session_start_inner(
         "session_incarnation": owner.incarnation.to_string(),
         "output": output,
     })
+}
+
+/// Resolve `vim_mode` for a hook-registered session.
+///
+/// Only Claude Code exposes a settings-file editor mode that the daemon can
+/// read; other backends keep the historical `false` default, as does Claude
+/// Code when no settings source states an `editorMode`.
+fn detect_hook_vim_mode(backend: Option<&str>, project_dir: &str) -> bool {
+    if backend != Some("claude-code") {
+        return false;
+    }
+    crate::backend::claude_code::detect_vim_mode(project_dir).unwrap_or(false)
+}
+
+/// Refresh an already-registered owner's `vim_mode` from backend settings.
+///
+/// Used by the SessionStart paths that return early for a session the daemon
+/// itself launched or reclaimed: those never build a fresh `SessionMeta`, so
+/// without this they would keep the default `false` no matter what the user's
+/// editor mode is. `Event::SyncVimMode` no-ops unless the exact owner is still
+/// live and the value actually changed.
+async fn sync_vim_mode_for_owner(
+    state: &std::sync::Arc<crate::state::AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    backend: Option<&str>,
+    project_dir: &str,
+) {
+    if backend != Some("claude-code") {
+        return;
+    }
+    let Some(vim_mode) = crate::backend::claude_code::detect_vim_mode(project_dir) else {
+        return;
+    };
+    state
+        .apply_and_execute(crate::daemon_protocol::Event::SyncVimMode {
+            owner: owner.clone(),
+            vim_mode,
+        })
+        .await;
 }
 
 fn normalize_backend_session_id(value: Option<&str>) -> Option<String> {
@@ -936,6 +1026,22 @@ mod tests {
                 metadata: crate::daemon_protocol::SessionMeta::default(),
             })
             .await;
+    }
+
+    #[test]
+    fn hook_vim_mode_is_false_for_non_claude_backends() {
+        // Only Claude Code has a daemon-readable editor-mode setting; other
+        // backends must keep the historical default instead of guessing.
+        assert!(!detect_hook_vim_mode(Some("codex-cli"), "/tmp/project"));
+        assert!(!detect_hook_vim_mode(Some("opencode"), "/tmp/project"));
+        assert!(!detect_hook_vim_mode(None, "/tmp/project"));
+    }
+
+    #[test]
+    fn hook_vim_mode_defaults_false_when_setting_is_undetermined() {
+        // `detect_vim_mode` is inert under cfg(test), which stands in for the
+        // "no settings source states editorMode" case.
+        assert!(!detect_hook_vim_mode(Some("claude-code"), "/tmp/project"));
     }
 
     #[tokio::test]
