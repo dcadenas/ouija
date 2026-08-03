@@ -100,17 +100,26 @@ fn version_mismatch_to_report(previous: Option<&str>, current: &str) -> Option<S
 /// overwrite the stamp.
 fn warn_if_plugin_version_skew(cache_dir: &std::path::Path, current: &str) {
     let prev = std::fs::read_to_string(cache_dir.join(".version")).ok();
-    if let Some(old) = version_mismatch_to_report(prev.as_deref(), current) {
-        eprintln!(
-            "warning: ouija plugin cache was previously stamped {old}, daemon is {current} — \
-             restart any running coding sessions so they pick up the new hook scripts."
-        );
+    let Some(old) = version_mismatch_to_report(prev.as_deref(), current) else {
+        return;
+    };
+    // A version bump alone is not a reason to restart anything. Most releases
+    // change only the daemon binary, and the cached hook scripts they run are
+    // byte-identical; warning anyway trained operators to restart working
+    // sessions — and abort in-flight agent turns — for no benefit. Only speak
+    // up when a file a running session actually loaded has changed.
+    if !embedded_plugin_files_differ(cache_dir) {
+        return;
     }
+    eprintln!(
+        "warning: ouija plugin cache was previously stamped {old}, daemon is {current} and the \
+         hook scripts changed — restart running coding sessions to pick them up."
+    );
 }
 
-/// Write all embedded plugin files to the given cache directory.
-fn write_embedded_plugin_files(cache_dir: &std::path::Path) {
-    let files: &[(&str, &str)] = &[
+/// Embedded plugin files, paired with their path inside the cache directory.
+fn embedded_plugin_files() -> &'static [(&'static str, &'static str)] {
+    &[
         ("hooks/hooks.json", embedded::HOOKS_JSON),
         (
             "scripts/block-interactive-prompts.sh",
@@ -142,7 +151,24 @@ fn write_embedded_plugin_files(cache_dir: &std::path::Path) {
             ".claude-plugin/marketplace.json",
             embedded::MARKETPLACE_JSON,
         ),
-    ];
+    ]
+}
+
+/// True when any embedded plugin file differs from the copy already on disk.
+///
+/// A missing file counts as changed. Callers must invoke this *before*
+/// overwriting the cache, or every file will compare equal.
+pub(crate) fn embedded_plugin_files_differ(cache_dir: &std::path::Path) -> bool {
+    embedded_plugin_files().iter().any(|(path, content)| {
+        std::fs::read_to_string(cache_dir.join(path))
+            .map(|on_disk| on_disk != *content)
+            .unwrap_or(true)
+    })
+}
+
+/// Write all embedded plugin files to the given cache directory.
+fn write_embedded_plugin_files(cache_dir: &std::path::Path) {
+    let files = embedded_plugin_files();
 
     for (path, content) in files {
         let dest = cache_dir.join(path);

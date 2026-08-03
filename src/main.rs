@@ -2637,20 +2637,29 @@ fn update_and_restart() -> anyhow::Result<()> {
         anyhow::bail!("cargo install ouija --version {latest} failed");
     }
 
+    // Sample this BEFORE refreshing, or the freshly written files always
+    // compare equal and the check is meaningless.
+    let opencode_plugin_changed = backend::opencode::installed_plugin_differs();
+
     backend::claude_code::refresh_plugin_cache(&latest);
 
-    // Check if opencode serve is running — it needs a restart to pick up plugin changes
-    let serve_running = Cmd::new("pgrep")
-        .args(["-f", "opencode serve"])
-        .stdout(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if serve_running {
-        println!(
-            "note: opencode serve is running — restart it to pick up plugin changes:\n  \
-             pkill -f 'opencode serve' && opencode serve --port 8200 --hostname 127.0.0.1 &"
-        );
+    // Only ask for a restart when `opencode serve` would actually load
+    // something new. Restarting it aborts every in-flight worker turn, and most
+    // releases touch only the daemon binary.
+    if opencode_plugin_changed {
+        let serve_running = Cmd::new("pgrep")
+            .args(["-f", "opencode serve"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if serve_running {
+            println!(
+                "note: the opencode plugin changed and opencode serve is running — restart it to \
+                 pick up the change (this aborts in-flight turns):\n  \
+                 pkill -f 'opencode serve' && opencode serve --port 8200 --hostname 127.0.0.1 &"
+            );
+        }
     }
 
     sync_current_exe_from_cargo_bin();

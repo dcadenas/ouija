@@ -7,6 +7,27 @@ mod embedded {
     pub const SKILL_MD: &str = include_str!("../../skills/ouija/SKILL.md");
 }
 
+/// True when the installed opencode plugin or skill differs from the embedded
+/// copy, i.e. when a running `opencode serve` would actually load something new.
+///
+/// Callers must check this *before* `install()` overwrites the files. Most
+/// releases change only the daemon binary, so restarting `opencode serve`
+/// aborts every in-flight worker turn for nothing.
+pub(crate) fn installed_plugin_differs() -> bool {
+    let Ok(home) = std::env::var("HOME") else {
+        // Cannot tell — say nothing rather than prompt a needless restart.
+        return false;
+    };
+    let config_dir = std::path::PathBuf::from(home).join(".config/opencode");
+    let differs = |path: std::path::PathBuf, embedded: &str| {
+        std::fs::read_to_string(path)
+            .map(|on_disk| on_disk != embedded)
+            .unwrap_or(true)
+    };
+    differs(config_dir.join("plugins/ouija.ts"), embedded::PLUGIN_TS)
+        || differs(config_dir.join("skills/ouija/SKILL.md"), embedded::SKILL_MD)
+}
+
 /// The legacy MCP URL that older ouija installs wrote into opencode's
 /// `mcp.ouija` config. The `/mcp` route was removed from the daemon in
 /// commit 2878926 "drop MCP tools, skill-only HATEOAS interface", and
