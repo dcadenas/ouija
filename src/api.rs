@@ -1225,7 +1225,18 @@ async fn execute_send_effects_for_api(
                 delivered,
                 transport,
             } => {
-                let delivered = if matches!(outcome, crate::state::DeliveryOutcome::Rejected(_)) {
+                // `delivered` in the durable log means *confirmed* delivered,
+                // not "probably arrived". An ambiguous outcome — an injection
+                // whose text we looked for and did not find, or an HTTP send we
+                // could not confirm — must not assert success here. Recording
+                // true on an unconfirmed delivery is what let five lost
+                // messages read as delivered while the daemon held the
+                // disconfirming evidence.
+                let delivered = if matches!(
+                    outcome,
+                    crate::state::DeliveryOutcome::Rejected(_)
+                        | crate::state::DeliveryOutcome::Ambiguous(_)
+                ) {
                     false
                 } else {
                     *delivered
