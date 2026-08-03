@@ -307,7 +307,7 @@ pub fn inject(
     vim_mode: bool,
     config: &crate::backend::InjectConfig,
     tui_pattern: Option<&str>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<InjectVerification> {
     let t0 = Instant::now();
 
     if vim_mode {
@@ -320,9 +320,11 @@ pub fn inject(
     inject_text(pane, message, config)?;
     let t3 = Instant::now();
 
-    // Best-effort verification (warns on miss, never fails the delivery)
+    // The paste commands succeeded, but that only proves tmux accepted them.
+    // Verification is the only evidence that the target actually received the
+    // text, so its result is returned to the caller instead of being dropped.
     thread::sleep(Duration::from_millis(VERIFY_DELAY_MS));
-    verify_injected(pane, message);
+    let verification = verify_injected(pane, message);
     let t4 = Instant::now();
 
     tracing::info!(
@@ -335,7 +337,7 @@ pub fn inject(
         "inject timing"
     );
 
-    Ok(())
+    Ok(verification)
 }
 
 fn capture_pane(pane: &str) -> anyhow::Result<String> {
@@ -354,45 +356,88 @@ fn capture_pane(pane: &str) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Best-effort verification — warns instead of failing.
+/// Result of checking whether injected text actually reached the pane.
 ///
-/// When the target is mid-turn, Claude's output can scroll the injected text
-/// off the visible capture window before we check. The message was still
-/// delivered (paste-buffer/send-keys are reliable), so a missing needle is
-/// not a real failure.
-fn verify_injected(pane: &str, message: &str) {
+/// `Unconfirmed` deliberately does not mean "failed": the capture window is a
+/// lossy observation of a live TUI. It means the daemon has no evidence the
+/// text arrived, which callers must report as ambiguous rather than as a
+/// successful delivery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InjectVerification {
+    /// The injected text was observed in the pane after the paste.
+    Confirmed,
+    /// The paste commands succeeded but the text was not observed.
+    Unconfirmed(String),
+}
+
+/// Check whether the injected text is visible in the pane after the paste.
+///
+/// The needle is taken from the **tail** of the sanitized message: after
+/// submission the most recently pasted text is the part still on screen, while
+/// a long message legitimately scrolls its own beginning out of the capture
+/// window. Both sides are normalized (whitespace and box-drawing glyphs
+/// removed) so that TUI line wrapping and input-box borders inserted in the
+/// middle of the pasted text do not, by themselves, cause a miss.
+///
+/// A miss is still not proof of loss — a TUI that elides or reflows the user's
+/// message in a way this normalization does not cover would also miss. That
+/// residual false-negative risk is why callers map `Unconfirmed` to
+/// `DeliveryOutcome::Ambiguous` and never to `Rejected`.
+fn verify_injected(pane: &str, message: &str) -> InjectVerification {
     let content = match capture_pane(pane) {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!("verify capture failed for pane {pane}: {e}");
-            return;
+            let reason = format!("could not capture pane {pane} to verify injection: {e}");
+            tracing::warn!(pane, "inject verification: {reason}");
+            return InjectVerification::Unconfirmed(reason);
         }
     };
 
-    let needle = verification_needle(message);
+    let sanitized = sanitize_injection_text(message);
+    let needle = verification_needle(&sanitized);
 
-    if !content.contains(needle) {
-        tracing::warn!(
-            pane,
-            "inject verification: text not found in visible area (may have scrolled off)"
-        );
+    if normalize_for_verification(&content).contains(&normalize_for_verification(needle)) {
+        return InjectVerification::Confirmed;
     }
+
+    let reason = format!(
+        "injected text was not observed in pane {pane} after paste \
+         (checked the last {VERIFY_NEEDLE_LEN} characters of the message \
+         against the last {} captured lines)",
+        CAPTURE_SCROLL_LINES.trim_start_matches('-')
+    );
+    tracing::warn!(
+        pane,
+        msg_len = message.len(),
+        "inject verification: {reason}"
+    );
+    InjectVerification::Unconfirmed(reason)
 }
 
+/// Strip characters a TUI may insert into the middle of pasted text.
+///
+/// Line wrapping adds newlines and padding; input boxes add vertical borders.
+/// Removing whitespace and box-drawing glyphs from both the capture and the
+/// needle keeps the comparison about the message's own characters.
+fn normalize_for_verification(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_whitespace() && !matches!(c, '\u{2500}'..='\u{257f}'))
+        .collect()
+}
+
+/// Take the last [`VERIFY_NEEDLE_LEN`] characters of `message`, on a char boundary.
 fn verification_needle(message: &str) -> &str {
     if message.len() <= VERIFY_NEEDLE_LEN {
         return message;
     }
 
-    let mut end = 0;
-    for (idx, ch) in message.char_indices() {
-        let next = idx + ch.len_utf8();
-        if next > VERIFY_NEEDLE_LEN {
-            break;
-        }
-        end = next;
-    }
-    &message[..end]
+    let start = message
+        .char_indices()
+        .rev()
+        .map(|(idx, _)| idx)
+        .find(|idx| message.len() - idx >= VERIFY_NEEDLE_LEN)
+        .unwrap_or(0);
+    &message[start..]
 }
 
 fn next_inject_buffer_name(pane: &str) -> String {
@@ -517,7 +562,7 @@ pub struct InjectRequest {
     pub inject_config: crate::backend::InjectConfig,
     pub tui_pattern: Option<String>,
     pub(crate) owned_assistant_process: Option<OwnedAssistantProcessEvidence>,
-    pub result_tx: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+    pub result_tx: tokio::sync::oneshot::Sender<anyhow::Result<InjectVerification>>,
 }
 
 #[derive(Clone, Debug)]
@@ -593,7 +638,10 @@ pub async fn pane_inject_loop(mut rx: tokio::sync::mpsc::UnboundedReceiver<Injec
             });
 
             match attempt {
-                Ok(Ok(())) => break Ok(()),
+                // An unverified inject is reported, not retried: the paste
+                // itself succeeded, so retrying risks delivering the message
+                // twice. The ambiguity is surfaced to the caller instead.
+                Ok(Ok(verification)) => break Ok(verification),
                 Ok(Err(e)) => {
                     attempts += 1;
                     if attempts >= MAX_INJECT_RETRIES {
@@ -783,9 +831,12 @@ pub async fn locked_inject(
                 result_tx,
             };
             state.enqueue_inject(req);
+            // Best-effort caller: an unverified inject is logged by
+            // `verify_injected` and does not change this path's semantics.
             return result_rx
                 .await
-                .map_err(|_| anyhow::anyhow!("inject queue closed"))?;
+                .map_err(|_| anyhow::anyhow!("inject queue closed"))?
+                .map(|_| ());
         }
         SessionDeliveryPlan::Unavailable(reason) => anyhow::bail!(reason),
     }
@@ -804,15 +855,39 @@ pub async fn locked_inject_raw_tmux(
     message: &str,
     vim_mode: bool,
 ) -> anyhow::Result<()> {
+    locked_inject_raw_tmux_verified(state, session_id, pane, message, vim_mode)
+        .await
+        .map(|_| ())
+}
+
+/// Like [`locked_inject_raw_tmux`], but reports whether the injected text was
+/// actually observed in the pane. Callers that report delivery status to a
+/// sender must use this and must not treat `Unconfirmed` as success.
+pub(crate) async fn locked_inject_raw_tmux_verified(
+    state: &crate::state::AppState,
+    session_id: &str,
+    pane: &str,
+    message: &str,
+    vim_mode: bool,
+) -> anyhow::Result<InjectVerification> {
     if cfg!(test) {
-        return Ok(());
+        return Ok(InjectVerification::Confirmed);
     }
 
     let backend = state.backend_for_session(session_id).await;
     let config = backend.inject_config();
     let tui_pattern = backend.tui_ready_pattern().map(String::from);
 
-    locked_inject_raw_tmux_with_config(state, pane, message, vim_mode, config, tui_pattern).await
+    locked_inject_raw_tmux_with_config_and_evidence(
+        state,
+        pane,
+        message,
+        vim_mode,
+        config,
+        tui_pattern,
+        None,
+    )
+    .await
 }
 
 pub async fn locked_inject_raw_tmux_with_config(
@@ -833,6 +908,7 @@ pub async fn locked_inject_raw_tmux_with_config(
         None,
     )
     .await
+    .map(|_| ())
 }
 
 pub(crate) async fn locked_inject_raw_tmux_with_config_and_evidence(
@@ -843,9 +919,9 @@ pub(crate) async fn locked_inject_raw_tmux_with_config_and_evidence(
     inject_config: crate::backend::InjectConfig,
     tui_pattern: Option<String>,
     owned_assistant_process: Option<OwnedAssistantProcessEvidence>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<InjectVerification> {
     if cfg!(test) {
-        return Ok(());
+        return Ok(InjectVerification::Confirmed);
     }
 
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
@@ -1612,12 +1688,52 @@ mod tests {
 
     #[test]
     fn verification_needle_stops_on_utf8_character_boundary() {
-        let message = format!("{}🙂 suffix", "a".repeat(VERIFY_NEEDLE_LEN - 1));
+        let message = format!("prefix 🙂{}", "a".repeat(VERIFY_NEEDLE_LEN - 1));
 
         let needle = verification_needle(&message);
 
-        assert_eq!(needle, "a".repeat(VERIFY_NEEDLE_LEN - 1));
-        assert!(message.is_char_boundary(needle.len()));
+        // A 60-byte tail would split the emoji, so the needle grows to the
+        // next character boundary instead.
+        assert_eq!(needle, format!("🙂{}", "a".repeat(VERIFY_NEEDLE_LEN - 1)));
+        assert!(message.is_char_boundary(message.len() - needle.len()));
+        assert!(needle.len() >= VERIFY_NEEDLE_LEN);
+    }
+
+    #[test]
+    fn verification_needle_uses_message_tail_not_head() {
+        let message = format!("{}TAIL-MARKER", "h".repeat(VERIFY_NEEDLE_LEN * 2));
+
+        let needle = verification_needle(&message);
+
+        assert!(
+            needle.ends_with("TAIL-MARKER"),
+            "needle should come from the end of the message: {needle:?}"
+        );
+        assert!(message.ends_with(needle));
+    }
+
+    #[test]
+    fn verification_needle_returns_whole_short_message() {
+        assert_eq!(verification_needle("short message"), "short message");
+    }
+
+    #[test]
+    fn verification_normalization_survives_tui_wrapping_and_borders() {
+        let needle = "the quick brown fox jumps over the lazy dog";
+        let wrapped = "\u{2502} the quick brown fox jumps \u{2502}\n\u{2502} over the lazy dog       \u{2502}";
+
+        assert!(
+            normalize_for_verification(wrapped).contains(&normalize_for_verification(needle)),
+            "wrapped pane content should still match the needle"
+        );
+    }
+
+    #[test]
+    fn verification_normalization_still_rejects_absent_text() {
+        let needle = "the quick brown fox";
+        let pane = "\u{2502} an entirely different line \u{2502}";
+
+        assert!(!normalize_for_verification(pane).contains(&normalize_for_verification(needle)));
     }
 
     #[test]

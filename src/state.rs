@@ -356,7 +356,7 @@ async fn deliver_raw_tmux_for_session(
             .await
         }
         None => {
-            crate::tmux::locked_inject_raw_tmux(
+            crate::tmux::locked_inject_raw_tmux_verified(
                 state,
                 request.session_id,
                 request.pane,
@@ -367,9 +367,26 @@ async fn deliver_raw_tmux_for_session(
         }
     };
 
-    result
-        .map(|()| DeliveryOutcome::Accepted)
-        .unwrap_or_else(|error| DeliveryOutcome::Rejected(error.to_string()))
+    inject_delivery_outcome(result)
+}
+
+/// Map a tmux injection attempt to a delivery outcome.
+///
+/// Only an observed injection counts as delivered. When the pane never showed
+/// the text we cannot prove either way, so report `Ambiguous` ("unknown" to the
+/// sender) rather than a delivery the recipient may never have seen. `Rejected`
+/// would be wrong for the same reason: the paste itself succeeded, and the
+/// recipient may well have the message.
+fn inject_delivery_outcome(
+    result: anyhow::Result<crate::tmux::InjectVerification>,
+) -> DeliveryOutcome {
+    match result {
+        Ok(crate::tmux::InjectVerification::Confirmed) => DeliveryOutcome::Accepted,
+        Ok(crate::tmux::InjectVerification::Unconfirmed(reason)) => {
+            DeliveryOutcome::Ambiguous(reason)
+        }
+        Err(error) => DeliveryOutcome::Rejected(error.to_string()),
+    }
 }
 
 async fn deliver_by_current_session_plan(
@@ -10643,6 +10660,59 @@ pub(crate) mod tests {
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         server.abort();
+    }
+
+    #[test]
+    fn unverified_inject_is_never_reported_as_delivered() {
+        let outcome = inject_delivery_outcome(Ok(crate::tmux::InjectVerification::Unconfirmed(
+            "injected text was not observed in pane %18 after paste".into(),
+        )));
+
+        assert!(
+            matches!(outcome, DeliveryOutcome::Ambiguous(ref reason) if reason.contains("not observed in pane %18")),
+            "an unverified injection must not be reported as delivered, got {outcome:?}"
+        );
+        assert_ne!(outcome, DeliveryOutcome::Accepted);
+    }
+
+    #[test]
+    fn verified_inject_is_reported_as_delivered() {
+        assert_eq!(
+            inject_delivery_outcome(Ok(crate::tmux::InjectVerification::Confirmed)),
+            DeliveryOutcome::Accepted
+        );
+    }
+
+    #[test]
+    fn failed_inject_is_reported_as_rejected() {
+        let outcome = inject_delivery_outcome(Err(anyhow::anyhow!("tmux paste-buffer failed")));
+
+        assert!(
+            matches!(outcome, DeliveryOutcome::Rejected(ref reason) if reason.contains("paste-buffer failed")),
+            "expected rejection, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_inject_delivery_reports_accepted() {
+        let state = AppState::new_for_test();
+        state.settings.write().await.default_backend = "claude-code".into();
+        proto_register(&state, "target", Some("%1")).await;
+
+        let outcome = deliver_inject_message_effect(
+            &state,
+            InjectDeliveryRequest {
+                session_id: "target",
+                pane: "%1",
+                message: "hello",
+                vim_mode: false,
+                delivery_method: Some("tmux"),
+                recorded_method: None,
+            },
+        )
+        .await;
+
+        assert_eq!(outcome, DeliveryOutcome::Accepted);
     }
 
     #[tokio::test]
