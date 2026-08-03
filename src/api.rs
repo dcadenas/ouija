@@ -925,8 +925,23 @@ pub async fn send_msg(
             return (StatusCode::BAD_GATEWAY, Json(body));
         }
         // Neither is a failure: the paste succeeded and the message may well be
-        // sitting in the recipient's input box. Keep the send's state changes.
-        crate::state::DeliveryOutcome::Ambiguous(_) | crate::state::DeliveryOutcome::Queued(_) => {}
+        // sitting in the recipient's input box. Finalize exactly as for an
+        // accepted delivery.
+        //
+        // Finalizing matters here, it is not a formality. `apply_send` clears
+        // the sender's pending-reply obligation, then
+        // `reserve_sender_state_after_send` re-reserves it until delivery is
+        // resolved; only `finalize_successful_delivery` releases that
+        // reservation. Doing nothing leaves the obligation reserved forever, so
+        // a reply that was genuinely sent keeps firing unanswered-question
+        // reminders with no way to clear it but manual suppression.
+        //
+        // The obligation asks whether the *sender* answered, which it did.
+        // Uncertainty about whether the recipient's TUI rendered the text is
+        // reported separately, as the send status.
+        crate::state::DeliveryOutcome::Ambiguous(_) | crate::state::DeliveryOutcome::Queued(_) => {
+            finalize_successful_delivery(&state, rollback).await;
+        }
     }
 
     if let Some((method, msg_id)) = effects.iter().find_map(|e| match e {
@@ -7019,6 +7034,43 @@ mod tests {
             })
             .await;
         state
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_reply_still_clears_the_obligation() {
+        // Regression: `apply_send` clears the pending reply, then
+        // `reserve_sender_state_after_send` re-reserves it until delivery
+        // resolves. When unverified injections started reporting Ambiguous
+        // instead of Accepted, neither finalize nor rollback ran, so the
+        // reservation was never released and a reply that was genuinely sent
+        // kept firing unanswered-question reminders forever.
+        let state = state_with_outstanding_ask().await;
+        let msg_id = state.protocol.read().await.pending_replies["owing"][0].msg_id;
+
+        let (status, _body) = send_msg(
+            State(state.clone()),
+            Json(SendBody {
+                from: "owing".into(),
+                to: "asker".into(),
+                message: "here is the answer".into(),
+                expects_reply: false,
+                responds_to: Some(msg_id),
+                done: true,
+                sender_ctx: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !state
+                .protocol
+                .read()
+                .await
+                .pending_replies
+                .contains_key("owing"),
+            "a completed reply must clear the obligation even when delivery could not be confirmed"
+        );
     }
 
     #[tokio::test]
