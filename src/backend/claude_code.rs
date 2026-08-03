@@ -53,6 +53,88 @@ pub fn pre_trust_workspace(dir: &str) {
     }
 }
 
+// --- Editor (vim) mode detection ---
+//
+// `SessionMeta::vim_mode` decides whether injection first forces the prompt
+// into INSERT mode. Before this, the flag could only be set by the operator via
+// `ouija register --vim-mode`, so every hook-registered session recorded
+// `vim_mode: false` even when Claude Code's prompt was in vim mode — and a
+// paste landing in NORMAL mode is eaten as vim commands, silently losing the
+// message.
+//
+// Claude Code stores the prompt key-binding mode as the `editorMode` setting
+// (`"vim"` | `"normal"`; legacy `"emacs"` means normal). Resolution order,
+// highest precedence first, mirrors Claude Code's own settings chain:
+// policy (managed) > project local > project shared > user > legacy
+// `~/.claude.json`. Flag settings (`--settings`) and the Windows/WSL registry
+// policy sources are not reachable from the daemon and are not consulted.
+
+/// Directory holding Claude Code's OS-level managed (policy) settings.
+fn managed_settings_dir() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "/Library/Application Support/ClaudeCode"
+    } else {
+        "/etc/claude-code"
+    }
+}
+
+/// Settings files that can carry `editorMode`, highest precedence first.
+fn editor_mode_setting_files(
+    managed_dir: &Path,
+    home: &Path,
+    project_dir: &Path,
+) -> Vec<std::path::PathBuf> {
+    vec![
+        managed_dir.join("managed-settings.json"),
+        project_dir.join(".claude").join("settings.local.json"),
+        project_dir.join(".claude").join("settings.json"),
+        home.join(".claude").join("settings.json"),
+        // Legacy global config; Claude Code still falls back to it.
+        home.join(".claude.json"),
+    ]
+}
+
+/// Read a top-level `editorMode` string out of a settings file's JSON.
+///
+/// Unreadable or malformed files yield `None` so the next source is tried.
+fn editor_mode_in_file(path: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    let mode = value.get("editorMode")?.as_str()?.trim();
+    if mode.is_empty() {
+        return None;
+    }
+    Some(mode.to_ascii_lowercase())
+}
+
+/// Resolve Claude Code's vim mode from explicit settings roots.
+///
+/// `None` means no source stated a preference — callers keep their default
+/// rather than guessing.
+fn detect_vim_mode_in(managed_dir: &Path, home: &Path, project_dir: &Path) -> Option<bool> {
+    editor_mode_setting_files(managed_dir, home, project_dir)
+        .iter()
+        .find_map(|path| editor_mode_in_file(path))
+        .map(|mode| mode == "vim")
+}
+
+/// Detect whether Claude Code's prompt uses vim key bindings for `project_dir`.
+///
+/// Returns `None` when no settings source states an `editorMode`, when `HOME`
+/// is unset, or under `cfg!(test)` (unit tests must not read the host's real
+/// Claude Code settings). Callers treat `None` as "keep the current default".
+pub fn detect_vim_mode(project_dir: &str) -> Option<bool> {
+    if cfg!(test) {
+        return None;
+    }
+    let home = std::env::var("HOME").ok()?;
+    detect_vim_mode_in(
+        Path::new(managed_settings_dir()),
+        Path::new(&home),
+        Path::new(project_dir),
+    )
+}
+
 // --- Embedded plugin files ---
 // These are compiled into the binary so `ouija start-server` can bootstrap the Claude
 // Code plugin without needing the source repo on disk.
@@ -642,6 +724,148 @@ mod tests {
             permission_mode: None,
             codex_home: None,
         }
+    }
+
+    fn write_settings(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn detect_vim_mode_reads_user_settings_editor_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = tmp.path().join("policy");
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        write_settings(
+            &home.join(".claude/settings.json"),
+            r#"{"editorMode": "vim"}"#,
+        );
+        assert_eq!(detect_vim_mode_in(&policy, &home, &project), Some(true));
+
+        write_settings(
+            &home.join(".claude/settings.json"),
+            r#"{"editorMode": "normal"}"#,
+        );
+        assert_eq!(detect_vim_mode_in(&policy, &home, &project), Some(false));
+    }
+
+    #[test]
+    fn detect_vim_mode_is_unknown_without_any_editor_mode_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = tmp.path().join("policy");
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        // No settings at all.
+        assert_eq!(detect_vim_mode_in(&policy, &home, &project), None);
+
+        // Settings present but silent about editorMode, plus a malformed file
+        // that must not be treated as an answer.
+        write_settings(&home.join(".claude/settings.json"), r#"{"theme": "dark"}"#);
+        write_settings(&project.join(".claude/settings.json"), "{not json");
+        assert_eq!(detect_vim_mode_in(&policy, &home, &project), None);
+    }
+
+    #[test]
+    fn detect_vim_mode_prefers_project_settings_over_user_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = tmp.path().join("policy");
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+
+        write_settings(
+            &home.join(".claude/settings.json"),
+            r#"{"editorMode": "normal"}"#,
+        );
+        write_settings(
+            &project.join(".claude/settings.json"),
+            r#"{"editorMode": "vim"}"#,
+        );
+        assert_eq!(detect_vim_mode_in(&policy, &home, &project), Some(true));
+
+        // settings.local.json outranks the shared project file.
+        write_settings(
+            &project.join(".claude/settings.local.json"),
+            r#"{"editorMode": "normal"}"#,
+        );
+        assert_eq!(detect_vim_mode_in(&policy, &home, &project), Some(false));
+    }
+
+    #[test]
+    fn detect_vim_mode_falls_back_to_legacy_global_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = tmp.path().join("policy");
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        write_settings(&home.join(".claude.json"), r#"{"editorMode": "vim"}"#);
+        assert_eq!(detect_vim_mode_in(&policy, &home, &project), Some(true));
+
+        // A real settings source outranks the legacy config.
+        write_settings(
+            &home.join(".claude/settings.json"),
+            r#"{"editorMode": "normal"}"#,
+        );
+        assert_eq!(detect_vim_mode_in(&policy, &home, &project), Some(false));
+    }
+
+    #[test]
+    fn detect_vim_mode_ignores_non_string_and_empty_editor_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = tmp.path().join("policy");
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        write_settings(
+            &home.join(".claude/settings.json"),
+            r#"{"editorMode": true}"#,
+        );
+        assert_eq!(detect_vim_mode_in(&policy, &home, &project), None);
+
+        write_settings(
+            &home.join(".claude/settings.json"),
+            r#"{"editorMode": "  "}"#,
+        );
+        assert_eq!(detect_vim_mode_in(&policy, &home, &project), None);
+
+        // Legacy "emacs" is Claude Code's non-vim mode.
+        write_settings(
+            &home.join(".claude/settings.json"),
+            r#"{"editorMode": "emacs"}"#,
+        );
+        assert_eq!(detect_vim_mode_in(&policy, &home, &project), Some(false));
+    }
+
+    #[test]
+    fn detect_vim_mode_lets_managed_policy_win() {
+        let tmp = tempfile::tempdir().unwrap();
+        let policy = tmp.path().join("policy");
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+
+        write_settings(
+            &project.join(".claude/settings.local.json"),
+            r#"{"editorMode": "normal"}"#,
+        );
+        write_settings(
+            &policy.join("managed-settings.json"),
+            r#"{"editorMode": "vim"}"#,
+        );
+        assert_eq!(detect_vim_mode_in(&policy, &home, &project), Some(true));
+    }
+
+    #[test]
+    fn detect_vim_mode_is_inert_under_cfg_test() {
+        // The filesystem wrapper must never read the host's real settings from
+        // unit tests, or `cargo test` results would depend on the developer's
+        // own Claude Code editor mode.
+        assert_eq!(detect_vim_mode("/nonexistent/project"), None);
     }
 
     #[test]

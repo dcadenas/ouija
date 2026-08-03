@@ -1793,8 +1793,11 @@ impl AppState {
             // mutation. It must not wait behind owned delivery I/O holding the
             // pane/backend/project gates; the protocol lock serializes the
             // update and `DaemonState::apply` rejects superseded owners.
+            // `SyncVimMode` is the same shape: a pure, exact-owner refresh of an
+            // injection hint that owns no pane/backend/project resource.
             crate::daemon_protocol::Event::ActiveContextActive { .. }
             | crate::daemon_protocol::Event::ActiveContextStopped { .. }
+            | crate::daemon_protocol::Event::SyncVimMode { .. }
             | crate::daemon_protocol::Event::ClaimActiveContextRestartDue { .. } => {}
             crate::daemon_protocol::Event::RefreshLaunchMetadata {
                 id, pane, metadata, ..

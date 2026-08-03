@@ -1035,6 +1035,22 @@ pub enum Event {
         /// TOCTOU guard: project_dir must match this value.
         expected_project_dir: String,
     },
+    /// Refresh the injection-time vim hint of an exact live owner.
+    ///
+    /// `vim_mode` only decides whether tmux injection first forces the prompt
+    /// into INSERT mode, so it is a delivery hint rather than identity or
+    /// ownership evidence. It is observed from the backend's own editor
+    /// settings at SessionStart, including for panes that were already
+    /// registered by a managed launch. Like [`Event::AdoptBackend`], this is
+    /// internal plumbing and must not bump `last_metadata_update`, which tracks
+    /// user-facing role/bulletin staleness (#458). Requires an exact
+    /// `ResourceOwner` so a superseded incarnation cannot rewrite the flag of
+    /// the session that replaced it. No-op for remote sessions and when the
+    /// stored value already matches.
+    SyncVimMode {
+        owner: ResourceOwner,
+        vim_mode: bool,
+    },
     UpdateMetadata {
         id: String,
         role: Option<String>,
@@ -2511,6 +2527,7 @@ impl DaemonState {
                 owner,
                 expected_project_dir,
             } => self.apply_remove_if_stale(&owner, &expected_project_dir),
+            Event::SyncVimMode { owner, vim_mode } => self.apply_sync_vim_mode(&owner, vim_mode),
             Event::UpdateMetadata {
                 id,
                 role,
@@ -4960,6 +4977,21 @@ impl DaemonState {
         }
 
         effects
+    }
+
+    /// See [`Event::SyncVimMode`].
+    fn apply_sync_vim_mode(&mut self, owner: &ResourceOwner, vim_mode: bool) -> Vec<Effect> {
+        let Some(session) = self.sessions.get_mut(&owner.session_id) else {
+            return vec![];
+        };
+        if !matches!(session.origin, Origin::Local)
+            || session.metadata.session_incarnation != owner.incarnation
+            || session.metadata.vim_mode == vim_mode
+        {
+            return vec![];
+        }
+        session.metadata.vim_mode = vim_mode;
+        vec![Effect::Persist]
     }
 
     fn apply_update_metadata(
@@ -12823,6 +12855,98 @@ mod tests {
             session_id: id.into(),
             incarnation: SessionIncarnation::default(),
         }
+    }
+
+    #[test]
+    fn sync_vim_mode_updates_the_exact_owner_and_persists() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta::default(),
+        });
+        let owner = test_owner(&state, "worker");
+        assert!(!state.sessions["worker"].metadata.vim_mode);
+
+        let effects = state.apply(Event::SyncVimMode {
+            owner: owner.clone(),
+            vim_mode: true,
+        });
+        assert!(state.sessions["worker"].metadata.vim_mode);
+        assert!(effects.iter().any(|e| matches!(e, Effect::Persist)));
+
+        // Idempotent: no effects when the stored value already matches.
+        let repeat = state.apply(Event::SyncVimMode {
+            owner: owner.clone(),
+            vim_mode: true,
+        });
+        assert!(repeat.is_empty(), "unchanged vim_mode must not persist");
+
+        // Turning it back off is a normal update.
+        state.apply(Event::SyncVimMode {
+            owner,
+            vim_mode: false,
+        });
+        assert!(!state.sessions["worker"].metadata.vim_mode);
+    }
+
+    #[test]
+    fn sync_vim_mode_ignores_superseded_and_unknown_owners() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::Register {
+            id: "worker".into(),
+            pane: Some("%1".into()),
+            metadata: SessionMeta {
+                vim_mode: true,
+                ..Default::default()
+            },
+        });
+        let stale = ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: SessionIncarnation(test_owner(&state, "worker").incarnation.0 + 1),
+        };
+        let effects = state.apply(Event::SyncVimMode {
+            owner: stale,
+            vim_mode: false,
+        });
+        assert!(effects.is_empty());
+        assert!(
+            state.sessions["worker"].metadata.vim_mode,
+            "a superseded owner must not rewrite the live session's hint"
+        );
+
+        let effects = state.apply(Event::SyncVimMode {
+            owner: missing_owner("ghost"),
+            vim_mode: true,
+        });
+        assert!(effects.is_empty());
+        assert!(!state.sessions.contains_key("ghost"));
+    }
+
+    #[test]
+    fn sync_vim_mode_ignores_remote_sessions() {
+        let mut state = DaemonState::new("d1".into(), "host1".into());
+        state.apply(Event::IncomingWire {
+            msg: crate::protocol::WireMessage::SessionList {
+                sessions: vec![crate::protocol::SessionInfo {
+                    id: "s1".into(),
+                    metadata: None,
+                }],
+                daemon_id: "npub1remote".into(),
+                daemon_name: "remote-host".into(),
+                aliases: Default::default(),
+                seq: 1,
+            },
+            sender_npub: Some("npub1remote".into()),
+        });
+        let remote_id = "remote-host/s1".to_string();
+        let owner = state.sessions[&remote_id].owner();
+        let effects = state.apply(Event::SyncVimMode {
+            owner,
+            vim_mode: true,
+        });
+        assert!(effects.is_empty());
+        assert!(!state.sessions[&remote_id].metadata.vim_mode);
     }
 
     #[test]
