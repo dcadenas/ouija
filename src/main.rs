@@ -553,7 +553,7 @@ async fn main() -> anyhow::Result<()> {
             };
             std::fs::create_dir_all(&data_dir)?;
 
-            let log_file = std::fs::File::create(data_dir.join("daemon.log"))?;
+            let log_file = open_daemon_log(&data_dir)?;
             tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1727,6 +1727,31 @@ fn persisted_session_from_entry(
             active_context_accounting_provisional: metadata.active_context_accounting_provisional,
         },
     })
+}
+
+/// Rotate `daemon.log` once it exceeds this size, keeping one previous file.
+const DAEMON_LOG_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Open `daemon.log` for appending, rotating it if it has grown too large.
+///
+/// This used to be `File::create`, which truncates on every daemon start — so
+/// each restart destroyed the whole log. Restarts cluster around shipping
+/// fixes, which is exactly when the before-picture matters, and it twice cost
+/// real forensic evidence during a live incident investigation: once
+/// manufacturing a spurious correlation from the surviving fragment, once
+/// destroying the per-pane counts needed to test a hypothesis.
+///
+/// Rotation keeps a single `daemon.log.1`. Failing to rotate is not fatal —
+/// logging matters more than the size bound.
+fn open_daemon_log(data_dir: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    let path = data_dir.join("daemon.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > DAEMON_LOG_MAX_BYTES) {
+        let _ = std::fs::rename(&path, data_dir.join("daemon.log.1"));
+    }
+    Ok(std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?)
 }
 
 async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Result<()> {
@@ -4426,6 +4451,50 @@ mod tests {
     // `/api/pane/{pane}/pending-replies/{from}` breaks axum's single-segment
     // match and silently 404s. The CLI must percent-encode the sender_id
     // segment before building the URL.
+
+    #[test]
+    fn daemon_log_survives_a_restart_instead_of_being_truncated() {
+        // Regression: the log was opened with File::create, so every daemon
+        // restart destroyed the forensic history a post-incident investigation
+        // needs — and restarts cluster around shipping fixes.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            use std::io::Write;
+            let mut first = open_daemon_log(dir.path()).unwrap();
+            writeln!(first, "before restart").unwrap();
+        }
+
+        {
+            use std::io::Write;
+            let mut second = open_daemon_log(dir.path()).unwrap();
+            writeln!(second, "after restart").unwrap();
+        }
+
+        let contents = std::fs::read_to_string(dir.path().join("daemon.log")).unwrap();
+        assert!(
+            contents.contains("before restart") && contents.contains("after restart"),
+            "restart must append, not truncate; got: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn daemon_log_rotates_once_past_the_size_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.log");
+        std::fs::write(&path, vec![b'x'; (DAEMON_LOG_MAX_BYTES + 1) as usize]).unwrap();
+
+        let _ = open_daemon_log(dir.path()).unwrap();
+
+        assert!(
+            dir.path().join("daemon.log.1").exists(),
+            "oversized log must be rotated aside, not deleted"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            0,
+            "the fresh log starts empty after rotation"
+        );
+    }
 
     #[test]
     fn encode_path_segment_encodes_slashes() {
