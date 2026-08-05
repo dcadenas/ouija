@@ -416,6 +416,7 @@ pub(crate) async fn resolve_inject_delivery_outcome(
             pane: request.pane.to_string(),
             message: request.message.to_string(),
             msg_id: request.msg_id,
+            logged: request.logged.clone(),
             first_reason: reason.clone(),
         })
         .await;
@@ -494,6 +495,10 @@ pub(crate) struct InjectDeliveryRequest<'a> {
     /// Message id reported to the sender, when the send carried one. Only used
     /// to identify the message in a deferred delivery re-check.
     pub msg_id: Option<u64>,
+    /// The durable message-log row this delivery is being recorded as, when it
+    /// is recorded at all. Carries the sender, so a deferred re-check can
+    /// supersede the exact row instead of throwing its result away.
+    pub logged: Option<LoggedMessageRef>,
 }
 
 #[derive(Clone, Debug)]
@@ -856,6 +861,10 @@ pub struct AppState {
     pub nodes: RwLock<HashMap<String, NodeInfo>>,
     pub message_log: RwLock<VecDeque<LogEntry>>,
     pub log_file: PathBuf,
+    /// Allocator for durable message-log ids. Seeded above the highest id
+    /// already in `messages.jsonl` so a restart cannot reissue an id and make
+    /// an unrelated later row look like an update of an older message.
+    next_log_id: std::sync::atomic::AtomicU64,
     transports: RwLock<TransportMap>,
     pub settings: RwLock<OuijaSettings>,
     pub scheduled_tasks: RwLock<HashMap<String, ScheduledTask>>,
@@ -1304,13 +1313,67 @@ pub struct NodeInfo {
 }
 
 /// A recorded inter-session message for the admin log.
+///
+/// `id` matches the `id` of the durable `messages.jsonl` row, so a deferred
+/// delivery outcome updates this entry in place instead of appending a second
+/// one. In-memory readers (the dashboard, the router snapshot) therefore see
+/// one entry per message carrying its final `delivered` value.
 #[derive(Clone, Debug, Serialize)]
 pub struct LogEntry {
+    pub id: u64,
     pub timestamp: DateTime<Utc>,
     pub from: String,
     pub to: String,
     pub message: String,
     pub delivered: bool,
+}
+
+/// First durable message-log id this process may issue.
+///
+/// Ids must never be reused across restarts: a reissued id would make an
+/// unrelated new row collapse into an old message when the log is resolved, so
+/// the counter starts above every id already on disk. A legacy file with no ids
+/// yields 1.
+fn initial_log_id(log_file: &std::path::Path) -> u64 {
+    let rows = crate::persistence::read_message_log(log_file);
+    crate::persistence::max_message_log_id(&rows).map_or(1, |max| max.saturating_add(1))
+}
+
+/// Allocate the durable log row identity for an effect batch, if it logs one.
+///
+/// The id has to exist before the injection runs, because the injection is what
+/// schedules the deferred re-check that may later supersede the row. Batches
+/// that log nothing allocate nothing.
+pub(crate) fn logged_message_ref(
+    state: &AppState,
+    effects: &[crate::daemon_protocol::Effect],
+) -> Option<LoggedMessageRef> {
+    effects.iter().find_map(|effect| match effect {
+        crate::daemon_protocol::Effect::LogMessage {
+            from,
+            to,
+            transport,
+            ..
+        } => Some(LoggedMessageRef {
+            id: state.next_log_id(),
+            from: from.clone(),
+            to: to.clone(),
+            method: transport.clone(),
+        }),
+        _ => None,
+    })
+}
+
+/// Identity of the durable `messages.jsonl` row a delivery was recorded as.
+///
+/// Carried into a deferred re-check so a later confirmation or proven loss can
+/// be attributed to the exact original row instead of being discarded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LoggedMessageRef {
+    pub id: u64,
+    pub from: String,
+    pub to: String,
+    pub method: String,
 }
 
 /// Max message log entries retained in memory.
@@ -1449,6 +1512,9 @@ impl AppState {
             )),
             nodes: RwLock::new(HashMap::new()),
             message_log: RwLock::new(VecDeque::with_capacity(MAX_LOG)),
+            next_log_id: std::sync::atomic::AtomicU64::new(initial_log_id(
+                &data_dir.join("messages.jsonl"),
+            )),
             log_file: data_dir.join("messages.jsonl"),
             transports: RwLock::new(HashMap::new()),
             settings: RwLock::new(Default::default()),
@@ -1511,6 +1577,7 @@ impl AppState {
             protocol: RwLock::new(protocol),
             nodes: RwLock::new(HashMap::new()),
             message_log: RwLock::new(VecDeque::with_capacity(MAX_LOG)),
+            next_log_id: std::sync::atomic::AtomicU64::new(initial_log_id(&log_file)),
             log_file,
             transports: RwLock::new(HashMap::new()),
             settings: RwLock::new(settings),
@@ -5229,6 +5296,7 @@ impl AppState {
             Effect::SendDelivered { msg_id, .. } => Some(*msg_id),
             _ => None,
         });
+        let logged = logged_message_ref(self, effects);
         let mut delivery_failure = None;
 
         for effect in effects {
@@ -5276,6 +5344,7 @@ impl AppState {
                             delivery_method: delivery_method.as_deref(),
                             recorded_method,
                             msg_id: recorded_msg_id.or(*pending_reply_msg_id),
+                            logged: logged.clone(),
                         },
                     )
                     .await;
@@ -5566,7 +5635,13 @@ impl AppState {
                     } else {
                         *delivered
                     };
-                    self.log_message(
+                    // Same id the injection above handed to its deferred
+                    // re-check, so a later confirmation supersedes this row.
+                    let id = logged
+                        .as_ref()
+                        .map_or_else(|| self.next_log_id(), |logged| logged.id);
+                    self.log_message_with_id(
+                        id,
                         from.clone(),
                         to.clone(),
                         message.clone(),
@@ -7099,6 +7174,12 @@ impl AppState {
         }
     }
 
+    /// Allocate the next durable message-log id.
+    pub(crate) fn next_log_id(&self) -> u64 {
+        self.next_log_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub async fn log_message(
         &self,
         from: String,
@@ -7107,27 +7188,39 @@ impl AppState {
         delivered: bool,
         method: &str,
     ) {
-        let ts = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let line = serde_json::json!({
-            "ts": ts,
-            "from": from,
-            "to": to,
-            "method": method,
-            "delivered": delivered,
-        });
-        {
-            let _guard = self.log_file_lock.lock().expect("log_file_lock poisoned");
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.log_file)
-            {
-                use std::io::Write;
-                let _ = writeln!(f, "{}", line);
-            }
-        }
+        self.log_message_with_id(self.next_log_id(), from, to, message, delivered, method)
+            .await;
+    }
+
+    /// Record a message under a caller-allocated id.
+    ///
+    /// Used when the id has to exist before the row is written, because a
+    /// deferred delivery re-check is already holding it in order to supersede
+    /// this row later.
+    pub(crate) async fn log_message_with_id(
+        &self,
+        id: u64,
+        from: String,
+        to: String,
+        message: String,
+        delivered: bool,
+        method: &str,
+    ) {
+        let row = crate::persistence::MessageLogRow {
+            ts: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            id: Some(id),
+            from: from.clone(),
+            to: to.clone(),
+            method: method.to_string(),
+            delivered,
+            update: false,
+            resolution: None,
+            reason: None,
+        };
+        self.append_message_log_row(&row);
 
         let entry = LogEntry {
+            id,
             timestamp: Utc::now(),
             from,
             to,
@@ -7139,6 +7232,67 @@ impl AppState {
             log.pop_front();
         }
         log.push_back(entry);
+    }
+
+    /// Append one row to `messages.jsonl`. The file is append-only; rows are
+    /// never rewritten in place.
+    fn append_message_log_row(&self, row: &crate::persistence::MessageLogRow) {
+        let Ok(line) = serde_json::to_string(row) else {
+            return;
+        };
+        let _guard = self.log_file_lock.lock().expect("log_file_lock poisoned");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log_file)
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "{line}");
+        }
+    }
+
+    /// Record how a deferred re-check resolved a delivery that could not be
+    /// confirmed synchronously.
+    ///
+    /// A confirmation and a proven loss are equally load-bearing: the durable
+    /// log saying `delivered: false` for a message the daemon later proved
+    /// arrived is the same defect as saying `true` for one it proved did not.
+    /// Both append a superseding row carrying the original id, and both update
+    /// the in-memory entry in place so dashboard readers do not see the stale
+    /// value or count the message twice.
+    pub(crate) async fn record_deferred_delivery_resolution(
+        &self,
+        pending: &crate::tmux::DeferredInjectVerification,
+        resolution: crate::persistence::MessageLogResolution,
+        reason: Option<String>,
+    ) {
+        let Some(logged) = pending.logged.as_ref() else {
+            // Nothing durable to supersede: this delivery was never logged
+            // (a scheduled prompt, for instance). The re-check's own warning
+            // is the whole record.
+            return;
+        };
+        let delivered = matches!(
+            resolution,
+            crate::persistence::MessageLogResolution::Confirmed
+        );
+
+        self.append_message_log_row(&crate::persistence::MessageLogRow {
+            ts: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            id: Some(logged.id),
+            from: logged.from.clone(),
+            to: logged.to.clone(),
+            method: logged.method.clone(),
+            delivered,
+            update: true,
+            resolution: Some(resolution),
+            reason,
+        });
+
+        let mut log = self.message_log.write().await;
+        if let Some(entry) = log.iter_mut().find(|entry| entry.id == logged.id) {
+            entry.delivered = delivered;
+        }
     }
 
     /// Port where opencode serve is expected to run.
@@ -10890,6 +11044,7 @@ pub(crate) mod tests {
             delivery_method: Some("tmux"),
             recorded_method: None,
             msg_id: Some(42),
+            logged: None,
         }
     }
 
@@ -11025,8 +11180,220 @@ pub(crate) mod tests {
         );
     }
 
+    /// Serializes the tests that drive the global deferred-verification test
+    /// hook, which is process-wide state.
+    fn deferred_verification_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(Default::default)
+    }
+
+    fn logged_request<'a>(
+        session_id: &'a str,
+        pane: &'a str,
+        id: u64,
+    ) -> InjectDeliveryRequest<'a> {
+        InjectDeliveryRequest {
+            logged: Some(LoggedMessageRef {
+                id,
+                from: "sender".into(),
+                to: session_id.to_string(),
+                method: "tmux".into(),
+            }),
+            ..inject_request(session_id, pane)
+        }
+    }
+
+    /// Drive one queued delivery through its deferred re-check and return the
+    /// durable rows it left behind.
+    async fn queued_delivery_with_recheck(
+        verification: crate::tmux::InjectVerification,
+    ) -> (Arc<AppState>, Vec<crate::persistence::MessageLogRow>) {
+        let state = AppState::new_for_test();
+        proto_register(&state, "busy", Some("%1")).await;
+        let owner = state.protocol.read().await.sessions["busy"].owner();
+        crate::tmux::set_test_deferred_verification(Some(verification));
+
+        state
+            .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Active)
+            .await;
+        let id = state.next_log_id();
+        let outcome = resolve_inject_delivery_outcome(
+            &state,
+            &logged_request("busy", "%1", id),
+            Ok(crate::tmux::InjectVerification::Unconfirmed(
+                "injected text was not observed in pane %1 after paste".into(),
+            )),
+        )
+        .await;
+        assert!(matches!(outcome, DeliveryOutcome::Queued(_)));
+
+        // What the synchronous path records: unconfirmed, never "probably".
+        state
+            .log_message_with_id(
+                id,
+                "sender".into(),
+                "busy".into(),
+                "hello there".into(),
+                false,
+                "tmux",
+            )
+            .await;
+
+        state
+            .notify_agent_owned(&owner, crate::session_agent::SessionMsg::Stopped)
+            .await;
+        let (queued, _) = take_agent_delivery_recheck_state(&state, "busy").await;
+        assert!(queued.is_empty(), "the turn ended, so the queue must drain");
+
+        crate::tmux::set_test_deferred_verification(None);
+        let rows = crate::persistence::read_message_log(&state.log_file);
+        (state, rows)
+    }
+
+    #[tokio::test]
+    async fn deferred_confirmation_appends_a_superseding_row() {
+        let _serialized = deferred_verification_lock().lock().await;
+        let (state, rows) =
+            queued_delivery_with_recheck(crate::tmux::InjectVerification::Confirmed).await;
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "the confirmation must be recorded, got {rows:?}"
+        );
+        assert!(
+            !rows[0].delivered && !rows[0].update,
+            "the original row stays exactly as it was written"
+        );
+        assert_eq!(
+            rows[0].id, rows[1].id,
+            "the update must name the same message"
+        );
+        assert!(rows[1].update);
+        assert!(
+            rows[1].delivered,
+            "a proven arrival must not be thrown away"
+        );
+        assert_eq!(
+            rows[1].resolution,
+            Some(crate::persistence::MessageLogResolution::Confirmed)
+        );
+        assert_eq!(rows[1].from, "sender");
+        assert_eq!(rows[1].to, "busy");
+
+        let resolved = crate::persistence::resolve_message_log(rows);
+        assert_eq!(
+            resolved.len(),
+            1,
+            "a reader must not double-count the update"
+        );
+        assert!(resolved[0].delivered);
+
+        let log = state.message_log.read().await;
+        assert_eq!(log.len(), 1, "the dashboard must show one message");
+        assert!(
+            log[0].delivered,
+            "the in-memory reader must show the final value"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_proven_loss_is_recorded_with_its_reason() {
+        let _serialized = deferred_verification_lock().lock().await;
+        let (state, rows) = queued_delivery_with_recheck(
+            crate::tmux::InjectVerification::Unconfirmed("still not in the pane".into()),
+        )
+        .await;
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "a proven loss must be recorded, got {rows:?}"
+        );
+        assert!(rows[1].update);
+        assert!(!rows[1].delivered);
+        assert_eq!(
+            rows[1].resolution,
+            Some(crate::persistence::MessageLogResolution::Lost)
+        );
+        assert!(
+            rows[1]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("still not observed in pane %1")),
+            "the loss must carry its evidence, got {:?}",
+            rows[1].reason
+        );
+
+        let resolved = crate::persistence::resolve_message_log(rows);
+        assert_eq!(resolved.len(), 1);
+        assert!(!resolved[0].delivered);
+
+        let log = state.message_log.read().await;
+        assert_eq!(log.len(), 1);
+        assert!(!log[0].delivered);
+    }
+
+    #[tokio::test]
+    async fn synchronous_log_records_only_confirmed_deliveries_as_delivered() {
+        let state = AppState::new_for_test();
+        state
+            .log_message("a".into(), "b".into(), "unconfirmed".into(), false, "tmux")
+            .await;
+        state
+            .log_message("a".into(), "b".into(), "confirmed".into(), true, "tmux")
+            .await;
+
+        let rows = crate::persistence::read_message_log(&state.log_file);
+        assert_eq!(rows.len(), 2);
+        assert!(!rows[0].delivered && !rows[0].update && rows[0].resolution.is_none());
+        assert!(rows[1].delivered);
+        assert!(
+            rows[0].id.is_some() && rows[0].id != rows[1].id,
+            "every message needs its own id, got {:?} and {:?}",
+            rows[0].id,
+            rows[1].id
+        );
+        assert_eq!(
+            crate::persistence::resolve_message_log(rows).len(),
+            2,
+            "plain sends are two messages, not an update"
+        );
+    }
+
+    #[test]
+    fn log_ids_start_above_every_id_already_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.jsonl");
+
+        assert_eq!(initial_log_id(&path), 1, "a missing log starts at 1");
+
+        std::fs::write(
+            &path,
+            r#"{"ts":"2026-08-05T15:12:51Z","from":"a","to":"b","method":"tmux","delivered":false}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            initial_log_id(&path),
+            1,
+            "a legacy id-less log reserves nothing"
+        );
+
+        std::fs::write(
+            &path,
+            r#"{"ts":"2026-08-05T15:12:51Z","id":41,"from":"a","to":"b","method":"tmux","delivered":false}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            initial_log_id(&path),
+            42,
+            "a restart must not reissue an id and merge unrelated messages"
+        );
+    }
+
     #[tokio::test]
     async fn queued_delivery_recheck_reports_a_loss_only_when_the_message_never_arrives() {
+        let _serialized = deferred_verification_lock().lock().await;
         let state = AppState::new_for_test();
         proto_register(&state, "busy", Some("%1")).await;
         let owner = state.protocol.read().await.sessions["busy"].owner();
@@ -11130,6 +11497,7 @@ pub(crate) mod tests {
                 delivery_method: Some("tmux"),
                 recorded_method: None,
                 msg_id: None,
+                logged: None,
             },
         )
         .await;
@@ -11152,6 +11520,7 @@ pub(crate) mod tests {
                 delivery_method: Some("tmux"),
                 recorded_method: None,
                 msg_id: None,
+                logged: None,
             },
         )
         .await;
@@ -11178,6 +11547,7 @@ pub(crate) mod tests {
                 delivery_method: None,
                 recorded_method: None,
                 msg_id: None,
+                logged: None,
             },
         )
         .await;
@@ -11218,6 +11588,7 @@ pub(crate) mod tests {
                 delivery_method: Some("tmux"),
                 recorded_method: None,
                 msg_id: None,
+                logged: None,
             },
         )
         .await;

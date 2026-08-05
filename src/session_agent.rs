@@ -378,7 +378,7 @@ impl Actor for SessionAgent {
                 // injection has now ended, so every message reported as
                 // `queued` gets looked at again. Anything still absent is a
                 // real loss and is reported as one.
-                Self::run_pending_delivery_rechecks(state).await;
+                self.run_pending_delivery_rechecks(state).await;
             }
             SessionMsg::Active => {
                 state.idle = false;
@@ -726,22 +726,53 @@ impl SessionAgent {
     /// A `queued` delivery that is never followed up would be the same
     /// false-benign signal as reporting an unverified injection as delivered,
     /// so the queue is always drained here and each entry is looked at again.
-    async fn run_pending_delivery_rechecks(state: &mut SessionAgentState) {
+    ///
+    /// Whatever the re-check proves is written back to the durable log. A
+    /// confirmation supersedes the `delivered: false` the synchronous check had
+    /// to record; a proven loss supersedes it with the reason. Neither result
+    /// may be dropped: a log that disagrees with what the daemon knows is the
+    /// defect, in either direction.
+    async fn run_pending_delivery_rechecks(&self, state: &mut SessionAgentState) {
         let pending = std::mem::take(&mut state.pending_delivery_rechecks);
         for entry in pending {
-            let loss =
-                tokio::task::spawn_blocking(move || crate::tmux::report_deferred_injection(&entry))
-                    .await
-                    .unwrap_or_else(|error| {
-                        tracing::warn!("deferred delivery re-check task failed: {error}");
-                        None
-                    });
-            #[cfg(test)]
-            if let Some(loss) = loss {
-                state.delivery_recheck_losses.push(loss);
+            let for_recheck = entry.clone();
+            let resolution = tokio::task::spawn_blocking(move || {
+                crate::tmux::report_deferred_injection(&for_recheck)
+            })
+            .await;
+            let resolution = match resolution {
+                Ok(resolution) => resolution,
+                Err(error) => {
+                    // The re-check never ran, so nothing was proved either way
+                    // and the log keeps its unconfirmed row.
+                    tracing::warn!("deferred delivery re-check task failed: {error}");
+                    continue;
+                }
+            };
+            match resolution {
+                crate::tmux::DeferredDeliveryResolution::Confirmed => {
+                    self.app_state
+                        .record_deferred_delivery_resolution(
+                            &entry,
+                            crate::persistence::MessageLogResolution::Confirmed,
+                            None,
+                        )
+                        .await;
+                }
+                crate::tmux::DeferredDeliveryResolution::Lost(loss) => {
+                    self.app_state
+                        .record_deferred_delivery_resolution(
+                            &entry,
+                            crate::persistence::MessageLogResolution::Lost,
+                            Some(loss.clone()),
+                        )
+                        .await;
+                    #[cfg(test)]
+                    state.delivery_recheck_losses.push(loss);
+                    #[cfg(not(test))]
+                    let _ = loss;
+                }
             }
-            #[cfg(not(test))]
-            let _ = loss;
         }
     }
 

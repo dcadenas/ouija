@@ -1200,6 +1200,9 @@ async fn execute_send_effects_for_api(
         Effect::SendDelivered { msg_id, .. } => Some(*msg_id),
         _ => None,
     });
+    // Identity of the durable log row this send will write, allocated before
+    // the injection so a deferred re-check can supersede it later.
+    let logged = crate::state::logged_message_ref(state, effects);
 
     let mut outcome = crate::state::DeliveryOutcome::Accepted;
 
@@ -1229,6 +1232,7 @@ async fn execute_send_effects_for_api(
                             delivery_method: delivery_method.as_deref(),
                             recorded_method,
                             msg_id: recorded_msg_id.or(*pending_reply_msg_id),
+                            logged: logged.clone(),
                         },
                     )
                     .await,
@@ -1282,8 +1286,16 @@ async fn execute_send_effects_for_api(
                 } else {
                     *delivered
                 };
+                // The deferred re-check already holds this id, so a later
+                // confirmation supersedes this exact row instead of being
+                // discarded — the mirror image of recording an unconfirmed
+                // delivery as true.
+                let id = logged
+                    .as_ref()
+                    .map_or_else(|| state.next_log_id(), |logged| logged.id);
                 state
-                    .log_message(
+                    .log_message_with_id(
+                        id,
                         from.clone(),
                         to.clone(),
                         message.clone(),
