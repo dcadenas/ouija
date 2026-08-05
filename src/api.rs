@@ -969,6 +969,16 @@ pub async fn send_msg(
             "method": method,
             "msg_id": msg_id,
         });
+        // `queued` and `unknown` are not failures, but a caller that has only
+        // ever seen `delivered` reads any other word as one and re-sends —
+        // which is how an unconfirmed delivery becomes a confirmed duplicate.
+        // Ship the instruction with the status so no client has to infer it.
+        if let crate::state::DeliveryOutcome::Queued(reason)
+        | crate::state::DeliveryOutcome::Ambiguous(reason) = &delivery_outcome
+        {
+            payload["reason"] = json!(reason);
+            payload["guidance"] = json!(UNCONFIRMED_DELIVERY_GUIDANCE);
+        }
         if let Some(owed) = owed_msg_id {
             let warning = format!(
                 "you still owe '{to}' a reply to msg #{owed}; a plain tell does not clear it — \
@@ -1734,6 +1744,15 @@ async fn resolve_force_pane_inject_target(
 }
 
 /// Inject text into a tmux pane via the queued writer.
+///
+/// This endpoint used to answer `injected` whenever the tmux commands
+/// succeeded, discarding the verification the injector had already computed.
+/// That made the raw escape hatch sound *more* certain than `/api/send`, which
+/// reports an unobserved paste as `queued`/`unknown`. A caller that read the
+/// honest answer as a failure and reached for this endpoint to "really" deliver
+/// the message got a confident `injected` for exactly the same evidence — and a
+/// duplicate in the recipient's context. The two paths now grade the same
+/// evidence the same way.
 pub async fn inject(
     State(state): State<SharedState>,
     Json(body): Json<InjectBody>,
@@ -1742,26 +1761,56 @@ pub async fn inject(
     if let Some(session_id) = target.session_id.as_deref() {
         tracing::debug!(session = %session_id, pane = %body.pane, "force-pane inject resolved registered session backend");
     }
-    match tmux::locked_inject_raw_tmux_with_config(
+    match tmux::locked_inject_raw_tmux_with_config_and_evidence(
         &state,
         &body.pane,
         &body.message,
         body.vim_mode,
         target.inject_config,
         target.tui_pattern,
+        None,
     )
     .await
     {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(json!({ "status": "injected", "delivery": "tmux" })),
-        ),
+        Ok(verification) => (StatusCode::OK, Json(inject_response_body(&verification))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
         ),
     }
 }
+
+/// Shape the `/api/inject` answer from what verification actually observed.
+///
+/// Pure so the grading is testable without a tmux server. `injected` asserts
+/// the text was seen in the pane; `unknown` says the paste was accepted and
+/// nothing more, and carries the guidance that stops a caller from turning an
+/// unconfirmed delivery into a duplicate one.
+fn inject_response_body(verification: &crate::tmux::InjectVerification) -> serde_json::Value {
+    match verification {
+        crate::tmux::InjectVerification::Confirmed => {
+            json!({ "status": "injected", "delivery": "tmux" })
+        }
+        crate::tmux::InjectVerification::Unconfirmed(reason) => json!({
+            "status": "unknown",
+            "delivery": "tmux",
+            "reason": reason,
+            "guidance": UNCONFIRMED_DELIVERY_GUIDANCE,
+        }),
+    }
+}
+
+/// What a caller should do with a delivery the daemon could not confirm.
+///
+/// An unconfirmed paste is *far* more often a rendering miss than a lost
+/// message: the recipient's TUI had not redrawn, or it holds a mid-turn prompt
+/// out of the transcript entirely. Re-sending converts that harmless
+/// uncertainty into a real, visible duplicate in the recipient's context, so
+/// the guidance is to wait for the recipient rather than to send again.
+const UNCONFIRMED_DELIVERY_GUIDANCE: &str =
+    "the paste was accepted but the text was not observed in the pane; this is usually a \
+     rendering miss, not a lost message. Do not re-send: wait for the recipient's reply, and \
+     ask a human if it never comes.";
 
 // --- Compact ---
 
@@ -8577,9 +8626,59 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "unknown");
         assert_eq!(body["method"], "http");
+        // An unconfirmed send must ship the do-not-re-send instruction with the
+        // status. Without it a caller reads "unknown" as "failed", re-sends, and
+        // turns a rendering miss into a real duplicate in the recipient.
+        assert_eq!(body["guidance"], UNCONFIRMED_DELIVERY_GUIDANCE);
+        assert!(
+            body["reason"].as_str().is_some_and(|r| !r.is_empty()),
+            "an unconfirmed send must say what was not observed, got: {:?}",
+            body["reason"]
+        );
         let proto = state.protocol.read().await;
         assert!(proto.pending_replies.contains_key("oc-managed"));
         server.abort();
+    }
+
+    #[test]
+    fn confirmed_inject_reports_injected_without_resend_guidance() {
+        let body = inject_response_body(&crate::tmux::InjectVerification::Confirmed);
+
+        assert_eq!(body["status"], "injected");
+        assert_eq!(body["delivery"], "tmux");
+        assert!(
+            body.get("guidance").is_none(),
+            "a confirmed inject has nothing to warn about, got: {body}"
+        );
+    }
+
+    #[test]
+    fn unconfirmed_inject_reports_unknown_instead_of_claiming_injection() {
+        // Regression (2026-08-05): `/api/inject` answered `injected` for any
+        // successful tmux command, so the unverified escape hatch sounded more
+        // certain than `/api/send`. A caller who distrusted an honest `queued`
+        // reached for this endpoint, was told `injected`, and delivered the
+        // message twice.
+        let body = inject_response_body(&crate::tmux::InjectVerification::Unconfirmed(
+            "injected text was not observed in pane %87 after paste".into(),
+        ));
+
+        assert_eq!(body["status"], "unknown");
+        assert_eq!(body["delivery"], "tmux");
+        assert_eq!(
+            body["reason"],
+            "injected text was not observed in pane %87 after paste"
+        );
+        assert_eq!(body["guidance"], UNCONFIRMED_DELIVERY_GUIDANCE);
+    }
+
+    #[test]
+    fn unconfirmed_delivery_guidance_tells_callers_not_to_re_send() {
+        assert!(
+            UNCONFIRMED_DELIVERY_GUIDANCE.contains("Do not re-send"),
+            "guidance must name the action that causes duplicate delivery: \
+             {UNCONFIRMED_DELIVERY_GUIDANCE}"
+        );
     }
 
     #[tokio::test]

@@ -56,6 +56,24 @@ as `<msg ... re="N">`. If that answer is the only blocker, end the turn and wait
 Do not poll logs, status, or pane output unless debugging a suspected delivery
 failure.
 
+### Reading the send result
+
+`ask`, `tell`, and `reply` print a `status`. Only a non-zero exit is a failure.
+
+- `delivered` / `accepted` — the recipient has it. Done.
+- `queued` — the recipient was mid-turn, so its TUI had not drawn the message
+  yet. It almost always arrives; the daemon re-checks after the recipient's turn
+  ends and reports a real loss loudly.
+- `unknown` — the paste was accepted but the text was not observed.
+
+`queued` and `unknown` are **not** delivery failures, and a zero exit with
+either status means the message was handed to the recipient's pane. **Never
+re-send on `queued` or `unknown`, and never fall back to `ouija inject` or a
+raw tmux paste.** Verification reads a live TUI, so it misses far more often
+than delivery does; re-sending turns a harmless unconfirmed result into a real
+duplicate in the recipient's context. Wait for the reply, and ask a human if it
+never comes.
+
 ## Session lifecycle
 
 When spawning, choose lifecycle ownership and completion behavior deliberately:
