@@ -891,6 +891,18 @@ pub struct AppState {
         std::sync::Mutex<HashMap<String, crate::tmux::ManagedPaneInspection>>,
     #[cfg(test)]
     pane_backend_test_observations: std::sync::Mutex<HashMap<String, Option<BTreeSet<String>>>>,
+    #[cfg(test)]
+    opencode_rotation_test_inspection: std::sync::Mutex<Option<crate::tmux::ManagedPaneInspection>>,
+    #[cfg(test)]
+    opencode_serve_probe_test_results:
+        std::sync::Mutex<HashMap<String, crate::api::OpencodeServeSessionProbe>>,
+    /// Bounded ring of the most recent backend-readiness refusals.
+    ///
+    /// A readiness callback that cannot be bound used to leave nothing behind
+    /// but repeated "received" log lines, so a wedged pane was invisible short
+    /// of reading the daemon log line by line. Operators read this through
+    /// `GET /api/backend-session/declines`.
+    backend_readiness_declines: RwLock<VecDeque<BackendReadinessDecline>>,
     /// Per-resource async gates serialize external pane/backend claims and cleanup
     /// without holding the protocol lock across tmux, process, or HTTP I/O.
     resource_gates:
@@ -1005,6 +1017,30 @@ pub(crate) enum ReusedPaneReplacementOutcome {
     Refused,
     PersistenceFailed,
 }
+
+/// One recorded refusal of a backend-readiness callback.
+///
+/// Readiness is the only signal a wedged pane produces, and a silent early
+/// return made a permanently unbindable pane indistinguishable from a healthy
+/// one. Every decline records the exact repair path that refused and why, so
+/// an operator can diagnose it from `GET /api/backend-session/declines`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct BackendReadinessDecline {
+    pub at: i64,
+    pub backend_session_id: String,
+    pub pane: Option<String>,
+    pub cwd: Option<String>,
+    /// Machine-readable outcome, mirrored into the readiness response body.
+    pub outcome: String,
+    /// Human-readable explanation of the refusal.
+    pub reason: String,
+    /// Session whose binding blocked the repair, when one was identified.
+    pub incumbent_session: Option<String>,
+    pub incumbent_backend_session_id: Option<String>,
+}
+
+/// Most recent readiness declines kept per daemon process.
+pub(crate) const MAX_BACKEND_READINESS_DECLINES: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PerFireWorktreeClaim {
@@ -1431,6 +1467,9 @@ impl AppState {
             local_backend_pane_attestation_test_pane_vars: std::sync::Mutex::new(HashMap::new()),
             local_backend_pane_attestation_test_inspections: std::sync::Mutex::new(HashMap::new()),
             pane_backend_test_observations: std::sync::Mutex::new(HashMap::new()),
+            opencode_rotation_test_inspection: std::sync::Mutex::new(None),
+            opencode_serve_probe_test_results: std::sync::Mutex::new(HashMap::new()),
+            backend_readiness_declines: RwLock::new(VecDeque::new()),
             resource_gates: std::sync::Mutex::new(HashMap::new()),
             project_index: RwLock::new(HashMap::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
@@ -1497,6 +1536,11 @@ impl AppState {
             local_backend_pane_attestation_test_inspections: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             pane_backend_test_observations: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            opencode_rotation_test_inspection: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            opencode_serve_probe_test_results: std::sync::Mutex::new(HashMap::new()),
+            backend_readiness_declines: RwLock::new(VecDeque::new()),
             resource_gates: std::sync::Mutex::new(HashMap::new()),
             project_index: RwLock::new(HashMap::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
@@ -1554,6 +1598,83 @@ impl AppState {
             .backend_recovery_test_inspection
             .lock()
             .expect("backend recovery test inspection mutex poisoned") = Some(inspection);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_opencode_rotation_test_inspection(
+        &self,
+        inspection: crate::tmux::ManagedPaneInspection,
+    ) {
+        *self
+            .opencode_rotation_test_inspection
+            .lock()
+            .expect("opencode rotation test inspection mutex poisoned") = Some(inspection);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_opencode_serve_probe_test_result(
+        &self,
+        backend_session_id: &str,
+        probe: crate::api::OpencodeServeSessionProbe,
+    ) {
+        self.opencode_serve_probe_test_results
+            .lock()
+            .expect("opencode serve probe test mutex poisoned")
+            .insert(backend_session_id.to_string(), probe);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn opencode_serve_probe_test_result(
+        &self,
+        backend_session_id: &str,
+    ) -> Option<crate::api::OpencodeServeSessionProbe> {
+        self.opencode_serve_probe_test_results
+            .lock()
+            .expect("opencode serve probe test mutex poisoned")
+            .get(backend_session_id)
+            .copied()
+    }
+
+    /// Physically inspect a pane's Ouija owner markers for the rotation path.
+    ///
+    /// Mirrors `recover_backend_identity`'s inspection so the stale-to-bound
+    /// rotation corroborates the exact incumbent owner before replacing it.
+    pub(crate) async fn opencode_rotation_pane_inspection(
+        &self,
+        pane: &str,
+    ) -> anyhow::Result<crate::tmux::ManagedPaneInspection> {
+        #[cfg(test)]
+        if let Some(inspection) = self
+            .opencode_rotation_test_inspection
+            .lock()
+            .expect("opencode rotation test inspection mutex poisoned")
+            .clone()
+        {
+            return Ok(inspection);
+        }
+        let pane = pane.to_string();
+        match tokio::task::spawn_blocking(move || crate::tmux::inspect_managed_pane(&pane)).await {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::anyhow!(error)),
+        }
+    }
+
+    /// Record one readiness refusal in the bounded operator-visible ring.
+    pub(crate) async fn record_backend_readiness_decline(&self, decline: BackendReadinessDecline) {
+        let mut declines = self.backend_readiness_declines.write().await;
+        if declines.len() >= MAX_BACKEND_READINESS_DECLINES {
+            declines.pop_front();
+        }
+        declines.push_back(decline);
+    }
+
+    pub(crate) async fn backend_readiness_declines(&self) -> Vec<BackendReadinessDecline> {
+        self.backend_readiness_declines
+            .read()
+            .await
+            .iter()
+            .cloned()
+            .collect()
     }
 
     #[cfg(test)]

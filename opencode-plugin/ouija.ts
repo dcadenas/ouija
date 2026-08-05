@@ -116,7 +116,7 @@ Load the ouija skill for full documentation on session management, task scheduli
         // auto-provision (ouija#35) without a round-trip to opencode serve
         // or a tmux pane scan. The daemon treats both as optional and
         // falls back to the serve+scan path when either is absent.
-        const readyBody: Record<string, string | number> = {}
+        const readyBody: Record<string, string | number | boolean> = {}
         const pane = process.env.TMUX_PANE
         if (pane) readyBody.pane = pane
         const knownIncarnation = sessionIncarnations.get(sid)
@@ -126,6 +126,18 @@ Load the ouija skill for full documentation on session management, task scheduli
         try {
           readyBody.cwd = process.cwd()
         } catch {}
+        // A pane whose ouija row still points at an abandoned conversation can
+        // only be repaired by an authority that can see this instance — a
+        // standalone `opencode` is invisible to the daemon's managed serve. So
+        // attest here, and only here, that a brand-new ROOT conversation was
+        // just created in this pane. Subagent sessions also emit
+        // session.created; reporting root_session:false keeps them from
+        // stealing the pane's binding.
+        const info = event.properties?.info
+        if (event.type === "session.created" && info) {
+          readyBody.created = true
+          readyBody.root_session = !info.parentID
+        }
         setTimeout(async () => {
           try {
             const resp = await fetch(`${base}/api/backend-session/${encodeURIComponent(sid)}/ready`, {

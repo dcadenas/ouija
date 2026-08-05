@@ -87,6 +87,10 @@ pub async fn run(state: SharedState) -> anyhow::Result<()> {
             post(api::backend_session_ready),
         )
         .route(
+            "/api/backend-session/declines",
+            get(api::backend_session_declines),
+        )
+        .route(
             "/api/backend-identities/resolve",
             post(api::resolve_backend_identity),
         )

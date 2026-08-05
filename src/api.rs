@@ -4366,6 +4366,18 @@ struct BackendSessionReadyHints {
         deserialize_with = "crate::daemon_protocol::deserialize_optional_incarnation"
     )]
     session_incarnation: Option<crate::daemon_protocol::SessionIncarnation>,
+    /// True only when this callback was raised by an OpenCode
+    /// `session.created` event, i.e. a conversation that has just come into
+    /// existence rather than a status refresh of an existing one.
+    #[serde(default)]
+    created: bool,
+    /// True when the reported conversation has no OpenCode parent session.
+    ///
+    /// Subagent/child conversations also emit `session.created`, so the pane's
+    /// binding must never follow one. Older plugins omit the field; `None` is
+    /// absence of proof and fails closed.
+    #[serde(default)]
+    root_session: Option<bool>,
 }
 
 #[cfg(test)]
@@ -4481,6 +4493,374 @@ async fn recover_standalone_opencode_backend_session(
     }
 }
 
+/// Record one readiness refusal and build the response body that reports it.
+///
+/// Both halves matter: the ring makes a wedged pane visible to an operator
+/// through `GET /api/backend-session/declines`, and the body names the reason
+/// in the response the plugin (or a `curl` probe) already receives.
+async fn record_readiness_decline(
+    state: &std::sync::Arc<crate::state::AppState>,
+    backend_sid: &str,
+    hints: &BackendSessionReadyHints,
+    outcome: &str,
+    reason: &str,
+) -> serde_json::Value {
+    let (incumbent_session, incumbent_backend_session_id) = match hints.pane.as_deref() {
+        Some(pane) => {
+            let proto = state.protocol.read().await;
+            proto
+                .sessions
+                .values()
+                .find(|session| {
+                    matches!(session.origin, crate::daemon_protocol::Origin::Local)
+                        && session.pane.as_deref() == Some(pane)
+                })
+                .map(|session| {
+                    (
+                        Some(session.id.clone()),
+                        session.metadata.backend_session_id.clone(),
+                    )
+                })
+                .unwrap_or((None, None))
+        }
+        None => (None, None),
+    };
+    tracing::warn!(
+        target: "ouija::api::backend_session_ready",
+        backend_session_id = %backend_sid,
+        pane = ?hints.pane,
+        cwd = ?hints.cwd,
+        incumbent_session = ?incumbent_session,
+        incumbent_backend_session_id = ?incumbent_backend_session_id,
+        outcome,
+        "backend session ready declined: {reason}"
+    );
+    state
+        .record_backend_readiness_decline(crate::state::BackendReadinessDecline {
+            at: chrono::Utc::now().timestamp(),
+            backend_session_id: backend_sid.to_string(),
+            pane: hints.pane.clone(),
+            cwd: hints.cwd.clone(),
+            outcome: outcome.to_string(),
+            reason: reason.to_string(),
+            incumbent_session,
+            incumbent_backend_session_id,
+        })
+        .await;
+    json!({
+        "delivered": false,
+        "outcome": outcome,
+        "error": reason,
+    })
+}
+
+/// GET /api/backend-session/declines — recent readiness refusals.
+pub async fn backend_session_declines(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    Json(json!({ "declines": state.backend_readiness_declines().await }))
+}
+
+/// Read-only view of one session id as the *managed* opencode serve sees it.
+///
+/// `Absent` means the managed serve positively does not have the session.
+/// `Unknown` covers every inconclusive answer (transport failure, non-404
+/// error status, unparseable body) and must always fail closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpencodeServeSessionProbe {
+    /// The serve has this session. `has_parent` distinguishes a root
+    /// conversation from a subagent child.
+    Live {
+        has_parent: bool,
+    },
+    Absent,
+    Unknown,
+}
+
+/// Probe the managed opencode serve for one session id (GET only).
+///
+/// The managed serve is authoritative **only** for sessions it created. A
+/// standalone interactive `opencode` keeps its conversations in its own
+/// instance, so `Absent` from this probe never proves such a session is dead;
+/// see [`classify_stale_opencode_rebind`] for how provenance gates its use.
+async fn probe_opencode_serve_session(
+    state: &std::sync::Arc<crate::state::AppState>,
+    backend_sid: &str,
+) -> OpencodeServeSessionProbe {
+    #[cfg(test)]
+    if let Some(probe) = state.opencode_serve_probe_test_result(backend_sid) {
+        return probe;
+    }
+
+    let port = state.opencode_serve_port();
+    let url = format!("http://127.0.0.1:{port}/session/{backend_sid}");
+    let Ok(resp) = state
+        .http_client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+    else {
+        return OpencodeServeSessionProbe::Unknown;
+    };
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return OpencodeServeSessionProbe::Absent;
+    }
+    if !resp.status().is_success() {
+        return OpencodeServeSessionProbe::Unknown;
+    }
+    let Ok(body) = resp.json::<serde_json::Value>().await else {
+        return OpencodeServeSessionProbe::Unknown;
+    };
+    let has_parent = body
+        .get("parentID")
+        .is_some_and(|value| value.as_str().is_some_and(|id| !id.trim().is_empty()));
+    OpencodeServeSessionProbe::Live { has_parent }
+}
+
+/// The exact incumbent facts a stale-to-bound rotation is allowed to read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StaleRebindIncumbent {
+    pub backend: Option<String>,
+    pub backend_session_id: Option<String>,
+    pub opencode_binding: Option<crate::daemon_protocol::OpenCodeBinding>,
+    pub has_session_start_credential: bool,
+    pub has_backend_repair_reservation: bool,
+}
+
+/// Attestation carried by the readiness callback itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StaleRebindAttestation {
+    pub created: bool,
+    pub root_session: Option<bool>,
+}
+
+/// Which authority proved the incumbent binding no longer names the pane's
+/// live conversation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StalenessEvidence {
+    /// The managed serve created this binding and now positively denies it,
+    /// while confirming the reported id as a live root conversation.
+    ManagedServeRefutation,
+    /// The in-pane plugin attested that it just created a new *root*
+    /// conversation. This is the only authority that can speak for a
+    /// standalone interactive instance the managed serve cannot see.
+    PluginRootCreation,
+}
+
+/// Structural facts a rotation needs before it is worth probing anything.
+///
+/// Kept separate so the coordinator can refuse (and skip both read-only serve
+/// probes) for the overwhelmingly common readiness callback that has nothing
+/// to do with a stale binding.
+fn stale_rebind_structural_precheck(
+    incumbent: &StaleRebindIncumbent,
+    reported_sid: &str,
+) -> Result<(), &'static str> {
+    if incumbent.backend.as_deref() != Some("opencode") {
+        return Err("incumbent pane owner is not bound to the opencode backend");
+    }
+    let Some(incumbent_sid) = incumbent.backend_session_id.as_deref() else {
+        return Err("incumbent pane owner has no backend session id to replace");
+    };
+    if incumbent_sid == reported_sid {
+        return Err("reported conversation is already the incumbent binding");
+    }
+    if incumbent.has_session_start_credential || incumbent.has_backend_repair_reservation {
+        return Err("incumbent pane owner has an outstanding managed-launch claim");
+    }
+    Ok(())
+}
+
+/// Decide whether a populated-but-wrong opencode binding may be rotated.
+///
+/// Pure so the whole discriminator is unit-testable without a live serve.
+/// Every unresolved question is a refusal: a wrong rotation silently hands one
+/// session's pane to another session's backend.
+fn classify_stale_opencode_rebind(
+    incumbent: &StaleRebindIncumbent,
+    reported_sid: &str,
+    attestation: StaleRebindAttestation,
+    incumbent_probe: OpencodeServeSessionProbe,
+    reported_probe: OpencodeServeSessionProbe,
+) -> Result<StalenessEvidence, &'static str> {
+    stale_rebind_structural_precheck(incumbent, reported_sid)?;
+    // A serve-visible child conversation must never take a pane's binding,
+    // whichever authority is speaking.
+    if reported_probe == (OpencodeServeSessionProbe::Live { has_parent: true }) {
+        return Err("reported conversation is an opencode child session");
+    }
+
+    if incumbent.opencode_binding == Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged) {
+        // The managed serve created this binding, so it is authoritative for
+        // it: a 404 there is genuine death, not invisibility.
+        return match (incumbent_probe, reported_probe) {
+            (OpencodeServeSessionProbe::Live { .. }, _) => {
+                Err("incumbent backend session is still present on the managed serve")
+            }
+            (OpencodeServeSessionProbe::Unknown, _) => {
+                Err("managed serve could not confirm the incumbent backend session")
+            }
+            (OpencodeServeSessionProbe::Absent, OpencodeServeSessionProbe::Live { .. }) => {
+                Ok(StalenessEvidence::ManagedServeRefutation)
+            }
+            (OpencodeServeSessionProbe::Absent, _) => {
+                Err("managed serve does not know the reported conversation either")
+            }
+        };
+    }
+
+    // Weak or unrecorded binding: the incumbent may live inside a standalone
+    // interactive instance, so the managed serve's `Absent` says nothing. Only
+    // the in-pane plugin can attest that a new root conversation replaced it.
+    if !attestation.created {
+        return Err(
+            "standalone binding needs a plugin session-created attestation to rotate; \
+             managed-serve absence does not prove a standalone session is dead",
+        );
+    }
+    match attestation.root_session {
+        Some(true) => Ok(StalenessEvidence::PluginRootCreation),
+        Some(false) => Err("reported conversation is an opencode child session"),
+        None => Err("plugin did not attest whether the reported conversation is a root session"),
+    }
+}
+
+/// Rotate an exact pane owner from a stale opencode binding onto the live one.
+///
+/// This is the stale-to-bound counterpart of
+/// [`recover_standalone_opencode_backend_session`]'s blank-to-bound rule. Per
+/// AGENTS.md a rebind is authorized only as the documented pane-owner
+/// replacement: it keeps the pane's public Ouija name, allocates a newer
+/// incarnation, and parks the incumbent in dormancy — all in the single pure
+/// `ReplaceReusedPaneOwner` transition, so no delayed observation owned by the
+/// stale incarnation can leak onto the new conversation. Metadata freshness
+/// deliberately resets here (unlike internal plumbing such as `AdoptBackend`)
+/// because a new user-facing conversation really did start in the pane.
+///
+/// Returns the new owner's public session id, or the reason it refused.
+async fn rotate_stale_opencode_pane_owner(
+    state: &std::sync::Arc<crate::state::AppState>,
+    backend_sid: &str,
+    pane: &str,
+    cwd: &str,
+    attestation: StaleRebindAttestation,
+) -> Result<String, String> {
+    if cwd.is_empty() || cwd == "/" || !cwd.starts_with('/') {
+        return Err("readiness cwd hint is not an absolute project path".into());
+    }
+    let Ok(project) = crate::project_identity::resolve_project_identity_async(cwd).await else {
+        return Err("readiness cwd hint does not resolve to a project".into());
+    };
+    let hinted_canonical = crate::state::project_dir_identity(&project.canonical_repository);
+
+    // Exactly one Local owner for this pane, and it must already claim the
+    // hinted canonical project. Two candidates is ambiguity, not a repair.
+    let (incumbent_owner, incumbent) = {
+        let proto = state.protocol.read().await;
+        let mut candidates = proto.sessions.values().filter(|session| {
+            matches!(session.origin, crate::daemon_protocol::Origin::Local)
+                && session.pane.as_deref() == Some(pane)
+        });
+        let Some(candidate) = candidates.next() else {
+            return Err("no Local session owns the readiness pane".into());
+        };
+        if candidates.next().is_some() {
+            return Err("multiple Local sessions claim the readiness pane".into());
+        }
+        if candidate
+            .metadata
+            .canonical_project_identity
+            .as_deref()
+            .map(crate::state::project_dir_identity)
+            != Some(hinted_canonical)
+        {
+            return Err("pane owner's canonical project does not match the readiness cwd".into());
+        }
+        if proto.lifecycle_leases.contains_key(&candidate.id) {
+            return Err("pane owner has a lifecycle lease in progress".into());
+        }
+        (
+            candidate.owner(),
+            StaleRebindIncumbent {
+                backend: candidate.metadata.backend.clone(),
+                backend_session_id: candidate.metadata.backend_session_id.clone(),
+                opencode_binding: candidate.metadata.opencode_binding.clone(),
+                has_session_start_credential: candidate.metadata.session_start_credential.is_some(),
+                has_backend_repair_reservation: candidate
+                    .metadata
+                    .backend_repair_reservation
+                    .is_some(),
+            },
+        )
+    };
+
+    stale_rebind_structural_precheck(&incumbent, backend_sid).map_err(str::to_string)?;
+
+    // Probe only what the classifier may consult; both calls are read-only.
+    let incumbent_probe = match incumbent.backend_session_id.as_deref() {
+        Some(sid) => probe_opencode_serve_session(state, sid).await,
+        None => OpencodeServeSessionProbe::Unknown,
+    };
+    let reported_probe = probe_opencode_serve_session(state, backend_sid).await;
+    let evidence = classify_stale_opencode_rebind(
+        &incumbent,
+        backend_sid,
+        attestation,
+        incumbent_probe,
+        reported_probe,
+    )
+    .map_err(str::to_string)?;
+
+    // Owner-marker corroboration: the physical pane must still accept the
+    // exact incumbent owner. An unreadable pane fails closed.
+    match state.opencode_rotation_pane_inspection(pane).await {
+        Ok(inspection) => {
+            if !crate::tmux::pane_accepts_owner_marker(&inspection, &incumbent_owner) {
+                return Err("pane owner markers do not match the incumbent owner".into());
+            }
+        }
+        Err(error) => {
+            return Err(format!(
+                "pane owner markers could not be inspected: {error}"
+            ));
+        }
+    }
+
+    let identity = crate::backend::BackendSessionIdentity {
+        backend: "opencode".into(),
+        session_id: backend_sid.to_string(),
+    };
+    let replacement_id = incumbent_owner.session_id.clone();
+    match state
+        .replace_reused_cross_backend_pane(
+            incumbent_owner,
+            pane.to_string(),
+            project,
+            identity,
+            replacement_id,
+        )
+        .await
+    {
+        crate::state::ReusedPaneReplacementOutcome::Replaced(owner) => {
+            tracing::info!(
+                target: "ouija::api::backend_session_ready",
+                backend_session_id = %backend_sid,
+                session = %owner.session_id,
+                incarnation = %owner.incarnation,
+                evidence = ?evidence,
+                "ready rotated a stale opencode pane binding onto the live conversation"
+            );
+            Ok(owner.session_id)
+        }
+        crate::state::ReusedPaneReplacementOutcome::PersistenceFailed => {
+            Err("stale binding rotation could not be persisted".into())
+        }
+        crate::state::ReusedPaneReplacementOutcome::NotApplicable
+        | crate::state::ReusedPaneReplacementOutcome::Refused => {
+            Err("stale binding rotation refused by pane/backend corroboration".into())
+        }
+    }
+}
+
 async fn backend_session_ready_inner_with_hints(
     state: &std::sync::Arc<crate::state::AppState>,
     backend_sid: String,
@@ -4527,18 +4907,24 @@ async fn backend_session_ready_inner_with_hints(
             n
         }
         crate::daemon_protocol::BackendIdentityResolution::IncompleteLegacy { .. } => {
-            return json!({
-                "delivered": false,
-                "outcome": "incomplete_legacy",
-                "error": "legacy backend metadata is incomplete; request an explicit fresh managed repair"
-            });
+            return record_readiness_decline(
+                state,
+                &backend_sid,
+                &hints,
+                "incomplete_legacy",
+                "legacy backend metadata is incomplete; request an explicit fresh managed repair",
+            )
+            .await;
         }
         crate::daemon_protocol::BackendIdentityResolution::Ambiguous { .. } => {
-            return json!({
-                "delivered": false,
-                "outcome": "ambiguous",
-                "error": "multiple Local sessions have this backend identity; repair state before retrying"
-            });
+            return record_readiness_decline(
+                state,
+                &backend_sid,
+                &hints,
+                "ambiguous",
+                "multiple Local sessions have this backend identity; repair state before retrying",
+            )
+            .await;
         }
         crate::daemon_protocol::BackendIdentityResolution::NotFound => {
             let mut standalone_recovered = None;
@@ -4546,6 +4932,36 @@ async fn backend_session_ready_inner_with_hints(
                 standalone_recovered =
                     recover_standalone_opencode_backend_session(state, &backend_sid, pane, cwd)
                         .await;
+                // Blank-to-bound only heals a row that never bound. A row that
+                // bound and then went stale needs the rotation path, or the
+                // pane stays permanently unbindable (every later readiness
+                // callback silently early-returns).
+                if standalone_recovered.is_none() {
+                    match rotate_stale_opencode_pane_owner(
+                        state,
+                        &backend_sid,
+                        pane,
+                        cwd,
+                        StaleRebindAttestation {
+                            created: hints.created,
+                            root_session: hints.root_session,
+                        },
+                    )
+                    .await
+                    {
+                        Ok(rotated) => standalone_recovered = Some(rotated),
+                        Err(reason) => {
+                            record_readiness_decline(
+                                state,
+                                &backend_sid,
+                                &hints,
+                                "stale_binding_rotation_refused",
+                                &reason,
+                            )
+                            .await;
+                        }
+                    }
+                }
                 if standalone_recovered.is_none() {
                     match record_opencode_ready_attestation(state, &backend_sid, pane, cwd).await {
                         crate::state::LocalBackendPaneAttestationRecordOutcome::Recorded(
@@ -4556,19 +4972,25 @@ async fn backend_session_ready_inner_with_hints(
                         crate::state::LocalBackendPaneAttestationRecordOutcome::Ambiguous {
                             ..
                         } => {
-                            return json!({
-                                "delivered": false,
-                                "outcome": "ambiguous_attestation",
-                                "error": "backend readiness is ambiguous across live panes",
-                            });
+                            return record_readiness_decline(
+                                state,
+                                &backend_sid,
+                                &hints,
+                                "ambiguous_attestation",
+                                "backend readiness is ambiguous across live panes",
+                            )
+                            .await;
                         }
                         crate::state::LocalBackendPaneAttestationRecordOutcome::Rejected => {
                             if state.settings.read().await.auto_register {
-                                return json!({
-                                    "delivered": false,
-                                    "outcome": "attestation_rejected",
-                                    "error": "backend readiness pane attestation rejected",
-                                });
+                                return record_readiness_decline(
+                                    state,
+                                    &backend_sid,
+                                    &hints,
+                                    "attestation_rejected",
+                                    "backend readiness pane attestation rejected",
+                                )
+                                .await;
                             }
                         }
                     }
@@ -4601,7 +5023,14 @@ async fn backend_session_ready_inner_with_hints(
                         target: "ouija::api::backend_session_ready",
                         "auto_register disabled; declining to auto-provision for backend_session_id {backend_sid}"
                     );
-                    return json!({"delivered": false, "error": "no session with this backend_session_id"});
+                    return record_readiness_decline(
+                        state,
+                        &backend_sid,
+                        &hints,
+                        "auto_register_disabled",
+                        "auto_register is disabled; no session with this backend_session_id",
+                    )
+                    .await;
                 }
 
                 // Fast path: plugin sent both pane + cwd. Skip the opencode-serve
@@ -4632,7 +5061,15 @@ async fn backend_session_ready_inner_with_hints(
                             cwd,
                             "ready explicit auto-provision failed"
                         );
-                        return json!({"delivered": false, "error": "no session with this backend_session_id"});
+                        return record_readiness_decline(
+                            state,
+                            &backend_sid,
+                            &hints,
+                            "auto_provision_failed",
+                            "explicit pane/cwd auto-provision found no bindable pane; \
+                             no session with this backend_session_id",
+                        )
+                        .await;
                     }
                 } else {
                     // Fallback: resolve dir from opencode serve, then scan tmux.
@@ -4642,7 +5079,15 @@ async fn backend_session_ready_inner_with_hints(
                             backend_session_id = %backend_sid,
                             "ready fallback could not resolve opencode session directory"
                         );
-                        return json!({"delivered": false, "error": "no session with this backend_session_id"});
+                        return record_readiness_decline(
+                            state,
+                            &backend_sid,
+                            &hints,
+                            "session_dir_unresolved",
+                            "managed opencode serve could not resolve this session's directory; \
+                             no session with this backend_session_id",
+                        )
+                        .await;
                     };
                     tracing::info!(
                         target: "ouija::api::backend_session_ready",
@@ -4660,7 +5105,15 @@ async fn backend_session_ready_inner_with_hints(
                             dir,
                             "ready scan-based auto-provision failed"
                         );
-                        return json!({"delivered": false, "error": "no session with this backend_session_id"});
+                        return record_readiness_decline(
+                            state,
+                            &backend_sid,
+                            &hints,
+                            "auto_provision_failed",
+                            "scan-based auto-provision found no bindable pane; \
+                             no session with this backend_session_id",
+                        )
+                        .await;
                     };
                     tracing::info!(
                         target: "ouija::api::backend_session_ready",
@@ -10879,6 +11332,7 @@ mod tests {
                 pane: Some("%17".into()),
                 cwd: Some(project_dir),
                 session_incarnation: None,
+                ..Default::default()
             },
         )
         .await;
@@ -11005,6 +11459,7 @@ mod tests {
                 session_incarnation: Some(crate::daemon_protocol::SessionIncarnation(
                     current.0.saturating_sub(1),
                 )),
+                ..Default::default()
             },
         )
         .await;
@@ -11055,6 +11510,7 @@ mod tests {
                 pane: Some("%17".into()),
                 cwd: Some("/tmp/stale-adoption".into()),
                 session_incarnation: Some(crate::daemon_protocol::SessionIncarnation(u64::MAX)),
+                ..Default::default()
             },
         )
         .await;
@@ -11100,6 +11556,7 @@ mod tests {
                 pane: Some("%31".into()),
                 cwd: Some("/tmp/stale-provision".into()),
                 session_incarnation: Some(crate::daemon_protocol::SessionIncarnation(u64::MAX)),
+                ..Default::default()
             },
         )
         .await;
@@ -11157,8 +11614,19 @@ mod tests {
         let response =
             backend_session_ready_inner(&backend_only_state, "unrelated-native-id".into()).await;
 
-        assert!(response.get("outcome").is_none(), "got: {response}");
-        assert_eq!(response["error"], "no session with this backend_session_id");
+        // Every readiness refusal now names the step that declined, so the
+        // outcome is present and the legacy error text is a substring.
+        assert_eq!(
+            response["outcome"], "session_dir_unresolved",
+            "got: {response}"
+        );
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no session with this backend_session_id"),
+            "got: {response}"
+        );
         assert!(response.get("session").is_none(), "got: {response}");
 
         let id_only_state = crate::state::AppState::new_for_test();
@@ -11187,6 +11655,7 @@ mod tests {
             pane: Some("%31".into()),
             cwd: Some("/tmp/local-project".into()),
             session_incarnation: None,
+            ..Default::default()
         };
 
         let response =
@@ -11267,6 +11736,7 @@ mod tests {
             pane: Some("%31".into()),
             cwd: Some("/tmp/local-project".into()),
             session_incarnation: None,
+            ..Default::default()
         };
 
         let response =
@@ -11323,6 +11793,7 @@ mod tests {
             pane: Some("%31".into()),
             cwd: Some("/tmp/explicit-project".into()),
             session_incarnation: None,
+            ..Default::default()
         };
 
         let response =
@@ -11388,6 +11859,7 @@ mod tests {
                 pane: Some("%3".into()),
                 cwd: Some(project_dir.clone()),
                 session_incarnation: None,
+                ..Default::default()
             },
         )
         .await;
@@ -11413,6 +11885,511 @@ mod tests {
         ));
     }
 
+    // --- stale-to-bound rotation (populated-but-wrong opencode binding) ---
+
+    fn strong_incumbent(sid: &str) -> StaleRebindIncumbent {
+        StaleRebindIncumbent {
+            backend: Some("opencode".into()),
+            backend_session_id: Some(sid.into()),
+            opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::StrongManaged),
+            has_session_start_credential: false,
+            has_backend_repair_reservation: false,
+        }
+    }
+
+    fn weak_incumbent(sid: &str) -> StaleRebindIncumbent {
+        StaleRebindIncumbent {
+            opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted),
+            ..strong_incumbent(sid)
+        }
+    }
+
+    fn root_creation() -> StaleRebindAttestation {
+        StaleRebindAttestation {
+            created: true,
+            root_session: Some(true),
+        }
+    }
+
+    #[test]
+    fn stale_rebind_accepts_managed_serve_refutation_of_a_strong_binding() {
+        // The managed serve created a StrongManaged binding, so it is
+        // authoritative for it: 404 there is genuine death, not invisibility.
+        assert_eq!(
+            classify_stale_opencode_rebind(
+                &strong_incumbent("ses_old"),
+                "ses_new",
+                StaleRebindAttestation::default(),
+                OpencodeServeSessionProbe::Absent,
+                OpencodeServeSessionProbe::Live { has_parent: false },
+            ),
+            Ok(StalenessEvidence::ManagedServeRefutation)
+        );
+    }
+
+    #[test]
+    fn stale_rebind_refuses_when_strong_incumbent_is_still_on_the_serve() {
+        assert_eq!(
+            classify_stale_opencode_rebind(
+                &strong_incumbent("ses_old"),
+                "ses_new",
+                root_creation(),
+                OpencodeServeSessionProbe::Live { has_parent: false },
+                OpencodeServeSessionProbe::Live { has_parent: false },
+            ),
+            Err("incumbent backend session is still present on the managed serve")
+        );
+    }
+
+    #[test]
+    fn stale_rebind_refuses_when_the_serve_is_unreachable() {
+        assert_eq!(
+            classify_stale_opencode_rebind(
+                &strong_incumbent("ses_old"),
+                "ses_new",
+                root_creation(),
+                OpencodeServeSessionProbe::Unknown,
+                OpencodeServeSessionProbe::Live { has_parent: false },
+            ),
+            Err("managed serve could not confirm the incumbent backend session")
+        );
+    }
+
+    #[test]
+    fn stale_rebind_refuses_when_the_serve_does_not_know_the_reported_session() {
+        assert_eq!(
+            classify_stale_opencode_rebind(
+                &strong_incumbent("ses_old"),
+                "ses_new",
+                StaleRebindAttestation::default(),
+                OpencodeServeSessionProbe::Absent,
+                OpencodeServeSessionProbe::Absent,
+            ),
+            Err("managed serve does not know the reported conversation either")
+        );
+    }
+
+    #[test]
+    fn stale_rebind_refuses_a_serve_visible_child_conversation() {
+        for incumbent in [strong_incumbent("ses_old"), weak_incumbent("ses_old")] {
+            assert_eq!(
+                classify_stale_opencode_rebind(
+                    &incumbent,
+                    "ses_child",
+                    root_creation(),
+                    OpencodeServeSessionProbe::Absent,
+                    OpencodeServeSessionProbe::Live { has_parent: true },
+                ),
+                Err("reported conversation is an opencode child session"),
+                "a subagent conversation must never take the pane's binding"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_rebind_does_not_treat_a_standalone_session_as_dead() {
+        // The defect's own shape: a weak/standalone binding whose id is
+        // invisible to the managed serve. 404 there proves nothing, so
+        // absence alone must never authorize a rotation.
+        assert_eq!(
+            classify_stale_opencode_rebind(
+                &weak_incumbent("ses_old"),
+                "ses_new",
+                StaleRebindAttestation::default(),
+                OpencodeServeSessionProbe::Absent,
+                OpencodeServeSessionProbe::Absent,
+            ),
+            Err(
+                "standalone binding needs a plugin session-created attestation to rotate; \
+                 managed-serve absence does not prove a standalone session is dead"
+            )
+        );
+    }
+
+    #[test]
+    fn stale_rebind_accepts_a_plugin_root_creation_attestation() {
+        assert_eq!(
+            classify_stale_opencode_rebind(
+                &weak_incumbent("ses_old"),
+                "ses_new",
+                root_creation(),
+                OpencodeServeSessionProbe::Absent,
+                OpencodeServeSessionProbe::Absent,
+            ),
+            Ok(StalenessEvidence::PluginRootCreation)
+        );
+    }
+
+    #[test]
+    fn stale_rebind_refuses_an_unattested_or_child_plugin_report() {
+        let cases = [
+            (
+                StaleRebindAttestation {
+                    created: true,
+                    root_session: None,
+                },
+                "plugin did not attest whether the reported conversation is a root session",
+            ),
+            (
+                StaleRebindAttestation {
+                    created: true,
+                    root_session: Some(false),
+                },
+                "reported conversation is an opencode child session",
+            ),
+            (
+                StaleRebindAttestation {
+                    created: false,
+                    root_session: Some(true),
+                },
+                "standalone binding needs a plugin session-created attestation to rotate; \
+                 managed-serve absence does not prove a standalone session is dead",
+            ),
+        ];
+        for (attestation, expected) in cases {
+            assert_eq!(
+                classify_stale_opencode_rebind(
+                    &weak_incumbent("ses_old"),
+                    "ses_new",
+                    attestation,
+                    OpencodeServeSessionProbe::Absent,
+                    OpencodeServeSessionProbe::Absent,
+                ),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn stale_rebind_refuses_structurally_ineligible_incumbents() {
+        let cases: [(StaleRebindIncumbent, &str, &str); 4] = [
+            (
+                StaleRebindIncumbent {
+                    backend: Some("claude-code".into()),
+                    ..weak_incumbent("ses_old")
+                },
+                "ses_new",
+                "incumbent pane owner is not bound to the opencode backend",
+            ),
+            (
+                StaleRebindIncumbent {
+                    backend_session_id: None,
+                    ..weak_incumbent("ses_old")
+                },
+                "ses_new",
+                "incumbent pane owner has no backend session id to replace",
+            ),
+            (
+                weak_incumbent("ses_same"),
+                "ses_same",
+                "reported conversation is already the incumbent binding",
+            ),
+            (
+                StaleRebindIncumbent {
+                    has_session_start_credential: true,
+                    ..weak_incumbent("ses_old")
+                },
+                "ses_new",
+                "incumbent pane owner has an outstanding managed-launch claim",
+            ),
+        ];
+        for (incumbent, reported, expected) in cases {
+            assert_eq!(
+                classify_stale_opencode_rebind(
+                    &incumbent,
+                    reported,
+                    root_creation(),
+                    OpencodeServeSessionProbe::Absent,
+                    OpencodeServeSessionProbe::Live { has_parent: false },
+                ),
+                Err(expected)
+            );
+        }
+    }
+
+    /// Register one Local session already holding a stale opencode binding,
+    /// with the live pane, markers, and probes corroborating a rotation.
+    async fn stale_binding_fixture(
+        project_dir: &str,
+    ) -> (
+        std::sync::Arc<crate::state::AppState>,
+        crate::daemon_protocol::ResourceOwner,
+    ) {
+        let state = crate::state::AppState::new_for_test();
+        state
+            .apply_and_execute(crate::daemon_protocol::Event::Register {
+                id: "hub-fundamentals".into(),
+                pane: Some("%87".into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_stale".into()),
+                    opencode_binding: Some(crate::daemon_protocol::OpenCodeBinding::WeakAdopted),
+                    project_dir: Some(project_dir.to_string()),
+                    canonical_project_identity: Some(project_dir.to_string()),
+                    ..Default::default()
+                },
+            })
+            .await;
+        let owner = state.protocol.read().await.sessions["hub-fundamentals"].owner();
+        *state.cached_assistant_panes.write().await = vec![pane_in(project_dir, "%87")];
+        state.set_opencode_rotation_test_inspection(
+            crate::tmux::ManagedPaneInspection::MarkerOwner(owner.clone()),
+        );
+        state.set_opencode_serve_probe_test_result("ses_stale", OpencodeServeSessionProbe::Absent);
+        state.set_opencode_serve_probe_test_result("ses_live", OpencodeServeSessionProbe::Absent);
+        (state, owner)
+    }
+
+    fn rotation_hints(
+        project_dir: &str,
+        attestation: StaleRebindAttestation,
+    ) -> BackendSessionReadyHints {
+        BackendSessionReadyHints {
+            pane: Some("%87".into()),
+            cwd: Some(project_dir.to_string()),
+            session_incarnation: None,
+            created: attestation.created,
+            root_session: attestation.root_session,
+        }
+    }
+
+    fn temp_project() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap();
+        let path = path.to_string_lossy().into_owned();
+        (dir, path)
+    }
+
+    #[tokio::test]
+    async fn backend_session_ready_rotates_a_stale_standalone_binding() {
+        let (_guard, project_dir) = temp_project();
+        let (state, stale_owner) = stale_binding_fixture(&project_dir).await;
+
+        let response = backend_session_ready_inner_with_hints(
+            &state,
+            "ses_live".into(),
+            rotation_hints(&project_dir, root_creation()),
+        )
+        .await;
+
+        assert_eq!(
+            response["session"].as_str(),
+            Some("hub-fundamentals"),
+            "a fully corroborated rotation must bind the live conversation, got: {response}"
+        );
+        let proto = state.protocol.read().await;
+        let session = &proto.sessions["hub-fundamentals"];
+        assert_eq!(
+            session.metadata.backend_session_id.as_deref(),
+            Some("ses_live")
+        );
+        assert!(
+            session.owner().incarnation > stale_owner.incarnation,
+            "rotation must allocate a newer incarnation"
+        );
+        assert!(matches!(
+            resolve_opencode_backend_identity(&proto, "ses_live"),
+            crate::daemon_protocol::BackendIdentityResolution::Resolved {
+                ref session_id
+            } if session_id == "hub-fundamentals"
+        ));
+    }
+
+    #[tokio::test]
+    async fn backend_session_ready_keeps_a_standalone_binding_without_attestation() {
+        // Both ids 404 on the managed serve because the whole instance is
+        // standalone. That is invisibility, not death: refuse and say so.
+        let (_guard, project_dir) = temp_project();
+        let (state, stale_owner) = stale_binding_fixture(&project_dir).await;
+
+        let response = backend_session_ready_inner_with_hints(
+            &state,
+            "ses_live".into(),
+            rotation_hints(&project_dir, StaleRebindAttestation::default()),
+        )
+        .await;
+
+        assert_eq!(response["delivered"], false);
+        let proto = state.protocol.read().await;
+        assert_eq!(proto.sessions["hub-fundamentals"].owner(), stale_owner);
+        assert_eq!(
+            proto.sessions["hub-fundamentals"]
+                .metadata
+                .backend_session_id
+                .as_deref(),
+            Some("ses_stale")
+        );
+        drop(proto);
+
+        let declines = state.backend_readiness_declines().await;
+        let rotation = declines
+            .iter()
+            .find(|decline| decline.outcome == "stale_binding_rotation_refused")
+            .expect("the refusal must be visible to an operator");
+        assert_eq!(rotation.backend_session_id, "ses_live");
+        assert_eq!(
+            rotation.incumbent_session.as_deref(),
+            Some("hub-fundamentals")
+        );
+        assert_eq!(
+            rotation.incumbent_backend_session_id.as_deref(),
+            Some("ses_stale")
+        );
+        assert!(
+            rotation
+                .reason
+                .contains("does not prove a standalone session is dead"),
+            "decline must explain itself: {rotation:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_rotation_refuses_a_foreign_pane_owner_marker() {
+        let (_guard, project_dir) = temp_project();
+        let (state, _owner) = stale_binding_fixture(&project_dir).await;
+        state.set_opencode_rotation_test_inspection(
+            crate::tmux::ManagedPaneInspection::MarkerOwner(
+                crate::daemon_protocol::ResourceOwner {
+                    session_id: "someone-else".into(),
+                    incarnation: crate::daemon_protocol::SessionIncarnation(u64::MAX),
+                },
+            ),
+        );
+
+        let refusal = rotate_stale_opencode_pane_owner(
+            &state,
+            "ses_live",
+            "%87",
+            &project_dir,
+            root_creation(),
+        )
+        .await
+        .expect_err("foreign markers must fail closed");
+
+        assert!(
+            refusal.contains("pane owner markers"),
+            "unexpected refusal: {refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_rotation_refuses_when_the_pane_runs_another_backend() {
+        let (_guard, project_dir) = temp_project();
+        let (state, _owner) = stale_binding_fixture(&project_dir).await;
+        *state.cached_assistant_panes.write().await =
+            vec![pane_for_backend(&project_dir, "%87", "claude")];
+
+        let refusal = rotate_stale_opencode_pane_owner(
+            &state,
+            "ses_live",
+            "%87",
+            &project_dir,
+            root_creation(),
+        )
+        .await
+        .expect_err("backend-process corroboration must fail closed");
+
+        assert!(
+            refusal.contains("pane/backend corroboration"),
+            "unexpected refusal: {refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_rotation_refuses_a_mismatched_canonical_project() {
+        let (_guard, project_dir) = temp_project();
+        let (other_guard, other_dir) = temp_project();
+        let (state, _owner) = stale_binding_fixture(&project_dir).await;
+
+        let refusal = rotate_stale_opencode_pane_owner(
+            &state,
+            "ses_live",
+            "%87",
+            &other_dir,
+            root_creation(),
+        )
+        .await
+        .expect_err("a foreign project must fail closed");
+
+        assert!(
+            refusal.contains("canonical project"),
+            "unexpected refusal: {refusal}"
+        );
+        drop(other_guard);
+    }
+
+    #[tokio::test]
+    async fn stale_rotation_refuses_a_lifecycle_lease_in_progress() {
+        let (_guard, project_dir) = temp_project();
+        let (state, owner) = stale_binding_fixture(&project_dir).await;
+        {
+            let mut proto = state.protocol.write().await;
+            let lease = crate::daemon_protocol::LifecycleLease {
+                owner: owner.clone(),
+                phase: crate::daemon_protocol::LifecyclePhase::Starting,
+                backend: None,
+                backend_session_id: None,
+                backend_session_owner: None,
+                restart_target_owner: None,
+                restart_previous: None,
+                project_dir: None,
+                project_dir_owner: None,
+                project_dir_cleanup_on_abandon: false,
+                inert_pane: None,
+                inert_pane_owner: None,
+            };
+            proto
+                .lifecycle_leases
+                .insert(owner.session_id.clone(), lease);
+        }
+
+        let refusal = rotate_stale_opencode_pane_owner(
+            &state,
+            "ses_live",
+            "%87",
+            &project_dir,
+            root_creation(),
+        )
+        .await
+        .expect_err("a lease in progress must fail closed");
+
+        assert!(
+            refusal.contains("lifecycle lease"),
+            "unexpected refusal: {refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_rotation_refuses_two_candidate_pane_owners() {
+        let (_guard, project_dir) = temp_project();
+        let (state, _owner) = stale_binding_fixture(&project_dir).await;
+        {
+            // Registration dedupes by pane, so seed the ambiguity directly:
+            // two Local rows claiming one pane is corrupt state, not a repair
+            // opportunity.
+            let mut proto = state.protocol.write().await;
+            let mut twin = proto.sessions["hub-fundamentals"].clone();
+            twin.id = "hub-fundamentals-2".into();
+            twin.metadata.backend_session_id = Some("ses_stale_twin".into());
+            proto.sessions.insert(twin.id.clone(), twin);
+        }
+
+        let refusal = rotate_stale_opencode_pane_owner(
+            &state,
+            "ses_live",
+            "%87",
+            &project_dir,
+            root_creation(),
+        )
+        .await
+        .expect_err("two pane owners must fail closed");
+
+        assert!(
+            refusal.contains("multiple Local sessions"),
+            "unexpected refusal: {refusal}"
+        );
+    }
+
     #[tokio::test]
     async fn backend_session_ready_explicit_hints_respect_auto_register_disabled() {
         // auto_register=false opts out of implicit session creation
@@ -11425,6 +12402,7 @@ mod tests {
             pane: Some("%31".into()),
             cwd: Some("/tmp/explicit-project".into()),
             session_incarnation: None,
+            ..Default::default()
         };
 
         let response =
@@ -11463,6 +12441,7 @@ mod tests {
             pane: Some("%31".into()),
             cwd: None,
             session_incarnation: None,
+            ..Default::default()
         };
 
         let response =
@@ -11500,6 +12479,7 @@ mod tests {
             pane: Some("%99".into()),
             cwd: Some("/tmp/unrelated".into()),
             session_incarnation: None,
+            ..Default::default()
         };
 
         let response =
