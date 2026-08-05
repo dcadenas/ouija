@@ -726,6 +726,9 @@ async fn inject_alive_session_prompt(
             delivery_method: None,
             recorded_method: None,
             msg_id: None,
+            // A scheduled prompt is not recorded in the durable message log,
+            // so a deferred re-check has no row to supersede.
+            logged: None,
         },
     )
     .await

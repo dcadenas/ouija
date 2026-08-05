@@ -443,8 +443,22 @@ pub struct DeferredInjectVerification {
     pub message: String,
     /// Message id reported to the sender, when the send carried one.
     pub msg_id: Option<u64>,
+    /// The durable message-log row this injection was recorded as, when it was
+    /// recorded at all. Without it a later confirmation has nothing to point
+    /// at, which is how confirmations used to be discarded.
+    pub logged: Option<crate::state::LoggedMessageRef>,
     /// Why the first verification was inconclusive.
     pub first_reason: String,
+}
+
+/// How a deferred re-check resolved an injection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DeferredDeliveryResolution {
+    /// The text is in the pane: the message did arrive, and the durable log's
+    /// synchronous `delivered: false` is now known to be stale.
+    Confirmed,
+    /// The text is still absent after the turn that could have hidden it.
+    Lost(String),
 }
 
 #[cfg(test)]
@@ -498,11 +512,14 @@ pub(crate) fn deferred_delivery_loss(
     }
 }
 
-/// Run a deferred re-check and report a still-missing message at warn.
+/// Run a deferred re-check and report what it proved.
 ///
-/// Returns the loss reason when the message is gone, `None` when it landed.
-/// Blocking: call from a blocking context.
-pub(crate) fn report_deferred_injection(pending: &DeferredInjectVerification) -> Option<String> {
+/// Both answers are evidence the daemon must not drop: a loss is warned about
+/// and a confirmation supersedes the log row the synchronous check could only
+/// record as unconfirmed. Blocking: call from a blocking context.
+pub(crate) fn report_deferred_injection(
+    pending: &DeferredInjectVerification,
+) -> DeferredDeliveryResolution {
     let verification = verify_deferred_injection(pending);
     match deferred_delivery_loss(pending, &verification) {
         Some(reason) => {
@@ -510,18 +527,20 @@ pub(crate) fn report_deferred_injection(pending: &DeferredInjectVerification) ->
                 session = %pending.session_id,
                 pane = %pending.pane,
                 msg_id = ?pending.msg_id,
+                log_id = ?pending.logged.as_ref().map(|logged| logged.id),
                 "queued message never arrived: {reason}"
             );
-            Some(reason)
+            DeferredDeliveryResolution::Lost(reason)
         }
         None => {
-            tracing::debug!(
+            tracing::info!(
                 session = %pending.session_id,
                 pane = %pending.pane,
                 msg_id = ?pending.msg_id,
+                log_id = ?pending.logged.as_ref().map(|logged| logged.id),
                 "queued message confirmed in pane after the recipient's turn ended"
             );
-            None
+            DeferredDeliveryResolution::Confirmed
         }
     }
 }
@@ -1531,6 +1550,7 @@ mod tests {
             pane: pane.into(),
             message: "hello".into(),
             msg_id: Some(7),
+            logged: None,
             first_reason: "recipient was mid-turn".into(),
         }
     }

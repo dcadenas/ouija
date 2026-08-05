@@ -1407,6 +1407,14 @@ async fn route_human_message(
                     } else {
                         Some("tmux")
                     };
+                    // Allocated before delivery so the deferred re-check this
+                    // injection may schedule can supersede the row below.
+                    let logged = crate::state::LoggedMessageRef {
+                        id: state.next_log_id(),
+                        from: from.to_string(),
+                        to: to.to_string(),
+                        method: "human-dm".to_string(),
+                    };
                     let outcome = crate::state::deliver_inject_message_effect(
                         state,
                         crate::state::InjectDeliveryRequest {
@@ -1417,12 +1425,14 @@ async fn route_human_message(
                             delivery_method,
                             recorded_method: None,
                             msg_id: Some(msg_id),
+                            logged: Some(logged.clone()),
                         },
                     )
                     .await;
                     let delivered = matches!(outcome, crate::state::DeliveryOutcome::Accepted);
                     state
-                        .log_message(
+                        .log_message_with_id(
+                            logged.id,
                             from.to_string(),
                             to.to_string(),
                             message.to_string(),

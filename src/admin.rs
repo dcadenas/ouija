@@ -276,6 +276,9 @@ pub async fn dashboard(State(state): State<SharedState>) -> Html<String> {
     }
 
     let mut log_html = String::new();
+    // One row per message: a deferred re-check updates the entry in place, so
+    // a delivery confirmed after the fact shows as confirmed here and is never
+    // listed twice.
     for entry in log.iter().rev().take(50) {
         let (status_icon, status_class) = if entry.delivered {
             ("&#10003;", "status-ok")
@@ -943,7 +946,7 @@ tr:hover td {{
   </div>
   <div class="section-body {messages_collapsed}">
     <table>
-      <tr><th>Time</th><th>From</th><th>To</th><th>Message</th><th style="text-align:center;">OK <span class="tip tip-right" data-tip="Checkmark = delivered to target pane, X = delivery failed">?</span></th></tr>
+      <tr><th>Time</th><th>From</th><th>To</th><th>Message</th><th style="text-align:center;">OK <span class="tip tip-right" data-tip="Checkmark = confirmed delivered to the target pane, X = not confirmed (failed, or never verified)">?</span></th></tr>
       {log_html}
       {log_empty}
     </table>

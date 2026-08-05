@@ -757,6 +757,118 @@ pub fn append_task_run(data_dir: &Path, run: &TaskRun) -> Result<()> {
     Ok(())
 }
 
+/// How a deferred re-check resolved a delivery that could not be confirmed
+/// synchronously.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageLogResolution {
+    /// The text was observed in the recipient's pane after its turn ended.
+    Confirmed,
+    /// The text was still absent after the turn that could have hidden it.
+    Lost,
+}
+
+/// One row of the append-only durable message log (`messages.jsonl`).
+///
+/// The file is never rewritten. A delivery whose outcome is decided later is
+/// recorded as a second row carrying the same `id` and `update: true`; the
+/// later row supersedes the earlier one. See [`resolve_message_log`].
+///
+/// Rows written before ids existed have no `id`. They deserialize with
+/// `id: None` and each stands alone, so a 13k-row legacy file keeps loading and
+/// reporting exactly what it did before.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MessageLogRow {
+    /// RFC3339 timestamp. On an update row this is when the outcome was
+    /// decided, not when the message was sent.
+    pub ts: String,
+    /// Stable per-message id. `None` only on legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
+    pub from: String,
+    pub to: String,
+    pub method: String,
+    /// Confirmed delivered. Never "probably arrived".
+    pub delivered: bool,
+    /// True when this row supersedes an earlier row with the same `id` rather
+    /// than describing a new message.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub update: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<MessageLogResolution>,
+    /// Why a deferred re-check called the message lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Read every row of `messages.jsonl`, skipping lines that do not parse.
+///
+/// Returns rows in file order, which is the order their outcomes were decided.
+pub fn read_message_log(path: &Path) -> Vec<MessageLogRow> {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<MessageLogRow>(line).ok())
+        .collect()
+}
+
+/// Highest id present in the log, or `None` for an empty or all-legacy file.
+pub fn max_message_log_id(rows: &[MessageLogRow]) -> Option<u64> {
+    rows.iter().filter_map(|row| row.id).max()
+}
+
+/// Collapse an append-only log into one row per message, with the final
+/// outcome.
+///
+/// Any consumer that counts messages or reports `delivered` must go through
+/// this: an update row is not another message, and the stale value it
+/// supersedes is not the answer. Rows keep the position of the message's first
+/// appearance, so the log still reads in send order.
+///
+/// - Rows with an `id`: the last row wins for `delivered`/`resolution`/`reason`,
+///   while `from`/`to`/`method`/`ts` stay those of the original send.
+/// - Rows without an `id` (legacy): each stands alone.
+/// - An update row whose original is no longer in the file stands alone too, so
+///   a truncated history loses nothing it still has.
+// Canonical reader for the durable log. Nothing in the daemon reads
+// `messages.jsonl` back today — the dashboard and router read the in-memory
+// ring, which is updated in place — so this has no in-tree caller yet. It
+// exists so that the next reader, in this repo or an operator's script, has one
+// correct interpretation to use instead of inventing a wrong one.
+#[allow(dead_code)]
+pub fn resolve_message_log(rows: Vec<MessageLogRow>) -> Vec<MessageLogRow> {
+    let mut resolved: Vec<MessageLogRow> = Vec::new();
+    let mut index_by_id: HashMap<u64, usize> = HashMap::new();
+
+    for row in rows {
+        let Some(id) = row.id else {
+            resolved.push(row);
+            continue;
+        };
+        match index_by_id.get(&id) {
+            Some(&index) => {
+                let base: &mut MessageLogRow = &mut resolved[index];
+                base.delivered = row.delivered;
+                base.resolution = row.resolution;
+                base.reason = row.reason;
+            }
+            None => {
+                index_by_id.insert(id, resolved.len());
+                resolved.push(row);
+            }
+        }
+    }
+
+    resolved
+}
+
 fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, data)?;
@@ -1899,5 +2011,125 @@ mod tests {
         assert!(dir.path().join("task_runs.jsonl").exists());
         let content = std::fs::read_to_string(dir.path().join("task_runs.jsonl")).unwrap();
         assert!(content.contains("abc"));
+    }
+
+    /// The shape rows had before ids existed; over 13k of these are live.
+    const LEGACY_ROW: &str = r#"{"ts":"2026-08-05T15:12:51Z","from":"turnero","to":"hub-fundamentals","method":"tmux","delivered":false}"#;
+
+    #[test]
+    fn legacy_rows_without_an_id_still_load_and_stand_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.jsonl");
+        std::fs::write(&path, format!("{LEGACY_ROW}\n{LEGACY_ROW}\n")).unwrap();
+
+        let rows = read_message_log(&path);
+        assert_eq!(rows.len(), 2, "legacy rows must keep loading");
+        assert_eq!(rows[0].id, None);
+        assert_eq!(rows[0].from, "turnero");
+        assert!(!rows[0].delivered);
+        assert_eq!(max_message_log_id(&rows), None);
+
+        let resolved = resolve_message_log(rows);
+        assert_eq!(
+            resolved.len(),
+            2,
+            "id-less rows are separate messages, not updates of each other"
+        );
+    }
+
+    #[test]
+    fn a_later_confirmation_supersedes_the_unconfirmed_row_for_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.jsonl");
+        let sent = r#"{"ts":"2026-08-05T15:12:51Z","id":7,"from":"turnero","to":"hub","method":"tmux","delivered":false}"#;
+        let confirmed = r#"{"ts":"2026-08-05T15:13:20Z","id":7,"from":"turnero","to":"hub","method":"tmux","delivered":true,"update":true,"resolution":"confirmed"}"#;
+        std::fs::write(&path, format!("{LEGACY_ROW}\n{sent}\n{confirmed}\n")).unwrap();
+
+        let rows = read_message_log(&path);
+        assert_eq!(max_message_log_id(&rows), Some(7));
+
+        let resolved = resolve_message_log(rows);
+        assert_eq!(
+            resolved.len(),
+            2,
+            "the update must not be counted as another message"
+        );
+        assert!(!resolved[0].delivered, "the legacy row is untouched");
+        assert_eq!(resolved[1].id, Some(7));
+        assert!(
+            resolved[1].delivered,
+            "a reader must report the proven arrival, not the stale false"
+        );
+        assert_eq!(
+            resolved[1].resolution,
+            Some(MessageLogResolution::Confirmed)
+        );
+        assert_eq!(
+            resolved[1].ts, "2026-08-05T15:12:51Z",
+            "the message keeps its send time"
+        );
+    }
+
+    #[test]
+    fn a_proven_loss_supersedes_with_its_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.jsonl");
+        let sent = r#"{"ts":"2026-08-05T15:12:51Z","id":9,"from":"a","to":"b","method":"tmux","delivered":false}"#;
+        let lost = r#"{"ts":"2026-08-05T15:13:20Z","id":9,"from":"a","to":"b","method":"tmux","delivered":false,"update":true,"resolution":"lost","reason":"still not observed in pane %3"}"#;
+        std::fs::write(&path, format!("{sent}\n{lost}\n")).unwrap();
+
+        let resolved = resolve_message_log(read_message_log(&path));
+        assert_eq!(resolved.len(), 1);
+        assert!(!resolved[0].delivered);
+        assert_eq!(resolved[0].resolution, Some(MessageLogResolution::Lost));
+        assert!(
+            resolved[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("pane %3")),
+            "a proven loss must keep its evidence"
+        );
+    }
+
+    #[test]
+    fn an_update_whose_original_is_gone_stands_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.jsonl");
+        let confirmed = r#"{"ts":"2026-08-05T15:13:20Z","id":7,"from":"a","to":"b","method":"tmux","delivered":true,"update":true,"resolution":"confirmed"}"#;
+        std::fs::write(&path, format!("{confirmed}\n")).unwrap();
+
+        let resolved = resolve_message_log(read_message_log(&path));
+        assert_eq!(resolved.len(), 1, "a truncated history must lose nothing");
+        assert!(resolved[0].delivered);
+    }
+
+    #[test]
+    fn unparseable_lines_are_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("messages.jsonl");
+        std::fs::write(&path, format!("not json\n{LEGACY_ROW}\n\n")).unwrap();
+
+        assert_eq!(read_message_log(&path).len(), 1);
+    }
+
+    #[test]
+    fn a_written_row_round_trips_through_the_reader() {
+        let row = MessageLogRow {
+            ts: "2026-08-05T15:12:51Z".into(),
+            id: Some(3),
+            from: "a".into(),
+            to: "b".into(),
+            method: "tmux".into(),
+            delivered: false,
+            update: false,
+            resolution: None,
+            reason: None,
+        };
+        let line = serde_json::to_string(&row).unwrap();
+        assert!(
+            !line.contains("update") && !line.contains("resolution"),
+            "a plain send row must stay the shape operators already read: {line}"
+        );
+        assert_eq!(serde_json::from_str::<MessageLogRow>(&line).unwrap(), row);
     }
 }
