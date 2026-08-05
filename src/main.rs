@@ -14,6 +14,7 @@ mod router;
 mod scheduler;
 mod server;
 mod session_agent;
+mod start_outcome;
 mod state;
 mod tmux;
 mod tmux_var;
@@ -230,6 +231,29 @@ enum Command {
         backend: Option<String>,
         #[arg(long)]
         from: Option<String>,
+        /// Block until the daemon confirms the session registered or the start
+        /// terminally failed. Without this the command only reports that the
+        /// start was accepted, which is not the same as a running worker.
+        /// Exits non-zero on failure, supersession, or timeout.
+        #[arg(long)]
+        wait: bool,
+        /// Give up waiting after this long (e.g. 5m, 300s). Default 5m.
+        #[arg(long, requires = "wait", value_parser = parse_fresh_context_after_active)]
+        wait_timeout: Option<u64>,
+    },
+    /// Report the terminal outcome of a start, by exact session incarnation.
+    ///
+    /// The incarnation comes from the `incarnation` field of a `spawn-session`
+    /// response. Public session ids are reused, so the incarnation is what
+    /// makes the answer this caller's own outcome.
+    #[command(name = "start-status")]
+    StartStatus {
+        name: String,
+        #[arg(long)]
+        incarnation: String,
+        /// Poll until terminal or this long elapses (e.g. 5m, 300s).
+        #[arg(long, value_parser = parse_fresh_context_after_active)]
+        wait: Option<u64>,
     },
     /// Kill a running session
     #[command(name = "kill-session")]
@@ -1080,6 +1104,8 @@ async fn main() -> anyhow::Result<()> {
             fresh_context_after_active,
             backend,
             from,
+            wait,
+            wait_timeout,
         } => {
             let idle_policy = when_done.map(IdlePolicy::from).or(idle_policy);
             if let Err(err) = validate_spawn_lifecycle(
@@ -1106,7 +1132,34 @@ async fn main() -> anyhow::Result<()> {
                 "backend": backend,
                 "from": from,
             });
-            cli_post("/api/sessions/start", &body).await?;
+            let response = cli_post_json("/api/sessions/start", &body).await?;
+            println!("{response}");
+            if wait {
+                let ticket = start_ticket_from_spawn_response(&name, &response)?;
+                let timeout =
+                    std::time::Duration::from_secs(wait_timeout.unwrap_or(DEFAULT_START_WAIT_SECS));
+                let report = await_start_outcome(&ticket, timeout).await?;
+                println!("{}", report.line);
+                if !report.started {
+                    std::process::exit(1);
+                }
+            }
+        }
+        Command::StartStatus {
+            name,
+            incarnation,
+            wait,
+        } => {
+            let ticket = StartTicket {
+                session: name,
+                incarnation,
+            };
+            let timeout = std::time::Duration::from_secs(wait.unwrap_or(0));
+            let report = await_start_outcome(&ticket, timeout).await?;
+            println!("{}", report.line);
+            if !report.started {
+                std::process::exit(1);
+            }
         }
         Command::KillSession {
             name,
@@ -1248,7 +1301,13 @@ async fn main() -> anyhow::Result<()> {
                 "model": model,
                 "effort": effort,
             });
-            cli_post("/api/sessions/restart", &body).await?;
+            let response = cli_post_json("/api/sessions/restart", &body).await?;
+            println!("{response}");
+            // The endpoint answers 200 even when the restart failed, so an
+            // unqualified exit 0 would read as success to a scripted caller.
+            if !restart_response_succeeded(&response) {
+                std::process::exit(1);
+            }
         }
         Command::ClearReminder { clearing_id, from } => {
             let from = match from {
@@ -3644,6 +3703,176 @@ async fn cli_post(path: &str, body: &serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether a `/api/sessions/restart` response reports a completed restart.
+///
+/// Only the explicit `restarted` outcome counts. A response without the field
+/// is an older daemon whose prose cannot be classified safely, so it is
+/// treated as inconclusive-but-not-failed to avoid breaking that pairing.
+fn restart_response_succeeded(response: &serde_json::Value) -> bool {
+    match response.get("outcome").and_then(|value| value.as_str()) {
+        Some(outcome) => outcome == "restarted",
+        None => true,
+    }
+}
+
+/// Default `spawn-session --wait` budget.
+const DEFAULT_START_WAIT_SECS: u64 = 300;
+/// Poll interval while waiting for a start ticket to reach a terminal state.
+const START_WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// POST and return the parsed response body instead of only printing it.
+async fn cli_post_json(path: &str, body: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
+    let url = format!("http://localhost:{port}{path}");
+    let client = reqwest::Client::new();
+    let resp = client.post(&url).json(body).send().await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    let body = classify_http_response(status, &text)?;
+    serde_json::from_str(&body)
+        .map_err(|error| anyhow::anyhow!("server response was not JSON: {error}: {body}"))
+}
+
+/// The exact owner a caller polls for its own start outcome.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StartTicket {
+    session: String,
+    incarnation: String,
+}
+
+/// Pull the ticket out of a `spawn-session` response.
+///
+/// A missing `incarnation` is a hard error: silently degrading to "accepted"
+/// is the exact failure mode this command exists to remove.
+fn start_ticket_from_spawn_response(
+    name: &str,
+    response: &serde_json::Value,
+) -> anyhow::Result<StartTicket> {
+    let incarnation = response
+        .get("incarnation")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "server response has no 'incarnation' ticket, so the start outcome cannot be \
+                 confirmed: {response}"
+            )
+        })?;
+    let session = response
+        .get("session")
+        .and_then(|value| value.as_str())
+        .unwrap_or(name);
+    Ok(StartTicket {
+        session: session.to_string(),
+        incarnation: incarnation.to_string(),
+    })
+}
+
+/// One poll's interpretation of a start ticket.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StartPoll {
+    /// Whether polling can stop.
+    terminal: bool,
+    /// Whether the session is confirmed started. Only ever true for a
+    /// terminal `started`.
+    started: bool,
+    line: String,
+}
+
+/// Interpret a `/api/sessions/start-status` body.
+///
+/// Anything other than an explicit `started` is treated as not-started, so an
+/// unrecognized or missing status can never read as a staffed worker.
+fn interpret_start_status(ticket: &StartTicket, body: &serde_json::Value) -> StartPoll {
+    let status = body.get("status").and_then(|value| value.as_str());
+    let detail = body.get("detail").and_then(|value| value.as_str());
+    let session = &ticket.session;
+    let incarnation = &ticket.incarnation;
+    match status {
+        Some("started") => StartPoll {
+            terminal: true,
+            started: true,
+            line: format!(
+                "started: {session} (incarnation {incarnation}){}",
+                detail.map(|d| format!(" — {d}")).unwrap_or_default()
+            ),
+        },
+        Some("failed") => StartPoll {
+            terminal: true,
+            started: false,
+            line: format!(
+                "failed: {session} (incarnation {incarnation}): {}",
+                detail.unwrap_or("start failed without a recorded reason")
+            ),
+        },
+        Some("superseded") => StartPoll {
+            terminal: true,
+            started: false,
+            line: format!(
+                "superseded: {session} (incarnation {incarnation}) was replaced by a newer \
+                 incarnation{}",
+                detail.map(|d| format!(" — {d}")).unwrap_or_default()
+            ),
+        },
+        Some("in_progress") => StartPoll {
+            terminal: false,
+            started: false,
+            line: format!("in progress: {session} (incarnation {incarnation})"),
+        },
+        Some("unknown") => StartPoll {
+            terminal: false,
+            started: false,
+            line: format!(
+                "unknown: no outcome retained for {session} (incarnation {incarnation}); it is \
+                 not confirmed started"
+            ),
+        },
+        other => StartPoll {
+            terminal: false,
+            started: false,
+            line: format!(
+                "unrecognized start status {:?} for {session} (incarnation {incarnation})",
+                other.unwrap_or("<missing>")
+            ),
+        },
+    }
+}
+
+/// Poll a start ticket until it is terminal or the budget runs out.
+///
+/// A timeout is reported as not-started: the caller must not treat "still
+/// waiting" as a staffed worker.
+async fn await_start_outcome(
+    ticket: &StartTicket,
+    timeout: std::time::Duration,
+) -> anyhow::Result<StartPoll> {
+    let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
+    let url = format!("http://localhost:{port}/api/sessions/start-status");
+    let query = [
+        ("session", ticket.session.as_str()),
+        ("incarnation", ticket.incarnation.as_str()),
+    ];
+    let client = reqwest::Client::new();
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let resp = client.get(&url).query(&query).send().await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        let body = classify_http_response(status, &text)?;
+        let value: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|error| anyhow::anyhow!("start-status response was not JSON: {error}"))?;
+        let mut poll = interpret_start_status(ticket, &value);
+        if poll.terminal {
+            return Ok(poll);
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            poll.line = format!("not confirmed within the wait budget — {}", poll.line);
+            return Ok(poll);
+        }
+        tokio::time::sleep(START_WAIT_POLL_INTERVAL.min(remaining)).await;
+    }
+}
+
 async fn cli_delete(path: &str) -> anyhow::Result<()> {
     let port = std::env::var("OUIJA_PORT").unwrap_or_else(|_| "7880".to_string());
     let url = format!("http://localhost:{port}{path}");
@@ -3778,6 +4007,159 @@ mod tests {
     #[test]
     fn pane_wire_suffix_strips_leading_percent() {
         assert_eq!(pane_wire_suffix("%74"), "74");
+    }
+
+    // --- spawn-session start tickets (CLI side) ---
+
+    #[test]
+    fn a_restart_response_only_counts_an_explicit_restarted_outcome() {
+        assert!(restart_response_succeeded(
+            &serde_json::json!({ "result": "restarted 'w'", "outcome": "restarted" })
+        ));
+        assert!(!restart_response_succeeded(
+            &serde_json::json!({ "result": "restart failed: ...", "outcome": "failed" })
+        ));
+        assert!(!restart_response_succeeded(
+            &serde_json::json!({ "outcome": "superseded" })
+        ));
+        // Older daemons omit the field; prose cannot be classified safely, so
+        // that pairing stays as it was rather than failing spuriously.
+        assert!(restart_response_succeeded(
+            &serde_json::json!({ "result": "restarted 'w'" })
+        ));
+    }
+
+    #[test]
+    fn a_spawn_response_yields_the_owner_scoped_ticket() {
+        let response = serde_json::json!({
+            "session": "tp-64",
+            "status": "starting",
+            "incarnation": "1784923380514537362"
+        });
+        let ticket = start_ticket_from_spawn_response("tp-64", &response).expect("ticket");
+        assert_eq!(ticket.session, "tp-64");
+        // Must survive as a decimal string: this value is above
+        // Number.MAX_SAFE_INTEGER and a JSON number would round it.
+        assert_eq!(ticket.incarnation, "1784923380514537362");
+    }
+
+    #[test]
+    fn a_spawn_response_without_a_ticket_is_an_error_not_a_silent_success() {
+        let response = serde_json::json!({ "session": "tp-64", "status": "starting" });
+        let error = start_ticket_from_spawn_response("tp-64", &response)
+            .expect_err("a missing ticket must not degrade to acceptance");
+        assert!(error.to_string().contains("incarnation"));
+    }
+
+    #[test]
+    fn cli_interprets_each_start_status_distinctly() {
+        let ticket = StartTicket {
+            session: "tp-64".into(),
+            incarnation: "7".into(),
+        };
+        let started = interpret_start_status(
+            &ticket,
+            &serde_json::json!({ "status": "started", "detail": "started 'tp-64' in /tmp (pane %151)" }),
+        );
+        assert!(started.terminal && started.started);
+        assert!(started.line.contains("pane %151"));
+
+        let reason = "start failed: OpenCode attach setup failed for 'tp-64' (pane %150)";
+        let failed = interpret_start_status(
+            &ticket,
+            &serde_json::json!({ "status": "failed", "detail": reason }),
+        );
+        assert!(failed.terminal);
+        assert!(!failed.started, "a failed start must not read as staffed");
+        assert!(
+            failed.line.contains(reason),
+            "the logged reason must reach the caller, got: {}",
+            failed.line
+        );
+
+        let in_progress =
+            interpret_start_status(&ticket, &serde_json::json!({ "status": "in_progress" }));
+        assert!(!in_progress.terminal && !in_progress.started);
+
+        let superseded =
+            interpret_start_status(&ticket, &serde_json::json!({ "status": "superseded" }));
+        assert!(superseded.terminal);
+        assert!(!superseded.started);
+
+        let unknown = interpret_start_status(&ticket, &serde_json::json!({ "status": "unknown" }));
+        assert!(!unknown.terminal && !unknown.started);
+    }
+
+    #[test]
+    fn an_unrecognized_start_status_never_reads_as_started() {
+        let ticket = StartTicket {
+            session: "tp-64".into(),
+            incarnation: "7".into(),
+        };
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({ "status": "who-knows" }),
+            serde_json::json!({ "status": 42 }),
+        ] {
+            let poll = interpret_start_status(&ticket, &body);
+            assert!(!poll.started, "unrecognized status must not claim success");
+            assert!(!poll.terminal);
+        }
+    }
+
+    #[test]
+    fn spawn_session_cli_accepts_wait_and_a_wait_budget() {
+        let cli = Cli::try_parse_from([
+            "ouija",
+            "spawn-session",
+            "tp-64",
+            "--wait",
+            "--wait-timeout",
+            "2m",
+        ])
+        .expect("spawn-session --wait parses");
+        match cli.command {
+            Command::SpawnSession {
+                wait, wait_timeout, ..
+            } => {
+                assert!(wait);
+                assert_eq!(wait_timeout, Some(120));
+            }
+            _ => panic!("expected spawn-session command"),
+        }
+    }
+
+    #[test]
+    fn spawn_session_cli_rejects_a_wait_budget_without_wait() {
+        // A budget without --wait would silently not wait at all.
+        assert!(
+            Cli::try_parse_from(["ouija", "spawn-session", "tp-64", "--wait-timeout", "2m"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn start_status_cli_takes_the_exact_incarnation() {
+        let cli = Cli::try_parse_from([
+            "ouija",
+            "start-status",
+            "tp-64",
+            "--incarnation",
+            "1784923380514537362",
+        ])
+        .expect("start-status parses");
+        match cli.command {
+            Command::StartStatus {
+                name,
+                incarnation,
+                wait,
+            } => {
+                assert_eq!(name, "tp-64");
+                assert_eq!(incarnation, "1784923380514537362");
+                assert_eq!(wait, None);
+            }
+            _ => panic!("expected start-status command"),
+        }
     }
 
     #[test]

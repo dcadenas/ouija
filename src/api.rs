@@ -3089,7 +3089,8 @@ pub async fn start_session(
                         StatusCode::ACCEPTED,
                         Json(json!({
                             "session": body.name,
-                            "status": "start_in_progress"
+                            "status": "start_in_progress",
+                            "incarnation": owner.incarnation.to_string()
                         })),
                     );
                 }
@@ -3106,18 +3107,25 @@ pub async fn start_session(
                 }
             }
         }
-        crate::daemon_protocol::StartDisposition::InProgress(_) => {
+        crate::daemon_protocol::StartDisposition::InProgress(owner) => {
             return (
                 StatusCode::ACCEPTED,
                 Json(json!({
                     "session": body.name,
-                    "status": "start_in_progress"
+                    "status": "start_in_progress",
+                    "incarnation": owner.incarnation.to_string()
                 })),
             );
         }
     };
 
-    // Return 202 immediately — all boot work happens in background.
+    // Return 202 immediately — all boot work happens in background. The
+    // caller's ticket is the exact owner it can poll for the terminal
+    // outcome; a public id alone is not enough because ids are reused.
+    let ticket_owner = reserved_owner
+        .clone()
+        .or_else(|| existing_owner.clone())
+        .expect("start disposition yields exactly one claimed owner");
     let name = body.name.clone();
     let state2 = state.clone();
     tokio::spawn(async move {
@@ -3130,7 +3138,7 @@ pub async fn start_session(
             if let Some(msg) = restart_drops_destructive_intent(&body) {
                 tracing::warn!("{msg}");
             }
-            let (_result, _msg_id, _) =
+            let (result, _msg_id, restart_outcome) =
                 crate::nostr_transport::restart_session_for_start_with_active_context_policy(
                     &state2,
                     &existing_owner,
@@ -3153,7 +3161,18 @@ pub async fn start_session(
                 )
                 .await;
 
-            tracing::info!("async session restart complete: {}", body.name);
+            // The restart path already returns a typed terminal outcome, so
+            // record it directly rather than re-deriving one. It is filed
+            // under the exact owner the caller was handed as its ticket.
+            state2.start_outcomes.record(
+                &existing_owner,
+                start_outcome_for_restart(restart_outcome),
+                result.clone(),
+            );
+            tracing::info!(
+                "async session restart complete: {}, result: {result}",
+                body.name
+            );
             return;
         }
 
@@ -3176,10 +3195,14 @@ pub async fn start_session(
                 body.base_branch.as_deref(),
                 body.force_reset.unwrap_or(false),
                 body.fresh_context_after_active_secs,
-                reserved_owner,
+                reserved_owner.clone(),
             )
             .await;
 
+        if let Some(owner) = reserved_owner.as_ref() {
+            let status = classify_completed_start(&state2, owner).await;
+            state2.start_outcomes.record(owner, status, result.clone());
+        }
         tracing::info!(
             "async session start complete: {}, result: {result}",
             body.name
@@ -3188,8 +3211,174 @@ pub async fn start_session(
 
     (
         StatusCode::ACCEPTED,
-        Json(json!({ "session": name, "status": "starting" })),
+        Json(json!({
+            "session": name,
+            "status": "starting",
+            "incarnation": ticket_owner.incarnation.to_string()
+        })),
     )
+}
+
+/// Map the restart path's typed terminal outcome onto a recorded start outcome.
+fn start_outcome_for_restart(
+    outcome: crate::nostr_transport::RestartOutcome,
+) -> crate::start_outcome::StartOutcomeStatus {
+    match outcome {
+        crate::nostr_transport::RestartOutcome::Restarted => {
+            crate::start_outcome::StartOutcomeStatus::Started
+        }
+        crate::nostr_transport::RestartOutcome::Failed => {
+            crate::start_outcome::StartOutcomeStatus::Failed
+        }
+        crate::nostr_transport::RestartOutcome::Superseded => {
+            crate::start_outcome::StartOutcomeStatus::Superseded
+        }
+    }
+}
+
+/// Decide the terminal disposition of a finished reserved start from daemon
+/// state rather than by sniffing the human-facing result string.
+///
+/// Only an exact owner match counts as started: a public id registered under
+/// a different incarnation belongs to somebody else's launch. The protocol
+/// lock is taken read-only for the comparison and released before the caller
+/// records anything; no I/O happens under it.
+async fn classify_completed_start(
+    state: &SharedState,
+    owner: &crate::daemon_protocol::ResourceOwner,
+) -> crate::start_outcome::StartOutcomeStatus {
+    let observed_newer = {
+        let protocol = state.protocol.read().await;
+        if protocol
+            .sessions
+            .get(&owner.session_id)
+            .is_some_and(|session| &session.owner() == owner)
+        {
+            return crate::start_outcome::StartOutcomeStatus::Started;
+        }
+        newer_incarnation_present(&protocol, owner)
+    };
+    if observed_newer {
+        crate::start_outcome::StartOutcomeStatus::Superseded
+    } else {
+        crate::start_outcome::StartOutcomeStatus::Failed
+    }
+}
+
+/// Whether the public id is currently held by a strictly newer incarnation
+/// than `owner`, either as a live session or as an in-flight lifecycle lease.
+fn newer_incarnation_present(
+    protocol: &crate::daemon_protocol::DaemonState,
+    owner: &crate::daemon_protocol::ResourceOwner,
+) -> bool {
+    let session_newer = protocol
+        .sessions
+        .get(&owner.session_id)
+        .is_some_and(|session| session.owner().incarnation > owner.incarnation);
+    let lease_newer = protocol
+        .lifecycle_leases
+        .get(&owner.session_id)
+        .is_some_and(|lease| {
+            lease.owner.incarnation > owner.incarnation
+                || lease
+                    .restart_target_owner
+                    .as_ref()
+                    .is_some_and(|target| target.incarnation > owner.incarnation)
+        });
+    session_newer || lease_newer
+}
+
+/// Query for `/api/sessions/start-status`.
+///
+/// The incarnation is a decimal string: these values exceed
+/// `Number.MAX_SAFE_INTEGER`, so a JSON number would silently lose bits.
+#[derive(Debug, Deserialize)]
+pub struct StartStatusQuery {
+    pub session: String,
+    pub incarnation: String,
+}
+
+/// Report the terminal outcome of a start ticket issued by
+/// `/api/sessions/start`.
+///
+/// Answers are scoped to the exact `ResourceOwner`. A caller holding an older
+/// incarnation's ticket is told `superseded`, never handed a newer
+/// incarnation's success.
+pub async fn start_status(
+    State(state): State<SharedState>,
+    Query(query): Query<StartStatusQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Ok(incarnation) = query.incarnation.trim().parse::<u64>() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("invalid incarnation '{}': expected a decimal u64", query.incarnation)
+            })),
+        );
+    };
+    let owner = crate::daemon_protocol::ResourceOwner {
+        session_id: query.session.clone(),
+        incarnation: crate::daemon_protocol::SessionIncarnation(incarnation),
+    };
+    let status = resolve_start_status(&state, &owner).await;
+    let mut payload = json!({
+        "session": owner.session_id,
+        "incarnation": owner.incarnation.to_string(),
+        "status": status.as_str(),
+        "terminal": status.is_terminal(),
+    });
+    if let Some(detail) = status.detail() {
+        payload["detail"] = json!(detail);
+    }
+    (StatusCode::OK, Json(payload))
+}
+
+/// Resolve a start ticket to one of started / failed / superseded /
+/// in_progress / unknown.
+///
+/// A retained terminal record wins. Otherwise daemon state answers: an exact
+/// registered owner is started, an in-flight lease for this exact owner is
+/// still in progress, a strictly newer incarnation means this ticket was
+/// superseded, and anything else is explicitly unknown rather than a success
+/// claim.
+pub(crate) async fn resolve_start_status(
+    state: &SharedState,
+    owner: &crate::daemon_protocol::ResourceOwner,
+) -> crate::start_outcome::StartStatus {
+    if let Some(recorded) = state.start_outcomes.get(owner) {
+        return recorded;
+    }
+    let protocol = state.protocol.read().await;
+    if protocol
+        .sessions
+        .get(&owner.session_id)
+        .is_some_and(|session| &session.owner() == owner)
+    {
+        return crate::start_outcome::StartStatus::Started {
+            detail: format!(
+                "session '{}' is registered at incarnation {}",
+                owner.session_id, owner.incarnation
+            ),
+        };
+    }
+    if protocol
+        .lifecycle_leases
+        .get(&owner.session_id)
+        .is_some_and(|lease| {
+            &lease.owner == owner || lease.restart_target_owner.as_ref() == Some(owner)
+        })
+    {
+        return crate::start_outcome::StartStatus::InProgress;
+    }
+    if newer_incarnation_present(&protocol, owner) {
+        return crate::start_outcome::StartStatus::Superseded {
+            detail: format!(
+                "session '{}' is now held by a newer incarnation",
+                owner.session_id
+            ),
+        };
+    }
+    crate::start_outcome::StartStatus::Unknown
 }
 
 /// Kill and restart a session, optionally with a fresh conversation.
@@ -3230,27 +3419,47 @@ pub async fn restart_session(
     }
 
     let fresh = body.fresh.unwrap_or(false);
-    let (result, _prompt_msg_id, _) = crate::nostr_transport::restart_session_with_prompt_controls(
-        &state,
-        &body.name,
-        fresh,
-        body.fresh_context_after_active_secs,
-        None,
-        body.prompt.as_deref(),
-        suppress_stored_prompt,
-        one_shot_prompt.as_deref(),
-        body.from.as_deref(),
-        None, // expects_reply not used for session restart
-        body.backend.as_deref(),
-        body.model.as_deref(),
-        body.effort.as_deref(),
-        body.reminder.as_deref(),
-        crate::nostr_transport::ParentSessionOverride::PreservePrevious,
-        None, // idle_policy: restart-session preserves previous lifecycle metadata
-    )
-    .await;
+    let (result, _prompt_msg_id, outcome) =
+        crate::nostr_transport::restart_session_with_prompt_controls(
+            &state,
+            &body.name,
+            fresh,
+            body.fresh_context_after_active_secs,
+            None,
+            body.prompt.as_deref(),
+            suppress_stored_prompt,
+            one_shot_prompt.as_deref(),
+            body.from.as_deref(),
+            None, // expects_reply not used for session restart
+            body.backend.as_deref(),
+            body.model.as_deref(),
+            body.effort.as_deref(),
+            body.reminder.as_deref(),
+            crate::nostr_transport::ParentSessionOverride::PreservePrevious,
+            None, // idle_policy: restart-session preserves previous lifecycle metadata
+        )
+        .await;
 
-    (StatusCode::OK, Json(json!({ "result": result })))
+    // `/api/sessions/restart` is synchronous, so the caller already has the
+    // terminal answer — but only as prose. Surface the typed outcome so a
+    // scripted caller does not have to pattern-match a human-facing string to
+    // tell a restart from a failed or superseded one.
+    (
+        StatusCode::OK,
+        Json(json!({
+            "result": result,
+            "outcome": restart_outcome_str(outcome),
+        })),
+    )
+}
+
+/// Stable wire spelling of a restart's terminal outcome.
+fn restart_outcome_str(outcome: crate::nostr_transport::RestartOutcome) -> &'static str {
+    match outcome {
+        crate::nostr_transport::RestartOutcome::Restarted => "restarted",
+        crate::nostr_transport::RestartOutcome::Failed => "failed",
+        crate::nostr_transport::RestartOutcome::Superseded => "superseded",
+    }
 }
 
 /// Check if interactive mode is currently blocked.
@@ -5457,6 +5666,241 @@ mod tests {
         assert_eq!(one["active_context_segment_open"], true);
         assert_eq!(one["active_context_restart_due"], true);
         assert_eq!(one["active_context_accounting_provisional"], true);
+    }
+
+    // --- asynchronous start outcomes are reachable by the exact caller ---
+    //
+    // `/api/sessions/start` answers 202 before any launch work runs, so its
+    // response only means "accepted". These cover the four answers a
+    // coordinator must be able to tell apart.
+
+    async fn reserved_owner(
+        state: &crate::state::SharedState,
+        name: &str,
+    ) -> crate::daemon_protocol::ResourceOwner {
+        match state.reserve_start(name).await.expect("reservation") {
+            crate::daemon_protocol::StartDisposition::Reserved(owner) => owner,
+            other => panic!("expected a fresh reservation, got {other:?}"),
+        }
+    }
+
+    /// Drive a reserved start to the state a successful launch leaves behind:
+    /// the session entry exists under the exact owner, launch metadata is
+    /// finalized, and the lease is released.
+    async fn complete_reserved_start(
+        state: &crate::state::SharedState,
+        owner: &crate::daemon_protocol::ResourceOwner,
+        pane: &str,
+    ) {
+        state.protocol.write().await.sessions.insert(
+            owner.session_id.clone(),
+            crate::daemon_protocol::SessionEntry {
+                id: owner.session_id.clone(),
+                pane: Some(pane.to_string()),
+                origin: crate::daemon_protocol::Origin::Local,
+                metadata: crate::daemon_protocol::SessionMeta {
+                    session_incarnation: owner.incarnation,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        state
+            .finalize_reserved_start(
+                owner,
+                Some(pane.to_string()),
+                crate::daemon_protocol::SessionMeta {
+                    session_incarnation: owner.incarnation,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("finalize");
+        state.abort_lifecycle(owner).await.expect("release lease");
+    }
+
+    #[tokio::test]
+    async fn a_start_still_running_is_in_progress_not_started() {
+        let state = crate::state::AppState::new_for_test();
+        let owner = reserved_owner(&state, "tp-64").await;
+
+        let status = resolve_start_status(&state, &owner).await;
+        assert_eq!(status.as_str(), "in_progress");
+        assert!(!status.is_terminal(), "an in-flight start is not terminal");
+    }
+
+    #[tokio::test]
+    async fn a_successful_start_reports_started_for_its_exact_owner() {
+        let state = crate::state::AppState::new_for_test();
+        let owner = reserved_owner(&state, "tp-64").await;
+
+        complete_reserved_start(&state, &owner, "%151").await;
+        let recorded = classify_completed_start(&state, &owner).await;
+        assert_eq!(recorded, crate::start_outcome::StartOutcomeStatus::Started);
+        state.start_outcomes.record(
+            &owner,
+            recorded,
+            "started 'tp-64' in /tmp/tp-64 (pane %151)".into(),
+        );
+
+        let status = resolve_start_status(&state, &owner).await;
+        assert_eq!(status.as_str(), "started");
+        assert!(status.is_terminal());
+        assert_eq!(
+            status.detail(),
+            Some("started 'tp-64' in /tmp/tp-64 (pane %151)")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_reports_the_logged_reason_not_success() {
+        // The live 2026-08-05 failure: the launch created the worktree, the
+        // OpenCode attach failed, nothing registered, and the caller was told
+        // only "starting".
+        let state = crate::state::AppState::new_for_test();
+        let owner = reserved_owner(&state, "tp-64").await;
+        state.abort_lifecycle(&owner).await.expect("abort");
+
+        let recorded = classify_completed_start(&state, &owner).await;
+        assert_eq!(recorded, crate::start_outcome::StartOutcomeStatus::Failed);
+        let reason = "start failed: OpenCode attach setup failed for 'tp-64' (pane %150)";
+        state.start_outcomes.record(&owner, recorded, reason.into());
+
+        let status = resolve_start_status(&state, &owner).await;
+        assert_eq!(status.as_str(), "failed");
+        assert_eq!(status.detail(), Some(reason));
+    }
+
+    #[tokio::test]
+    async fn a_superseded_owner_never_receives_the_newer_incarnation_outcome() {
+        let state = crate::state::AppState::new_for_test();
+        let first = reserved_owner(&state, "tp-64").await;
+        state.abort_lifecycle(&first).await.expect("abort");
+        let second = reserved_owner(&state, "tp-64").await;
+        assert!(second.incarnation > first.incarnation);
+
+        // The retry succeeds under a newer incarnation and records its own
+        // success. The first caller's ticket must not read that as its own.
+        complete_reserved_start(&state, &second, "%151").await;
+        state.start_outcomes.record(
+            &second,
+            crate::start_outcome::StartOutcomeStatus::Started,
+            "started 'tp-64' in /tmp/tp-64 (pane %151)".into(),
+        );
+
+        let first_status = resolve_start_status(&state, &first).await;
+        assert_eq!(first_status.as_str(), "superseded");
+        assert_eq!(
+            resolve_start_status(&state, &second).await.as_str(),
+            "started"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_status_endpoint_scopes_the_answer_to_the_ticket_incarnation() {
+        let state = crate::state::AppState::new_for_test();
+        let owner = reserved_owner(&state, "tp-64").await;
+        complete_reserved_start(&state, &owner, "%151").await;
+
+        let (code, Json(body)) = start_status(
+            State(state.clone()),
+            Query(StartStatusQuery {
+                session: "tp-64".into(),
+                incarnation: owner.incarnation.to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body["status"], "started");
+        assert_eq!(body["incarnation"], owner.incarnation.to_string());
+        assert_eq!(body["terminal"], true);
+
+        // Incarnations are decimal strings on the wire: a JSON number would
+        // lose bits above Number.MAX_SAFE_INTEGER.
+        let (code, Json(body)) = start_status(
+            State(state.clone()),
+            Query(StartStatusQuery {
+                session: "tp-64".into(),
+                incarnation: "not-a-number".into(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("incarnation"));
+
+        // An unrelated incarnation of the same public id is not this caller's.
+        let (_, Json(body)) = start_status(
+            State(state),
+            Query(StartStatusQuery {
+                session: "tp-64".into(),
+                incarnation: (owner.incarnation.0 - 1).to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(body["status"], "superseded");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_ticket_is_not_reported_as_started() {
+        let state = crate::state::AppState::new_for_test();
+        let ghost = crate::daemon_protocol::ResourceOwner {
+            session_id: "never-existed".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(1),
+        };
+        let status = resolve_start_status(&state, &ghost).await;
+        assert_eq!(status.as_str(), "unknown");
+        assert!(!status.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn retained_start_outcomes_do_not_grow_without_limit() {
+        let state = crate::state::AppState::new_for_test();
+        for incarnation in 0..(crate::start_outcome::MAX_RETAINED_START_OUTCOMES as u64 * 3) {
+            state.start_outcomes.record(
+                &crate::daemon_protocol::ResourceOwner {
+                    session_id: format!("s-{incarnation}"),
+                    incarnation: crate::daemon_protocol::SessionIncarnation(incarnation),
+                },
+                crate::start_outcome::StartOutcomeStatus::Started,
+                "started".into(),
+            );
+        }
+        assert_eq!(
+            state.start_outcomes.len(),
+            crate::start_outcome::MAX_RETAINED_START_OUTCOMES
+        );
+    }
+
+    #[test]
+    fn restart_outcomes_have_stable_wire_spellings() {
+        assert_eq!(
+            restart_outcome_str(crate::nostr_transport::RestartOutcome::Restarted),
+            "restarted"
+        );
+        assert_eq!(
+            restart_outcome_str(crate::nostr_transport::RestartOutcome::Failed),
+            "failed"
+        );
+        assert_eq!(
+            restart_outcome_str(crate::nostr_transport::RestartOutcome::Superseded),
+            "superseded"
+        );
+    }
+
+    #[test]
+    fn a_restart_outcome_maps_onto_the_recorded_start_outcome() {
+        assert_eq!(
+            start_outcome_for_restart(crate::nostr_transport::RestartOutcome::Restarted),
+            crate::start_outcome::StartOutcomeStatus::Started
+        );
+        assert_eq!(
+            start_outcome_for_restart(crate::nostr_transport::RestartOutcome::Failed),
+            crate::start_outcome::StartOutcomeStatus::Failed
+        );
+        assert_eq!(
+            start_outcome_for_restart(crate::nostr_transport::RestartOutcome::Superseded),
+            crate::start_outcome::StartOutcomeStatus::Superseded
+        );
     }
 
     fn backend_identity_request(backend: &str, session_id: &str) -> BackendIdentityRequest {

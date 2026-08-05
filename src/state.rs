@@ -930,6 +930,9 @@ pub struct AppState {
     /// Maps session_id -> queued readiness prompt.
     pub pending_prompts: std::sync::Mutex<std::collections::HashMap<String, PendingPrompt>>,
     compact_in_progress: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Terminal outcomes of asynchronous session starts, keyed by exact
+    /// lifecycle owner. Bounded and TTL-expiring; see `start_outcome`.
+    pub start_outcomes: crate::start_outcome::StartOutcomeStore,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1445,6 +1448,7 @@ impl AppState {
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
             compact_in_progress: std::sync::Mutex::new(std::collections::HashSet::new()),
+            start_outcomes: crate::start_outcome::StartOutcomeStore::default(),
         })
     }
 
@@ -1511,6 +1515,7 @@ impl AppState {
             http_client: reqwest::Client::new(),
             pending_prompts: std::sync::Mutex::new(std::collections::HashMap::new()),
             compact_in_progress: std::sync::Mutex::new(std::collections::HashSet::new()),
+            start_outcomes: crate::start_outcome::StartOutcomeStore::default(),
         })
     }
 

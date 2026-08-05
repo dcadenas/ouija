@@ -66,6 +66,7 @@ pub async fn run(state: SharedState) -> anyhow::Result<()> {
         .route("/api/sessions/recover-lease", post(api::recover_lease))
         .route("/api/sessions/prune-stale", post(api::prune_stale_sessions))
         .route("/api/sessions/start", post(api::start_session))
+        .route("/api/sessions/start-status", get(api::start_status))
         .route("/api/sessions/restart", post(api::restart_session))
         .route(
             "/api/pane/{pane}/block-interactive",

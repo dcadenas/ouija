@@ -177,6 +177,24 @@ sessions and must not be enrolled as descendants.
 
 ## Useful patterns
 
+### Confirm a spawn actually started
+
+`spawn-session` returns as soon as the start is *accepted*; the launch itself
+runs asynchronously and can still fail after the worktree exists. A bare
+`spawn-session` that prints `starting` is not evidence that a worker is running.
+
+```bash
+ouija spawn-session worker --project-dir /path --prompt "..." --wait
+```
+
+`--wait` blocks until the daemon confirms registration or the start terminally
+fails, prints the recorded reason on failure, and exits non-zero. To poll
+separately, keep the `incarnation` from the spawn response (the ticket) and
+run `ouija start-status <name> --incarnation <n>`. The incarnation is what makes
+the answer yours: public session ids get reused, and an older ticket reports
+`superseded` rather than another launch's success. This replaces polling
+`ouija ls` for an open pane after every spawn.
+
 ### Report once when done
 
 ```bash
