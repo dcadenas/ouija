@@ -1920,6 +1920,42 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
                     response.status()
                 );
             }
+
+            // Aborting the parent leaves its opencode subagents running: they
+            // are separate server-side sessions, so nothing else in restore
+            // reaches them and they would keep writing in the worktree while
+            // the daemon reports a clean start. The registry is not populated
+            // yet, so the persisted sharers computed above stand in for the
+            // live ownership check the sweep would otherwise do.
+            let protected: std::collections::HashSet<String> = sessions
+                .iter()
+                .filter(|session| !abandoned_lease_owns_staged_row(session, lease))
+                .filter_map(|session| session.metadata.backend_session_id.clone())
+                .chain(
+                    dormant_sessions
+                        .values()
+                        .filter_map(|dormant| dormant.metadata.backend_session_id.clone()),
+                )
+                .collect();
+            let subagents_aborted = crate::nostr_transport::abort_subagent_tree(
+                state,
+                &lease.owner,
+                &lease.owner.session_id,
+                backend_session_id,
+                &protected,
+            )
+            .await
+            .map_err(|failure| {
+                anyhow::anyhow!(
+                    "subagent sweep for abandoned session '{backend_session_id}' did not complete: {}",
+                    failure.detail
+                )
+            })?;
+            tracing::info!(
+                backend_session_id,
+                subagents_aborted,
+                "swept subagents of abandoned backend session"
+            );
         }
 
         let inert_panes: Vec<_> = abandoned_leases
@@ -6006,6 +6042,259 @@ mod tests {
             );
             server.abort();
         }
+    }
+
+    // ---- abandoned-lease subagent sweep ------------------------------------
+    //
+    // Opencode subagents are separate server-side sessions. A daemon restart
+    // that replays only the parent abort leaves them running, which is the
+    // worst doorway for this defect: nobody is watching a restart.
+
+    #[derive(Clone)]
+    struct RestoreSubagentProbe {
+        children: std::collections::HashMap<String, Vec<String>>,
+        reject_abort: std::collections::HashSet<String>,
+        aborted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    async fn restore_probe_children(
+        axum::extract::Path(id): axum::extract::Path<String>,
+        axum::extract::State(probe): axum::extract::State<RestoreSubagentProbe>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        match probe.children.get(&id) {
+            Some(children) => axum::Json(
+                children
+                    .iter()
+                    .map(|child| serde_json::json!({ "id": child, "parentID": id }))
+                    .collect::<Vec<_>>(),
+            )
+            .into_response(),
+            None => axum::http::StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    async fn restore_probe_abort(
+        axum::extract::Path(id): axum::extract::Path<String>,
+        axum::extract::State(probe): axum::extract::State<RestoreSubagentProbe>,
+    ) -> axum::http::StatusCode {
+        probe.aborted.lock().unwrap().push(id.clone());
+        if probe.reject_abort.contains(&id) {
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        } else {
+            axum::http::StatusCode::NO_CONTENT
+        }
+    }
+
+    /// Persist one abandoned Stopping lease for `ses_worker` and serve `probe`
+    /// on the daemon's opencode port.
+    async fn restore_state_with_stopping_lease(
+        dir: &tempfile::TempDir,
+        probe: &RestoreSubagentProbe,
+    ) -> (crate::state::SharedState, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_port = listener.local_addr().unwrap().port();
+        let daemon_port = serve_port.checked_sub(320).unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/session/{session_id}/children",
+                axum::routing::get(restore_probe_children),
+            )
+            .route(
+                "/session/{session_id}/abort",
+                axum::routing::post(restore_probe_abort),
+            )
+            .with_state(probe.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(7),
+        };
+        let snapshot = crate::persistence::PersistedLifecycleState::new(
+            vec![],
+            std::collections::BTreeMap::new(),
+            owner.incarnation,
+            std::collections::BTreeMap::from([(
+                owner.session_id.clone(),
+                crate::daemon_protocol::LifecycleLease {
+                    owner: owner.clone(),
+                    phase: crate::daemon_protocol::LifecyclePhase::Stopping,
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_worker".into()),
+                    backend_session_owner: Some(owner),
+                    restart_target_owner: None,
+                    restart_previous: None,
+                    project_dir: None,
+                    project_dir_owner: None,
+                    project_dir_cleanup_on_abandon: false,
+                    inert_pane: None,
+                    inert_pane_owner: None,
+                },
+            )]),
+        );
+        crate::persistence::save_sessions(dir.path(), &snapshot).unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: daemon_port,
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        (state, server)
+    }
+
+    #[tokio::test]
+    async fn restore_sweeps_nested_subagents_of_an_abandoned_stopping_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = RestoreSubagentProbe {
+            children: std::collections::HashMap::from([
+                ("ses_worker".to_string(), vec!["ses_a".to_string()]),
+                ("ses_a".to_string(), vec!["ses_b".to_string()]),
+                ("ses_b".to_string(), vec![]),
+            ]),
+            reject_abort: std::collections::HashSet::new(),
+            aborted: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let (state, server) = restore_state_with_stopping_lease(&dir, &probe).await;
+
+        restore_persisted_sessions(&state).await.unwrap();
+
+        let mut aborted = probe.aborted.lock().unwrap().clone();
+        aborted.sort();
+        assert_eq!(
+            aborted,
+            vec![
+                "ses_a".to_string(),
+                "ses_b".to_string(),
+                "ses_worker".to_string()
+            ],
+            "restore must abort the parent and every nested subagent"
+        );
+        assert!(
+            crate::persistence::load_sessions(dir.path())
+                .unwrap()
+                .lifecycle_leases
+                .is_empty()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn restore_fails_closed_when_an_abandoned_subagent_abort_is_unconfirmed() {
+        // Same posture as the parent abort: startup must not proceed as if
+        // cleanup succeeded while a subagent may still be writing.
+        let dir = tempfile::tempdir().unwrap();
+        let probe = RestoreSubagentProbe {
+            children: std::collections::HashMap::from([
+                ("ses_worker".to_string(), vec!["ses_child".to_string()]),
+                ("ses_child".to_string(), vec![]),
+            ]),
+            reject_abort: std::collections::HashSet::from(["ses_child".to_string()]),
+            aborted: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let (state, server) = restore_state_with_stopping_lease(&dir, &probe).await;
+
+        let error = restore_persisted_sessions(&state).await.unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("subagent sweep for abandoned session 'ses_worker'"),
+            "got: {error:#}"
+        );
+        assert!(
+            crate::persistence::load_sessions(dir.path())
+                .unwrap()
+                .lifecycle_leases
+                .contains_key("worker"),
+            "a failed sweep must retain the stopping lease"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn restore_never_aborts_a_subagent_owned_by_a_persisted_session() {
+        // The registry is empty during restore, so the persisted-sharer set is
+        // the only ownership evidence the sweep can use.
+        let dir = tempfile::tempdir().unwrap();
+        let probe = RestoreSubagentProbe {
+            children: std::collections::HashMap::from([
+                ("ses_worker".to_string(), vec!["ses_child".to_string()]),
+                ("ses_child".to_string(), vec![]),
+            ]),
+            reject_abort: std::collections::HashSet::new(),
+            aborted: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_port = listener.local_addr().unwrap().port();
+        let daemon_port = serve_port.checked_sub(320).unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/session/{session_id}/children",
+                axum::routing::get(restore_probe_children),
+            )
+            .route(
+                "/session/{session_id}/abort",
+                axum::routing::post(restore_probe_abort),
+            )
+            .with_state(probe.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(7),
+        };
+        let snapshot = crate::persistence::PersistedLifecycleState::new(
+            vec![crate::persistence::PersistedSession {
+                id: "neighbour".into(),
+                pane: None,
+                registered_at: chrono::Utc::now(),
+                last_activity_at: chrono::Utc::now(),
+                metadata: crate::state::SessionMetadata {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_child".into()),
+                    session_incarnation: crate::daemon_protocol::SessionIncarnation(6),
+                    ..Default::default()
+                },
+            }],
+            std::collections::BTreeMap::new(),
+            owner.incarnation,
+            std::collections::BTreeMap::from([(
+                owner.session_id.clone(),
+                crate::daemon_protocol::LifecycleLease {
+                    owner: owner.clone(),
+                    phase: crate::daemon_protocol::LifecyclePhase::Stopping,
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_worker".into()),
+                    backend_session_owner: Some(owner),
+                    restart_target_owner: None,
+                    restart_previous: None,
+                    project_dir: None,
+                    project_dir_owner: None,
+                    project_dir_cleanup_on_abandon: false,
+                    inert_pane: None,
+                    inert_pane_owner: None,
+                },
+            )]),
+        );
+        crate::persistence::save_sessions(dir.path(), &snapshot).unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: daemon_port,
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+
+        restore_persisted_sessions(&state).await.unwrap();
+
+        assert_eq!(
+            probe.aborted.lock().unwrap().clone(),
+            vec!["ses_worker".to_string()],
+            "a subagent owned by a persisted session must not be aborted"
+        );
+        server.abort();
     }
 
     #[tokio::test]

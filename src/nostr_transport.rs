@@ -1766,7 +1766,14 @@ pub async fn recover_lease(state: &std::sync::Arc<AppState>, name: &str) -> Kill
             // would leave those server-side sessions running and writing.
             let sweep = state
                 .with_owned_backend_cleanup(&lease.owner, backend_session_id, || async {
-                    abort_subagent_tree(state, &lease.owner, name, backend_session_id).await
+                    abort_subagent_tree(
+                        state,
+                        &lease.owner,
+                        name,
+                        backend_session_id,
+                        &std::collections::HashSet::new(),
+                    )
+                    .await
                 })
                 .await;
             match sweep {
@@ -1817,8 +1824,8 @@ const SUBAGENT_SWEEP_MAX_ROUNDS: usize = 4;
 /// definitely-refused call releases stop authority for a retry while an
 /// ambiguous one retains it.
 pub(crate) struct SubagentSweepFailure {
-    detail: String,
-    decision: PromptAsyncFallbackDecision,
+    pub(crate) detail: String,
+    pub(crate) decision: PromptAsyncFallbackDecision,
 }
 
 /// True when some *other* live session owns this backend session id.
@@ -1955,11 +1962,17 @@ async fn abort_backend_session(
 ///
 /// The caller is responsible for holding the backend resource gate; this
 /// function must not acquire it (the gate is not reentrant).
-async fn abort_subagent_tree(
+///
+/// `protected` names backend sessions the caller already knows belong to
+/// someone else. Live-daemon callers pass an empty set because registry
+/// ownership is checked directly; the daemon-start restore path has no live
+/// registry yet, so it passes the persisted sharers it computed itself.
+pub(crate) async fn abort_subagent_tree(
     state: &std::sync::Arc<AppState>,
     owner: &crate::daemon_protocol::ResourceOwner,
     name: &str,
     root_backend_session_id: &str,
+    protected: &std::collections::HashSet<String>,
 ) -> Result<usize, SubagentSweepFailure> {
     let port = state.opencode_serve_port();
     let mut visited: std::collections::HashSet<String> =
@@ -1999,7 +2012,9 @@ async fn abort_subagent_tree(
                         });
                     }
                     discovered += 1;
-                    if backend_session_owned_elsewhere(state, owner, &child).await {
+                    if protected.contains(&child)
+                        || backend_session_owned_elsewhere(state, owner, &child).await
+                    {
                         tracing::warn!(
                             session = %name,
                             subagent = %child,
@@ -2251,7 +2266,14 @@ async fn kill_session_inner(
             // pid kill below would never reach them.
             let sweep = state
                 .with_owned_backend_cleanup(&owner, oc_sid, || async {
-                    abort_subagent_tree(state, &owner, name, oc_sid).await
+                    abort_subagent_tree(
+                        state,
+                        &owner,
+                        name,
+                        oc_sid,
+                        &std::collections::HashSet::new(),
+                    )
+                    .await
                 })
                 .await;
             let Some(sweep) = sweep else {
