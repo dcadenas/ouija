@@ -1841,8 +1841,7 @@ fn inject_response_body(verification: &crate::tmux::InjectVerification) -> serde
 /// out of the transcript entirely. Re-sending converts that harmless
 /// uncertainty into a real, visible duplicate in the recipient's context, so
 /// the guidance is to wait for the recipient rather than to send again.
-const UNCONFIRMED_DELIVERY_GUIDANCE: &str =
-    "the paste was accepted but the text was not observed in the pane; this is usually a \
+const UNCONFIRMED_DELIVERY_GUIDANCE: &str = "the paste was accepted but the text was not observed in the pane; this is usually a \
      rendering miss, not a lost message. Do not re-send: wait for the recipient's reply, and \
      ask a human if it never comes.";
 
@@ -12470,6 +12469,7 @@ mod tests {
                 project_dir_cleanup_on_abandon: false,
                 inert_pane: None,
                 inert_pane_owner: None,
+                sweep_unconfirmed: None,
             };
             proto
                 .lifecycle_leases
