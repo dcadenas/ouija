@@ -1732,6 +1732,7 @@ pub async fn recover_lease(state: &std::sync::Arc<AppState>, name: &str) -> Kill
 
     // Only an HTTP-delivery backend has a server-side turn that can outlive the
     // pane, so only that case needs an abort replayed before release.
+    let mut subagents_aborted: Option<usize> = None;
     match (
         lease.backend.as_deref(),
         lease.backend_session_id.as_deref(),
@@ -1770,15 +1771,49 @@ pub async fn recover_lease(state: &std::sync::Arc<AppState>, name: &str) -> Kill
                     ));
                 }
             }
+
+            // Releasing the lease without sweeping the parent's subagents
+            // would leave those server-side sessions running and writing.
+            let sweep = state
+                .with_owned_backend_cleanup(&lease.owner, backend_session_id, || async {
+                    abort_subagent_tree(
+                        state,
+                        &lease.owner,
+                        name,
+                        backend_session_id,
+                        &std::collections::HashSet::new(),
+                    )
+                    .await
+                })
+                .await;
+            match sweep {
+                Some(Ok(aborted)) => subagents_aborted = Some(aborted),
+                Some(Err(SubagentSweepFailure { detail, .. })) => {
+                    tracing::warn!(session = %name, backend_session_id, "recover-lease subagent sweep failed: {detail}");
+                    let reason = format!("subagent sweep for '{name}' did not complete: {detail}");
+                    // Refresh the quarantine so status shows this attempt's
+                    // reason rather than the one recorded at daemon start.
+                    mark_lease_sweep_unconfirmed(state, &lease.owner, &reason).await;
+                    return KillSessionResult::failed(format!(
+                        "{reason}; stop authority retained, session '{name}' stays quarantined"
+                    ));
+                }
+                None => {
+                    return KillSessionResult::failed(format!(
+                        "backend session '{backend_session_id}' for '{name}' is owned by another session; stop authority retained"
+                    ));
+                }
+            }
         }
         _ => {}
     }
 
     match state.abort_lifecycle(&lease.owner).await {
         Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {
-            tracing::info!(session = %name, "recover-lease released stop authority");
+            tracing::info!(session = %name, ?subagents_aborted, "recover-lease released stop authority");
+            let subagents = subagents_aborted.map(subagent_report).unwrap_or_default();
             KillSessionResult::recovered(format!(
-                "released stop authority for '{name}'; retry 'ouija kill-session {name}' to finish cleanup"
+                "released stop authority for '{name}'{subagents}; retry 'ouija kill-session {name}' to finish cleanup"
             ))
         }
         Ok(outcome) => KillSessionResult::failed(format!(
@@ -1787,6 +1822,278 @@ pub async fn recover_lease(state: &std::sync::Arc<AppState>, name: &str) -> Kill
         Err(error) => KillSessionResult::failed(format!(
             "failed to persist lease release for '{name}': {error}"
         )),
+    }
+}
+
+/// Record why a lease stays quarantined, so `/api/status` and `ouija ls` show
+/// the latest retry's reason instead of the one recorded at daemon start.
+///
+/// This annotates an existing lease; it grants and revokes no authority, which
+/// is why it is a direct field update rather than a `DaemonState::apply` event.
+/// The owner comparison keeps a superseded retry from relabelling a lease that
+/// now belongs to someone else.
+async fn mark_lease_sweep_unconfirmed(
+    state: &std::sync::Arc<AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    reason: &str,
+) {
+    {
+        let mut protocol = state.protocol.write().await;
+        let Some(lease) = protocol.lifecycle_leases.get_mut(&owner.session_id) else {
+            return;
+        };
+        if lease.owner != *owner {
+            return;
+        }
+        lease.sweep_unconfirmed = Some(reason.to_string());
+    }
+    let protocol = state.protocol.read().await;
+    if let Err(error) = state.persist_protocol_state(&protocol) {
+        tracing::warn!(
+            session = %owner.session_id,
+            "failed to persist refreshed lease quarantine: {error}"
+        );
+    }
+}
+
+/// Deepest subagent nesting the sweep will follow before failing closed.
+const SUBAGENT_SWEEP_MAX_DEPTH: usize = 16;
+/// Maximum number of distinct backend sessions one sweep will touch.
+const SUBAGENT_SWEEP_MAX_SESSIONS: usize = 512;
+/// Maximum full re-walks of the tree while new subagents keep appearing.
+const SUBAGENT_SWEEP_MAX_ROUNDS: usize = 4;
+
+/// A subagent sweep that could not confirm every descendant was aborted.
+///
+/// The decision is classified exactly like a failed parent abort so a
+/// definitely-refused call releases stop authority for a retry while an
+/// ambiguous one retains it.
+pub(crate) struct SubagentSweepFailure {
+    pub(crate) detail: String,
+    pub(crate) decision: PromptAsyncFallbackDecision,
+}
+
+/// True when some *other* live session owns this backend session id.
+///
+/// A sweep must never abort a backend session another owner is responsible
+/// for, so such a node is walked for its own children but not aborted.
+async fn backend_session_owned_elsewhere(
+    state: &std::sync::Arc<AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    backend_session_id: &str,
+) -> bool {
+    state
+        .protocol
+        .read()
+        .await
+        .sessions
+        .values()
+        .any(|session| {
+            session.metadata.backend_session_id.as_deref() == Some(backend_session_id)
+                && session.owner() != *owner
+        })
+}
+
+/// List the direct children of one opencode session.
+///
+/// A 404 means the session no longer exists, which is indistinguishable from
+/// "no children" for cleanup purposes. Every other failure is a sweep failure:
+/// an unlisted subtree may still hold a writer.
+async fn list_backend_children(
+    state: &std::sync::Arc<AppState>,
+    port: u16,
+    backend_session_id: &str,
+) -> Result<Vec<String>, SubagentSweepFailure> {
+    let segment = crate::encode_path_segment(backend_session_id);
+    let url = format!("http://127.0.0.1:{port}/session/{segment}/children");
+    let response = state
+        .http_client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            return Err(SubagentSweepFailure {
+                decision: classify_prompt_async_fallback(PromptAsyncFailure::Request(&error)),
+                detail: format!("listing subagents of '{backend_session_id}' failed: {error}"),
+            });
+        }
+    };
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(Vec::new());
+    }
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(SubagentSweepFailure {
+            decision: classify_prompt_async_fallback(PromptAsyncFailure::Status(status)),
+            detail: format!(
+                "listing subagents of '{backend_session_id}' returned {status}: {text}"
+            ),
+        });
+    }
+    let children: Vec<serde_json::Value> = match response.json().await {
+        Ok(children) => children,
+        Err(error) => {
+            return Err(SubagentSweepFailure {
+                decision: PromptAsyncFallbackDecision::Ambiguous,
+                detail: format!(
+                    "subagent listing for '{backend_session_id}' was unreadable: {error}"
+                ),
+            });
+        }
+    };
+    Ok(children
+        .into_iter()
+        .filter_map(|child| {
+            child
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect())
+}
+
+/// Abort one server-side session, tolerating a 404 for an already-gone one.
+async fn abort_backend_session(
+    state: &std::sync::Arc<AppState>,
+    port: u16,
+    backend_session_id: &str,
+) -> Result<(), SubagentSweepFailure> {
+    let segment = crate::encode_path_segment(backend_session_id);
+    let url = format!("http://127.0.0.1:{port}/session/{segment}/abort");
+    let response = state
+        .http_client
+        .post(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await;
+    match response {
+        Ok(r) if r.status().is_success() || r.status() == reqwest::StatusCode::NOT_FOUND => Ok(()),
+        Ok(r) => {
+            let status = r.status();
+            let text = r.text().await.unwrap_or_default();
+            Err(SubagentSweepFailure {
+                decision: classify_prompt_async_fallback(PromptAsyncFailure::Status(status)),
+                detail: format!(
+                    "subagent abort for '{backend_session_id}' returned {status}: {text}"
+                ),
+            })
+        }
+        Err(error) => Err(SubagentSweepFailure {
+            decision: classify_prompt_async_fallback(PromptAsyncFailure::Request(&error)),
+            detail: format!("subagent abort for '{backend_session_id}' failed: {error}"),
+        }),
+    }
+}
+
+/// Abort every server-side descendant of an opencode session.
+///
+/// Opencode subagents are *separate server sessions* linked to their parent
+/// only by `parentID`; they are not children of the attach client process. So
+/// aborting the parent session and killing the pane's process tree — what a
+/// kill used to do — leaves every subagent running and still writing files in
+/// the worktree.
+///
+/// The walk is breadth-first over `/session/{id}/children`, guarded against
+/// cycles by a visited set and bounded by depth, node count and round count so
+/// a pathological or adversarial tree cannot spin forever. Because the parent
+/// is aborted first it can no longer spawn, but an in-flight subagent may have
+/// been created mid-sweep, so the whole tree is re-walked until a round finds
+/// nothing new. Anything left unconfirmed is an error: the caller must fail the
+/// kill rather than report success while a writer survives.
+///
+/// The caller is responsible for holding the backend resource gate; this
+/// function must not acquire it (the gate is not reentrant).
+///
+/// `protected` names backend sessions the caller already knows belong to
+/// someone else. Live-daemon callers pass an empty set because registry
+/// ownership is checked directly; the daemon-start restore path has no live
+/// registry yet, so it passes the persisted sharers it computed itself.
+pub(crate) async fn abort_subagent_tree(
+    state: &std::sync::Arc<AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    name: &str,
+    root_backend_session_id: &str,
+    protected: &std::collections::HashSet<String>,
+) -> Result<usize, SubagentSweepFailure> {
+    let port = state.opencode_serve_port();
+    let mut visited: std::collections::HashSet<String> =
+        std::collections::HashSet::from([root_backend_session_id.to_string()]);
+    let mut aborted = 0usize;
+    let mut round = 0usize;
+    loop {
+        round += 1;
+        let mut expanded: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut frontier: Vec<(String, usize)> = vec![(root_backend_session_id.to_string(), 0)];
+        let mut discovered = 0usize;
+        while let Some((backend_session_id, depth)) = frontier.pop() {
+            if !expanded.insert(backend_session_id.clone()) {
+                continue;
+            }
+            let children = list_backend_children(state, port, &backend_session_id).await?;
+            if children.is_empty() {
+                continue;
+            }
+            if depth + 1 > SUBAGENT_SWEEP_MAX_DEPTH {
+                return Err(SubagentSweepFailure {
+                    decision: PromptAsyncFallbackDecision::Ambiguous,
+                    detail: format!(
+                        "subagent tree for session '{name}' is deeper than {SUBAGENT_SWEEP_MAX_DEPTH} levels; not all subagents were aborted"
+                    ),
+                });
+            }
+            for child in children {
+                let is_new = visited.insert(child.clone());
+                if is_new {
+                    if visited.len() > SUBAGENT_SWEEP_MAX_SESSIONS {
+                        return Err(SubagentSweepFailure {
+                            decision: PromptAsyncFallbackDecision::Ambiguous,
+                            detail: format!(
+                                "subagent tree for session '{name}' exceeded {SUBAGENT_SWEEP_MAX_SESSIONS} sessions; not all subagents were aborted"
+                            ),
+                        });
+                    }
+                    discovered += 1;
+                    if protected.contains(&child)
+                        || backend_session_owned_elsewhere(state, owner, &child).await
+                    {
+                        tracing::warn!(
+                            session = %name,
+                            subagent = %child,
+                            "skipping subagent abort: another session owns that backend session"
+                        );
+                    } else {
+                        abort_backend_session(state, port, &child).await?;
+                        aborted += 1;
+                        tracing::info!(session = %name, subagent = %child, "aborted opencode subagent session");
+                    }
+                }
+                frontier.push((child, depth + 1));
+            }
+        }
+        if discovered == 0 {
+            return Ok(aborted);
+        }
+        if round >= SUBAGENT_SWEEP_MAX_ROUNDS {
+            return Err(SubagentSweepFailure {
+                decision: PromptAsyncFallbackDecision::Ambiguous,
+                detail: format!(
+                    "subagents for session '{name}' were still appearing after {SUBAGENT_SWEEP_MAX_ROUNDS} sweeps; not all subagents were aborted"
+                ),
+            });
+        }
+    }
+}
+
+/// Human-facing suffix reporting how much of the subagent tree was aborted.
+fn subagent_report(aborted: usize) -> String {
+    match aborted {
+        0 => ", no subagent sessions".to_string(),
+        1 => ", aborted 1 subagent session".to_string(),
+        n => format!(", aborted {n} subagent sessions"),
     }
 }
 
@@ -1936,6 +2243,7 @@ async fn kill_session_inner(
     // For HttpApi backends (opencode), abort the server-side session BEFORE
     // killing the client process. The attach client is just a TUI — killing
     // it does NOT stop the server from executing the current assistant turn.
+    let mut subagents_aborted = 0usize;
     if is_http_api {
         if !state.owns_stopping_session(&owner, &pane).await {
             let _ = state.abort_lifecycle(&owner).await;
@@ -1994,6 +2302,36 @@ async fn kill_session_inner(
                         format!("opencode abort for session '{name}' failed: {e}"),
                     )
                     .await;
+                }
+            }
+
+            // The parent is aborted and can no longer spawn, so now sweep the
+            // subagent sessions it already spawned. They are separate
+            // server-side sessions, not child processes of the pane, so the
+            // pid kill below would never reach them.
+            let sweep = state
+                .with_owned_backend_cleanup(&owner, oc_sid, || async {
+                    abort_subagent_tree(
+                        state,
+                        &owner,
+                        name,
+                        oc_sid,
+                        &std::collections::HashSet::new(),
+                    )
+                    .await
+                })
+                .await;
+            let Some(sweep) = sweep else {
+                let _ = state.abort_lifecycle(&owner).await;
+                return KillSessionResult::superseded(format!(
+                    "session '{name}' backend exit was superseded before the subagent sweep"
+                ));
+            };
+            match sweep {
+                Ok(aborted) => subagents_aborted = aborted,
+                Err(SubagentSweepFailure { detail, decision }) => {
+                    return resolve_failed_abort(state, &owner, name, oc_sid, decision, detail)
+                        .await;
                 }
             }
         }
@@ -2290,9 +2628,14 @@ async fn kill_session_inner(
         }
     }
 
+    let subagents = if is_http_api {
+        subagent_report(subagents_aborted)
+    } else {
+        String::new()
+    };
     match state.abort_lifecycle(&owner).await {
         Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {
-            KillSessionResult::removed(format!("{msg}, session '{name}' removed"))
+            KillSessionResult::removed(format!("{msg}{subagents}, session '{name}' removed"))
         }
         Ok(outcome) => KillSessionResult::superseded(format!(
             "session '{name}' cleanup completion was superseded ({outcome:?})"
@@ -7584,6 +7927,514 @@ mod tests {
         );
     }
 
+    // ---- opencode subagent sweep -------------------------------------------
+    //
+    // Opencode subagents are separate server-side sessions linked to their
+    // parent only by `parentID`. The pane's process tree does not contain
+    // them, so a kill that only aborts the parent leaves them writing files.
+
+    /// Pane id that no tmux server can resolve, so the kill path's pane work
+    /// short-circuits on `Missing` instead of touching a real pane.
+    const DEAD_PANE: &str = "%999999999";
+
+    #[derive(Clone, Default)]
+    struct SubagentProbe {
+        /// backend session id -> direct children. A missing key answers 404,
+        /// which is how opencode reports a session that no longer exists.
+        children: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>>,
+        /// (trigger id, parent id, child id): the child is attached to the
+        /// parent right after the trigger's children are listed, simulating a
+        /// subagent created while the sweep is already running.
+        late_children: std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+        reject_abort: std::sync::Arc<std::collections::HashSet<String>>,
+        aborted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl SubagentProbe {
+        fn with_tree(tree: &[(&str, &[&str])]) -> Self {
+            Self {
+                children: std::sync::Arc::new(std::sync::Mutex::new(
+                    tree.iter()
+                        .map(|(parent, children)| {
+                            (
+                                (*parent).to_string(),
+                                children.iter().map(|c| (*c).to_string()).collect(),
+                            )
+                        })
+                        .collect(),
+                )),
+                ..Default::default()
+            }
+        }
+
+        fn aborted_ids(&self) -> Vec<String> {
+            self.aborted.lock().unwrap().clone()
+        }
+    }
+
+    async fn probe_children(
+        axum::extract::Path(id): axum::extract::Path<String>,
+        axum::extract::State(probe): axum::extract::State<SubagentProbe>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let response = match probe.children.lock().unwrap().get(&id) {
+            Some(children) => axum::Json(
+                children
+                    .iter()
+                    .map(|child| serde_json::json!({ "id": child, "parentID": id }))
+                    .collect::<Vec<_>>(),
+            )
+            .into_response(),
+            None => axum::http::StatusCode::NOT_FOUND.into_response(),
+        };
+        let due: Vec<(String, String)> = {
+            let mut late = probe.late_children.lock().unwrap();
+            let due = late
+                .iter()
+                .filter(|(trigger, _, _)| *trigger == id)
+                .map(|(_, parent, child)| (parent.clone(), child.clone()))
+                .collect();
+            late.retain(|(trigger, _, _)| *trigger != id);
+            due
+        };
+        let mut children = probe.children.lock().unwrap();
+        for (parent, child) in due {
+            children.entry(parent).or_default().push(child.clone());
+            children.entry(child).or_default();
+        }
+        response
+    }
+
+    async fn probe_abort(
+        axum::extract::Path(id): axum::extract::Path<String>,
+        axum::extract::State(probe): axum::extract::State<SubagentProbe>,
+    ) -> axum::http::StatusCode {
+        probe.aborted.lock().unwrap().push(id.clone());
+        if probe.reject_abort.contains(&id) {
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        } else {
+            axum::http::StatusCode::NO_CONTENT
+        }
+    }
+
+    /// Serve the probe and return a daemon state whose `opencode_serve_port()`
+    /// (daemon port + 320) resolves to it.
+    async fn probe_state(
+        probe: &SubagentProbe,
+        dir: &tempfile::TempDir,
+    ) -> (std::sync::Arc<AppState>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_port = listener.local_addr().unwrap().port();
+        let daemon_port = serve_port.checked_sub(320).unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/session/{session_id}/children",
+                axum::routing::get(probe_children),
+            )
+            .route(
+                "/session/{session_id}/abort",
+                axum::routing::post(probe_abort),
+            )
+            .with_state(probe.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: daemon_port,
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        (state, server)
+    }
+
+    async fn register_http_session(
+        state: &std::sync::Arc<AppState>,
+        id: &str,
+        pane: &str,
+        backend_session_id: &str,
+    ) {
+        state
+            .protocol
+            .write()
+            .await
+            .apply(crate::daemon_protocol::Event::Register {
+                id: id.into(),
+                pane: Some(pane.into()),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some(backend_session_id.into()),
+                    ..Default::default()
+                },
+            });
+    }
+
+    #[tokio::test]
+    async fn http_kill_without_subagents_aborts_only_the_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = SubagentProbe::with_tree(&[("ses_root", &[])]);
+        let (state, server) = probe_state(&probe, &dir).await;
+        register_http_session(&state, "worker", DEAD_PANE, "ses_root").await;
+
+        let result = kill_session(&state, "worker").await;
+
+        assert_eq!(result.outcome, KillOutcome::Removed, "{}", result.message);
+        assert!(
+            result.message.contains("no subagent sessions"),
+            "got: {}",
+            result.message
+        );
+        assert_eq!(probe.aborted_ids(), vec!["ses_root".to_string()]);
+        assert!(state.protocol.read().await.lifecycle_leases.is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_kill_aborts_one_subagent() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = SubagentProbe::with_tree(&[("ses_root", &["ses_child"]), ("ses_child", &[])]);
+        let (state, server) = probe_state(&probe, &dir).await;
+        register_http_session(&state, "worker", DEAD_PANE, "ses_root").await;
+
+        let result = kill_session(&state, "worker").await;
+
+        assert_eq!(result.outcome, KillOutcome::Removed, "{}", result.message);
+        assert!(
+            result.message.contains("aborted 1 subagent session"),
+            "got: {}",
+            result.message
+        );
+        let mut aborted = probe.aborted_ids();
+        aborted.sort();
+        assert_eq!(
+            aborted,
+            vec!["ses_child".to_string(), "ses_root".to_string()]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_kill_aborts_nested_subagents() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = SubagentProbe::with_tree(&[
+            ("ses_root", &["ses_a"]),
+            ("ses_a", &["ses_b"]),
+            ("ses_b", &["ses_c"]),
+            ("ses_c", &[]),
+        ]);
+        let (state, server) = probe_state(&probe, &dir).await;
+        register_http_session(&state, "worker", DEAD_PANE, "ses_root").await;
+
+        let result = kill_session(&state, "worker").await;
+
+        assert_eq!(result.outcome, KillOutcome::Removed, "{}", result.message);
+        assert!(
+            result.message.contains("aborted 3 subagent sessions"),
+            "got: {}",
+            result.message
+        );
+        let mut aborted = probe.aborted_ids();
+        aborted.sort();
+        assert_eq!(
+            aborted,
+            vec![
+                "ses_a".to_string(),
+                "ses_b".to_string(),
+                "ses_c".to_string(),
+                "ses_root".to_string(),
+            ]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_kill_aborts_a_subagent_created_during_the_sweep() {
+        // A subagent can be created while the sweep is walking the tree, so
+        // the tree is re-walked until a round finds nothing new.
+        let dir = tempfile::tempdir().unwrap();
+        let probe = SubagentProbe::with_tree(&[("ses_root", &["ses_a"]), ("ses_a", &[])]);
+        probe.late_children.lock().unwrap().push((
+            "ses_a".into(),
+            "ses_root".into(),
+            "ses_late".into(),
+        ));
+        let (state, server) = probe_state(&probe, &dir).await;
+        register_http_session(&state, "worker", DEAD_PANE, "ses_root").await;
+
+        let result = kill_session(&state, "worker").await;
+
+        assert_eq!(result.outcome, KillOutcome::Removed, "{}", result.message);
+        assert!(
+            result.message.contains("aborted 2 subagent sessions"),
+            "got: {}",
+            result.message
+        );
+        assert!(
+            probe.aborted_ids().contains(&"ses_late".to_string()),
+            "a straggler subagent must still be aborted: {:?}",
+            probe.aborted_ids()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_kill_terminates_on_a_subagent_cycle() {
+        // `parentID` cycles should be impossible, but a visited set is what
+        // keeps a malformed tree from spinning the sweep forever.
+        let dir = tempfile::tempdir().unwrap();
+        let probe = SubagentProbe::with_tree(&[("ses_root", &["ses_a"]), ("ses_a", &["ses_root"])]);
+        let (state, server) = probe_state(&probe, &dir).await;
+        register_http_session(&state, "worker", DEAD_PANE, "ses_root").await;
+
+        let result = kill_session(&state, "worker").await;
+
+        assert_eq!(result.outcome, KillOutcome::Removed, "{}", result.message);
+        assert!(
+            result.message.contains("aborted 1 subagent session"),
+            "got: {}",
+            result.message
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_kill_fails_when_a_subagent_abort_is_unconfirmed() {
+        // A surviving writer must never be reported as a successful kill.
+        let dir = tempfile::tempdir().unwrap();
+        let mut probe =
+            SubagentProbe::with_tree(&[("ses_root", &["ses_child"]), ("ses_child", &[])]);
+        probe.reject_abort =
+            std::sync::Arc::new(std::collections::HashSet::from(["ses_child".to_string()]));
+        let (state, server) = probe_state(&probe, &dir).await;
+        register_http_session(&state, "worker", DEAD_PANE, "ses_root").await;
+
+        let result = kill_session(&state, "worker").await;
+
+        assert_eq!(result.outcome, KillOutcome::Failed, "{}", result.message);
+        assert!(
+            result.message.contains("subagent abort for 'ses_child'"),
+            "got: {}",
+            result.message
+        );
+        let protocol = state.protocol.read().await;
+        assert!(
+            protocol.sessions.contains_key("worker"),
+            "a failed kill must not remove the session row"
+        );
+        assert_eq!(
+            protocol.lifecycle_leases["worker"].phase,
+            crate::daemon_protocol::LifecyclePhase::Stopping,
+            "an ambiguous subagent abort retains stop authority for recovery"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_kill_skips_a_subagent_owned_by_another_session() {
+        // Ownership discipline: the sweep may only abort backend sessions this
+        // owner is responsible for, so a foreign-owned node is a no-op.
+        let dir = tempfile::tempdir().unwrap();
+        let probe = SubagentProbe::with_tree(&[("ses_root", &["ses_child"]), ("ses_child", &[])]);
+        let (state, server) = probe_state(&probe, &dir).await;
+        register_http_session(&state, "worker", DEAD_PANE, "ses_root").await;
+        register_http_session(&state, "sibling", "%999999998", "ses_child").await;
+
+        let result = kill_session(&state, "worker").await;
+
+        assert_eq!(result.outcome, KillOutcome::Removed, "{}", result.message);
+        assert!(
+            result.message.contains("no subagent sessions"),
+            "got: {}",
+            result.message
+        );
+        assert_eq!(probe.aborted_ids(), vec!["ses_root".to_string()]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_owned_kill_never_reaches_the_subagent_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = SubagentProbe::with_tree(&[("ses_root", &["ses_child"]), ("ses_child", &[])]);
+        let (state, server) = probe_state(&probe, &dir).await;
+        register_http_session(&state, "worker", DEAD_PANE, "ses_root").await;
+        let current_owner = state.protocol.read().await.sessions["worker"].owner();
+        let stale_owner = crate::daemon_protocol::ResourceOwner {
+            session_id: current_owner.session_id.clone(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(
+                current_owner.incarnation.0 + 1,
+            ),
+        };
+
+        let result = kill_session_owned(&state, &stale_owner, DEAD_PANE).await;
+
+        assert_eq!(result.outcome, KillOutcome::Superseded);
+        assert!(
+            probe.aborted_ids().is_empty(),
+            "a superseded owner must abort nothing: {:?}",
+            probe.aborted_ids()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn recover_lease_sweeps_subagents_before_releasing_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = SubagentProbe::with_tree(&[("ses_root", &["ses_child"]), ("ses_child", &[])]);
+        let (state, server) = probe_state(&probe, &dir).await;
+        register_http_session(&state, "worker", DEAD_PANE, "ses_root").await;
+        let owner = state.protocol.read().await.sessions["worker"].owner();
+        assert_eq!(
+            state
+                .claim_existing_stop(&owner, DEAD_PANE, true)
+                .await
+                .unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+
+        let result = recover_lease(&state, "worker").await;
+
+        assert_eq!(result.outcome, KillOutcome::Recovered, "{}", result.message);
+        assert!(
+            result.message.contains("aborted 1 subagent session"),
+            "got: {}",
+            result.message
+        );
+        let mut aborted = probe.aborted_ids();
+        aborted.sort();
+        assert_eq!(
+            aborted,
+            vec!["ses_child".to_string(), "ses_root".to_string()]
+        );
+        assert!(state.protocol.read().await.lifecycle_leases.is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn recover_lease_retains_authority_when_a_subagent_abort_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut probe =
+            SubagentProbe::with_tree(&[("ses_root", &["ses_child"]), ("ses_child", &[])]);
+        probe.reject_abort =
+            std::sync::Arc::new(std::collections::HashSet::from(["ses_child".to_string()]));
+        let (state, server) = probe_state(&probe, &dir).await;
+        register_http_session(&state, "worker", DEAD_PANE, "ses_root").await;
+        let owner = state.protocol.read().await.sessions["worker"].owner();
+        assert_eq!(
+            state
+                .claim_existing_stop(&owner, DEAD_PANE, true)
+                .await
+                .unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+
+        let result = recover_lease(&state, "worker").await;
+
+        assert_eq!(result.outcome, KillOutcome::Failed, "{}", result.message);
+        assert!(
+            result.message.contains("subagent sweep"),
+            "got: {}",
+            result.message
+        );
+        assert_eq!(
+            state.protocol.read().await.lifecycle_leases["worker"].phase,
+            crate::daemon_protocol::LifecyclePhase::Stopping,
+        );
+        server.abort();
+    }
+
+    /// Put `id` into the state a quarantining daemon start leaves behind: a
+    /// held `Stopping` lease carrying a sweep-failure reason.
+    async fn quarantine_lease(state: &std::sync::Arc<AppState>, id: &str, reason: &str) {
+        let mut protocol = state.protocol.write().await;
+        protocol
+            .lifecycle_leases
+            .get_mut(id)
+            .expect("a lease must be held before it can be quarantined")
+            .sweep_unconfirmed = Some(reason.to_string());
+    }
+
+    #[tokio::test]
+    async fn recover_lease_clears_the_quarantine_on_a_confirmed_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = SubagentProbe::with_tree(&[("ses_root", &["ses_child"]), ("ses_child", &[])]);
+        let (state, server) = probe_state(&probe, &dir).await;
+        register_http_session(&state, "worker", DEAD_PANE, "ses_root").await;
+        let owner = state.protocol.read().await.sessions["worker"].owner();
+        assert_eq!(
+            state
+                .claim_existing_stop(&owner, DEAD_PANE, true)
+                .await
+                .unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        quarantine_lease(&state, "worker", "sweep did not complete at daemon start").await;
+
+        let result = recover_lease(&state, "worker").await;
+
+        assert_eq!(result.outcome, KillOutcome::Recovered, "{}", result.message);
+        let protocol = state.protocol.read().await;
+        assert!(
+            protocol.lifecycle_leases.is_empty(),
+            "releasing the lease clears the quarantine with it"
+        );
+        assert!(
+            crate::persistence::load_sessions(dir.path())
+                .unwrap()
+                .lifecycle_leases
+                .is_empty(),
+            "the cleared quarantine must be durable"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn recover_lease_keeps_and_refreshes_the_quarantine_when_the_sweep_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut probe =
+            SubagentProbe::with_tree(&[("ses_root", &["ses_child"]), ("ses_child", &[])]);
+        probe.reject_abort =
+            std::sync::Arc::new(std::collections::HashSet::from(["ses_child".to_string()]));
+        let (state, server) = probe_state(&probe, &dir).await;
+        register_http_session(&state, "worker", DEAD_PANE, "ses_root").await;
+        let owner = state.protocol.read().await.sessions["worker"].owner();
+        assert_eq!(
+            state
+                .claim_existing_stop(&owner, DEAD_PANE, true)
+                .await
+                .unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        quarantine_lease(&state, "worker", "stale reason from daemon start").await;
+
+        let result = recover_lease(&state, "worker").await;
+
+        assert_eq!(result.outcome, KillOutcome::Failed, "{}", result.message);
+        assert!(
+            result.message.contains("stays quarantined"),
+            "got: {}",
+            result.message
+        );
+        let reason = state.protocol.read().await.lifecycle_leases["worker"]
+            .sweep_unconfirmed
+            .clone()
+            .expect("a failed retry must keep the quarantine");
+        assert!(
+            reason.contains("ses_child"),
+            "the quarantine must carry this attempt's reason: {reason}"
+        );
+        assert_eq!(
+            crate::persistence::load_sessions(dir.path())
+                .unwrap()
+                .lifecycle_leases["worker"]
+                .sweep_unconfirmed
+                .as_deref(),
+            Some(reason.as_str()),
+            "the refreshed quarantine must survive a restart"
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn recover_lease_reports_when_nothing_is_held() {
         let state = AppState::new_for_test();
@@ -10424,6 +11275,7 @@ mod tests {
                     project_dir_cleanup_on_abandon: false,
                     inert_pane: None,
                     inert_pane_owner: None,
+                    sweep_unconfirmed: None,
                 },
             );
         }

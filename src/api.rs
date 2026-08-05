@@ -201,6 +201,27 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
             })
         })
         .collect();
+    // A quarantined lease holds a public ID that no session row explains: the
+    // row may already be dormant while a possibly-live opencode subagent keeps
+    // writing. Surface it with its reason so an operator does not have to read
+    // daemon.log to find out why the name is locked.
+    let quarantined_list: Vec<_> = proto
+        .lifecycle_leases
+        .iter()
+        .filter_map(|(id, lease)| {
+            lease.sweep_unconfirmed.as_ref().map(|reason| {
+                json!({
+                    "id": id,
+                    "session_incarnation": lease.owner.incarnation.to_string(),
+                    "phase": format!("{:?}", lease.phase),
+                    "backend": lease.backend,
+                    "backend_session_id": lease.backend_session_id,
+                    "reason": reason,
+                    "recover_with": format!("ouija recover-lease {id}"),
+                })
+            })
+        })
+        .collect();
     drop(proto);
 
     let nodes_list: Vec<_> = nodes
@@ -245,6 +266,7 @@ pub async fn status(State(state): State<SharedState>) -> Json<serde_json::Value>
         "transport": compat_transport,
         "endpoint_id": compat_endpoint_id,
         "sessions": sessions_list,
+        "quarantined_sessions": quarantined_list,
         "nodes": nodes_list,
         "assistant_panes": assistant_panes,
     }))

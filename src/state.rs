@@ -14235,6 +14235,7 @@ pub(crate) mod tests {
                 project_dir_cleanup_on_abandon: false,
                 inert_pane: None,
                 inert_pane_owner: None,
+                sweep_unconfirmed: None,
             },
         );
 

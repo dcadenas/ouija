@@ -1858,6 +1858,14 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
             }
         }
 
+        // Leases whose subagent sweep could not be confirmed. They keep their
+        // public ID locked instead of being released, and the daemon still
+        // boots — see `LifecycleLease::sweep_unconfirmed`.
+        let mut quarantined: std::collections::BTreeMap<
+            String,
+            crate::daemon_protocol::LifecycleLease,
+        > = std::collections::BTreeMap::new();
+
         // A durable Stopping lease can outlive its registry row. Finish the
         // exact HTTP-backend abort obligation before releasing any pane,
         // worktree, row, or public-ID authority. A different persisted owner
@@ -1920,7 +1928,67 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
                     response.status()
                 );
             }
+
+            // Aborting the parent leaves its opencode subagents running: they
+            // are separate server-side sessions, so nothing else in restore
+            // reaches them and they would keep writing in the worktree while
+            // the daemon reports a clean start. The registry is not populated
+            // yet, so the persisted sharers computed above stand in for the
+            // live ownership check the sweep would otherwise do.
+            let protected: std::collections::HashSet<String> = sessions
+                .iter()
+                .filter(|session| !abandoned_lease_owns_staged_row(session, lease))
+                .filter_map(|session| session.metadata.backend_session_id.clone())
+                .chain(
+                    dormant_sessions
+                        .values()
+                        .filter_map(|dormant| dormant.metadata.backend_session_id.clone()),
+                )
+                .collect();
+            let sweep = crate::nostr_transport::abort_subagent_tree(
+                state,
+                &lease.owner,
+                &lease.owner.session_id,
+                backend_session_id,
+                &protected,
+            )
+            .await;
+            let subagents_aborted = match sweep {
+                Ok(subagents_aborted) => subagents_aborted,
+                Err(failure) => {
+                    // Quarantine instead of failing startup: propagating here
+                    // would restart-loop the daemon under systemd forever and
+                    // take every unrelated session on the host down with it.
+                    let reason = format!(
+                        "subagent sweep for abandoned session '{backend_session_id}' did not complete: {}",
+                        failure.detail
+                    );
+                    tracing::error!(
+                        session = %lease.owner.session_id,
+                        backend_session_id,
+                        "quarantining lifecycle lease: {reason}"
+                    );
+                    let mut quarantined_lease = lease.clone();
+                    quarantined_lease.sweep_unconfirmed = Some(reason);
+                    quarantined.insert(lease.owner.session_id.clone(), quarantined_lease);
+                    continue;
+                }
+            };
+            tracing::info!(
+                backend_session_id,
+                subagents_aborted,
+                "swept subagents of abandoned backend session"
+            );
         }
+
+        // A quarantined lease keeps every resource it holds. Its pane, staged
+        // row, worktree and public ID stay claimed until an operator retries
+        // the sweep with `ouija recover-lease`, so it is excluded from all the
+        // reconciliation below.
+        let abandoned_leases: Vec<_> = abandoned_leases
+            .into_iter()
+            .filter(|lease| !quarantined.contains_key(&lease.owner.session_id))
+            .collect();
 
         let inert_panes: Vec<_> = abandoned_leases
             .iter()
@@ -2043,6 +2111,11 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
             for lease in &abandoned_leases {
                 proto.abort_lifecycle(&lease.owner);
             }
+            // Carry the quarantine reason into the live lease so status and
+            // `ouija ls` can show why the ID is locked.
+            for (id, lease) in &quarantined {
+                proto.lifecycle_leases.insert(id.clone(), lease.clone());
+            }
         }
         persistence::save_sessions(
             &state.config.data_dir,
@@ -2050,7 +2123,7 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
                 sessions.clone(),
                 dormant_sessions.clone(),
                 incarnation_high_water,
-                std::collections::BTreeMap::new(),
+                quarantined.clone(),
             )
             // Reply obligations are not lifecycle authority and must survive
             // this reconciliation; omitting them here would silently wipe every
@@ -3554,6 +3627,21 @@ fn local_incarnation_hint() -> anyhow::Result<Option<u64>> {
 }
 
 fn project_session_list(status: &serde_json::Value) -> serde_json::Value {
+    // Quarantined public IDs: a lease the daemon could not confirm clean. The
+    // matching session row may already be gone, so the list is reported on its
+    // own as well as flagged inline on any row that survives.
+    let quarantined: Vec<&serde_json::Value> = status
+        .get("quarantined_sessions")
+        .and_then(|value| value.as_array())
+        .map(|entries| entries.iter().collect())
+        .unwrap_or_default();
+    let quarantine_reason = |id: &str| -> Option<String> {
+        quarantined
+            .iter()
+            .find(|entry| entry.get("id").and_then(|v| v.as_str()) == Some(id))
+            .and_then(|entry| entry.get("reason").and_then(|v| v.as_str()))
+            .map(str::to_owned)
+    };
     let sessions = status
         .get("sessions")
         .and_then(|sessions| sessions.as_array())
@@ -3620,13 +3708,30 @@ fn project_session_list(status: &serde_json::Value) -> serde_json::Value {
                         }
                     }
 
+                    if let Some(reason) = session
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .and_then(quarantine_reason)
+                    {
+                        projected.insert("quarantined".to_string(), serde_json::Value::Bool(true));
+                        projected
+                            .insert("quarantine_reason".to_string(), serde_json::json!(reason));
+                    }
+
                     serde_json::Value::Object(projected)
                 })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
 
-    serde_json::json!({ "sessions": sessions })
+    if quarantined.is_empty() {
+        serde_json::json!({ "sessions": sessions })
+    } else {
+        serde_json::json!({
+            "sessions": sessions,
+            "quarantined_sessions": quarantined,
+        })
+    }
 }
 
 async fn cli_post(path: &str, body: &serde_json::Value) -> anyhow::Result<()> {
@@ -5173,6 +5278,7 @@ mod tests {
             project_dir_cleanup_on_abandon: false,
             inert_pane: None,
             inert_pane_owner: None,
+            sweep_unconfirmed: None,
         };
         let snapshot = crate::persistence::PersistedLifecycleState::new(
             vec![],
@@ -5274,6 +5380,7 @@ mod tests {
             project_dir_cleanup_on_abandon: true,
             inert_pane: None,
             inert_pane_owner: None,
+            sweep_unconfirmed: None,
         };
         let snapshot = crate::persistence::PersistedLifecycleState::new(
             vec![],
@@ -5571,6 +5678,7 @@ mod tests {
                     project_dir_cleanup_on_abandon: true,
                     inert_pane: None,
                     inert_pane_owner: None,
+                    sweep_unconfirmed: None,
                 },
             )]),
         );
@@ -5686,6 +5794,7 @@ mod tests {
                     project_dir_cleanup_on_abandon: false,
                     inert_pane: None,
                     inert_pane_owner: None,
+                    sweep_unconfirmed: None,
                 },
             )]),
         );
@@ -5788,6 +5897,7 @@ mod tests {
                     project_dir_cleanup_on_abandon: true,
                     inert_pane: None,
                     inert_pane_owner: None,
+                    sweep_unconfirmed: None,
                 },
             )]),
         );
@@ -5880,6 +5990,7 @@ mod tests {
                     project_dir_cleanup_on_abandon: true,
                     inert_pane: Some("%999999999".into()),
                     inert_pane_owner: Some(owner.clone()),
+                    sweep_unconfirmed: None,
                 },
             )]),
         );
@@ -5983,6 +6094,7 @@ mod tests {
                         project_dir_cleanup_on_abandon: false,
                         inert_pane: pane.map(str::to_owned),
                         inert_pane_owner: pane.map(|_| owner.clone()),
+                        sweep_unconfirmed: None,
                     },
                 )]),
             );
@@ -6006,6 +6118,383 @@ mod tests {
             );
             server.abort();
         }
+    }
+
+    // ---- abandoned-lease subagent sweep ------------------------------------
+    //
+    // Opencode subagents are separate server-side sessions. A daemon restart
+    // that replays only the parent abort leaves them running, which is the
+    // worst doorway for this defect: nobody is watching a restart.
+
+    #[derive(Clone)]
+    struct RestoreSubagentProbe {
+        children: std::collections::HashMap<String, Vec<String>>,
+        reject_abort: std::collections::HashSet<String>,
+        aborted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    async fn restore_probe_children(
+        axum::extract::Path(id): axum::extract::Path<String>,
+        axum::extract::State(probe): axum::extract::State<RestoreSubagentProbe>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        match probe.children.get(&id) {
+            Some(children) => axum::Json(
+                children
+                    .iter()
+                    .map(|child| serde_json::json!({ "id": child, "parentID": id }))
+                    .collect::<Vec<_>>(),
+            )
+            .into_response(),
+            None => axum::http::StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    async fn restore_probe_abort(
+        axum::extract::Path(id): axum::extract::Path<String>,
+        axum::extract::State(probe): axum::extract::State<RestoreSubagentProbe>,
+    ) -> axum::http::StatusCode {
+        probe.aborted.lock().unwrap().push(id.clone());
+        if probe.reject_abort.contains(&id) {
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        } else {
+            axum::http::StatusCode::NO_CONTENT
+        }
+    }
+
+    /// Persist one abandoned Stopping lease for `ses_worker` and serve `probe`
+    /// on the daemon's opencode port.
+    async fn restore_state_with_stopping_lease(
+        dir: &tempfile::TempDir,
+        probe: &RestoreSubagentProbe,
+    ) -> (crate::state::SharedState, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_port = listener.local_addr().unwrap().port();
+        let daemon_port = serve_port.checked_sub(320).unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/session/{session_id}/children",
+                axum::routing::get(restore_probe_children),
+            )
+            .route(
+                "/session/{session_id}/abort",
+                axum::routing::post(restore_probe_abort),
+            )
+            .with_state(probe.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(7),
+        };
+        let snapshot = crate::persistence::PersistedLifecycleState::new(
+            vec![],
+            std::collections::BTreeMap::new(),
+            owner.incarnation,
+            std::collections::BTreeMap::from([(
+                owner.session_id.clone(),
+                crate::daemon_protocol::LifecycleLease {
+                    owner: owner.clone(),
+                    phase: crate::daemon_protocol::LifecyclePhase::Stopping,
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_worker".into()),
+                    backend_session_owner: Some(owner),
+                    restart_target_owner: None,
+                    restart_previous: None,
+                    project_dir: None,
+                    project_dir_owner: None,
+                    project_dir_cleanup_on_abandon: false,
+                    inert_pane: None,
+                    inert_pane_owner: None,
+                    sweep_unconfirmed: None,
+                },
+            )]),
+        );
+        crate::persistence::save_sessions(dir.path(), &snapshot).unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: daemon_port,
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+        (state, server)
+    }
+
+    #[tokio::test]
+    async fn restore_sweeps_nested_subagents_of_an_abandoned_stopping_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = RestoreSubagentProbe {
+            children: std::collections::HashMap::from([
+                ("ses_worker".to_string(), vec!["ses_a".to_string()]),
+                ("ses_a".to_string(), vec!["ses_b".to_string()]),
+                ("ses_b".to_string(), vec![]),
+            ]),
+            reject_abort: std::collections::HashSet::new(),
+            aborted: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let (state, server) = restore_state_with_stopping_lease(&dir, &probe).await;
+
+        restore_persisted_sessions(&state).await.unwrap();
+
+        let mut aborted = probe.aborted.lock().unwrap().clone();
+        aborted.sort();
+        assert_eq!(
+            aborted,
+            vec![
+                "ses_a".to_string(),
+                "ses_b".to_string(),
+                "ses_worker".to_string()
+            ],
+            "restore must abort the parent and every nested subagent"
+        );
+        assert!(
+            crate::persistence::load_sessions(dir.path())
+                .unwrap()
+                .lifecycle_leases
+                .is_empty()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn restore_quarantines_an_unconfirmed_sweep_and_still_boots() {
+        // Fail-closed for the one session, open for the host: propagating the
+        // error here would restart-loop the daemon under systemd forever.
+        let dir = tempfile::tempdir().unwrap();
+        let probe = RestoreSubagentProbe {
+            children: std::collections::HashMap::from([
+                ("ses_worker".to_string(), vec!["ses_child".to_string()]),
+                ("ses_child".to_string(), vec![]),
+            ]),
+            reject_abort: std::collections::HashSet::from(["ses_child".to_string()]),
+            aborted: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let (state, server) = restore_state_with_stopping_lease(&dir, &probe).await;
+
+        restore_persisted_sessions(&state)
+            .await
+            .expect("an unconfirmed sweep must not fail daemon startup");
+
+        let persisted = crate::persistence::load_sessions(dir.path()).unwrap();
+        let lease = persisted
+            .lifecycle_leases
+            .get("worker")
+            .expect("a quarantined lease must be retained on disk");
+        assert_eq!(
+            lease.phase,
+            crate::daemon_protocol::LifecyclePhase::Stopping
+        );
+        assert!(
+            lease.sweep_unconfirmed.as_deref().is_some_and(
+                |reason| reason.contains("subagent sweep for abandoned session 'ses_worker'")
+            ),
+            "the quarantine must carry the reason: {:?}",
+            lease.sweep_unconfirmed
+        );
+        let protocol = state.protocol.read().await;
+        assert_eq!(
+            protocol.lifecycle_leases["worker"]
+                .sweep_unconfirmed
+                .as_deref(),
+            lease.sweep_unconfirmed.as_deref(),
+            "the live lease must carry the same reason as the persisted one"
+        );
+        // Fail-closed on the public ID: it stays unusable while quarantined.
+        let mut probe_protocol = protocol.clone();
+        drop(protocol);
+        assert!(matches!(
+            probe_protocol.clone().reserve_start("worker").unwrap(),
+            crate::daemon_protocol::StartDisposition::InProgress(_)
+        ));
+        let effects = probe_protocol.apply(crate::daemon_protocol::Event::Register {
+            id: "worker".into(),
+            pane: Some("%42".into()),
+            metadata: Default::default(),
+        });
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                crate::daemon_protocol::Effect::RegisterFailed { session_id, .. }
+                    if session_id == "worker"
+            )),
+            "a quarantined ID must not be adoptable: {effects:?}"
+        );
+        let owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(7),
+        };
+        assert_eq!(
+            probe_protocol.claim_existing_stop(&owner, "%42", true),
+            crate::daemon_protocol::LifecycleMutationOutcome::Rejected,
+            "a quarantined ID must not be reapable"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn quarantined_lease_is_reported_by_status_and_ls() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = RestoreSubagentProbe {
+            children: std::collections::HashMap::from([
+                ("ses_worker".to_string(), vec!["ses_child".to_string()]),
+                ("ses_child".to_string(), vec![]),
+            ]),
+            reject_abort: std::collections::HashSet::from(["ses_child".to_string()]),
+            aborted: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let (state, server) = restore_state_with_stopping_lease(&dir, &probe).await;
+        restore_persisted_sessions(&state).await.unwrap();
+
+        let axum::Json(status) = crate::api::status(axum::extract::State(state.clone())).await;
+
+        let quarantined = status["quarantined_sessions"].as_array().unwrap();
+        assert_eq!(quarantined.len(), 1, "got: {status}");
+        assert_eq!(quarantined[0]["id"], "worker");
+        assert_eq!(quarantined[0]["backend_session_id"], "ses_worker");
+        assert_eq!(quarantined[0]["recover_with"], "ouija recover-lease worker");
+        assert!(
+            quarantined[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("subagent sweep"),
+            "got: {}",
+            quarantined[0]["reason"]
+        );
+
+        // `ouija ls` renders the projection, so the operator sees it there too.
+        let listed = project_session_list(&status);
+        assert_eq!(
+            listed["quarantined_sessions"], status["quarantined_sessions"],
+            "ls must carry the quarantine list verbatim"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn ls_flags_a_surviving_row_of_a_quarantined_session() {
+        let status = serde_json::json!({
+            "sessions": [
+                { "id": "worker", "origin": "local" },
+                { "id": "other", "origin": "local" },
+            ],
+            "quarantined_sessions": [
+                { "id": "worker", "reason": "subagent sweep did not complete" },
+            ],
+        });
+
+        let listed = project_session_list(&status);
+
+        let sessions = listed["sessions"].as_array().unwrap();
+        assert_eq!(sessions[0]["quarantined"], serde_json::json!(true));
+        assert_eq!(
+            sessions[0]["quarantine_reason"],
+            "subagent sweep did not complete"
+        );
+        assert!(
+            sessions[1].get("quarantined").is_none(),
+            "an unaffected session must not be flagged"
+        );
+    }
+
+    #[test]
+    fn ls_omits_the_quarantine_list_when_nothing_is_quarantined() {
+        let status = serde_json::json!({
+            "sessions": [{ "id": "worker", "origin": "local" }],
+            "quarantined_sessions": [],
+        });
+
+        let listed = project_session_list(&status);
+
+        assert!(listed.get("quarantined_sessions").is_none());
+        assert!(listed["sessions"][0].get("quarantined").is_none());
+    }
+
+    #[tokio::test]
+    async fn restore_never_aborts_a_subagent_owned_by_a_persisted_session() {
+        // The registry is empty during restore, so the persisted-sharer set is
+        // the only ownership evidence the sweep can use.
+        let dir = tempfile::tempdir().unwrap();
+        let probe = RestoreSubagentProbe {
+            children: std::collections::HashMap::from([
+                ("ses_worker".to_string(), vec!["ses_child".to_string()]),
+                ("ses_child".to_string(), vec![]),
+            ]),
+            reject_abort: std::collections::HashSet::new(),
+            aborted: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serve_port = listener.local_addr().unwrap().port();
+        let daemon_port = serve_port.checked_sub(320).unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/session/{session_id}/children",
+                axum::routing::get(restore_probe_children),
+            )
+            .route(
+                "/session/{session_id}/abort",
+                axum::routing::post(restore_probe_abort),
+            )
+            .with_state(probe.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(7),
+        };
+        let snapshot = crate::persistence::PersistedLifecycleState::new(
+            vec![crate::persistence::PersistedSession {
+                id: "neighbour".into(),
+                pane: None,
+                registered_at: chrono::Utc::now(),
+                last_activity_at: chrono::Utc::now(),
+                metadata: crate::state::SessionMetadata {
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_child".into()),
+                    session_incarnation: crate::daemon_protocol::SessionIncarnation(6),
+                    ..Default::default()
+                },
+            }],
+            std::collections::BTreeMap::new(),
+            owner.incarnation,
+            std::collections::BTreeMap::from([(
+                owner.session_id.clone(),
+                crate::daemon_protocol::LifecycleLease {
+                    owner: owner.clone(),
+                    phase: crate::daemon_protocol::LifecyclePhase::Stopping,
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_worker".into()),
+                    backend_session_owner: Some(owner),
+                    restart_target_owner: None,
+                    restart_previous: None,
+                    project_dir: None,
+                    project_dir_owner: None,
+                    project_dir_cleanup_on_abandon: false,
+                    inert_pane: None,
+                    inert_pane_owner: None,
+                    sweep_unconfirmed: None,
+                },
+            )]),
+        );
+        crate::persistence::save_sessions(dir.path(), &snapshot).unwrap();
+        let state = crate::state::AppState::new(crate::config::OuijaConfig {
+            name: "test".into(),
+            npub: "npub1test".into(),
+            port: daemon_port,
+            data_dir: dir.path().to_path_buf(),
+            config_dir: dir.path().to_path_buf(),
+        });
+
+        restore_persisted_sessions(&state).await.unwrap();
+
+        assert_eq!(
+            probe.aborted.lock().unwrap().clone(),
+            vec!["ses_worker".to_string()],
+            "a subagent owned by a persisted session must not be aborted"
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -6049,6 +6538,7 @@ mod tests {
                     project_dir_cleanup_on_abandon: false,
                     inert_pane: None,
                     inert_pane_owner: None,
+                    sweep_unconfirmed: None,
                 },
             )]),
         );
@@ -6118,6 +6608,7 @@ mod tests {
                     project_dir_cleanup_on_abandon: false,
                     inert_pane: None,
                     inert_pane_owner: None,
+                    sweep_unconfirmed: None,
                 },
             )]),
         );
@@ -6339,6 +6830,7 @@ mod tests {
                     project_dir_cleanup_on_abandon: false,
                     inert_pane: None,
                     inert_pane_owner: None,
+                    sweep_unconfirmed: None,
                 },
             )]),
         );
@@ -6418,6 +6910,7 @@ mod tests {
                         project_dir_cleanup_on_abandon: false,
                         inert_pane: None,
                         inert_pane_owner: None,
+                        sweep_unconfirmed: None,
                     },
                 ),
                 (
@@ -6435,6 +6928,7 @@ mod tests {
                         project_dir_cleanup_on_abandon: false,
                         inert_pane: None,
                         inert_pane_owner: None,
+                        sweep_unconfirmed: None,
                     },
                 ),
             ]),
@@ -6636,6 +7130,7 @@ mod tests {
             project_dir_cleanup_on_abandon: false,
             inert_pane: Some("%fallback".into()),
             inert_pane_owner: Some(owner),
+            sweep_unconfirmed: None,
         };
 
         assert!(abandoned_lease_owns_staged_row(&session, &lease));
@@ -6664,6 +7159,7 @@ mod tests {
             project_dir_cleanup_on_abandon: false,
             inert_pane: Some("%existing".into()),
             inert_pane_owner: Some(staged.clone()),
+            sweep_unconfirmed: None,
         };
 
         assert_eq!(lifecycle_lease_pane_owners(&lease), vec![incumbent, staged]);
