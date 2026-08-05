@@ -1858,6 +1858,14 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
             }
         }
 
+        // Leases whose subagent sweep could not be confirmed. They keep their
+        // public ID locked instead of being released, and the daemon still
+        // boots — see `LifecycleLease::sweep_unconfirmed`.
+        let mut quarantined: std::collections::BTreeMap<
+            String,
+            crate::daemon_protocol::LifecycleLease,
+        > = std::collections::BTreeMap::new();
+
         // A durable Stopping lease can outlive its registry row. Finish the
         // exact HTTP-backend abort obligation before releasing any pane,
         // worktree, row, or public-ID authority. A different persisted owner
@@ -1937,26 +1945,50 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
                         .filter_map(|dormant| dormant.metadata.backend_session_id.clone()),
                 )
                 .collect();
-            let subagents_aborted = crate::nostr_transport::abort_subagent_tree(
+            let sweep = crate::nostr_transport::abort_subagent_tree(
                 state,
                 &lease.owner,
                 &lease.owner.session_id,
                 backend_session_id,
                 &protected,
             )
-            .await
-            .map_err(|failure| {
-                anyhow::anyhow!(
-                    "subagent sweep for abandoned session '{backend_session_id}' did not complete: {}",
-                    failure.detail
-                )
-            })?;
+            .await;
+            let subagents_aborted = match sweep {
+                Ok(subagents_aborted) => subagents_aborted,
+                Err(failure) => {
+                    // Quarantine instead of failing startup: propagating here
+                    // would restart-loop the daemon under systemd forever and
+                    // take every unrelated session on the host down with it.
+                    let reason = format!(
+                        "subagent sweep for abandoned session '{backend_session_id}' did not complete: {}",
+                        failure.detail
+                    );
+                    tracing::error!(
+                        session = %lease.owner.session_id,
+                        backend_session_id,
+                        "quarantining lifecycle lease: {reason}"
+                    );
+                    let mut quarantined_lease = lease.clone();
+                    quarantined_lease.sweep_unconfirmed = Some(reason);
+                    quarantined.insert(lease.owner.session_id.clone(), quarantined_lease);
+                    continue;
+                }
+            };
             tracing::info!(
                 backend_session_id,
                 subagents_aborted,
                 "swept subagents of abandoned backend session"
             );
         }
+
+        // A quarantined lease keeps every resource it holds. Its pane, staged
+        // row, worktree and public ID stay claimed until an operator retries
+        // the sweep with `ouija recover-lease`, so it is excluded from all the
+        // reconciliation below.
+        let abandoned_leases: Vec<_> = abandoned_leases
+            .into_iter()
+            .filter(|lease| !quarantined.contains_key(&lease.owner.session_id))
+            .collect();
 
         let inert_panes: Vec<_> = abandoned_leases
             .iter()
@@ -2079,6 +2111,11 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
             for lease in &abandoned_leases {
                 proto.abort_lifecycle(&lease.owner);
             }
+            // Carry the quarantine reason into the live lease so status and
+            // `ouija ls` can show why the ID is locked.
+            for (id, lease) in &quarantined {
+                proto.lifecycle_leases.insert(id.clone(), lease.clone());
+            }
         }
         persistence::save_sessions(
             &state.config.data_dir,
@@ -2086,7 +2123,7 @@ async fn restore_persisted_sessions(state: &state::SharedState) -> anyhow::Resul
                 sessions.clone(),
                 dormant_sessions.clone(),
                 incarnation_high_water,
-                std::collections::BTreeMap::new(),
+                quarantined.clone(),
             )
             // Reply obligations are not lifecycle authority and must survive
             // this reconciliation; omitting them here would silently wipe every
@@ -3590,6 +3627,21 @@ fn local_incarnation_hint() -> anyhow::Result<Option<u64>> {
 }
 
 fn project_session_list(status: &serde_json::Value) -> serde_json::Value {
+    // Quarantined public IDs: a lease the daemon could not confirm clean. The
+    // matching session row may already be gone, so the list is reported on its
+    // own as well as flagged inline on any row that survives.
+    let quarantined: Vec<&serde_json::Value> = status
+        .get("quarantined_sessions")
+        .and_then(|value| value.as_array())
+        .map(|entries| entries.iter().collect())
+        .unwrap_or_default();
+    let quarantine_reason = |id: &str| -> Option<String> {
+        quarantined
+            .iter()
+            .find(|entry| entry.get("id").and_then(|v| v.as_str()) == Some(id))
+            .and_then(|entry| entry.get("reason").and_then(|v| v.as_str()))
+            .map(str::to_owned)
+    };
     let sessions = status
         .get("sessions")
         .and_then(|sessions| sessions.as_array())
@@ -3656,13 +3708,30 @@ fn project_session_list(status: &serde_json::Value) -> serde_json::Value {
                         }
                     }
 
+                    if let Some(reason) = session
+                        .get("id")
+                        .and_then(|id| id.as_str())
+                        .and_then(quarantine_reason)
+                    {
+                        projected.insert("quarantined".to_string(), serde_json::Value::Bool(true));
+                        projected
+                            .insert("quarantine_reason".to_string(), serde_json::json!(reason));
+                    }
+
                     serde_json::Value::Object(projected)
                 })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
 
-    serde_json::json!({ "sessions": sessions })
+    if quarantined.is_empty() {
+        serde_json::json!({ "sessions": sessions })
+    } else {
+        serde_json::json!({
+            "sessions": sessions,
+            "quarantined_sessions": quarantined,
+        })
+    }
 }
 
 async fn cli_post(path: &str, body: &serde_json::Value) -> anyhow::Result<()> {
@@ -5209,6 +5278,7 @@ mod tests {
             project_dir_cleanup_on_abandon: false,
             inert_pane: None,
             inert_pane_owner: None,
+            sweep_unconfirmed: None,
         };
         let snapshot = crate::persistence::PersistedLifecycleState::new(
             vec![],
@@ -5310,6 +5380,7 @@ mod tests {
             project_dir_cleanup_on_abandon: true,
             inert_pane: None,
             inert_pane_owner: None,
+            sweep_unconfirmed: None,
         };
         let snapshot = crate::persistence::PersistedLifecycleState::new(
             vec![],
@@ -5607,6 +5678,7 @@ mod tests {
                     project_dir_cleanup_on_abandon: true,
                     inert_pane: None,
                     inert_pane_owner: None,
+                    sweep_unconfirmed: None,
                 },
             )]),
         );
@@ -5722,6 +5794,7 @@ mod tests {
                     project_dir_cleanup_on_abandon: false,
                     inert_pane: None,
                     inert_pane_owner: None,
+                    sweep_unconfirmed: None,
                 },
             )]),
         );
@@ -5824,6 +5897,7 @@ mod tests {
                     project_dir_cleanup_on_abandon: true,
                     inert_pane: None,
                     inert_pane_owner: None,
+                    sweep_unconfirmed: None,
                 },
             )]),
         );
@@ -5916,6 +5990,7 @@ mod tests {
                     project_dir_cleanup_on_abandon: true,
                     inert_pane: Some("%999999999".into()),
                     inert_pane_owner: Some(owner.clone()),
+                    sweep_unconfirmed: None,
                 },
             )]),
         );
@@ -6019,6 +6094,7 @@ mod tests {
                         project_dir_cleanup_on_abandon: false,
                         inert_pane: pane.map(str::to_owned),
                         inert_pane_owner: pane.map(|_| owner.clone()),
+                        sweep_unconfirmed: None,
                     },
                 )]),
             );
@@ -6131,6 +6207,7 @@ mod tests {
                     project_dir_cleanup_on_abandon: false,
                     inert_pane: None,
                     inert_pane_owner: None,
+                    sweep_unconfirmed: None,
                 },
             )]),
         );
@@ -6182,9 +6259,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_fails_closed_when_an_abandoned_subagent_abort_is_unconfirmed() {
-        // Same posture as the parent abort: startup must not proceed as if
-        // cleanup succeeded while a subagent may still be writing.
+    async fn restore_quarantines_an_unconfirmed_sweep_and_still_boots() {
+        // Fail-closed for the one session, open for the host: propagating the
+        // error here would restart-loop the daemon under systemd forever.
         let dir = tempfile::tempdir().unwrap();
         let probe = RestoreSubagentProbe {
             children: std::collections::HashMap::from([
@@ -6196,20 +6273,142 @@ mod tests {
         };
         let (state, server) = restore_state_with_stopping_lease(&dir, &probe).await;
 
-        let error = restore_persisted_sessions(&state).await.unwrap_err();
+        restore_persisted_sessions(&state)
+            .await
+            .expect("an unconfirmed sweep must not fail daemon startup");
 
-        assert!(
-            format!("{error:#}").contains("subagent sweep for abandoned session 'ses_worker'"),
-            "got: {error:#}"
+        let persisted = crate::persistence::load_sessions(dir.path()).unwrap();
+        let lease = persisted
+            .lifecycle_leases
+            .get("worker")
+            .expect("a quarantined lease must be retained on disk");
+        assert_eq!(
+            lease.phase,
+            crate::daemon_protocol::LifecyclePhase::Stopping
         );
         assert!(
-            crate::persistence::load_sessions(dir.path())
-                .unwrap()
-                .lifecycle_leases
-                .contains_key("worker"),
-            "a failed sweep must retain the stopping lease"
+            lease.sweep_unconfirmed.as_deref().is_some_and(
+                |reason| reason.contains("subagent sweep for abandoned session 'ses_worker'")
+            ),
+            "the quarantine must carry the reason: {:?}",
+            lease.sweep_unconfirmed
+        );
+        let protocol = state.protocol.read().await;
+        assert_eq!(
+            protocol.lifecycle_leases["worker"]
+                .sweep_unconfirmed
+                .as_deref(),
+            lease.sweep_unconfirmed.as_deref(),
+            "the live lease must carry the same reason as the persisted one"
+        );
+        // Fail-closed on the public ID: it stays unusable while quarantined.
+        let mut probe_protocol = protocol.clone();
+        drop(protocol);
+        assert!(matches!(
+            probe_protocol.clone().reserve_start("worker").unwrap(),
+            crate::daemon_protocol::StartDisposition::InProgress(_)
+        ));
+        let effects = probe_protocol.apply(crate::daemon_protocol::Event::Register {
+            id: "worker".into(),
+            pane: Some("%42".into()),
+            metadata: Default::default(),
+        });
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                crate::daemon_protocol::Effect::RegisterFailed { session_id, .. }
+                    if session_id == "worker"
+            )),
+            "a quarantined ID must not be adoptable: {effects:?}"
+        );
+        let owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(7),
+        };
+        assert_eq!(
+            probe_protocol.claim_existing_stop(&owner, "%42", true),
+            crate::daemon_protocol::LifecycleMutationOutcome::Rejected,
+            "a quarantined ID must not be reapable"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn quarantined_lease_is_reported_by_status_and_ls() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = RestoreSubagentProbe {
+            children: std::collections::HashMap::from([
+                ("ses_worker".to_string(), vec!["ses_child".to_string()]),
+                ("ses_child".to_string(), vec![]),
+            ]),
+            reject_abort: std::collections::HashSet::from(["ses_child".to_string()]),
+            aborted: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let (state, server) = restore_state_with_stopping_lease(&dir, &probe).await;
+        restore_persisted_sessions(&state).await.unwrap();
+
+        let axum::Json(status) = crate::api::status(axum::extract::State(state.clone())).await;
+
+        let quarantined = status["quarantined_sessions"].as_array().unwrap();
+        assert_eq!(quarantined.len(), 1, "got: {status}");
+        assert_eq!(quarantined[0]["id"], "worker");
+        assert_eq!(quarantined[0]["backend_session_id"], "ses_worker");
+        assert_eq!(quarantined[0]["recover_with"], "ouija recover-lease worker");
+        assert!(
+            quarantined[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("subagent sweep"),
+            "got: {}",
+            quarantined[0]["reason"]
+        );
+
+        // `ouija ls` renders the projection, so the operator sees it there too.
+        let listed = project_session_list(&status);
+        assert_eq!(
+            listed["quarantined_sessions"], status["quarantined_sessions"],
+            "ls must carry the quarantine list verbatim"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn ls_flags_a_surviving_row_of_a_quarantined_session() {
+        let status = serde_json::json!({
+            "sessions": [
+                { "id": "worker", "origin": "local" },
+                { "id": "other", "origin": "local" },
+            ],
+            "quarantined_sessions": [
+                { "id": "worker", "reason": "subagent sweep did not complete" },
+            ],
+        });
+
+        let listed = project_session_list(&status);
+
+        let sessions = listed["sessions"].as_array().unwrap();
+        assert_eq!(sessions[0]["quarantined"], serde_json::json!(true));
+        assert_eq!(
+            sessions[0]["quarantine_reason"],
+            "subagent sweep did not complete"
+        );
+        assert!(
+            sessions[1].get("quarantined").is_none(),
+            "an unaffected session must not be flagged"
+        );
+    }
+
+    #[test]
+    fn ls_omits_the_quarantine_list_when_nothing_is_quarantined() {
+        let status = serde_json::json!({
+            "sessions": [{ "id": "worker", "origin": "local" }],
+            "quarantined_sessions": [],
+        });
+
+        let listed = project_session_list(&status);
+
+        assert!(listed.get("quarantined_sessions").is_none());
+        assert!(listed["sessions"][0].get("quarantined").is_none());
     }
 
     #[tokio::test]
@@ -6275,6 +6474,7 @@ mod tests {
                     project_dir_cleanup_on_abandon: false,
                     inert_pane: None,
                     inert_pane_owner: None,
+                    sweep_unconfirmed: None,
                 },
             )]),
         );
@@ -6338,6 +6538,7 @@ mod tests {
                     project_dir_cleanup_on_abandon: false,
                     inert_pane: None,
                     inert_pane_owner: None,
+                    sweep_unconfirmed: None,
                 },
             )]),
         );
@@ -6407,6 +6608,7 @@ mod tests {
                     project_dir_cleanup_on_abandon: false,
                     inert_pane: None,
                     inert_pane_owner: None,
+                    sweep_unconfirmed: None,
                 },
             )]),
         );
@@ -6628,6 +6830,7 @@ mod tests {
                     project_dir_cleanup_on_abandon: false,
                     inert_pane: None,
                     inert_pane_owner: None,
+                    sweep_unconfirmed: None,
                 },
             )]),
         );
@@ -6707,6 +6910,7 @@ mod tests {
                         project_dir_cleanup_on_abandon: false,
                         inert_pane: None,
                         inert_pane_owner: None,
+                        sweep_unconfirmed: None,
                     },
                 ),
                 (
@@ -6724,6 +6928,7 @@ mod tests {
                         project_dir_cleanup_on_abandon: false,
                         inert_pane: None,
                         inert_pane_owner: None,
+                        sweep_unconfirmed: None,
                     },
                 ),
             ]),
@@ -6925,6 +7130,7 @@ mod tests {
             project_dir_cleanup_on_abandon: false,
             inert_pane: Some("%fallback".into()),
             inert_pane_owner: Some(owner),
+            sweep_unconfirmed: None,
         };
 
         assert!(abandoned_lease_owns_staged_row(&session, &lease));
@@ -6953,6 +7159,7 @@ mod tests {
             project_dir_cleanup_on_abandon: false,
             inert_pane: Some("%existing".into()),
             inert_pane_owner: Some(staged.clone()),
+            sweep_unconfirmed: None,
         };
 
         assert_eq!(lifecycle_lease_pane_owners(&lease), vec![incumbent, staged]);

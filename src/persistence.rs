@@ -928,6 +928,7 @@ mod tests {
                     project_dir_cleanup_on_abandon: false,
                     inert_pane: Some("%42".into()),
                     inert_pane_owner: Some(owner.clone()),
+                    sweep_unconfirmed: None,
                 },
             )]),
         );
@@ -1257,6 +1258,7 @@ mod tests {
                     project_dir_cleanup_on_abandon: false,
                     inert_pane: None,
                     inert_pane_owner: None,
+                    sweep_unconfirmed: None,
                 },
             )]),
         );
@@ -1410,6 +1412,7 @@ mod tests {
                             project_dir_cleanup_on_abandon: false,
                             inert_pane: None,
                             inert_pane_owner: None,
+                            sweep_unconfirmed: None,
                         },
                     );
                 }
@@ -1465,6 +1468,7 @@ mod tests {
                     project_dir_cleanup_on_abandon: false,
                     inert_pane: None,
                     inert_pane_owner: None,
+                    sweep_unconfirmed: None,
                 },
             )]),
         );
@@ -1562,6 +1566,7 @@ mod tests {
                     project_dir_cleanup_on_abandon: false,
                     inert_pane: None,
                     inert_pane_owner: None,
+                    sweep_unconfirmed: None,
                 },
             )]),
         };
@@ -1604,6 +1609,7 @@ mod tests {
                         session_id: "other".into(),
                         incarnation: crate::daemon_protocol::SessionIncarnation(6),
                     }),
+                    sweep_unconfirmed: None,
                 },
             )]),
         };
@@ -1614,6 +1620,97 @@ mod tests {
         .unwrap();
 
         assert!(load_sessions(dir.path()).is_err());
+    }
+
+    #[test]
+    fn load_sessions_accepts_a_lease_written_before_sweep_quarantine_existed() {
+        // Every lease already on disk predates `sweep_unconfirmed`. It must
+        // load as "not quarantined" rather than failing the upgrade, and a
+        // lease without a quarantine must not write the key back out.
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = serde_json::json!({
+            "version": SESSION_STATE_VERSION,
+            "sessions": [],
+            "incarnation_high_water": 5,
+            "lifecycle_leases": {
+                "worker": {
+                    "owner": { "session_id": "worker", "incarnation": 5 },
+                    "phase": "stopping",
+                    "backend": "opencode",
+                    "backend_session_id": "ses_worker",
+                    "backend_session_owner": { "session_id": "worker", "incarnation": 5 },
+                }
+            }
+        });
+        std::fs::write(
+            dir.path().join("sessions.json"),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_sessions(dir.path()).unwrap();
+
+        let lease = &loaded.lifecycle_leases["worker"];
+        assert_eq!(lease.sweep_unconfirmed, None);
+        assert_eq!(lease.backend_session_id.as_deref(), Some("ses_worker"));
+        assert_eq!(
+            lease.phase,
+            crate::daemon_protocol::LifecyclePhase::Stopping
+        );
+        let reserialized = serde_json::to_value(lease).unwrap();
+        assert!(
+            reserialized.get("sweep_unconfirmed").is_none(),
+            "an unquarantined lease must not gain a new key on rewrite: {reserialized}"
+        );
+    }
+
+    #[test]
+    fn load_sessions_round_trips_a_quarantined_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = crate::daemon_protocol::ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(5),
+        };
+        let snapshot = PersistedLifecycleState {
+            version: SESSION_STATE_VERSION,
+            sessions: vec![],
+            dormant_sessions: BTreeMap::new(),
+            incarnation_high_water: owner.incarnation,
+            pending_replies: BTreeMap::new(),
+            lifecycle_leases: BTreeMap::from([(
+                "worker".into(),
+                crate::daemon_protocol::LifecycleLease {
+                    owner: owner.clone(),
+                    phase: crate::daemon_protocol::LifecyclePhase::Stopping,
+                    backend: Some("opencode".into()),
+                    backend_session_id: Some("ses_worker".into()),
+                    backend_session_owner: Some(owner),
+                    restart_target_owner: None,
+                    restart_previous: None,
+                    project_dir: None,
+                    project_dir_owner: None,
+                    project_dir_cleanup_on_abandon: false,
+                    inert_pane: None,
+                    inert_pane_owner: None,
+                    sweep_unconfirmed: Some("subagent sweep did not complete".into()),
+                },
+            )]),
+        };
+        std::fs::write(
+            dir.path().join("sessions.json"),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_sessions(dir.path()).unwrap();
+
+        assert_eq!(
+            loaded.lifecycle_leases["worker"]
+                .sweep_unconfirmed
+                .as_deref(),
+            Some("subagent sweep did not complete"),
+            "a quarantine must survive a daemon restart"
+        );
     }
 
     #[test]

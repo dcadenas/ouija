@@ -122,6 +122,22 @@ pub struct LifecycleLease {
     /// a newer incarnation than the lease claimant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inert_pane_owner: Option<ResourceOwner>,
+    /// Why this abandoned stop was quarantined instead of released.
+    ///
+    /// Daemon start replays a `Stopping` lease's backend abort and then sweeps
+    /// the opencode subagents that abort leaves running. When that sweep cannot
+    /// be confirmed, a possibly-live writer remains, so the lease must not be
+    /// released — but failing startup outright wedges the whole host into a
+    /// systemd restart loop (`Restart=on-failure`, `RestartSec=5`, which never
+    /// trips the 10s/5-start burst limiter). Instead the daemon boots and this
+    /// field quarantines the one public ID, carrying the operator-visible
+    /// reason. `ouija recover-lease` retries the sweep; releasing the lease
+    /// clears the quarantine with it.
+    ///
+    /// Absent on every lease written before this existed, and omitted from
+    /// serialization when unset, so on-disk leases round-trip unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_unconfirmed: Option<String>,
 }
 
 /// Atomic result of trying to reserve a new same-ID start.
@@ -2113,6 +2129,7 @@ impl DaemonState {
                 project_dir_cleanup_on_abandon: false,
                 inert_pane: None,
                 inert_pane_owner: None,
+                sweep_unconfirmed: None,
             },
         );
         Ok(StartDisposition::Reserved(owner))
@@ -2199,6 +2216,7 @@ impl DaemonState {
                 project_dir_cleanup_on_abandon: false,
                 inert_pane: None,
                 inert_pane_owner: None,
+                sweep_unconfirmed: None,
             },
         );
         LifecycleMutationOutcome::Applied
@@ -2255,6 +2273,7 @@ impl DaemonState {
                 project_dir_cleanup_on_abandon: cleanup_project_dir_on_abandon,
                 inert_pane: Some(pane.to_string()),
                 inert_pane_owner: Some(owner.clone()),
+                sweep_unconfirmed: None,
             },
         );
         LifecycleMutationOutcome::Applied
@@ -15035,6 +15054,7 @@ mod tests {
                 project_dir_cleanup_on_abandon: false,
                 inert_pane: None,
                 inert_pane_owner: None,
+                sweep_unconfirmed: None,
             },
         );
         assert!(leased.apply(recover_divine_invite_event(&owner)).is_empty());
@@ -15058,6 +15078,7 @@ mod tests {
                 project_dir_cleanup_on_abandon: false,
                 inert_pane: Some("%712".into()),
                 inert_pane_owner: None,
+                sweep_unconfirmed: None,
             },
         );
         assert!(

@@ -1780,8 +1780,12 @@ pub async fn recover_lease(state: &std::sync::Arc<AppState>, name: &str) -> Kill
                 Some(Ok(aborted)) => subagents_aborted = Some(aborted),
                 Some(Err(SubagentSweepFailure { detail, .. })) => {
                     tracing::warn!(session = %name, backend_session_id, "recover-lease subagent sweep failed: {detail}");
+                    let reason = format!("subagent sweep for '{name}' did not complete: {detail}");
+                    // Refresh the quarantine so status shows this attempt's
+                    // reason rather than the one recorded at daemon start.
+                    mark_lease_sweep_unconfirmed(state, &lease.owner, &reason).await;
                     return KillSessionResult::failed(format!(
-                        "subagent sweep for '{name}' failed: {detail}; stop authority retained"
+                        "{reason}; stop authority retained, session '{name}' stays quarantined"
                     ));
                 }
                 None => {
@@ -1808,6 +1812,37 @@ pub async fn recover_lease(state: &std::sync::Arc<AppState>, name: &str) -> Kill
         Err(error) => KillSessionResult::failed(format!(
             "failed to persist lease release for '{name}': {error}"
         )),
+    }
+}
+
+/// Record why a lease stays quarantined, so `/api/status` and `ouija ls` show
+/// the latest retry's reason instead of the one recorded at daemon start.
+///
+/// This annotates an existing lease; it grants and revokes no authority, which
+/// is why it is a direct field update rather than a `DaemonState::apply` event.
+/// The owner comparison keeps a superseded retry from relabelling a lease that
+/// now belongs to someone else.
+async fn mark_lease_sweep_unconfirmed(
+    state: &std::sync::Arc<AppState>,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    reason: &str,
+) {
+    {
+        let mut protocol = state.protocol.write().await;
+        let Some(lease) = protocol.lifecycle_leases.get_mut(&owner.session_id) else {
+            return;
+        };
+        if lease.owner != *owner {
+            return;
+        }
+        lease.sweep_unconfirmed = Some(reason.to_string());
+    }
+    let protocol = state.protocol.read().await;
+    if let Err(error) = state.persist_protocol_state(&protocol) {
+        tracing::warn!(
+            session = %owner.session_id,
+            "failed to persist refreshed lease quarantine: {error}"
+        );
     }
 }
 
@@ -8298,6 +8333,98 @@ mod tests {
         server.abort();
     }
 
+    /// Put `id` into the state a quarantining daemon start leaves behind: a
+    /// held `Stopping` lease carrying a sweep-failure reason.
+    async fn quarantine_lease(state: &std::sync::Arc<AppState>, id: &str, reason: &str) {
+        let mut protocol = state.protocol.write().await;
+        protocol
+            .lifecycle_leases
+            .get_mut(id)
+            .expect("a lease must be held before it can be quarantined")
+            .sweep_unconfirmed = Some(reason.to_string());
+    }
+
+    #[tokio::test]
+    async fn recover_lease_clears_the_quarantine_on_a_confirmed_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = SubagentProbe::with_tree(&[("ses_root", &["ses_child"]), ("ses_child", &[])]);
+        let (state, server) = probe_state(&probe, &dir).await;
+        register_http_session(&state, "worker", DEAD_PANE, "ses_root").await;
+        let owner = state.protocol.read().await.sessions["worker"].owner();
+        assert_eq!(
+            state
+                .claim_existing_stop(&owner, DEAD_PANE, true)
+                .await
+                .unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        quarantine_lease(&state, "worker", "sweep did not complete at daemon start").await;
+
+        let result = recover_lease(&state, "worker").await;
+
+        assert_eq!(result.outcome, KillOutcome::Recovered, "{}", result.message);
+        let protocol = state.protocol.read().await;
+        assert!(
+            protocol.lifecycle_leases.is_empty(),
+            "releasing the lease clears the quarantine with it"
+        );
+        assert!(
+            crate::persistence::load_sessions(dir.path())
+                .unwrap()
+                .lifecycle_leases
+                .is_empty(),
+            "the cleared quarantine must be durable"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn recover_lease_keeps_and_refreshes_the_quarantine_when_the_sweep_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut probe =
+            SubagentProbe::with_tree(&[("ses_root", &["ses_child"]), ("ses_child", &[])]);
+        probe.reject_abort =
+            std::sync::Arc::new(std::collections::HashSet::from(["ses_child".to_string()]));
+        let (state, server) = probe_state(&probe, &dir).await;
+        register_http_session(&state, "worker", DEAD_PANE, "ses_root").await;
+        let owner = state.protocol.read().await.sessions["worker"].owner();
+        assert_eq!(
+            state
+                .claim_existing_stop(&owner, DEAD_PANE, true)
+                .await
+                .unwrap(),
+            crate::daemon_protocol::LifecycleMutationOutcome::Applied
+        );
+        quarantine_lease(&state, "worker", "stale reason from daemon start").await;
+
+        let result = recover_lease(&state, "worker").await;
+
+        assert_eq!(result.outcome, KillOutcome::Failed, "{}", result.message);
+        assert!(
+            result.message.contains("stays quarantined"),
+            "got: {}",
+            result.message
+        );
+        let reason = state.protocol.read().await.lifecycle_leases["worker"]
+            .sweep_unconfirmed
+            .clone()
+            .expect("a failed retry must keep the quarantine");
+        assert!(
+            reason.contains("ses_child"),
+            "the quarantine must carry this attempt's reason: {reason}"
+        );
+        assert_eq!(
+            crate::persistence::load_sessions(dir.path())
+                .unwrap()
+                .lifecycle_leases["worker"]
+                .sweep_unconfirmed
+                .as_deref(),
+            Some(reason.as_str()),
+            "the refreshed quarantine must survive a restart"
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn recover_lease_reports_when_nothing_is_held() {
         let state = AppState::new_for_test();
@@ -11138,6 +11265,7 @@ mod tests {
                     project_dir_cleanup_on_abandon: false,
                     inert_pane: None,
                     inert_pane_owner: None,
+                    sweep_unconfirmed: None,
                 },
             );
         }
