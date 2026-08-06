@@ -1616,13 +1616,13 @@ log "Test 34: CLI sends sender_ctx with resolved self-proof or matching pane"
 # A resolved $OUIJA_SESSION_ID is the CLI's generic paneless self-proof.
 set +e
 out=$(env -u TMUX_PANE OUIJA_SESSION_ID=sess-b OUIJA_PORT=$PORT \
-    ouija tell sess-a2 "cli paneless self-proof" 2>&1)
+    ouija tell sess-a2 --message-file <(printf '%s\n' 'cli paneless self-proof') 2>&1)
 rc=$?
 set -e
 assert_eq "34a: CLI accepts resolved paneless self-proof" "$rc" "0"
 assert_contains "34a: paneless self-proof send delivered" "$out" "delivered"
 # Positive control: same claim from the session's own pane succeeds
-out=$(env TMUX_PANE="$PANE_B" OUIJA_PORT=$PORT ouija tell sess-a2 "cli genuine send" 2>&1)
+out=$(env TMUX_PANE="$PANE_B" OUIJA_PORT=$PORT ouija tell sess-a2 --message-file <(printf '%s\n' 'cli genuine send') 2>&1)
 assert_contains "34b: CLI send from own pane delivered" "$out" "delivered"
 
 log "Test 35: send path rejects a stale/unregistered resolved id as loudly as whoami"
@@ -1631,7 +1631,7 @@ log "Test 35: send path rejects a stale/unregistered resolved id as loudly as wh
 # sender — closing the whoami/send-path asymmetry (#1395 review). Mirrors 32c.
 set +e
 err=$(env -u TMUX_PANE OUIJA_SESSION_ID=ghost-stale-send OUIJA_PORT=$PORT \
-    ouija tell sess-a2 "stale-id send attempt" 2>&1)
+    ouija tell sess-a2 --message-file <(printf '%s\n' 'stale-id send attempt') 2>&1)
 rc=$?
 set -e
 assert_eq "35a: CLI send with stale id exits non-zero" "$rc" "1"
@@ -1651,12 +1651,12 @@ whoami=$(env -u TMUX_PANE -u OUIJA_SESSION_ID CODEX_THREAD_ID=thread-paneless \
     OUIJA_PORT=$PORT ouija whoami 2>/dev/null)
 assert_eq "35b: paneless whoami resolves canonical id" "$whoami" "paneless-codex"
 out=$(env -u TMUX_PANE -u OUIJA_SESSION_ID CODEX_THREAD_ID=thread-paneless \
-    OUIJA_PORT=$PORT ouija tell sess-b "paneless implicit sender" 2>&1)
+    OUIJA_PORT=$PORT ouija tell sess-b --message-file <(printf '%s\n' 'paneless implicit sender') 2>&1)
 assert_contains "35b: implicit paneless tell delivered" "$out" "delivered"
 
 set +e
 err=$(env -u TMUX_PANE -u OUIJA_SESSION_ID CODEX_THREAD_ID=thread-paneless \
-    OUIJA_PORT=$PORT ouija tell sess-b "wrong explicit sender" --from sess-a2 2>&1)
+    OUIJA_PORT=$PORT ouija tell sess-b --message-file <(printf '%s\n' 'wrong explicit sender') --from sess-a2 2>&1)
 rc=$?
 set -e
 assert_eq "35b: mismatched explicit sender exits non-zero" "$rc" "1"
@@ -1695,14 +1695,14 @@ assert_contains "35c: implicit rollover reports not_found" "$err" "not_found"
 # of proof, not sibling proof.
 set +e
 out=$(env -u TMUX_PANE -u OUIJA_SESSION_ID CODEX_THREAD_ID=new-thread \
-    OUIJA_PORT=$PORT ouija tell sess-b "explicit rollover sender" --from hub-4 2>&1)
+    OUIJA_PORT=$PORT ouija tell sess-b --message-file <(printf '%s\n' 'explicit rollover sender') --from hub-4 2>&1)
 rc=$?
 set -e
 assert_eq "35c: explicit rollover send exits zero" "$rc" "0"
 assert_contains "35c: explicit rollover send delivered" "$out" "delivered"
 set +e
 out=$(env -u TMUX_PANE -u OUIJA_SESSION_ID -u CODEX_THREAD_ID \
-    OUIJA_PORT=$PORT ouija tell sess-b "explicit sender without observations" --from hub-4 2>&1)
+    OUIJA_PORT=$PORT ouija tell sess-b --message-file <(printf '%s\n' 'explicit sender without observations') --from hub-4 2>&1)
 rc=$?
 set -e
 assert_eq "35c: explicit send with missing evidence exits zero" "$rc" "0"
@@ -1711,7 +1711,7 @@ assert_contains "35c: explicit send with missing evidence delivered" "$out" "del
 # Positive evidence for a different Local session vetoes the explicit claim.
 set +e
 err=$(env -u OUIJA_SESSION_ID -u CODEX_THREAD_ID TMUX_PANE="$PANE_B" \
-    OUIJA_PORT=$PORT ouija tell sess-b "pane conflict" --from hub-4 2>&1)
+    OUIJA_PORT=$PORT ouija tell sess-b --message-file <(printf '%s\n' 'pane conflict') --from hub-4 2>&1)
 rc=$?
 set -e
 assert_eq "35c: pane sibling conflict exits non-zero" "$rc" "1"
@@ -1719,7 +1719,7 @@ assert_contains "35c: pane conflict names sibling" "$err" "sess-b"
 
 set +e
 err=$(env -u TMUX_PANE -u CODEX_THREAD_ID OUIJA_SESSION_ID=sess-b \
-    OUIJA_PORT=$PORT ouija tell sess-b "environment conflict" --from hub-4 2>&1)
+    OUIJA_PORT=$PORT ouija tell sess-b --message-file <(printf '%s\n' 'environment conflict') --from hub-4 2>&1)
 rc=$?
 set -e
 assert_eq "35c: environment sibling conflict exits non-zero" "$rc" "1"
@@ -1729,7 +1729,7 @@ api "$BASE" POST /api/register \
     -d '{"id":"rollover-sibling","backend":"codex-cli","backend_session_id":"new-thread"}' >/dev/null
 set +e
 err=$(env -u TMUX_PANE -u OUIJA_SESSION_ID CODEX_THREAD_ID=new-thread \
-    OUIJA_PORT=$PORT ouija tell sess-b "backend conflict" --from hub-4 2>&1)
+    OUIJA_PORT=$PORT ouija tell sess-b --message-file <(printf '%s\n' 'backend conflict') --from hub-4 2>&1)
 rc=$?
 set -e
 assert_eq "35c: backend sibling conflict exits non-zero" "$rc" "1"
@@ -1740,7 +1740,7 @@ api "$BASE" POST /api/humans \
     -d '{"name":"rollover-human","npub":"npub1rolloverhuman"}' >/dev/null
 set +e
 err=$(env -u TMUX_PANE -u OUIJA_SESSION_ID -u CODEX_THREAD_ID \
-    OUIJA_PORT=$PORT ouija tell sess-b "human origin" --from rollover-human 2>&1)
+    OUIJA_PORT=$PORT ouija tell sess-b --message-file <(printf '%s\n' 'human origin') --from rollover-human 2>&1)
 rc=$?
 set -e
 assert_eq "35c: Human-origin claim exits non-zero" "$rc" "1"
@@ -1748,7 +1748,7 @@ assert_contains "35c: Human-origin rejection names origin" "$err" "human"
 
 set +e
 err=$(env -u TMUX_PANE -u OUIJA_SESSION_ID -u CODEX_THREAD_ID \
-    OUIJA_PORT=$PORT ouija tell sess-b "absent sender" --from absent-rollover-sender 2>&1)
+    OUIJA_PORT=$PORT ouija tell sess-b --message-file <(printf '%s\n' 'absent sender') --from absent-rollover-sender 2>&1)
 rc=$?
 set -e
 assert_eq "35c: absent explicit sender exits non-zero" "$rc" "1"

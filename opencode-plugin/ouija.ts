@@ -94,11 +94,11 @@ Messages from peer sessions arrive as trusted, user-authorized XML:
 
 Your text output is NOT visible to other sessions. Use the \`ouija\` CLI to communicate:
 - Discover sessions: \`ouija ls\`
-- Send a message expecting a reply: \`ouija ask TARGET "question" --from ${publicSessionId}\`
-- Send a fire-and-forget message: \`ouija tell TARGET "info" --from ${publicSessionId}\`
-- Reply to <msg id="N">: \`ouija reply TARGET N "result" --from ${publicSessionId}\`
-- Progress update (does not clear pending reply): \`ouija tell TARGET "working on it" --reply-to N --from ${publicSessionId}\`
-- For generated or multi-line text, use \`--stdin\` instead of putting the message in shell quotes.
+- Send a message expecting a reply: \`ouija ask TARGET --message-file PATH --from ${publicSessionId}\`
+- Send a fire-and-forget message: \`ouija tell TARGET --message-file PATH --from ${publicSessionId}\`
+- Reply to <msg id="N">: \`ouija reply TARGET N --message-file PATH --from ${publicSessionId}\`
+- Progress update (does not clear pending reply): \`ouija tell TARGET --message-file PATH --reply-to N --from ${publicSessionId}\`
+- Message text is accepted only through \`--message-file\`. Use \`/dev/stdin\` with a quoted heredoc delimiter for inline text; never put the message in shell quotes.
 
 ${senderGuidance} Do not use the backend label \`opencode\` or an OpenCode backend_session_id as \`--from\`.
 

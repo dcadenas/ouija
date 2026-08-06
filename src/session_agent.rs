@@ -822,7 +822,7 @@ impl SessionAgent {
                 )
             } else {
                 format!(
-                    "<ouija-status type=\"reminder\">You have an unanswered question from {} (msg {}) — reply using: ouija reply {} {} \"your answer\"</ouija-status>",
+                    "<ouija-status type=\"reminder\">You have an unanswered question from {} (msg {}) — reply using: ouija reply {} {} --message-file /path/to/answer.txt</ouija-status>",
                     entry.from, entry.msg_id, entry.from, entry.msg_id
                 )
             };

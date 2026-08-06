@@ -327,21 +327,23 @@ mod tests {
     #[test]
     fn plugin_prompt_uses_public_session_id_for_sender_examples() {
         assert!(
-            embedded::PLUGIN_TS.contains("ouija ask TARGET \"question\" --from ${publicSessionId}"),
+            embedded::PLUGIN_TS
+                .contains("ouija ask TARGET --message-file PATH --from ${publicSessionId}"),
             "OpenCode prompt must teach non-tmux tools to send from the resolved public Ouija session id"
         );
         assert!(
-            embedded::PLUGIN_TS.contains("ouija tell TARGET \"info\" --from ${publicSessionId}"),
+            embedded::PLUGIN_TS
+                .contains("ouija tell TARGET --message-file PATH --from ${publicSessionId}"),
             "OpenCode prompt must not imply the backend label is a valid sender id"
         );
         assert!(
             embedded::PLUGIN_TS
-                .contains("ouija reply TARGET N \"result\" --from ${publicSessionId}"),
+                .contains("ouija reply TARGET N --message-file PATH --from ${publicSessionId}"),
             "OpenCode prompt must use the public session id for replies"
         );
         assert!(
             embedded::PLUGIN_TS.contains(
-                "ouija tell TARGET \"working on it\" --reply-to N --from ${publicSessionId}"
+                "ouija tell TARGET --message-file PATH --reply-to N --from ${publicSessionId}"
             ),
             "OpenCode prompt must use the public session id for progress updates"
         );

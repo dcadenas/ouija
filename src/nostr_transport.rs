@@ -11478,7 +11478,9 @@ mod tests {
         assert!(text.starts_with("queued prompt\n\ncheck the deployment\n\n"));
         assert!(text.contains("Lifecycle policy: ask-parent-when-done"));
         assert!(text.contains("Parent session id: parent-session"));
-        assert!(text.contains("ouija ask parent-session --stdin --from oc"));
+        assert!(
+            text.contains("ouija ask parent-session --message-file /path/to/message.txt --from oc")
+        );
         assert!(!text.contains("ouija clear-reminder"));
         assert!(!text.contains("<clearing_id>"));
         server.abort();

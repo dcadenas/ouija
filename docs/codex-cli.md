@@ -168,14 +168,14 @@ Codex learns the mesh two complementary ways:
 
    ```
    ouija ls
-   ouija ask <target> "question" --from <your-public-id>
-   ouija tell <target> "note" --from <your-public-id>
-   ouija reply <target> <msg-id> "answer" --from <your-public-id>
+   ouija ask <target> --message-file <path> --from <your-public-id>
+   ouija tell <target> --message-file <path> --from <your-public-id>
+   ouija reply <target> <msg-id> --message-file <path> --from <your-public-id>
    ouija rename <new-public-id> --from <your-public-id>
    ```
 
-   For generated or multi-line text, use `--stdin` or `--message-file` instead
-   of putting the message body in shell quotes.
+   Message text is accepted only through `--message-file`. For inline text, use
+   `/dev/stdin` with a quoted heredoc delimiter; never put the body in shell quotes.
 
    `--from <your-public-id>` is an authoritative explicit-local path when the
    id came from this injected context or was provided exactly by the operator.

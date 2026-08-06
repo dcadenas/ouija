@@ -753,11 +753,11 @@ impl SessionMeta {
                     .as_deref()
                     .unwrap_or("<missing-parent-session>");
                 lines.push(
-                    "When work is complete, ask the parent what to do next using stdin, then wait for the reply."
+                    "When work is complete, ask the parent what to do next through a message file, then wait for the reply."
                         .to_string(),
                 );
                 lines.push(format!(
-                    "Example: printf '%s\\n' 'done: <summary>' | ouija ask {parent} --stdin --from {session_id}"
+                    "Example: ouija ask {parent} --message-file /path/to/message.txt --from {session_id}"
                 ));
                 if let Some(clearing_id) = clearing_id {
                     lines.push(format!(
@@ -8716,7 +8716,9 @@ mod tests {
         assert!(reminder.contains("Lifecycle policy: ask-parent-when-done"));
         assert!(reminder.contains("Current session id: worker-2"));
         assert!(reminder.contains("Parent session id: parent-session"));
-        assert!(reminder.contains("ouija ask parent-session --stdin --from worker-2"));
+        assert!(reminder.contains(
+            "ouija ask parent-session --message-file /path/to/message.txt --from worker-2"
+        ));
         assert!(reminder.contains("ouija clear-reminder 7"));
     }
 
@@ -8746,7 +8748,9 @@ mod tests {
         assert!(reminder.contains("Lifecycle policy: ask-parent-when-done"));
         assert!(reminder.contains("Current session id: worker-4"));
         assert!(reminder.contains("Parent session id: parent-session"));
-        assert!(reminder.contains("ouija ask parent-session --stdin --from worker-4"));
+        assert!(reminder.contains(
+            "ouija ask parent-session --message-file /path/to/message.txt --from worker-4"
+        ));
         assert!(!reminder.contains("ouija clear-reminder"));
         assert!(!reminder.contains("<clearing_id>"));
     }

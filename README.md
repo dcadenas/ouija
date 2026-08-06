@@ -39,7 +39,7 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 
 ## What you can do
 
-**Message any session**, local or remote. Sessions discover each other automatically. Messages travel through a short CLI command (`ouija ask target "question"`) instead of making the assistant compose raw HTTP requests.
+**Message any session**, local or remote. Sessions discover each other automatically. Messages travel through a short CLI command (`ouija ask target --message-file question.txt`) instead of making the assistant compose raw HTTP requests.
 
 **Share state through the filesystem, not just the wire.** A message can be small and point to shared state: "see `docs/api.md`" or "check the worktree at `~/code/foo`". The receiver loads the full content from disk, bypassing the compression that any fixed-size message would impose. Messages as pointers to shared state scale better than messages as state.
 
@@ -224,10 +224,9 @@ ouija self-update    # install latest from crates.io, restart
 ouija ls             # list sessions on the mesh
 ouija status         # full daemon and session JSON, including active-context status
 ouija whoami         # print this session's own id (fails loudly if unresolvable)
-ouija ask <to> "msg" # send a message expecting a reply
-ouija tell <to> "msg" # fire-and-forget message
-ouija reply <to> <id> "msg" # reply to a message
-ouija reply <to> <id> --stdin < reply.txt # safer for generated/multiline text
+ouija ask <to> --message-file question.txt # send a message expecting a reply
+ouija tell <to> --message-file note.txt # fire-and-forget message
+ouija reply <to> <id> --message-file reply.txt # reply to a message
 ouija rename <new-id> --from <current-id> # rename an exact Local session
 ouija announce --role "..." --bulletin "..." # update your metadata
 ouija spawn-session <name> --no-parent-session --when-done keep-open --prompt "..." # start a new session
@@ -238,9 +237,10 @@ ouija nodes          # list connected nodes
 ouija config ...     # manage settings, Nostr DM users, router
 ```
 
-For generated or multi-line message bodies, prefer `--stdin` or
-`--message-file` on `ask`, `tell`, and `reply`. That avoids shell expansion of
-backticks, `$()`, quotes, and JSON before `ouija` receives the message.
+`ask`, `tell`, and `reply` accept message bodies only through `--message-file`.
+For inline text, use `--message-file /dev/stdin` with a quoted heredoc delimiter.
+This prevents shell expansion of backticks, `$()`, quotes, and JSON before
+`ouija` receives the message.
 
 `spawn-session` requires explicit lifecycle ownership: choose either
 `--parent-session <SESSION_ID>` or `--no-parent-session`, and choose
@@ -273,7 +273,7 @@ wake a session without a manual reminder. Ouija supplies the concrete
 `clear-reminder` command and current ID in each injected nudge, so manual
 reminder text must not include its own clearing command.
 
-Outside tmux, such as an OpenCode HTTP/API tool process, run `ouija whoami` to resolve your own session id. Implicit resolution remains fail-closed when no pane, environment, or complete backend pair proves one Local owner. For an explicit local send or rename, an exact public Local id from injected context or the operator remains authoritative despite missing, not-found, or incomplete backend evidence: `ouija ask <to> "msg" --from <public-ouija-id>` or `ouija rename <new-id> --from <current-public-id>`. The daemon rejects absent, Remote/Human, and sibling-conflicted claims. Never guess a sender id (project directory name, branch name, or an `ouija ls` entry), and never use a backend label or opaque backend session id as `--from`.
+Outside tmux, such as an OpenCode HTTP/API tool process, run `ouija whoami` to resolve your own session id. Implicit resolution remains fail-closed when no pane, environment, or complete backend pair proves one Local owner. For an explicit local send or rename, an exact public Local id from injected context or the operator remains authoritative despite missing, not-found, or incomplete backend evidence: `ouija ask <to> --message-file <path> --from <public-ouija-id>` or `ouija rename <new-id> --from <current-public-id>`. The daemon rejects absent, Remote/Human, and sibling-conflicted claims. Never guess a sender id (project directory name, branch name, or an `ouija ls` entry), and never use a backend label or opaque backend session id as `--from`.
 
 Run `ouija --help` for the full command list.
 

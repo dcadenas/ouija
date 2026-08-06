@@ -20,7 +20,7 @@ mod tmux;
 mod tmux_var;
 mod transport;
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use backend::CodingAssistant;
 use clap::{Parser, Subcommand, ValueEnum};
 use daemon_protocol::IdlePolicy;
@@ -95,13 +95,9 @@ enum Command {
     /// Send a message expecting a reply
     Ask {
         to: String,
-        message: Option<String>,
-        /// Read message body from stdin.
+        /// Read the message body from this file. Use /dev/stdin for piped input.
         #[arg(long)]
-        stdin: bool,
-        /// Read message body from a file.
-        #[arg(long)]
-        message_file: Option<PathBuf>,
+        message_file: PathBuf,
         /// Sender session ID: the exact output of `ouija whoami` (never a guessed id)
         #[arg(long)]
         from: Option<String>,
@@ -109,13 +105,9 @@ enum Command {
     /// Send a message (fire-and-forget)
     Tell {
         to: String,
-        message: Option<String>,
-        /// Read message body from stdin.
+        /// Read the message body from this file. Use /dev/stdin for piped input.
         #[arg(long)]
-        stdin: bool,
-        /// Read message body from a file.
-        #[arg(long)]
-        message_file: Option<PathBuf>,
+        message_file: PathBuf,
         /// Thread as progress update for a pending reply
         #[arg(long)]
         reply_to: Option<u64>,
@@ -127,13 +119,9 @@ enum Command {
     Reply {
         to: String,
         msg_id: u64,
-        message: Option<String>,
-        /// Read message body from stdin.
+        /// Read the message body from this file. Use /dev/stdin for piped input.
         #[arg(long)]
-        stdin: bool,
-        /// Read message body from a file.
-        #[arg(long)]
-        message_file: Option<PathBuf>,
+        message_file: PathBuf,
         /// Don't mark as done (progress update)
         #[arg(long)]
         no_done: bool,
@@ -318,7 +306,7 @@ enum Command {
     },
     /// List the replies this session still owes, with the question bodies.
     ///
-    /// Answer each with `ouija reply <from> <msg_id> "..."`. A plain `tell`
+    /// Answer each with `ouija reply <from> <msg_id> --message-file <path>`. A plain `tell`
     /// does not clear the obligation.
     Pending,
     /// Clear a pending reply from a disconnected sender
@@ -911,12 +899,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Ask {
             to,
-            message,
-            stdin,
             message_file,
             from,
         } => {
-            let message = resolve_message(message, stdin, message_file)?;
+            let message = read_message_file(&message_file)?;
             let sender = resolve_sender(from).await?;
             let body = serde_json::json!({
                 "from": sender.id,
@@ -929,13 +915,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Tell {
             to,
-            message,
-            stdin,
             message_file,
             reply_to,
             from,
         } => {
-            let message = resolve_message(message, stdin, message_file)?;
+            let message = read_message_file(&message_file)?;
             let sender = resolve_sender(from).await?;
             let body = serde_json::json!({
                 "from": sender.id,
@@ -950,14 +934,12 @@ async fn main() -> anyhow::Result<()> {
         Command::Reply {
             to,
             msg_id,
-            message,
-            stdin,
             message_file,
             no_done,
             expect_reply,
             from,
         } => {
-            let message = resolve_message(message, stdin, message_file)?;
+            let message = read_message_file(&message_file)?;
             let sender = resolve_sender(from).await?;
             let body = serde_json::json!({
                 "from": sender.id,
@@ -3108,32 +3090,9 @@ fn unresolved_sender_error() -> String {
     )
 }
 
-fn resolve_message(
-    positional: Option<String>,
-    read_stdin: bool,
-    message_file: Option<PathBuf>,
-) -> anyhow::Result<String> {
-    let source_count = usize::from(positional.is_some())
-        + usize::from(read_stdin)
-        + usize::from(message_file.is_some());
-    match source_count {
-        0 => bail!("provide a message argument, --stdin, or --message-file <path>"),
-        1 => {}
-        _ => bail!("provide only one message source: argument, --stdin, or --message-file"),
-    }
-
-    if let Some(message) = positional {
-        return Ok(message);
-    }
-    if let Some(path) = message_file {
-        return std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read message file {}", path.display()));
-    }
-
-    let mut message = String::new();
-    std::io::Read::read_to_string(&mut std::io::stdin(), &mut message)
-        .context("failed to read message from stdin")?;
-    Ok(message)
+fn read_message_file(path: &std::path::Path) -> anyhow::Result<String> {
+    std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read message file {}", path.display()))
 }
 
 /// Pick the caller's session id from the three available signals.
@@ -4879,26 +4838,37 @@ mod tests {
     }
 
     #[test]
-    fn ask_cli_accepts_stdin_without_message_argument() {
-        let cli = Cli::try_parse_from(["ouija", "ask", "parent", "--stdin", "--from", "worker"])
-            .expect("ask --stdin parses without positional message");
+    fn ask_cli_requires_message_file() {
+        let cli = Cli::try_parse_from([
+            "ouija",
+            "ask",
+            "parent",
+            "--message-file",
+            "/dev/stdin",
+            "--from",
+            "worker",
+        ])
+        .expect("ask --message-file parses");
 
         match cli.command {
             Command::Ask {
                 to,
-                message,
-                stdin,
                 message_file,
                 from,
             } => {
                 assert_eq!(to, "parent");
-                assert_eq!(message, None);
-                assert!(stdin);
-                assert_eq!(message_file, None);
+                assert_eq!(message_file, PathBuf::from("/dev/stdin"));
                 assert_eq!(from.as_deref(), Some("worker"));
             }
             _ => panic!("expected ask command"),
         }
+
+        assert!(Cli::try_parse_from(["ouija", "ask", "parent", "hello"]).is_err());
+        assert!(Cli::try_parse_from(["ouija", "ask", "parent", "--stdin"]).is_err());
+        assert!(Cli::try_parse_from(["ouija", "tell", "parent", "hello"]).is_err());
+        assert!(Cli::try_parse_from(["ouija", "tell", "parent", "--stdin"]).is_err());
+        assert!(Cli::try_parse_from(["ouija", "reply", "parent", "47", "hello"]).is_err());
+        assert!(Cli::try_parse_from(["ouija", "reply", "parent", "47", "--stdin"]).is_err());
     }
 
     #[test]
@@ -5328,34 +5298,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_message_accepts_positional_text() {
-        let message = resolve_message(Some("hello `literal`".into()), false, None).unwrap();
-        assert_eq!(message, "hello `literal`");
-    }
-
-    #[test]
-    fn resolve_message_accepts_file_text() {
+    fn read_message_file_preserves_shell_metacharacters() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("message.txt");
-        std::fs::write(&path, "hello $(literal)\n").unwrap();
+        std::fs::write(&path, "hello `literal` $(literal)\n").unwrap();
 
-        let message = resolve_message(None, false, Some(path)).unwrap();
+        let message = read_message_file(&path).unwrap();
 
-        assert_eq!(message, "hello $(literal)\n");
-    }
-
-    #[test]
-    fn resolve_message_rejects_missing_source() {
-        let err = resolve_message(None, false, None).unwrap_err();
-
-        assert!(err.to_string().contains("provide a message argument"));
-    }
-
-    #[test]
-    fn resolve_message_rejects_multiple_sources() {
-        let err = resolve_message(Some("hello".into()), true, None).unwrap_err();
-
-        assert!(err.to_string().contains("provide only one message source"));
+        assert_eq!(message, "hello `literal` $(literal)\n");
     }
 
     #[test]

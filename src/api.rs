@@ -1004,7 +1004,7 @@ pub async fn send_msg(
         if let Some(owed) = owed_msg_id {
             let warning = format!(
                 "you still owe '{to}' a reply to msg #{owed}; a plain tell does not clear it — \
-                 use: ouija reply {to} {owed} \"...\""
+                 use: ouija reply {to} {owed} --message-file /path/to/reply.txt"
             );
             tracing::warn!(%from, %to, owed_msg_id = owed, "plain tell sent while a reply is owed");
             payload["warning"] = json!(warning);

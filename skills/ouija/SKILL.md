@@ -37,16 +37,17 @@ Reply immediately for short work. For long work, send progress with `ouija tell
 --reply-to`, then send the final result with `ouija reply`. Only messages with
 `reply="true"` require a reply.
 
-Use `--stdin` for generated or multiline text. It prevents the shell from
-expanding backticks, `$()`, quotes, JSON, or other content before Ouija receives
-it.
+Message bodies are accepted only through `--message-file`; never pass message
+text as a shell argument. For inline text, use `/dev/stdin` with a quoted heredoc
+delimiter so the shell cannot expand backticks, `$()`, quotes, JSON, or other
+content before Ouija receives it.
 
 ```bash
-ouija tell session-id --reply-to 47 --stdin <<'EOF'
+ouija tell session-id --reply-to 47 --message-file /dev/stdin <<'EOF'
 working on it
 EOF
 
-ouija reply session-id 47 --stdin <<'EOF'
+ouija reply session-id 47 --message-file /dev/stdin <<'EOF'
 done: verified result
 EOF
 ```
