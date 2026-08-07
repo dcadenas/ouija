@@ -462,6 +462,10 @@ const RELAY_CONNECT_TIMEOUT_SECS: u64 = 5;
 const SEEN_EVENTS_CACHE_LIMIT: usize = 2048;
 /// Timeout for the claude process to exit after sending /exit.
 const PROCESS_EXIT_TIMEOUT_SECS: u64 = 10;
+
+fn should_attempt_graceful_shutdown(exit_command: Option<&str>) -> bool {
+    exit_command.is_some()
+}
 /// Length threshold for truncating npub display strings.
 const NPUB_TRUNCATE_LEN: usize = 20;
 
@@ -1675,11 +1679,20 @@ pub async fn kill_session(state: &std::sync::Arc<AppState>, name: &str) -> KillS
     kill_session_inner(state, name, false, None).await
 }
 
-pub async fn kill_session_keep_worktree(
+pub async fn kill_session_delete_worktree(
     state: &std::sync::Arc<AppState>,
     name: &str,
 ) -> KillSessionResult {
     kill_session_inner(state, name, true, None).await
+}
+
+#[allow(dead_code)]
+#[deprecated(note = "worktrees are preserved by default")]
+pub async fn kill_session_keep_worktree(
+    state: &std::sync::Arc<AppState>,
+    name: &str,
+) -> KillSessionResult {
+    kill_session(state, name).await
 }
 
 /// Kill only the exact idle-session snapshot selected by max-session eviction.
@@ -2147,7 +2160,7 @@ async fn resolve_failed_abort(
 async fn kill_session_inner(
     state: &std::sync::Arc<AppState>,
     name: &str,
-    keep_worktree: bool,
+    delete_worktree: bool,
     expected_owner: Option<(crate::daemon_protocol::ResourceOwner, String)>,
 ) -> KillSessionResult {
     let session = state.protocol.read().await.sessions.get(name).cloned();
@@ -2171,7 +2184,7 @@ async fn kill_session_inner(
     let pane = pane.clone();
     let owner = session.owner();
     match state
-        .claim_existing_stop(&owner, &pane, !keep_worktree)
+        .claim_existing_stop(&owner, &pane, delete_worktree)
         .await
     {
         Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {}
@@ -2481,53 +2494,40 @@ async fn kill_session_inner(
                 match backend_pid {
                     Some(pid) => {
                         let mut exited = false;
-                        // When preserving worktrees, skip graceful /exit — the
-                        // backend may clean up its own worktree during exit.
-                        // Go straight to SIGKILL to prevent cleanup handlers.
-                        if keep_worktree {
+                        // Filesystem cleanup is a post-exit policy. Preserving a
+                        // worktree must not turn an ordinary shutdown into SIGKILL.
+                        if should_attempt_graceful_shutdown(exit_cmd.as_deref()) {
+                            let exit = exit_cmd
+                                .as_deref()
+                                .expect("graceful shutdown requires an exit command");
                             if !pane_still_owned()? {
                                 return Ok("pane already exited".to_string());
                             }
-                            let signal_status =
-                                Command::new("kill").args(["-9", &pid.to_string()]).status()?;
-                            std::thread::sleep(std::time::Duration::from_millis(500));
-                            if process_alive(pid)? {
-                                anyhow::bail!(
-                                    "SIGKILL did not stop {cli_name} pid {pid} (status {signal_status})"
-                                );
-                            }
-                        } else {
-                            // Graceful: send exit command if backend supports it
-                            if let Some(ref exit) = exit_cmd {
-                                if !pane_still_owned()? {
-                                    return Ok("pane already exited".to_string());
-                                }
-                                let _send_status = Command::new("tmux")
-                                    .args(["send-keys", "-t", &pane_for_kill, exit, "Enter"])
-                                    .status()?;
+                            let _send_status = Command::new("tmux")
+                                .args(["send-keys", "-t", &pane_for_kill, exit, "Enter"])
+                                .status()?;
 
-                                // Poll up to 10s for process to exit
-                                let deadline = std::time::Instant::now()
-                                    + std::time::Duration::from_secs(PROCESS_EXIT_TIMEOUT_SECS);
-                                while std::time::Instant::now() < deadline {
-                                    std::thread::sleep(std::time::Duration::from_secs(1));
-                                    if !process_alive(pid)? {
-                                        exited = true;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if !exited {
-                                // Fallback: SIGTERM
-                                if !pane_still_owned()? {
-                                    return Ok("pane already exited".to_string());
-                                }
-                                let _signal_status =
-                                    Command::new("kill").arg(pid.to_string()).status()?;
+                            // Poll up to 10s for process to exit
+                            let deadline = std::time::Instant::now()
+                                + std::time::Duration::from_secs(PROCESS_EXIT_TIMEOUT_SECS);
+                            while std::time::Instant::now() < deadline {
                                 std::thread::sleep(std::time::Duration::from_secs(1));
-                                exited = !process_alive(pid)?;
+                                if !process_alive(pid)? {
+                                    exited = true;
+                                    break;
+                                }
                             }
+                        }
+
+                        if !exited {
+                            // Fallback: SIGTERM
+                            if !pane_still_owned()? {
+                                return Ok("pane already exited".to_string());
+                            }
+                            let _signal_status =
+                                Command::new("kill").arg(pid.to_string()).status()?;
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                            exited = !process_alive(pid)?;
                         }
 
                         kill_owned_pane()?;
@@ -2541,9 +2541,7 @@ async fn kill_session_inner(
                                 );
                             }
                         }
-                        let method = if keep_worktree {
-                            "SIGKILL (worktree preserved)"
-                        } else if exited {
+                        let method = if exited {
                             "exited gracefully"
                         } else {
                             "SIGTERM"
@@ -2618,15 +2616,20 @@ async fn kill_session_inner(
     // race against claude writing to its cwd. Mirrors the shared-worktree
     // guard in apply_remove: skip cleanup if another session still uses
     // the same directory.
-    if !keep_worktree {
-        if let Some(dir) = project_dir {
-            let is_worktree_path =
-                dir.contains("/.ouija/worktrees/") || dir.contains("/.claude/worktrees/");
-            if is_worktree_path {
-                state.cleanup_worktree_dir_if_unused(&owner, &dir).await;
-            }
+    let worktree = if let Some(dir) = project_dir.as_ref() {
+        let is_worktree_path =
+            dir.contains("/.ouija/worktrees/") || dir.contains("/.claude/worktrees/");
+        if delete_worktree && is_worktree_path {
+            Some((
+                dir.clone(),
+                state.cleanup_worktree_dir_if_unused(&owner, dir).await,
+            ))
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
 
     let subagents = if is_http_api {
         subagent_report(subagents_aborted)
@@ -2634,9 +2637,27 @@ async fn kill_session_inner(
         String::new()
     };
     match state.abort_lifecycle(&owner).await {
-        Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => {
-            KillSessionResult::removed(format!("{msg}{subagents}, session '{name}' removed"))
-        }
+        Ok(crate::daemon_protocol::LifecycleMutationOutcome::Applied) => match worktree {
+            Some((dir, crate::state::WorktreeCleanupOutcome::Deleted)) => {
+                KillSessionResult::removed(format!(
+                    "{msg}{subagents}, session '{name}' removed; worktree deleted: {dir}"
+                ))
+            }
+            Some((dir, outcome)) => KillSessionResult::failed(format!(
+                "{msg}{subagents}, session '{name}' removed; requested worktree deletion failed for {dir}: {outcome:?}"
+            )),
+            None => {
+                let suffix = project_dir
+                    .filter(|dir| {
+                        dir.contains("/.ouija/worktrees/") || dir.contains("/.claude/worktrees/")
+                    })
+                    .map(|dir| format!("; worktree preserved: {dir}"))
+                    .unwrap_or_default();
+                KillSessionResult::removed(format!(
+                    "{msg}{subagents}, session '{name}' removed{suffix}"
+                ))
+            }
+        },
         Ok(outcome) => KillSessionResult::superseded(format!(
             "session '{name}' cleanup completion was superseded ({outcome:?})"
         )),
@@ -7841,6 +7862,12 @@ pub(crate) fn opencode_prompt_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserving_worktree_still_attempts_graceful_shutdown() {
+        assert!(should_attempt_graceful_shutdown(Some("/exit")));
+        assert!(!should_attempt_graceful_shutdown(None));
+    }
 
     #[tokio::test]
     async fn stale_owned_kill_returns_typed_superseded_before_external_work() {

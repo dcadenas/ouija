@@ -32,6 +32,8 @@ pub const START_OUTCOME_TTL: Duration = Duration::from_secs(30 * 60);
 /// Terminal disposition of one start attempt for one exact owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartOutcomeStatus {
+    /// The launch is still waiting for registration or first-turn completion.
+    InProgress,
     /// The launch completed and the session is registered under this owner.
     Started,
     /// The launch terminally failed. The detail carries the logged reason.
@@ -146,6 +148,7 @@ impl StartOutcomeStore {
             .rev()
             .find(|record| &record.owner == owner)
             .map(|record| match record.status {
+                StartOutcomeStatus::InProgress => StartStatus::InProgress,
                 StartOutcomeStatus::Started => StartStatus::Started {
                     detail: record.detail.clone(),
                 },
@@ -193,6 +196,17 @@ mod tests {
             session_id: id.to_string(),
             incarnation: SessionIncarnation(incarnation),
         }
+    }
+
+    #[test]
+    fn an_in_progress_record_overrides_registration_fallback() {
+        let store = StartOutcomeStore::default();
+        store.record(
+            &owner("tp-64", 7),
+            StartOutcomeStatus::InProgress,
+            "waiting".into(),
+        );
+        assert_eq!(store.get(&owner("tp-64", 7)), Some(StartStatus::InProgress));
     }
 
     #[test]

@@ -174,16 +174,16 @@ enum Command {
     Unregister { id: String },
     /// Start a new session.
     ///
-    /// There is no `ouija spawn` alias. The initial `--prompt` is the complete
-    /// bounded assignment; this command does not support `--one-shot-file`.
+    /// There is no `ouija spawn` alias. The initial `--prompt-file` contains the
+    /// complete bounded assignment; this command does not support `--one-shot-file`.
     #[command(name = "spawn-session")]
     SpawnSession {
         name: String,
         #[arg(long)]
         project_dir: Option<String>,
-        /// Complete re-entrant, state-checking assignment stored as the session's base prompt and replayed after fresh restarts; verify live state and perform only remaining work. Before destructive or external actions, verify completion and current authorization.
+        /// Read the complete re-entrant, state-checking base prompt from this UTF-8 file. Verify live state and perform only remaining work; before destructive or external actions, verify completion and current authorization. Use /dev/stdin only with a quoted heredoc.
         #[arg(long)]
-        prompt: Option<String>,
+        prompt_file: Option<PathBuf>,
         #[arg(long, value_parser = parse_manual_reminder)]
         reminder: Option<String>,
         #[arg(long)]
@@ -247,7 +247,11 @@ enum Command {
     #[command(name = "kill-session")]
     KillSession {
         name: String,
-        #[arg(long)]
+        /// Delete the session worktree after the backend process stops.
+        #[arg(long, conflicts_with = "keep_worktree")]
+        delete_worktree: bool,
+        /// Deprecated compatibility flag; worktrees are preserved by default.
+        #[arg(long, hide = true, conflicts_with = "delete_worktree")]
         keep_worktree: bool,
     },
     /// Release a stuck lifecycle lease left by a failed kill, without
@@ -275,9 +279,9 @@ enum Command {
             value_parser = parse_fresh_context_after_active
         )]
         fresh_context_after_active: Option<u64>,
-        /// Replace the durable stored base prompt when absent or transient recovery prose. It is replayed by default after every fresh restart; make it re-entrant, state-checking, guard expensive, destructive, or external actions against repetition, and verify current authorization before destructive or external actions.
+        /// Read a replacement durable stored base prompt from this UTF-8 file. It is replayed by default after every fresh restart; make it re-entrant and verify current authorization before destructive or external actions. Use /dev/stdin only with a quoted heredoc.
         #[arg(long)]
-        prompt: Option<String>,
+        prompt_file: Option<PathBuf>,
         /// Do not reuse the stored startup prompt for this launch.
         #[arg(long)]
         suppress_stored_prompt: bool,
@@ -1072,7 +1076,7 @@ async fn main() -> anyhow::Result<()> {
         Command::SpawnSession {
             name,
             project_dir,
-            prompt,
+            prompt_file,
             reminder,
             parent_session,
             no_parent_session,
@@ -1089,6 +1093,7 @@ async fn main() -> anyhow::Result<()> {
             wait,
             wait_timeout,
         } => {
+            let prompt = prompt_file.as_deref().map(read_prompt_file).transpose()?;
             let idle_policy = when_done.map(IdlePolicy::from).or(idle_policy);
             if let Err(err) = validate_spawn_lifecycle(
                 parent_session.as_deref(),
@@ -1145,13 +1150,18 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::KillSession {
             name,
-            keep_worktree,
+            delete_worktree,
+            keep_worktree: _,
         } => {
             let body = serde_json::json!({
                 "name": name,
-                "keep_worktree": keep_worktree,
+                "delete_worktree": delete_worktree,
             });
-            cli_post("/api/sessions/kill", &body).await?;
+            let response = cli_post_json("/api/sessions/kill", &body).await?;
+            println!("{}", serde_json::to_string(&response)?);
+            if !kill_response_succeeded(&response) {
+                std::process::exit(1);
+            }
         }
         Command::RecoverLease { name } => {
             let body = serde_json::json!({ "name": name });
@@ -1259,7 +1269,7 @@ async fn main() -> anyhow::Result<()> {
             name,
             fresh,
             fresh_context_after_active,
-            prompt,
+            prompt_file,
             suppress_stored_prompt,
             one_shot_file,
             reminder,
@@ -1267,6 +1277,7 @@ async fn main() -> anyhow::Result<()> {
             model,
             effort,
         } => {
+            let prompt = prompt_file.as_deref().map(read_prompt_file).transpose()?;
             let one_shot_prompt = one_shot_file
                 .as_deref()
                 .map(read_one_shot_file)
@@ -3767,6 +3778,11 @@ async fn cli_post(path: &str, body: &serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether a `/api/sessions/kill` response reports a completed kill.
+fn kill_response_succeeded(response: &serde_json::Value) -> bool {
+    response.get("outcome").and_then(|value| value.as_str()) == Some("removed")
+}
+
 /// Whether a `/api/sessions/restart` response reports a completed restart.
 ///
 /// Only the explicit `restarted` outcome counts. A response without the field
@@ -4014,8 +4030,13 @@ fn dormant_show_path(id: &str) -> String {
     )
 }
 
+fn read_prompt_file(path: &std::path::Path) -> anyhow::Result<String> {
+    std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read UTF-8 prompt from {}", path.display()))
+}
+
 fn read_one_shot_file(path: &std::path::Path) -> anyhow::Result<String> {
-    std::fs::read_to_string(path).with_context(|| {
+    read_prompt_file(path).with_context(|| {
         format!(
             "failed to read UTF-8 one-shot prompt from {}",
             path.display()
@@ -4534,8 +4555,8 @@ mod tests {
             "ouija",
             "restart-session",
             "worker",
-            "--prompt",
-            "replacement",
+            "--prompt-file",
+            "/tmp/base.txt",
             "--suppress-stored-prompt",
             "--one-shot-file",
             "/tmp/adopt.txt",
@@ -4546,13 +4567,16 @@ mod tests {
 
         match cli.command {
             Command::RestartSession {
-                prompt,
+                prompt_file,
                 suppress_stored_prompt,
                 one_shot_file,
                 backend,
                 ..
             } => {
-                assert_eq!(prompt.as_deref(), Some("replacement"));
+                assert_eq!(
+                    prompt_file.as_deref(),
+                    Some(std::path::Path::new("/tmp/base.txt"))
+                );
                 assert!(suppress_stored_prompt);
                 assert_eq!(
                     one_shot_file.as_deref(),
@@ -4573,18 +4597,15 @@ mod tests {
         let help = subcommand_long_help("restart-session");
         let spawn_help = subcommand_long_help("spawn-session");
 
-        assert!(help.contains("durable stored base prompt"));
+        assert!(help.contains("replacement durable stored base prompt"));
         assert!(help.contains("replayed by default after every fresh restart"));
-        assert!(help.contains("re-entrant, state-checking"));
-        assert!(help.contains("expensive, destructive, or external actions"));
-        assert!(help.contains("current authorization"));
-        assert!(help.contains("transient recovery prose"));
+        assert!(help.contains("UTF-8 file"));
+        assert!(help.contains("quoted heredoc"));
         assert!(help.contains("verified current-work continuation"));
         assert!(help.contains("binding is absent or cannot be trusted"));
         assert!(spawn_help.contains("re-entrant, state-checking"));
-        assert!(spawn_help.contains("perform only remaining work"));
-        assert!(spawn_help.contains("destructive or external actions"));
-        assert!(spawn_help.contains("current authorization"));
+        assert!(spawn_help.contains("UTF-8 file"));
+        assert!(spawn_help.contains("quoted heredoc"));
     }
 
     #[test]
@@ -5306,6 +5327,100 @@ mod tests {
         let message = read_message_file(&path).unwrap();
 
         assert_eq!(message, "hello `literal` $(literal)\n");
+    }
+
+    #[test]
+    fn prompt_file_preserves_shell_metacharacters_and_newlines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prompt.txt");
+        std::fs::write(
+            &path,
+            "Review `DANIEL HANDOFF` and $(literal).\nNext line.\n",
+        )
+        .unwrap();
+
+        let prompt = read_prompt_file(&path).unwrap();
+
+        assert_eq!(
+            prompt,
+            "Review `DANIEL HANDOFF` and $(literal).\nNext line.\n"
+        );
+    }
+
+    #[test]
+    fn spawn_and_restart_reject_legacy_inline_prompt() {
+        for command in ["spawn-session", "restart-session"] {
+            let error = Cli::try_parse_from(["ouija", command, "worker", "--prompt", "`DANIEL`"])
+                .err()
+                .expect("inline prompt must be rejected")
+                .to_string();
+            assert!(error.contains("--prompt"));
+        }
+    }
+
+    #[test]
+    fn spawn_session_accepts_prompt_file() {
+        let cli = Cli::try_parse_from([
+            "ouija",
+            "spawn-session",
+            "worker",
+            "--prompt-file",
+            "/dev/stdin",
+        ])
+        .expect("spawn prompt file must parse");
+        match cli.command {
+            Command::SpawnSession { prompt_file, .. } => {
+                assert_eq!(
+                    prompt_file.as_deref(),
+                    Some(std::path::Path::new("/dev/stdin"))
+                );
+            }
+            _ => panic!("expected spawn-session command"),
+        }
+    }
+
+    #[test]
+    fn kill_session_preserves_worktree_by_default_and_accepts_explicit_delete() {
+        let default = Cli::try_parse_from(["ouija", "kill-session", "worker"]).unwrap();
+        assert!(matches!(
+            default.command,
+            Command::KillSession {
+                delete_worktree: false,
+                keep_worktree: false,
+                ..
+            }
+        ));
+
+        let delete =
+            Cli::try_parse_from(["ouija", "kill-session", "worker", "--delete-worktree"]).unwrap();
+        assert!(matches!(
+            delete.command,
+            Command::KillSession {
+                delete_worktree: true,
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "ouija",
+                "kill-session",
+                "worker",
+                "--delete-worktree",
+                "--keep-worktree",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn kill_response_requires_removed_outcome() {
+        assert!(kill_response_succeeded(&serde_json::json!({
+            "outcome": "removed"
+        })));
+        assert!(!kill_response_succeeded(&serde_json::json!({
+            "outcome": "failed"
+        })));
+        assert!(!kill_response_succeeded(&serde_json::json!({})));
     }
 
     #[test]

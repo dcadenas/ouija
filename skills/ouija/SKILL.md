@@ -85,6 +85,15 @@ When spawning, choose lifecycle ownership and completion behavior deliberately:
 - Pending replies can wake a session even without a reminder.
 - `--worktree`, `--branch`, and `--base-branch` control git isolation.
 
+Restarts preserve the worktree. A non-fresh OpenCode restart may also preserve
+its backend conversation and history; `--fresh` starts a new context. Put
+verified continuation state in `--one-shot-file` rather than rewriting the
+replay-safe base prompt.
+
+`kill-session` preserves its worktree by default and reports the worktree path
+and outcome. Use `--delete-worktree` only for an explicit destructive cleanup;
+dirty, untracked, or ignored artifacts prevent deletion.
+
 Completion and recovery are not the same. `ask-parent` reports completion once;
 a reminder reappears during idle recovery until cleared. Ouija injects the exact
 clearing command, so never place `ouija clear-reminder` in reminder text.
@@ -92,10 +101,12 @@ clearing command, so never place `ouija clear-reminder` in reminder text.
 ## Replay-safe prompts
 
 Fresh restarts replay the stored prompt unless that launch uses
-`--suppress-stored-prompt`. A replacement `--prompt` becomes the new stored
+`--suppress-stored-prompt`. A replacement `--prompt-file` becomes the new stored
 prompt. `--one-shot-file` appends launch-only UTF-8 context and is not stored.
-`spawn-session` has no one-shot file, so its initial prompt must contain the
-complete bounded assignment.
+`spawn-session` has no one-shot file, so its initial prompt file must contain the
+complete bounded assignment. Never put prompt text directly in a shell argument.
+For inline composition, use `--prompt-file /dev/stdin` with a quoted heredoc
+delimiter.
 
 Every stored prompt must be re-entrant and state-checking:
 
@@ -134,7 +145,7 @@ For initial setup:
 ```bash
 ouija restart-session exact-public-id --fresh \
   --fresh-context-after-active 1h \
-  --prompt "durable replay-safe assignment" \
+  --prompt-file /path/to/base-prompt.txt \
   --one-shot-file /dev/stdin <<'EOF'
 Verified current work:
 - Completed: ...
@@ -203,12 +214,19 @@ runs asynchronously and can still fail after the worktree exists. A bare
 `spawn-session` that prints `starting` is not evidence that a worker is running.
 
 ```bash
-ouija spawn-session worker --project-dir /path --prompt "..." --wait
+ouija spawn-session worker --project-dir /path --prompt-file /path/to/base-prompt.txt --wait
 ```
 
-`--wait` blocks until the daemon confirms registration or the start terminally
-fails, prints the recorded reason on failure, and exits non-zero. To poll
-separately, keep the `incarnation` from the spawn response (the ticket) and
+For prompt-bearing OpenCode `spawn-session --wait`, including its
+existing-session restart path, the result certifies more than registration: it
+succeeds only after the correlated first assistant turn completes and the
+requested provider/model matches the one actually used. Provider errors, model
+mismatches, and timeouts are non-success outcomes. An OpenCode start without a
+prompt remains registration-based.
+
+Otherwise, `--wait` blocks until the daemon confirms registration or the start
+terminally fails, prints the recorded reason on failure, and exits non-zero. To
+poll separately, keep the `incarnation` from the spawn response (the ticket) and
 run `ouija start-status <name> --incarnation <n>`. The incarnation is what makes
 the answer yours: public session ids get reused, and an older ticket reports
 `superseded` rather than another launch's success. This replaces polling
@@ -219,7 +237,7 @@ the answer yours: public session ids get reused, and an older ticket reports
 ```bash
 ouija spawn-session worker --project-dir /path \
   --parent-session hub --when-done ask-parent \
-  --prompt "implement and verify feature X"
+  --prompt-file /path/to/base-prompt.txt
 ```
 
 Add a reminder only if recurring recovery is desired.
@@ -228,7 +246,7 @@ Add a reminder only if recurring recovery is desired.
 
 ```bash
 ouija spawn-session counter --no-parent-session --when-done keep-open \
-  --prompt "check value.txt; increment only while below 10; verify each write" \
+  --prompt-file /path/to/base-prompt.txt \
   --reminder "Check state. If below 10, continue one verified step. If complete, verify and report."
 ```
 

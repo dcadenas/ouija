@@ -2859,8 +2859,11 @@ pub struct SessionNameBody {
     /// Base branch to create the worktree branch from. If omitted, branches from HEAD.
     #[serde(default)]
     base_branch: Option<String>,
-    /// On kill, preserve the worktree directory instead of cleaning it up.
-    /// Defaults to false (cleanup) when omitted.
+    /// Explicitly delete the worktree after the backend process stops.
+    /// Worktrees are preserved when omitted or false.
+    #[serde(default)]
+    delete_worktree: Option<bool>,
+    /// Deprecated compatibility input. Preservation is now the default.
     #[serde(default)]
     keep_worktree: Option<bool>,
     /// Opt-in to the data-destructive worktree reset on respawn.
@@ -2955,8 +2958,10 @@ pub async fn kill_session(
     State(state): State<SharedState>,
     Json(body): Json<SessionNameBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let result = if body.keep_worktree.unwrap_or(false) {
-        crate::nostr_transport::kill_session_keep_worktree(&state, &body.name).await
+    // `keep_worktree` is accepted for compatibility; preservation is now the default.
+    let delete_worktree = body.delete_worktree.unwrap_or(false) && body.keep_worktree != Some(true);
+    let result = if delete_worktree {
+        crate::nostr_transport::kill_session_delete_worktree(&state, &body.name).await
     } else {
         crate::nostr_transport::kill_session(&state, &body.name).await
     };
@@ -3156,6 +3161,16 @@ pub async fn start_session(
                 );
             }
         };
+    let existing_metadata = match &disposition {
+        crate::daemon_protocol::StartDisposition::Existing(owner) => state
+            .protocol
+            .read()
+            .await
+            .sessions
+            .get(&owner.session_id)
+            .map(|session| session.metadata.clone()),
+        _ => None,
+    };
     let (existing_owner, reserved_owner) = match disposition {
         crate::daemon_protocol::StartDisposition::Reserved(owner) => (None, Some(owner)),
         crate::daemon_protocol::StartDisposition::Existing(owner) => {
@@ -3209,7 +3224,55 @@ pub async fn start_session(
         .or_else(|| existing_owner.clone())
         .expect("start disposition yields exactly one claimed owner");
     let name = body.name.clone();
+    let inference_backend = state
+        .backend_or_default(
+            body.backend.as_deref().or(existing_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.backend.as_deref())),
+        )
+        .await;
+    let effective_base_prompt = body.prompt.clone().or_else(|| {
+        existing_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.prompt.clone())
+    });
+    let observe_first_turn =
+        effective_base_prompt.is_some() && inference_backend.name() == "opencode";
+    let expected_prompt = effective_base_prompt.as_deref().map(|prompt| {
+        let metadata = crate::daemon_protocol::SessionMeta {
+            reminder: body.reminder.clone().or_else(|| {
+                existing_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.reminder.clone())
+            }),
+            parent_session: body.parent_session.clone().or_else(|| {
+                existing_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.parent_session.clone())
+            }),
+            idle_policy: body.idle_policy.clone().or_else(|| {
+                existing_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.idle_policy.clone())
+            }),
+            ..Default::default()
+        };
+        metadata.effective_reminder(&body.name, None).map_or_else(
+            || prompt.to_string(),
+            |reminder| format!("{prompt}\n\n{reminder}"),
+        )
+    });
     let state2 = state.clone();
+    if observe_first_turn {
+        // Registration alone is not a successful prompt-bearing OpenCode start.
+        // This provisional record prevents the exact registered owner from
+        // reading as started while its first assistant turn is still running.
+        state.start_outcomes.record(
+            &ticket_owner,
+            crate::start_outcome::StartOutcomeStatus::InProgress,
+            "waiting for first assistant turn".into(),
+        );
+    }
     tokio::spawn(async move {
         // If session already exists, restart with fresh context instead of failing.
         if let Some(existing_owner) = existing_owner {
@@ -3220,7 +3283,7 @@ pub async fn start_session(
             if let Some(msg) = restart_drops_destructive_intent(&body) {
                 tracing::warn!("{msg}");
             }
-            let (result, _msg_id, restart_outcome) =
+            let (result, prompt_msg_id, restart_outcome) =
                 crate::nostr_transport::restart_session_for_start_with_active_context_policy(
                     &state2,
                     &existing_owner,
@@ -3246,11 +3309,25 @@ pub async fn start_session(
             // The restart path already returns a typed terminal outcome, so
             // record it directly rather than re-deriving one. It is filed
             // under the exact owner the caller was handed as its ticket.
-            state2.start_outcomes.record(
-                &existing_owner,
-                start_outcome_for_restart(restart_outcome),
-                result.clone(),
-            );
+            let (status, detail) = if restart_outcome
+                == crate::nostr_transport::RestartOutcome::Restarted
+                && observe_first_turn
+            {
+                let target_owner = current_exact_or_newer_owner(&state2, &existing_owner).await;
+                observe_opencode_first_turn(
+                    &state2,
+                    &target_owner,
+                    prompt_msg_id,
+                    expected_prompt.as_deref(),
+                    body.model.as_deref(),
+                )
+                .await
+            } else {
+                (start_outcome_for_restart(restart_outcome), result.clone())
+            };
+            state2
+                .start_outcomes
+                .record(&existing_owner, status, detail);
             tracing::info!(
                 "async session restart complete: {}, result: {result}",
                 body.name
@@ -3258,7 +3335,7 @@ pub async fn start_session(
             return;
         }
 
-        let (result, _prompt_msg_id) =
+        let (result, prompt_msg_id) =
             crate::nostr_transport::start_session_with_active_context_policy(
                 &state2,
                 &body.name,
@@ -3282,8 +3359,23 @@ pub async fn start_session(
             .await;
 
         if let Some(owner) = reserved_owner.as_ref() {
-            let status = classify_completed_start(&state2, owner).await;
-            state2.start_outcomes.record(owner, status, result.clone());
+            let launch_status = classify_completed_start(&state2, owner).await;
+            let (status, detail) = if launch_status
+                == crate::start_outcome::StartOutcomeStatus::Started
+                && observe_first_turn
+            {
+                observe_opencode_first_turn(
+                    &state2,
+                    owner,
+                    prompt_msg_id,
+                    expected_prompt.as_deref(),
+                    body.model.as_deref(),
+                )
+                .await
+            } else {
+                (launch_status, result.clone())
+            };
+            state2.start_outcomes.record(owner, status, detail);
         }
         tracing::info!(
             "async session start complete: {}, result: {result}",
@@ -3325,6 +3417,179 @@ fn start_outcome_for_restart(
 /// a different incarnation belongs to somebody else's launch. The protocol
 /// lock is taken read-only for the comparison and released before the caller
 /// records anything; no I/O happens under it.
+const OPENCODE_FIRST_TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4 * 60);
+
+async fn current_exact_or_newer_owner(
+    state: &SharedState,
+    incumbent: &crate::daemon_protocol::ResourceOwner,
+) -> crate::daemon_protocol::ResourceOwner {
+    state
+        .protocol
+        .read()
+        .await
+        .sessions
+        .get(&incumbent.session_id)
+        .map(|session| session.owner())
+        .unwrap_or_else(|| incumbent.clone())
+}
+
+async fn observe_opencode_first_turn(
+    state: &SharedState,
+    owner: &crate::daemon_protocol::ResourceOwner,
+    prompt_msg_id: Option<u64>,
+    expected_prompt: Option<&str>,
+    requested_model: Option<&str>,
+) -> (crate::start_outcome::StartOutcomeStatus, String) {
+    const TIMEOUT: std::time::Duration = OPENCODE_FIRST_TURN_TIMEOUT;
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+    let started = std::time::Instant::now();
+    loop {
+        let session = {
+            let protocol = state.protocol.read().await;
+            let Some(session) = protocol.sessions.get(&owner.session_id) else {
+                return (
+                    crate::start_outcome::StartOutcomeStatus::Failed,
+                    format!(
+                        "session '{}' disappeared before its first assistant turn completed",
+                        owner.session_id
+                    ),
+                );
+            };
+            if session.owner() != *owner {
+                return (
+                    crate::start_outcome::StartOutcomeStatus::Superseded,
+                    format!(
+                        "session '{}' was superseded before its first assistant turn completed",
+                        owner.session_id
+                    ),
+                );
+            }
+            (
+                session.metadata.backend_session_id.clone(),
+                session.metadata.project_dir.clone(),
+            )
+        };
+        let (Some(backend_session_id), Some(project_dir)) = session else {
+            return (
+                crate::start_outcome::StartOutcomeStatus::Failed,
+                format!(
+                    "session '{}' has no OpenCode identity for first-turn observation",
+                    owner.session_id
+                ),
+            );
+        };
+
+        let url = format!(
+            "http://127.0.0.1:{}/session/{backend_session_id}/message",
+            state.opencode_serve_port()
+        );
+        match state
+            .http_client
+            .get(url)
+            .header("x-opencode-directory", project_dir)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => match response.json().await {
+                Ok(messages) => {
+                    if let Some(observation) = classify_opencode_first_turn(
+                        &messages,
+                        prompt_msg_id,
+                        expected_prompt,
+                        requested_model,
+                    ) {
+                        return observation;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, session = %owner.session_id, "could not decode OpenCode messages while observing first turn");
+                }
+            },
+            Ok(response) => {
+                tracing::warn!(status = %response.status(), session = %owner.session_id, "OpenCode message polling returned an error");
+            }
+            Err(error) => {
+                tracing::warn!(%error, session = %owner.session_id, "OpenCode message polling failed");
+            }
+        }
+
+        if started.elapsed() >= TIMEOUT {
+            return (
+                crate::start_outcome::StartOutcomeStatus::Failed,
+                format!(
+                    "timed out waiting for session '{}' first assistant turn",
+                    owner.session_id
+                ),
+            );
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+fn classify_opencode_first_turn(
+    messages: &serde_json::Value,
+    prompt_msg_id: Option<u64>,
+    expected_prompt: Option<&str>,
+    requested_model: Option<&str>,
+) -> Option<(crate::start_outcome::StartOutcomeStatus, String)> {
+    let messages = messages.as_array()?;
+    let correlation = prompt_msg_id.map(|id| format!("id=\"{id}\""));
+    let user = messages.iter().rev().find(|message| {
+        message["info"]["role"] == "user"
+            && message["parts"].as_array().is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    if part["type"] != "text" {
+                        return false;
+                    }
+                    part["text"].as_str().is_some_and(|text| {
+                        correlation.as_ref().map_or_else(
+                            || expected_prompt == Some(text),
+                            |needle| text.contains(needle),
+                        )
+                    })
+                })
+            })
+    })?;
+    let user_id = user["info"]["id"].as_str()?;
+    let assistant = messages.iter().find(|message| {
+        message["info"]["role"] == "assistant"
+            && message["info"]["parentID"].as_str() == Some(user_id)
+    })?;
+    let info = &assistant["info"];
+
+    if !info["error"].is_null() {
+        return Some((
+            crate::start_outcome::StartOutcomeStatus::Failed,
+            format!("OpenCode first turn failed: {}", info["error"]),
+        ));
+    }
+    let completed = !info["time"]["completed"].is_null() || !info["finish"].is_null();
+    if !completed {
+        return None;
+    }
+    if let Some(requested) = requested_model.and_then(parse_opencode_model) {
+        let actual = (
+            info["providerID"].as_str().unwrap_or_default(),
+            info["modelID"].as_str().unwrap_or_default(),
+        );
+        if actual != (requested.0.as_str(), requested.1.as_str()) {
+            return Some((
+                crate::start_outcome::StartOutcomeStatus::Failed,
+                format!(
+                    "OpenCode first turn used model {}/{}, expected {}/{}",
+                    actual.0, actual.1, requested.0, requested.1
+                ),
+            ));
+        }
+    }
+    Some((
+        crate::start_outcome::StartOutcomeStatus::Started,
+        "OpenCode first assistant turn completed".into(),
+    ))
+}
+
 async fn classify_completed_start(
     state: &SharedState,
     owner: &crate::daemon_protocol::ResourceOwner,
@@ -6203,6 +6468,130 @@ mod tests {
         assert_eq!(one["active_context_accounting_provisional"], true);
     }
 
+    #[test]
+    fn opencode_first_turn_correlates_transformed_prompt_by_message_id() {
+        let pending = serde_json::json!([
+            {"info":{"id":"u1","role":"user"},"parts":[{"type":"text","text":"<msg from=\"parent\" id=\"42\" reply=\"true\">do it\n\nReminder: report back</msg>"}]},
+            {"info":{"id":"a1","role":"assistant","parentID":"u1","providerID":"anthropic","modelID":"sonnet","time":{}},"parts":[]}
+        ]);
+        assert_eq!(
+            classify_opencode_first_turn(&pending, Some(41), None, None),
+            None
+        );
+        assert_eq!(
+            classify_opencode_first_turn(&pending, Some(42), None, None),
+            None
+        );
+
+        let complete = serde_json::json!([
+            {"info":{"id":"u1","role":"user"},"parts":[{"type":"text","text":"<msg from=\"parent\" id=\"42\" reply=\"true\">do it\n\nReminder: report back</msg>"}]},
+            {"info":{"id":"a1","role":"assistant","parentID":"u1","providerID":"anthropic","modelID":"sonnet","time":{"completed":123}},"parts":[]}
+        ]);
+        assert_eq!(
+            classify_opencode_first_turn(&complete, Some(42), None, Some("anthropic/sonnet")),
+            Some((
+                crate::start_outcome::StartOutcomeStatus::Started,
+                "OpenCode first assistant turn completed".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn opencode_first_turn_surfaces_error_and_model_mismatch() {
+        let failed = serde_json::json!([
+            {"info":{"id":"u1","role":"user"},"parts":[{"type":"text","text":"do it"}]},
+            {"info":{"id":"a1","role":"assistant","parentID":"u1","error":{"name":"ProviderError","message":"denied"}},"parts":[]}
+        ]);
+        let (status, detail) =
+            classify_opencode_first_turn(&failed, None, Some("do it"), None).unwrap();
+        assert_eq!(status, crate::start_outcome::StartOutcomeStatus::Failed);
+        assert!(detail.contains("ProviderError"));
+
+        let mismatch = serde_json::json!([
+            {"info":{"id":"u1","role":"user"},"parts":[{"type":"text","text":"do it"}]},
+            {"info":{"id":"a1","role":"assistant","parentID":"u1","providerID":"openai","modelID":"gpt-5","finish":"stop"},"parts":[]}
+        ]);
+        let (status, detail) =
+            classify_opencode_first_turn(&mismatch, None, Some("do it"), Some("anthropic/sonnet"))
+                .unwrap();
+        assert_eq!(status, crate::start_outcome::StartOutcomeStatus::Failed);
+        assert!(detail.contains("openai/gpt-5"));
+        assert!(detail.contains("anthropic/sonnet"));
+    }
+
+    #[tokio::test]
+    async fn restart_observation_uses_rotated_owner() {
+        let state = crate::state::AppState::new_for_test();
+        let incumbent = crate::daemon_protocol::ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(7),
+        };
+        let target = crate::daemon_protocol::ResourceOwner {
+            session_id: "worker".into(),
+            incarnation: crate::daemon_protocol::SessionIncarnation(8),
+        };
+        state.protocol.write().await.sessions.insert(
+            "worker".into(),
+            crate::daemon_protocol::SessionEntry {
+                id: "worker".into(),
+                metadata: crate::daemon_protocol::SessionMeta {
+                    session_incarnation: target.incarnation,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            current_exact_or_newer_owner(&state, &incumbent).await,
+            target
+        );
+    }
+
+    #[tokio::test]
+    async fn omitted_restart_backend_uses_existing_session_backend() {
+        let state = crate::state::AppState::new_for_test();
+        let selected = state.backend_or_default(Some("opencode")).await;
+        assert_eq!(selected.name(), "opencode");
+        let existing_backend = Some("opencode".to_string());
+        let selected = state
+            .backend_or_default(None.or(existing_backend.as_deref()))
+            .await;
+        assert_eq!(selected.name(), "opencode");
+    }
+
+    #[test]
+    fn omitted_replacement_replays_existing_stored_prompt_for_observation() {
+        let existing = crate::daemon_protocol::SessionMeta {
+            backend: Some("opencode".into()),
+            prompt: Some("durable assignment".into()),
+            reminder: Some("report completion".into()),
+            ..Default::default()
+        };
+        let replacement: Option<String> = None;
+        let effective = replacement.or_else(|| existing.prompt.clone());
+        let expected = effective.as_deref().map(|prompt| {
+            existing.effective_reminder("worker", None).map_or_else(
+                || prompt.to_string(),
+                |reminder| format!("{prompt}\n\n{reminder}"),
+            )
+        });
+        assert_eq!(effective.as_deref(), Some("durable assignment"));
+        assert!(
+            expected
+                .as_deref()
+                .unwrap()
+                .starts_with("durable assignment\n\n")
+        );
+    }
+
+    #[test]
+    fn inference_timeout_precedes_default_cli_wait_budget() {
+        assert!(
+            OPENCODE_FIRST_TURN_TIMEOUT
+                < std::time::Duration::from_secs(crate::DEFAULT_START_WAIT_SECS)
+        );
+    }
+
     // --- asynchronous start outcomes are reachable by the exact caller ---
     //
     // `/api/sessions/start` answers 202 before any launch work runs, so its
@@ -7075,6 +7464,7 @@ mod tests {
                 idle_policy: Some(crate::daemon_protocol::IdlePolicy::KeepOpen),
                 branch: None,
                 base_branch: None,
+                delete_worktree: None,
                 keep_worktree: None,
                 force_reset: None,
             }),
@@ -7112,6 +7502,7 @@ mod tests {
                 idle_policy: Some(crate::daemon_protocol::IdlePolicy::KeepOpen),
                 branch: None,
                 base_branch: None,
+                delete_worktree: None,
                 keep_worktree: None,
                 force_reset: None,
             }),
@@ -7221,6 +7612,7 @@ mod tests {
                 idle_policy: None,
                 branch: None,
                 base_branch: None,
+                delete_worktree: None,
                 keep_worktree: None,
                 force_reset: None,
             }),
@@ -7271,6 +7663,7 @@ mod tests {
                 idle_policy: None,
                 branch: None,
                 base_branch: None,
+                delete_worktree: None,
                 keep_worktree: None,
                 force_reset: None,
             }),
@@ -7310,6 +7703,7 @@ mod tests {
                     idle_policy: None,
                     branch: None,
                     base_branch: None,
+                    delete_worktree: None,
                     keep_worktree: None,
                     force_reset: None,
                 },
@@ -7375,6 +7769,7 @@ mod tests {
                     idle_policy: None,
                     branch: None,
                     base_branch: None,
+                    delete_worktree: None,
                     keep_worktree: None,
                     force_reset: None,
                 },
@@ -7473,6 +7868,7 @@ mod tests {
                 idle_policy: Some(crate::daemon_protocol::IdlePolicy::KeepOpen),
                 branch: None,
                 base_branch: None,
+                delete_worktree: None,
                 keep_worktree: None,
                 force_reset: None,
             }),

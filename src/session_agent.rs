@@ -1566,7 +1566,7 @@ mod tests {
         assert!(message.contains("stored prompt"));
         assert!(message.contains("will be replayed"));
         assert!(message.contains("Confirm it is a durable base prompt"));
-        assert!(message.contains("replace it with `--prompt`"));
+        assert!(message.contains("replace it with `--prompt-file`"));
         assert!(message.contains("<<'OUIJA_CONTINUATION'"));
         assert!(
             message.contains(
@@ -1605,8 +1605,8 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert!(messages[0].contains("has no stored prompt"));
         assert!(messages[0].contains("compose a concise durable base prompt"));
-        assert!(messages[0].contains("durable_prompt=\"$(cat <<'OUIJA_BASE_PROMPT'"));
-        assert!(messages[0].contains("--prompt \"$durable_prompt\""));
+        assert!(messages[0].contains("durable_prompt_file=\"$(mktemp)\""));
+        assert!(messages[0].contains("--prompt-file \"$durable_prompt_file\""));
         assert!(messages[0].contains("keep mutable current work only"));
         server.abort();
     }

@@ -661,20 +661,21 @@ fn active_context_restart_due_message(
     let shell_session_id = crate::scheduler::shell_escape(session_id);
     let (prompt_guidance, prompt_setup, prompt_option) = if has_stored_prompt {
         (
-            "This session has a stored prompt; it will be replayed before the one-shot continuation. Confirm it is a durable base prompt. If it is transient recovery or handoff prose, replace it with `--prompt` when running the restart.",
+            "This session has a stored prompt; it will be replayed before the one-shot continuation. Confirm it is a durable base prompt. If it is transient recovery or handoff prose, replace it with `--prompt-file` when running the restart.",
             "",
             "",
         )
     } else {
         (
-            "This session has no stored prompt. Before restarting, compose a concise durable base prompt with the stable role, authority, invariants, and source-of-truth rules. Store it with `--prompt`; keep mutable current work only in the one-shot continuation.",
-            r#"Set the durable base prompt before running the restart:
-durable_prompt="$(cat <<'OUIJA_BASE_PROMPT'
+            "This session has no stored prompt. Before restarting, compose a concise durable base prompt with the stable role, authority, invariants, and source-of-truth rules. Store it with `--prompt-file`; keep mutable current work only in the one-shot continuation.",
+            r#"Set the durable base prompt in a temporary file before running the restart:
+durable_prompt_file="$(mktemp)" || exit
+trap 'rm -f "$durable_prompt_file"' EXIT HUP INT TERM
+cat >"$durable_prompt_file" <<'OUIJA_BASE_PROMPT'
 Write the durable base prompt here.
 OUIJA_BASE_PROMPT
-)"
 "#,
-            r#" --prompt "$durable_prompt""#,
+            r#" --prompt-file "$durable_prompt_file""#,
         )
     };
     format!(
@@ -961,6 +962,15 @@ enum ResourceGateKey {
     Pane(String),
     BackendSession(String),
     ProjectDir(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorktreeCleanupOutcome {
+    Deleted,
+    PreservedDirty,
+    SkippedInUse,
+    Failed(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5889,7 +5899,7 @@ impl AppState {
     /// Clean up a git worktree directory if it has no uncommitted changes.
     /// Supports ouija-managed worktrees (both `~/.ouija/worktrees/` and legacy
     /// `<repo>/.ouija/worktrees/`) and Claude Code (`.claude/worktrees/`) paths.
-    pub(crate) async fn cleanup_worktree_dir(dir: &str) {
+    pub(crate) async fn cleanup_worktree_dir(dir: &str) -> WorktreeCleanupOutcome {
         let dir_owned = dir.to_string();
         // Resolve the main repo via git. This handles every layout: the
         // legacy `<repo>/.ouija/worktrees/<name>`, the newer
@@ -5911,13 +5921,22 @@ impl AppState {
             Ok(Some(r)) if !r.is_empty() => r,
             _ => {
                 tracing::info!("worktree {dir_owned} not inside a git repo, skipping cleanup");
-                return;
+                return WorktreeCleanupOutcome::Failed(
+                    "path is not an accessible git worktree".into(),
+                );
             }
         };
         let dir_clone = dir_owned.clone();
         let has_changes = tokio::task::spawn_blocking(move || {
             std::process::Command::new("git")
-                .args(["-C", &dir_clone, "status", "--porcelain"])
+                .args([
+                    "-C",
+                    &dir_clone,
+                    "status",
+                    "--porcelain",
+                    "--ignored=matching",
+                    "--untracked-files=all",
+                ])
                 .output()
                 .map(|o| !o.stdout.is_empty())
                 .unwrap_or(true)
@@ -5926,15 +5945,25 @@ impl AppState {
         .unwrap_or(true);
         if has_changes {
             tracing::info!("worktree {dir_owned} has uncommitted changes, keeping it");
-            return;
+            return WorktreeCleanupOutcome::PreservedDirty;
         }
         tracing::info!("cleaning up worktree: {dir_owned}");
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = std::process::Command::new("git")
-                .args(["-C", &repo, "worktree", "remove", &dir_owned, "--force"])
-                .status();
+        let removed = tokio::task::spawn_blocking(move || {
+            // Do not use --force: git performs its own final dirtiness check,
+            // closing the race between our artifact scan and removal.
+            std::process::Command::new("git")
+                .args(["-C", &repo, "worktree", "remove", &dir_owned])
+                .output()
         })
         .await;
+        match removed {
+            Ok(Ok(output)) if output.status.success() => WorktreeCleanupOutcome::Deleted,
+            Ok(Ok(output)) => WorktreeCleanupOutcome::Failed(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ),
+            Ok(Err(error)) => WorktreeCleanupOutcome::Failed(error.to_string()),
+            Err(error) => WorktreeCleanupOutcome::Failed(error.to_string()),
+        }
     }
 
     /// Remove a worktree under its project-directory resource gate. Protocol
@@ -5943,17 +5972,21 @@ impl AppState {
         &self,
         owner: &crate::daemon_protocol::ResourceOwner,
         dir: &str,
-    ) -> bool {
+    ) -> WorktreeCleanupOutcome {
         let cleaned = self
             .with_owned_worktree_cleanup(owner, dir, || async move {
-                Self::cleanup_worktree_dir(dir).await;
+                Self::cleanup_worktree_dir(dir).await
             })
             .await;
-        if cleaned.is_none() {
-            tracing::info!("skipping worktree cleanup for {dir}: other sessions still using it");
-            return false;
+        match cleaned {
+            Some(outcome) => outcome,
+            None => {
+                tracing::info!(
+                    "skipping worktree cleanup for {dir}: other sessions still using it"
+                );
+                WorktreeCleanupOutcome::SkippedInUse
+            }
         }
-        true
     }
 
     /// Register a connected node by npub.
@@ -7998,9 +8031,20 @@ pub(crate) mod tests {
             );
             let mut expected = b"7\0restart-session\0".to_vec();
             expected.extend_from_slice(session_id.as_bytes());
-            expected.extend_from_slice(
-                b"\0--fresh\0--prompt\0Write the durable base prompt here.\0--one-shot-file\0/dev/stdin\0",
+            expected.extend_from_slice(b"\0--fresh\0--prompt-file\0");
+            let prompt_file_start = expected.len();
+            let separator = output.stdout[prompt_file_start..]
+                .iter()
+                .position(|byte| *byte == 0)
+                .expect("prompt file argument terminator");
+            let prompt_file = std::path::Path::new(
+                std::str::from_utf8(
+                    &output.stdout[prompt_file_start..prompt_file_start + separator],
+                )
+                .expect("UTF-8 temporary prompt path"),
             );
+            expected.extend_from_slice(prompt_file.as_os_str().as_encoded_bytes());
+            expected.extend_from_slice(b"\0--one-shot-file\0/dev/stdin\0");
             assert_eq!(
                 output.stdout, expected,
                 "generated command must pass the literal ID as one argument"
@@ -8027,8 +8071,9 @@ pub(crate) mod tests {
         let message = active_context_restart_due_message("worker", 60, false);
 
         assert!(message.contains("compose a concise durable base prompt"));
-        assert!(message.contains("durable_prompt=\"$(cat <<'OUIJA_BASE_PROMPT'"));
-        assert!(message.contains("--prompt \"$durable_prompt\""));
+        assert!(message.contains("durable_prompt_file=\"$(mktemp)\""));
+        assert!(message.contains("cat >\"$durable_prompt_file\" <<'OUIJA_BASE_PROMPT'"));
+        assert!(message.contains("--prompt-file \"$durable_prompt_file\""));
         assert!(!message.contains("self-contained continuation"));
         assert!(!message.contains(
             "make the one-shot continuation complete enough to finish the work on its own"
@@ -8050,7 +8095,7 @@ pub(crate) mod tests {
         assert!(message.contains("must not be repeated solely because the prompt was replayed"));
         assert!(message.contains("current authorization"));
         assert!(message.contains("If it is transient recovery or handoff prose"));
-        assert!(message.contains("replace it with `--prompt`"));
+        assert!(message.contains("replace it with `--prompt-file`"));
     }
 
     #[test]
@@ -10940,6 +10985,47 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn worktree_cleanup_preserves_ignored_artifacts() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let worktree = root.path().join("worktree");
+        std::fs::create_dir(&repo).unwrap();
+        let run = |cwd: &std::path::Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&repo, &["init", "-q"]);
+        run(&repo, &["config", "user.email", "test@example.com"]);
+        run(&repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join(".gitignore"), "artifact.log\n").unwrap();
+        std::fs::write(repo.join("tracked"), "tracked\n").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-qm", "initial"]);
+        run(
+            &repo,
+            &["worktree", "add", "-q", worktree.to_str().unwrap()],
+        );
+        std::fs::write(worktree.join("artifact.log"), "local artifact\n").unwrap();
+
+        let outcome = AppState::cleanup_worktree_dir(worktree.to_str().unwrap()).await;
+
+        assert_eq!(outcome, WorktreeCleanupOutcome::PreservedDirty);
+        assert!(worktree.join("artifact.log").exists());
+        run(
+            &repo,
+            &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+        );
+    }
+
+    #[tokio::test]
     async fn worktree_cleanup_fails_closed_when_a_replacement_uses_the_directory() {
         let state = AppState::new_for_test();
         state
@@ -10954,13 +11040,14 @@ pub(crate) mod tests {
             .await;
         let replacement_owner = state.protocol.read().await.sessions["replacement"].owner();
 
-        assert!(
-            !state
+        assert_eq!(
+            state
                 .cleanup_worktree_dir_if_unused(
                     &replacement_owner,
                     "/tmp/.ouija/worktrees/project/replacement",
                 )
-                .await
+                .await,
+            WorktreeCleanupOutcome::SkippedInUse
         );
     }
 

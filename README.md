@@ -55,7 +55,7 @@ Sessions auto-register using the working directory name (e.g. `/code/api` become
 
 **Always interactive.** Every session runs in a tmux pane. You can jump into any session at any time — watch it work, type a correction, answer a question, or take over. The session doesn't know or care whether the next input comes from a peer session or from you at the keyboard.
 
-**Worktree sessions.** Spawn sessions in isolated git worktrees for parallel work on the same repo without branch conflicts.
+**Worktree sessions.** Spawn sessions in isolated git worktrees for parallel work on the same repo without branch conflicts. Restarts preserve the worktree. `kill-session` also preserves it by default; `--delete-worktree` explicitly requests destructive cleanup, which refuses to delete a worktree containing dirty, untracked, or ignored artifacts.
 
 **Nostr DMs.** If you use Nostr, configure your npub to control the daemon from any Nostr client. Send `/list`, `/start`, `@session message`, or bare text (routed by an LLM).
 
@@ -81,27 +81,27 @@ the active-time counter automatically; there is no separate rearm command.
 
 For a new manually managed session, bootstrap the policy with `spawn-session`
 (there is no `ouija spawn` alias). `spawn-session` has no `--one-shot-file`, so
-its stored `--prompt` must be the complete bounded assignment:
+its stored `--prompt-file` must be the complete bounded assignment:
 
 ```bash
 ouija spawn-session worker --project-dir /path/to/project \
   --parent-session hub --when-done ask-parent \
-  --fresh-context-after-active 4h --prompt "implement the feature"
+  --fresh-context-after-active 4h --prompt-file /path/to/base-prompt.txt
 ```
 
 For an existing session, inspect its exact Local row in `ouija status` before
 the fresh restart. Keep a concise durable base prompt in stored `prompt`; if it
-is null or transient handoff/recovery prose, replace it with `--prompt`. Put
+is null or transient handoff/recovery prose, replace it with `--prompt-file`. Put
 only verified mutable work in the launch-only continuation:
 
 ```bash
 ouija restart-session worker --fresh --fresh-context-after-active 4h \
-  --prompt "durable role, authority, invariants, and source-of-truth rules" \
+  --prompt-file /path/to/base-prompt.txt \
   --backend codex-cli \
   --one-shot-file /tmp/verified-continuation.txt
 ```
 
-Omit `--prompt` when the stored prompt is already durable. Specify `--backend`
+Omit `--prompt-file` when the stored prompt is already durable. Specify `--backend`
 when the current binding is absent or cannot be trusted; use only the exact
 current backend. If `ouija whoami` safely refuses stale evidence, recover only
 with the exact public Local ID supplied by trusted injected context or the
@@ -229,10 +229,12 @@ ouija tell <to> --message-file note.txt # fire-and-forget message
 ouija reply <to> <id> --message-file reply.txt # reply to a message
 ouija rename <new-id> --from <current-id> # rename an exact Local session
 ouija announce --role "..." --bulletin "..." # update your metadata
-ouija spawn-session <name> --no-parent-session --when-done keep-open --prompt "..." # start a new session
-ouija spawn-session <name> --no-parent-session --when-done keep-open --fresh-context-after-active 4h --prompt "..." # opt in to active-context refresh
-ouija restart-session <name> --fresh --prompt "..." --backend codex-cli # replace stored prompt and restart
+ouija spawn-session <name> --no-parent-session --when-done keep-open --prompt-file base-prompt.txt # start a new session
+ouija spawn-session <name> --no-parent-session --when-done keep-open --fresh-context-after-active 4h --prompt-file base-prompt.txt # opt in to active-context refresh
+ouija restart-session <name> --fresh --prompt-file base-prompt.txt --backend codex-cli # replace stored prompt and restart
 ouija restart-session <name> --fresh --fresh-context-after-active 4h --one-shot-file continuation.txt # set/change the active limit
+ouija kill-session <name> # stop the session and preserve its worktree
+ouija kill-session <name> --delete-worktree # explicitly request destructive worktree cleanup
 ouija nodes          # list connected nodes
 ouija config ...     # manage settings, Nostr DM users, router
 ```
@@ -248,16 +250,32 @@ This prevents shell expansion of backticks, `$()`, quotes, and JSON before
 The legacy `--idle-policy` flag remains available for compatibility but is
 deprecated.
 
-On `spawn-session`, `--prompt` is the complete bounded assignment and becomes
-the stored base prompt; this command has no launch-only `--one-shot-file`.
+On `spawn-session`, `--prompt-file` contains the complete bounded assignment and
+its UTF-8 contents become the stored base prompt; this command has no launch-only
+`--one-shot-file`. Never put prompt text directly in a shell argument. For inline
+composition, use `--prompt-file /dev/stdin` with a quoted heredoc delimiter.
 
-On `restart-session`, `--prompt` replaces the durable stored base prompt and
+On `restart-session`, `--prompt-file` replaces the durable stored base prompt and
 should repair null or transient recovery prose.
 `--suppress-stored-prompt` skips that stored prompt for one launch without
 erasing it, while `--one-shot-file <PATH>` appends UTF-8 content that is
-delivered only on that launch and is never persisted. `--backend` explicitly
-selects `claude-code`, `opencode`, or `codex-cli`; use it when the current
-binding is absent or cannot be trusted.
+delivered only on that launch and is never persisted. Prefer a one-shot file for
+verified continuation state. Restart always preserves the worktree. A non-fresh
+OpenCode restart may also preserve the backend conversation and its history;
+`--fresh` starts a new context. `--backend` explicitly selects `claude-code`,
+`opencode`, or `codex-cli`; use it when the current binding is absent or cannot
+be trusted.
+
+For prompt-bearing OpenCode `spawn-session --wait`, including its
+existing-session restart path, success requires the correlated first assistant
+turn to complete and the requested provider/model to match the one actually
+used. Provider errors, model mismatches, and timeouts are non-success outcomes.
+Without a prompt, readiness remains registration-based.
+
+`kill-session` reports the worktree path and whether it was preserved, deleted,
+or could not be deleted. Worktrees are preserved by default. The explicit
+`--delete-worktree` option is destructive, but deletion fails closed when dirty,
+untracked, or ignored artifacts are present.
 
 `--fresh-context-after-active DURATION` counts active seconds only; parked time
 does not count. It is available on `spawn-session`, and setting or changing it
